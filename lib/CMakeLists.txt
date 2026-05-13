@@ -1,5 +1,7 @@
 add_library(notdec-bin2llvm-core STATIC
   ModuleBuilder.cpp
+  Pcode.cpp
+  PcodeToLLVM.cpp
 )
 
 target_include_directories(notdec-bin2llvm-core
