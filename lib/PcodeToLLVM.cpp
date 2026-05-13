@@ -14,9 +14,14 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 
+#include <algorithm>
+#include <map>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace notdec::bin2llvm {
 namespace {
@@ -42,19 +47,207 @@ unsigned bitWidth(uint32_t byteSize) {
 class PcodeLowerer {
 public:
   PcodeLowerer(llvm::LLVMContext &context, llvm::Module &module,
-               llvm::IRBuilder<> &builder)
-      : Context(context), Module(module), Builder(builder) {}
+               llvm::Function &function, llvm::IRBuilder<> &builder)
+      : Context(context), Module(module), Function(function), Builder(builder) {
+  }
 
   bool lower(const PcodeProgram &program, std::string &errorMessage) {
-    for (const PcodeOpView &op : program.Ops) {
-      if (!lowerOp(op, errorMessage)) {
-        return false;
+    if (program.Ops.empty()) {
+      return true;
+    }
+
+    buildBasicBlocks(program);
+
+    for (size_t blockIndex = 0; blockIndex < BlockStarts.size(); ++blockIndex) {
+      size_t start = BlockStarts[blockIndex];
+      size_t end = blockIndex + 1 < BlockStarts.size()
+                       ? BlockStarts[blockIndex + 1]
+                       : program.Ops.size();
+      Builder.SetInsertPoint(BlockForStart[start]);
+      Values.clear();
+
+      bool ended = false;
+      for (size_t opIndex = start; opIndex < end; ++opIndex) {
+        const PcodeOpView &op = program.Ops[opIndex];
+        if (isTerminator(op.Opcode)) {
+          if (!lowerTerminator(op, nextBlock(blockIndex), errorMessage)) {
+            return false;
+          }
+          ended = true;
+          break;
+        }
+
+        if (!lowerOp(op, errorMessage)) {
+          return false;
+        }
+      }
+
+      if (!ended) {
+        if (llvm::BasicBlock *next = nextBlock(blockIndex)) {
+          Builder.CreateBr(next);
+        } else {
+          Builder.CreateRetVoid();
+        }
       }
     }
+
+    for (llvm::BasicBlock *target : ExternalTargetBlocks) {
+      Builder.SetInsertPoint(target);
+      Builder.CreateRetVoid();
+    }
+
     return true;
   }
 
 private:
+  static bool isTerminator(PcodeOpcode opcode) {
+    return opcode == PcodeOpcode::Branch || opcode == PcodeOpcode::CBranch ||
+           opcode == PcodeOpcode::Return;
+  }
+
+  std::string blockName(uint64_t address) {
+    std::ostringstream os;
+    os << "bb_" << std::hex << address;
+    return os.str();
+  }
+
+  std::optional<uint64_t> directTarget(const PcodeOpView &op,
+                                       size_t inputIndex) {
+    if (op.Inputs.size() <= inputIndex ||
+        op.Inputs[inputIndex].Space != "ram") {
+      return std::nullopt;
+    }
+    return op.Inputs[inputIndex].Offset;
+  }
+
+  void addBlockStart(std::set<size_t> &starts,
+                     const std::map<uint64_t, size_t> &firstOpForAddress,
+                     uint64_t address) {
+    auto it = firstOpForAddress.find(address);
+    if (it != firstOpForAddress.end()) {
+      starts.insert(it->second);
+    }
+  }
+
+  void buildBasicBlocks(const PcodeProgram &program) {
+    std::map<uint64_t, size_t> firstOpForAddress;
+    for (size_t index = 0; index < program.Ops.size(); ++index) {
+      firstOpForAddress.try_emplace(program.Ops[index].Address, index);
+    }
+
+    std::set<size_t> starts;
+    starts.insert(0);
+    for (size_t index = 0; index < program.Ops.size(); ++index) {
+      const PcodeOpView &op = program.Ops[index];
+      if (op.Opcode == PcodeOpcode::Branch ||
+          op.Opcode == PcodeOpcode::CBranch) {
+        if (auto target = directTarget(op, 0)) {
+          addBlockStart(starts, firstOpForAddress, *target);
+        }
+      }
+
+      if (isTerminator(op.Opcode) && index + 1 < program.Ops.size()) {
+        starts.insert(index + 1);
+      }
+    }
+
+    BlockStarts.assign(starts.begin(), starts.end());
+    for (size_t index = 0; index < BlockStarts.size(); ++index) {
+      size_t start = BlockStarts[index];
+      uint64_t address = program.Ops[start].Address;
+      llvm::BasicBlock *block = nullptr;
+      if (index == 0) {
+        block = Builder.GetInsertBlock();
+        block->setName("entry");
+      } else {
+        block =
+            llvm::BasicBlock::Create(Context, blockName(address), &Function);
+      }
+      BlockForStart[start] = block;
+      BlockForAddress.try_emplace(address, block);
+    }
+  }
+
+  llvm::BasicBlock *nextBlock(size_t blockIndex) {
+    if (blockIndex + 1 >= BlockStarts.size()) {
+      return nullptr;
+    }
+    return BlockForStart[BlockStarts[blockIndex + 1]];
+  }
+
+  llvm::BasicBlock *blockForTarget(uint64_t address) {
+    auto it = BlockForAddress.find(address);
+    if (it != BlockForAddress.end()) {
+      return it->second;
+    }
+
+    auto *block =
+        llvm::BasicBlock::Create(Context, blockName(address), &Function);
+    BlockForAddress[address] = block;
+    ExternalTargetBlocks.push_back(block);
+    return block;
+  }
+
+  llvm::BasicBlock *exitBlock() {
+    if (!ExitBlock) {
+      ExitBlock = llvm::BasicBlock::Create(Context, "notdec_exit", &Function);
+      ExternalTargetBlocks.push_back(ExitBlock);
+    }
+    return ExitBlock;
+  }
+
+  llvm::Value *asCondition(llvm::Value *value) {
+    if (value->getType()->isIntegerTy(1)) {
+      return value;
+    }
+    return Builder.CreateICmpNE(value,
+                                llvm::ConstantInt::get(value->getType(), 0));
+  }
+
+  bool lowerTerminator(const PcodeOpView &op, llvm::BasicBlock *fallthrough,
+                       std::string &errorMessage) {
+    switch (op.Opcode) {
+    case PcodeOpcode::Branch: {
+      if (!requireInputCount(op, 1, errorMessage)) {
+        return false;
+      }
+      auto target = directTarget(op, 0);
+      if (!target) {
+        errorMessage = "BRANCH target must be a direct ram address";
+        return false;
+      }
+      Builder.CreateBr(blockForTarget(*target));
+      return true;
+    }
+
+    case PcodeOpcode::CBranch: {
+      if (!requireInputCount(op, 2, errorMessage)) {
+        return false;
+      }
+      auto target = directTarget(op, 0);
+      if (!target) {
+        errorMessage = "CBRANCH target must be a direct ram address";
+        return false;
+      }
+      llvm::BasicBlock *falseBlock = fallthrough ? fallthrough : exitBlock();
+      Builder.CreateCondBr(asCondition(read(op.Inputs[1])),
+                           blockForTarget(*target), falseBlock);
+      return true;
+    }
+
+    case PcodeOpcode::Return:
+      if (!requireInputCount(op, 1, errorMessage)) {
+        return false;
+      }
+      Builder.CreateRetVoid();
+      return true;
+
+    default:
+      errorMessage = "not a terminator opcode: " + op.OpcodeName;
+      return false;
+    }
+  }
+
   llvm::Type *intType(uint32_t byteSize) {
     return llvm::IntegerType::get(Context, bitWidth(byteSize));
   }
@@ -259,6 +452,17 @@ private:
     return true;
   }
 
+  bool lowerBoolNegate(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 1, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *input = asCondition(read(op.Inputs[0]));
+    llvm::Value *result = Builder.CreateNot(input);
+    write(*op.Output, result);
+    return true;
+  }
+
   llvm::GlobalVariable *memoryGlobal() {
     if (Memory) {
       return Memory;
@@ -330,6 +534,11 @@ private:
       return lowerLoad(op, errorMessage);
     case PcodeOpcode::Store:
       return lowerStore(op, errorMessage);
+    case PcodeOpcode::Branch:
+    case PcodeOpcode::CBranch:
+    case PcodeOpcode::Return:
+      errorMessage = op.OpcodeName + " appeared in non-terminator position";
+      return false;
     case PcodeOpcode::IntAdd:
     case PcodeOpcode::IntSub:
     case PcodeOpcode::IntMult:
@@ -356,6 +565,8 @@ private:
       return lowerPopcount(op, errorMessage);
     case PcodeOpcode::IntSBorrow:
       return lowerSignedBorrow(op, errorMessage);
+    case PcodeOpcode::BoolNegate:
+      return lowerBoolNegate(op, errorMessage);
     case PcodeOpcode::Unsupported:
       break;
     }
@@ -366,8 +577,14 @@ private:
 
   llvm::LLVMContext &Context;
   llvm::Module &Module;
+  llvm::Function &Function;
   llvm::IRBuilder<> &Builder;
   std::unordered_map<std::string, llvm::Value *> Values;
+  std::vector<size_t> BlockStarts;
+  std::unordered_map<size_t, llvm::BasicBlock *> BlockForStart;
+  std::unordered_map<uint64_t, llvm::BasicBlock *> BlockForAddress;
+  std::vector<llvm::BasicBlock *> ExternalTargetBlocks;
+  llvm::BasicBlock *ExitBlock = nullptr;
   llvm::GlobalVariable *Memory = nullptr;
 };
 
@@ -386,11 +603,10 @@ buildPcodeModule(llvm::LLVMContext &context, const PcodeProgram &program,
 
   auto *entryBlock = llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entryBlock);
-  PcodeLowerer lowerer(context, *module, builder);
+  PcodeLowerer lowerer(context, *module, *function, builder);
   if (!lowerer.lower(program, errorMessage)) {
     return nullptr;
   }
-  builder.CreateRetVoid();
   return module;
 }
 

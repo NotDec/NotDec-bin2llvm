@@ -103,6 +103,12 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
     return PcodeOpcode::Load;
   case ghidra::CPUI_STORE:
     return PcodeOpcode::Store;
+  case ghidra::CPUI_BRANCH:
+    return PcodeOpcode::Branch;
+  case ghidra::CPUI_CBRANCH:
+    return PcodeOpcode::CBranch;
+  case ghidra::CPUI_RETURN:
+    return PcodeOpcode::Return;
   case ghidra::CPUI_INT_EQUAL:
     return PcodeOpcode::IntEqual;
   case ghidra::CPUI_INT_NOTEQUAL:
@@ -135,6 +141,8 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
     return PcodeOpcode::IntSRight;
   case ghidra::CPUI_INT_MULT:
     return PcodeOpcode::IntMult;
+  case ghidra::CPUI_BOOL_NEGATE:
+    return PcodeOpcode::BoolNegate;
   case ghidra::CPUI_PIECE:
     return PcodeOpcode::Piece;
   case ghidra::CPUI_SUBPIECE:
@@ -155,10 +163,11 @@ class PcodeCollector : public ghidra::PcodeEmit {
 public:
   explicit PcodeCollector(PcodeProgram &program) : Program(program) {}
 
-  void dump(const ghidra::Address &, ghidra::OpCode op,
+  void dump(const ghidra::Address &address, ghidra::OpCode op,
             ghidra::VarnodeData *outVar, ghidra::VarnodeData *vars,
             int32_t inputCount) override {
     PcodeOpView view;
+    view.Address = address.getOffset();
     view.Opcode = convertOpcode(op);
     view.OpcodeName = ghidra::get_opname(op);
     if (outVar) {

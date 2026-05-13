@@ -11,6 +11,9 @@ enum class PcodeOpcode {
   Copy,
   Load,
   Store,
+  Branch,
+  CBranch,
+  Return,
   IntEqual,
   IntNotEqual,
   IntSLess,
@@ -27,6 +30,7 @@ enum class PcodeOpcode {
   IntRight,
   IntSRight,
   IntMult,
+  BoolNegate,
   Piece,
   Subpiece,
   Popcount,
@@ -44,6 +48,7 @@ struct VarnodeView {
 // One decoded P-Code op.  Output is absent for STORE and control-flow style
 // ops.
 struct PcodeOpView {
+  uint64_t Address = 0;
   PcodeOpcode Opcode = PcodeOpcode::Unsupported;
   std::string OpcodeName;
   std::optional<VarnodeView> Output;

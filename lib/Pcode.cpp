@@ -10,6 +10,12 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
     return "LOAD";
   case PcodeOpcode::Store:
     return "STORE";
+  case PcodeOpcode::Branch:
+    return "BRANCH";
+  case PcodeOpcode::CBranch:
+    return "CBRANCH";
+  case PcodeOpcode::Return:
+    return "RETURN";
   case PcodeOpcode::IntEqual:
     return "INT_EQUAL";
   case PcodeOpcode::IntNotEqual:
@@ -42,6 +48,8 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
     return "INT_SRIGHT";
   case PcodeOpcode::IntMult:
     return "INT_MULT";
+  case PcodeOpcode::BoolNegate:
+    return "BOOL_NEGATE";
   case PcodeOpcode::Piece:
     return "PIECE";
   case PcodeOpcode::Subpiece:
