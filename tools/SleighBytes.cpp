@@ -99,6 +99,10 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
   switch (opcode) {
   case ghidra::CPUI_COPY:
     return PcodeOpcode::Copy;
+  case ghidra::CPUI_LOAD:
+    return PcodeOpcode::Load;
+  case ghidra::CPUI_STORE:
+    return PcodeOpcode::Store;
   case ghidra::CPUI_INT_EQUAL:
     return PcodeOpcode::IntEqual;
   case ghidra::CPUI_INT_NOTEQUAL:

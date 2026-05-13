@@ -9,6 +9,8 @@ namespace notdec::bin2llvm {
 
 enum class PcodeOpcode {
   Copy,
+  Load,
+  Store,
   IntEqual,
   IntNotEqual,
   IntSLess,
@@ -39,8 +41,8 @@ struct VarnodeView {
   uint32_t Size = 0;
 };
 
-// One decoded P-Code op.  Output is absent for branch/store style ops, which
-// the first lowering reports as unsupported.
+// One decoded P-Code op.  Output is absent for STORE and control-flow style
+// ops.
 struct PcodeOpView {
   PcodeOpcode Opcode = PcodeOpcode::Unsupported;
   std::string OpcodeName;

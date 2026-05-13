@@ -3,7 +3,9 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -257,6 +259,65 @@ private:
     return true;
   }
 
+  llvm::GlobalVariable *memoryGlobal() {
+    if (Memory) {
+      return Memory;
+    }
+
+    // First memory model: one external byte array.  It keeps LOAD/STORE visible
+    // in IR without pretending we already understand binary sections or ABI.
+    auto *byteType = llvm::Type::getInt8Ty(Context);
+    auto *arrayType = llvm::ArrayType::get(byteType, 1024 * 1024);
+    Memory = new llvm::GlobalVariable(Module, arrayType, false,
+                                      llvm::GlobalValue::ExternalLinkage,
+                                      nullptr, "notdec_ram");
+    return Memory;
+  }
+
+  llvm::Value *memoryPointer(llvm::Value *address) {
+    llvm::Value *zero = llvm::ConstantInt::get(address->getType(), 0);
+    return Builder.CreateGEP(memoryGlobal()->getValueType(), memoryGlobal(),
+                             {zero, address}, "notdec_ram_ptr");
+  }
+
+  bool requireConstSpaceSelector(const PcodeOpView &op,
+                                 std::string &errorMessage) {
+    if (!op.Inputs.empty() && op.Inputs[0].Space == "const") {
+      return true;
+    }
+
+    errorMessage = op.OpcodeName + " address space selector must be const";
+    return false;
+  }
+
+  bool lowerLoad(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 2, errorMessage) ||
+        !requireConstSpaceSelector(op, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *address = resize(read(op.Inputs[1]), 8);
+    auto *load =
+        Builder.CreateLoad(intType(op.Output->Size), memoryPointer(address),
+                           valueName(*op.Output));
+    load->setAlignment(llvm::Align(1));
+    write(*op.Output, load);
+    return true;
+  }
+
+  bool lowerStore(const PcodeOpView &op, std::string &errorMessage) {
+    if (!requireInputCount(op, 3, errorMessage) ||
+        !requireConstSpaceSelector(op, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *address = resize(read(op.Inputs[1]), 8);
+    llvm::Value *value = read(op.Inputs[2]);
+    auto *store = Builder.CreateStore(value, memoryPointer(address));
+    store->setAlignment(llvm::Align(1));
+    return true;
+  }
+
   bool lowerOp(const PcodeOpView &op, std::string &errorMessage) {
     switch (op.Opcode) {
     case PcodeOpcode::Copy:
@@ -265,6 +326,10 @@ private:
       }
       write(*op.Output, read(op.Inputs[0]));
       return true;
+    case PcodeOpcode::Load:
+      return lowerLoad(op, errorMessage);
+    case PcodeOpcode::Store:
+      return lowerStore(op, errorMessage);
     case PcodeOpcode::IntAdd:
     case PcodeOpcode::IntSub:
     case PcodeOpcode::IntMult:
@@ -303,6 +368,7 @@ private:
   llvm::Module &Module;
   llvm::IRBuilder<> &Builder;
   std::unordered_map<std::string, llvm::Value *> Values;
+  llvm::GlobalVariable *Memory = nullptr;
 };
 
 } // namespace

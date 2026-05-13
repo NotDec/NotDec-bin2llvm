@@ -6,6 +6,10 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
   switch (opcode) {
   case PcodeOpcode::Copy:
     return "COPY";
+  case PcodeOpcode::Load:
+    return "LOAD";
+  case PcodeOpcode::Store:
+    return "STORE";
   case PcodeOpcode::IntEqual:
     return "INT_EQUAL";
   case PcodeOpcode::IntNotEqual:
