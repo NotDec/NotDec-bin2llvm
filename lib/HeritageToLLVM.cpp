@@ -1,5 +1,6 @@
 #include "notdec-bin2llvm/HeritageToLLVM.h"
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -196,6 +197,22 @@ private:
     return true;
   }
 
+  bool constInput(const HeritageOp &op, size_t index, uint64_t &value,
+                  std::string &errorMessage) {
+    if (op.Inputs.size() <= index) {
+      errorMessage = op.Mnemonic + " missing constant input";
+      return false;
+    }
+    const HeritageVarnode *varnode = varnodeFor(op.Inputs[index]);
+    if (varnode == nullptr || !varnode->IsConstant) {
+      errorMessage =
+          op.Mnemonic + " input " + std::to_string(index) + " must be constant";
+      return false;
+    }
+    value = varnode->Offset;
+    return true;
+  }
+
   bool lowerCopy(const HeritageOp &op, std::string &errorMessage) {
     if (!op.Output || !requireInputs(op, 1, errorMessage)) {
       return false;
@@ -203,6 +220,19 @@ private:
     llvm::Value *input = read(op.Inputs[0]);
     if (input == nullptr) {
       errorMessage = "COPY reads unknown varnode: " + op.Inputs[0];
+      return false;
+    }
+    return write(*op.Output, input, errorMessage);
+  }
+
+  bool lowerCopyLike(const HeritageOp &op, std::string &errorMessage) {
+    if (!op.Output || op.Inputs.empty()) {
+      errorMessage = op.Mnemonic + " needs output and at least one input";
+      return false;
+    }
+    llvm::Value *input = read(op.Inputs[0]);
+    if (input == nullptr) {
+      errorMessage = op.Mnemonic + " reads unknown varnode: " + op.Inputs[0];
       return false;
     }
     return write(*op.Output, input, errorMessage);
@@ -458,6 +488,118 @@ private:
                  errorMessage);
   }
 
+  bool lowerPtrAdd(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 3, errorMessage)) {
+      return false;
+    }
+
+    uint64_t elementSize = 0;
+    if (!constInput(op, 2, elementSize, errorMessage)) {
+      return false;
+    }
+    llvm::Value *base = resize(read(op.Inputs[0]), output->Size);
+    llvm::Value *index = resize(read(op.Inputs[1]), output->Size);
+    llvm::Value *scale =
+        llvm::ConstantInt::get(intType(output->Size), elementSize);
+    return write(*op.Output,
+                 Builder.CreateAdd(base, Builder.CreateMul(index, scale)),
+                 errorMessage);
+  }
+
+  bool lowerPtrSub(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 2, errorMessage)) {
+      return false;
+    }
+
+    uint64_t offset = 0;
+    if (!constInput(op, 1, offset, errorMessage)) {
+      return false;
+    }
+    llvm::Value *base = resize(read(op.Inputs[0]), output->Size);
+    llvm::Value *constant =
+        llvm::ConstantInt::get(intType(output->Size), offset);
+    return write(*op.Output, Builder.CreateAdd(base, constant), errorMessage);
+  }
+
+  bool lowerInsert(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 4, errorMessage)) {
+      return false;
+    }
+
+    uint64_t bitOffset = 0;
+    uint64_t bitSize = 0;
+    if (!constInput(op, 2, bitOffset, errorMessage) ||
+        !constInput(op, 3, bitSize, errorMessage)) {
+      return false;
+    }
+
+    unsigned width = bitWidth(output->Size);
+    if (bitOffset >= width || bitSize > width - bitOffset) {
+      errorMessage = "INSERT bit range exceeds output width";
+      return false;
+    }
+
+    llvm::Type *type = intType(output->Size);
+    llvm::APInt rangeMask =
+        llvm::APInt::getLowBitsSet(width, bitSize).shl(bitOffset);
+    llvm::Value *base = resize(read(op.Inputs[0]), output->Size);
+    llvm::Value *inserted = resize(read(op.Inputs[1]), output->Size);
+    llvm::Value *cleared =
+        Builder.CreateAnd(base, llvm::ConstantInt::get(type, ~rangeMask));
+    llvm::Value *shifted = Builder.CreateAnd(
+        Builder.CreateShl(inserted, llvm::ConstantInt::get(type, bitOffset)),
+        llvm::ConstantInt::get(type, rangeMask));
+    return write(*op.Output, Builder.CreateOr(cleared, shifted), errorMessage);
+  }
+
+  bool lowerExtract(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 3, errorMessage)) {
+      return false;
+    }
+
+    uint64_t bitOffset = 0;
+    uint64_t bitSize = 0;
+    if (!constInput(op, 1, bitOffset, errorMessage) ||
+        !constInput(op, 2, bitSize, errorMessage)) {
+      return false;
+    }
+    const HeritageVarnode *inputVarnode = varnodeFor(op.Inputs[0]);
+    if (inputVarnode == nullptr) {
+      errorMessage = op.Mnemonic + " input is unknown";
+      return false;
+    }
+    unsigned inputWidth = bitWidth(inputVarnode->Size);
+    if (bitOffset >= inputWidth || bitSize > inputWidth - bitOffset) {
+      errorMessage = op.Mnemonic + " bit range exceeds input width";
+      return false;
+    }
+
+    llvm::Value *input = read(op.Inputs[0]);
+    llvm::Value *shifted = Builder.CreateLShr(
+        input, llvm::ConstantInt::get(input->getType(), bitOffset));
+    llvm::Value *masked = Builder.CreateAnd(
+        shifted,
+        llvm::ConstantInt::get(
+            input->getType(), llvm::APInt::getLowBitsSet(inputWidth, bitSize)));
+    if (op.Mnemonic == "SPULL") {
+      unsigned shift = inputWidth - bitSize;
+      llvm::Value *left = Builder.CreateShl(
+          masked, llvm::ConstantInt::get(input->getType(), shift));
+      masked = Builder.CreateAShr(
+          left, llvm::ConstantInt::get(input->getType(), shift));
+      masked = Builder.CreateSExtOrTrunc(masked, intType(output->Size));
+    }
+    return write(*op.Output, masked, errorMessage);
+  }
+
   llvm::GlobalVariable *memoryGlobal() {
     if (Memory) {
       return Memory;
@@ -672,6 +814,9 @@ private:
     if (op.Mnemonic == "COPY") {
       return lowerCopy(op, errorMessage);
     }
+    if (op.Mnemonic == "CAST" || op.Mnemonic == "INDIRECT") {
+      return lowerCopyLike(op, errorMessage);
+    }
     if (op.Mnemonic == "LOAD") {
       return lowerLoad(op, errorMessage);
     }
@@ -717,6 +862,19 @@ private:
     }
     if (op.Mnemonic == "PIECE") {
       return lowerPiece(op, errorMessage);
+    }
+    if (op.Mnemonic == "PTRADD") {
+      return lowerPtrAdd(op, errorMessage);
+    }
+    if (op.Mnemonic == "PTRSUB") {
+      return lowerPtrSub(op, errorMessage);
+    }
+    if (op.Mnemonic == "INSERT") {
+      return lowerInsert(op, errorMessage);
+    }
+    if (op.Mnemonic == "EXTRACT" || op.Mnemonic == "ZPULL" ||
+        op.Mnemonic == "SPULL") {
+      return lowerExtract(op, errorMessage);
     }
     if (op.Mnemonic == "MULTIEQUAL") {
       return lowerPhi(op, errorMessage);
