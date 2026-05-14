@@ -1,9 +1,7 @@
-#include "llvm/Support/Error.h"
-#include "llvm/Support/JSON.h"
-#include "llvm/Support/MemoryBuffer.h"
+#include "notdec-bin2llvm/HeritagePcode.h"
+
 #include "llvm/Support/raw_ostream.h"
 
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -11,17 +9,9 @@
 
 namespace {
 
-// Keep this checker intentionally small. It validates the exported shape before
-// we commit to a native lowering data model for heritage P-Code.
 struct CheckState {
-  std::unordered_set<std::string> Blocks;
-  std::unordered_set<std::string> Ops;
-  std::unordered_set<std::string> Varnodes;
-  std::unordered_map<std::string, unsigned> BlockInputCounts;
   std::vector<std::string> Errors;
-  unsigned ParamCount = 0;
   unsigned MissingParamVarnodes = 0;
-  unsigned OpCount = 0;
   unsigned MultiequalCount = 0;
   unsigned RegisterVarnodeCount = 0;
   unsigned DirectCallCount = 0;
@@ -31,264 +21,107 @@ void addError(CheckState &state, std::string message) {
   state.Errors.push_back(std::move(message));
 }
 
-std::string asString(llvm::StringRef value) { return value.str(); }
-
-std::optional<std::string> getString(const llvm::json::Object &object,
-                                     llvm::StringRef key) {
-  if (auto value = object.getString(key)) {
-    return value->str();
+void checkSchema(const notdec::bin2llvm::HeritageProgram &program,
+                 CheckState &state) {
+  if (program.Schema != "notdec.heritage-pcode.v0") {
+    addError(state, "unexpected schema: " + program.Schema);
   }
-  return std::nullopt;
 }
 
-const llvm::json::Array *requireArray(const llvm::json::Object &object,
-                                      llvm::StringRef key,
-                                      CheckState &state) {
-  const auto *array = object.getArray(key);
-  if (array == nullptr) {
-    addError(state, "missing array: " + key.str());
-  }
-  return array;
-}
-
-const llvm::json::Object *requireObject(const llvm::json::Value &value,
-                                        llvm::StringRef what,
-                                        CheckState &state) {
-  const auto *object = value.getAsObject();
-  if (object == nullptr) {
-    addError(state, "expected object in " + what.str());
-  }
-  return object;
-}
-
-bool isNullValue(const llvm::json::Value *value) {
-  return value == nullptr || value->getAsNull().has_value();
-}
-
-void collectBlocks(const llvm::json::Object &root, CheckState &state) {
-  const auto *blocks = requireArray(root, "blocks", state);
-  if (blocks == nullptr) {
-    return;
-  }
-
-  for (const auto &blockValue : *blocks) {
-    const auto *block = requireObject(blockValue, "blocks", state);
-    if (block == nullptr) {
+void checkFunction(const notdec::bin2llvm::HeritageProgram &program,
+                   CheckState &state) {
+  for (const auto &param : program.Function.Params) {
+    if (!param.Varnode) {
+      state.MissingParamVarnodes++;
       continue;
     }
-    auto id = getString(*block, "id");
-    if (!id) {
-      addError(state, "block missing id");
-      continue;
-    }
-    state.Blocks.insert(*id);
-    if (const auto *in = block->getArray("in")) {
-      state.BlockInputCounts[*id] = in->size();
+    if (!program.VarnodeById.count(*param.Varnode)) {
+      addError(state, "parameter references unknown varnode: " +
+                          *param.Varnode);
     }
   }
 }
 
-void collectVarnodes(const llvm::json::Object &root, CheckState &state) {
-  const auto *varnodes = requireArray(root, "varnodes", state);
-  if (varnodes == nullptr) {
-    return;
+void checkBlocks(const notdec::bin2llvm::HeritageProgram &program,
+                 CheckState &state) {
+  for (const auto &block : program.Blocks) {
+    for (const std::string &input : block.In) {
+      if (!program.BlockById.count(input)) {
+        addError(state, "block " + block.Id +
+                            " references unknown input block: " + input);
+      }
+    }
+    for (const std::string &output : block.Out) {
+      if (!program.BlockById.count(output)) {
+        addError(state, "block " + block.Id +
+                            " references unknown output block: " + output);
+      }
+    }
+    for (const std::string &op : block.Ops) {
+      if (!program.OpById.count(op)) {
+        addError(state, "block " + block.Id + " references unknown op: " +
+                            op);
+      }
+    }
   }
+}
 
-  for (const auto &varnodeValue : *varnodes) {
-    const auto *varnode = requireObject(varnodeValue, "varnodes", state);
-    if (varnode == nullptr) {
-      continue;
+void checkOps(const notdec::bin2llvm::HeritageProgram &program,
+              CheckState &state) {
+  for (const auto &op : program.Ops) {
+    if (!program.BlockById.count(op.Parent)) {
+      addError(state, "op " + op.Id + " references unknown parent block");
     }
-    auto id = getString(*varnode, "id");
-    if (!id) {
-      addError(state, "varnode missing id");
-      continue;
+
+    if (op.Mnemonic == "MULTIEQUAL") {
+      state.MultiequalCount++;
+      auto block = program.BlockById.find(op.Parent);
+      if (block != program.BlockById.end() &&
+          block->second->In.size() != op.Inputs.size()) {
+        addError(state, "MULTIEQUAL " + op.Id + " has " +
+                            std::to_string(op.Inputs.size()) +
+                            " input(s), but parent block has " +
+                            std::to_string(block->second->In.size()) +
+                            " predecessor(s)");
+      }
     }
-    state.Varnodes.insert(*id);
-    if (auto isRegister = varnode->getBoolean("isRegister");
-        isRegister && *isRegister) {
+
+    if (op.CallTarget) {
+      state.DirectCallCount++;
+    }
+
+    if (op.Output && !program.VarnodeById.count(*op.Output)) {
+      addError(state, "op " + op.Id + " references unknown output varnode");
+    }
+    for (const std::string &input : op.Inputs) {
+      if (!program.VarnodeById.count(input)) {
+        addError(state, "op " + op.Id +
+                            " references unknown input varnode: " + input);
+      }
+    }
+  }
+}
+
+void countVarnodes(const notdec::bin2llvm::HeritageProgram &program,
+                   CheckState &state) {
+  for (const auto &varnode : program.Varnodes) {
+    if (varnode.IsRegister) {
       state.RegisterVarnodeCount++;
     }
   }
 }
 
-void collectOps(const llvm::json::Object &root, CheckState &state) {
-  const auto *ops = requireArray(root, "ops", state);
-  if (ops == nullptr) {
-    return;
-  }
-
-  for (const auto &opValue : *ops) {
-    const auto *op = requireObject(opValue, "ops", state);
-    if (op == nullptr) {
-      continue;
-    }
-    auto id = getString(*op, "id");
-    if (!id) {
-      addError(state, "op missing id");
-      continue;
-    }
-    state.Ops.insert(*id);
-  }
-}
-
-void checkFunction(const llvm::json::Object &root, CheckState &state) {
-  const auto *function = root.getObject("function");
-  if (function == nullptr) {
-    addError(state, "missing object: function");
-    return;
-  }
-  const auto *params = function->getArray("params");
-  if (params == nullptr) {
-    addError(state, "function missing params array");
-    return;
-  }
-
-  state.ParamCount = params->size();
-  for (const auto &paramValue : *params) {
-    const auto *param = requireObject(paramValue, "function.params", state);
-    if (param == nullptr) {
-      continue;
-    }
-    auto *varnodeValue = param->get("varnode");
-    if (isNullValue(varnodeValue)) {
-      state.MissingParamVarnodes++;
-      continue;
-    }
-    auto varnode = varnodeValue->getAsString();
-    if (!varnode) {
-      addError(state, "parameter varnode is not a string");
-      continue;
-    }
-    if (!state.Varnodes.count(asString(*varnode))) {
-      addError(state, "parameter references unknown varnode: " +
-                          asString(*varnode));
-    }
-  }
-}
-
-void checkBlockReferences(const llvm::json::Object &root, CheckState &state) {
-  const auto *blocks = root.getArray("blocks");
-  if (blocks == nullptr) {
-    return;
-  }
-
-  for (const auto &blockValue : *blocks) {
-    const auto *block = blockValue.getAsObject();
-    if (block == nullptr) {
-      continue;
-    }
-    auto id = getString(*block, "id").value_or("<unknown>");
-    for (llvm::StringRef edgeName : {"in", "out"}) {
-      const auto *edges = block->getArray(edgeName);
-      if (edges == nullptr) {
-        addError(state, "block " + id + " missing " + edgeName.str() +
-                            " array");
-        continue;
-      }
-      for (const auto &edgeValue : *edges) {
-        auto edge = edgeValue.getAsString();
-        if (!edge) {
-          addError(state, "block " + id + " has non-string " +
-                              edgeName.str() + " edge");
-          continue;
-        }
-        if (!state.Blocks.count(asString(*edge))) {
-          addError(state, "block " + id + " references unknown block: " +
-                              asString(*edge));
-        }
-      }
-    }
-
-    const auto *ops = block->getArray("ops");
-    if (ops == nullptr) {
-      addError(state, "block " + id + " missing ops array");
-      continue;
-    }
-    for (const auto &opValue : *ops) {
-      auto op = opValue.getAsString();
-      if (!op) {
-        addError(state, "block " + id + " has non-string op reference");
-        continue;
-      }
-      if (!state.Ops.count(asString(*op))) {
-        addError(state, "block " + id + " references unknown op: " +
-                            asString(*op));
-      }
-    }
-  }
-}
-
-void checkOpReferences(const llvm::json::Object &root, CheckState &state) {
-  const auto *ops = root.getArray("ops");
-  if (ops == nullptr) {
-    return;
-  }
-
-  for (const auto &opValue : *ops) {
-    const auto *op = opValue.getAsObject();
-    if (op == nullptr) {
-      continue;
-    }
-    auto id = getString(*op, "id").value_or("<unknown>");
-    state.OpCount++;
-
-    auto parent = getString(*op, "parent");
-    if (!parent || !state.Blocks.count(*parent)) {
-      addError(state, "op " + id + " references unknown parent block");
-    }
-
-    auto mnemonic = getString(*op, "mnemonic").value_or("");
-    if (mnemonic == "MULTIEQUAL") {
-      state.MultiequalCount++;
-    }
-    if (auto callTarget = getString(*op, "callTarget"); callTarget) {
-      state.DirectCallCount++;
-    }
-
-    auto *outputValue = op->get("output");
-    if (!isNullValue(outputValue)) {
-      auto output = outputValue->getAsString();
-      if (!output || !state.Varnodes.count(asString(*output))) {
-        addError(state, "op " + id + " references unknown output varnode");
-      }
-    }
-
-    const auto *inputs = op->getArray("inputs");
-    if (inputs == nullptr) {
-      addError(state, "op " + id + " missing inputs array");
-      continue;
-    }
-    for (const auto &inputValue : *inputs) {
-      auto input = inputValue.getAsString();
-      if (!input || !state.Varnodes.count(asString(*input))) {
-        addError(state, "op " + id + " references unknown input varnode");
-      }
-    }
-
-    if (mnemonic == "MULTIEQUAL" && parent) {
-      auto blockInputs = state.BlockInputCounts.find(*parent);
-      if (blockInputs != state.BlockInputCounts.end() &&
-          blockInputs->second != inputs->size()) {
-        addError(state, "MULTIEQUAL " + id + " has " +
-                            std::to_string(inputs->size()) +
-                            " input(s), but parent block has " +
-                            std::to_string(blockInputs->second) +
-                            " predecessor(s)");
-      }
-    }
-  }
-}
-
-int printSummary(const CheckState &state) {
+int printSummary(const notdec::bin2llvm::HeritageProgram &program,
+                 const CheckState &state) {
   llvm::outs() << "heritage-pcode check\n";
-  llvm::outs() << "  blocks: " << state.Blocks.size() << '\n';
-  llvm::outs() << "  ops: " << state.OpCount << '\n';
-  llvm::outs() << "  varnodes: " << state.Varnodes.size() << '\n';
-  llvm::outs() << "  params: " << state.ParamCount << '\n';
+  llvm::outs() << "  blocks: " << program.Blocks.size() << '\n';
+  llvm::outs() << "  ops: " << program.Ops.size() << '\n';
+  llvm::outs() << "  varnodes: " << program.Varnodes.size() << '\n';
+  llvm::outs() << "  params: " << program.Function.Params.size() << '\n';
   llvm::outs() << "  missing param varnodes: " << state.MissingParamVarnodes
                << '\n';
-  llvm::outs() << "  register varnodes: " << state.RegisterVarnodeCount << '\n';
+  llvm::outs() << "  register varnodes: " << state.RegisterVarnodeCount
+               << '\n';
   llvm::outs() << "  MULTIEQUAL ops: " << state.MultiequalCount << '\n';
   llvm::outs() << "  direct calls: " << state.DirectCallCount << '\n';
 
@@ -312,38 +145,19 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  auto buffer = llvm::MemoryBuffer::getFile(argv[1]);
-  if (!buffer) {
-    llvm::errs() << "failed to read " << argv[1] << ": "
-                 << buffer.getError().message() << '\n';
-    return 1;
-  }
-
-  auto parsed = llvm::json::parse(buffer.get()->getBuffer());
-  if (!parsed) {
-    llvm::errs() << "failed to parse JSON: "
-                 << llvm::toString(parsed.takeError()) << '\n';
-    return 1;
-  }
-
-  const auto *root = parsed->getAsObject();
-  if (root == nullptr) {
-    llvm::errs() << "top-level JSON value must be an object\n";
+  notdec::bin2llvm::HeritageProgram program;
+  std::string errorMessage;
+  if (!notdec::bin2llvm::loadHeritageProgramFromJson(argv[1], program,
+                                                     errorMessage)) {
+    llvm::errs() << errorMessage << '\n';
     return 1;
   }
 
   CheckState state;
-  auto schema = getString(*root, "schema");
-  if (!schema || *schema != "notdec.heritage-pcode.v0") {
-    addError(state, "unexpected or missing schema");
-  }
-
-  collectBlocks(*root, state);
-  collectVarnodes(*root, state);
-  collectOps(*root, state);
-  checkFunction(*root, state);
-  checkBlockReferences(*root, state);
-  checkOpReferences(*root, state);
-
-  return printSummary(state);
+  checkSchema(program, state);
+  checkFunction(program, state);
+  checkBlocks(program, state);
+  checkOps(program, state);
+  countVarnodes(program, state);
+  return printSummary(program, state);
 }
