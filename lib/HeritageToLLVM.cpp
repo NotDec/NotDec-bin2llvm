@@ -6,6 +6,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -234,6 +235,14 @@ private:
       result = Builder.CreateLShr(lhs, rhs);
     } else if (op.Mnemonic == "INT_SRIGHT") {
       result = Builder.CreateAShr(lhs, rhs);
+    } else if (op.Mnemonic == "INT_DIV") {
+      result = Builder.CreateUDiv(lhs, rhs);
+    } else if (op.Mnemonic == "INT_SDIV") {
+      result = Builder.CreateSDiv(lhs, rhs);
+    } else if (op.Mnemonic == "INT_REM") {
+      result = Builder.CreateURem(lhs, rhs);
+    } else if (op.Mnemonic == "INT_SREM") {
+      result = Builder.CreateSRem(lhs, rhs);
     } else {
       errorMessage = "unsupported binary opcode: " + op.Mnemonic;
       return false;
@@ -269,6 +278,60 @@ private:
       result = Builder.CreateICmpNE(lhs, rhs);
     } else {
       errorMessage = "unsupported compare opcode: " + op.Mnemonic;
+      return false;
+    }
+    return write(*op.Output, result, errorMessage);
+  }
+
+  bool lowerOverflow(const HeritageOp &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputs(op, 2, errorMessage)) {
+      return false;
+    }
+
+    const HeritageVarnode *lhsVarnode = varnodeFor(op.Inputs[0]);
+    if (lhsVarnode == nullptr) {
+      errorMessage = op.Mnemonic + " left input is unknown";
+      return false;
+    }
+    llvm::Value *lhs = read(op.Inputs[0]);
+    llvm::Value *rhs = resize(read(op.Inputs[1]), lhsVarnode->Size);
+    llvm::Intrinsic::ID intrinsicId = llvm::Intrinsic::not_intrinsic;
+    if (op.Mnemonic == "INT_CARRY") {
+      intrinsicId = llvm::Intrinsic::uadd_with_overflow;
+    } else if (op.Mnemonic == "INT_SCARRY") {
+      intrinsicId = llvm::Intrinsic::sadd_with_overflow;
+    } else if (op.Mnemonic == "INT_SBORROW") {
+      intrinsicId = llvm::Intrinsic::ssub_with_overflow;
+    } else {
+      errorMessage = "unsupported overflow opcode: " + op.Mnemonic;
+      return false;
+    }
+
+    llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+        &Module, intrinsicId, {lhs->getType()});
+    llvm::Value *call = Builder.CreateCall(intrinsic, {lhs, rhs});
+    return write(*op.Output, Builder.CreateExtractValue(call, 1), errorMessage);
+  }
+
+  bool lowerCountBits(const HeritageOp &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputs(op, 1, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *input = read(op.Inputs[0]);
+    llvm::Function *intrinsic = nullptr;
+    llvm::Value *result = nullptr;
+    if (op.Mnemonic == "POPCOUNT") {
+      intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, llvm::Intrinsic::ctpop, {input->getType()});
+      result = Builder.CreateCall(intrinsic, {input});
+    } else if (op.Mnemonic == "LZCOUNT") {
+      intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, llvm::Intrinsic::ctlz, {input->getType()});
+      result = Builder.CreateCall(
+          intrinsic, {input, llvm::ConstantInt::getFalse(Context)});
+    } else {
+      errorMessage = "unsupported bit count opcode: " + op.Mnemonic;
       return false;
     }
     return write(*op.Output, result, errorMessage);
@@ -619,8 +682,17 @@ private:
         op.Mnemonic == "INT_MULT" || op.Mnemonic == "INT_AND" ||
         op.Mnemonic == "INT_OR" || op.Mnemonic == "INT_XOR" ||
         op.Mnemonic == "INT_LEFT" || op.Mnemonic == "INT_RIGHT" ||
-        op.Mnemonic == "INT_SRIGHT") {
+        op.Mnemonic == "INT_SRIGHT" || op.Mnemonic == "INT_DIV" ||
+        op.Mnemonic == "INT_SDIV" || op.Mnemonic == "INT_REM" ||
+        op.Mnemonic == "INT_SREM") {
       return lowerBinary(op, errorMessage);
+    }
+    if (op.Mnemonic == "INT_CARRY" || op.Mnemonic == "INT_SCARRY" ||
+        op.Mnemonic == "INT_SBORROW") {
+      return lowerOverflow(op, errorMessage);
+    }
+    if (op.Mnemonic == "POPCOUNT" || op.Mnemonic == "LZCOUNT") {
+      return lowerCountBits(op, errorMessage);
     }
     if (op.Mnemonic == "INT_SLESSEQUAL" || op.Mnemonic == "INT_SLESS" ||
         op.Mnemonic == "INT_LESSEQUAL" || op.Mnemonic == "INT_LESS" ||
