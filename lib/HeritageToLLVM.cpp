@@ -2,7 +2,9 @@
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -15,7 +17,9 @@
 namespace notdec::bin2llvm {
 namespace {
 
-unsigned bitWidth(uint32_t byteSize) { return byteSize == 0 ? 1 : byteSize * 8; }
+unsigned bitWidth(uint32_t byteSize) {
+  return byteSize == 0 ? 1 : byteSize * 8;
+}
 
 bool isIntLikeType(const std::string &type) {
   return type == "int" || type == "uint" || type == "undefined4";
@@ -72,9 +76,9 @@ private:
     }
 
     auto *functionType = llvm::FunctionType::get(returnType, paramTypes, false);
-    Function = llvm::Function::Create(functionType,
-                                      llvm::GlobalValue::ExternalLinkage,
-                                      Program.Function.Name, &Module);
+    Function =
+        llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
+                               Program.Function.Name, &Module);
     unsigned index = 0;
     for (llvm::Argument &argument : Function->args()) {
       if (index < Program.Function.Params.size()) {
@@ -92,8 +96,8 @@ private:
 
   void createBlocks() {
     for (const HeritageBlock &block : Program.Blocks) {
-      std::string name = block.Id == Program.Blocks.front().Id ? "entry"
-                                                               : block.Id;
+      std::string name =
+          block.Id == Program.Blocks.front().Id ? "entry" : block.Id;
       BlockMap.emplace(block.Id,
                        llvm::BasicBlock::Create(Context, name, Function));
     }
@@ -177,6 +181,20 @@ private:
     return false;
   }
 
+  bool requireOutput(const HeritageOp &op, const HeritageVarnode *&output,
+                     std::string &errorMessage) {
+    if (!op.Output) {
+      errorMessage = op.Mnemonic + " has no output";
+      return false;
+    }
+    output = varnodeFor(*op.Output);
+    if (output == nullptr) {
+      errorMessage = op.Mnemonic + " output is unknown";
+      return false;
+    }
+    return true;
+  }
+
   bool lowerCopy(const HeritageOp &op, std::string &errorMessage) {
     if (!op.Output || !requireInputs(op, 1, errorMessage)) {
       return false;
@@ -189,22 +207,44 @@ private:
     return write(*op.Output, input, errorMessage);
   }
 
-  bool lowerIntAdd(const HeritageOp &op, std::string &errorMessage) {
-    if (!op.Output || !requireInputs(op, 2, errorMessage)) {
-      return false;
-    }
-    const HeritageVarnode *output = varnodeFor(*op.Output);
-    if (output == nullptr) {
-      errorMessage = "INT_ADD output is unknown";
+  bool lowerBinary(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 2, errorMessage)) {
       return false;
     }
     llvm::Value *lhs = resize(read(op.Inputs[0]), output->Size);
     llvm::Value *rhs = resize(read(op.Inputs[1]), output->Size);
-    return write(*op.Output, Builder.CreateAdd(lhs, rhs), errorMessage);
+    llvm::Value *result = nullptr;
+    if (op.Mnemonic == "INT_ADD") {
+      result = Builder.CreateAdd(lhs, rhs);
+    } else if (op.Mnemonic == "INT_SUB") {
+      result = Builder.CreateSub(lhs, rhs);
+    } else if (op.Mnemonic == "INT_MULT") {
+      result = Builder.CreateMul(lhs, rhs);
+    } else if (op.Mnemonic == "INT_AND") {
+      result = Builder.CreateAnd(lhs, rhs);
+    } else if (op.Mnemonic == "INT_OR") {
+      result = Builder.CreateOr(lhs, rhs);
+    } else if (op.Mnemonic == "INT_XOR") {
+      result = Builder.CreateXor(lhs, rhs);
+    } else if (op.Mnemonic == "INT_LEFT") {
+      result = Builder.CreateShl(lhs, rhs);
+    } else if (op.Mnemonic == "INT_RIGHT") {
+      result = Builder.CreateLShr(lhs, rhs);
+    } else if (op.Mnemonic == "INT_SRIGHT") {
+      result = Builder.CreateAShr(lhs, rhs);
+    } else {
+      errorMessage = "unsupported binary opcode: " + op.Mnemonic;
+      return false;
+    }
+    return write(*op.Output, result, errorMessage);
   }
 
   bool lowerCompare(const HeritageOp &op, std::string &errorMessage) {
-    if (!op.Output || !requireInputs(op, 2, errorMessage)) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 2, errorMessage)) {
       return false;
     }
     const HeritageVarnode *lhsVarnode = varnodeFor(op.Inputs[0]);
@@ -219,13 +259,201 @@ private:
       result = Builder.CreateICmpSLE(lhs, rhs);
     } else if (op.Mnemonic == "INT_SLESS") {
       result = Builder.CreateICmpSLT(lhs, rhs);
+    } else if (op.Mnemonic == "INT_LESSEQUAL") {
+      result = Builder.CreateICmpULE(lhs, rhs);
+    } else if (op.Mnemonic == "INT_LESS") {
+      result = Builder.CreateICmpULT(lhs, rhs);
     } else if (op.Mnemonic == "INT_EQUAL") {
       result = Builder.CreateICmpEQ(lhs, rhs);
+    } else if (op.Mnemonic == "INT_NOTEQUAL") {
+      result = Builder.CreateICmpNE(lhs, rhs);
     } else {
       errorMessage = "unsupported compare opcode: " + op.Mnemonic;
       return false;
     }
     return write(*op.Output, result, errorMessage);
+  }
+
+  bool lowerCast(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 1, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *input = read(op.Inputs[0]);
+    llvm::Type *outputType = intType(output->Size);
+    llvm::Value *result = nullptr;
+    if (op.Mnemonic == "INT_ZEXT") {
+      result = Builder.CreateZExt(input, outputType);
+    } else if (op.Mnemonic == "INT_SEXT") {
+      result = Builder.CreateSExt(input, outputType);
+    } else {
+      errorMessage = "unsupported cast opcode: " + op.Mnemonic;
+      return false;
+    }
+    return write(*op.Output, result, errorMessage);
+  }
+
+  bool lowerBoolNegate(const HeritageOp &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputs(op, 1, errorMessage)) {
+      return false;
+    }
+    llvm::Value *input = read(op.Inputs[0]);
+    if (!input->getType()->isIntegerTy(1)) {
+      input = Builder.CreateICmpNE(input,
+                                   llvm::ConstantInt::get(input->getType(), 0));
+    }
+    return write(*op.Output, Builder.CreateNot(input), errorMessage);
+  }
+
+  bool lowerUnary(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 1, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *input = resize(read(op.Inputs[0]), output->Size);
+    llvm::Value *result = nullptr;
+    if (op.Mnemonic == "INT_NEGATE") {
+      result = Builder.CreateNot(input);
+    } else if (op.Mnemonic == "INT_2COMP") {
+      result = Builder.CreateNeg(input);
+    } else {
+      errorMessage = "unsupported unary opcode: " + op.Mnemonic;
+      return false;
+    }
+    return write(*op.Output, result, errorMessage);
+  }
+
+  bool lowerBoolBinary(const HeritageOp &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputs(op, 2, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *lhs = read(op.Inputs[0]);
+    llvm::Value *rhs = read(op.Inputs[1]);
+    if (!lhs->getType()->isIntegerTy(1)) {
+      lhs =
+          Builder.CreateICmpNE(lhs, llvm::ConstantInt::get(lhs->getType(), 0));
+    }
+    if (!rhs->getType()->isIntegerTy(1)) {
+      rhs =
+          Builder.CreateICmpNE(rhs, llvm::ConstantInt::get(rhs->getType(), 0));
+    }
+
+    llvm::Value *result = nullptr;
+    if (op.Mnemonic == "BOOL_AND") {
+      result = Builder.CreateAnd(lhs, rhs);
+    } else if (op.Mnemonic == "BOOL_OR") {
+      result = Builder.CreateOr(lhs, rhs);
+    } else if (op.Mnemonic == "BOOL_XOR") {
+      result = Builder.CreateXor(lhs, rhs);
+    } else {
+      errorMessage = "unsupported bool opcode: " + op.Mnemonic;
+      return false;
+    }
+    return write(*op.Output, result, errorMessage);
+  }
+
+  bool lowerSubpiece(const HeritageOp &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputs(op, 2, errorMessage)) {
+      return false;
+    }
+    const HeritageVarnode *offset = varnodeFor(op.Inputs[1]);
+    if (offset == nullptr || !offset->IsConstant) {
+      errorMessage = "SUBPIECE offset must be constant";
+      return false;
+    }
+
+    llvm::Value *input = read(op.Inputs[0]);
+    llvm::Value *shift =
+        llvm::ConstantInt::get(input->getType(), offset->Offset * 8);
+    return write(*op.Output, Builder.CreateLShr(input, shift), errorMessage);
+  }
+
+  bool lowerPiece(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 2, errorMessage)) {
+      return false;
+    }
+
+    llvm::Type *outputType = intType(output->Size);
+    llvm::Value *high = Builder.CreateZExt(read(op.Inputs[0]), outputType);
+    llvm::Value *low = Builder.CreateZExt(read(op.Inputs[1]), outputType);
+    const HeritageVarnode *lowVarnode = varnodeFor(op.Inputs[1]);
+    if (lowVarnode == nullptr) {
+      errorMessage = "PIECE low input is unknown";
+      return false;
+    }
+    llvm::Value *shift =
+        llvm::ConstantInt::get(outputType, bitWidth(lowVarnode->Size));
+    return write(*op.Output,
+                 Builder.CreateOr(Builder.CreateShl(high, shift), low),
+                 errorMessage);
+  }
+
+  llvm::GlobalVariable *memoryGlobal() {
+    if (Memory) {
+      return Memory;
+    }
+
+    // Temporary heritage memory model.  This keeps LOAD/STORE explicit in LLVM
+    // IR until binary sections and stack objects are exported.
+    auto *byteType = llvm::Type::getInt8Ty(Context);
+    auto *arrayType = llvm::ArrayType::get(byteType, 1024 * 1024);
+    Memory = new llvm::GlobalVariable(Module, arrayType, false,
+                                      llvm::GlobalValue::ExternalLinkage,
+                                      nullptr, "notdec_ram");
+    return Memory;
+  }
+
+  llvm::Value *memoryPointer(llvm::Value *address) {
+    llvm::Value *zero = llvm::ConstantInt::get(address->getType(), 0);
+    return Builder.CreateGEP(memoryGlobal()->getValueType(), memoryGlobal(),
+                             {zero, address}, "notdec_ram_ptr");
+  }
+
+  bool requireConstSpaceSelector(const HeritageOp &op,
+                                 std::string &errorMessage) {
+    const HeritageVarnode *selector =
+        op.Inputs.empty() ? nullptr : varnodeFor(op.Inputs[0]);
+    if (selector != nullptr && selector->IsConstant) {
+      return true;
+    }
+
+    errorMessage = op.Mnemonic + " address space selector must be const";
+    return false;
+  }
+
+  bool lowerLoad(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 2, errorMessage) ||
+        !requireConstSpaceSelector(op, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *address = resize(read(op.Inputs[1]), 8);
+    auto *load = Builder.CreateLoad(intType(output->Size),
+                                    memoryPointer(address), *op.Output);
+    load->setAlignment(llvm::Align(1));
+    return write(*op.Output, load, errorMessage);
+  }
+
+  bool lowerStore(const HeritageOp &op, std::string &errorMessage) {
+    if (!requireInputs(op, 3, errorMessage) ||
+        !requireConstSpaceSelector(op, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *address = resize(read(op.Inputs[1]), 8);
+    llvm::Value *value = read(op.Inputs[2]);
+    auto *store = Builder.CreateStore(value, memoryPointer(address));
+    store->setAlignment(llvm::Align(1));
+    return true;
   }
 
   bool lowerPhi(const HeritageOp &op, std::string &errorMessage) {
@@ -244,8 +472,8 @@ private:
       return false;
     }
 
-    auto *phi = Builder.CreatePHI(intType(output->Size), op.Inputs.size(),
-                                  *op.Output);
+    auto *phi =
+        Builder.CreatePHI(intType(output->Size), op.Inputs.size(), *op.Output);
     Values[*op.Output] = phi;
     for (size_t index = 0; index < op.Inputs.size(); ++index) {
       llvm::BasicBlock *incomingBlock = BlockMap.at(block->In[index]);
@@ -262,7 +490,6 @@ private:
     }
 
     std::vector<llvm::Value *> args;
-    std::vector<llvm::Type *> argTypes;
     for (size_t index = 1; index < op.Inputs.size(); ++index) {
       llvm::Value *arg = read(op.Inputs[index]);
       if (arg == nullptr) {
@@ -270,7 +497,6 @@ private:
         return false;
       }
       args.push_back(arg);
-      argTypes.push_back(arg->getType());
     }
 
     const HeritageVarnode *output = varnodeFor(*op.Output);
@@ -278,8 +504,10 @@ private:
       errorMessage = "CALL output is unknown";
       return false;
     }
-    auto *calleeType = llvm::FunctionType::get(intType(output->Size), argTypes,
-                                               false);
+    // HighFunction can omit or vary call-site arguments while prototype
+    // recovery is still incomplete.  Use a vararg declaration until the export
+    // schema carries stable callee prototypes.
+    auto *calleeType = llvm::FunctionType::get(intType(output->Size), {}, true);
     llvm::FunctionCallee callee =
         Module.getOrInsertFunction(*op.CallTargetName, calleeType);
     return write(*op.Output, Builder.CreateCall(callee, args), errorMessage);
@@ -342,6 +570,24 @@ private:
       return true;
     }
 
+    if (op.Mnemonic == "BRANCH") {
+      if (!requireInputs(op, 1, errorMessage)) {
+        return false;
+      }
+      const HeritageVarnode *target = varnodeFor(op.Inputs[0]);
+      if (target == nullptr) {
+        errorMessage = "BRANCH target varnode is unknown";
+        return false;
+      }
+      auto targetBlockIt = Program.BlockByStart.find(target->Address);
+      if (targetBlockIt == Program.BlockByStart.end()) {
+        errorMessage = "BRANCH target block is unknown: " + target->Address;
+        return false;
+      }
+      Builder.CreateBr(BlockMap.at(targetBlockIt->second->Id));
+      return true;
+    }
+
     if (op.Mnemonic == "RETURN") {
       llvm::Value *value = returnValueFor(op, errorMessage);
       if (!errorMessage.empty()) {
@@ -363,12 +609,42 @@ private:
     if (op.Mnemonic == "COPY") {
       return lowerCopy(op, errorMessage);
     }
-    if (op.Mnemonic == "INT_ADD") {
-      return lowerIntAdd(op, errorMessage);
+    if (op.Mnemonic == "LOAD") {
+      return lowerLoad(op, errorMessage);
+    }
+    if (op.Mnemonic == "STORE") {
+      return lowerStore(op, errorMessage);
+    }
+    if (op.Mnemonic == "INT_ADD" || op.Mnemonic == "INT_SUB" ||
+        op.Mnemonic == "INT_MULT" || op.Mnemonic == "INT_AND" ||
+        op.Mnemonic == "INT_OR" || op.Mnemonic == "INT_XOR" ||
+        op.Mnemonic == "INT_LEFT" || op.Mnemonic == "INT_RIGHT" ||
+        op.Mnemonic == "INT_SRIGHT") {
+      return lowerBinary(op, errorMessage);
     }
     if (op.Mnemonic == "INT_SLESSEQUAL" || op.Mnemonic == "INT_SLESS" ||
-        op.Mnemonic == "INT_EQUAL") {
+        op.Mnemonic == "INT_LESSEQUAL" || op.Mnemonic == "INT_LESS" ||
+        op.Mnemonic == "INT_EQUAL" || op.Mnemonic == "INT_NOTEQUAL") {
       return lowerCompare(op, errorMessage);
+    }
+    if (op.Mnemonic == "INT_ZEXT" || op.Mnemonic == "INT_SEXT") {
+      return lowerCast(op, errorMessage);
+    }
+    if (op.Mnemonic == "INT_NEGATE" || op.Mnemonic == "INT_2COMP") {
+      return lowerUnary(op, errorMessage);
+    }
+    if (op.Mnemonic == "BOOL_NEGATE") {
+      return lowerBoolNegate(op, errorMessage);
+    }
+    if (op.Mnemonic == "BOOL_AND" || op.Mnemonic == "BOOL_OR" ||
+        op.Mnemonic == "BOOL_XOR") {
+      return lowerBoolBinary(op, errorMessage);
+    }
+    if (op.Mnemonic == "SUBPIECE") {
+      return lowerSubpiece(op, errorMessage);
+    }
+    if (op.Mnemonic == "PIECE") {
+      return lowerPiece(op, errorMessage);
     }
     if (op.Mnemonic == "MULTIEQUAL") {
       return lowerPhi(op, errorMessage);
@@ -384,7 +660,8 @@ private:
   bool lowerBlock(const HeritageBlock &block, std::string &errorMessage) {
     for (const std::string &opId : block.Ops) {
       const HeritageOp *op = Program.OpById.at(opId);
-      if (op->Mnemonic == "CBRANCH" || op->Mnemonic == "RETURN") {
+      if (op->Mnemonic == "BRANCH" || op->Mnemonic == "CBRANCH" ||
+          op->Mnemonic == "RETURN") {
         return lowerBranch(*op, block, errorMessage);
       }
       if (!lowerOp(*op, errorMessage)) {
@@ -409,6 +686,7 @@ private:
   llvm::Function *Function = nullptr;
   std::unordered_map<std::string, llvm::BasicBlock *> BlockMap;
   std::unordered_map<std::string, llvm::Value *> Values;
+  llvm::GlobalVariable *Memory = nullptr;
 };
 
 } // namespace
