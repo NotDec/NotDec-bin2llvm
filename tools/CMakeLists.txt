@@ -7,6 +7,15 @@ target_link_libraries(notdec-bin2llvm
     notdec-bin2llvm-core
 )
 
+add_executable(notdec-heritage-check
+  notdec-heritage-check.cpp
+)
+
+target_link_libraries(notdec-heritage-check
+  PRIVATE
+    notdec-bin2llvm-core
+)
+
 if (NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
   add_library(notdec-bin2llvm-sleigh-bytes STATIC
     SleighBytes.cpp
