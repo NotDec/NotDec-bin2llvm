@@ -57,6 +57,20 @@ private:
     return llvm::IntegerType::get(Context, bitWidth(byteSize));
   }
 
+  llvm::Type *floatType(uint32_t byteSize) {
+    if (byteSize == 4) {
+      return llvm::Type::getFloatTy(Context);
+    }
+    if (byteSize == 8) {
+      return llvm::Type::getDoubleTy(Context);
+    }
+    return nullptr;
+  }
+
+  uint32_t floatByteSize(llvm::Type *type) const {
+    return type->isDoubleTy() ? 8 : 4;
+  }
+
   llvm::Type *typeForSourceType(const std::string &type) {
     if (isIntLikeType(type)) {
       return intType(4);
@@ -169,6 +183,22 @@ private:
     }
     Values[id] = resize(value, varnode->Size);
     return true;
+  }
+
+  llvm::Value *readFloatBits(const std::string &id, llvm::Type *floatTy,
+                             std::string &errorMessage) {
+    llvm::Value *bits = read(id);
+    if (bits == nullptr) {
+      errorMessage = "FLOAT op reads unknown varnode: " + id;
+      return nullptr;
+    }
+    return Builder.CreateBitCast(resize(bits, floatByteSize(floatTy)), floatTy);
+  }
+
+  bool writeFloatBits(const std::string &id, llvm::Value *value,
+                      std::string &errorMessage) {
+    llvm::Type *bitsTy = intType(floatByteSize(value->getType()));
+    return write(id, Builder.CreateBitCast(value, bitsTy), errorMessage);
   }
 
   bool requireInputs(const HeritageOp &op, size_t count,
@@ -450,6 +480,201 @@ private:
     return write(*op.Output, result, errorMessage);
   }
 
+  bool lowerFloatBinary(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 2, errorMessage)) {
+      return false;
+    }
+    llvm::Type *floatTy = floatType(output->Size);
+    if (floatTy == nullptr) {
+      errorMessage = op.Mnemonic + " only supports 4/8-byte floats";
+      return false;
+    }
+
+    llvm::Value *lhs = readFloatBits(op.Inputs[0], floatTy, errorMessage);
+    llvm::Value *rhs = readFloatBits(op.Inputs[1], floatTy, errorMessage);
+    if (lhs == nullptr || rhs == nullptr) {
+      return false;
+    }
+
+    llvm::Value *result = nullptr;
+    if (op.Mnemonic == "FLOAT_ADD") {
+      result = Builder.CreateFAdd(lhs, rhs);
+    } else if (op.Mnemonic == "FLOAT_SUB") {
+      result = Builder.CreateFSub(lhs, rhs);
+    } else if (op.Mnemonic == "FLOAT_MULT") {
+      result = Builder.CreateFMul(lhs, rhs);
+    } else if (op.Mnemonic == "FLOAT_DIV") {
+      result = Builder.CreateFDiv(lhs, rhs);
+    } else {
+      errorMessage = "unsupported float binary opcode: " + op.Mnemonic;
+      return false;
+    }
+    return writeFloatBits(*op.Output, result, errorMessage);
+  }
+
+  bool lowerFloatCompare(const HeritageOp &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputs(op, 2, errorMessage)) {
+      return false;
+    }
+    const HeritageVarnode *lhsVarnode = varnodeFor(op.Inputs[0]);
+    if (lhsVarnode == nullptr) {
+      errorMessage = op.Mnemonic + " input is unknown";
+      return false;
+    }
+    llvm::Type *floatTy = floatType(lhsVarnode->Size);
+    if (floatTy == nullptr) {
+      errorMessage = op.Mnemonic + " only supports 4/8-byte floats";
+      return false;
+    }
+
+    llvm::Value *lhs = readFloatBits(op.Inputs[0], floatTy, errorMessage);
+    llvm::Value *rhs = readFloatBits(op.Inputs[1], floatTy, errorMessage);
+    if (lhs == nullptr || rhs == nullptr) {
+      return false;
+    }
+
+    llvm::Value *result = nullptr;
+    if (op.Mnemonic == "FLOAT_EQUAL") {
+      result = Builder.CreateFCmpOEQ(lhs, rhs);
+    } else if (op.Mnemonic == "FLOAT_NOTEQUAL") {
+      result = Builder.CreateFCmpUNE(lhs, rhs);
+    } else if (op.Mnemonic == "FLOAT_LESS") {
+      result = Builder.CreateFCmpOLT(lhs, rhs);
+    } else if (op.Mnemonic == "FLOAT_LESSEQUAL") {
+      result = Builder.CreateFCmpOLE(lhs, rhs);
+    } else {
+      errorMessage = "unsupported float compare opcode: " + op.Mnemonic;
+      return false;
+    }
+    return write(*op.Output, result, errorMessage);
+  }
+
+  bool lowerFloatUnary(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 1, errorMessage)) {
+      return false;
+    }
+    llvm::Type *floatTy = floatType(output->Size);
+    if (floatTy == nullptr) {
+      errorMessage = op.Mnemonic + " only supports 4/8-byte floats";
+      return false;
+    }
+
+    llvm::Value *input = readFloatBits(op.Inputs[0], floatTy, errorMessage);
+    if (input == nullptr) {
+      return false;
+    }
+
+    llvm::Value *result = nullptr;
+    if (op.Mnemonic == "FLOAT_NEG") {
+      result = Builder.CreateFNeg(input);
+    } else if (op.Mnemonic == "FLOAT_ABS") {
+      llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, llvm::Intrinsic::fabs, {floatTy});
+      result = Builder.CreateCall(intrinsic, {input});
+    } else if (op.Mnemonic == "FLOAT_SQRT") {
+      llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, llvm::Intrinsic::sqrt, {floatTy});
+      result = Builder.CreateCall(intrinsic, {input});
+    } else if (op.Mnemonic == "CEIL" || op.Mnemonic == "FLOOR" ||
+               op.Mnemonic == "ROUND") {
+      llvm::Intrinsic::ID intrinsicId = llvm::Intrinsic::not_intrinsic;
+      if (op.Mnemonic == "CEIL") {
+        intrinsicId = llvm::Intrinsic::ceil;
+      } else if (op.Mnemonic == "FLOOR") {
+        intrinsicId = llvm::Intrinsic::floor;
+      } else {
+        intrinsicId = llvm::Intrinsic::round;
+      }
+      llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, intrinsicId, {floatTy});
+      result = Builder.CreateCall(intrinsic, {input});
+    } else {
+      errorMessage = "unsupported float unary opcode: " + op.Mnemonic;
+      return false;
+    }
+    return writeFloatBits(*op.Output, result, errorMessage);
+  }
+
+  bool lowerFloatNan(const HeritageOp &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputs(op, 1, errorMessage)) {
+      return false;
+    }
+    const HeritageVarnode *inputVarnode = varnodeFor(op.Inputs[0]);
+    if (inputVarnode == nullptr) {
+      errorMessage = "FLOAT_NAN input is unknown";
+      return false;
+    }
+    llvm::Type *floatTy = floatType(inputVarnode->Size);
+    if (floatTy == nullptr) {
+      errorMessage = "FLOAT_NAN only supports 4/8-byte floats";
+      return false;
+    }
+    llvm::Value *input = readFloatBits(op.Inputs[0], floatTy, errorMessage);
+    if (input == nullptr) {
+      return false;
+    }
+    return write(*op.Output, Builder.CreateFCmpUNO(input, input), errorMessage);
+  }
+
+  bool lowerFloatCast(const HeritageOp &op, std::string &errorMessage) {
+    const HeritageVarnode *output = nullptr;
+    if (!requireOutput(op, output, errorMessage) ||
+        !requireInputs(op, 1, errorMessage)) {
+      return false;
+    }
+    llvm::Type *outputFloatTy = floatType(output->Size);
+    if (op.Mnemonic == "INT2FLOAT") {
+      if (outputFloatTy == nullptr) {
+        errorMessage = "INT2FLOAT only supports 4/8-byte float outputs";
+        return false;
+      }
+      llvm::Value *input = read(op.Inputs[0]);
+      if (input == nullptr) {
+        errorMessage = "INT2FLOAT reads unknown varnode: " + op.Inputs[0];
+        return false;
+      }
+      return writeFloatBits(
+          *op.Output, Builder.CreateSIToFP(input, outputFloatTy), errorMessage);
+    }
+
+    const HeritageVarnode *inputVarnode = varnodeFor(op.Inputs[0]);
+    if (inputVarnode == nullptr) {
+      errorMessage = op.Mnemonic + " input is unknown";
+      return false;
+    }
+    llvm::Type *inputFloatTy = floatType(inputVarnode->Size);
+    if (inputFloatTy == nullptr) {
+      errorMessage = op.Mnemonic + " only supports 4/8-byte float inputs";
+      return false;
+    }
+    llvm::Value *input =
+        readFloatBits(op.Inputs[0], inputFloatTy, errorMessage);
+    if (input == nullptr) {
+      return false;
+    }
+
+    if (op.Mnemonic == "FLOAT2FLOAT") {
+      if (outputFloatTy == nullptr) {
+        errorMessage = "FLOAT2FLOAT only supports 4/8-byte float outputs";
+        return false;
+      }
+      return writeFloatBits(
+          *op.Output, Builder.CreateFPCast(input, outputFloatTy), errorMessage);
+    }
+    if (op.Mnemonic == "TRUNC") {
+      return write(*op.Output,
+                   Builder.CreateFPToSI(input, intType(output->Size)),
+                   errorMessage);
+    }
+
+    errorMessage = "unsupported float cast opcode: " + op.Mnemonic;
+    return false;
+  }
+
   bool lowerSubpiece(const HeritageOp &op, std::string &errorMessage) {
     if (!op.Output || !requireInputs(op, 2, errorMessage)) {
       return false;
@@ -689,8 +914,8 @@ private:
   }
 
   bool lowerCall(const HeritageOp &op, std::string &errorMessage) {
-    if (!op.Output || !op.CallTargetName || op.Inputs.empty()) {
-      errorMessage = "CALL needs output, target name, and target input";
+    if (!op.CallTargetName || op.Inputs.empty()) {
+      errorMessage = "CALL needs target name and target input";
       return false;
     }
 
@@ -704,18 +929,60 @@ private:
       args.push_back(arg);
     }
 
-    const HeritageVarnode *output = varnodeFor(*op.Output);
-    if (output == nullptr) {
-      errorMessage = "CALL output is unknown";
-      return false;
+    llvm::Type *returnType = llvm::Type::getVoidTy(Context);
+    if (op.Output) {
+      const HeritageVarnode *output = varnodeFor(*op.Output);
+      if (output == nullptr) {
+        errorMessage = "CALL output is unknown";
+        return false;
+      }
+      returnType = intType(output->Size);
     }
     // HighFunction can omit or vary call-site arguments while prototype
     // recovery is still incomplete.  Use a vararg declaration until the export
     // schema carries stable callee prototypes.
-    auto *calleeType = llvm::FunctionType::get(intType(output->Size), {}, true);
+    auto *calleeType = llvm::FunctionType::get(returnType, {}, true);
     llvm::FunctionCallee callee =
         Module.getOrInsertFunction(*op.CallTargetName, calleeType);
-    return write(*op.Output, Builder.CreateCall(callee, args), errorMessage);
+    llvm::CallInst *call = Builder.CreateCall(callee, args);
+    if (!op.Output) {
+      return true;
+    }
+    return write(*op.Output, call, errorMessage);
+  }
+
+  bool lowerHelperCall(const HeritageOp &op, std::string &errorMessage) {
+    llvm::Type *returnType = llvm::Type::getVoidTy(Context);
+    std::string helperName = "notdec_heritage_" + op.Mnemonic + "_void";
+    if (op.Output) {
+      const HeritageVarnode *output = varnodeFor(*op.Output);
+      if (output == nullptr) {
+        errorMessage = op.Mnemonic + " output is unknown";
+        return false;
+      }
+      returnType = intType(output->Size);
+      helperName = "notdec_heritage_" + op.Mnemonic + "_i" +
+                   std::to_string(bitWidth(output->Size));
+    }
+
+    std::vector<llvm::Value *> args;
+    for (const std::string &inputId : op.Inputs) {
+      llvm::Value *arg = read(inputId);
+      if (arg == nullptr) {
+        errorMessage = op.Mnemonic + " reads unknown argument varnode";
+        return false;
+      }
+      args.push_back(arg);
+    }
+
+    auto *helperType = llvm::FunctionType::get(returnType, {}, true);
+    llvm::FunctionCallee helper =
+        Module.getOrInsertFunction(helperName, helperType);
+    llvm::CallInst *call = Builder.CreateCall(helper, args);
+    if (!op.Output) {
+      return true;
+    }
+    return write(*op.Output, call, errorMessage);
   }
 
   llvm::Value *returnValueFor(const HeritageOp &op, std::string &errorMessage) {
@@ -806,6 +1073,33 @@ private:
       return true;
     }
 
+    if (op.Mnemonic == "BRANCHIND") {
+      if (!requireInputs(op, 1, errorMessage)) {
+        return false;
+      }
+      llvm::Value *target = read(op.Inputs[0]);
+      if (target == nullptr) {
+        errorMessage = "BRANCHIND target varnode is unknown";
+        return false;
+      }
+      if (block.Out.empty()) {
+        if (Function->getReturnType()->isVoidTy()) {
+          Builder.CreateRetVoid();
+        } else {
+          Builder.CreateRet(llvm::PoisonValue::get(Function->getReturnType()));
+        }
+        return true;
+      }
+      llvm::Value *address =
+          Builder.CreateIntToPtr(target, llvm::PointerType::get(Context, 0));
+      llvm::IndirectBrInst *branch =
+          Builder.CreateIndirectBr(address, block.Out.size());
+      for (const std::string &successor : block.Out) {
+        branch->addDestination(BlockMap.at(successor));
+      }
+      return true;
+    }
+
     errorMessage = "unsupported terminator: " + op.Mnemonic;
     return false;
   }
@@ -857,6 +1151,26 @@ private:
         op.Mnemonic == "BOOL_XOR") {
       return lowerBoolBinary(op, errorMessage);
     }
+    if (op.Mnemonic == "FLOAT_ADD" || op.Mnemonic == "FLOAT_SUB" ||
+        op.Mnemonic == "FLOAT_MULT" || op.Mnemonic == "FLOAT_DIV") {
+      return lowerFloatBinary(op, errorMessage);
+    }
+    if (op.Mnemonic == "FLOAT_EQUAL" || op.Mnemonic == "FLOAT_NOTEQUAL" ||
+        op.Mnemonic == "FLOAT_LESS" || op.Mnemonic == "FLOAT_LESSEQUAL") {
+      return lowerFloatCompare(op, errorMessage);
+    }
+    if (op.Mnemonic == "FLOAT_NEG" || op.Mnemonic == "FLOAT_ABS" ||
+        op.Mnemonic == "FLOAT_SQRT" || op.Mnemonic == "CEIL" ||
+        op.Mnemonic == "FLOOR" || op.Mnemonic == "ROUND") {
+      return lowerFloatUnary(op, errorMessage);
+    }
+    if (op.Mnemonic == "FLOAT_NAN") {
+      return lowerFloatNan(op, errorMessage);
+    }
+    if (op.Mnemonic == "INT2FLOAT" || op.Mnemonic == "FLOAT2FLOAT" ||
+        op.Mnemonic == "TRUNC") {
+      return lowerFloatCast(op, errorMessage);
+    }
     if (op.Mnemonic == "SUBPIECE") {
       return lowerSubpiece(op, errorMessage);
     }
@@ -882,6 +1196,11 @@ private:
     if (op.Mnemonic == "CALL") {
       return lowerCall(op, errorMessage);
     }
+    if (op.Mnemonic == "CALLIND" || op.Mnemonic == "CALLOTHER" ||
+        op.Mnemonic == "SEGMENTOP" || op.Mnemonic == "CPOOLREF" ||
+        op.Mnemonic == "NEW") {
+      return lowerHelperCall(op, errorMessage);
+    }
 
     errorMessage = "unsupported heritage opcode: " + op.Mnemonic;
     return false;
@@ -891,7 +1210,7 @@ private:
     for (const std::string &opId : block.Ops) {
       const HeritageOp *op = Program.OpById.at(opId);
       if (op->Mnemonic == "BRANCH" || op->Mnemonic == "CBRANCH" ||
-          op->Mnemonic == "RETURN") {
+          op->Mnemonic == "BRANCHIND" || op->Mnemonic == "RETURN") {
         return lowerBranch(*op, block, errorMessage);
       }
       if (!lowerOp(*op, errorMessage)) {
