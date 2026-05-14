@@ -1196,9 +1196,9 @@ private:
     if (op.Mnemonic == "CALL") {
       return lowerCall(op, errorMessage);
     }
-    if (op.Mnemonic == "CALLIND" || op.Mnemonic == "CALLOTHER" ||
-        op.Mnemonic == "SEGMENTOP" || op.Mnemonic == "CPOOLREF" ||
-        op.Mnemonic == "NEW") {
+    if (op.Mnemonic == "UNIMPLEMENTED" || op.Mnemonic == "CALLIND" ||
+        op.Mnemonic == "CALLOTHER" || op.Mnemonic == "SEGMENTOP" ||
+        op.Mnemonic == "CPOOLREF" || op.Mnemonic == "NEW") {
       return lowerHelperCall(op, errorMessage);
     }
 
