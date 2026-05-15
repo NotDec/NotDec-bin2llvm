@@ -226,10 +226,17 @@ public:
         return false;
       }
     }
-    return true;
+    return finalizePendingPhis(errorMessage);
   }
 
 private:
+  struct PendingPhi {
+    llvm::PHINode *Phi = nullptr;
+    std::vector<std::string> Predecessors;
+    std::vector<std::string> Inputs;
+    uint32_t OutputSize = 0;
+  };
+
   llvm::Type *intType(uint32_t byteSize) {
     return llvm::IntegerType::get(Context, bitWidth(byteSize));
   }
@@ -1060,10 +1067,66 @@ private:
     auto *phi =
         Builder.CreatePHI(intType(output->Size), op.Inputs.size(), *op.Output);
     Values[*op.Output] = phi;
-    for (size_t index = 0; index < op.Inputs.size(); ++index) {
-      llvm::BasicBlock *incomingBlock = BlockMap.at(block->In[index]);
-      llvm::Value *incoming = read(op.Inputs[index]);
-      phi->addIncoming(resize(incoming, output->Size), incomingBlock);
+    PendingPhis.push_back(PendingPhi{phi, block->In, op.Inputs, output->Size});
+    return true;
+  }
+
+  llvm::Value *resizeForPhiIncoming(llvm::Value *value, uint32_t byteSize,
+                                    llvm::BasicBlock *incomingBlock) {
+    llvm::Type *targetType = intType(byteSize);
+    if (value->getType() == targetType) {
+      return value;
+    }
+
+    if (auto *constantInt = llvm::dyn_cast<llvm::ConstantInt>(value)) {
+      return llvm::ConstantInt::get(
+          targetType, constantInt->getValue().zextOrTrunc(bitWidth(byteSize)));
+    }
+    if (llvm::isa<llvm::Constant>(value)) {
+      return llvm::PoisonValue::get(targetType);
+    }
+
+    llvm::Instruction *terminator = incomingBlock->getTerminator();
+    if (terminator == nullptr) {
+      return llvm::PoisonValue::get(targetType);
+    }
+
+    llvm::IRBuilder<> edgeBuilder(terminator);
+    unsigned sourceBits = value->getType()->getIntegerBitWidth();
+    unsigned targetBits = targetType->getIntegerBitWidth();
+    if (sourceBits < targetBits) {
+      return edgeBuilder.CreateZExt(value, targetType);
+    }
+    return edgeBuilder.CreateTrunc(value, targetType);
+  }
+
+  llvm::Value *readPhiIncoming(const std::string &id, uint32_t byteSize,
+                               llvm::BasicBlock *incomingBlock) {
+    if (auto it = Values.find(id); it != Values.end()) {
+      return resizeForPhiIncoming(it->second, byteSize, incomingBlock);
+    }
+
+    const HeritageVarnode *varnode = varnodeFor(id);
+    if (varnode != nullptr && varnode->IsConstant) {
+      return llvm::ConstantInt::get(intType(byteSize), varnode->Offset);
+    }
+
+    return llvm::PoisonValue::get(intType(byteSize));
+  }
+
+  bool finalizePendingPhis(std::string &errorMessage) {
+    for (const PendingPhi &pending : PendingPhis) {
+      for (size_t index = 0; index < pending.Inputs.size(); ++index) {
+        auto blockIt = BlockMap.find(pending.Predecessors[index]);
+        if (blockIt == BlockMap.end()) {
+          errorMessage = "MULTIEQUAL references unknown predecessor block: " +
+                         pending.Predecessors[index];
+          return false;
+        }
+        llvm::Value *incoming = readPhiIncoming(
+            pending.Inputs[index], pending.OutputSize, blockIt->second);
+        pending.Phi->addIncoming(incoming, blockIt->second);
+      }
     }
     return true;
   }
@@ -1169,21 +1232,23 @@ private:
         return false;
       }
       auto trueBlockIt = Program.BlockByStart.find(target->Address);
-      if (trueBlockIt == Program.BlockByStart.end()) {
+      if (trueBlockIt == Program.BlockByStart.end() && block.Out.size() < 2) {
         errorMessage = "CBRANCH target block is unknown: " + target->Address;
         return false;
       }
-      if (block.Out.empty()) {
-        errorMessage = "CBRANCH block has no false successor";
-        return false;
-      }
-      llvm::BasicBlock *trueBlock = BlockMap.at(trueBlockIt->second->Id);
       llvm::BasicBlock *falseBlock = nullptr;
-      for (const std::string &successor : block.Out) {
-        if (successor != trueBlockIt->second->Id) {
-          falseBlock = BlockMap.at(successor);
-          break;
+      llvm::BasicBlock *trueBlock = nullptr;
+      if (trueBlockIt != Program.BlockByStart.end()) {
+        trueBlock = BlockMap.at(trueBlockIt->second->Id);
+        for (const std::string &successor : block.Out) {
+          if (successor != trueBlockIt->second->Id) {
+            falseBlock = BlockMap.at(successor);
+            break;
+          }
         }
+      } else {
+        trueBlock = BlockMap.at(block.Out[0]);
+        falseBlock = BlockMap.at(block.Out[1]);
       }
       if (falseBlock == nullptr) {
         errorMessage = "CBRANCH false successor is unknown";
@@ -1209,8 +1274,12 @@ private:
       }
       auto targetBlockIt = Program.BlockByStart.find(target->Address);
       if (targetBlockIt == Program.BlockByStart.end()) {
-        errorMessage = "BRANCH target block is unknown: " + target->Address;
-        return false;
+        if (block.Out.size() != 1) {
+          errorMessage = "BRANCH target block is unknown: " + target->Address;
+          return false;
+        }
+        Builder.CreateBr(BlockMap.at(block.Out.front()));
+        return true;
       }
       Builder.CreateBr(BlockMap.at(targetBlockIt->second->Id));
       return true;
@@ -1365,6 +1434,16 @@ private:
   bool lowerBlock(const HeritageBlock &block, std::string &errorMessage) {
     for (const std::string &opId : block.Ops) {
       const HeritageOp *op = Program.OpById.at(opId);
+      if (op->Mnemonic == "MULTIEQUAL" && !lowerPhi(*op, errorMessage)) {
+        return false;
+      }
+    }
+
+    for (const std::string &opId : block.Ops) {
+      const HeritageOp *op = Program.OpById.at(opId);
+      if (op->Mnemonic == "MULTIEQUAL") {
+        continue;
+      }
       if (op->Mnemonic == "BRANCH" || op->Mnemonic == "CBRANCH" ||
           op->Mnemonic == "BRANCHIND" || op->Mnemonic == "RETURN") {
         return lowerBranch(*op, block, errorMessage);
@@ -1392,6 +1471,7 @@ private:
   llvm::Function *Function = nullptr;
   std::unordered_map<std::string, llvm::BasicBlock *> BlockMap;
   std::unordered_map<std::string, llvm::Value *> Values;
+  std::vector<PendingPhi> PendingPhis;
   llvm::GlobalVariable *Memory = nullptr;
 };
 
