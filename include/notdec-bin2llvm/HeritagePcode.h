@@ -59,8 +59,16 @@ struct HeritageFunction {
   std::vector<HeritageParam> Params;
 };
 
+struct HeritageProgramInfo {
+  std::string Name;
+  std::string Language;
+  std::string CompilerSpec;
+  std::string SimplificationStyle;
+};
+
 struct HeritageProgram {
   std::string Schema;
+  HeritageProgramInfo Program;
   HeritageFunction Function;
   std::vector<HeritageBlock> Blocks;
   std::vector<HeritageOp> Ops;
@@ -71,9 +79,47 @@ struct HeritageProgram {
   std::unordered_map<std::string, const HeritageBlock *> BlockByStart;
 };
 
+// One module function owns the same per-function data as the old schema.  The
+// wrapper keeps status/error near the function so module lowering can leave a
+// failed function as a declaration without losing its symbol.
+struct HeritageModuleFunction {
+  HeritageProgram Program;
+  std::string Status;
+  std::string ErrorMessage;
+};
+
+struct HeritageExternalFunction {
+  std::string Name;
+  std::string Address;
+  std::string ReturnType;
+  std::vector<HeritageParam> Params;
+  std::string Source;
+};
+
+struct HeritageModuleFailure {
+  std::string Entry;
+  std::string Name;
+  std::string Stage;
+  std::string Message;
+};
+
+// Module-level JSON is intentionally a thin container around function-level
+// heritage data.  This keeps the old single-function path stable while adding
+// enough symbol tables for a real LLVM module shell.
+struct HeritageModule {
+  std::string Schema;
+  HeritageProgramInfo Program;
+  std::vector<HeritageModuleFunction> Functions;
+  std::vector<HeritageExternalFunction> Externals;
+  std::vector<HeritageModuleFailure> Failures;
+};
+
 bool loadHeritageProgramFromJson(const std::string &path,
                                  HeritageProgram &program,
                                  std::string &errorMessage);
+
+bool loadHeritageModuleFromJson(const std::string &path, HeritageModule &module,
+                                std::string &errorMessage);
 
 void indexHeritageProgram(HeritageProgram &program);
 

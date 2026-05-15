@@ -29,3 +29,33 @@ analyzeHeadless /tmp/notdec-ghidra-proj ProjectName \
 4. P-Code op、输入输出 varnode、direct call target。
 5. varnode 的 space、offset、size、寄存器名、HighVariable 名和类型。
 6. 统计信息，包括 `MULTIEQUAL` 数量和残留 register-space varnode 数量。
+
+## ExportHeritageModule.java
+
+导出模块级 `notdec.heritage-module.v0` JSON。每个成功 decompile 的内部函数复用
+单函数 heritage 字段，失败函数写入 `failures[]`，外部函数写入 `externals[]`。
+
+用法：
+
+```bash
+analyzeHeadless /tmp/notdec-ghidra-proj ProjectName \
+  -import /path/to/binary \
+  -scriptPath /sn640/NotDec/external/NotDec-bin2llvm/ghidra_scripts \
+  -postScript ExportHeritageModule.java /tmp/module.json --limit=20 --timeout=60
+```
+
+参数：
+
+1. 输出 JSON 路径。
+2. `--limit=N` 或位置参数 `N`：最多导出 N 个非 external、非 thunk 函数，默认 `20`。
+3. `--all`：导出所有函数。
+4. `--timeout=N`：单函数 decompile timeout 秒数，默认 `60`。
+5. `--style=name`：Ghidra decompiler simplification style，默认 `decompile`。
+
+配套 native 工具：
+
+```bash
+notdec-heritage-module-check /tmp/module.json
+notdec-heritage-module-llvm /tmp/module.json -o /tmp/module.ll
+llvm-as /tmp/module.ll -o /tmp/module.bc
+```

@@ -21,4 +21,8 @@ buildHeritageModule(llvm::LLVMContext &context, const HeritageProgram &program,
                     const HeritageLoweringConfig &config,
                     std::string &errorMessage);
 
+std::unique_ptr<llvm::Module> buildHeritageDeclarationModule(
+    llvm::LLVMContext &context, const HeritageModule &module,
+    const HeritageLoweringConfig &config, std::string &errorMessage);
+
 } // namespace notdec::bin2llvm

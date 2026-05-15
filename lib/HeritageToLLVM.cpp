@@ -13,6 +13,8 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 
+#include <cctype>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 
@@ -25,6 +27,106 @@ unsigned bitWidth(uint32_t byteSize) {
 
 bool isIntLikeType(const std::string &type) {
   return type == "int" || type == "uint" || type == "undefined4";
+}
+
+llvm::Type *typeForSourceType(llvm::LLVMContext &context,
+                              const std::string &type) {
+  if (type == "void") {
+    return llvm::Type::getVoidTy(context);
+  }
+  if (isIntLikeType(type)) {
+    return llvm::IntegerType::get(context, 32);
+  }
+  if (type == "long" || type == "ulong" || type == "undefined8" ||
+      type.find('*') != std::string::npos) {
+    return llvm::IntegerType::get(context, 64);
+  }
+  if (type == "short" || type == "ushort" || type == "undefined2") {
+    return llvm::IntegerType::get(context, 16);
+  }
+  if (type == "char" || type == "byte" || type == "undefined1") {
+    return llvm::IntegerType::get(context, 8);
+  }
+  return llvm::IntegerType::get(context, 32);
+}
+
+std::string sanitizeSymbolName(const std::string &name) {
+  std::string result;
+  result.reserve(name.size());
+  for (char ch : name) {
+    unsigned char uch = static_cast<unsigned char>(ch);
+    if (std::isalnum(uch) || ch == '_' || ch == '$' || ch == '.') {
+      result.push_back(ch);
+    } else {
+      result.push_back('_');
+    }
+  }
+  if (result.empty()) {
+    return "";
+  }
+  if (std::isdigit(static_cast<unsigned char>(result.front()))) {
+    result.insert(result.begin(), '_');
+  }
+  return result;
+}
+
+std::string addressSuffix(const std::string &address) {
+  std::string text = address;
+  size_t colon = text.rfind(':');
+  if (colon != std::string::npos) {
+    text = text.substr(colon + 1);
+  }
+
+  std::string result;
+  for (char ch : text) {
+    if (std::isxdigit(static_cast<unsigned char>(ch))) {
+      result.push_back(static_cast<char>(std::tolower(ch)));
+    }
+  }
+  return result.empty() ? "unknown" : result;
+}
+
+std::string uniqueSymbolName(const std::string &preferred,
+                             const std::string &entry,
+                             std::set<std::string> &usedNames) {
+  std::string base = sanitizeSymbolName(preferred);
+  if (base.empty()) {
+    base = "sub_" + addressSuffix(entry);
+  }
+  if (usedNames.insert(base).second) {
+    return base;
+  }
+
+  std::string withAddress = base + "_" + addressSuffix(entry);
+  if (usedNames.insert(withAddress).second) {
+    return withAddress;
+  }
+
+  unsigned index = 1;
+  while (true) {
+    std::string candidate = withAddress + "_" + std::to_string(index++);
+    if (usedNames.insert(candidate).second) {
+      return candidate;
+    }
+  }
+}
+
+llvm::FunctionType *
+functionTypeForHeritageFunction(llvm::LLVMContext &context,
+                                const HeritageFunction &function) {
+  std::vector<llvm::Type *> paramTypes;
+  for (const HeritageParam &param : function.Params) {
+    paramTypes.push_back(typeForSourceType(context, param.Type));
+  }
+
+  llvm::Type *returnType = typeForSourceType(context, function.ReturnType);
+  return llvm::FunctionType::get(returnType, paramTypes, false);
+}
+
+llvm::FunctionType *varargFunctionType(llvm::LLVMContext &context,
+                                       const std::string &returnType) {
+  return llvm::FunctionType::get(typeForSourceType(context, returnType), {},
+                                 true);
 }
 
 class HeritageLowerer {
@@ -72,10 +174,7 @@ private:
   }
 
   llvm::Type *typeForSourceType(const std::string &type) {
-    if (isIntLikeType(type)) {
-      return intType(4);
-    }
-    return intType(4);
+    return ::notdec::bin2llvm::typeForSourceType(Context, type);
   }
 
   bool createFunction(std::string &errorMessage) {
@@ -1249,6 +1348,41 @@ buildHeritageModule(llvm::LLVMContext &context, const HeritageProgram &program,
   if (!lowerer.lower(errorMessage)) {
     return nullptr;
   }
+  return module;
+}
+
+std::unique_ptr<llvm::Module> buildHeritageDeclarationModule(
+    llvm::LLVMContext &context, const HeritageModule &heritageModule,
+    const HeritageLoweringConfig &config, std::string &errorMessage) {
+  auto module = std::make_unique<llvm::Module>(config.ModuleName, context);
+  std::set<std::string> usedNames;
+
+  for (const HeritageModuleFunction &function : heritageModule.Functions) {
+    const HeritageFunction &heritageFunction = function.Program.Function;
+    std::string name = uniqueSymbolName(heritageFunction.Name,
+                                        heritageFunction.Entry, usedNames);
+    auto *functionType =
+        functionTypeForHeritageFunction(context, heritageFunction);
+    auto *llvmFunction = llvm::Function::Create(
+        functionType, llvm::GlobalValue::ExternalLinkage, name, module.get());
+
+    unsigned index = 0;
+    for (llvm::Argument &argument : llvmFunction->args()) {
+      if (index < heritageFunction.Params.size()) {
+        argument.setName(
+            sanitizeSymbolName(heritageFunction.Params[index].Name));
+      }
+      ++index;
+    }
+  }
+
+  for (const HeritageExternalFunction &external : heritageModule.Externals) {
+    std::string name =
+        uniqueSymbolName(external.Name, external.Address, usedNames);
+    module->getOrInsertFunction(
+        name, varargFunctionType(context, external.ReturnType));
+  }
+
   return module;
 }
 
