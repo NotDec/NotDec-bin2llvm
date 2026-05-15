@@ -20,6 +20,7 @@
 #include <set>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace notdec::bin2llvm {
 namespace {
@@ -30,6 +31,12 @@ unsigned bitWidth(uint32_t byteSize) {
 
 bool isIntLikeType(const std::string &type) {
   return type == "int" || type == "uint" || type == "undefined4";
+}
+
+void printPoisonFallbackWarning(llvm::StringRef functionName,
+                                const std::string &reason) {
+  llvm::errs() << "Warning: heritage lowering uses poison fallback in "
+               << functionName << ": " << reason << '\n';
 }
 
 llvm::Type *typeForSourceType(llvm::LLVMContext &context,
@@ -241,6 +248,12 @@ private:
     return llvm::IntegerType::get(Context, bitWidth(byteSize));
   }
 
+  void warnPoisonFallback(const std::string &reason) {
+    if (PoisonFallbackWarnings.insert(reason).second) {
+      printPoisonFallbackWarning(Program.Function.Name, reason);
+    }
+  }
+
   llvm::Type *floatType(uint32_t byteSize) {
     if (byteSize == 4) {
       return llvm::Type::getFloatTy(Context);
@@ -332,6 +345,7 @@ private:
       return llvm::ConstantInt::get(intType(varnode->Size), varnode->Offset);
     }
 
+    warnPoisonFallback("read uninitialized varnode " + id);
     return Builder.CreateFreeze(llvm::PoisonValue::get(intType(varnode->Size)),
                                 id + "_in");
   }
@@ -1083,11 +1097,13 @@ private:
           targetType, constantInt->getValue().zextOrTrunc(bitWidth(byteSize)));
     }
     if (llvm::isa<llvm::Constant>(value)) {
+      warnPoisonFallback("PHI incoming constant has unsupported resize");
       return llvm::PoisonValue::get(targetType);
     }
 
     llvm::Instruction *terminator = incomingBlock->getTerminator();
     if (terminator == nullptr) {
+      warnPoisonFallback("PHI incoming block has no terminator for resize");
       return llvm::PoisonValue::get(targetType);
     }
 
@@ -1111,6 +1127,7 @@ private:
       return llvm::ConstantInt::get(intType(byteSize), varnode->Offset);
     }
 
+    warnPoisonFallback("PHI incoming varnode is unavailable: " + id);
     return llvm::PoisonValue::get(intType(byteSize));
   }
 
@@ -1311,6 +1328,7 @@ private:
         if (Function->getReturnType()->isVoidTy()) {
           Builder.CreateRetVoid();
         } else {
+          warnPoisonFallback("BRANCHIND without successors returns poison");
           Builder.CreateRet(llvm::PoisonValue::get(Function->getReturnType()));
         }
         return true;
@@ -1458,6 +1476,7 @@ private:
     } else if (Function->getReturnType()->isVoidTy()) {
       Builder.CreateRetVoid();
     } else {
+      warnPoisonFallback("fallthrough block without successors returns poison");
       Builder.CreateRet(llvm::PoisonValue::get(Function->getReturnType()));
     }
     return true;
@@ -1471,6 +1490,7 @@ private:
   llvm::Function *Function = nullptr;
   std::unordered_map<std::string, llvm::BasicBlock *> BlockMap;
   std::unordered_map<std::string, llvm::Value *> Values;
+  std::unordered_set<std::string> PoisonFallbackWarnings;
   std::vector<PendingPhi> PendingPhis;
   llvm::GlobalVariable *Memory = nullptr;
 };
