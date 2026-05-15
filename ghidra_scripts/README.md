@@ -59,3 +59,12 @@ notdec-heritage-module-check /tmp/module.json
 notdec-heritage-module-llvm /tmp/module.json -o /tmp/module.ll
 llvm-as /tmp/module.ll -o /tmp/module.bc
 ```
+
+`notdec-heritage-module-llvm` 默认会尝试填入 `status == "ok"` 的函数体。单个函数
+lowering 或 verifier 失败时，会恢复成 declaration，并继续处理其他函数。
+
+只需要阶段 3 的 declaration-only 输出时：
+
+```bash
+notdec-heritage-module-llvm /tmp/module.json -o /tmp/module.ll --declarations-only
+```

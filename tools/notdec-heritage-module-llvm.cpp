@@ -16,14 +16,17 @@ namespace {
 struct CliOptions {
   std::string InputPath;
   std::string OutputPath;
+  bool DeclarationsOnly = false;
 };
 
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0 << " <heritage-module.json> -o <output.ll>\n";
+  std::cerr << "       " << argv0
+            << " <heritage-module.json> -o <output.ll> --declarations-only\n";
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
-  if (argc != 4) {
+  if (argc != 4 && argc != 5) {
     return std::nullopt;
   }
   CliOptions options;
@@ -34,6 +37,14 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     return std::nullopt;
   }
   options.OutputPath = argv[3];
+  if (argc == 5) {
+    std::string mode = argv[4];
+    if (mode != "--declarations-only") {
+      std::cerr << "unknown flag: " << mode << '\n';
+      return std::nullopt;
+    }
+    options.DeclarationsOnly = true;
+  }
   return options;
 }
 
@@ -70,11 +81,30 @@ int main(int argc, char **argv) {
   llvm::LLVMContext context;
   notdec::bin2llvm::HeritageLoweringConfig config;
   config.ModuleName = "notdec.bin2llvm.heritage.module";
-  auto module = notdec::bin2llvm::buildHeritageDeclarationModule(
-      context, heritageModule, config, errorMessage);
+  std::unique_ptr<llvm::Module> module;
+  if (options->DeclarationsOnly) {
+    module = notdec::bin2llvm::buildHeritageDeclarationModule(
+        context, heritageModule, config, errorMessage);
+  } else {
+    notdec::bin2llvm::HeritageModuleLoweringStats stats;
+    module = notdec::bin2llvm::buildHeritageModuleWithBodies(
+        context, heritageModule, config, stats, errorMessage);
+    llvm::errs() << "heritage module lowering\n";
+    llvm::errs() << "  internal declarations: "
+                 << stats.DeclaredInternalFunctions << '\n';
+    llvm::errs() << "  external declarations: "
+                 << stats.DeclaredExternalFunctions << '\n';
+    llvm::errs() << "  lowered function bodies: " << stats.LoweredFunctions
+                 << '\n';
+    llvm::errs() << "  failed function bodies: " << stats.Failures.size()
+                 << '\n';
+    for (const auto &failure : stats.Failures) {
+      llvm::errs() << "  failure: " << failure.FunctionName << " "
+                   << failure.Entry << ": " << failure.Message << '\n';
+    }
+  }
   if (!module) {
-    std::cerr << "failed to build heritage module declarations: "
-              << errorMessage << '\n';
+    std::cerr << "failed to build heritage module: " << errorMessage << '\n';
     return 1;
   }
 

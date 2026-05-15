@@ -12,8 +12,11 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <cctype>
+#include <map>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -129,11 +132,83 @@ llvm::FunctionType *varargFunctionType(llvm::LLVMContext &context,
                                  true);
 }
 
+struct HeritageModuleSymbolPlan {
+  std::vector<std::string> InternalNames;
+  std::vector<std::string> ExternalNames;
+  std::unordered_map<std::string, std::string> NameByEntry;
+  std::unordered_map<std::string, std::string> NameByOriginalName;
+};
+
+HeritageModuleSymbolPlan planModuleSymbols(const HeritageModule &module) {
+  HeritageModuleSymbolPlan plan;
+  std::set<std::string> usedNames;
+
+  for (const HeritageModuleFunction &function : module.Functions) {
+    const HeritageFunction &heritageFunction = function.Program.Function;
+    std::string name = uniqueSymbolName(heritageFunction.Name,
+                                        heritageFunction.Entry, usedNames);
+    plan.NameByEntry.emplace(heritageFunction.Entry, name);
+    plan.NameByOriginalName.emplace(heritageFunction.Name, name);
+    plan.InternalNames.push_back(std::move(name));
+  }
+
+  for (const HeritageExternalFunction &external : module.Externals) {
+    std::string name =
+        uniqueSymbolName(external.Name, external.Address, usedNames);
+    plan.NameByOriginalName.emplace(external.Name, name);
+    plan.ExternalNames.push_back(std::move(name));
+  }
+
+  return plan;
+}
+
+std::string resolveCallTargetName(const HeritageOp &op,
+                                  const HeritageModuleSymbolPlan *symbols) {
+  if (symbols == nullptr) {
+    return op.CallTargetName.value_or("");
+  }
+  if (op.CallTarget) {
+    auto it = symbols->NameByEntry.find(*op.CallTarget);
+    if (it != symbols->NameByEntry.end()) {
+      return it->second;
+    }
+  }
+  if (op.CallTargetName) {
+    auto it = symbols->NameByOriginalName.find(*op.CallTargetName);
+    if (it != symbols->NameByOriginalName.end()) {
+      return it->second;
+    }
+    return *op.CallTargetName;
+  }
+  return "";
+}
+
+llvm::Function *declareInternalFunction(llvm::Module &module,
+                                        const HeritageFunction &function,
+                                        const std::string &name) {
+  auto *functionType =
+      functionTypeForHeritageFunction(module.getContext(), function);
+  auto *llvmFunction = llvm::Function::Create(
+      functionType, llvm::GlobalValue::ExternalLinkage, name, &module);
+
+  unsigned index = 0;
+  for (llvm::Argument &argument : llvmFunction->args()) {
+    if (index < function.Params.size()) {
+      argument.setName(sanitizeSymbolName(function.Params[index].Name));
+    }
+    ++index;
+  }
+  return llvmFunction;
+}
+
 class HeritageLowerer {
 public:
   HeritageLowerer(llvm::LLVMContext &context, llvm::Module &module,
-                  const HeritageProgram &program)
-      : Context(context), Module(module), Program(program), Builder(context) {}
+                  const HeritageProgram &program,
+                  const HeritageModuleSymbolPlan *symbols = nullptr,
+                  llvm::Function *function = nullptr)
+      : Context(context), Module(module), Program(program), Symbols(symbols),
+        Builder(context), Function(function) {}
 
   bool lower(std::string &errorMessage) {
     if (!createFunction(errorMessage)) {
@@ -178,28 +253,9 @@ private:
   }
 
   bool createFunction(std::string &errorMessage) {
-    std::vector<llvm::Type *> paramTypes;
-    for (const HeritageParam &param : Program.Function.Params) {
-      paramTypes.push_back(typeForSourceType(param.Type));
-    }
-
-    llvm::Type *returnType = nullptr;
-    if (Program.Function.ReturnType == "void") {
-      returnType = llvm::Type::getVoidTy(Context);
-    } else {
-      returnType = typeForSourceType(Program.Function.ReturnType);
-    }
-
-    auto *functionType = llvm::FunctionType::get(returnType, paramTypes, false);
-    Function =
-        llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
-                               Program.Function.Name, &Module);
-    unsigned index = 0;
-    for (llvm::Argument &argument : Function->args()) {
-      if (index < Program.Function.Params.size()) {
-        argument.setName(Program.Function.Params[index].Name);
-      }
-      ++index;
+    if (Function == nullptr) {
+      Function = declareInternalFunction(Module, Program.Function,
+                                         Program.Function.Name);
     }
 
     if (Program.Blocks.empty()) {
@@ -1013,8 +1069,9 @@ private:
   }
 
   bool lowerCall(const HeritageOp &op, std::string &errorMessage) {
-    if (!op.CallTargetName || op.Inputs.empty()) {
-      errorMessage = "CALL needs target name and target input";
+    std::string calleeName = resolveCallTargetName(op, Symbols);
+    if (calleeName.empty() || op.Inputs.empty()) {
+      errorMessage = "CALL needs resolvable target and target input";
       return false;
     }
 
@@ -1042,7 +1099,7 @@ private:
     // schema carries stable callee prototypes.
     auto *calleeType = llvm::FunctionType::get(returnType, {}, true);
     llvm::FunctionCallee callee =
-        Module.getOrInsertFunction(*op.CallTargetName, calleeType);
+        Module.getOrInsertFunction(calleeName, calleeType);
     llvm::CallInst *call = Builder.CreateCall(callee, args);
     if (!op.Output) {
       return true;
@@ -1330,6 +1387,7 @@ private:
   llvm::LLVMContext &Context;
   llvm::Module &Module;
   const HeritageProgram &Program;
+  const HeritageModuleSymbolPlan *Symbols = nullptr;
   llvm::IRBuilder<> Builder;
   llvm::Function *Function = nullptr;
   std::unordered_map<std::string, llvm::BasicBlock *> BlockMap;
@@ -1355,32 +1413,88 @@ std::unique_ptr<llvm::Module> buildHeritageDeclarationModule(
     llvm::LLVMContext &context, const HeritageModule &heritageModule,
     const HeritageLoweringConfig &config, std::string &errorMessage) {
   auto module = std::make_unique<llvm::Module>(config.ModuleName, context);
-  std::set<std::string> usedNames;
+  HeritageModuleSymbolPlan symbols = planModuleSymbols(heritageModule);
 
-  for (const HeritageModuleFunction &function : heritageModule.Functions) {
-    const HeritageFunction &heritageFunction = function.Program.Function;
-    std::string name = uniqueSymbolName(heritageFunction.Name,
-                                        heritageFunction.Entry, usedNames);
-    auto *functionType =
-        functionTypeForHeritageFunction(context, heritageFunction);
-    auto *llvmFunction = llvm::Function::Create(
-        functionType, llvm::GlobalValue::ExternalLinkage, name, module.get());
-
-    unsigned index = 0;
-    for (llvm::Argument &argument : llvmFunction->args()) {
-      if (index < heritageFunction.Params.size()) {
-        argument.setName(
-            sanitizeSymbolName(heritageFunction.Params[index].Name));
-      }
-      ++index;
-    }
+  for (size_t index = 0; index < heritageModule.Functions.size(); ++index) {
+    declareInternalFunction(*module,
+                            heritageModule.Functions[index].Program.Function,
+                            symbols.InternalNames[index]);
   }
 
-  for (const HeritageExternalFunction &external : heritageModule.Externals) {
-    std::string name =
-        uniqueSymbolName(external.Name, external.Address, usedNames);
+  for (size_t index = 0; index < heritageModule.Externals.size(); ++index) {
+    const HeritageExternalFunction &external = heritageModule.Externals[index];
     module->getOrInsertFunction(
-        name, varargFunctionType(context, external.ReturnType));
+        symbols.ExternalNames[index],
+        varargFunctionType(context, external.ReturnType));
+  }
+
+  return module;
+}
+
+std::unique_ptr<llvm::Module> buildHeritageModuleWithBodies(
+    llvm::LLVMContext &context, const HeritageModule &heritageModule,
+    const HeritageLoweringConfig &config, HeritageModuleLoweringStats &stats,
+    std::string &errorMessage) {
+  stats = HeritageModuleLoweringStats{};
+  auto module = std::make_unique<llvm::Module>(config.ModuleName, context);
+  HeritageModuleSymbolPlan symbols = planModuleSymbols(heritageModule);
+
+  for (size_t index = 0; index < heritageModule.Functions.size(); ++index) {
+    declareInternalFunction(*module,
+                            heritageModule.Functions[index].Program.Function,
+                            symbols.InternalNames[index]);
+    stats.DeclaredInternalFunctions++;
+  }
+
+  for (size_t index = 0; index < heritageModule.Externals.size(); ++index) {
+    const HeritageExternalFunction &external = heritageModule.Externals[index];
+    module->getOrInsertFunction(
+        symbols.ExternalNames[index],
+        varargFunctionType(context, external.ReturnType));
+    stats.DeclaredExternalFunctions++;
+  }
+
+  auto restoreDeclaration = [&](size_t index) {
+    const HeritageFunction &function =
+        heritageModule.Functions[index].Program.Function;
+    if (llvm::Function *existing =
+            module->getFunction(symbols.InternalNames[index])) {
+      existing->eraseFromParent();
+    }
+    declareInternalFunction(*module, function, symbols.InternalNames[index]);
+  };
+
+  for (size_t index = 0; index < heritageModule.Functions.size(); ++index) {
+    const HeritageModuleFunction &function = heritageModule.Functions[index];
+    if (function.Status != "ok") {
+      continue;
+    }
+
+    llvm::Function *llvmFunction =
+        module->getFunction(symbols.InternalNames[index]);
+    std::string functionError;
+    HeritageLowerer lowerer(context, *module, function.Program, &symbols,
+                            llvmFunction);
+    if (!lowerer.lower(functionError)) {
+      restoreDeclaration(index);
+      stats.Failures.push_back({function.Program.Function.Name,
+                                function.Program.Function.Entry,
+                                functionError});
+      continue;
+    }
+
+    std::string verifierError;
+    llvm::raw_string_ostream verifierStream(verifierError);
+    if (llvm::verifyFunction(*llvmFunction, &verifierStream)) {
+      restoreDeclaration(index);
+      verifierStream.flush();
+      stats.Failures.push_back({function.Program.Function.Name,
+                                function.Program.Function.Entry,
+                                verifierError});
+      continue;
+    }
+
+    stats.LoweredFunctions++;
   }
 
   return module;
