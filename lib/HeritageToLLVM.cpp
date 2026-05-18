@@ -34,9 +34,9 @@ bool isIntLikeType(const std::string &type) {
   return type == "int" || type == "uint" || type == "undefined4";
 }
 
-void printPoisonFallbackWarning(llvm::StringRef functionName,
-                                const std::string &reason) {
-  llvm::errs() << "Warning: heritage lowering uses poison fallback in "
+void printPoisonFallbackError(llvm::StringRef functionName,
+                              const std::string &reason) {
+  llvm::errs() << "Error: heritage lowering fell back to poison in "
                << functionName << ": " << reason << '\n';
 }
 
@@ -270,8 +270,37 @@ private:
 
   void warnPoisonFallback(const std::string &reason) {
     if (PoisonFallbackWarnings.insert(reason).second) {
-      printPoisonFallbackWarning(Program.Function.Name, reason);
+      printPoisonFallbackError(Program.Function.Name, reason);
     }
+  }
+
+  std::string describeCurrentOp() const {
+    if (CurrentOp == nullptr) {
+      return "";
+    }
+    std::ostringstream os;
+    os << " op=" << CurrentOp->Id << " mnemonic=" << CurrentOp->Mnemonic
+       << " block=" << CurrentOp->Parent;
+    return os.str();
+  }
+
+  std::string describeVarnode(const HeritageVarnode &varnode) const {
+    std::ostringstream os;
+    os << varnode.Id << " space=" << varnode.Space
+       << " address=" << varnode.Address << " offset=" << varnode.Offset
+       << " size=" << varnode.Size << " isInput=" << varnode.IsInput
+       << " isAddressTied=" << varnode.IsAddressTied;
+    if (varnode.RegisterName) {
+      os << " register=" << *varnode.RegisterName;
+    }
+    if (varnode.HighVariable) {
+      os << " highVariable=" << *varnode.HighVariable;
+    }
+    if (varnode.HighType) {
+      os << " highType=" << *varnode.HighType;
+    }
+    os << describeCurrentOp();
+    return os.str();
   }
 
   llvm::Type *floatType(uint32_t byteSize) {
@@ -371,8 +400,11 @@ private:
         return value;
       }
     }
+    if (llvm::Value *value = readAddressTiedInput(Builder, *varnode)) {
+      return value;
+    }
 
-    warnPoisonFallback("read uninitialized varnode " + id);
+    warnPoisonFallback("read unmodeled varnode " + describeVarnode(*varnode));
     return Builder.CreateFreeze(llvm::PoisonValue::get(intType(varnode->Size)),
                                 id + "_in");
   }
@@ -1036,6 +1068,54 @@ private:
     return write(*op.Output, masked, errorMessage);
   }
 
+  llvm::Value *readStackPointer(llvm::IRBuilderBase &builder) {
+    for (const HeritageVarnode &candidate : Program.Varnodes) {
+      if (!candidate.IsRegister || !candidate.RegisterName ||
+          *candidate.RegisterName != "RSP") {
+        continue;
+      }
+      RegisterAccess access{candidate.Space, candidate.Offset, candidate.Size,
+                            candidate.RegisterName};
+      llvm::Value *value = Registers.read(builder, access);
+      if (value != nullptr) {
+        return builder.CreateZExtOrTrunc(value, intType(8));
+      }
+    }
+    return nullptr;
+  }
+
+  llvm::Value *addressForAddressTiedInput(llvm::IRBuilderBase &builder,
+                                          const HeritageVarnode &varnode) {
+    if (!varnode.IsInput || !varnode.IsAddressTied) {
+      return nullptr;
+    }
+    if (varnode.Space == "ram") {
+      return llvm::ConstantInt::get(intType(8), varnode.Offset);
+    }
+    if (varnode.Space == "stack") {
+      llvm::Value *stackPointer = readStackPointer(builder);
+      if (stackPointer == nullptr) {
+        return nullptr;
+      }
+      auto *offset = llvm::ConstantInt::get(intType(8), varnode.Offset);
+      return builder.CreateAdd(stackPointer, offset, varnode.Id + ".addr");
+    }
+    return nullptr;
+  }
+
+  llvm::Value *readAddressTiedInput(llvm::IRBuilderBase &builder,
+                                    const HeritageVarnode &varnode) {
+    llvm::Value *address = addressForAddressTiedInput(builder, varnode);
+    if (address == nullptr) {
+      return nullptr;
+    }
+    auto *load = builder.CreateLoad(intType(varnode.Size),
+                                    memoryPointer(builder, address),
+                                    varnode.Id + ".mem");
+    load->setAlignment(llvm::Align(1));
+    return load;
+  }
+
   llvm::GlobalVariable *memoryGlobal() {
     if (Memory) {
       return Memory;
@@ -1051,10 +1131,10 @@ private:
     return Memory;
   }
 
-  llvm::Value *memoryPointer(llvm::Value *address) {
-    llvm::Value *zero = llvm::ConstantInt::get(address->getType(), 0);
-    return Builder.CreateGEP(memoryGlobal()->getValueType(), memoryGlobal(),
-                             {zero, address}, "notdec_ram_ptr");
+  llvm::Value *memoryPointer(llvm::IRBuilderBase &builder,
+                             llvm::Value *address) {
+    return builder.CreateIntToPtr(address, llvm::PointerType::get(Context, 0),
+                                  "notdec_mem_ptr");
   }
 
   bool requireConstSpaceSelector(const HeritageOp &op,
@@ -1079,7 +1159,8 @@ private:
 
     llvm::Value *address = resize(read(op.Inputs[1]), 8);
     auto *load = Builder.CreateLoad(intType(output->Size),
-                                    memoryPointer(address), *op.Output);
+                                    memoryPointer(Builder, address),
+                                    *op.Output);
     load->setAlignment(llvm::Align(1));
     return write(*op.Output, load, errorMessage);
   }
@@ -1092,7 +1173,7 @@ private:
 
     llvm::Value *address = resize(read(op.Inputs[1]), 8);
     llvm::Value *value = read(op.Inputs[2]);
-    auto *store = Builder.CreateStore(value, memoryPointer(address));
+    auto *store = Builder.CreateStore(value, memoryPointer(Builder, address));
     store->setAlignment(llvm::Align(1));
     return true;
   }
@@ -1172,8 +1253,22 @@ private:
         }
       }
     }
+    if (varnode != nullptr) {
+      llvm::Instruction *terminator = incomingBlock->getTerminator();
+      if (terminator != nullptr) {
+        llvm::IRBuilder<> edgeBuilder(terminator);
+        if (llvm::Value *value = readAddressTiedInput(edgeBuilder, *varnode)) {
+          return resizeForPhiIncoming(value, byteSize, incomingBlock);
+        }
+      }
+    }
 
-    warnPoisonFallback("PHI incoming varnode is unavailable: " + id);
+    if (varnode != nullptr) {
+      warnPoisonFallback("PHI incoming varnode is unavailable: " +
+                         describeVarnode(*varnode));
+    } else {
+      warnPoisonFallback("PHI incoming varnode is unknown: " + id);
+    }
     return llvm::PoisonValue::get(intType(byteSize));
   }
 
@@ -1498,8 +1593,13 @@ private:
   bool lowerBlock(const HeritageBlock &block, std::string &errorMessage) {
     for (const std::string &opId : block.Ops) {
       const HeritageOp *op = Program.OpById.at(opId);
-      if (op->Mnemonic == "MULTIEQUAL" && !lowerPhi(*op, errorMessage)) {
-        return false;
+      if (op->Mnemonic == "MULTIEQUAL") {
+        CurrentOp = op;
+        bool ok = lowerPhi(*op, errorMessage);
+        CurrentOp = nullptr;
+        if (!ok) {
+          return false;
+        }
       }
     }
 
@@ -1510,9 +1610,15 @@ private:
       }
       if (op->Mnemonic == "BRANCH" || op->Mnemonic == "CBRANCH" ||
           op->Mnemonic == "BRANCHIND" || op->Mnemonic == "RETURN") {
-        return lowerBranch(*op, block, errorMessage);
+        CurrentOp = op;
+        bool ok = lowerBranch(*op, block, errorMessage);
+        CurrentOp = nullptr;
+        return ok;
       }
-      if (!lowerOp(*op, errorMessage)) {
+      CurrentOp = op;
+      bool ok = lowerOp(*op, errorMessage);
+      CurrentOp = nullptr;
+      if (!ok) {
         return false;
       }
     }
@@ -1540,6 +1646,7 @@ private:
   std::unordered_set<std::string> PoisonFallbackWarnings;
   std::vector<PendingPhi> PendingPhis;
   llvm::GlobalVariable *Memory = nullptr;
+  const HeritageOp *CurrentOp = nullptr;
 };
 
 } // namespace

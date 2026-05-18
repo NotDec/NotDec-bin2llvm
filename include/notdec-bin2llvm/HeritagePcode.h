@@ -20,6 +20,7 @@ struct HeritageVarnode {
   bool IsConstant = false;
   bool IsRegister = false;
   bool IsInput = false;
+  bool IsAddressTied = false;
   std::optional<std::string> RegisterName;
   std::optional<std::string> HighVariable;
   std::optional<std::string> HighType;

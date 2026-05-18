@@ -243,6 +243,8 @@ bool readVarnodes(const llvm::json::Object &root,
     varnode.IsConstant = object->getBoolean("isConstant").value_or(false);
     varnode.IsRegister = object->getBoolean("isRegister").value_or(false);
     varnode.IsInput = object->getBoolean("isInput").value_or(false);
+    varnode.IsAddressTied =
+        object->getBoolean("isAddressTied").value_or(false);
     varnodes.push_back(std::move(varnode));
   }
   return true;
