@@ -1,4 +1,5 @@
 #include "notdec-bin2llvm/HeritageToLLVM.h"
+#include "notdec-bin2llvm/RegisterStorage.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/IR/BasicBlock.h"
@@ -169,6 +170,23 @@ HeritageModuleSymbolPlan planModuleSymbols(const HeritageModule &module) {
   return plan;
 }
 
+std::vector<RegisterInfo>
+registerInfosForHeritageProgram(const HeritageProgram &program) {
+  std::vector<RegisterInfo> registers;
+  for (const HeritageVarnode &varnode : program.Varnodes) {
+    if (!varnode.IsRegister || !varnode.RegisterName) {
+      continue;
+    }
+    RegisterInfo info;
+    info.Space = varnode.Space;
+    info.Offset = varnode.Offset;
+    info.Size = varnode.Size;
+    info.Name = *varnode.RegisterName;
+    registers.push_back(std::move(info));
+  }
+  return registers;
+}
+
 std::string resolveCallTargetName(const HeritageOp &op,
                                   const HeritageModuleSymbolPlan *symbols) {
   if (symbols == nullptr) {
@@ -215,7 +233,9 @@ public:
                   const HeritageModuleSymbolPlan *symbols = nullptr,
                   llvm::Function *function = nullptr)
       : Context(context), Module(module), Program(program), Symbols(symbols),
-        Builder(context), Function(function) {}
+        Builder(context), Function(function),
+        Registers(context, module, registerInfosForHeritageProgram(program),
+                  false) {}
 
   bool lower(std::string &errorMessage) {
     if (!createFunction(errorMessage)) {
@@ -344,6 +364,13 @@ private:
     if (varnode->IsConstant) {
       return llvm::ConstantInt::get(intType(varnode->Size), varnode->Offset);
     }
+    if (varnode->IsRegister && varnode->RegisterName) {
+      RegisterAccess access{varnode->Space, varnode->Offset, varnode->Size,
+                            varnode->RegisterName};
+      if (llvm::Value *value = Registers.read(Builder, access)) {
+        return value;
+      }
+    }
 
     warnPoisonFallback("read uninitialized varnode " + id);
     return Builder.CreateFreeze(llvm::PoisonValue::get(intType(varnode->Size)),
@@ -357,7 +384,15 @@ private:
       errorMessage = "unknown output varnode: " + id;
       return false;
     }
-    Values[id] = resize(value, varnode->Size);
+    llvm::Value *resized = resize(value, varnode->Size);
+    Values[id] = resized;
+    if (varnode->IsRegister && varnode->RegisterName) {
+      RegisterAccess access{varnode->Space, varnode->Offset, varnode->Size,
+                            varnode->RegisterName};
+      if (Registers.hasRegister(access)) {
+        Registers.write(Builder, access, resized);
+      }
+    }
     return true;
   }
 
@@ -1126,6 +1161,17 @@ private:
     if (varnode != nullptr && varnode->IsConstant) {
       return llvm::ConstantInt::get(intType(byteSize), varnode->Offset);
     }
+    if (varnode != nullptr && varnode->IsRegister && varnode->RegisterName) {
+      llvm::Instruction *terminator = incomingBlock->getTerminator();
+      if (terminator != nullptr) {
+        llvm::IRBuilder<> edgeBuilder(terminator);
+        RegisterAccess access{varnode->Space, varnode->Offset, varnode->Size,
+                              varnode->RegisterName};
+        if (llvm::Value *value = Registers.read(edgeBuilder, access)) {
+          return resizeForPhiIncoming(value, byteSize, incomingBlock);
+        }
+      }
+    }
 
     warnPoisonFallback("PHI incoming varnode is unavailable: " + id);
     return llvm::PoisonValue::get(intType(byteSize));
@@ -1488,6 +1534,7 @@ private:
   const HeritageModuleSymbolPlan *Symbols = nullptr;
   llvm::IRBuilder<> Builder;
   llvm::Function *Function = nullptr;
+  RegisterStorage Registers;
   std::unordered_map<std::string, llvm::BasicBlock *> BlockMap;
   std::unordered_map<std::string, llvm::Value *> Values;
   std::unordered_set<std::string> PoisonFallbackWarnings;

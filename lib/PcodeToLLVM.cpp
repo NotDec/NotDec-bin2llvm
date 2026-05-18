@@ -1,4 +1,5 @@
 #include "notdec-bin2llvm/PcodeToLLVM.h"
+#include "notdec-bin2llvm/RegisterStorage.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/IR/BasicBlock.h"
@@ -16,6 +17,7 @@
 
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -52,6 +54,9 @@ public:
   }
 
   bool lower(const PcodeProgram &program, std::string &errorMessage) {
+    Registers = std::make_unique<RegisterStorage>(
+        Context, Module, program.Registers, program.IsBigEndian);
+
     if (program.Ops.empty()) {
       return true;
     }
@@ -278,12 +283,29 @@ private:
       return resize(it->second, varnode.Size);
     }
 
+    if (varnode.IsRegister && Registers != nullptr) {
+      RegisterAccess access{varnode.Space, varnode.Offset, varnode.Size,
+                            varnode.RegisterName};
+      if (llvm::Value *value = Registers->read(Builder, access)) {
+        return value;
+      }
+    }
+
     return Builder.CreateFreeze(llvm::PoisonValue::get(type),
                                 valueName(varnode) + "_in");
   }
 
   void write(const VarnodeView &varnode, llvm::Value *value) {
     llvm::Value *resized = resize(value, varnode.Size);
+    if (varnode.IsRegister && Registers != nullptr) {
+      RegisterAccess access{varnode.Space, varnode.Offset, varnode.Size,
+                            varnode.RegisterName};
+      if (Registers->hasRegister(access)) {
+        Registers->write(Builder, access, resized);
+        return;
+      }
+    }
+
     if (auto *instruction = llvm::dyn_cast<llvm::Instruction>(resized)) {
       instruction->setName(valueName(varnode));
     }
@@ -586,6 +608,7 @@ private:
   std::vector<llvm::BasicBlock *> ExternalTargetBlocks;
   llvm::BasicBlock *ExitBlock = nullptr;
   llvm::GlobalVariable *Memory = nullptr;
+  std::unique_ptr<RegisterStorage> Registers;
 };
 
 } // namespace

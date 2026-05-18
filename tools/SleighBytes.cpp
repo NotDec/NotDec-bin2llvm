@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <exception>
+#include <map>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -87,11 +88,23 @@ std::string parseHexBytes(std::string_view hexBytes, uint64_t address,
   return buffer;
 }
 
-VarnodeView convertVarnode(const ghidra::VarnodeData &data) {
+VarnodeView convertVarnode(const ghidra::Sleigh &engine,
+                           const ghidra::VarnodeData &data) {
   VarnodeView result;
   result.Space = data.space ? data.space->getName() : "";
   result.Offset = data.offset;
   result.Size = static_cast<uint32_t>(data.size);
+  if (data.space != nullptr) {
+    std::string name =
+        engine.getExactRegisterName(data.space, data.offset, data.size);
+    if (name.empty()) {
+      name = engine.getRegisterName(data.space, data.offset, data.size);
+    }
+    if (!name.empty()) {
+      result.IsRegister = true;
+      result.RegisterName = std::move(name);
+    }
+  }
   return result;
 }
 
@@ -161,7 +174,8 @@ void printVarData(std::ostream &os, const VarnodeView &data) {
 
 class PcodeCollector : public ghidra::PcodeEmit {
 public:
-  explicit PcodeCollector(PcodeProgram &program) : Program(program) {}
+  PcodeCollector(const ghidra::Sleigh &engine, PcodeProgram &program)
+      : Engine(engine), Program(program) {}
 
   void dump(const ghidra::Address &address, ghidra::OpCode op,
             ghidra::VarnodeData *outVar, ghidra::VarnodeData *vars,
@@ -171,18 +185,35 @@ public:
     view.Opcode = convertOpcode(op);
     view.OpcodeName = ghidra::get_opname(op);
     if (outVar) {
-      view.Output = convertVarnode(*outVar);
+      view.Output = convertVarnode(Engine, *outVar);
     }
     view.Inputs.reserve(inputCount);
     for (int32_t index = 0; index < inputCount; ++index) {
-      view.Inputs.push_back(convertVarnode(vars[index]));
+      view.Inputs.push_back(convertVarnode(Engine, vars[index]));
     }
     Program.Ops.push_back(std::move(view));
   }
 
 private:
+  const ghidra::Sleigh &Engine;
   PcodeProgram &Program;
 };
+
+void collectRegisters(const ghidra::Sleigh &engine, PcodeProgram &program) {
+  std::map<ghidra::VarnodeData, std::string> registers;
+  engine.getAllRegisters(registers);
+  for (const auto &[varnode, name] : registers) {
+    if (varnode.space == nullptr || name.empty()) {
+      continue;
+    }
+    RegisterInfo info;
+    info.Space = varnode.space->getName();
+    info.Offset = varnode.offset;
+    info.Size = static_cast<uint32_t>(varnode.size);
+    info.Name = name;
+    program.Registers.push_back(std::move(info));
+  }
+}
 
 void loadProcessorSpecContext(ghidra::Sleigh &engine,
                               ghidra::ContextInternal &context,
@@ -309,6 +340,8 @@ PcodeProgram collectSleighPcode(const SleighBytesOptions &options,
   engine.initialize(storage);
   engine.allowContextSet(false);
   loadProcessorSpecContext(engine, context, storage);
+  program.IsBigEndian = engine.isBigEndian();
+  collectRegisters(engine, program);
 
   std::string imageBuffer = parseHexBytes(options.HexBytes, address,
                                           engine.getDefaultSize(), errorStream);
@@ -319,7 +352,7 @@ PcodeProgram collectSleighPcode(const SleighBytesOptions &options,
   size_t length = imageBuffer.size();
   loadImage.setImageBuffer(std::move(imageBuffer));
 
-  PcodeCollector collector(program);
+  PcodeCollector collector(engine, program);
   ghidra::Address current(engine.getDefaultCodeSpace(), address);
   ghidra::Address end(engine.getDefaultCodeSpace(), address + length);
   while (current < end) {

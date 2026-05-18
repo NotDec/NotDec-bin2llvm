@@ -1,5 +1,7 @@
 #pragma once
 
+#include "notdec-bin2llvm/RegisterStorage.h"
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -37,12 +39,15 @@ enum class PcodeOpcode {
   Unsupported,
 };
 
-// A varnode is the smallest P-Code storage reference.  Keep only the parts the
-// first lowering needs: address space, offset, and byte width.
+// A varnode is the smallest P-Code storage reference.  Register metadata is
+// optional because JSON heritage input already carries it, while raw Sleigh
+// P-Code has to recover it from the architecture definition.
 struct VarnodeView {
   std::string Space;
   uint64_t Offset = 0;
   uint32_t Size = 0;
+  bool IsRegister = false;
+  std::optional<std::string> RegisterName;
 };
 
 // One decoded P-Code op.  Output is absent for STORE and control-flow style
@@ -57,6 +62,8 @@ struct PcodeOpView {
 
 struct PcodeProgram {
   std::vector<PcodeOpView> Ops;
+  std::vector<RegisterInfo> Registers;
+  bool IsBigEndian = false;
 };
 
 const char *pcodeOpcodeName(PcodeOpcode opcode);
