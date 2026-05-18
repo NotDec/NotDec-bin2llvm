@@ -35,6 +35,7 @@ struct HeritageOp {
   std::vector<std::string> Inputs;
   std::optional<std::string> CallTarget;
   std::optional<std::string> CallTargetName;
+  std::optional<std::string> EffectOp;
 };
 
 struct HeritageBlock {

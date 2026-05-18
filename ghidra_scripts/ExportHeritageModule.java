@@ -370,13 +370,13 @@ public class ExportHeritageModule extends GhidraScript {
 				out.println(",");
 			}
 			first = false;
-			writeOp(out, op);
+			writeOp(out, highFunction, op);
 		}
 		out.println();
 		out.print("      ]");
 	}
 
-	private void writeOp(PrintWriter out, PcodeOp op) {
+	private void writeOp(PrintWriter out, HighFunction highFunction, PcodeOp op) {
 		SequenceNumber seq = op.getSeqnum();
 		out.println("        {");
 		out.println("          \"id\": " + json(opId(op)) + ",");
@@ -388,6 +388,7 @@ public class ExportHeritageModule extends GhidraScript {
 		out.println("          \"text\": " + json(op.toString()) + ",");
 		out.println("          \"callTarget\": " + json(directCallTarget(op)) + ",");
 		out.println("          \"callTargetName\": " + json(directCallTargetName(op)) + ",");
+		out.println("          \"effectOp\": " + json(indirectEffectOpId(highFunction, op)) + ",");
 		out.println("          \"output\": " + json(vnodeId(op.getOutput())) + ",");
 		out.println("          \"inputs\": [");
 		for (int i = 0; i < op.getNumInputs(); ++i) {
@@ -399,6 +400,18 @@ public class ExportHeritageModule extends GhidraScript {
 		out.println();
 		out.println("          ]");
 		out.print("        }");
+	}
+
+	private String indirectEffectOpId(HighFunction highFunction, PcodeOp op) {
+		if (op.getOpcode() != PcodeOp.INDIRECT || op.getNumInputs() < 2) {
+			return null;
+		}
+		Varnode effect = op.getInput(1);
+		if (effect == null || !effect.isConstant()) {
+			return null;
+		}
+		PcodeOp effectOp = highFunction.getOpRef((int) effect.getOffset());
+		return effectOp != null ? opId(effectOp) : null;
 	}
 
 	private void writeVarnodes(PrintWriter out) {

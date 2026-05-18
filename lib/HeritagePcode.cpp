@@ -192,7 +192,8 @@ bool readOps(const llvm::json::Object &root, std::vector<HeritageOp> &ops,
         !readOptionalString(*object, "callTarget", op.CallTarget,
                             errorMessage) ||
         !readOptionalString(*object, "callTargetName", op.CallTargetName,
-                            errorMessage)) {
+                            errorMessage) ||
+        !readOptionalString(*object, "effectOp", op.EffectOp, errorMessage)) {
       return false;
     }
     ops.push_back(std::move(op));

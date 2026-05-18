@@ -10,6 +10,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
@@ -22,6 +23,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace notdec::bin2llvm {
 namespace {
@@ -264,6 +266,15 @@ private:
     uint32_t OutputSize = 0;
   };
 
+  // Many Ghidra INDIRECT ops appear before the STORE/CALL that their second
+  // input references. Keep the lowered instruction until the effect op is
+  // lowered, then attach metadata to both sides.
+  struct PendingIndirectMetadata {
+    llvm::Instruction *Instruction = nullptr;
+    std::string EffectOp;
+    std::string Input0;
+  };
+
   llvm::Type *intType(uint32_t byteSize) {
     return llvm::IntegerType::get(Context, bitWidth(byteSize));
   }
@@ -428,6 +439,92 @@ private:
     return true;
   }
 
+  void rememberOpInstruction(const HeritageOp &op, llvm::Instruction *inst) {
+    if (inst == nullptr) {
+      return;
+    }
+    OpInstructionById[op.Id] = inst;
+    llvm::Metadata *metadata[] = {
+        llvm::MDString::get(Context, "effectOp"),
+        llvm::MDString::get(Context, op.Id),
+        llvm::MDString::get(Context, "mnemonic"),
+        llvm::MDString::get(Context, op.Mnemonic),
+    };
+    llvm::MDNode *node = llvm::MDNode::getDistinct(Context, metadata);
+    EffectMetadataByOpId[op.Id] = node;
+    inst->setMetadata("notdec.effect", node);
+    attachPendingIndirectMetadata(op.Id);
+  }
+
+  void attachIndirectMetadata(const HeritageOp &op, llvm::Value *value) {
+    if (!op.EffectOp || value == nullptr) {
+      return;
+    }
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
+    if (inst == nullptr) {
+      return;
+    }
+    auto effectIt = OpInstructionById.find(*op.EffectOp);
+    if (effectIt == OpInstructionById.end() || effectIt->second == nullptr) {
+      PendingIndirectsByEffect[*op.EffectOp].push_back(
+          PendingIndirectMetadata{inst, *op.EffectOp,
+                                  op.Inputs.empty() ? "" : op.Inputs[0]});
+      return;
+    }
+
+    auto metadataIt = EffectMetadataByOpId.find(*op.EffectOp);
+    if (metadataIt == EffectMetadataByOpId.end() || metadataIt->second == nullptr) {
+      return;
+    }
+
+    std::vector<llvm::Metadata *> metadata = {
+        llvm::MDString::get(Context, "effect"),
+        metadataIt->second,
+        llvm::MDString::get(Context, "effectOp"),
+        llvm::MDString::get(Context, *op.EffectOp),
+        llvm::MDString::get(Context, "input0"),
+        llvm::MDString::get(Context, op.Inputs.empty() ? "" : op.Inputs[0]),
+    };
+    inst->setMetadata("notdec.indirect",
+                      llvm::MDNode::get(Context, metadata));
+  }
+
+  void attachPendingIndirectMetadata(const std::string &effectOp) {
+    auto pendingIt = PendingIndirectsByEffect.find(effectOp);
+    if (pendingIt == PendingIndirectsByEffect.end()) {
+      return;
+    }
+    for (const PendingIndirectMetadata &pending : pendingIt->second) {
+      attachIndirectMetadata(pending.Instruction, pending.EffectOp,
+                             pending.Input0);
+    }
+    PendingIndirectsByEffect.erase(pendingIt);
+  }
+
+  void attachIndirectMetadata(llvm::Instruction *inst,
+                              const std::string &effectOp,
+                              const std::string &input0) {
+    auto effectIt = OpInstructionById.find(effectOp);
+    if (effectIt == OpInstructionById.end() || effectIt->second == nullptr) {
+      return;
+    }
+    auto metadataIt = EffectMetadataByOpId.find(effectOp);
+    if (metadataIt == EffectMetadataByOpId.end() || metadataIt->second == nullptr) {
+      return;
+    }
+
+    std::vector<llvm::Metadata *> metadata = {
+        llvm::MDString::get(Context, "effect"),
+        metadataIt->second,
+        llvm::MDString::get(Context, "effectOp"),
+        llvm::MDString::get(Context, effectOp),
+        llvm::MDString::get(Context, "input0"),
+        llvm::MDString::get(Context, input0),
+    };
+    inst->setMetadata("notdec.indirect",
+                      llvm::MDNode::get(Context, metadata));
+  }
+
   llvm::Value *readFloatBits(const std::string &id, llvm::Type *floatTy,
                              std::string &errorMessage) {
     llvm::Value *bits = read(id);
@@ -509,6 +606,26 @@ private:
       return false;
     }
     return write(*op.Output, input, errorMessage);
+  }
+
+  bool lowerIndirect(const HeritageOp &op, std::string &errorMessage) {
+    if (!op.Output || op.Inputs.empty()) {
+      errorMessage = "INDIRECT needs output and at least one input";
+      return false;
+    }
+    llvm::Value *input = read(op.Inputs[0]);
+    if (input == nullptr) {
+      errorMessage = "INDIRECT reads unknown varnode: " + op.Inputs[0];
+      return false;
+    }
+    if (!write(*op.Output, input, errorMessage)) {
+      return false;
+    }
+    auto valueIt = Values.find(*op.Output);
+    if (valueIt != Values.end()) {
+      attachIndirectMetadata(op, valueIt->second);
+    }
+    return true;
   }
 
   bool lowerBinary(const HeritageOp &op, std::string &errorMessage) {
@@ -1175,6 +1292,7 @@ private:
     llvm::Value *value = read(op.Inputs[2]);
     auto *store = Builder.CreateStore(value, memoryPointer(Builder, address));
     store->setAlignment(llvm::Align(1));
+    rememberOpInstruction(op, store);
     return true;
   }
 
@@ -1322,6 +1440,7 @@ private:
     llvm::FunctionCallee callee =
         Module.getOrInsertFunction(calleeName, calleeType);
     llvm::CallInst *call = Builder.CreateCall(callee, args);
+    rememberOpInstruction(op, call);
     if (!op.Output) {
       return true;
     }
@@ -1356,6 +1475,7 @@ private:
     llvm::FunctionCallee helper =
         Module.getOrInsertFunction(helperName, helperType);
     llvm::CallInst *call = Builder.CreateCall(helper, args);
+    rememberOpInstruction(op, call);
     if (!op.Output) {
       return true;
     }
@@ -1492,8 +1612,11 @@ private:
     if (op.Mnemonic == "COPY") {
       return lowerCopy(op, errorMessage);
     }
-    if (op.Mnemonic == "CAST" || op.Mnemonic == "INDIRECT") {
+    if (op.Mnemonic == "CAST") {
       return lowerCopyLike(op, errorMessage);
+    }
+    if (op.Mnemonic == "INDIRECT") {
+      return lowerIndirect(op, errorMessage);
     }
     if (op.Mnemonic == "LOAD") {
       return lowerLoad(op, errorMessage);
@@ -1643,6 +1766,13 @@ private:
   RegisterStorage Registers;
   std::unordered_map<std::string, llvm::BasicBlock *> BlockMap;
   std::unordered_map<std::string, llvm::Value *> Values;
+  // Maps exported P-Code op ids to the LLVM instruction produced from them.
+  // This lets INDIRECT metadata point at an IR-level effect instead of only
+  // preserving the original P-Code text.
+  std::unordered_map<std::string, llvm::Instruction *> OpInstructionById;
+  std::unordered_map<std::string, llvm::MDNode *> EffectMetadataByOpId;
+  std::unordered_map<std::string, std::vector<PendingIndirectMetadata>>
+      PendingIndirectsByEffect;
   std::unordered_set<std::string> PoisonFallbackWarnings;
   std::vector<PendingPhi> PendingPhis;
   llvm::GlobalVariable *Memory = nullptr;
