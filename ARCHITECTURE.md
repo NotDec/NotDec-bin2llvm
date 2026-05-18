@@ -1,0 +1,343 @@
+# NotDec-bin2llvm 代码架构
+
+本文只描述 `external/NotDec-bin2llvm` 当前代码。它现在最重要的链路是：
+
+1. Ghidra 脚本把二进制里的函数导出成 heritage P-Code JSON。
+2. native 工具读取 JSON。
+3. `HeritageToLLVM.cpp` 把函数和模块 lowered 成 LLVM IR。
+
+Sleigh 相关代码仍在，但默认不开启，当前 Bench2 主要不走那条路径。
+
+## 目录
+
+```text
+external/NotDec-bin2llvm/
+  ghidra_scripts/   Ghidra headless 导出脚本
+  include/          对外头文件和主要数据结构
+  lib/              JSON 读取、P-Code 表达、LLVM IR lowering
+  tools/            命令行工具
+  cmake/            LLVM 查找逻辑
+```
+
+几个文件的职责：
+
+- `ghidra_scripts/ExportHeritageModule.java`：模块级 JSON 导出入口。遍历 Ghidra 函数，逐个 decompile，成功的写入 `functions[]`，失败的写入 `failures[]`，外部函数写入 `externals[]`。
+- `ghidra_scripts/ExportHeritagePcode.java`：单函数 JSON 导出入口。现在主要用于小样例和定位单个函数问题。
+- `include/notdec-bin2llvm/HeritagePcode.h`：heritage JSON 在 C++ 侧的数据结构。
+- `lib/HeritagePcode.cpp`：读取单函数和模块级 heritage JSON，并建立 id 到对象的索引。
+- `include/notdec-bin2llvm/HeritageToLLVM.h`：heritage lowering 的对外入口。
+- `lib/HeritageToLLVM.cpp`：当前最核心的 lowering 实现。
+- `tools/notdec-heritage-module-llvm.cpp`：模块级 JSON 到 `.ll` 的命令行入口。
+- `tools/notdec-heritage-module-check.cpp`：模块级 JSON 引用关系检查工具。
+- `tools/notdec-heritage-llvm.cpp`：单函数 JSON 到 `.ll` 的命令行入口。
+- `tools/notdec-heritage-check.cpp`：单函数 JSON 检查工具。
+- `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。
+- `include/notdec-bin2llvm/ModuleBuilder.h`、`lib/ModuleBuilder.cpp`、`tools/notdec-bin2llvm.cpp`：最早的 demo module 入口，只生成一个空函数。
+
+## 当前主执行顺序：模块级 heritage JSON 到 LLVM IR
+
+常用命令：
+
+```bash
+notdec-heritage-module-llvm /tmp/module.json -o /tmp/module.ll
+```
+
+大致顺序如下。
+
+### 1. Ghidra 导出模块 JSON
+
+入口：
+
+- `ExportHeritageModule.run()`
+
+关键步骤：
+
+1. `parseOptions(...)` 读取输出路径、函数数量限制、decompile timeout 和 simplification style。
+2. `createDecompiler(...)` 创建 Ghidra `DecompInterface`，关闭 C 输出，保留 syntax tree，并设置 simplification style。
+3. `selectFunctions(...)` 遍历 `currentProgram.getFunctionManager().getFunctions(true)`，跳过 external 和 thunk，按 `--limit` 或 `--all` 选择内部函数。
+4. 对每个函数调用 `decompile(...)`，拿到 `HighFunction`。
+5. `writeFunctionObject(...)` 写一个函数对象，内容包括函数签名、basic block、op、varnode。
+6. `writeExternals(...)` 写模块级外部函数表。
+7. `writeFailures(...)` 写 decompile 失败的函数。
+
+输出 schema 是 `notdec.heritage-module.v0`，核心字段是：
+
+- `program`：程序名、语言、compiler spec、simplification style。
+- `functions[]`：内部函数，每个元素复用单函数 heritage 字段。
+- `externals[]`：外部函数声明。
+- `failures[]`：Ghidra 导出阶段失败的函数。
+
+### 2. native 工具解析参数
+
+入口：
+
+- `tools/notdec-heritage-module-llvm.cpp::main(...)`
+
+关键函数：
+
+- `parseArgs(...)`：接受 `<heritage-module.json> -o <output.ll>`，可选 `--declarations-only`。
+- `printUsage(...)`：参数错误时打印用法。
+- `writeModule(...)`：最后把 LLVM module 写到 `.ll`。
+
+`main(...)` 的顺序：
+
+1. 解析 CLI。
+2. 调用 `loadHeritageModuleFromJson(...)` 读取 JSON。
+3. 创建 `llvm::LLVMContext`。
+4. 如果是 `--declarations-only`，调用 `buildHeritageDeclarationModule(...)`。
+5. 否则调用 `buildHeritageModuleWithBodies(...)`。
+6. 调用 `llvm::verifyModule(...)`。
+7. 写出 `.ll`。
+
+### 3. 读取 heritage module JSON
+
+入口：
+
+- `lib/HeritagePcode.cpp::loadHeritageModuleFromJson(...)`
+
+关键函数：
+
+- `requireString(...)`：读取必填字符串。
+- `readProgramInfo(...)`：读取 `program`。
+- `readModuleFunction(...)`：读取 `functions[]` 里的一个函数。
+- `readFunctionObject(...)`：读取函数名、入口地址、返回类型和参数。
+- `readBlocks(...)`：读取 basic block 和 CFG 边。
+- `readOps(...)`：读取 P-Code op、输入输出、call target。
+- `readVarnodes(...)`：读取 varnode 的 space、offset、size、寄存器信息和 high variable 信息。
+- `readExternalFunction(...)`：读取 `externals[]`。
+- `readFailure(...)`：读取 `failures[]`。
+- `indexHeritageProgram(...)`：给每个函数建立 `BlockById`、`OpById`、`VarnodeById`、`BlockByStart`。
+
+这里的数据结构尽量贴近 JSON。当前没有再造一套中间 IR，主要是为了让 Ghidra 导出结果和 native lowering 一一对上。
+
+### 4. 规划模块符号名
+
+入口：
+
+- `lib/HeritageToLLVM.cpp::buildHeritageModuleWithBodies(...)`
+
+第一步会调用：
+
+- `planModuleSymbols(...)`
+
+它做三件事：
+
+1. 给内部函数生成 LLVM symbol。
+2. 给外部函数生成 LLVM symbol。
+3. 建立 `NameByEntry` 和 `NameByOriginalName`，后面 `CALL` lowering 用它解析目标函数。
+
+相关辅助函数：
+
+- `sanitizeSymbolName(...)`：把 Ghidra 名字转成 LLVM 里更安全的 symbol。
+- `addressSuffix(...)`：从地址里提取后缀。
+- `uniqueSymbolName(...)`：处理重名，必要时拼地址和序号。
+
+### 5. 先声明所有函数
+
+`buildHeritageModuleWithBodies(...)` 先创建一个空 module，然后分两类声明函数：
+
+1. 内部函数：调用 `declareInternalFunction(...)`。
+2. 外部函数：调用 `module->getOrInsertFunction(...)`，当前使用 vararg function type。
+
+这样做是为了让函数 body lowering 时可以解析内部互调，也让单个函数失败时还能保留 declaration。
+
+函数类型相关逻辑：
+
+- `typeForSourceType(...)`：把 Ghidra 类型字符串粗略映射到 LLVM integer/void 类型。
+- `functionTypeForHeritageFunction(...)`：根据 `HeritageFunction.Params` 和 `ReturnType` 生成内部函数类型。
+- `varargFunctionType(...)`：给外部函数和不稳定 call prototype 用。
+
+### 6. 逐个 lower 函数体
+
+入口：
+
+- `HeritageLowerer::lower(...)`
+
+顺序：
+
+1. `createFunction(...)`：确认或创建当前 LLVM function。
+2. `createBlocks()`：按 heritage block 建 LLVM basic block。
+3. `mapParameters(...)`：把函数参数绑定到对应 varnode。
+4. 遍历 `Program.Blocks`，对每个 block 调 `lowerBlock(...)`。
+5. `finalizePendingPhis(...)`：补完所有 `MULTIEQUAL` 的 incoming value。
+
+`HeritageLowerer` 里几个核心状态：
+
+- `BlockMap`：heritage block id 到 LLVM basic block。
+- `Values`：varnode id 到当前 LLVM value。
+- `PendingPhis`：先创建但还没填 incoming 的 PHI。
+- `Symbols`：模块级函数符号表，用于解析 `CALL`。
+- `Memory`：临时 `notdec_ram` 外部数组，用于表达 LOAD/STORE。
+
+### 7. lower 一个 basic block
+
+入口：
+
+- `HeritageLowerer::lowerBlock(...)`
+
+它的顺序和普通 SSA lowering 一样：
+
+1. 第一遍只处理本 block 里的 `MULTIEQUAL`，调用 `lowerPhi(...)` 创建 LLVM PHI。
+2. 第二遍跳过 `MULTIEQUAL`，按 op 顺序 lower 普通指令。
+3. 如果遇到 `BRANCH`、`CBRANCH`、`BRANCHIND`、`RETURN`，调用 `lowerBranch(...)` 并结束这个 block。
+4. 如果没有显式 terminator，就按 `block.Out` 生成 fallthrough branch；没有 successor 时生成 return。
+
+这也是 `scripts/bin2llvm-dump-module-pcode.py` 当前按 lowering 顺序打印 P-Code 的依据。
+
+### 8. lower 普通 P-Code op
+
+入口：
+
+- `HeritageLowerer::lowerOp(...)`
+
+它按 mnemonic 分发到具体函数：
+
+- 数据移动：`lowerCopy(...)`、`lowerCopyLike(...)`
+- 整数运算：`lowerBinary(...)`、`lowerUnary(...)`
+- 整数比较：`lowerCompare(...)`
+- 溢出判断：`lowerOverflow(...)`
+- 位计数：`lowerCountBits(...)`
+- 扩展/截断：`lowerCast(...)`
+- 布尔运算：`lowerBoolNegate(...)`、`lowerBoolBinary(...)`
+- 浮点运算：`lowerFloatBinary(...)`、`lowerFloatCompare(...)`、`lowerFloatUnary(...)`、`lowerFloatNan(...)`、`lowerFloatCast(...)`
+- 拼接/切片：`lowerPiece(...)`、`lowerSubpiece(...)`
+- 指针加减：`lowerPtrAdd(...)`、`lowerPtrSub(...)`
+- bit range：`lowerInsert(...)`、`lowerExtract(...)`
+- 内存访问：`lowerLoad(...)`、`lowerStore(...)`
+- PHI：`lowerPhi(...)`
+- 调用：`lowerCall(...)`
+- 暂不精确支持的 op：`lowerHelperCall(...)`
+
+读写 varnode 的基础函数：
+
+- `read(...)`：优先从 `Values` 取值；常量 varnode 生成 `ConstantInt`；未初始化 varnode 目前生成 `freeze poison` 并打印 warning。
+- `write(...)`：按 varnode size resize 后写回 `Values`。
+- `resize(...)`：用 zero extend 或 truncate 调整 integer bit width。
+
+### 9. 内存、调用和 PHI 的当前处理
+
+内存：
+
+- `memoryGlobal()` 创建外部全局数组 `@notdec_ram`。
+- `memoryPointer(...)` 用地址对 `@notdec_ram` 做 GEP。
+- `lowerLoad(...)` 和 `lowerStore(...)` 只接受常量 address-space selector，按 1 字节对齐生成 load/store。
+
+调用：
+
+- `lowerCall(...)` 先用 `resolveCallTargetName(...)` 查模块符号表。
+- 当前 call prototype 还不稳定，所以用 vararg declaration。
+- 如果是 `CALLIND`、`CALLOTHER`、`SEGMENTOP` 等暂不精确支持的 op，走 `lowerHelperCall(...)`，生成 `notdec_heritage_<opcode>_*` helper call。
+
+PHI：
+
+- `lowerPhi(...)` 只创建 PHI，并把 predecessor block id 和 input varnode id 存到 `PendingPhis`。
+- `finalizePendingPhis(...)` 在所有 block lower 完之后补 incoming。
+- `resizeForPhiIncoming(...)` 会尽量在 predecessor terminator 前插入 zext/trunc。
+- 找不到 incoming value 时当前使用 poison fallback，并打印 warning。
+
+### 10. 函数失败时恢复成 declaration
+
+`buildHeritageModuleWithBodies(...)` 对每个 `status == "ok"` 的函数尝试填 body。
+
+如果 `HeritageLowerer::lower(...)` 失败，或 `llvm::verifyFunction(...)` 失败，会调用局部 lambda `restoreDeclaration(...)`：
+
+1. 删除当前半成品 LLVM function。
+2. 用同一个 symbol 重新声明函数。
+3. 把失败信息写入 `HeritageModuleLoweringStats::Failures`。
+4. 继续处理后面的函数。
+
+这保证一个坏函数不会导致整个 module 没有输出。
+
+## 单函数 heritage 路径
+
+常用命令：
+
+```bash
+notdec-heritage-llvm /tmp/function.json -o /tmp/function.ll
+```
+
+顺序：
+
+1. `tools/notdec-heritage-llvm.cpp::main(...)` 解析参数。
+2. `loadHeritageProgramFromJson(...)` 读取单函数 JSON。
+3. `buildHeritageModule(...)` 创建 module。
+4. `HeritageLowerer::lower(...)` lower 一个函数体。
+5. `llvm::verifyModule(...)` 检查。
+6. 写出 `.ll`。
+
+这条路径和模块级路径共用 `HeritageProgram`、`HeritageLowerer` 和大部分 lowering 逻辑。
+
+## 检查工具
+
+### `notdec-heritage-module-check`
+
+入口：
+
+- `tools/notdec-heritage-module-check.cpp::main(...)`
+
+主要检查：
+
+- schema 是否是 `notdec.heritage-module.v0`。
+- 内部函数 name 和 entry 是否重复。
+- block 的 `in/out/ops` 引用是否存在。
+- op 的 parent、input、output varnode 是否存在。
+- direct call 能否解析到内部函数或外部函数。
+
+关键函数：
+
+- `checkModuleSymbols(...)`
+- `checkFunctionRefs(...)`
+- `countCalls(...)`
+- `printSummary(...)`
+
+### `notdec-heritage-check`
+
+入口：
+
+- `tools/notdec-heritage-check.cpp::main(...)`
+
+主要检查单函数 JSON：
+
+- schema 是否是 `notdec.heritage-pcode.v0`。
+- 参数 varnode 是否存在。
+- block/op/varnode 引用是否完整。
+- `MULTIEQUAL` 输入数量是否等于 predecessor 数量。
+- 统计 register varnode 和 direct call。
+
+## Sleigh 实验路径
+
+默认构建时 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`，所以这条路径通常不会进 Bench2 当前验证。
+
+如果开启 Sleigh，入口大致是：
+
+```bash
+notdec-sleigh-pcode ...
+notdec-sleigh-llvm ...
+```
+
+执行顺序：
+
+1. `tools/SleighBytes.cpp` 用 Sleigh 从字节生成 `PcodeProgram`。
+2. `PcodeCollector::dump(...)` 收集每条 P-Code op。
+3. `buildPcodeModule(...)` 创建一个 void LLVM function。
+4. `PcodeLowerer::lower(...)` 按线性 P-Code 建 basic block 并 lower op。
+
+这条路径使用的是 `Pcode.h` 里的简化结构：
+
+- `VarnodeView`
+- `PcodeOpView`
+- `PcodeProgram`
+
+它没有 Ghidra HighFunction 的 SSA、block、high variable 信息，所以能力弱于 heritage 路径。
+
+## 主要限制
+
+当前代码能生成结构上可验证的 LLVM IR，但还不是完整语义恢复：
+
+1. 源类型到 LLVM 类型的映射很粗，很多类型都落到整数。
+2. 外部函数和 call-site prototype 仍使用 vararg。
+3. `notdec_ram` 只是临时内存模型，还没表达真实 ELF section、stack object、GOT/PLT 和 relocation。
+4. 未初始化 varnode、部分 PHI incoming、间接跳转失败路径会使用 poison fallback。
+5. 部分 P-Code op 通过 helper call 保留，不是精确 lowering。
+6. 模块级 lowering 能隔离单函数失败，但失败函数只有 declaration，没有 body。
+
