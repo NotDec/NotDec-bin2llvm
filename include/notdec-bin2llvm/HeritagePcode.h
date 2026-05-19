@@ -78,7 +78,8 @@ struct HeritageProgram {
   std::unordered_map<std::string, const HeritageBlock *> BlockById;
   std::unordered_map<std::string, const HeritageOp *> OpById;
   std::unordered_map<std::string, const HeritageVarnode *> VarnodeById;
-  std::unordered_map<std::string, const HeritageBlock *> BlockByStart;
+  std::unordered_map<std::string, std::vector<const HeritageBlock *>>
+      BlockByStart;
 };
 
 // One module function owns the same per-function data as the old schema.  The

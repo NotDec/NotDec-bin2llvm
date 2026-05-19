@@ -1520,6 +1520,56 @@ private:
     return resizeToIntegerType(value, returnType);
   }
 
+  const HeritageBlock *
+  chooseBlockByAddress(const std::vector<const HeritageBlock *> &candidates,
+                       const std::string &address,
+                       std::string &errorMessage) const {
+    if (candidates.empty()) {
+      return nullptr;
+    }
+    if (candidates.size() == 1) {
+      return candidates.front();
+    }
+
+    const HeritageBlock *nonEmpty = nullptr;
+    for (const HeritageBlock *candidate : candidates) {
+      if (candidate != nullptr && !candidate->Ops.empty()) {
+        if (nonEmpty != nullptr) {
+          errorMessage = "branch target address is ambiguous: " + address;
+          return nullptr;
+        }
+        nonEmpty = candidate;
+      }
+    }
+    return nonEmpty != nullptr ? nonEmpty : candidates.front();
+  }
+
+  const HeritageBlock *resolveSuccessorByAddress(
+      const HeritageBlock &block, const std::string &address,
+      std::string &errorMessage) const {
+    // Ghidra can emit an empty entry trampoline and a real code block with the
+    // same start address.  Prefer the current CFG edge, otherwise a branch back
+    // to the function entry may accidentally target the empty entry block.
+    std::vector<const HeritageBlock *> successorCandidates;
+    for (const std::string &successor : block.Out) {
+      auto blockIt = Program.BlockById.find(successor);
+      if (blockIt != Program.BlockById.end() &&
+          blockIt->second->Start == address) {
+        successorCandidates.push_back(blockIt->second);
+      }
+    }
+    if (!successorCandidates.empty()) {
+      return chooseBlockByAddress(successorCandidates, address, errorMessage);
+    }
+
+    auto globalCandidates = Program.BlockByStart.find(address);
+    if (globalCandidates == Program.BlockByStart.end()) {
+      return nullptr;
+    }
+    return chooseBlockByAddress(globalCandidates->second, address,
+                                errorMessage);
+  }
+
   bool lowerBranch(const HeritageOp &op, const HeritageBlock &block,
                    std::string &errorMessage) {
     if (op.Mnemonic == "CBRANCH") {
@@ -1531,17 +1581,21 @@ private:
         errorMessage = "CBRANCH target varnode is unknown";
         return false;
       }
-      auto trueBlockIt = Program.BlockByStart.find(target->Address);
-      if (trueBlockIt == Program.BlockByStart.end() && block.Out.size() < 2) {
+      const HeritageBlock *trueHeritageBlock =
+          resolveSuccessorByAddress(block, target->Address, errorMessage);
+      if (!errorMessage.empty()) {
+        return false;
+      }
+      if (trueHeritageBlock == nullptr && block.Out.size() < 2) {
         errorMessage = "CBRANCH target block is unknown: " + target->Address;
         return false;
       }
       llvm::BasicBlock *falseBlock = nullptr;
       llvm::BasicBlock *trueBlock = nullptr;
-      if (trueBlockIt != Program.BlockByStart.end()) {
-        trueBlock = BlockMap.at(trueBlockIt->second->Id);
+      if (trueHeritageBlock != nullptr) {
+        trueBlock = BlockMap.at(trueHeritageBlock->Id);
         for (const std::string &successor : block.Out) {
-          if (successor != trueBlockIt->second->Id) {
+          if (successor != trueHeritageBlock->Id) {
             falseBlock = BlockMap.at(successor);
             break;
           }
@@ -1572,8 +1626,12 @@ private:
         errorMessage = "BRANCH target varnode is unknown";
         return false;
       }
-      auto targetBlockIt = Program.BlockByStart.find(target->Address);
-      if (targetBlockIt == Program.BlockByStart.end()) {
+      const HeritageBlock *targetBlock =
+          resolveSuccessorByAddress(block, target->Address, errorMessage);
+      if (!errorMessage.empty()) {
+        return false;
+      }
+      if (targetBlock == nullptr) {
         if (block.Out.size() != 1) {
           errorMessage = "BRANCH target block is unknown: " + target->Address;
           return false;
@@ -1581,7 +1639,7 @@ private:
         Builder.CreateBr(BlockMap.at(block.Out.front()));
         return true;
       }
-      Builder.CreateBr(BlockMap.at(targetBlockIt->second->Id));
+      Builder.CreateBr(BlockMap.at(targetBlock->Id));
       return true;
     }
 

@@ -317,7 +317,7 @@ void indexHeritageProgram(HeritageProgram &program) {
 
   for (const HeritageBlock &block : program.Blocks) {
     program.BlockById.emplace(block.Id, &block);
-    program.BlockByStart.emplace(block.Start, &block);
+    program.BlockByStart[block.Start].push_back(&block);
   }
   for (const HeritageOp &op : program.Ops) {
     program.OpById.emplace(op.Id, &op);
