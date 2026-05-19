@@ -608,13 +608,10 @@ private:
     }
     llvm::Value *resized = resize(value, varnode->Size);
     Values[id] = resized;
-    if (varnode->IsRegister && varnode->RegisterName) {
-      RegisterAccess access{varnode->Space, varnode->Offset, varnode->Size,
-                            varnode->RegisterName};
-      if (Registers->hasRegister(access)) {
-        Registers->write(Builder, access, resized);
-      }
-    }
+    // Register varnodes are usually heritage's provenance for machine
+    // temporaries.  Keep their SSA value in Values, but do not mirror every
+    // write into a module-global register unless a later read has no SSA value
+    // and explicitly falls back to RegisterStorage.
     if (llvm::Value *pointer = pointerForStackVarnode(Builder, *varnode)) {
       auto *store = Builder.CreateStore(resized, pointer);
       store->setAlignment(llvm::Align(1));

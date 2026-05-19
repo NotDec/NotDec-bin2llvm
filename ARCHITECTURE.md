@@ -245,6 +245,9 @@ PHI：
   例如 x86-64 的 `RAX/EAX/AX/AL` 都落在 `RAX` 这个最大承载寄存器里，LLVM IR
   只建一个 `@RAX` global；更小的访问用 shift/trunc/mask 访问它的一部分。
 - `EAX` 写入会清空 `RAX` 高位这类语义由 P-Code 表达，这里不要用额外规则重复模拟。
+- register varnode 的写入默认只进入函数内 SSA `Values`，不再同步写回 `@RAX/@RDX`
+  这类 module-global register。只有读一个没有 SSA 值的 register input 时，才从
+  `RegisterStorage` 兜底读全局寄存器。
 
 栈：
 
