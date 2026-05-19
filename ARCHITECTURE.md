@@ -308,6 +308,12 @@ notdec-heritage-llvm /tmp/function.json -o /tmp/function.ll
 
 默认构建时 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`，所以这条路径通常不会进 Bench2 当前验证。
 
+Sleigh 依赖会从 `lifting-bits/sleigh` 拉取，Ghidra 源码统一使用
+`NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR` 指向的 checkout。当前本机默认是
+`/sn640/ghidra`，需要 checkout 到 sleigh pin 的 Ghidra tag。不要混用旧
+Ghidra release 目录里的 `.sla/.pspec`；native pcode 工具应优先使用
+`/sn640/ghidra/Ghidra/Processors/.../data/languages/` 下同版本的 spec。
+
 如果开启 Sleigh，入口大致是：
 
 ```bash
@@ -340,4 +346,3 @@ notdec-sleigh-llvm ...
 4. 未初始化 varnode、部分 PHI incoming、间接跳转失败路径会使用 poison fallback。
 5. 部分 P-Code op 通过 helper call 保留，不是精确 lowering。
 6. 模块级 lowering 能隔离单函数失败，但失败函数只有 declaration，没有 body。
-

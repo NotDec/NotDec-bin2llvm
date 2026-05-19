@@ -116,6 +116,18 @@ private:
   PcodeProgram &Program;
 };
 
+class XmlCapableSleigh : public ghidra::Sleigh {
+public:
+  XmlCapableSleigh(ghidra::LoadImage *loadImage,
+                   ghidra::ContextDatabase *context)
+      : ghidra::Sleigh(loadImage, context) {}
+
+  void decodeXmlSla(const ghidra::Element *element) {
+    ghidra::XmlDecode decoder(this, element);
+    decode(decoder);
+  }
+};
+
 void collectRegisters(const ghidra::Sleigh &engine, PcodeProgram &program) {
   std::map<ghidra::VarnodeData, std::string> registers;
   engine.getAllRegisters(registers);
@@ -208,23 +220,28 @@ PcodeProgram collectSleighPcode(ghidra::LoadImage &loadImage,
     errorStream << "could not find sla file: " << options.SlaFileName << '\n';
     return program;
   }
-  if (isXmlSlaFile(*slaFilePath)) {
-    errorStream << "libsla expects a compressed .sla file, got XML .sla: "
-                << slaFilePath->string() << '\n';
-    return program;
-  }
+  bool isXmlSla = isXmlSlaFile(*slaFilePath);
 
   ghidra::AttributeId::initialize();
   ghidra::ElementId::initialize();
 
   ghidra::ContextInternal context;
-  ghidra::Sleigh engine(&loadImage, &context);
+  XmlCapableSleigh engine(&loadImage, &context);
   ghidra::DocumentStorage storage;
 
-  std::istringstream sleighXml("<sleigh>" + slaFilePath->string() +
-                               "</sleigh>");
-  ghidra::Element *root = storage.parseDocument(sleighXml)->getRoot();
-  storage.registerTag(root);
+  if (isXmlSla) {
+    try {
+      engine.decodeXmlSla(storage.openDocument(slaFilePath->string())->getRoot());
+    } catch (ghidra::LowlevelError &error) {
+      errorStream << "failed to decode XML .sla: " << error.explain << '\n';
+      return program;
+    }
+  } else {
+    std::istringstream sleighXml("<sleigh>" + slaFilePath->string() +
+                                 "</sleigh>");
+    ghidra::Element *root = storage.parseDocument(sleighXml)->getRoot();
+    storage.registerTag(root);
+  }
 
   auto pspecPath = findPspecPath(options, *slaFilePath);
   if (options.PspecFileName && !pspecPath) {

@@ -27,6 +27,12 @@ set(
   CACHE PATH
   "Optional local sleigh source override. When set, FetchContent uses this source tree."
 )
+set(
+  NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR
+  "/sn640/ghidra"
+  CACHE PATH
+  "Ghidra source checkout used by lifting-bits/sleigh. Keep it at the Ghidra tag pinned by sleigh."
+)
 
 option(NOTDEC_BIN2LLVM_ENABLE_LIEF "Enable LIEF dependency for native binary parsing work." OFF)
 set(
@@ -59,6 +65,10 @@ if (NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
 
   if (NOTDEC_BIN2LLVM_SLEIGH_SOURCE_DIR)
     set(FETCHCONTENT_SOURCE_DIR_SLEIGH "${NOTDEC_BIN2LLVM_SLEIGH_SOURCE_DIR}")
+  endif ()
+  if (NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR)
+    set(FETCHCONTENT_SOURCE_DIR_GHIDRASOURCE
+        "${NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR}")
   endif ()
 
   FetchContent_Declare(
