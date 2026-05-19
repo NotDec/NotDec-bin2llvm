@@ -102,6 +102,8 @@ bool readParam(const llvm::json::Object &object, HeritageParam &param,
   return requireString(object, "name", param.Name, errorMessage) &&
          requireString(object, "type", param.Type, errorMessage) &&
          requireString(object, "storage", param.Storage, errorMessage) &&
+         readOptionalString(object, "registerName", param.RegisterName,
+                            errorMessage) &&
          readOptionalString(object, "varnode", param.Varnode, errorMessage);
 }
 

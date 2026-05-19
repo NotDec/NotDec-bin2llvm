@@ -244,6 +244,7 @@ public:
       return false;
     }
     createBlocks();
+    attachParameterMetadata();
     mapParameters(errorMessage);
     if (!errorMessage.empty()) {
       return false;
@@ -282,6 +283,17 @@ private:
   void warnPoisonFallback(const std::string &reason) {
     if (PoisonFallbackWarnings.insert(reason).second) {
       printPoisonFallbackError(Program.Function.Name, reason);
+    }
+  }
+
+  void warnMissingParameterVarnode(const HeritageParam &param) {
+    std::ostringstream os;
+    os << "parameter " << param.Name << " has no varnode";
+    if (param.RegisterName) {
+      os << " (register " << *param.RegisterName << ")";
+    }
+    if (MissingParameterWarnings.insert(os.str()).second) {
+      llvm::errs() << "Warning: " << os.str() << '\n';
     }
   }
 
@@ -357,18 +369,37 @@ private:
   void mapParameters(std::string &errorMessage) {
     auto arg = Function->arg_begin();
     for (const HeritageParam &param : Program.Function.Params) {
-      if (!param.Varnode) {
-        std::ostringstream os;
-        os << "parameter " << param.Name << " has no varnode";
-        errorMessage = os.str();
-        return;
-      }
       if (arg == Function->arg_end()) {
         errorMessage = "LLVM function argument mismatch";
         return;
       }
-      Values[*param.Varnode] = &*arg;
+      if (param.Varnode) {
+        Values[*param.Varnode] = &*arg;
+      } else {
+        warnMissingParameterVarnode(param);
+      }
       ++arg;
+    }
+  }
+
+  void attachParameterMetadata() {
+    std::vector<llvm::Metadata *> entries;
+    for (const HeritageParam &param : Program.Function.Params) {
+      if (param.Varnode || !param.RegisterName) {
+        continue;
+      }
+      llvm::Metadata *fields[] = {
+          llvm::MDString::get(Context, "index=" + std::to_string(param.Index)),
+          llvm::MDString::get(Context, "name=" + param.Name),
+          llvm::MDString::get(Context, "type=" + param.Type),
+          llvm::MDString::get(Context, "storage=" + param.Storage),
+          llvm::MDString::get(Context, "register=" + *param.RegisterName),
+      };
+      entries.push_back(llvm::MDNode::get(Context, fields));
+    }
+    if (!entries.empty()) {
+      Function->setMetadata("notdec.param.register",
+                            llvm::MDNode::get(Context, entries));
     }
   }
 
@@ -1854,6 +1885,7 @@ private:
   std::unordered_map<std::string, std::vector<PendingIndirectMetadata>>
       PendingIndirectsByEffect;
   std::unordered_set<std::string> PoisonFallbackWarnings;
+  std::unordered_set<std::string> MissingParameterWarnings;
   std::vector<PendingPhi> PendingPhis;
   llvm::GlobalVariable *Memory = nullptr;
   const HeritageOp *CurrentOp = nullptr;

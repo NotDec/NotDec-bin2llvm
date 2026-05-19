@@ -51,6 +51,7 @@ struct HeritageParam {
   std::string Name;
   std::string Type;
   std::string Storage;
+  std::optional<std::string> RegisterName;
   std::optional<std::string> Varnode;
 };
 

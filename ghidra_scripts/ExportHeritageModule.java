@@ -300,17 +300,34 @@ public class ExportHeritageModule extends GhidraScript {
 	}
 
 	private void writeParam(PrintWriter out, HighSymbol symbol, int index) {
+		String storage = symbol.getStorage().toString();
 		out.print("        {");
 		out.print("\"index\": " + index);
 		out.print(", \"name\": " + json(symbol.getName()));
 		out.print(", \"type\": " + json(typeString(symbol.getDataType())));
-		out.print(", \"storage\": " + json(symbol.getStorage().toString()));
+		out.print(", \"storage\": " + json(storage));
+		String registerName = registerNameFromStorage(storage);
+		if (registerName != null) {
+			out.print(", \"registerName\": " + json(registerName));
+		}
 		HighVariable highVariable = symbol.getHighVariable();
 		if (highVariable != null && highVariable.getRepresentative() != null) {
 			out.print(", \"varnode\": " + json(vnodeId(highVariable.getRepresentative())));
 			out.print(", \"highVariable\": " + json(highVariable.getName()));
 		}
 		out.print("}");
+	}
+
+	private String registerNameFromStorage(String storage) {
+		int colon = storage.indexOf(':');
+		if (colon <= 0) {
+			return null;
+		}
+		String name = storage.substring(0, colon);
+		if (name.indexOf('[') >= 0 || name.indexOf(' ') >= 0) {
+			return null;
+		}
+		return name;
 	}
 
 	private void writeBlocks(PrintWriter out, HighFunction highFunction) {
