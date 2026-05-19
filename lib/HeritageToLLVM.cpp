@@ -18,6 +18,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cctype>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -322,6 +323,7 @@ public:
       return false;
     }
     createBlocks();
+    createStackFrame();
     attachParameterMetadata();
     mapParameters(errorMessage);
     if (!errorMessage.empty()) {
@@ -352,6 +354,15 @@ private:
     llvm::Instruction *Instruction = nullptr;
     std::string EffectOp;
     std::string Input0;
+  };
+
+  // Ghidra heritage already rewrites normal RSP prologue/epilogue traffic into
+  // frame-relative stack varnodes.  Keep those locals as one byte-addressed
+  // alloca instead of reconstructing them through the current RSP value.
+  struct StackFrame {
+    int64_t Low = 0;
+    int64_t High = 0;
+    llvm::AllocaInst *Storage = nullptr;
   };
 
   llvm::Type *intType(uint32_t byteSize) {
@@ -442,6 +453,51 @@ private:
       BlockMap.emplace(block.Id,
                        llvm::BasicBlock::Create(Context, name, Function));
     }
+  }
+
+  static int64_t signedOffset(uint64_t offset) {
+    return static_cast<int64_t>(offset);
+  }
+
+  void createStackFrame() {
+    int64_t low = 0;
+    int64_t high = 0;
+    bool hasLocalStack = false;
+    for (const HeritageVarnode &varnode : Program.Varnodes) {
+      if (varnode.Space != "stack" || varnode.Size == 0) {
+        continue;
+      }
+      int64_t offset = signedOffset(varnode.Offset);
+      if (offset >= 0) {
+        continue;
+      }
+      int64_t end = offset + static_cast<int64_t>(varnode.Size);
+      if (!hasLocalStack) {
+        low = offset;
+        high = std::max<int64_t>(0, end);
+        hasLocalStack = true;
+      } else {
+        low = std::min(low, offset);
+        high = std::max(high, end);
+      }
+    }
+    if (!hasLocalStack || high <= low) {
+      return;
+    }
+
+    uint64_t size = static_cast<uint64_t>(high - low);
+    if (size > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+      return;
+    }
+    llvm::IRBuilder<> entryBuilder(&Function->getEntryBlock(),
+                                   Function->getEntryBlock().begin());
+    auto *byteType = llvm::Type::getInt8Ty(Context);
+    auto *arrayType = llvm::ArrayType::get(byteType, size);
+    Stack.Low = low;
+    Stack.High = high;
+    Stack.Storage =
+        entryBuilder.CreateAlloca(arrayType, nullptr, "notdec_stack");
+    Stack.Storage->setAlignment(llvm::Align(16));
   }
 
   void mapParameters(std::string &errorMessage) {
@@ -558,6 +614,10 @@ private:
       if (Registers->hasRegister(access)) {
         Registers->write(Builder, access, resized);
       }
+    }
+    if (llvm::Value *pointer = pointerForStackVarnode(Builder, *varnode)) {
+      auto *store = Builder.CreateStore(resized, pointer);
+      store->setAlignment(llvm::Align(1));
     }
     return true;
   }
@@ -1308,50 +1368,46 @@ private:
     return write(*op.Output, masked, errorMessage);
   }
 
-  llvm::Value *readStackPointer(llvm::IRBuilderBase &builder) {
-    for (const HeritageVarnode &candidate : Program.Varnodes) {
-      if (!candidate.IsRegister || !candidate.RegisterName ||
-          *candidate.RegisterName != "RSP") {
-        continue;
-      }
-      RegisterAccess access{candidate.Space, candidate.Offset, candidate.Size,
-                            candidate.RegisterName};
-      llvm::Value *value = Registers->read(builder, access);
-      if (value != nullptr) {
-        return builder.CreateZExtOrTrunc(value, intType(8));
-      }
+  llvm::Value *pointerForStackVarnode(llvm::IRBuilderBase &builder,
+                                      const HeritageVarnode &varnode) {
+    if (Stack.Storage == nullptr || varnode.Space != "stack") {
+      return nullptr;
     }
-    return nullptr;
+    int64_t offset = signedOffset(varnode.Offset);
+    int64_t end = offset + static_cast<int64_t>(varnode.Size);
+    if (offset < Stack.Low || end > Stack.High) {
+      return nullptr;
+    }
+    auto *byteOffset = llvm::ConstantInt::get(
+        intType(8), static_cast<uint64_t>(offset - Stack.Low));
+    return builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(Context),
+                                     Stack.Storage, byteOffset,
+                                     varnode.Id + ".stack");
   }
 
-  llvm::Value *addressForAddressTiedInput(llvm::IRBuilderBase &builder,
+  llvm::Value *pointerForAddressTiedInput(llvm::IRBuilderBase &builder,
                                           const HeritageVarnode &varnode) {
     if (!varnode.IsInput || !varnode.IsAddressTied) {
       return nullptr;
     }
     if (varnode.Space == "ram") {
-      return llvm::ConstantInt::get(intType(8), varnode.Offset);
+      llvm::Value *address = llvm::ConstantInt::get(intType(8), varnode.Offset);
+      return memoryPointer(builder, address);
     }
     if (varnode.Space == "stack") {
-      llvm::Value *stackPointer = readStackPointer(builder);
-      if (stackPointer == nullptr) {
-        return nullptr;
-      }
-      auto *offset = llvm::ConstantInt::get(intType(8), varnode.Offset);
-      return builder.CreateAdd(stackPointer, offset, varnode.Id + ".addr");
+      return pointerForStackVarnode(builder, varnode);
     }
     return nullptr;
   }
 
   llvm::Value *readAddressTiedInput(llvm::IRBuilderBase &builder,
                                     const HeritageVarnode &varnode) {
-    llvm::Value *address = addressForAddressTiedInput(builder, varnode);
-    if (address == nullptr) {
+    llvm::Value *pointer = pointerForAddressTiedInput(builder, varnode);
+    if (pointer == nullptr) {
       return nullptr;
     }
-    auto *load = builder.CreateLoad(intType(varnode.Size),
-                                    memoryPointer(builder, address),
-                                    varnode.Id + ".mem");
+    auto *load =
+        builder.CreateLoad(intType(varnode.Size), pointer, varnode.Id + ".mem");
     load->setAlignment(llvm::Align(1));
     return load;
   }
@@ -1967,6 +2023,7 @@ private:
   std::unordered_set<std::string> MissingParameterWarnings;
   std::vector<PendingPhi> PendingPhis;
   llvm::GlobalVariable *Memory = nullptr;
+  StackFrame Stack;
   const HeritageOp *CurrentOp = nullptr;
 };
 

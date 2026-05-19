@@ -246,6 +246,16 @@ PHI：
   只建一个 `@RAX` global；更小的访问用 shift/trunc/mask 访问它的一部分。
 - `EAX` 写入会清空 `RAX` 高位这类语义由 P-Code 表达，这里不要用额外规则重复模拟。
 
+栈：
+
+- heritage 输出里普通 prologue/epilogue 的 `RSP` 加减通常已经被 Ghidra 抽成
+  `Stack[-offset]` 这类 frame-relative varnode。
+- `HeritageLowerer` 会扫描每个函数的负偏移 stack varnode，按覆盖范围在函数入口生成一个
+  byte-addressed `alloca`。例如最低访问到 `Stack[-0x38]` 时，栈帧至少覆盖 0x38 字节。
+- `Stack[-offset]` 的读写直接落到这个 alloca 的 GEP 上，不再通过 `@RSP + offset`
+  访问临时内存模型。
+- 正偏移 stack varnode 先不放进这个 alloca，避免把调用者栈参数或返回地址混成本函数本地栈。
+
 ### 10. 函数失败时恢复成 declaration
 
 `buildHeritageModuleWithBodies(...)` 对每个 `status == "ok"` 的函数尝试填 body。
