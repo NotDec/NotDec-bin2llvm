@@ -28,6 +28,26 @@ set(
   "Optional local sleigh source override. When set, FetchContent uses this source tree."
 )
 
+option(NOTDEC_BIN2LLVM_ENABLE_LIEF "Enable LIEF dependency for native binary parsing work." OFF)
+set(
+  NOTDEC_BIN2LLVM_LIEF_GIT_REPOSITORY
+  "https://github.com/lief-project/LIEF.git"
+  CACHE STRING
+  "Git repository used when fetching LIEF."
+)
+set(
+  NOTDEC_BIN2LLVM_LIEF_GIT_TAG
+  "0.17.6"
+  CACHE STRING
+  "Pinned LIEF release tag used by FetchContent."
+)
+set(
+  NOTDEC_BIN2LLVM_LIEF_SOURCE_DIR
+  ""
+  CACHE PATH
+  "Optional local LIEF source override. When set, FetchContent uses this source tree."
+)
+
 if (NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
   include(FetchContent)
 
@@ -59,6 +79,26 @@ if (NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
   if (TARGET sleigh_support)
     target_compile_options(sleigh_support PRIVATE -frtti)
   endif ()
+endif ()
+
+if (NOTDEC_BIN2LLVM_ENABLE_LIEF)
+  include(FetchContent)
+
+  # Start with the upstream release layout and keep the integration small.
+  set(LIEF_TESTS OFF CACHE BOOL "" FORCE)
+  set(LIEF_PYTHON_API OFF CACHE BOOL "" FORCE)
+  set(LIEF_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+  if (NOTDEC_BIN2LLVM_LIEF_SOURCE_DIR)
+    set(FETCHCONTENT_SOURCE_DIR_LIEF "${NOTDEC_BIN2LLVM_LIEF_SOURCE_DIR}")
+  endif ()
+
+  FetchContent_Declare(
+    lief
+    GIT_REPOSITORY "${NOTDEC_BIN2LLVM_LIEF_GIT_REPOSITORY}"
+    GIT_TAG "${NOTDEC_BIN2LLVM_LIEF_GIT_TAG}"
+  )
+  FetchContent_MakeAvailable(lief)
 endif ()
 
 include_directories("${PROJECT_SOURCE_DIR}/include")

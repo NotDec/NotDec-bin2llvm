@@ -79,3 +79,14 @@ if (NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
       notdec-bin2llvm-sleigh-bytes
   )
 endif ()
+
+if (NOTDEC_BIN2LLVM_ENABLE_LIEF)
+  add_executable(notdec-lief-elf
+    notdec-lief-elf.cpp
+  )
+
+  target_link_libraries(notdec-lief-elf
+    PRIVATE
+      LIEF::LIEF
+  )
+endif ()
