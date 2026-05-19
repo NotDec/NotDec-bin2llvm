@@ -55,10 +55,7 @@ if (NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
 
   target_link_libraries(notdec-bin2llvm-sleigh-bytes
     PUBLIC
-      notdec-bin2llvm-core
-      sleigh::sla
-      sleigh::decomp
-      sleigh::support
+      notdec-bin2llvm-sleigh
   )
 
   add_executable(notdec-sleigh-pcode
