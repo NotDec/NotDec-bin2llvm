@@ -574,9 +574,6 @@ private:
     if (!varnode.IsInput || !varnode.IsRegister || !varnode.RegisterName) {
       return false;
     }
-    if (varnode.HighVariable && varnode.HighVariable->rfind("unaff_", 0) == 0) {
-      return false;
-    }
     return true;
   }
 

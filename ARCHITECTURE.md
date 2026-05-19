@@ -247,8 +247,7 @@ PHI：
 - `EAX` 写入会清空 `RAX` 高位这类语义由 P-Code 表达，这里不要用额外规则重复模拟。
 - register varnode 的写入默认只进入函数内 SSA `Values`，不再同步写回 `@RAX/@RDX`
   这类 module-global register。只有读一个没有 SSA 值的 register input 时，才从
-  `RegisterStorage` 兜底读全局寄存器。`unaff_*` 这类 high variable 是 Ghidra 对未知入口值的命名，
-  不能当成真实寄存器状态去读全局变量。
+  `RegisterStorage` 兜底读全局寄存器。
 
 栈：
 
