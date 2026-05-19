@@ -570,6 +570,16 @@ private:
     return it != Program.VarnodeById.end() ? it->second : nullptr;
   }
 
+  bool canReadRegisterFallback(const HeritageVarnode &varnode) const {
+    if (!varnode.IsInput || !varnode.IsRegister || !varnode.RegisterName) {
+      return false;
+    }
+    if (varnode.HighVariable && varnode.HighVariable->rfind("unaff_", 0) == 0) {
+      return false;
+    }
+    return true;
+  }
+
   llvm::Value *read(const std::string &id) {
     if (auto it = Values.find(id); it != Values.end()) {
       const HeritageVarnode *varnode = varnodeFor(id);
@@ -583,7 +593,7 @@ private:
     if (varnode->IsConstant) {
       return llvm::ConstantInt::get(intType(varnode->Size), varnode->Offset);
     }
-    if (varnode->IsRegister && varnode->RegisterName) {
+    if (canReadRegisterFallback(*varnode)) {
       RegisterAccess access{varnode->Space, varnode->Offset, varnode->Size,
                             varnode->RegisterName};
       if (llvm::Value *value = Registers->read(Builder, access)) {
@@ -1536,7 +1546,7 @@ private:
     if (varnode != nullptr && varnode->IsConstant) {
       return llvm::ConstantInt::get(intType(byteSize), varnode->Offset);
     }
-    if (varnode != nullptr && varnode->IsRegister && varnode->RegisterName) {
+    if (varnode != nullptr && canReadRegisterFallback(*varnode)) {
       llvm::Instruction *terminator = incomingBlock->getTerminator();
       if (terminator != nullptr) {
         llvm::IRBuilder<> edgeBuilder(terminator);
