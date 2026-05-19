@@ -19,6 +19,7 @@
 
 #include <cctype>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -34,6 +35,47 @@ unsigned bitWidth(uint32_t byteSize) {
 
 bool isIntLikeType(const std::string &type) {
   return type == "int" || type == "uint" || type == "undefined4";
+}
+
+bool isLikelyX86_64Language(const std::string &language) {
+  return language.find("x86") != std::string::npos &&
+         language.find("64") != std::string::npos;
+}
+
+struct X86_64RegisterAlias {
+  const char *Name;
+  const char *Base;
+  uint32_t BaseSize;
+  uint32_t ByteOffset;
+};
+
+const X86_64RegisterAlias *findX86_64RegisterAlias(const std::string &name) {
+  static const X86_64RegisterAlias aliases[] = {
+      {"EAX", "RAX", 8, 0},  {"AX", "RAX", 8, 0},   {"AL", "RAX", 8, 0},
+      {"AH", "RAX", 8, 1},   {"EBX", "RBX", 8, 0},  {"BX", "RBX", 8, 0},
+      {"BL", "RBX", 8, 0},   {"BH", "RBX", 8, 1},   {"ECX", "RCX", 8, 0},
+      {"CX", "RCX", 8, 0},   {"CL", "RCX", 8, 0},   {"CH", "RCX", 8, 1},
+      {"EDX", "RDX", 8, 0},  {"DX", "RDX", 8, 0},   {"DL", "RDX", 8, 0},
+      {"DH", "RDX", 8, 1},   {"ESI", "RSI", 8, 0},  {"SI", "RSI", 8, 0},
+      {"SIL", "RSI", 8, 0},  {"EDI", "RDI", 8, 0},  {"DI", "RDI", 8, 0},
+      {"DIL", "RDI", 8, 0},  {"ESP", "RSP", 8, 0},  {"SP", "RSP", 8, 0},
+      {"SPL", "RSP", 8, 0},  {"EBP", "RBP", 8, 0},  {"BP", "RBP", 8, 0},
+      {"BPL", "RBP", 8, 0},  {"R8D", "R8", 8, 0},   {"R8W", "R8", 8, 0},
+      {"R8B", "R8", 8, 0},   {"R9D", "R9", 8, 0},   {"R9W", "R9", 8, 0},
+      {"R9B", "R9", 8, 0},   {"R10D", "R10", 8, 0}, {"R10W", "R10", 8, 0},
+      {"R10B", "R10", 8, 0}, {"R11D", "R11", 8, 0}, {"R11W", "R11", 8, 0},
+      {"R11B", "R11", 8, 0}, {"R12D", "R12", 8, 0}, {"R12W", "R12", 8, 0},
+      {"R12B", "R12", 8, 0}, {"R13D", "R13", 8, 0}, {"R13W", "R13", 8, 0},
+      {"R13B", "R13", 8, 0}, {"R14D", "R14", 8, 0}, {"R14W", "R14", 8, 0},
+      {"R14B", "R14", 8, 0}, {"R15D", "R15", 8, 0}, {"R15W", "R15", 8, 0},
+      {"R15B", "R15", 8, 0},
+  };
+  for (const X86_64RegisterAlias &alias : aliases) {
+    if (name == alias.Name) {
+      return &alias;
+    }
+  }
+  return nullptr;
 }
 
 void printPoisonFallbackError(llvm::StringRef functionName,
@@ -175,6 +217,7 @@ HeritageModuleSymbolPlan planModuleSymbols(const HeritageModule &module) {
 std::vector<RegisterInfo>
 registerInfosForHeritageProgram(const HeritageProgram &program) {
   std::vector<RegisterInfo> registers;
+  bool useX86_64Aliases = isLikelyX86_64Language(program.Program.Language);
   for (const HeritageVarnode &varnode : program.Varnodes) {
     if (!varnode.IsRegister || !varnode.RegisterName) {
       continue;
@@ -185,6 +228,36 @@ registerInfosForHeritageProgram(const HeritageProgram &program) {
     info.Size = varnode.Size;
     info.Name = *varnode.RegisterName;
     registers.push_back(std::move(info));
+
+    // Build register storage from the largest architectural register.  P-Code
+    // already models effects such as EAX zeroing the upper half of RAX; this
+    // only decides which LLVM global backs the byte range.
+    if (!useX86_64Aliases) {
+      continue;
+    }
+    const X86_64RegisterAlias *alias =
+        findX86_64RegisterAlias(*varnode.RegisterName);
+    if (alias == nullptr || varnode.Offset < alias->ByteOffset) {
+      continue;
+    }
+    RegisterInfo base;
+    base.Space = varnode.Space;
+    base.Offset = varnode.Offset - alias->ByteOffset;
+    base.Size = alias->BaseSize;
+    base.Name = alias->Base;
+    registers.push_back(std::move(base));
+  }
+  return registers;
+}
+
+std::vector<RegisterInfo>
+registerInfosForHeritageModule(const HeritageModule &module) {
+  std::vector<RegisterInfo> registers;
+  for (const HeritageModuleFunction &function : module.Functions) {
+    std::vector<RegisterInfo> functionRegisters =
+        registerInfosForHeritageProgram(function.Program);
+    registers.insert(registers.end(), functionRegisters.begin(),
+                     functionRegisters.end());
   }
   return registers;
 }
@@ -233,11 +306,16 @@ public:
   HeritageLowerer(llvm::LLVMContext &context, llvm::Module &module,
                   const HeritageProgram &program,
                   const HeritageModuleSymbolPlan *symbols = nullptr,
-                  llvm::Function *function = nullptr)
+                  llvm::Function *function = nullptr,
+                  RegisterStorage *registers = nullptr)
       : Context(context), Module(module), Program(program), Symbols(symbols),
-        Builder(context), Function(function),
-        Registers(context, module, registerInfosForHeritageProgram(program),
-                  false) {}
+        Builder(context), Function(function), Registers(registers) {
+    if (Registers == nullptr) {
+      OwnedRegisters = std::make_unique<RegisterStorage>(
+          context, module, registerInfosForHeritageProgram(program), false);
+      Registers = OwnedRegisters.get();
+    }
+  }
 
   bool lower(std::string &errorMessage) {
     if (!createFunction(errorMessage)) {
@@ -452,7 +530,7 @@ private:
     if (varnode->IsRegister && varnode->RegisterName) {
       RegisterAccess access{varnode->Space, varnode->Offset, varnode->Size,
                             varnode->RegisterName};
-      if (llvm::Value *value = Registers.read(Builder, access)) {
+      if (llvm::Value *value = Registers->read(Builder, access)) {
         return value;
       }
     }
@@ -477,8 +555,8 @@ private:
     if (varnode->IsRegister && varnode->RegisterName) {
       RegisterAccess access{varnode->Space, varnode->Offset, varnode->Size,
                             varnode->RegisterName};
-      if (Registers.hasRegister(access)) {
-        Registers.write(Builder, access, resized);
+      if (Registers->hasRegister(access)) {
+        Registers->write(Builder, access, resized);
       }
     }
     return true;
@@ -1238,7 +1316,7 @@ private:
       }
       RegisterAccess access{candidate.Space, candidate.Offset, candidate.Size,
                             candidate.RegisterName};
-      llvm::Value *value = Registers.read(builder, access);
+      llvm::Value *value = Registers->read(builder, access);
       if (value != nullptr) {
         return builder.CreateZExtOrTrunc(value, intType(8));
       }
@@ -1411,7 +1489,7 @@ private:
         llvm::IRBuilder<> edgeBuilder(terminator);
         RegisterAccess access{varnode->Space, varnode->Offset, varnode->Size,
                               varnode->RegisterName};
-        if (llvm::Value *value = Registers.read(edgeBuilder, access)) {
+        if (llvm::Value *value = Registers->read(edgeBuilder, access)) {
           return resizeForPhiIncoming(value, byteSize, incomingBlock);
         }
       }
@@ -1874,7 +1952,8 @@ private:
   const HeritageModuleSymbolPlan *Symbols = nullptr;
   llvm::IRBuilder<> Builder;
   llvm::Function *Function = nullptr;
-  RegisterStorage Registers;
+  std::unique_ptr<RegisterStorage> OwnedRegisters;
+  RegisterStorage *Registers = nullptr;
   std::unordered_map<std::string, llvm::BasicBlock *> BlockMap;
   std::unordered_map<std::string, llvm::Value *> Values;
   // Maps exported P-Code op ids to the LLVM instruction produced from them.
@@ -1934,6 +2013,8 @@ std::unique_ptr<llvm::Module> buildHeritageModuleWithBodies(
   stats = HeritageModuleLoweringStats{};
   auto module = std::make_unique<llvm::Module>(config.ModuleName, context);
   HeritageModuleSymbolPlan symbols = planModuleSymbols(heritageModule);
+  RegisterStorage registers(
+      context, *module, registerInfosForHeritageModule(heritageModule), false);
 
   for (size_t index = 0; index < heritageModule.Functions.size(); ++index) {
     declareInternalFunction(*module,
@@ -1970,7 +2051,7 @@ std::unique_ptr<llvm::Module> buildHeritageModuleWithBodies(
         module->getFunction(symbols.InternalNames[index]);
     std::string functionError;
     HeritageLowerer lowerer(context, *module, function.Program, &symbols,
-                            llvmFunction);
+                            llvmFunction, &registers);
     if (!lowerer.lower(functionError)) {
       restoreDeclaration(index);
       stats.Failures.push_back({function.Program.Function.Name,

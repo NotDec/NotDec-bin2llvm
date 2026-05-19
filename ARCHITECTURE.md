@@ -235,6 +235,17 @@ PHI：
 - `resizeForPhiIncoming(...)` 会尽量在 predecessor terminator 前插入 zext/trunc。
 - 找不到 incoming value 时当前使用 poison fallback，并打印 warning。
 
+寄存器：
+
+- register space 的全局变量由 `RegisterStorage` 统一管理。
+- 模块级 heritage lowering 先收集整个模块里的 register varnode，再给所有函数共享同一份
+  `RegisterStorage`。同一个寄存器不能因为出现在不同函数里就生成 `@R13`、`@R13.1`
+  这种多份状态。
+- 寄存器内存段拆分按“不会被重叠访问跨过的边界”来切。也就是不能存在一个访问范围把切分边界包在内部。
+  例如 x86-64 的 `RAX/EAX/AX/AL` 都落在 `RAX` 这个最大承载寄存器里，LLVM IR
+  只建一个 `@RAX` global；更小的访问用 shift/trunc/mask 访问它的一部分。
+- `EAX` 写入会清空 `RAX` 高位这类语义由 P-Code 表达，这里不要用额外规则重复模拟。
+
 ### 10. 函数失败时恢复成 declaration
 
 `buildHeritageModuleWithBodies(...)` 对每个 `status == "ok"` 的函数尝试填 body。
