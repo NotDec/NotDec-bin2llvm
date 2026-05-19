@@ -35,3 +35,20 @@ if (NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
       sleigh::support
   )
 endif ()
+
+if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
+  add_library(notdec-bin2llvm-native STATIC
+    LiefElfLoadImage.cpp
+  )
+
+  target_include_directories(notdec-bin2llvm-native
+    PUBLIC
+      "${PROJECT_SOURCE_DIR}/include"
+  )
+
+  target_link_libraries(notdec-bin2llvm-native
+    PUBLIC
+      notdec-bin2llvm-sleigh
+      LIEF::LIEF
+  )
+endif ()

@@ -3,6 +3,7 @@
 #include <sleigh/Support.h>
 #include <sleigh/libsleigh.hh>
 
+#include <fstream>
 #include <map>
 #include <sstream>
 
@@ -173,6 +174,13 @@ findPspecPath(const SleighSpecOptions &options,
   return std::nullopt;
 }
 
+bool isXmlSlaFile(const std::filesystem::path &slaFilePath) {
+  std::ifstream input(slaFilePath);
+  char first = '\0';
+  input >> first;
+  return first == '<';
+}
+
 } // namespace
 
 std::optional<std::filesystem::path>
@@ -198,6 +206,11 @@ PcodeProgram collectSleighPcode(ghidra::LoadImage &loadImage,
   auto slaFilePath = findSleighSpecPath(options.SlaFileName, options.RootSlaDir);
   if (!slaFilePath) {
     errorStream << "could not find sla file: " << options.SlaFileName << '\n';
+    return program;
+  }
+  if (isXmlSlaFile(*slaFilePath)) {
+    errorStream << "libsla expects a compressed .sla file, got XML .sla: "
+                << slaFilePath->string() << '\n';
     return program;
   }
 

@@ -87,3 +87,15 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF)
       LIEF::LIEF
   )
 endif ()
+
+if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
+  add_executable(notdec-native-pcode
+    notdec-native-pcode.cpp
+  )
+
+  target_link_libraries(notdec-native-pcode
+    PRIVATE
+      notdec-bin2llvm-native
+      notdec-bin2llvm-sleigh-bytes
+  )
+endif ()
