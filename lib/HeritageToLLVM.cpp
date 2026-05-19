@@ -386,6 +386,20 @@ private:
     return Builder.CreateTrunc(value, targetType);
   }
 
+  llvm::Value *resizeToIntegerType(llvm::Value *value,
+                                   llvm::Type *targetType) {
+    if (value->getType() == targetType) {
+      return value;
+    }
+
+    unsigned sourceBits = value->getType()->getIntegerBitWidth();
+    unsigned targetBits = targetType->getIntegerBitWidth();
+    if (sourceBits < targetBits) {
+      return Builder.CreateZExt(value, targetType);
+    }
+    return Builder.CreateTrunc(value, targetType);
+  }
+
   const HeritageVarnode *varnodeFor(const std::string &id) const {
     auto it = Program.VarnodeById.find(id);
     return it != Program.VarnodeById.end() ? it->second : nullptr;
@@ -1483,19 +1497,27 @@ private:
   }
 
   llvm::Value *returnValueFor(const HeritageOp &op, std::string &errorMessage) {
-    if (Program.Function.ReturnType == "void") {
+    llvm::Type *returnType = Function->getReturnType();
+    if (returnType->isVoidTy()) {
       return nullptr;
     }
     if (op.Inputs.size() < 2) {
-      errorMessage = "RETURN with non-void function needs value input";
-      return nullptr;
+      llvm::errs() << "Warning: RETURN op " << op.Id << " in "
+                   << Program.Function.Name << " block " << op.Parent
+                   << " has no value input; returning undef for "
+                   << Program.Function.ReturnType << '\n';
+      return llvm::UndefValue::get(returnType);
     }
     llvm::Value *value = read(op.Inputs[1]);
     if (value == nullptr) {
       errorMessage = "RETURN reads unknown varnode";
       return nullptr;
     }
-    return resize(value, 4);
+    if (!returnType->isIntegerTy() || !value->getType()->isIntegerTy()) {
+      errorMessage = "RETURN value type is not integer";
+      return nullptr;
+    }
+    return resizeToIntegerType(value, returnType);
   }
 
   bool lowerBranch(const HeritageOp &op, const HeritageBlock &block,
