@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -21,6 +22,10 @@
 #include <utility>
 
 namespace {
+
+#ifndef NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR
+#define NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR "/sn640/ghidra"
+#endif
 
 struct CliOptions {
   std::string ElfPath;
@@ -32,7 +37,7 @@ struct CliOptions {
 
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0
-            << " <elf-file> <sla-file> -a <address> -l <length> "
+            << " <elf-file> [sla-file] -a <address> -l <length> "
                "-o <output.ll> [-p root-sla-dir] [-s pspec-file]\n";
 }
 
@@ -47,17 +52,20 @@ bool parseUint64(const std::string &text, uint64_t &value) {
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
-  if (argc < 8) {
+  if (argc < 7) {
     return std::nullopt;
   }
 
   CliOptions options;
   options.ElfPath = argv[1];
-  options.SpecOptions.SlaFileName = argv[2];
   bool hasAddress = false;
   bool hasLength = false;
+  int argIndex = 2;
+  if (argIndex < argc && std::string(argv[argIndex]).rfind("-", 0) != 0) {
+    options.SpecOptions.SlaFileName = argv[argIndex++];
+  }
 
-  for (int argIndex = 3; argIndex < argc; ++argIndex) {
+  for (; argIndex < argc; ++argIndex) {
     std::string flag = argv[argIndex];
     if (argIndex + 1 >= argc) {
       std::cerr << "flag has no value: " << flag << '\n';
@@ -104,6 +112,38 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
   return options;
 }
 
+std::filesystem::path defaultX86SpecRoot() {
+  return std::filesystem::path(NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR) /
+         "Ghidra/Processors/x86/data/languages";
+}
+
+bool resolveSpecOptions(const LIEF::ELF::Binary &binary,
+                        notdec::bin2llvm::SleighSpecOptions &options) {
+  if (!options.SlaFileName.empty()) {
+    return true;
+  }
+
+  if (binary.header().machine_type() != LIEF::ELF::ARCH::X86_64) {
+    std::cerr << "automatic sleigh spec selection only supports x86-64 ELF\n";
+    return false;
+  }
+
+  std::filesystem::path specRoot = defaultX86SpecRoot();
+  std::filesystem::path slaPath = specRoot / "x86-64.sla";
+  std::filesystem::path pspecPath = specRoot / "x86-64.pspec";
+  if (!std::filesystem::exists(slaPath)) {
+    std::cerr << "could not find auto-selected sla file: "
+              << slaPath.string() << '\n';
+    return false;
+  }
+
+  options.SlaFileName = slaPath.string();
+  if (!options.PspecFileName && std::filesystem::exists(pspecPath)) {
+    options.PspecFileName = pspecPath.string();
+  }
+  return true;
+}
+
 int writeModule(const llvm::Module &module, const std::string &outputPath) {
   std::error_code errorCode;
   llvm::raw_fd_ostream output(outputPath, errorCode);
@@ -131,6 +171,9 @@ int main(int argc, char **argv) {
         LIEF::ELF::Parser::parse(options->ElfPath);
     if (!binary) {
       std::cerr << "failed to parse ELF: " << options->ElfPath << '\n';
+      return 1;
+    }
+    if (!resolveSpecOptions(*binary, options->SpecOptions)) {
       return 1;
     }
 

@@ -108,4 +108,18 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
       notdec-bin2llvm-native
       notdec-bin2llvm-sleigh-bytes
   )
+
+  target_compile_definitions(notdec-native-llvm
+    PRIVATE
+      NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR="${NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR}"
+  )
+
+  if (BUILD_TESTING AND EXISTS "/bin/ls")
+    add_test(
+      NAME notdec.native_llvm.x86_64_smoke
+      COMMAND
+        /bin/bash -c
+        "$<TARGET_FILE:notdec-native-llvm> /bin/ls -a 0x6aa0 -l 1024 -o ${PROJECT_BINARY_DIR}/notdec-native-llvm-smoke.ll && ${NOTDEC_LLVM_INSTALL_DIR}/bin/llvm-as ${PROJECT_BINARY_DIR}/notdec-native-llvm-smoke.ll -o ${PROJECT_BINARY_DIR}/notdec-native-llvm-smoke.bc && ${NOTDEC_LLVM_INSTALL_DIR}/bin/opt -passes=verify ${PROJECT_BINARY_DIR}/notdec-native-llvm-smoke.bc -o ${PROJECT_BINARY_DIR}/notdec-native-llvm-smoke.opt.bc"
+    )
+  endif ()
 endif ()

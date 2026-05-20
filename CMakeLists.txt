@@ -4,6 +4,8 @@ project(notdec-bin2llvm
   VERSION 0.0.1
 )
 
+include(CTest)
+
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
 include(FindLLVM)

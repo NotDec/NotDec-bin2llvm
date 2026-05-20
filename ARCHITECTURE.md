@@ -347,6 +347,10 @@ notdec-native-pcode ...
 notdec-native-llvm ...
 ```
 
+`notdec-native-llvm` 对 x86-64 ELF 可以自动选择 spec，默认使用
+`/sn640/ghidra/Ghidra/Processors/x86/data/languages/x86-64.sla` 和同目录的
+`x86-64.pspec`。手动传入 `[sla-file]` 和 `-s <pspec-file>` 时仍会覆盖默认选择。
+
 执行顺序：
 
 1. `tools/SleighBytes.cpp` 用 Sleigh 从字节生成 `PcodeProgram`。
