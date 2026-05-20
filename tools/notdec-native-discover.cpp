@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
     notdec::bin2llvm::NativeProgramState state(*binary);
     notdec::bin2llvm::NativeAnalysisManager manager;
     manager.addAnalyzer(notdec::bin2llvm::createElfLoadAnalyzer());
+    manager.addAnalyzer(notdec::bin2llvm::createRelocationPltAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createElfEntryAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createElfSymbolAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createReportAnalyzer(std::cout));

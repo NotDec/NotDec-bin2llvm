@@ -49,10 +49,35 @@ struct NativeSectionInfo {
   bool Executable = false;
 };
 
+// NativeRelocationInfo records the subset of ELF relocation state that native
+// discovery needs.  It does not try to model every relocation side effect; it
+// keeps enough data to explain pointer reads and later classify PLT calls.
+struct NativeRelocationInfo {
+  uint64_t Address = 0;
+  uint32_t Type = 0;
+  std::string TypeName;
+  std::string SymbolName;
+  uint64_t SymbolValue = 0;
+  int64_t Addend = 0;
+  std::string TableKind;
+  std::string Status;
+  std::optional<uint64_t> ComputedValue;
+};
+
+// NativePltEntry links an executable PLT stub to the GOT slot and external
+// symbol it dispatches to.  Function decoding can later use this to report an
+// external call instead of treating the stub as an internal function.
+struct NativePltEntry {
+  uint64_t StubAddress = 0;
+  uint64_t GotAddress = 0;
+  std::string SymbolName;
+};
+
 // NativeProgramState is the shared state for the native lifter's first
 // AutoAnalysis pass.  It is intentionally much smaller than Ghidra's Program:
-// the current goal is to let analyzers exchange memory, section, symbol, and
-// function-seed facts without turning discovery into one large function.
+// the current goal is to let analyzers exchange memory, relocation, PLT,
+// section, symbol, and function-seed facts without turning discovery into one
+// large function.
 class NativeProgramState {
 public:
   explicit NativeProgramState(const LIEF::ELF::Binary &binary);
@@ -70,13 +95,25 @@ public:
   const std::map<std::string, uint64_t> &sourceCounts() const {
     return SourceCounts;
   }
+  const std::vector<NativeRelocationInfo> &relocations() const {
+    return Relocations;
+  }
+  const std::map<uint64_t, uint64_t> &relocatedPointers() const {
+    return RelocatedPointers;
+  }
+  const std::vector<NativePltEntry> &pltEntries() const { return PltEntries; }
   const std::vector<std::string> &notes() const { return Notes; }
 
   bool isExecutableAddress(uint64_t address) const;
   std::optional<uint64_t> readPointer(uint64_t address) const;
+  std::optional<uint64_t> readRawPointer(uint64_t address) const;
+  std::optional<std::string> lookupPltExternal(uint64_t address) const;
 
   bool addFunctionSeed(uint64_t address, uint64_t size, std::string name,
                        std::string source, NativeFunctionConfidence confidence);
+  void addRelocation(NativeRelocationInfo relocation);
+  void addRelocatedPointer(uint64_t address, uint64_t value);
+  void addPltEntry(NativePltEntry entry);
   void addNote(std::string note);
 
 private:
@@ -86,6 +123,9 @@ private:
   std::vector<NativeSectionInfo> Sections;
   std::map<uint64_t, NativeFunctionSeed> FunctionSeeds;
   std::map<std::string, uint64_t> SourceCounts;
+  std::vector<NativeRelocationInfo> Relocations;
+  std::map<uint64_t, uint64_t> RelocatedPointers;
+  std::vector<NativePltEntry> PltEntries;
   std::vector<std::string> Notes;
 };
 
@@ -115,6 +155,7 @@ private:
 };
 
 std::unique_ptr<NativeAnalyzer> createElfLoadAnalyzer();
+std::unique_ptr<NativeAnalyzer> createRelocationPltAnalyzer();
 std::unique_ptr<NativeAnalyzer> createElfEntryAnalyzer();
 std::unique_ptr<NativeAnalyzer> createElfSymbolAnalyzer();
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output);

@@ -2,6 +2,7 @@
 
 #include <LIEF/ELF/Binary.hpp>
 #include <LIEF/ELF/DynamicEntry.hpp>
+#include <LIEF/ELF/Relocation.hpp>
 #include <LIEF/ELF/Section.hpp>
 #include <LIEF/ELF/Segment.hpp>
 #include <LIEF/ELF/Symbol.hpp>
@@ -29,6 +30,38 @@ std::string hexAddress(uint64_t address) {
 NativeFunctionConfidence mergeConfidence(NativeFunctionConfidence lhs,
                                          NativeFunctionConfidence rhs) {
   return static_cast<int>(lhs) < static_cast<int>(rhs) ? lhs : rhs;
+}
+
+std::string relocationTypeName(const LIEF::ELF::Relocation &relocation) {
+  const char *name = LIEF::ELF::to_string(relocation.type());
+  if (name == nullptr) {
+    return "unknown";
+  }
+  return name;
+}
+
+std::string relocationPurposeName(const LIEF::ELF::Relocation &relocation) {
+  switch (relocation.purpose()) {
+  case LIEF::ELF::Relocation::PURPOSE::PLTGOT:
+    return "pltgot";
+  case LIEF::ELF::Relocation::PURPOSE::DYNAMIC:
+    return "dynamic";
+  case LIEF::ELF::Relocation::PURPOSE::OBJECT:
+    return "object";
+  case LIEF::ELF::Relocation::PURPOSE::NONE:
+    return "none";
+  }
+  return "unknown";
+}
+
+std::optional<NativeSectionInfo> findSection(const NativeProgramState &state,
+                                             const std::string &name) {
+  for (const NativeSectionInfo &section : state.sections()) {
+    if (section.Name == name) {
+      return section;
+    }
+  }
+  return std::nullopt;
 }
 
 void addDynamicScalarEntry(NativeProgramState &state, uint64_t address,
@@ -82,6 +115,111 @@ public:
     }
     if (executableRanges == 0) {
       state.addNote("ELF has no executable PT_LOAD segment");
+    }
+  }
+};
+
+class RelocationPltAnalyzer final : public NativeAnalyzer {
+public:
+  std::string name() const override { return "RelocationPltAnalyzer"; }
+  int priority() const override { return 20; }
+
+  void run(NativeProgramState &state, NativeAnalysisManager &) override {
+    if (state.binary().header().machine_type() != LIEF::ELF::ARCH::X86_64) {
+      state.addNote("relocation analysis currently supports x86-64 ELF only");
+      return;
+    }
+
+    std::vector<NativeRelocationInfo> jumpSlots;
+    for (const LIEF::ELF::Relocation &relocation :
+         state.binary().relocations()) {
+      NativeRelocationInfo info;
+      info.Address = relocation.address();
+      info.Type = LIEF::ELF::Relocation::to_value(relocation.type());
+      info.TypeName = relocationTypeName(relocation);
+      info.TableKind = relocationPurposeName(relocation);
+      info.Addend = relocation.addend();
+
+      if (const LIEF::ELF::Symbol *symbol = relocation.symbol()) {
+        info.SymbolName = symbol->name();
+        info.SymbolValue = symbol->value();
+      }
+
+      switch (relocation.type()) {
+      case LIEF::ELF::Relocation::TYPE::X86_64_RELATIVE:
+      case LIEF::ELF::Relocation::TYPE::X86_64_RELATIVE64:
+        info.ComputedValue = static_cast<uint64_t>(relocation.addend());
+        info.Status = "applied";
+        state.addRelocatedPointer(info.Address, *info.ComputedValue);
+        break;
+      case LIEF::ELF::Relocation::TYPE::X86_64_GLOB_DAT:
+        if (info.SymbolValue != 0) {
+          info.ComputedValue =
+              info.SymbolValue + static_cast<uint64_t>(relocation.addend());
+          state.addRelocatedPointer(info.Address, *info.ComputedValue);
+          info.Status = "applied";
+        } else {
+          info.Status = "external";
+        }
+        break;
+      case LIEF::ELF::Relocation::TYPE::X86_64_JUMP_SLOT:
+        info.Status = "external";
+        jumpSlots.push_back(info);
+        break;
+      case LIEF::ELF::Relocation::TYPE::X86_64_IRELATIVE:
+        info.ComputedValue = static_cast<uint64_t>(relocation.addend());
+        info.Status = "resolver";
+        break;
+      default:
+        info.Status = "unsupported";
+        break;
+      }
+
+      state.addRelocation(std::move(info));
+    }
+
+    addPltEntries(state, jumpSlots);
+  }
+
+private:
+  void addPltEntries(NativeProgramState &state,
+                     std::vector<NativeRelocationInfo> jumpSlots) {
+    if (jumpSlots.empty()) {
+      return;
+    }
+
+    std::sort(
+        jumpSlots.begin(), jumpSlots.end(),
+        [](const NativeRelocationInfo &lhs, const NativeRelocationInfo &rhs) {
+          return lhs.Address < rhs.Address;
+        });
+
+    std::optional<NativeSectionInfo> pltSec = findSection(state, ".plt.sec");
+    std::optional<NativeSectionInfo> plt = findSection(state, ".plt");
+    uint64_t stubStart = 0;
+    bool usesLegacyPlt = false;
+
+    if (pltSec && pltSec->Size / 16 >= jumpSlots.size()) {
+      stubStart = pltSec->Address;
+    } else if (plt && plt->Size >= 32 &&
+               (plt->Size / 16) - 1 >= jumpSlots.size()) {
+      stubStart = plt->Address + 16;
+      usesLegacyPlt = true;
+    } else {
+      state.addNote("could not match PLT stubs to jump-slot relocations");
+      return;
+    }
+
+    for (size_t index = 0; index < jumpSlots.size(); ++index) {
+      NativePltEntry entry;
+      entry.StubAddress = stubStart + index * 16;
+      entry.GotAddress = jumpSlots[index].Address;
+      entry.SymbolName = jumpSlots[index].SymbolName;
+      state.addPltEntry(std::move(entry));
+    }
+
+    if (usesLegacyPlt) {
+      state.addNote("PLT external mapping uses legacy .plt entries");
     }
   }
 };
@@ -210,6 +348,38 @@ public:
              << " size " << section.Size << '\n';
     }
 
+    Output << "  relocations:\n";
+    Output << "    total: " << state.relocations().size() << '\n';
+    Output << "    relocated pointers: " << state.relocatedPointers().size()
+           << '\n';
+    std::map<std::string, uint64_t> relocationStatusCounts;
+    std::map<std::string, uint64_t> relocationTypeCounts;
+    for (const NativeRelocationInfo &relocation : state.relocations()) {
+      ++relocationStatusCounts[relocation.Status];
+      ++relocationTypeCounts[relocation.TypeName];
+    }
+    Output << "    by status:\n";
+    for (const auto &[status, count] : relocationStatusCounts) {
+      Output << "      " << status << ": " << count << '\n';
+    }
+    Output << "    by type:\n";
+    for (const auto &[typeName, count] : relocationTypeCounts) {
+      Output << "      " << typeName << ": " << count << '\n';
+    }
+
+    Output << "  plt:\n";
+    Output << "    external symbols: " << state.pltEntries().size() << '\n';
+    size_t shownPltEntries = 0;
+    for (const NativePltEntry &entry : state.pltEntries()) {
+      if (shownPltEntries == 8) {
+        break;
+      }
+      Output << "    " << hexAddress(entry.StubAddress) << " -> "
+             << entry.SymbolName << " via GOT " << hexAddress(entry.GotAddress)
+             << '\n';
+      ++shownPltEntries;
+    }
+
     if (!state.notes().empty()) {
       Output << "  notes:\n";
       for (const std::string &note : state.notes()) {
@@ -309,6 +479,15 @@ bool NativeProgramState::isExecutableAddress(uint64_t address) const {
 
 std::optional<uint64_t>
 NativeProgramState::readPointer(uint64_t address) const {
+  auto relocated = RelocatedPointers.find(address);
+  if (relocated != RelocatedPointers.end()) {
+    return relocated->second;
+  }
+  return readRawPointer(address);
+}
+
+std::optional<uint64_t>
+NativeProgramState::readRawPointer(uint64_t address) const {
   for (const NativeMemoryRange &range : MemoryRanges) {
     if (range.Start > address) {
       break;
@@ -328,6 +507,16 @@ NativeProgramState::readPointer(uint64_t address) const {
                << (index * 8);
     }
     return value;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string>
+NativeProgramState::lookupPltExternal(uint64_t address) const {
+  for (const NativePltEntry &entry : PltEntries) {
+    if (entry.StubAddress == address) {
+      return entry.SymbolName;
+    }
   }
   return std::nullopt;
 }
@@ -368,6 +557,18 @@ bool NativeProgramState::addFunctionSeed(uint64_t address, uint64_t size,
   return inserted;
 }
 
+void NativeProgramState::addRelocation(NativeRelocationInfo relocation) {
+  Relocations.push_back(std::move(relocation));
+}
+
+void NativeProgramState::addRelocatedPointer(uint64_t address, uint64_t value) {
+  RelocatedPointers[address] = value;
+}
+
+void NativeProgramState::addPltEntry(NativePltEntry entry) {
+  PltEntries.push_back(std::move(entry));
+}
+
 void NativeProgramState::addNote(std::string note) {
   Notes.push_back(std::move(note));
 }
@@ -390,6 +591,10 @@ void NativeAnalysisManager::run(NativeProgramState &state) {
 
 std::unique_ptr<NativeAnalyzer> createElfLoadAnalyzer() {
   return std::make_unique<ElfLoadAnalyzer>();
+}
+
+std::unique_ptr<NativeAnalyzer> createRelocationPltAnalyzer() {
+  return std::make_unique<RelocationPltAnalyzer>();
 }
 
 std::unique_ptr<NativeAnalyzer> createElfEntryAnalyzer() {
