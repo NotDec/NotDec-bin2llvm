@@ -42,6 +42,8 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
     return PcodeOpcode::Call;
   case ghidra::CPUI_CALLIND:
     return PcodeOpcode::CallInd;
+  case ghidra::CPUI_CALLOTHER:
+    return PcodeOpcode::CallOther;
   case ghidra::CPUI_BRANCH:
     return PcodeOpcode::Branch;
   case ghidra::CPUI_BRANCHIND:

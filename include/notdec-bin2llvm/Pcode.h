@@ -15,6 +15,7 @@ enum class PcodeOpcode {
   Store,
   Call,
   CallInd,
+  CallOther,
   Branch,
   BranchInd,
   CBranch,

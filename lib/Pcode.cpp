@@ -14,6 +14,8 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
     return "CALL";
   case PcodeOpcode::CallInd:
     return "CALLIND";
+  case PcodeOpcode::CallOther:
+    return "CALLOTHER";
   case PcodeOpcode::Branch:
     return "BRANCH";
   case PcodeOpcode::BranchInd:

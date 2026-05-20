@@ -647,6 +647,7 @@ private:
       return lowerStore(op, errorMessage);
     case PcodeOpcode::Call:
     case PcodeOpcode::CallInd:
+    case PcodeOpcode::CallOther:
       return lowerHelperCall(op, errorMessage);
     case PcodeOpcode::Branch:
     case PcodeOpcode::BranchInd:
