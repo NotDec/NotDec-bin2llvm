@@ -36,6 +36,11 @@ struct NativeMemoryRange {
 struct NativeFunctionSeed {
   uint64_t Address = 0;
   uint64_t Size = 0;
+  // Function ranges are half-open: [RangeStart, RangeEnd).  This matches later
+  // decode-boundary checks and avoids inclusive-end overflow cases.
+  uint64_t RangeStart = 0;
+  uint64_t RangeEnd = 0;
+  std::string RangeSource;
   std::string PrimaryName;
   std::vector<std::string> Aliases;
   std::vector<std::string> Sources;
@@ -47,6 +52,21 @@ struct NativeSectionInfo {
   uint64_t Address = 0;
   uint64_t Size = 0;
   bool Executable = false;
+};
+
+// EhFrameStats keeps the first native .eh_frame reader observable without
+// exposing DWARF internals to the rest of native discovery.
+struct NativeEhFrameStats {
+  bool HasEhFrameHdr = false;
+  bool HasEhFrame = false;
+  uint64_t CieCount = 0;
+  uint64_t FdeCount = 0;
+  uint64_t ParsedFdeCount = 0;
+  uint64_t AddedSeedCount = 0;
+  uint64_t OverlappedSeedCount = 0;
+  uint64_t InvalidCount = 0;
+  uint64_t UnsupportedCount = 0;
+  std::vector<std::string> UnsupportedSamples;
 };
 
 // NativeRelocationInfo records the subset of ELF relocation state that native
@@ -102,6 +122,8 @@ public:
     return RelocatedPointers;
   }
   const std::vector<NativePltEntry> &pltEntries() const { return PltEntries; }
+  const NativeEhFrameStats &ehFrameStats() const { return EhFrameStats; }
+  NativeEhFrameStats &ehFrameStats() { return EhFrameStats; }
   const std::vector<std::string> &notes() const { return Notes; }
 
   bool isExecutableAddress(uint64_t address) const;
@@ -111,6 +133,8 @@ public:
 
   bool addFunctionSeed(uint64_t address, uint64_t size, std::string name,
                        std::string source, NativeFunctionConfidence confidence);
+  void addFunctionRange(uint64_t address, uint64_t start, uint64_t end,
+                        std::string source);
   void addRelocation(NativeRelocationInfo relocation);
   void addRelocatedPointer(uint64_t address, uint64_t value);
   void addPltEntry(NativePltEntry entry);
@@ -126,6 +150,7 @@ private:
   std::vector<NativeRelocationInfo> Relocations;
   std::map<uint64_t, uint64_t> RelocatedPointers;
   std::vector<NativePltEntry> PltEntries;
+  NativeEhFrameStats EhFrameStats;
   std::vector<std::string> Notes;
 };
 
@@ -158,6 +183,7 @@ std::unique_ptr<NativeAnalyzer> createElfLoadAnalyzer();
 std::unique_ptr<NativeAnalyzer> createRelocationPltAnalyzer();
 std::unique_ptr<NativeAnalyzer> createElfEntryAnalyzer();
 std::unique_ptr<NativeAnalyzer> createElfSymbolAnalyzer();
+std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer();
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output);
 
 } // namespace notdec::bin2llvm
