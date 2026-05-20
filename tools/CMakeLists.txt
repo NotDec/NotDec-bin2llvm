@@ -98,4 +98,14 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
       notdec-bin2llvm-native
       notdec-bin2llvm-sleigh-bytes
   )
+
+  add_executable(notdec-native-llvm
+    notdec-native-llvm.cpp
+  )
+
+  target_link_libraries(notdec-native-llvm
+    PRIVATE
+      notdec-bin2llvm-native
+      notdec-bin2llvm-sleigh-bytes
+  )
 endif ()

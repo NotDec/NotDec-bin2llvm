@@ -106,8 +106,9 @@ public:
 
 private:
   static bool isTerminator(PcodeOpcode opcode) {
-    return opcode == PcodeOpcode::Branch || opcode == PcodeOpcode::CBranch ||
-           opcode == PcodeOpcode::Return;
+    return opcode == PcodeOpcode::Branch ||
+           opcode == PcodeOpcode::BranchInd ||
+           opcode == PcodeOpcode::CBranch || opcode == PcodeOpcode::Return;
   }
 
   std::string blockName(uint64_t address) {
@@ -145,6 +146,7 @@ private:
     for (size_t index = 0; index < program.Ops.size(); ++index) {
       const PcodeOpView &op = program.Ops[index];
       if (op.Opcode == PcodeOpcode::Branch ||
+          op.Opcode == PcodeOpcode::BranchInd ||
           op.Opcode == PcodeOpcode::CBranch) {
         if (auto target = directTarget(op, 0)) {
           addBlockStart(starts, firstOpForAddress, *target);
@@ -239,6 +241,13 @@ private:
                            blockForTarget(*target), falseBlock);
       return true;
     }
+
+    case PcodeOpcode::BranchInd:
+      if (!requireInputCount(op, 1, errorMessage)) {
+        return false;
+      }
+      Builder.CreateBr(exitBlock());
+      return true;
 
     case PcodeOpcode::Return:
       if (!requireInputCount(op, 1, errorMessage)) {
@@ -343,6 +352,12 @@ private:
       break;
     case PcodeOpcode::IntMult:
       result = Builder.CreateMul(lhs, rhs);
+      break;
+    case PcodeOpcode::IntDiv:
+      result = Builder.CreateUDiv(lhs, rhs);
+      break;
+    case PcodeOpcode::IntRem:
+      result = Builder.CreateURem(lhs, rhs);
       break;
     case PcodeOpcode::IntAnd:
       result = Builder.CreateAnd(lhs, rhs);
@@ -474,6 +489,24 @@ private:
     return true;
   }
 
+  bool lowerAddOverflow(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 2, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *lhs = read(op.Inputs[0]);
+    llvm::Value *rhs = resize(read(op.Inputs[1]), op.Inputs[0].Size);
+    llvm::Intrinsic::ID intrinsicId =
+        op.Opcode == PcodeOpcode::IntCarry
+            ? llvm::Intrinsic::uadd_with_overflow
+            : llvm::Intrinsic::sadd_with_overflow;
+    llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+        &Module, intrinsicId, {lhs->getType()});
+    llvm::Value *call = Builder.CreateCall(intrinsic, {lhs, rhs});
+    write(*op.Output, Builder.CreateExtractValue(call, 1));
+    return true;
+  }
+
   bool lowerBoolNegate(const PcodeOpView &op, std::string &errorMessage) {
     if (!op.Output || !requireInputCount(op, 1, errorMessage)) {
       return false;
@@ -481,6 +514,31 @@ private:
 
     llvm::Value *input = asCondition(read(op.Inputs[0]));
     llvm::Value *result = Builder.CreateNot(input);
+    write(*op.Output, result);
+    return true;
+  }
+
+  bool lowerBoolBinary(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 2, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *lhs = asCondition(read(op.Inputs[0]));
+    llvm::Value *rhs = asCondition(read(op.Inputs[1]));
+    llvm::Value *result = nullptr;
+    switch (op.Opcode) {
+    case PcodeOpcode::BoolAnd:
+      result = Builder.CreateAnd(lhs, rhs);
+      break;
+    case PcodeOpcode::BoolOr:
+      result = Builder.CreateOr(lhs, rhs);
+      break;
+    case PcodeOpcode::BoolXor:
+      result = Builder.CreateXor(lhs, rhs);
+      break;
+    default:
+      return false;
+    }
     write(*op.Output, result);
     return true;
   }
@@ -544,6 +602,37 @@ private:
     return true;
   }
 
+  bool lowerHelperCall(const PcodeOpView &op, std::string &errorMessage) {
+    llvm::Type *returnType = llvm::Type::getVoidTy(Context);
+    std::string helperName = "notdec_pcode_" + op.OpcodeName + "_void";
+    if (op.Output) {
+      returnType = intType(op.Output->Size);
+      helperName = "notdec_pcode_" + op.OpcodeName + "_i" +
+                   std::to_string(bitWidth(op.Output->Size));
+    }
+
+    std::vector<llvm::Value *> args;
+    args.reserve(op.Inputs.size());
+    for (const VarnodeView &input : op.Inputs) {
+      if (input.Space == "ram") {
+        args.push_back(
+            llvm::ConstantInt::get(intType(input.Size), input.Offset));
+      } else {
+        args.push_back(read(input));
+      }
+    }
+
+    auto *helperType = llvm::FunctionType::get(returnType, {}, true);
+    llvm::FunctionCallee helper =
+        Module.getOrInsertFunction(helperName, helperType);
+    llvm::CallInst *call = Builder.CreateCall(helper, args);
+    if (!op.Output) {
+      return true;
+    }
+    write(*op.Output, call);
+    return true;
+  }
+
   bool lowerOp(const PcodeOpView &op, std::string &errorMessage) {
     switch (op.Opcode) {
     case PcodeOpcode::Copy:
@@ -556,7 +645,11 @@ private:
       return lowerLoad(op, errorMessage);
     case PcodeOpcode::Store:
       return lowerStore(op, errorMessage);
+    case PcodeOpcode::Call:
+    case PcodeOpcode::CallInd:
+      return lowerHelperCall(op, errorMessage);
     case PcodeOpcode::Branch:
+    case PcodeOpcode::BranchInd:
     case PcodeOpcode::CBranch:
     case PcodeOpcode::Return:
       errorMessage = op.OpcodeName + " appeared in non-terminator position";
@@ -564,6 +657,8 @@ private:
     case PcodeOpcode::IntAdd:
     case PcodeOpcode::IntSub:
     case PcodeOpcode::IntMult:
+    case PcodeOpcode::IntDiv:
+    case PcodeOpcode::IntRem:
     case PcodeOpcode::IntAnd:
     case PcodeOpcode::IntOr:
     case PcodeOpcode::IntXor:
@@ -585,10 +680,17 @@ private:
       return lowerSubpiece(op, errorMessage);
     case PcodeOpcode::Popcount:
       return lowerPopcount(op, errorMessage);
+    case PcodeOpcode::IntCarry:
+    case PcodeOpcode::IntSCarry:
+      return lowerAddOverflow(op, errorMessage);
     case PcodeOpcode::IntSBorrow:
       return lowerSignedBorrow(op, errorMessage);
     case PcodeOpcode::BoolNegate:
       return lowerBoolNegate(op, errorMessage);
+    case PcodeOpcode::BoolAnd:
+    case PcodeOpcode::BoolOr:
+    case PcodeOpcode::BoolXor:
+      return lowerBoolBinary(op, errorMessage);
     case PcodeOpcode::Unsupported:
       break;
     }

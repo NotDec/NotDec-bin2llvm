@@ -38,8 +38,14 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
     return PcodeOpcode::Load;
   case ghidra::CPUI_STORE:
     return PcodeOpcode::Store;
+  case ghidra::CPUI_CALL:
+    return PcodeOpcode::Call;
+  case ghidra::CPUI_CALLIND:
+    return PcodeOpcode::CallInd;
   case ghidra::CPUI_BRANCH:
     return PcodeOpcode::Branch;
+  case ghidra::CPUI_BRANCHIND:
+    return PcodeOpcode::BranchInd;
   case ghidra::CPUI_CBRANCH:
     return PcodeOpcode::CBranch;
   case ghidra::CPUI_RETURN:
@@ -58,6 +64,10 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
     return PcodeOpcode::IntSExt;
   case ghidra::CPUI_INT_ADD:
     return PcodeOpcode::IntAdd;
+  case ghidra::CPUI_INT_CARRY:
+    return PcodeOpcode::IntCarry;
+  case ghidra::CPUI_INT_SCARRY:
+    return PcodeOpcode::IntSCarry;
   case ghidra::CPUI_INT_SUB:
     return PcodeOpcode::IntSub;
   case ghidra::CPUI_INT_SBORROW:
@@ -76,8 +86,18 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
     return PcodeOpcode::IntSRight;
   case ghidra::CPUI_INT_MULT:
     return PcodeOpcode::IntMult;
+  case ghidra::CPUI_INT_DIV:
+    return PcodeOpcode::IntDiv;
+  case ghidra::CPUI_INT_REM:
+    return PcodeOpcode::IntRem;
   case ghidra::CPUI_BOOL_NEGATE:
     return PcodeOpcode::BoolNegate;
+  case ghidra::CPUI_BOOL_AND:
+    return PcodeOpcode::BoolAnd;
+  case ghidra::CPUI_BOOL_OR:
+    return PcodeOpcode::BoolOr;
+  case ghidra::CPUI_BOOL_XOR:
+    return PcodeOpcode::BoolXor;
   case ghidra::CPUI_PIECE:
     return PcodeOpcode::Piece;
   case ghidra::CPUI_SUBPIECE:

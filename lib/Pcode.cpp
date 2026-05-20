@@ -10,8 +10,14 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
     return "LOAD";
   case PcodeOpcode::Store:
     return "STORE";
+  case PcodeOpcode::Call:
+    return "CALL";
+  case PcodeOpcode::CallInd:
+    return "CALLIND";
   case PcodeOpcode::Branch:
     return "BRANCH";
+  case PcodeOpcode::BranchInd:
+    return "BRANCHIND";
   case PcodeOpcode::CBranch:
     return "CBRANCH";
   case PcodeOpcode::Return:
@@ -30,6 +36,10 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
     return "INT_SEXT";
   case PcodeOpcode::IntAdd:
     return "INT_ADD";
+  case PcodeOpcode::IntCarry:
+    return "INT_CARRY";
+  case PcodeOpcode::IntSCarry:
+    return "INT_SCARRY";
   case PcodeOpcode::IntSub:
     return "INT_SUB";
   case PcodeOpcode::IntSBorrow:
@@ -48,8 +58,18 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
     return "INT_SRIGHT";
   case PcodeOpcode::IntMult:
     return "INT_MULT";
+  case PcodeOpcode::IntDiv:
+    return "INT_DIV";
+  case PcodeOpcode::IntRem:
+    return "INT_REM";
   case PcodeOpcode::BoolNegate:
     return "BOOL_NEGATE";
+  case PcodeOpcode::BoolAnd:
+    return "BOOL_AND";
+  case PcodeOpcode::BoolOr:
+    return "BOOL_OR";
+  case PcodeOpcode::BoolXor:
+    return "BOOL_XOR";
   case PcodeOpcode::Piece:
     return "PIECE";
   case PcodeOpcode::Subpiece:
