@@ -89,6 +89,24 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF)
 endif ()
 
 if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
+  add_executable(notdec-native-discover
+    notdec-native-discover.cpp
+  )
+
+  target_link_libraries(notdec-native-discover
+    PRIVATE
+      notdec-bin2llvm-native
+  )
+
+  if (BUILD_TESTING AND EXISTS "/bin/ls")
+    add_test(
+      NAME notdec.native_discover.x86_64_smoke
+      COMMAND
+        /bin/bash -c
+        "$<TARGET_FILE:notdec-native-discover> /bin/ls > ${PROJECT_BINARY_DIR}/notdec-native-discover-smoke.txt"
+    )
+  endif ()
+
   add_executable(notdec-native-pcode
     notdec-native-pcode.cpp
   )

@@ -39,6 +39,7 @@ endif ()
 if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
   add_library(notdec-bin2llvm-native STATIC
     LiefElfLoadImage.cpp
+    NativeAnalysis.cpp
   )
 
   target_include_directories(notdec-bin2llvm-native
