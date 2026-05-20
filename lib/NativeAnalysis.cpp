@@ -109,6 +109,21 @@ void addUnsupportedEhFrameSample(NativeEhFrameStats &stats,
   }
 }
 
+void addEhFrameHdrUnsupportedSample(NativeEhFrameStats &stats,
+                                    const std::string &sample) {
+  ++stats.HdrUnsupportedCount;
+  if (stats.UnsupportedSamples.size() < 8) {
+    stats.UnsupportedSamples.push_back(".eh_frame_hdr " + sample);
+  }
+}
+
+void addEhFrameHdrMismatchSample(NativeEhFrameStats &stats,
+                                 const std::string &sample) {
+  if (stats.HdrMismatchSamples.size() < 8) {
+    stats.HdrMismatchSamples.push_back(sample);
+  }
+}
+
 void addDynamicScalarEntry(NativeProgramState &state, uint64_t address,
                            const std::string &source) {
   if (address == 0) {
@@ -357,7 +372,9 @@ public:
 
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
     NativeEhFrameStats &stats = state.ehFrameStats();
-    stats.HasEhFrameHdr = findSection(state, ".eh_frame_hdr").has_value();
+    std::optional<NativeSectionInfo> hdrSection =
+        findSection(state, ".eh_frame_hdr");
+    stats.HasEhFrameHdr = hdrSection.has_value();
 
     std::optional<NativeSectionInfo> section = findSection(state, ".eh_frame");
     if (!section) {
@@ -374,6 +391,20 @@ public:
 
     EhFrameReader reader(state, *section, bytes);
     reader.parse();
+
+    if (hdrSection) {
+      std::vector<uint8_t> hdrBytes;
+      if (!readBytes(state, hdrSection->Address, hdrSection->Size, hdrBytes)) {
+        ++stats.HdrInvalidCount;
+        state.addNote(".eh_frame_hdr section is not readable");
+      } else {
+        EhFrameHdrReader hdrReader(state, *hdrSection, hdrBytes);
+        hdrReader.parse();
+        if (stats.ParsedEhFrameHdr) {
+          compareEhFrameHdr(state);
+        }
+      }
+    }
   }
 
 private:
@@ -383,6 +414,7 @@ private:
   static constexpr uint8_t DW_EH_PE_sdata4 = 0x0b;
   static constexpr uint8_t DW_EH_PE_sdata8 = 0x0c;
   static constexpr uint8_t DW_EH_PE_pcrel = 0x10;
+  static constexpr uint8_t DW_EH_PE_datarel = 0x30;
   static constexpr uint8_t DW_EH_PE_omit = 0xff;
 
   struct CieInfo {
@@ -430,7 +462,7 @@ private:
         if (ciePointer == 0) {
           parseCie(recordOffset, contentOffset + 4, recordEnd);
         } else {
-          parseFde(contentOffset, ciePointer, offset, recordEnd);
+          parseFde(recordOffset, contentOffset, ciePointer, offset, recordEnd);
         }
         offset = recordEnd;
       }
@@ -625,6 +657,20 @@ private:
         }
         value = delta < 0 ? fieldAddress - static_cast<uint64_t>(-delta)
                           : fieldAddress + static_cast<uint64_t>(delta);
+      } else if ((encoding & 0x70) == DW_EH_PE_datarel) {
+        int64_t delta =
+            (encoding & 0x08) != 0 ? rawSigned : static_cast<int64_t>(value);
+        if (delta < 0 && Section.Address < static_cast<uint64_t>(-delta)) {
+          return false;
+        }
+        if (delta > 0 &&
+            Section.Address >
+                std::numeric_limits<uint64_t>::max() -
+                    static_cast<uint64_t>(delta)) {
+          return false;
+        }
+        value = delta < 0 ? Section.Address - static_cast<uint64_t>(-delta)
+                          : Section.Address + static_cast<uint64_t>(delta);
       } else if ((encoding & 0x70) != 0) {
         addUnsupportedEhFrameSample(stats(), "unsupported encoding " +
                                                  encodingName(encoding));
@@ -736,8 +782,8 @@ private:
       Cies[cie.Address] = cie;
     }
 
-    void parseFde(size_t ciePointerOffset, uint32_t ciePointer,
-                  size_t offset, size_t recordEnd) {
+    void parseFde(size_t recordOffset, size_t ciePointerOffset,
+                  uint32_t ciePointer, size_t offset, size_t recordEnd) {
       ++stats().FdeCount;
       uint64_t ciePointerAddress = recordAddress(ciePointerOffset);
       if (ciePointerAddress < ciePointer) {
@@ -793,6 +839,7 @@ private:
       }
 
       State.addFunctionRange(pcBegin, pcBegin, pcEnd, "eh-frame");
+      stats().FrameFdes.push_back({pcBegin, recordAddress(recordOffset)});
       ++stats().ParsedFdeCount;
     }
 
@@ -801,6 +848,271 @@ private:
     const std::vector<uint8_t> &Bytes;
     std::map<uint64_t, CieInfo> Cies;
   };
+
+  class EhFrameHdrReader {
+  public:
+    EhFrameHdrReader(NativeProgramState &state,
+                     const NativeSectionInfo &section,
+                     const std::vector<uint8_t> &bytes)
+        : State(state), Section(section), Bytes(bytes) {}
+
+    void parse() {
+      size_t offset = 0;
+      uint8_t version = 0;
+      uint8_t ehFramePtrEncoding = 0;
+      uint8_t fdeCountEncoding = 0;
+      uint8_t tableEncoding = 0;
+      if (!readU8(offset, version) || !readU8(offset, ehFramePtrEncoding) ||
+          !readU8(offset, fdeCountEncoding) || !readU8(offset, tableEncoding)) {
+        ++stats().HdrInvalidCount;
+        return;
+      }
+      if (version != 1) {
+        ++stats().HdrInvalidCount;
+        State.addNote(".eh_frame_hdr has unsupported version " +
+                      std::to_string(version));
+        return;
+      }
+
+      uint64_t ignoredEhFramePtr = 0;
+      if (!decodeEncodedAddress(offset, ehFramePtrEncoding,
+                                ignoredEhFramePtr)) {
+        ++stats().HdrInvalidCount;
+        return;
+      }
+      uint64_t fdeCount = 0;
+      if (!decodeEncodedScalar(offset, fdeCountEncoding, fdeCount)) {
+        ++stats().HdrInvalidCount;
+        return;
+      }
+      stats().HdrFdeCount = fdeCount;
+
+      if (tableEncoding == DW_EH_PE_omit) {
+        addEhFrameHdrUnsupportedSample(stats(), "omitted FDE table");
+        return;
+      }
+      for (uint64_t index = 0; index < fdeCount; ++index) {
+        uint64_t initialLocation = 0;
+        uint64_t fdeAddress = 0;
+        if (!decodeEncodedAddress(offset, tableEncoding, initialLocation) ||
+            !decodeEncodedAddress(offset, tableEncoding, fdeAddress)) {
+          ++stats().HdrInvalidCount;
+          return;
+        }
+        stats().HdrEntries.push_back({initialLocation, fdeAddress});
+      }
+      stats().HdrTableEntries = stats().HdrEntries.size();
+      stats().ParsedEhFrameHdr = true;
+    }
+
+  private:
+    NativeEhFrameStats &stats() { return State.ehFrameStats(); }
+
+    uint64_t fieldAddress(size_t offset) const {
+      return Section.Address + static_cast<uint64_t>(offset);
+    }
+
+    bool readU8(size_t &offset, uint8_t &value) const {
+      if (offset >= Bytes.size()) {
+        return false;
+      }
+      value = Bytes[offset++];
+      return true;
+    }
+
+    bool readUnsigned(size_t &offset, uint8_t size, uint64_t &value) const {
+      if (size > 8 || size > Bytes.size() || offset > Bytes.size() - size) {
+        return false;
+      }
+      value = 0;
+      for (uint8_t index = 0; index < size; ++index) {
+        value |= static_cast<uint64_t>(Bytes[offset + index]) << (index * 8);
+      }
+      offset += size;
+      return true;
+    }
+
+    bool readSigned(size_t &offset, uint8_t size, int64_t &value) const {
+      uint64_t raw = 0;
+      if (!readUnsigned(offset, size, raw)) {
+        return false;
+      }
+      if (size == 8) {
+        value = static_cast<int64_t>(raw);
+        return true;
+      }
+      uint64_t signBit = uint64_t{1} << (size * 8 - 1);
+      if ((raw & signBit) != 0) {
+        raw |= (~uint64_t{0}) << (size * 8);
+      }
+      value = static_cast<int64_t>(raw);
+      return true;
+    }
+
+    std::string encodingName(uint8_t encoding) const {
+      std::ostringstream stream;
+      stream << "0x" << std::hex << static_cast<unsigned>(encoding);
+      return stream.str();
+    }
+
+    bool encodedSize(uint8_t encoding, uint8_t &size) {
+      if (encoding == DW_EH_PE_omit) {
+        size = 0;
+        return true;
+      }
+      switch (encoding & 0x0f) {
+      case DW_EH_PE_absptr:
+        size = State.pointerSize();
+        return size == 4 || size == 8;
+      case DW_EH_PE_udata4:
+      case DW_EH_PE_sdata4:
+        size = 4;
+        return true;
+      case DW_EH_PE_udata8:
+      case DW_EH_PE_sdata8:
+        size = 8;
+        return true;
+      default:
+        addEhFrameHdrUnsupportedSample(stats(), "unsupported encoding " +
+                                                    encodingName(encoding));
+        return false;
+      }
+    }
+
+    bool readEncodedRaw(size_t &offset, uint8_t encoding, uint64_t &value,
+                        int64_t &signedValue, uint64_t &address) {
+      if (encoding == DW_EH_PE_omit) {
+        return false;
+      }
+      uint8_t size = 0;
+      if (!encodedSize(encoding, size) || offset > Bytes.size() ||
+          size > Bytes.size() - offset) {
+        return false;
+      }
+
+      address = fieldAddress(offset);
+      value = 0;
+      signedValue = 0;
+      switch (encoding & 0x0f) {
+      case DW_EH_PE_absptr:
+      case DW_EH_PE_udata4:
+      case DW_EH_PE_udata8:
+        if (!readUnsigned(offset, size, value)) {
+          return false;
+        }
+        signedValue = static_cast<int64_t>(value);
+        return true;
+      case DW_EH_PE_sdata4:
+      case DW_EH_PE_sdata8:
+        if (!readSigned(offset, size, signedValue)) {
+          return false;
+        }
+        value = static_cast<uint64_t>(signedValue);
+        return true;
+      default:
+        return false;
+      }
+    }
+
+    bool applyRelative(uint8_t encoding, uint64_t rawValue,
+                       int64_t signedValue, uint64_t fieldAddr,
+                       uint64_t &value) {
+      uint8_t relative = encoding & 0x70;
+      if (relative == 0) {
+        value = rawValue;
+        return true;
+      }
+      if (relative != DW_EH_PE_pcrel && relative != DW_EH_PE_datarel) {
+        addEhFrameHdrUnsupportedSample(stats(), "unsupported encoding " +
+                                                    encodingName(encoding));
+        return false;
+      }
+
+      uint64_t base = relative == DW_EH_PE_pcrel ? fieldAddr : Section.Address;
+      int64_t delta =
+          (encoding & 0x08) != 0 ? signedValue : static_cast<int64_t>(rawValue);
+      if (delta < 0 && base < static_cast<uint64_t>(-delta)) {
+        return false;
+      }
+      if (delta > 0 &&
+          base > std::numeric_limits<uint64_t>::max() -
+                     static_cast<uint64_t>(delta)) {
+        return false;
+      }
+      value = delta < 0 ? base - static_cast<uint64_t>(-delta)
+                        : base + static_cast<uint64_t>(delta);
+      return true;
+    }
+
+    bool decodeEncodedAddress(size_t &offset, uint8_t encoding,
+                              uint64_t &value) {
+      uint64_t rawValue = 0;
+      int64_t signedValue = 0;
+      uint64_t address = 0;
+      return readEncodedRaw(offset, encoding, rawValue, signedValue, address) &&
+             applyRelative(encoding, rawValue, signedValue, address, value);
+    }
+
+    bool decodeEncodedScalar(size_t &offset, uint8_t encoding,
+                             uint64_t &value) {
+      uint64_t rawValue = 0;
+      int64_t signedValue = 0;
+      uint64_t address = 0;
+      if (!readEncodedRaw(offset, encoding, rawValue, signedValue, address)) {
+        return false;
+      }
+      if ((encoding & 0x08) != 0 && signedValue < 0) {
+        return false;
+      }
+      value = (encoding & 0x08) != 0 ? static_cast<uint64_t>(signedValue)
+                                     : rawValue;
+      return true;
+    }
+
+    NativeProgramState &State;
+    const NativeSectionInfo &Section;
+    const std::vector<uint8_t> &Bytes;
+  };
+
+  static void compareEhFrameHdr(NativeProgramState &state) {
+    NativeEhFrameStats &stats = state.ehFrameStats();
+    std::map<uint64_t, uint64_t> fdeByStart;
+    std::set<uint64_t> hdrStarts;
+    for (const NativeEhFrameFdeInfo &fde : stats.FrameFdes) {
+      fdeByStart[fde.PcBegin] = fde.FdeAddress;
+    }
+
+    for (const NativeEhFrameHdrEntry &entry : stats.HdrEntries) {
+      hdrStarts.insert(entry.InitialLocation);
+      auto frameFde = fdeByStart.find(entry.InitialLocation);
+      if (frameFde == fdeByStart.end()) {
+        ++stats.HdrMissingInFrame;
+        addEhFrameHdrMismatchSample(
+            stats, "hdr start missing in .eh_frame: " +
+                       hexAddress(entry.InitialLocation));
+        continue;
+      }
+      ++stats.HdrMatchedStarts;
+      if (frameFde->second == entry.FdeAddress) {
+        ++stats.HdrFdeAddressMatches;
+      } else {
+        ++stats.HdrFdeAddressMismatches;
+        addEhFrameHdrMismatchSample(
+            stats, "hdr FDE address mismatch for " +
+                       hexAddress(entry.InitialLocation) + ": hdr " +
+                       hexAddress(entry.FdeAddress) + ", frame " +
+                       hexAddress(frameFde->second));
+      }
+    }
+
+    for (const NativeEhFrameFdeInfo &fde : stats.FrameFdes) {
+      if (hdrStarts.find(fde.PcBegin) == hdrStarts.end()) {
+        ++stats.HdrExtraFrameFdes;
+        addEhFrameHdrMismatchSample(
+            stats, ".eh_frame FDE missing in hdr: " + hexAddress(fde.PcBegin));
+      }
+    }
+  }
 };
 
 class ReportAnalyzer final : public NativeAnalyzer {
@@ -884,13 +1196,34 @@ public:
            << '\n';
     Output << "    .eh_frame: " << (ehFrame.HasEhFrame ? "yes" : "no")
            << '\n';
+    Output << "    parsed hdr: "
+           << (ehFrame.ParsedEhFrameHdr ? "yes" : "no") << '\n';
     Output << "    CIE: " << ehFrame.CieCount << '\n';
     Output << "    FDE: " << ehFrame.FdeCount << '\n';
     Output << "    parsed FDE: " << ehFrame.ParsedFdeCount << '\n';
+    Output << "    hdr FDE count: " << ehFrame.HdrFdeCount << '\n';
+    Output << "    hdr table entries: " << ehFrame.HdrTableEntries << '\n';
+    Output << "    hdr matched starts: " << ehFrame.HdrMatchedStarts << '\n';
+    Output << "    hdr missing in frame: " << ehFrame.HdrMissingInFrame
+           << '\n';
+    Output << "    frame FDEs missing in hdr: " << ehFrame.HdrExtraFrameFdes
+           << '\n';
+    Output << "    hdr FDE address matches: "
+           << ehFrame.HdrFdeAddressMatches << '\n';
+    Output << "    hdr FDE address mismatches: "
+           << ehFrame.HdrFdeAddressMismatches << '\n';
     Output << "    added seeds: " << ehFrame.AddedSeedCount << '\n';
     Output << "    overlapped seeds: " << ehFrame.OverlappedSeedCount << '\n';
     Output << "    invalid: " << ehFrame.InvalidCount << '\n';
     Output << "    unsupported: " << ehFrame.UnsupportedCount << '\n';
+    Output << "    hdr invalid: " << ehFrame.HdrInvalidCount << '\n';
+    Output << "    hdr unsupported: " << ehFrame.HdrUnsupportedCount << '\n';
+    if (!ehFrame.HdrMismatchSamples.empty()) {
+      Output << "    hdr mismatch samples:\n";
+      for (const std::string &sample : ehFrame.HdrMismatchSamples) {
+        Output << "      " << sample << '\n';
+      }
+    }
     if (!ehFrame.UnsupportedSamples.empty()) {
       Output << "    unsupported samples:\n";
       for (const std::string &sample : ehFrame.UnsupportedSamples) {

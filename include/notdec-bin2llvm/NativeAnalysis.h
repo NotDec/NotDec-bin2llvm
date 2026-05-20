@@ -54,18 +54,41 @@ struct NativeSectionInfo {
   bool Executable = false;
 };
 
+struct NativeEhFrameFdeInfo {
+  uint64_t PcBegin = 0;
+  uint64_t FdeAddress = 0;
+};
+
+struct NativeEhFrameHdrEntry {
+  uint64_t InitialLocation = 0;
+  uint64_t FdeAddress = 0;
+};
+
 // EhFrameStats keeps the first native .eh_frame reader observable without
 // exposing DWARF internals to the rest of native discovery.
 struct NativeEhFrameStats {
   bool HasEhFrameHdr = false;
   bool HasEhFrame = false;
+  bool ParsedEhFrameHdr = false;
   uint64_t CieCount = 0;
   uint64_t FdeCount = 0;
   uint64_t ParsedFdeCount = 0;
   uint64_t AddedSeedCount = 0;
   uint64_t OverlappedSeedCount = 0;
+  uint64_t HdrFdeCount = 0;
+  uint64_t HdrTableEntries = 0;
+  uint64_t HdrMatchedStarts = 0;
+  uint64_t HdrMissingInFrame = 0;
+  uint64_t HdrExtraFrameFdes = 0;
+  uint64_t HdrFdeAddressMatches = 0;
+  uint64_t HdrFdeAddressMismatches = 0;
+  uint64_t HdrInvalidCount = 0;
+  uint64_t HdrUnsupportedCount = 0;
   uint64_t InvalidCount = 0;
   uint64_t UnsupportedCount = 0;
+  std::vector<NativeEhFrameFdeInfo> FrameFdes;
+  std::vector<NativeEhFrameHdrEntry> HdrEntries;
+  std::vector<std::string> HdrMismatchSamples;
   std::vector<std::string> UnsupportedSamples;
 };
 
