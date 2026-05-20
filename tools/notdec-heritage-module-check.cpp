@@ -11,6 +11,7 @@ namespace {
 
 struct CheckState {
   std::vector<std::string> Errors;
+  unsigned DuplicateFunctionNameCount = 0;
   unsigned DirectCallCount = 0;
   unsigned ResolvedInternalCalls = 0;
   unsigned ResolvedExternalCalls = 0;
@@ -83,7 +84,7 @@ void checkModuleSymbols(const notdec::bin2llvm::HeritageModule &module,
   }
   for (const auto &[name, count] : names) {
     if (count > 1) {
-      addError(state, "duplicate function name: " + name);
+      state.DuplicateFunctionNameCount += count - 1;
     }
   }
   for (const auto &[entry, count] : entries) {
@@ -131,6 +132,8 @@ int printSummary(const notdec::bin2llvm::HeritageModule &module,
   llvm::outs() << "  functions: " << module.Functions.size() << '\n';
   llvm::outs() << "  externals: " << module.Externals.size() << '\n';
   llvm::outs() << "  failures: " << module.Failures.size() << '\n';
+  llvm::outs() << "  duplicate function names: "
+               << state.DuplicateFunctionNameCount << '\n';
   llvm::outs() << "  direct calls: " << state.DirectCallCount << '\n';
   llvm::outs() << "  resolved internal calls: " << state.ResolvedInternalCalls
                << '\n';

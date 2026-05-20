@@ -2097,7 +2097,8 @@ std::unique_ptr<llvm::Module> buildHeritageModuleWithBodies(
         heritageModule.Functions[index].Program.Function;
     if (llvm::Function *existing =
             module->getFunction(symbols.InternalNames[index])) {
-      existing->eraseFromParent();
+      existing->deleteBody();
+      return;
     }
     declareInternalFunction(*module, function, symbols.InternalNames[index]);
   };
