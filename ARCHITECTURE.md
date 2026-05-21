@@ -20,15 +20,18 @@ Ghidra 那种完整数据库：
    成真实函数。
 3. `NativeBasicBlock`：函数内的最小 block 范围和 successor 地址。
 4. `NativeXref`：统一记录 flow/call/data/string 四类引用，支持 from/to 查询。
+5. `NativeInstruction`：已接受的指令，保留地址、长度、字节和来源。
 
 `NativeProgramState` 现在提供：
 
 - `functionAt(...)`、`functionContaining(...)`
 - `xrefsFrom(...)`、`xrefsTo(...)`
-- `addFunction(...)`、`addBasicBlock(...)`、`addXref(...)`
+- `instructionAt(...)`、`instructionsInRange(...)`
+- `addFunction(...)`、`addBasicBlock(...)`、`addXref(...)`、`addInstruction(...)`
 
 `notdec-native-discover` 的 report 会输出 confirmed function、basic block 和 xref
-数量。当前 recursive decode 还没接入，所以 Bench2 运行时这些数量仍可能是 0。
+数量，也会输出 instruction 数量。当前 recursive decode 还没接入，所以 Bench2 运行时这些
+数量仍可能是 0。
 
 ## 目录
 

@@ -1198,6 +1198,8 @@ public:
       blockCount += function.Blocks.size();
     }
     Output << "    basic blocks: " << blockCount << '\n';
+    Output << "  instructions:\n";
+    Output << "    total: " << state.instructions().size() << '\n';
 
     std::map<NativeXrefKind, uint64_t> xrefKindCounts;
     for (const NativeXref &xref : state.xrefs()) {
@@ -1471,6 +1473,29 @@ NativeProgramState::xrefsTo(uint64_t address) const {
   return result;
 }
 
+const NativeInstruction *
+NativeProgramState::instructionAt(uint64_t address) const {
+  auto iterator = Instructions.find(address);
+  if (iterator == Instructions.end()) {
+    return nullptr;
+  }
+  return &iterator->second;
+}
+
+std::vector<const NativeInstruction *>
+NativeProgramState::instructionsInRange(uint64_t start, uint64_t end) const {
+  std::vector<const NativeInstruction *> result;
+  if (start >= end) {
+    return result;
+  }
+
+  for (auto iterator = Instructions.lower_bound(start);
+       iterator != Instructions.end() && iterator->first < end; ++iterator) {
+    result.push_back(&iterator->second);
+  }
+  return result;
+}
+
 bool NativeProgramState::addFunctionSeed(uint64_t address, uint64_t size,
                                          std::string name, std::string source,
                                          NativeFunctionConfidence confidence) {
@@ -1579,6 +1604,27 @@ void NativeProgramState::addXref(NativeXref xref) {
   Xrefs.push_back(std::move(xref));
   XrefsByFrom[Xrefs[index].From].push_back(index);
   XrefsByTo[Xrefs[index].To].push_back(index);
+}
+
+bool NativeProgramState::addInstruction(NativeInstruction instruction) {
+  if (instruction.Address == 0 || instruction.Size == 0) {
+    return false;
+  }
+  if (instruction.Address >
+      std::numeric_limits<uint64_t>::max() - instruction.Size) {
+    return false;
+  }
+  if (!executableRangeContains(*this, instruction.Address, instruction.end())) {
+    Notes.push_back("instruction outside executable range at " +
+                    hexAddress(instruction.Address));
+    return false;
+  }
+  if (!instruction.Bytes.empty() && instruction.Bytes.size() != instruction.Size) {
+    Notes.push_back("instruction byte length mismatch at " +
+                    hexAddress(instruction.Address));
+    return false;
+  }
+  return Instructions.emplace(instruction.Address, std::move(instruction)).second;
 }
 
 void NativeProgramState::addFunctionRange(uint64_t address, uint64_t start,

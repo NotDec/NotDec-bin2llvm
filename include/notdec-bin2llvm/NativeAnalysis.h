@@ -157,6 +157,20 @@ struct NativeXref {
   std::string Source;
 };
 
+// NativeInstruction records decoded instruction facts accepted by native
+// analyzers.  It deliberately stores raw bytes and a light display mnemonic,
+// while operands and P-Code stay out until recursive decode has real users for
+// them.
+struct NativeInstruction {
+  uint64_t Address = 0;
+  uint64_t Size = 0;
+  std::vector<uint8_t> Bytes;
+  std::string Mnemonic;
+  std::string Source;
+
+  uint64_t end() const { return Address + Size; }
+};
+
 // NativeProgramState is the shared state for the native lifter's first
 // AutoAnalysis pass.  It is intentionally much smaller than Ghidra's Program:
 // the current goal is to let analyzers exchange memory, relocation, PLT,
@@ -192,6 +206,9 @@ public:
     return Functions;
   }
   const std::vector<NativeXref> &xrefs() const { return Xrefs; }
+  const std::map<uint64_t, NativeInstruction> &instructions() const {
+    return Instructions;
+  }
   const std::vector<std::string> &notes() const { return Notes; }
 
   bool isExecutableAddress(uint64_t address) const;
@@ -202,12 +219,16 @@ public:
   const NativeFunction *functionContaining(uint64_t address) const;
   std::vector<const NativeXref *> xrefsFrom(uint64_t address) const;
   std::vector<const NativeXref *> xrefsTo(uint64_t address) const;
+  const NativeInstruction *instructionAt(uint64_t address) const;
+  std::vector<const NativeInstruction *>
+  instructionsInRange(uint64_t start, uint64_t end) const;
 
   bool addFunctionSeed(uint64_t address, uint64_t size, std::string name,
                        std::string source, NativeFunctionConfidence confidence);
   bool addFunction(NativeFunction function);
   bool addBasicBlock(uint64_t functionEntry, NativeBasicBlock block);
   void addXref(NativeXref xref);
+  bool addInstruction(NativeInstruction instruction);
   void addFunctionRange(uint64_t address, uint64_t start, uint64_t end,
                         std::string source);
   void addRelocation(NativeRelocationInfo relocation);
@@ -230,6 +251,7 @@ private:
   std::vector<NativeXref> Xrefs;
   std::map<uint64_t, std::vector<size_t>> XrefsByFrom;
   std::map<uint64_t, std::vector<size_t>> XrefsByTo;
+  std::map<uint64_t, NativeInstruction> Instructions;
   std::vector<std::string> Notes;
 };
 
