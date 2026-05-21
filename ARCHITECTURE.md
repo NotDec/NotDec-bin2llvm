@@ -110,7 +110,8 @@ external/NotDec-bin2llvm/
 - `tools/notdec-native-llvm.cpp`：native P-Code 到 LLVM IR 的入口。可以继续用
   `-a <address> -l <length>` 手工指定范围，也可以用 `-f <entry>`、`-n <name>` 或
   `--all-confirmed` 先跑 native discovery，从 confirmed function 取入口到保守 range end，
-  再生成 `.ll`。`--all-confirmed` 会跳过当前 lowering 还不能通过 verifier 的函数。
+  再生成 `.ll`。P-Code lowering 会把 LLVM `%entry` 作为单独跳板，真实机器入口放在
+  `bb_<address>`，所以 CFG 可以有回边跳到机器入口。
 - `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。
 - `include/notdec-bin2llvm/ModuleBuilder.h`、`lib/ModuleBuilder.cpp`、`tools/notdec-bin2llvm.cpp`：最早的 demo module 入口，只生成一个空函数。
 

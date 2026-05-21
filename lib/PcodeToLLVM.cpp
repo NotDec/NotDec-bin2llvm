@@ -62,6 +62,7 @@ public:
     }
 
     buildBasicBlocks(program);
+    Builder.CreateBr(BlockForStart[BlockStarts.front()]);
 
     for (size_t blockIndex = 0; blockIndex < BlockStarts.size(); ++blockIndex) {
       size_t start = BlockStarts[blockIndex];
@@ -162,14 +163,8 @@ private:
     for (size_t index = 0; index < BlockStarts.size(); ++index) {
       size_t start = BlockStarts[index];
       uint64_t address = program.Ops[start].Address;
-      llvm::BasicBlock *block = nullptr;
-      if (index == 0) {
-        block = Builder.GetInsertBlock();
-        block->setName("entry");
-      } else {
-        block =
-            llvm::BasicBlock::Create(Context, blockName(address), &Function);
-      }
+      llvm::BasicBlock *block =
+          llvm::BasicBlock::Create(Context, blockName(address), &Function);
       BlockForStart[start] = block;
       BlockForAddress.try_emplace(address, block);
     }

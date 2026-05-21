@@ -34,6 +34,7 @@
   - [x] 已补 `notdec-native-llvm -f <entry>`，按 native confirmed function 入口生成 LLVM IR。
   - [x] 已补 `notdec-native-llvm -n <name>`，按 native confirmed function 名字生成 LLVM IR。
   - [x] 已补 `notdec-native-llvm --all-confirmed`，把可验证 confirmed functions 输出到同一 LLVM module。
+  - [x] 已补 P-Code lowering 的 LLVM entry 跳板，允许 CFG 回边跳到机器入口 block。
 - [ ] 阶段 7: Bench2 regression
 
 ## 记录规则
