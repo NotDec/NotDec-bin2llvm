@@ -36,7 +36,8 @@ function、basic block、instruction、xref 和 unresolved indirect flow 数量�
 `--summary-json` 时会跳过文本 report，输出同口径的最小 JSON summary，供 Bench2 smoke
 做机器检查。`--functions-json` 输出已确认函数列表，包含入口、保守范围、名字、来源和
 block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址、大小和 successor。
-`--xrefs-json` 输出当前 direct control-flow xref 列表。
+`--xrefs-json` 输出当前 direct control-flow xref 列表。`--instructions-json` 输出已接受
+指令的地址、大小、字节、显示文本和来源。
 
 当前 recursive decode 只接入了一个很小的 Sleigh 线性指令解码入口：
 
@@ -94,7 +95,7 @@ external/NotDec-bin2llvm/
   `--summary-json` 打印 function、block、instruction、xref 和 unresolved indirect flow
   的汇总 JSON，`--functions-json` 打印 confirmed function 列表 JSON，`--blocks-json`
   打印 confirmed function 下的 basic block 列表 JSON，`--xrefs-json` 打印 xref 列表
-  JSON。
+  JSON，`--instructions-json` 打印 instruction 列表 JSON。
 - `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。
 - `include/notdec-bin2llvm/ModuleBuilder.h`、`lib/ModuleBuilder.cpp`、`tools/notdec-bin2llvm.cpp`：最早的 demo module 入口，只生成一个空函数。
 

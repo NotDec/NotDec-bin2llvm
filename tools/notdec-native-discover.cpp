@@ -22,6 +22,7 @@ enum class OutputMode {
   FunctionsJson,
   BlocksJson,
   XrefsJson,
+  InstructionsJson,
 };
 
 struct CliOptions {
@@ -35,6 +36,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
@@ -57,6 +59,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::BlocksJson;
   } else if (mode == "--xrefs-json") {
     options.Mode = OutputMode::XrefsJson;
+  } else if (mode == "--instructions-json") {
+    options.Mode = OutputMode::InstructionsJson;
   } else {
     return std::nullopt;
   }
@@ -67,6 +71,17 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
 std::string hexString(uint64_t value) {
   std::ostringstream stream;
   stream << "0x" << std::hex << value;
+  return stream.str();
+}
+
+std::string bytesHex(const std::vector<uint8_t> &bytes) {
+  std::ostringstream stream;
+  stream << std::hex;
+  for (uint8_t byte : bytes) {
+    stream.width(2);
+    stream.fill('0');
+    stream << static_cast<unsigned>(byte);
+  }
   return stream.str();
 }
 
@@ -251,6 +266,32 @@ void printXrefsJson(std::ostream &output,
   output << "}\n";
 }
 
+void printInstructionsJson(
+    std::ostream &output,
+    const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"instructions\": [";
+  bool firstInstruction = true;
+  for (const auto &[address, instruction] : state.instructions()) {
+    (void)address;
+    output << (firstInstruction ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"address\": \"" << hexString(instruction.Address)
+           << "\",\n";
+    output << "      \"size\": " << instruction.Size << ",\n";
+    output << "      \"bytes\": \"" << bytesHex(instruction.Bytes) << "\",\n";
+    output << "      \"text\": \"" << jsonEscape(instruction.Mnemonic)
+           << "\",\n";
+    output << "      \"source\": \"" << jsonEscape(instruction.Source)
+           << "\"\n";
+    output << "    }";
+    firstInstruction = false;
+  }
+  output << (firstInstruction ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << state.instructions().size() << "\n";
+  output << "}\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -289,6 +330,8 @@ int main(int argc, char **argv) {
       printBlocksJson(std::cout, state);
     } else if (options->Mode == OutputMode::XrefsJson) {
       printXrefsJson(std::cout, state);
+    } else if (options->Mode == OutputMode::InstructionsJson) {
+      printInstructionsJson(std::cout, state);
     }
     return 0;
   } catch (const std::exception &error) {
