@@ -20,6 +20,7 @@ enum class OutputMode {
   TextReport,
   SummaryJson,
   MemoryJson,
+  RelocationsJson,
   SeedsJson,
   FunctionsJson,
   BlocksJson,
@@ -48,6 +49,7 @@ void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0 << " <elf-file>\n";
   std::cerr << "       " << argv0 << " --summary-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --memory-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --relocations-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --seeds-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
@@ -160,6 +162,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::SummaryJson;
   } else if (mode == "--memory-json") {
     options.Mode = OutputMode::MemoryJson;
+  } else if (mode == "--relocations-json") {
+    options.Mode = OutputMode::RelocationsJson;
   } else if (mode == "--seeds-json") {
     options.Mode = OutputMode::SeedsJson;
   } else if (mode == "--functions-json") {
@@ -351,6 +355,43 @@ void printMemoryJson(std::ostream &output,
   output << (firstSection ? "],\n" : "\n  ],\n");
   output << "  \"ranges_count\": " << state.memoryRanges().size() << ",\n";
   output << "  \"sections_count\": " << state.sections().size() << "\n";
+  output << "}\n";
+}
+
+void printRelocationsJson(std::ostream &output,
+                          const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"relocations\": [";
+  bool firstRelocation = true;
+  for (const notdec::bin2llvm::NativeRelocationInfo &relocation :
+       state.relocations()) {
+    output << (firstRelocation ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"address\": \"" << hexString(relocation.Address)
+           << "\",\n";
+    output << "      \"type\": " << relocation.Type << ",\n";
+    output << "      \"type_name\": \"" << jsonEscape(relocation.TypeName)
+           << "\",\n";
+    output << "      \"symbol\": \"" << jsonEscape(relocation.SymbolName)
+           << "\",\n";
+    output << "      \"symbol_value\": \""
+           << hexString(relocation.SymbolValue) << "\",\n";
+    output << "      \"addend\": " << relocation.Addend << ",\n";
+    output << "      \"table\": \"" << jsonEscape(relocation.TableKind)
+           << "\",\n";
+    output << "      \"status\": \"" << jsonEscape(relocation.Status)
+           << "\",\n";
+    output << "      \"computed_value\": ";
+    if (relocation.ComputedValue) {
+      output << "\"" << hexString(*relocation.ComputedValue) << "\"\n";
+    } else {
+      output << "null\n";
+    }
+    output << "    }";
+    firstRelocation = false;
+  }
+  output << (firstRelocation ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << state.relocations().size() << "\n";
   output << "}\n";
 }
 
@@ -687,6 +728,8 @@ int main(int argc, char **argv) {
       printSummaryJson(std::cout, state);
     } else if (options->Mode == OutputMode::MemoryJson) {
       printMemoryJson(std::cout, state);
+    } else if (options->Mode == OutputMode::RelocationsJson) {
+      printRelocationsJson(std::cout, state);
     } else if (options->Mode == OutputMode::SeedsJson) {
       printSeedsJson(std::cout, state);
     } else if (options->Mode == OutputMode::FunctionsJson) {
