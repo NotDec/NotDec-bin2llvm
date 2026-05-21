@@ -64,6 +64,15 @@ require_file() {
   fi
 }
 
+require_no_unresolved_indirect_calls() {
+  local file="$1"
+  local name="$2"
+  if grep -Eq '"indirect call":[[:space:]]*[1-9]' "$file"; then
+    echo "$name: unresolved indirect calls remain in $file" >&2
+    exit 1
+  fi
+}
+
 require_ir_pattern() {
   local file="$1"
   local pattern="$2"
@@ -165,6 +174,7 @@ for index in "${!TARGET_NAMES[@]}"; do
     echo "$name: no confirmed functions in $summary" >&2
     exit 1
   fi
+  require_no_unresolved_indirect_calls "$summary" "$name"
 
   "$NATIVE_LLVM" "$target" --all-confirmed -o "$ll" \
     >"$native_stdout" 2>"$native_stderr"

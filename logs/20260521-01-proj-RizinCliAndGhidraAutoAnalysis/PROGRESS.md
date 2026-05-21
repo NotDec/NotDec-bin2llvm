@@ -20,6 +20,7 @@
   - [x] 已补已知函数入口边界：direct branch 到其他 function seed 时不并入当前函数。
   - [x] 已补已知 function seed range 对 Sleigh decode 字节数的截断，减少跨函数线性 decode。
   - [x] 已补 `functionContaining(...)` 按 confirmed basic block 判断，避免 block 空洞误判。
+  - [x] 已补来源可追到外部 `GLOB_DAT` GOT slot 的 `CALLIND` xref，并从 unresolved indirect call 中移除。
   - [ ] 尚未解析间接 branch/call 目标，也还没有完整函数边界判断。
 - [ ] 阶段 4: CLI query
   - [x] 已补 `notdec-native-discover --summary-json` 最小 summary 输出。
@@ -54,6 +55,7 @@
   - [x] 已补 libuv 单函数 `-f 0x9df0` 和 `-n uv_key_delete` 的 smoke 检查。
   - [x] 已补三个目标 `_init` 里 `__gmon_start__` GOT indirect call 的 smoke pattern。
   - [x] 已补 Bench2 smoke 禁止 `CALL` / `CALLIND` / `CALLOTHER` helper 回退。
+  - [x] 已补 Bench2 smoke 禁止当前三目标保留 unresolved indirect call。
 
 ## 记录规则
 

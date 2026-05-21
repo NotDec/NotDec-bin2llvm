@@ -55,6 +55,9 @@ block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址
 - analyzer 会从 P-Code 里识别直接 `CALL`、`BRANCH`、`CBRANCH`。第一个输入是 `ram` 地址时，
   写入 `NativeXref`；direct `CALL` 命中 PLT stub 时来源记为 `sleigh-pcode-plt-call`，
   并且不作为内部 function seed 入队。直接 branch 目标也会写入当前 block 的 `Successors`。
+- analyzer 对 `CALLIND` 会先做一层很窄的来源追踪：如果输入能追到带外部符号名的
+  `X86_64_GLOB_DAT` GOT slot，会记录 `sleigh-pcode-got-indirect-call` call xref，并且
+  不再把该点计入 unresolved。其他 indirect call 仍记录 unresolved。
 - analyzer 也会从非控制流 P-Code 里识别 direct `ram` varnode。如果目标不是 executable
   address，会记录为 data 或 string xref。目标在可读、不可写、不可执行内存里，并且像
   NUL 结尾 ASCII C 字符串时，记为 `NativeXrefKind::String`，来源是
@@ -69,7 +72,7 @@ block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址
   前缀。`CBRANCH` block 同时记录直接目标和下一条指令 fallthrough，`BRANCH` block 只记录直接
   目标，`BRANCHIND` / `RETURN` block 暂不记录 successor。
 - `CALLIND` / `BRANCHIND` 会写入 `NativeUnresolvedFlow`，report 按 indirect call / indirect
-  branch 统计。这里不猜目标，只保留后续跳表和函数指针分析需要的样本。
+  branch 统计。这里不猜普通函数指针和跳表，只保留后续分析需要的样本。
 - direct `CALL` 的可执行目标会作为 `sleigh-direct-call` function seed 写入，并进入同一个本地
   decode 队列。本轮总 decode 上限是 16 个 seed，已入队或已 decode 的地址不会重复处理。
 - direct `BRANCH` / `CBRANCH` 的可执行 successor 会作为同一个 function entry 下的 block
@@ -129,8 +132,9 @@ external/NotDec-bin2llvm/
   P-Code 已经保留交换语义。未命中目标和其他 `CALLOTHER` 仍走 helper call。
 - `scripts/bench2-native-smoke.sh`：Bench2 native smoke 入口。它固定跑 `vsftpd`、
   `libuv.so.1.0.0`、`memcached`，先用 `notdec-native-discover --summary-json` 确认
-  native discovery 至少产出 confirmed function，再用 `notdec-native-llvm --all-confirmed`
-  生成 IR，并用本地 LLVM 22 的 `llvm-as` 和 `opt -passes=verify` 验证；随后还会检查
+  native discovery 至少产出 confirmed function，且当前三目标不再保留 unresolved indirect
+  call，再用 `notdec-native-llvm --all-confirmed` 生成 IR，并用本地 LLVM 22 的 `llvm-as`
+  和 `opt -passes=verify` 验证；随后还会检查
   若干固定 IR pattern，确认最近补上的 direct call / PLT external call 没有退回 helper，
   并禁止最近清掉的 `CALL` / `CALLIND` / `CALLOTHER` helper 回到 Bench2 smoke 输出。
 - `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。

@@ -1496,7 +1496,15 @@ private:
   addDirectControlFlow(NativeProgramState &state, const PcodeProgram &program) {
     DirectControlFlowResult result;
     std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> seenXrefs;
+    // This is intentionally local to one decoded P-Code range.  It only keeps
+    // enough provenance to recognize guarded GOT indirect calls.
+    std::map<std::string, uint64_t> sourceRamByVarnode;
     for (const PcodeOpView &op : program.Ops) {
+      if (op.Opcode == PcodeOpcode::Load) {
+        trackLoadSourceRam(sourceRamByVarnode, op);
+      }
+      trackCopySourceRam(sourceRamByVarnode, op);
+
       std::optional<uint64_t> target = directRamTarget(op);
       if (op.Opcode == PcodeOpcode::Call) {
         if (target && state.isExecutableAddress(*target)) {
@@ -1510,6 +1518,15 @@ private:
           addUniqueAddress(result.CallTargets, *target);
         }
       } else if (op.Opcode == PcodeOpcode::CallInd) {
+        if (auto gotAddress = callIndGotSource(sourceRamByVarnode, op)) {
+          if (isExternalGlobDatSymbolAt(state, *gotAddress)) {
+            addUniqueXref(state, seenXrefs, op.Address, *gotAddress,
+                          NativeXrefKind::Call,
+                          "sleigh-pcode-got-indirect-call");
+            continue;
+          }
+        }
+
         NativeUnresolvedFlow flow;
         flow.Address = op.Address;
         flow.Kind = NativeUnresolvedFlowKind::IndirectCall;
@@ -1542,6 +1559,78 @@ private:
       }
     }
     return result;
+  }
+
+  static void trackCopySourceRam(std::map<std::string, uint64_t> &sources,
+                                 const PcodeOpView &op) {
+    if (op.Opcode != PcodeOpcode::Copy || !op.Output ||
+        op.Inputs.size() != 1) {
+      return;
+    }
+
+    std::string outputKey = varnodeStorageKey(*op.Output);
+    if (auto source = sourceRam(sources, op.Inputs[0])) {
+      sources[outputKey] = *source;
+      return;
+    }
+    sources.erase(outputKey);
+  }
+
+  static void trackLoadSourceRam(std::map<std::string, uint64_t> &sources,
+                                 const PcodeOpView &op) {
+    if (op.Opcode != PcodeOpcode::Load || !op.Output ||
+        op.Inputs.size() != 2 || op.Inputs[0].Space != "const") {
+      return;
+    }
+
+    std::string outputKey = varnodeStorageKey(*op.Output);
+    if (auto source = sourceRam(sources, op.Inputs[1])) {
+      sources[outputKey] = *source;
+      return;
+    }
+    sources.erase(outputKey);
+  }
+
+  static std::optional<uint64_t>
+  callIndGotSource(const std::map<std::string, uint64_t> &sources,
+                   const PcodeOpView &op) {
+    if (op.Inputs.size() != 1) {
+      return std::nullopt;
+    }
+    return sourceRam(sources, op.Inputs[0]);
+  }
+
+  static std::optional<uint64_t>
+  sourceRam(const std::map<std::string, uint64_t> &sources,
+            const VarnodeView &varnode) {
+    if (varnode.Space == "ram") {
+      return varnode.Offset;
+    }
+    auto it = sources.find(varnodeStorageKey(varnode));
+    if (it == sources.end()) {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+  static std::string varnodeStorageKey(const VarnodeView &varnode) {
+    std::ostringstream stream;
+    stream << varnode.Space << ':' << std::hex << varnode.Offset << ':'
+           << std::dec << varnode.Size;
+    return stream.str();
+  }
+
+  static bool isExternalGlobDatSymbolAt(const NativeProgramState &state,
+                                        uint64_t address) {
+    for (const NativeRelocationInfo &relocation : state.relocations()) {
+      if (relocation.Address != address ||
+          relocation.TypeName != "X86_64_GLOB_DAT" ||
+          relocation.Status != "external" || relocation.SymbolName.empty()) {
+        continue;
+      }
+      return true;
+    }
+    return false;
   }
 
   static void addDirectDataXrefs(
