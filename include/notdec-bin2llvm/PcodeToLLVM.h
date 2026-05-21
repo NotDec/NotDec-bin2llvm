@@ -28,9 +28,10 @@ struct PcodeLoweringConfig {
   // even if the stub bytes were decoded earlier.
   std::unordered_map<uint64_t, std::string> ExternalCallTargets;
 
-  // GOT-slot-to-symbol table for guarded indirect external calls such as
-  // __gmon_start__.  The lowerer only uses this when a CALLIND input can be
-  // traced back to a direct RAM varnode at that GOT address.
+  // GOT-slot-to-symbol table for guarded indirect external calls or tail jumps
+  // such as __gmon_start__ and _ITM_deregisterTMCloneTable.  The lowerer only
+  // uses this when a CALLIND/BRANCHIND input can be traced back to a direct RAM
+  // varnode at that GOT address.
   std::unordered_map<uint64_t, std::string> IndirectExternalCallTargets;
 };
 

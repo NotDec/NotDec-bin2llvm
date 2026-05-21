@@ -123,6 +123,8 @@ check_ir_features() {
       "$name internal direct call"
     require_ir_pattern "$ll" "call void @__gmon_start__()" \
       "$name GOT external indirect call"
+    require_ir_pattern "$ll" "call void @_ITM_deregisterTMCloneTable()" \
+      "$name GOT external indirect tail jump"
     ;;
   libuv)
     require_ir_pattern "$ll" "call void @notdec_native_9d80()" \
@@ -133,6 +135,8 @@ check_ir_features() {
       "$name PLT.GOT external direct call"
     require_ir_pattern "$ll" "call void @pthread_key_delete()" \
       "$name PLT external direct call"
+    require_ir_pattern "$ll" "call void @_ITM_deregisterTMCloneTable()" \
+      "$name GOT external indirect tail jump"
     ;;
   memcached)
     require_ir_pattern "$ll" "call void @__cxa_finalize()" \
@@ -141,6 +145,8 @@ check_ir_features() {
       "$name internal direct call"
     require_ir_pattern "$ll" "call void @__gmon_start__()" \
       "$name GOT external indirect call"
+    require_ir_pattern "$ll" "call void @_ITM_deregisterTMCloneTable()" \
+      "$name GOT external indirect tail jump"
     ;;
   esac
 

@@ -52,6 +52,7 @@
   - [x] 已补 `-f` / `-n` 单函数模式复用 confirmed function 和 PLT 外部符号映射。
   - [x] 已补来源可追到外部 `GLOB_DAT` GOT slot 的 `CALLIND` 到外部 LLVM function call。
   - [x] 已补 x86 `LOCK` / `UNLOCK` `CALLOTHER` 17/18 no-op lowering，保留普通内存交换语义。
+  - [x] 已补来源可追到外部 `GLOB_DAT` GOT slot 的 `BRANCHIND` external tail jump lowering。
 - [ ] 阶段 7: Bench2 regression
   - [x] 已补 `scripts/bench2-native-smoke.sh`，固定跑 `vsftpd`、`libuv`、`memcached` 的 native discovery 和 LLVM verify。
   - [x] 已补 Bench2 smoke 的固定 IR pattern 检查，覆盖内部 direct call 和 libuv PLT external call。
@@ -62,6 +63,7 @@
   - [x] 已补 Bench2 smoke 禁止当前三目标保留 unresolved indirect call。
   - [x] 已补 Bench2 smoke 对当前 unresolved indirect branch 基线的上限检查。
   - [x] 已把当前 branch 基线收紧到 `vsftpd` / `memcached` <= 1，`libuv` <= 0。
+  - [x] 已补三个目标 `_ITM_deregisterTMCloneTable` GOT external tail jump 的 smoke pattern。
 
 ## 记录规则
 

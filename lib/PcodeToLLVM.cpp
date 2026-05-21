@@ -243,6 +243,12 @@ private:
       if (!requireInputCount(op, 1, errorMessage)) {
         return false;
       }
+      if (auto gotAddress = sourceRam(op.Inputs[0])) {
+        auto it = Config.IndirectExternalCallTargets.find(*gotAddress);
+        if (it != Config.IndirectExternalCallTargets.end()) {
+          return lowerKnownVoidTailJump(it->second);
+        }
+      }
       Builder.CreateBr(exitBlock());
       return true;
 
@@ -667,6 +673,14 @@ private:
     llvm::FunctionCallee callee =
         Module.getOrInsertFunction(calleeName, calleeType);
     Builder.CreateCall(callee, {});
+    return true;
+  }
+
+  bool lowerKnownVoidTailJump(const std::string &calleeName) {
+    // Current native lowering has no ABI/prototype model.  For proven external
+    // tail jumps, preserve the handoff to the external symbol and end this body.
+    lowerKnownVoidCall(calleeName);
+    Builder.CreateRetVoid();
     return true;
   }
 
