@@ -34,7 +34,8 @@ Ghidra 那种完整数据库：
 `notdec-native-discover` 默认输出文本 report，包含 function seed、worklist、confirmed
 function、basic block、instruction、xref 和 unresolved indirect flow 数量。加
 `--summary-json` 时会跳过文本 report，输出同口径的最小 JSON summary，供 Bench2 smoke
-做机器检查。
+做机器检查。`--functions-json` 输出已确认函数列表，包含入口、保守范围、名字、来源和
+block 数。
 
 当前 recursive decode 只接入了一个很小的 Sleigh 线性指令解码入口：
 
@@ -90,7 +91,7 @@ external/NotDec-bin2llvm/
 - `tools/notdec-heritage-check.cpp`：单函数 JSON 检查工具。
 - `tools/notdec-native-discover.cpp`：native discovery smoke 入口。默认打印文本 report，
   `--summary-json` 打印 function、block、instruction、xref 和 unresolved indirect flow
-  的汇总 JSON。
+  的汇总 JSON，`--functions-json` 打印 confirmed function 列表 JSON。
 - `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。
 - `include/notdec-bin2llvm/ModuleBuilder.h`、`lib/ModuleBuilder.cpp`、`tools/notdec-bin2llvm.cpp`：最早的 demo module 入口，只生成一个空函数。
 

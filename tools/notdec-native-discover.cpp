@@ -8,18 +8,28 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 
 namespace {
 
+// Keep CLI output modes explicit.  Query commands share the same analysis
+// pipeline; only the final formatter changes.
+enum class OutputMode {
+  TextReport,
+  SummaryJson,
+  FunctionsJson,
+};
+
 struct CliOptions {
   std::string ElfPath;
-  bool SummaryJson = false;
+  OutputMode Mode = OutputMode::TextReport;
 };
 
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0 << " <elf-file>\n";
   std::cerr << "       " << argv0 << " --summary-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
@@ -33,12 +43,22 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     return options;
   }
 
-  if (std::string(argv[1]) != "--summary-json") {
+  std::string mode = argv[1];
+  if (mode == "--summary-json") {
+    options.Mode = OutputMode::SummaryJson;
+  } else if (mode == "--functions-json") {
+    options.Mode = OutputMode::FunctionsJson;
+  } else {
     return std::nullopt;
   }
-  options.SummaryJson = true;
   options.ElfPath = argv[2];
   return options;
+}
+
+std::string hexString(uint64_t value) {
+  std::ostringstream stream;
+  stream << "0x" << std::hex << value;
+  return stream.str();
 }
 
 std::string jsonEscape(const std::string &text) {
@@ -139,6 +159,31 @@ void printSummaryJson(std::ostream &output,
   output << "}\n";
 }
 
+void printFunctionsJson(std::ostream &output,
+                        const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"functions\": [";
+  bool firstFunction = true;
+  for (const auto &[entry, function] : state.functions()) {
+    (void)entry;
+    output << (firstFunction ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"entry\": \"" << hexString(function.Entry) << "\",\n";
+    output << "      \"range_start\": \"" << hexString(function.RangeStart)
+           << "\",\n";
+    output << "      \"range_end\": \"" << hexString(function.RangeEnd)
+           << "\",\n";
+    output << "      \"name\": \"" << jsonEscape(function.Name) << "\",\n";
+    output << "      \"source\": \"" << jsonEscape(function.Source) << "\",\n";
+    output << "      \"block_count\": " << function.Blocks.size() << "\n";
+    output << "    }";
+    firstFunction = false;
+  }
+  output << (firstFunction ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << state.functions().size() << "\n";
+  output << "}\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -165,12 +210,14 @@ int main(int argc, char **argv) {
     manager.addAnalyzer(notdec::bin2llvm::createEhFrameAnalyzer());
     manager.addAnalyzer(
         notdec::bin2llvm::createSleighSeedInstructionAnalyzer());
-    if (!options->SummaryJson) {
+    if (options->Mode == OutputMode::TextReport) {
       manager.addAnalyzer(notdec::bin2llvm::createReportAnalyzer(std::cout));
     }
     manager.run(state);
-    if (options->SummaryJson) {
+    if (options->Mode == OutputMode::SummaryJson) {
       printSummaryJson(std::cout, state);
+    } else if (options->Mode == OutputMode::FunctionsJson) {
+      printFunctionsJson(std::cout, state);
     }
     return 0;
   } catch (const std::exception &error) {
