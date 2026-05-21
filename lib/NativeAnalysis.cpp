@@ -1456,6 +1456,11 @@ private:
       std::optional<uint64_t> target = directRamTarget(op);
       if (op.Opcode == PcodeOpcode::Call) {
         if (target && state.isExecutableAddress(*target)) {
+          if (state.lookupPltExternal(*target)) {
+            addUniqueXref(state, seenXrefs, op.Address, *target,
+                          NativeXrefKind::Call, "sleigh-pcode-plt-call");
+            continue;
+          }
           addUniqueXref(state, seenXrefs, op.Address, *target,
                         NativeXrefKind::Call, "sleigh-pcode-direct-flow");
           addUniqueAddress(result.CallTargets, *target);

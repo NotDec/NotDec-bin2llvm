@@ -53,7 +53,8 @@ block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址
 - `lib/SleighLift.cpp::collectSleighInstructionDecode(...)` 在同一次 Sleigh 初始化里收集指令摘要
   和对应 P-Code，避免为了 xref 再解码一次。
 - analyzer 会从 P-Code 里识别直接 `CALL`、`BRANCH`、`CBRANCH`。第一个输入是 `ram` 地址时，
-  写入 `NativeXref`；直接 branch 目标也会写入当前 block 的 `Successors`。
+  写入 `NativeXref`；direct `CALL` 命中 PLT stub 时来源记为 `sleigh-pcode-plt-call`，
+  并且不作为内部 function seed 入队。直接 branch 目标也会写入当前 block 的 `Successors`。
 - analyzer 也会从非控制流 P-Code 里识别 direct `ram` varnode。如果目标不是 executable
   address，会记录为 data 或 string xref。目标在可读、不可写、不可执行内存里，并且像
   NUL 结尾 ASCII C 字符串时，记为 `NativeXrefKind::String`，来源是
