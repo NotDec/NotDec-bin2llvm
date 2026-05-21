@@ -73,6 +73,7 @@
   - [x] 已补 Bench2 smoke 禁止 direct `ram` 输入重新 lower 成 `freeze poison`。
   - [x] 已补 Bench2 smoke 禁止当前三目标重新出现 `notdec_exit`，并检查 PLT0 resolver call。
   - [x] 已补 Bench2 smoke 的 `metrics.tsv` 汇总，记录函数、block、instruction、xref、unresolved 和耗时。
+  - [x] 已补 Bench2 smoke 消费已有 heritage module，输出 `heritage-metrics.tsv` 和 `native-heritage-compare.tsv`。
 
 ## 记录规则
 

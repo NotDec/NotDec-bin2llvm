@@ -6,13 +6,15 @@ set -euo pipefail
 # assemble and verify the generated IR.
 BUILD_DIR="${NOTDEC_BIN2LLVM_BUILD_DIR:-/tmp/notdec-bin2llvm-build}"
 BENCH2_ROOT="${BENCH2_ROOT:-/sn640/NotDec-Exp/Bench2/rootfs}"
+BENCH2_IR_ROOT="${BENCH2_IR_ROOT:-/sn640/NotDec-Exp/Bench2/bin2llvm-ir}"
 OUT_DIR="${OUT_DIR:-/tmp/notdec-bin2llvm-bench2-smoke}"
 LLVM_BIN="${LLVM_BIN:-/sn640/NotDec/llvm-22.1.0.obj/bin}"
 
 usage() {
   cat <<'EOF'
 usage: bench2-native-smoke.sh [--build-dir DIR] [--bench2-root DIR]
-                              [--out-dir DIR] [--llvm-bin DIR]
+                              [--bench2-ir-root DIR] [--out-dir DIR]
+                              [--llvm-bin DIR]
 EOF
 }
 
@@ -24,6 +26,10 @@ while [[ $# -gt 0 ]]; do
     ;;
   --bench2-root)
     BENCH2_ROOT="$2"
+    shift 2
+    ;;
+  --bench2-ir-root)
+    BENCH2_IR_ROOT="$2"
     shift 2
     ;;
   --out-dir)
@@ -47,6 +53,7 @@ done
 
 DISCOVER="$BUILD_DIR/bin/notdec-native-discover"
 NATIVE_LLVM="$BUILD_DIR/bin/notdec-native-llvm"
+HERITAGE_CHECK="$BUILD_DIR/bin/notdec-heritage-module-check"
 LLVM_AS="$LLVM_BIN/llvm-as"
 OPT="$LLVM_BIN/opt"
 
@@ -146,6 +153,23 @@ require_summary_number() {
   fi
 }
 
+parse_heritage_metric() {
+  local file="$1"
+  local label="$2"
+  sed -n "s/[[:space:]]*$label:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" |
+    head -n 1
+}
+
+require_heritage_metric() {
+  local value="$1"
+  local file="$2"
+  local label="$3"
+  if [[ -z "$value" ]]; then
+    echo "missing heritage metric $label in $file" >&2
+    exit 1
+  fi
+}
+
 check_ir_features() {
   local name="$1"
   local ll="$2"
@@ -229,6 +253,12 @@ echo "out_dir=$OUT_DIR"
 METRICS="$OUT_DIR/metrics.tsv"
 printf 'target\telapsed_seconds\tconfirmed_functions\tbasic_blocks\tinstructions\txrefs_total\txrefs_flow\txrefs_call\txrefs_data\txrefs_string\tunresolved_total\tunresolved_indirect_call\tunresolved_indirect_branch\n' \
   >"$METRICS"
+HERITAGE_METRICS="$OUT_DIR/heritage-metrics.tsv"
+printf 'target\theritage_available\tfunctions\texternals\tfailures\tdirect_calls\tresolved_internal_calls\tresolved_external_calls\tunknown_calls\n' \
+  >"$HERITAGE_METRICS"
+COMPARE_METRICS="$OUT_DIR/native-heritage-compare.tsv"
+printf 'target\theritage_available\tnative_confirmed_functions\theritage_functions\tnative_call_xrefs\theritage_direct_calls\tnative_unresolved_total\theritage_unknown_calls\n' \
+  >"$COMPARE_METRICS"
 
 for index in "${!TARGET_NAMES[@]}"; do
   name="${TARGET_NAMES[$index]}"
@@ -347,6 +377,46 @@ for index in "${!TARGET_NAMES[@]}"; do
     "$instructions" "$xrefs_total" "$xrefs_flow" "$xrefs_call" \
     "$xrefs_data" "$xrefs_string" "$unresolved_total" \
     "$unresolved_indirect_call" "$unresolved_indirect_branch" >>"$METRICS"
+
+  heritage_module="$BENCH2_IR_ROOT/$name/module-limit5.json"
+  if [[ -f "$heritage_module" ]]; then
+    require_executable "$HERITAGE_CHECK"
+    heritage_check_stdout="$OUT_DIR/$name.heritage-module-check.stdout"
+    heritage_check_stderr="$OUT_DIR/$name.heritage-module-check.stderr"
+    "$HERITAGE_CHECK" "$heritage_module" \
+      >"$heritage_check_stdout" 2>"$heritage_check_stderr"
+
+    heritage_functions="$(parse_heritage_metric "$heritage_check_stdout" "functions")"
+    heritage_externals="$(parse_heritage_metric "$heritage_check_stdout" "externals")"
+    heritage_failures="$(parse_heritage_metric "$heritage_check_stdout" "failures")"
+    heritage_direct_calls="$(parse_heritage_metric "$heritage_check_stdout" "direct calls")"
+    heritage_resolved_internal="$(parse_heritage_metric "$heritage_check_stdout" "resolved internal calls")"
+    heritage_resolved_external="$(parse_heritage_metric "$heritage_check_stdout" "resolved external calls")"
+    heritage_unknown_calls="$(parse_heritage_metric "$heritage_check_stdout" "unknown calls")"
+
+    require_heritage_metric "$heritage_functions" "$heritage_check_stdout" "functions"
+    require_heritage_metric "$heritage_externals" "$heritage_check_stdout" "externals"
+    require_heritage_metric "$heritage_failures" "$heritage_check_stdout" "failures"
+    require_heritage_metric "$heritage_direct_calls" "$heritage_check_stdout" "direct calls"
+    require_heritage_metric "$heritage_resolved_internal" "$heritage_check_stdout" "resolved internal calls"
+    require_heritage_metric "$heritage_resolved_external" "$heritage_check_stdout" "resolved external calls"
+    require_heritage_metric "$heritage_unknown_calls" "$heritage_check_stdout" "unknown calls"
+
+    printf '%s\t1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$name" "$heritage_functions" "$heritage_externals" \
+      "$heritage_failures" "$heritage_direct_calls" \
+      "$heritage_resolved_internal" "$heritage_resolved_external" \
+      "$heritage_unknown_calls" >>"$HERITAGE_METRICS"
+    printf '%s\t1\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$name" "$confirmed_functions" "$heritage_functions" "$xrefs_call" \
+      "$heritage_direct_calls" "$unresolved_total" \
+      "$heritage_unknown_calls" >>"$COMPARE_METRICS"
+  else
+    printf '%s\t0\t\t\t\t\t\t\t\n' "$name" >>"$HERITAGE_METRICS"
+    printf '%s\t0\t%s\t\t%s\t\t%s\t\n' \
+      "$name" "$confirmed_functions" "$xrefs_call" "$unresolved_total" \
+      >>"$COMPARE_METRICS"
+  fi
 
   echo "$name ok elapsed=${elapsed_seconds}s summary=$summary ll=$ll"
 done

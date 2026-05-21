@@ -147,7 +147,9 @@ external/NotDec-bin2llvm/
   native discovery 至少产出 confirmed function，且当前三目标不再保留 unresolved indirect
   call / branch；再用 `notdec-native-llvm --all-confirmed` 生成 IR，并用本地 LLVM 22 的
   `llvm-as` 和 `opt -passes=verify` 验证；输出目录会生成 `metrics.tsv`，汇总每个目标的
-  函数数、block 数、instruction 数、xref 数、unresolved 数和耗时；随后还会检查
+  函数数、block 数、instruction 数、xref 数、unresolved 数和耗时；如果 Bench2 IR 目录里已有
+  `module-limit5.json`，还会用 `notdec-heritage-module-check` 生成 `heritage-metrics.tsv`
+  和 `native-heritage-compare.tsv`；随后还会检查
   若干固定 IR pattern，确认最近补上的 direct call、PLT external call、GOT external
   indirect call / tail jump 没有退回 helper，并禁止最近清掉的 `CALL` / `CALLIND` /
   `CALLOTHER` helper 回到 Bench2 smoke 输出；同时禁止 direct `ram` 输入重新 lower 成
