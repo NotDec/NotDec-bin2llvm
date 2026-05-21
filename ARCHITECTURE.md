@@ -147,7 +147,9 @@ external/NotDec-bin2llvm/
 - `scripts/bench2-native-smoke.sh`：Bench2 native smoke 入口。它固定跑 `vsftpd`、
   `libuv.so.1.0.0`、`memcached`，先用 `notdec-native-discover --summary-json` 确认
   native discovery 至少产出 confirmed function，且当前三目标不再保留 unresolved indirect
-  call / branch；再用 `notdec-native-llvm --all-confirmed` 生成 IR，并用本地 LLVM 22 的
+  call / branch；它还会检查入口 source baseline：可执行文件需要有 `elf-entry`，shared
+  object `libuv` 不能有 `elf-entry`，并且三目标都要有 dynamic init/fini、init/fini array
+  和 `.eh_frame` 来源。然后再用 `notdec-native-llvm --all-confirmed` 生成 IR，并用本地 LLVM 22 的
   `llvm-as` 和 `opt -passes=verify` 验证；输出目录会生成 `metrics.tsv`，汇总每个目标的
   函数数、block 数、instruction 数、xref 数、unresolved 数和耗时；如果 Bench2 IR 目录里已有
   `module-limit5.json`，还会用 `notdec-heritage-module-check` 生成 `heritage-metrics.tsv`

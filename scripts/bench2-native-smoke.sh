@@ -96,6 +96,37 @@ require_unresolved_indirect_branches_at_most() {
   fi
 }
 
+summary_source_count() {
+  local file="$1"
+  local source="$2"
+  sed -n "s/.*\"$source\":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" |
+    head -n 1
+}
+
+require_summary_source() {
+  local file="$1"
+  local name="$2"
+  local source="$3"
+  local count
+  count="$(summary_source_count "$file" "$source")"
+  if [[ -z "$count" || "$count" == "0" ]]; then
+    echo "$name: missing function seed source $source in $file" >&2
+    exit 1
+  fi
+}
+
+forbid_summary_source() {
+  local file="$1"
+  local name="$2"
+  local source="$3"
+  local count
+  count="$(summary_source_count "$file" "$source")"
+  if [[ -n "$count" && "$count" != "0" ]]; then
+    echo "$name: unexpected function seed source $source=$count in $file" >&2
+    exit 1
+  fi
+}
+
 require_ir_pattern() {
   local file="$1"
   local pattern="$2"
@@ -236,6 +267,28 @@ check_ir_features() {
     "$name CALLOTHER helper regression"
 }
 
+check_entry_sources() {
+  local name="$1"
+  local summary="$2"
+
+  require_summary_source "$summary" "$name" "dt-init"
+  require_summary_source "$summary" "$name" "dt-fini"
+  require_summary_source "$summary" "$name" "dt-init-array"
+  require_summary_source "$summary" "$name" "dt-fini-array"
+  require_summary_source "$summary" "$name" "eh-frame"
+
+  case "$name" in
+  libuv)
+    forbid_summary_source "$summary" "$name" "elf-entry"
+    require_summary_source "$summary" "$name" "elf-dynamic-symbol"
+    require_summary_source "$summary" "$name" "elf-symbol"
+    ;;
+  vsftpd | memcached)
+    require_summary_source "$summary" "$name" "elf-entry"
+    ;;
+  esac
+}
+
 require_executable "$DISCOVER"
 require_executable "$NATIVE_LLVM"
 require_executable "$LLVM_AS"
@@ -285,6 +338,7 @@ for index in "${!TARGET_NAMES[@]}"; do
   fi
   require_no_unresolved_indirect_calls "$summary" "$name"
   require_unresolved_indirect_branches_at_most "$summary" "$name" 0
+  check_entry_sources "$name" "$summary"
 
   "$NATIVE_LLVM" "$target" --all-confirmed -o "$ll" \
     >"$native_stdout" 2>"$native_stderr"

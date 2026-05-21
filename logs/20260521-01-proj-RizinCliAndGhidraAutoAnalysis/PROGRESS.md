@@ -8,6 +8,7 @@
 - [ ] 阶段 2: Entry discovery
   - [x] 已补 function seed 到 recursive decode worklist 的最小桥接。
   - [x] 已补 `.dynsym` 已定义函数符号的 seed 来源。
+  - [x] 已补 Bench2 smoke 的入口 source baseline，覆盖 dynamic init/fini、init/fini array、`.eh_frame`、executable `elf-entry` 和 shared object 无 `elf-entry`。
 - [ ] 阶段 3: Recursive disassembly CFG
   - [x] 已补从 function worklist 到 `NativeInstruction` 的最小 Sleigh 线性解码。
   - [x] 已补已解码 seed 到 confirmed function / 单 basic block 的保守落地。
