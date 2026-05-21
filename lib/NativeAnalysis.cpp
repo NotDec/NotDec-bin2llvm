@@ -95,6 +95,55 @@ bool readBytes(const NativeProgramState &state, uint64_t address, uint64_t size,
   return false;
 }
 
+const NativeMemoryRange *findReadableRangeContaining(
+    const NativeProgramState &state, uint64_t address) {
+  for (const NativeMemoryRange &range : state.memoryRanges()) {
+    if (range.Start > address) {
+      break;
+    }
+    if (range.Readable && containsAddress(range.Start, range.Size, address)) {
+      return &range;
+    }
+  }
+  return nullptr;
+}
+
+bool isLikelyCStringByte(uint8_t byte) {
+  return (byte >= 0x20 && byte <= 0x7e) || byte == '\t' || byte == '\n' ||
+         byte == '\r';
+}
+
+bool looksLikeReadOnlyCString(const NativeProgramState &state,
+                              uint64_t address) {
+  const NativeMemoryRange *range = findReadableRangeContaining(state, address);
+  if (range == nullptr || range->Writable || range->Executable) {
+    return false;
+  }
+
+  constexpr uint64_t kMaxCStringProbeBytes = 256;
+  constexpr uint64_t kMinCStringBytes = 4;
+
+  uint64_t offset = address - range->Start;
+  if (offset >= range->Bytes.size()) {
+    return false;
+  }
+
+  uint64_t available = range->Bytes.size() - offset;
+  uint64_t limit = std::min(kMaxCStringProbeBytes, available);
+  uint64_t length = 0;
+  for (uint64_t index = 0; index < limit; ++index) {
+    uint8_t byte = range->Bytes[offset + index];
+    if (byte == 0) {
+      return length >= kMinCStringBytes;
+    }
+    if (!isLikelyCStringByte(byte)) {
+      return false;
+    }
+    ++length;
+  }
+  return false;
+}
+
 bool executableRangeContains(const NativeProgramState &state, uint64_t start,
                              uint64_t end) {
   if (start >= end) {
@@ -1427,8 +1476,13 @@ private:
     if (varnode.Space != "ram" || state.isExecutableAddress(varnode.Offset)) {
       return;
     }
-    addUniqueXref(state, seenXrefs, from, varnode.Offset, NativeXrefKind::Data,
-                  "sleigh-pcode-direct-data");
+    NativeXrefKind kind = looksLikeReadOnlyCString(state, varnode.Offset)
+                              ? NativeXrefKind::String
+                              : NativeXrefKind::Data;
+    const char *source = kind == NativeXrefKind::String
+                             ? "sleigh-pcode-direct-string"
+                             : "sleigh-pcode-direct-data";
+    addUniqueXref(state, seenXrefs, from, varnode.Offset, kind, source);
   }
 
   static std::optional<uint64_t> directRamTarget(const PcodeOpView &op) {
