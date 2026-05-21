@@ -125,12 +125,14 @@ external/NotDec-bin2llvm/
   direct call。`-f` / `-n` 单函数模式也会先规划 native discovery 的 confirmed function 和
   PLT 外部符号映射，所以已知 direct call 仍能落到符号名。`CALLIND` 如果输入来源能追到
   直接 RAM GOT slot，并且该 slot 是外部 `GLOB_DAT` 符号，会生成为对应外部函数调用。
-  未命中目标和 `CALLOTHER` 仍走 helper call。
+  x86 `CALLOTHER` userop 17/18（`LOCK` / `UNLOCK`）会 no-op，因为普通内存读写
+  P-Code 已经保留交换语义。未命中目标和其他 `CALLOTHER` 仍走 helper call。
 - `scripts/bench2-native-smoke.sh`：Bench2 native smoke 入口。它固定跑 `vsftpd`、
   `libuv.so.1.0.0`、`memcached`，先用 `notdec-native-discover --summary-json` 确认
   native discovery 至少产出 confirmed function，再用 `notdec-native-llvm --all-confirmed`
   生成 IR，并用本地 LLVM 22 的 `llvm-as` 和 `opt -passes=verify` 验证；随后还会检查
-  若干固定 IR pattern，确认最近补上的 direct call / PLT external call 没有退回 helper。
+  若干固定 IR pattern，确认最近补上的 direct call / PLT external call 没有退回 helper，
+  并禁止最近清掉的 `CALL` / `CALLIND` / `CALLOTHER` helper 回到 Bench2 smoke 输出。
 - `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。
 - `include/notdec-bin2llvm/ModuleBuilder.h`、`lib/ModuleBuilder.cpp`、`tools/notdec-bin2llvm.cpp`：最早的 demo module 入口，只生成一个空函数。
 

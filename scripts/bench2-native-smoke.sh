@@ -75,6 +75,17 @@ require_ir_pattern() {
   fi
 }
 
+forbid_ir_pattern() {
+  local file="$1"
+  local pattern="$2"
+  local description="$3"
+  if grep -Fq "$pattern" "$file"; then
+    echo "unexpected IR pattern for $description: $pattern" >&2
+    echo "  file: $file" >&2
+    exit 1
+  fi
+}
+
 check_ir_features() {
   local name="$1"
   local ll="$2"
@@ -107,6 +118,13 @@ check_ir_features() {
       "$name GOT external indirect call"
     ;;
   esac
+
+  forbid_ir_pattern "$ll" "notdec_pcode_CALL_void" \
+    "$name direct call helper regression"
+  forbid_ir_pattern "$ll" "notdec_pcode_CALLIND_void" \
+    "$name indirect call helper regression"
+  forbid_ir_pattern "$ll" "notdec_pcode_CALLOTHER_void" \
+    "$name CALLOTHER helper regression"
 }
 
 require_executable "$DISCOVER"
@@ -175,10 +193,12 @@ for index in "${!TARGET_NAMES[@]}"; do
       "$name single-function PLT.GOT external direct call"
     require_ir_pattern "$single_ll" "call void @notdec_native_9d80()" \
       "$name single-function internal direct call"
-    if grep -Fq "notdec_pcode_CALL_void" "$single_ll"; then
-      echo "single-function libuv still contains helper call" >&2
-      exit 1
-    fi
+    forbid_ir_pattern "$single_ll" "notdec_pcode_CALL_void" \
+      "$name single-function direct call helper regression"
+    forbid_ir_pattern "$single_ll" "notdec_pcode_CALLIND_void" \
+      "$name single-function indirect call helper regression"
+    forbid_ir_pattern "$single_ll" "notdec_pcode_CALLOTHER_void" \
+      "$name single-function CALLOTHER helper regression"
 
     named_ll="$OUT_DIR/$name.named-function.ll"
     named_bc="$OUT_DIR/$name.named-function.bc"
@@ -198,6 +218,12 @@ for index in "${!TARGET_NAMES[@]}"; do
       >"$named_opt_stdout" 2>"$named_opt_stderr"
     require_ir_pattern "$named_ll" "call void @pthread_key_delete()" \
       "$name named-function PLT external direct call"
+    forbid_ir_pattern "$named_ll" "notdec_pcode_CALL_void" \
+      "$name named-function direct call helper regression"
+    forbid_ir_pattern "$named_ll" "notdec_pcode_CALLIND_void" \
+      "$name named-function indirect call helper regression"
+    forbid_ir_pattern "$named_ll" "notdec_pcode_CALLOTHER_void" \
+      "$name named-function CALLOTHER helper regression"
   fi
   finished_at="$(date +%s)"
 

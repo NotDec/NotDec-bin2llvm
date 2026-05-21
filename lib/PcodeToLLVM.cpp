@@ -704,6 +704,17 @@ private:
     return lowerHelperCall(op, errorMessage);
   }
 
+  bool lowerCallOther(const PcodeOpView &op, std::string &errorMessage) {
+    // x86 LOCK/UNLOCK are Sleigh userops around normal memory P-Code.  The
+    // read/write ops still carry the value semantics, so keep only that part.
+    if (!op.Output && requireInputCount(op, 1, errorMessage) &&
+        op.Inputs[0].Space == "const" &&
+        (op.Inputs[0].Offset == 17 || op.Inputs[0].Offset == 18)) {
+      return true;
+    }
+    return lowerHelperCall(op, errorMessage);
+  }
+
   bool lowerOp(const PcodeOpView &op, std::string &errorMessage) {
     switch (op.Opcode) {
     case PcodeOpcode::Copy:
@@ -725,7 +736,7 @@ private:
     case PcodeOpcode::CallInd:
       return lowerCallInd(op, errorMessage);
     case PcodeOpcode::CallOther:
-      return lowerHelperCall(op, errorMessage);
+      return lowerCallOther(op, errorMessage);
     case PcodeOpcode::Branch:
     case PcodeOpcode::BranchInd:
     case PcodeOpcode::CBranch:
