@@ -22,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 namespace {
@@ -307,6 +308,16 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
       std::make_unique<llvm::Module>("notdec.bin2llvm.native.confirmed", context);
 
   std::set<std::string> usedNames;
+  std::unordered_map<uint64_t, std::string> namesByEntry;
+  for (const auto &[entry, function] : state.functions()) {
+    (void)entry;
+    if (function.RangeEnd <= function.Entry) {
+      continue;
+    }
+    namesByEntry.emplace(function.Entry,
+                         nativeFunctionLlvmName(function, usedNames));
+  }
+
   unsigned appended = 0;
   for (const auto &[entry, function] : state.functions()) {
     (void)entry;
@@ -325,7 +336,12 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
 
     notdec::bin2llvm::PcodeLoweringConfig config;
     config.ModuleName = "notdec.bin2llvm.native.confirmed.check";
-    config.EntryFunctionName = nativeFunctionLlvmName(function, usedNames);
+    auto nameIt = namesByEntry.find(function.Entry);
+    if (nameIt == namesByEntry.end()) {
+      continue;
+    }
+    config.EntryFunctionName = nameIt->second;
+    config.DirectCallTargets = namesByEntry;
 
     llvm::LLVMContext checkContext;
     std::string checkError;

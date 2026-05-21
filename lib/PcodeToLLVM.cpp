@@ -49,8 +49,10 @@ unsigned bitWidth(uint32_t byteSize) {
 class PcodeLowerer {
 public:
   PcodeLowerer(llvm::LLVMContext &context, llvm::Module &module,
-               llvm::Function &function, llvm::IRBuilder<> &builder)
-      : Context(context), Module(module), Function(function), Builder(builder) {
+               llvm::Function &function, llvm::IRBuilder<> &builder,
+               const PcodeLoweringConfig &config)
+      : Context(context), Module(module), Function(function), Builder(builder),
+        Config(config) {
   }
 
   bool lower(const PcodeProgram &program, std::string &errorMessage) {
@@ -638,6 +640,28 @@ private:
     return true;
   }
 
+  bool lowerCall(const PcodeOpView &op, std::string &errorMessage) {
+    // Minimal inter-function lowering: when --all-confirmed has already planned
+    // a symbol for this direct target, emit a real LLVM call.  Calls with a
+    // modeled return value stay on the helper path until native prototype
+    // recovery exists.
+    if (!op.Output) {
+      if (auto target = directTarget(op, 0)) {
+        auto it = Config.DirectCallTargets.find(*target);
+        if (it != Config.DirectCallTargets.end()) {
+          auto *calleeType =
+              llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
+          llvm::FunctionCallee callee =
+              Module.getOrInsertFunction(it->second, calleeType);
+          Builder.CreateCall(callee, {});
+          return true;
+        }
+      }
+    }
+
+    return lowerHelperCall(op, errorMessage);
+  }
+
   bool lowerOp(const PcodeOpView &op, std::string &errorMessage) {
     switch (op.Opcode) {
     case PcodeOpcode::Copy:
@@ -651,6 +675,7 @@ private:
     case PcodeOpcode::Store:
       return lowerStore(op, errorMessage);
     case PcodeOpcode::Call:
+      return lowerCall(op, errorMessage);
     case PcodeOpcode::CallInd:
     case PcodeOpcode::CallOther:
       return lowerHelperCall(op, errorMessage);
@@ -709,6 +734,7 @@ private:
   llvm::Module &Module;
   llvm::Function &Function;
   llvm::IRBuilder<> &Builder;
+  const PcodeLoweringConfig &Config;
   std::unordered_map<std::string, llvm::Value *> Values;
   std::vector<size_t> BlockStarts;
   std::unordered_map<size_t, llvm::BasicBlock *> BlockForStart;
@@ -738,7 +764,7 @@ bool appendPcodeFunction(llvm::LLVMContext &context, llvm::Module &module,
 
   auto *entryBlock = llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entryBlock);
-  PcodeLowerer lowerer(context, module, *function, builder);
+  PcodeLowerer lowerer(context, module, *function, builder, config);
   if (!lowerer.lower(program, errorMessage)) {
     function->eraseFromParent();
     return false;

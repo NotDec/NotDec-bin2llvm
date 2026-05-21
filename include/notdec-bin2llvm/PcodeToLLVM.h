@@ -2,8 +2,10 @@
 
 #include "notdec-bin2llvm/Pcode.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 namespace llvm {
 class LLVMContext;
@@ -15,6 +17,11 @@ namespace notdec::bin2llvm {
 struct PcodeLoweringConfig {
   std::string ModuleName = "notdec.bin2llvm.pcode";
   std::string EntryFunctionName = "notdec_pcode";
+
+  // Address-to-symbol table for already-confirmed functions in the same
+  // generated module.  Raw Sleigh P-Code only gives CALL a target address, so
+  // the module builder has to provide the symbol name when it knows one.
+  std::unordered_map<uint64_t, std::string> DirectCallTargets;
 };
 
 std::unique_ptr<llvm::Module>
