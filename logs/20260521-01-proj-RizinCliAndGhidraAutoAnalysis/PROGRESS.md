@@ -35,6 +35,7 @@
   - [x] 已补 `notdec-native-discover --xrefs-from-json` / `--xrefs-to-json` 按地址查 xref。
   - [x] 已补 `notdec-native-discover --instructions-json` 最小 instruction 列表输出。
   - [x] 已补 `notdec-native-discover --instructions-range-json` 按地址范围查 instruction。
+  - [x] 已补 `notdec-native-discover --instructions-function-json` 按 confirmed function 入口查 instruction。
   - [x] 已补 `notdec-native-discover --plt-json` 输出 PLT stub / GOT / 外部符号映射。
   - [x] 已补 `.plt.got` 函数型 `GLOB_DAT` thunk 到 PLT 外部映射。
   - [x] 已补 `.plt.got` 机器码反查 GOT slot，覆盖 relocation 数量不对齐的外部 thunk。

@@ -39,7 +39,7 @@ block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址
 `--xrefs-json` 输出当前 direct control-flow xref 列表，`--xrefs-from-json <addr>` 和
 `--xrefs-to-json <addr>` 按地址查引用。`--instructions-json` 输出已接受指令的地址、
 大小、字节、显示文本和来源，`--instructions-range-json <start> <end>` 按地址范围过滤同一批
-instruction。
+instruction，`--instructions-function-json <entry>` 按 confirmed function 入口过滤 instruction。
 
 当前 recursive decode 只接入了一个很小的 Sleigh 线性指令解码入口：
 
@@ -125,6 +125,7 @@ external/NotDec-bin2llvm/
   打印 confirmed function 下的 basic block 列表 JSON，`--xrefs-json` 打印 xref 列表
   JSON，`--xrefs-from-json` / `--xrefs-to-json` 按地址查 xref，`--instructions-json`
   打印 instruction 列表 JSON，`--instructions-range-json` 按地址范围打印 instruction
+  列表 JSON，`--instructions-function-json` 按 confirmed function 入口打印 instruction
   列表 JSON，`--plt-json` 打印 `.plt.sec` / `.plt.got` stub、GOT slot 和外部符号名映射，
   `--unresolved-json` 打印尚未解析的 indirect call / branch 地址列表。
 - `tools/notdec-native-llvm.cpp`：native P-Code 到 LLVM IR 的入口。可以继续用

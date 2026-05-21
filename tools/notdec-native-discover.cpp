@@ -24,6 +24,7 @@ enum class OutputMode {
   XrefsJson,
   InstructionsJson,
   InstructionsRangeJson,
+  InstructionsFunctionJson,
   PltJson,
   UnresolvedJson,
   XrefsFromJson,
@@ -36,6 +37,7 @@ struct CliOptions {
   std::optional<uint64_t> QueryAddress;
   std::optional<uint64_t> QueryStart;
   std::optional<uint64_t> QueryEnd;
+  std::optional<uint64_t> QueryFunctionEntry;
 };
 
 void printUsage(const char *argv0) {
@@ -47,6 +49,8 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
   std::cerr << "       " << argv0
             << " --instructions-range-json <start> <end> <elf-file>\n";
+  std::cerr << "       " << argv0
+            << " --instructions-function-json <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --plt-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --unresolved-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-from-json <addr> <elf-file>\n";
@@ -97,12 +101,19 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.Mode = OutputMode::XrefsFromJson;
     } else if (mode == "--xrefs-to-json") {
       options.Mode = OutputMode::XrefsToJson;
+    } else if (mode == "--instructions-function-json") {
+      options.Mode = OutputMode::InstructionsFunctionJson;
     } else {
       return std::nullopt;
     }
-    options.QueryAddress = parseAddress(argv[2]);
-    if (!options.QueryAddress) {
+    std::optional<uint64_t> address = parseAddress(argv[2]);
+    if (!address) {
       return std::nullopt;
+    }
+    if (options.Mode == OutputMode::InstructionsFunctionJson) {
+      options.QueryFunctionEntry = *address;
+    } else {
+      options.QueryAddress = *address;
     }
     options.ElfPath = argv[3];
     return options;
@@ -415,6 +426,36 @@ void printInstructionsRangeJson(
   output << "}\n";
 }
 
+void printInstructionsFunctionJson(
+    std::ostream &output,
+    const notdec::bin2llvm::NativeProgramState &state, uint64_t entry) {
+  const notdec::bin2llvm::NativeFunction *function = state.functionAt(entry);
+  std::vector<const notdec::bin2llvm::NativeInstruction *> instructions;
+  output << "{\n";
+  output << "  \"query\": \"" << hexString(entry) << "\",\n";
+  if (function == nullptr) {
+    output << "  \"found\": false,\n";
+    printInstructionListJson(output, instructions, "  ");
+    output << "}\n";
+    return;
+  }
+
+  instructions = state.instructionsInRange(function->RangeStart,
+                                           function->RangeEnd);
+  output << "  \"found\": true,\n";
+  output << "  \"function\": {\n";
+  output << "    \"entry\": \"" << hexString(function->Entry) << "\",\n";
+  output << "    \"range_start\": \"" << hexString(function->RangeStart)
+         << "\",\n";
+  output << "    \"range_end\": \"" << hexString(function->RangeEnd)
+         << "\",\n";
+  output << "    \"name\": \"" << jsonEscape(function->Name) << "\",\n";
+  output << "    \"source\": \"" << jsonEscape(function->Source) << "\"\n";
+  output << "  },\n";
+  printInstructionListJson(output, instructions, "  ");
+  output << "}\n";
+}
+
 void printPltJson(std::ostream &output,
                   const notdec::bin2llvm::NativeProgramState &state) {
   output << "{\n";
@@ -499,6 +540,9 @@ int main(int argc, char **argv) {
     } else if (options->Mode == OutputMode::InstructionsRangeJson) {
       printInstructionsRangeJson(std::cout, state, *options->QueryStart,
                                  *options->QueryEnd);
+    } else if (options->Mode == OutputMode::InstructionsFunctionJson) {
+      printInstructionsFunctionJson(std::cout, state,
+                                    *options->QueryFunctionEntry);
     } else if (options->Mode == OutputMode::PltJson) {
       printPltJson(std::cout, state);
     } else if (options->Mode == OutputMode::UnresolvedJson) {
