@@ -299,6 +299,7 @@ std::string externalFunctionLlvmName(const std::string &symbolName,
 struct NativeCallTargets {
   std::unordered_map<uint64_t, std::string> Direct;
   std::unordered_map<uint64_t, std::string> External;
+  std::unordered_map<uint64_t, std::string> IndirectExternal;
 };
 
 NativeCallTargets planNativeCallTargets(
@@ -322,6 +323,19 @@ NativeCallTargets planNativeCallTargets(
     targets.External.emplace(
         entry.StubAddress,
         externalFunctionLlvmName(entry.SymbolName, usedNames));
+  }
+
+  for (const notdec::bin2llvm::NativeRelocationInfo &relocation :
+       state.relocations()) {
+    if (relocation.SymbolName.empty() || relocation.Status != "external") {
+      continue;
+    }
+    if (relocation.TypeName != "X86_64_GLOB_DAT") {
+      continue;
+    }
+    targets.IndirectExternal.emplace(
+        relocation.Address,
+        externalFunctionLlvmName(relocation.SymbolName, usedNames));
   }
 
   return targets;
@@ -374,6 +388,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
     config.EntryFunctionName = nameIt->second;
     config.DirectCallTargets = callTargets.Direct;
     config.ExternalCallTargets = callTargets.External;
+    config.IndirectExternalCallTargets = callTargets.IndirectExternal;
 
     llvm::LLVMContext checkContext;
     std::string checkError;
@@ -474,6 +489,8 @@ int main(int argc, char **argv) {
         callTargets.Direct[*options->FunctionEntry] = config.EntryFunctionName;
         config.DirectCallTargets = std::move(callTargets.Direct);
         config.ExternalCallTargets = std::move(callTargets.External);
+        config.IndirectExternalCallTargets =
+            std::move(callTargets.IndirectExternal);
       }
       module = notdec::bin2llvm::buildPcodeModule(context, program, config,
                                                   errorMessage);

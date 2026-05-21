@@ -301,7 +301,28 @@ private:
                                 valueName(varnode) + "_in");
   }
 
+  std::optional<uint64_t> sourceRam(const VarnodeView &varnode) const {
+    if (varnode.Space == "ram") {
+      return varnode.Offset;
+    }
+    auto it = SourceRamByVarnode.find(varnodeKey(varnode));
+    if (it == SourceRamByVarnode.end()) {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+  void setSourceRam(const VarnodeView &varnode, std::optional<uint64_t> source) {
+    std::string key = varnodeKey(varnode);
+    if (source) {
+      SourceRamByVarnode[key] = *source;
+    } else {
+      SourceRamByVarnode.erase(key);
+    }
+  }
+
   void write(const VarnodeView &varnode, llvm::Value *value) {
+    SourceRamByVarnode.erase(varnodeKey(varnode));
     llvm::Value *resized = resize(value, varnode.Size);
     if (varnode.IsRegister && Registers != nullptr) {
       RegisterAccess access{varnode.Space, varnode.Offset, varnode.Size,
@@ -640,6 +661,15 @@ private:
     return true;
   }
 
+  bool lowerKnownVoidCall(const std::string &calleeName) {
+    auto *calleeType =
+        llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
+    llvm::FunctionCallee callee =
+        Module.getOrInsertFunction(calleeName, calleeType);
+    Builder.CreateCall(callee, {});
+    return true;
+  }
+
   bool lowerCall(const PcodeOpView &op, std::string &errorMessage) {
     // Minimal inter-function lowering: when --all-confirmed has already planned
     // a symbol for this direct target, emit a real LLVM call.  Calls with a
@@ -649,26 +679,28 @@ private:
       if (auto target = directTarget(op, 0)) {
         auto externalIt = Config.ExternalCallTargets.find(*target);
         if (externalIt != Config.ExternalCallTargets.end()) {
-          auto *calleeType =
-              llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
-          llvm::FunctionCallee callee =
-              Module.getOrInsertFunction(externalIt->second, calleeType);
-          Builder.CreateCall(callee, {});
-          return true;
+          return lowerKnownVoidCall(externalIt->second);
         }
 
         auto it = Config.DirectCallTargets.find(*target);
         if (it != Config.DirectCallTargets.end()) {
-          auto *calleeType =
-              llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
-          llvm::FunctionCallee callee =
-              Module.getOrInsertFunction(it->second, calleeType);
-          Builder.CreateCall(callee, {});
-          return true;
+          return lowerKnownVoidCall(it->second);
         }
       }
     }
 
+    return lowerHelperCall(op, errorMessage);
+  }
+
+  bool lowerCallInd(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output && requireInputCount(op, 1, errorMessage)) {
+      if (auto gotAddress = sourceRam(op.Inputs[0])) {
+        auto it = Config.IndirectExternalCallTargets.find(*gotAddress);
+        if (it != Config.IndirectExternalCallTargets.end()) {
+          return lowerKnownVoidCall(it->second);
+        }
+      }
+    }
     return lowerHelperCall(op, errorMessage);
   }
 
@@ -678,7 +710,11 @@ private:
       if (!op.Output || !requireInputCount(op, 1, errorMessage)) {
         return false;
       }
-      write(*op.Output, read(op.Inputs[0]));
+      {
+        std::optional<uint64_t> source = sourceRam(op.Inputs[0]);
+        write(*op.Output, read(op.Inputs[0]));
+        setSourceRam(*op.Output, source);
+      }
       return true;
     case PcodeOpcode::Load:
       return lowerLoad(op, errorMessage);
@@ -687,6 +723,7 @@ private:
     case PcodeOpcode::Call:
       return lowerCall(op, errorMessage);
     case PcodeOpcode::CallInd:
+      return lowerCallInd(op, errorMessage);
     case PcodeOpcode::CallOther:
       return lowerHelperCall(op, errorMessage);
     case PcodeOpcode::Branch:
@@ -746,6 +783,7 @@ private:
   llvm::IRBuilder<> &Builder;
   const PcodeLoweringConfig &Config;
   std::unordered_map<std::string, llvm::Value *> Values;
+  std::unordered_map<std::string, uint64_t> SourceRamByVarnode;
   std::vector<size_t> BlockStarts;
   std::unordered_map<size_t, llvm::BasicBlock *> BlockForStart;
   std::unordered_map<uint64_t, llvm::BasicBlock *> BlockForAddress;

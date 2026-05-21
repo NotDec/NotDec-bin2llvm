@@ -123,8 +123,9 @@ external/NotDec-bin2llvm/
   映射，会生成为普通 LLVM direct call；forward call 先创建的空 declaration 可以在后续
   lowering 中补成函数体。`CALL` 如果命中已知 PLT stub，会生成为对应外部符号的 LLVM
   direct call。`-f` / `-n` 单函数模式也会先规划 native discovery 的 confirmed function 和
-  PLT 外部符号映射，所以已知 direct call 仍能落到符号名。未命中目标、`CALLIND`、
-  `CALLOTHER` 仍走 helper call。
+  PLT 外部符号映射，所以已知 direct call 仍能落到符号名。`CALLIND` 如果输入来源能追到
+  直接 RAM GOT slot，并且该 slot 是外部 `GLOB_DAT` 符号，会生成为对应外部函数调用。
+  未命中目标和 `CALLOTHER` 仍走 helper call。
 - `scripts/bench2-native-smoke.sh`：Bench2 native smoke 入口。它固定跑 `vsftpd`、
   `libuv.so.1.0.0`、`memcached`，先用 `notdec-native-discover --summary-json` 确认
   native discovery 至少产出 confirmed function，再用 `notdec-native-llvm --all-confirmed`

@@ -85,10 +85,14 @@ check_ir_features() {
       "$name internal direct call"
     require_ir_pattern "$ll" "call void @notdec_native_8290()" \
       "$name internal direct call"
+    require_ir_pattern "$ll" "call void @__gmon_start__()" \
+      "$name GOT external indirect call"
     ;;
   libuv)
     require_ir_pattern "$ll" "call void @notdec_native_9d80()" \
       "$name internal direct call"
+    require_ir_pattern "$ll" "call void @__gmon_start__()" \
+      "$name GOT external indirect call"
     require_ir_pattern "$ll" "call void @__cxa_finalize()" \
       "$name PLT.GOT external direct call"
     require_ir_pattern "$ll" "call void @pthread_key_delete()" \
@@ -99,6 +103,8 @@ check_ir_features() {
       "$name internal direct call"
     require_ir_pattern "$ll" "call void @notdec_native_b950()" \
       "$name internal direct call"
+    require_ir_pattern "$ll" "call void @__gmon_start__()" \
+      "$name GOT external indirect call"
     ;;
   esac
 }
