@@ -4,6 +4,7 @@
 #include <sleigh/libsleigh.hh>
 
 #include <fstream>
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -138,6 +139,26 @@ private:
   PcodeProgram &Program;
 };
 
+class AssemblyCollector : public ghidra::AssemblyEmit {
+public:
+  void dump(const ghidra::Address &address, const std::string &mnemonic,
+            const std::string &body) override {
+    Last.Address = address.getOffset();
+    Last.Mnemonic = mnemonic;
+    Last.Body = body;
+  }
+
+  SleighInstructionSummary take(uint64_t size) {
+    Last.Size = size;
+    SleighInstructionSummary result = std::move(Last);
+    Last = {};
+    return result;
+  }
+
+private:
+  SleighInstructionSummary Last;
+};
+
 class XmlCapableSleigh : public ghidra::Sleigh {
 public:
   XmlCapableSleigh(ghidra::LoadImage *loadImage,
@@ -215,6 +236,59 @@ bool isXmlSlaFile(const std::filesystem::path &slaFilePath) {
   return first == '<';
 }
 
+bool initializeSleighEngine(ghidra::LoadImage &loadImage,
+                            const SleighSpecOptions &options,
+                            std::ostream &errorStream,
+                            ghidra::ContextInternal &context,
+                            XmlCapableSleigh &engine,
+                            ghidra::DocumentStorage &storage,
+                            std::filesystem::path &slaFilePath) {
+  auto foundSlaFilePath =
+      findSleighSpecPath(options.SlaFileName, options.RootSlaDir);
+  if (!foundSlaFilePath) {
+    errorStream << "could not find sla file: " << options.SlaFileName << '\n';
+    return false;
+  }
+  slaFilePath = *foundSlaFilePath;
+  bool isXmlSla = isXmlSlaFile(slaFilePath);
+
+  ghidra::AttributeId::initialize();
+  ghidra::ElementId::initialize();
+
+  if (isXmlSla) {
+    try {
+      engine.decodeXmlSla(
+          storage.openDocument(slaFilePath.string())->getRoot());
+    } catch (ghidra::LowlevelError &error) {
+      errorStream << "failed to decode XML .sla: " << error.explain << '\n';
+      return false;
+    }
+  } else {
+    std::istringstream sleighXml("<sleigh>" + slaFilePath.string() +
+                                 "</sleigh>");
+    ghidra::Element *root = storage.parseDocument(sleighXml)->getRoot();
+    storage.registerTag(root);
+  }
+
+  auto pspecPath = findPspecPath(options, slaFilePath);
+  if (options.PspecFileName && !pspecPath) {
+    errorStream << "could not find pspec file: " << *options.PspecFileName
+                << '\n';
+    return false;
+  }
+  if (pspecPath) {
+    ghidra::Element *pspecRoot =
+        storage.openDocument(pspecPath->string())->getRoot();
+    storage.registerTag(pspecRoot);
+  }
+
+  engine.initialize(storage);
+  engine.allowContextSet(false);
+  loadProcessorSpecContext(engine, context, storage);
+  (void)loadImage;
+  return true;
+}
+
 } // namespace
 
 std::optional<std::filesystem::path>
@@ -237,49 +311,14 @@ PcodeProgram collectSleighPcode(ghidra::LoadImage &loadImage,
                                 uint64_t address, uint64_t length,
                                 std::ostream &errorStream) {
   PcodeProgram program;
-  auto slaFilePath = findSleighSpecPath(options.SlaFileName, options.RootSlaDir);
-  if (!slaFilePath) {
-    errorStream << "could not find sla file: " << options.SlaFileName << '\n';
-    return program;
-  }
-  bool isXmlSla = isXmlSlaFile(*slaFilePath);
-
-  ghidra::AttributeId::initialize();
-  ghidra::ElementId::initialize();
-
   ghidra::ContextInternal context;
   XmlCapableSleigh engine(&loadImage, &context);
   ghidra::DocumentStorage storage;
-
-  if (isXmlSla) {
-    try {
-      engine.decodeXmlSla(storage.openDocument(slaFilePath->string())->getRoot());
-    } catch (ghidra::LowlevelError &error) {
-      errorStream << "failed to decode XML .sla: " << error.explain << '\n';
-      return program;
-    }
-  } else {
-    std::istringstream sleighXml("<sleigh>" + slaFilePath->string() +
-                                 "</sleigh>");
-    ghidra::Element *root = storage.parseDocument(sleighXml)->getRoot();
-    storage.registerTag(root);
-  }
-
-  auto pspecPath = findPspecPath(options, *slaFilePath);
-  if (options.PspecFileName && !pspecPath) {
-    errorStream << "could not find pspec file: " << *options.PspecFileName
-                << '\n';
+  std::filesystem::path slaFilePath;
+  if (!initializeSleighEngine(loadImage, options, errorStream, context, engine,
+                              storage, slaFilePath)) {
     return program;
   }
-  if (pspecPath) {
-    ghidra::Element *pspecRoot =
-        storage.openDocument(pspecPath->string())->getRoot();
-    storage.registerTag(pspecRoot);
-  }
-
-  engine.initialize(storage);
-  engine.allowContextSet(false);
-  loadProcessorSpecContext(engine, context, storage);
   program.IsBigEndian = engine.isBigEndian();
   collectRegisters(engine, program);
 
@@ -304,6 +343,57 @@ PcodeProgram collectSleighPcode(ghidra::LoadImage &loadImage,
   }
 
   return program;
+}
+
+std::vector<SleighInstructionSummary>
+collectSleighInstructionSummaries(ghidra::LoadImage &loadImage,
+                                  const SleighSpecOptions &options,
+                                  uint64_t address, uint64_t maxInstructions,
+                                  uint64_t maxBytes,
+                                  std::ostream &errorStream) {
+  std::vector<SleighInstructionSummary> instructions;
+  if (maxInstructions == 0 || maxBytes == 0) {
+    return instructions;
+  }
+
+  ghidra::ContextInternal context;
+  XmlCapableSleigh engine(&loadImage, &context);
+  ghidra::DocumentStorage storage;
+  std::filesystem::path slaFilePath;
+  if (!initializeSleighEngine(loadImage, options, errorStream, context, engine,
+                              storage, slaFilePath)) {
+    return instructions;
+  }
+
+  AssemblyCollector collector;
+  ghidra::Address current(engine.getDefaultCodeSpace(), address);
+  if (address > std::numeric_limits<uint64_t>::max() - maxBytes) {
+    maxBytes = std::numeric_limits<uint64_t>::max() - address;
+  }
+  ghidra::Address end(engine.getDefaultCodeSpace(), address + maxBytes);
+  while (instructions.size() < maxInstructions && current < end) {
+    try {
+      int32_t instructionLength = engine.printAssembly(collector, current);
+      if (instructionLength <= 0 ||
+          static_cast<uint64_t>(instructionLength) >
+              end.getOffset() - current.getOffset()) {
+        break;
+      }
+      instructions.push_back(
+          collector.take(static_cast<uint64_t>(instructionLength)));
+      current = current + instructionLength;
+    } catch (ghidra::UnimplError &error) {
+      errorStream << "UnimplError @ " << current << ": " << error.explain
+                  << '\n';
+      return instructions;
+    } catch (ghidra::BadDataError &error) {
+      errorStream << "BadDataError @ " << current << ": " << error.explain
+                  << '\n';
+      return instructions;
+    }
+  }
+
+  return instructions;
 }
 
 } // namespace notdec::bin2llvm

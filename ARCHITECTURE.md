@@ -32,8 +32,19 @@ Ghidra 那种完整数据库：
 - `addFunction(...)`、`addBasicBlock(...)`、`addXref(...)`、`addInstruction(...)`
 
 `notdec-native-discover` 的 report 会输出 function seed、worklist、confirmed function、
-basic block、instruction 和 xref 数量。当前 recursive decode 还没接入，所以 Bench2 运行时
-confirmed function、basic block、instruction 和 xref 数量仍可能是 0。
+basic block、instruction 和 xref 数量。
+
+当前 recursive decode 只接入了一个很小的 Sleigh 线性指令解码入口：
+
+- `lib/SleighLift.cpp::collectSleighInstructionSummaries(...)` 用
+  `Sleigh::printAssembly(...)` 解码指令地址、长度和显示文本。
+- `lib/NativeAnalysis.cpp::SleighSeedInstructionAnalyzer` 从 function worklist 取前 8 个
+  seed，每个 seed 最多解码 8 条 / 64 字节，并写入 `NativeInstruction`。
+- 这一步只用于打通 native seed 到 instruction state 的链路，不确认函数，不建 CFG，也不产
+  生 branch/call xref。
+
+因此 Bench2 运行时 instruction 数量应该已经大于 0，但 confirmed function、basic block 和
+xref 数量仍可能是 0。
 
 ## 目录
 

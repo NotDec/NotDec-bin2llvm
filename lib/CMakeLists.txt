@@ -52,4 +52,9 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
       notdec-bin2llvm-sleigh
       LIEF::LIEF
   )
+
+  target_compile_definitions(notdec-bin2llvm-native
+    PRIVATE
+      NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR="${NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR}"
+  )
 endif ()

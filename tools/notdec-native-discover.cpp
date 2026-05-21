@@ -53,6 +53,8 @@ int main(int argc, char **argv) {
     manager.addAnalyzer(notdec::bin2llvm::createElfEntryAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createElfSymbolAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createEhFrameAnalyzer());
+    manager.addAnalyzer(
+        notdec::bin2llvm::createSleighSeedInstructionAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createReportAnalyzer(std::cout));
     manager.run(state);
     return 0;

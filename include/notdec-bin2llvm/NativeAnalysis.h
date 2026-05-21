@@ -297,6 +297,7 @@ std::unique_ptr<NativeAnalyzer> createRelocationPltAnalyzer();
 std::unique_ptr<NativeAnalyzer> createElfEntryAnalyzer();
 std::unique_ptr<NativeAnalyzer> createElfSymbolAnalyzer();
 std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer();
+std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer();
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output);
 
 } // namespace notdec::bin2llvm

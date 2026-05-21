@@ -1,5 +1,8 @@
 #include "notdec-bin2llvm/NativeAnalysis.h"
 
+#include "notdec-bin2llvm/LiefElfLoadImage.h"
+#include "notdec-bin2llvm/SleighLift.h"
+
 #include <LIEF/ELF/Binary.hpp>
 #include <LIEF/ELF/DynamicEntry.hpp>
 #include <LIEF/ELF/Relocation.hpp>
@@ -8,6 +11,7 @@
 #include <LIEF/ELF/Symbol.hpp>
 
 #include <algorithm>
+#include <filesystem>
 #include <iomanip>
 #include <limits>
 #include <ostream>
@@ -17,6 +21,10 @@
 
 namespace notdec::bin2llvm {
 namespace {
+
+#ifndef NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR
+#define NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR "/sn640/ghidra"
+#endif
 
 bool containsAddress(uint64_t start, uint64_t size, uint64_t address) {
   return size != 0 && address >= start && address - start < size;
@@ -1127,6 +1135,113 @@ private:
   }
 };
 
+class SleighSeedInstructionAnalyzer final : public NativeAnalyzer {
+public:
+  std::string name() const override { return "SleighSeedInstructionAnalyzer"; }
+  int priority() const override { return 60; }
+
+  void run(NativeProgramState &state, NativeAnalysisManager &) override {
+    if (!resolveSpecOptions(state)) {
+      return;
+    }
+
+    LiefElfLoadImage loadImage(state.binary(), NullErrors);
+    if (!loadImage.hasExecutableBytes()) {
+      state.addNote("sleigh instruction decode skipped: no executable bytes");
+      return;
+    }
+
+    uint64_t decodedSeeds = 0;
+    for (const NativeFunctionWorkItem &item : state.functionWorklist()) {
+      if (decodedSeeds == MaxSeeds) {
+        break;
+      }
+      if (!state.isExecutableAddress(item.Address)) {
+        continue;
+      }
+      decodeSeed(state, loadImage, item.Address);
+      ++decodedSeeds;
+    }
+  }
+
+private:
+  // This analyzer is only a bounded smoke path for recursive decode.  Larger
+  // limits should come with CFG stop rules first, otherwise linear decode after
+  // branches can look more precise than it is.
+  static constexpr uint64_t MaxSeeds = 8;
+  static constexpr uint64_t MaxInstructionsPerSeed = 8;
+  static constexpr uint64_t MaxBytesPerSeed = 64;
+
+  std::ostringstream NullErrors;
+  SleighSpecOptions SpecOptions;
+
+  bool resolveSpecOptions(NativeProgramState &state) {
+    const LIEF::ELF::Binary &binary = state.binary();
+    if (binary.header().machine_type() != LIEF::ELF::ARCH::X86_64) {
+      state.addNote("sleigh instruction decode supports x86-64 ELF only");
+      return false;
+    }
+
+    std::filesystem::path specRoot =
+        std::filesystem::path(NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR) /
+        "Ghidra/Processors/x86/data/languages";
+    std::filesystem::path slaPath = specRoot / "x86-64.sla";
+    std::filesystem::path pspecPath = specRoot / "x86-64.pspec";
+    if (!std::filesystem::exists(slaPath)) {
+      state.addNote("sleigh instruction decode missing spec: " +
+                    slaPath.string());
+      return false;
+    }
+
+    SpecOptions.SlaFileName = slaPath.string();
+    if (std::filesystem::exists(pspecPath)) {
+      SpecOptions.PspecFileName = pspecPath.string();
+    }
+    return true;
+  }
+
+  void decodeSeed(NativeProgramState &state, LiefElfLoadImage &loadImage,
+                  uint64_t address) {
+    std::optional<uint64_t> availableBytes = executableBytesFrom(state, address);
+    if (!availableBytes || *availableBytes == 0) {
+      return;
+    }
+
+    std::vector<SleighInstructionSummary> summaries =
+        collectSleighInstructionSummaries(loadImage, SpecOptions, address,
+                                          MaxInstructionsPerSeed,
+                                          std::min(MaxBytesPerSeed,
+                                                   *availableBytes),
+                                          NullErrors);
+    for (const SleighInstructionSummary &summary : summaries) {
+      NativeInstruction instruction;
+      instruction.Address = summary.Address;
+      instruction.Size = summary.Size;
+      instruction.Mnemonic = summary.Body.empty()
+                                  ? summary.Mnemonic
+                                  : summary.Mnemonic + " " + summary.Body;
+      instruction.Source = "sleigh-seed-linear";
+      (void)readBytes(state, summary.Address, summary.Size, instruction.Bytes);
+      state.addInstruction(std::move(instruction));
+    }
+  }
+
+  static std::optional<uint64_t>
+  executableBytesFrom(const NativeProgramState &state, uint64_t address) {
+    for (const NativeMemoryRange &range : state.memoryRanges()) {
+      if (range.Start > address) {
+        break;
+      }
+      if (!range.Executable ||
+          !containsAddress(range.Start, range.Size, address)) {
+        continue;
+      }
+      return range.Size - (address - range.Start);
+    }
+    return std::nullopt;
+  }
+};
+
 class ReportAnalyzer final : public NativeAnalyzer {
 public:
   explicit ReportAnalyzer(std::ostream &output) : Output(output) {}
@@ -1722,6 +1837,10 @@ std::unique_ptr<NativeAnalyzer> createElfSymbolAnalyzer() {
 
 std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer() {
   return std::make_unique<EhFrameAnalyzer>();
+}
+
+std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer() {
+  return std::make_unique<SleighSeedInstructionAnalyzer>();
 }
 
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output) {
