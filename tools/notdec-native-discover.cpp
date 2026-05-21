@@ -21,6 +21,7 @@ enum class OutputMode {
   SummaryJson,
   FunctionsJson,
   BlocksJson,
+  XrefsJson,
 };
 
 struct CliOptions {
@@ -33,6 +34,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --summary-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
@@ -53,6 +55,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::FunctionsJson;
   } else if (mode == "--blocks-json") {
     options.Mode = OutputMode::BlocksJson;
+  } else if (mode == "--xrefs-json") {
+    options.Mode = OutputMode::XrefsJson;
   } else {
     return std::nullopt;
   }
@@ -226,6 +230,27 @@ void printBlocksJson(std::ostream &output,
   output << "}\n";
 }
 
+void printXrefsJson(std::ostream &output,
+                    const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"xrefs\": [";
+  bool firstXref = true;
+  for (const notdec::bin2llvm::NativeXref &xref : state.xrefs()) {
+    output << (firstXref ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"from\": \"" << hexString(xref.From) << "\",\n";
+    output << "      \"to\": \"" << hexString(xref.To) << "\",\n";
+    output << "      \"kind\": \"" << notdec::bin2llvm::toString(xref.Kind)
+           << "\",\n";
+    output << "      \"source\": \"" << jsonEscape(xref.Source) << "\"\n";
+    output << "    }";
+    firstXref = false;
+  }
+  output << (firstXref ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << state.xrefs().size() << "\n";
+  output << "}\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -262,6 +287,8 @@ int main(int argc, char **argv) {
       printFunctionsJson(std::cout, state);
     } else if (options->Mode == OutputMode::BlocksJson) {
       printBlocksJson(std::cout, state);
+    } else if (options->Mode == OutputMode::XrefsJson) {
+      printXrefsJson(std::cout, state);
     }
     return 0;
   } catch (const std::exception &error) {
