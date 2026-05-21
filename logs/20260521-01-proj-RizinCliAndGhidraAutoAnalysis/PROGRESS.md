@@ -18,6 +18,7 @@
   - [x] 已补 direct call 目标到 function seed / worklist 的桥接。
   - [x] 已补本轮 bounded direct call seed 消费：初始 8 个 seed，同轮最多 decode 16 个 seed。
   - [x] 已补本轮 bounded direct branch successor 消费：branch target 作为同函数 block 入队。
+  - [x] 已补已解码 direct branch target 对 basic block 起点的反向切分，并避免同函数 block 重叠。
   - [x] 已补 unresolved indirect flow 记录：`CALLIND` / `BRANCHIND` 进入 native state 和 report。
   - [x] 已补已知函数入口边界：direct branch 到其他 function seed 时不并入当前函数。
   - [x] 已补已知 function seed range 对 Sleigh decode 字节数的截断，减少跨函数线性 decode。

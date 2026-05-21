@@ -1783,11 +1783,41 @@ private:
       return blocks;
     }
 
+    std::set<uint64_t> instructionStarts;
+    for (const SleighInstructionSummary &instruction : instructions) {
+      instructionStarts.insert(instruction.Address);
+    }
+
+    std::set<uint64_t> blockStarts;
+    blockStarts.insert(rangeStart);
+    for (size_t index = 0; index < instructions.size(); ++index) {
+      const SleighInstructionSummary &instruction = instructions[index];
+      auto flowIterator = flowInfos.find(instruction.Address);
+      if (flowIterator == flowInfos.end()) {
+        continue;
+      }
+
+      const DecodedFlowInfo &flowInfo = flowIterator->second;
+      for (uint64_t target : flowInfo.BranchTargets) {
+        if (instructionStarts.count(target) != 0) {
+          blockStarts.insert(target);
+        }
+      }
+      if (index + 1 != instructions.size() &&
+          (flowInfo.HasConditionalBranch || flowInfo.HasUnconditionalBranch ||
+           flowInfo.HasIndirectBranch || flowInfo.HasReturn)) {
+        blockStarts.insert(instructions[index + 1].Address);
+      }
+    }
+
     uint64_t blockStart = rangeStart;
     for (size_t index = 0; index < instructions.size(); ++index) {
       const SleighInstructionSummary &instruction = instructions[index];
       uint64_t instructionEnd = instruction.Address + instruction.Size;
       bool isLastInstruction = index + 1 == instructions.size();
+      bool nextStartsBlock =
+          !isLastInstruction &&
+          blockStarts.count(instructions[index + 1].Address) != 0;
       const DecodedFlowInfo *flowInfo = nullptr;
       auto flowIterator = flowInfos.find(instruction.Address);
       if (flowIterator != flowInfos.end()) {
@@ -1795,7 +1825,7 @@ private:
       }
 
       std::vector<uint64_t> successors;
-      bool endBlock = isLastInstruction;
+      bool endBlock = isLastInstruction || nextStartsBlock;
       if (flowInfo != nullptr) {
         if (flowInfo->HasConditionalBranch) {
           successors = flowInfo->BranchTargets;
@@ -1809,6 +1839,9 @@ private:
         } else if (flowInfo->HasIndirectBranch || flowInfo->HasReturn) {
           endBlock = true;
         }
+      }
+      if (nextStartsBlock && successors.empty()) {
+        addUniqueAddress(successors, instructions[index + 1].Address);
       }
 
       if (!endBlock) {
@@ -2393,10 +2426,35 @@ bool NativeProgramState::addBasicBlock(uint64_t functionEntry,
   }
 
   NativeFunction &function = iterator->second;
-  for (const NativeBasicBlock &existing : function.Blocks) {
-    if (existing.Start == block.Start && existing.End == block.End) {
+  for (NativeBasicBlock &existing : function.Blocks) {
+    if (existing.Start != block.Start) {
+      continue;
+    }
+    if (existing.End == block.End) {
       return false;
     }
+    if (block.End < existing.End) {
+      existing.End = block.End;
+      existing.Successors = std::move(block.Successors);
+      return true;
+    }
+    return false;
+  }
+
+  for (NativeBasicBlock &existing : function.Blocks) {
+    if (existing.Start < block.Start && block.Start < existing.End) {
+      existing.End = block.Start;
+      existing.Successors.clear();
+      existing.Successors.push_back(block.Start);
+    }
+    if (block.Start < existing.Start && existing.Start < block.End) {
+      block.End = existing.Start;
+      block.Successors.clear();
+      block.Successors.push_back(existing.Start);
+    }
+  }
+  if (block.Start >= block.End) {
+    return false;
   }
   function.RangeStart = std::min(function.RangeStart, block.Start);
   function.RangeEnd = std::max(function.RangeEnd, block.End);

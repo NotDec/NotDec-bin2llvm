@@ -83,6 +83,8 @@ instruction，`--instructions-function-json <entry>` 按 confirmed function 入�
 - 当前 block 不是单纯整段线性范围：`SleighSeedInstructionAnalyzer` 会按控制流指令切分已解码
   前缀。`CBRANCH` block 同时记录直接目标和下一条指令 fallthrough，`BRANCH` block 只记录直接
   目标，`BRANCHIND` / `RETURN` block 暂不记录 successor。
+- 已解码范围内的 direct branch target 如果正好落在已知指令起点，会被强制作为 basic block
+  起点；追加同函数 block 时也会截断重叠 block，避免同一个函数里出现互相覆盖的 block 范围。
 - `CALLIND` / `BRANCHIND` 会写入 `NativeUnresolvedFlow`，report 按 indirect call / indirect
   branch 统计。这里不猜普通函数指针和跳表，只保留后续分析需要的样本。
 - direct `CALL` 的可执行目标会作为 `sleigh-direct-call` function seed 写入，并进入同一个本地
