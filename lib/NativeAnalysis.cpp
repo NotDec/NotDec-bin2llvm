@@ -1173,6 +1173,14 @@ private:
   static constexpr uint64_t MaxInstructionsPerSeed = 8;
   static constexpr uint64_t MaxBytesPerSeed = 64;
 
+  struct DecodedFlowInfo {
+    std::vector<uint64_t> BranchTargets;
+    bool HasConditionalBranch = false;
+    bool HasUnconditionalBranch = false;
+    bool HasIndirectBranch = false;
+    bool HasReturn = false;
+  };
+
   std::ostringstream NullErrors;
   SleighSpecOptions SpecOptions;
 
@@ -1230,17 +1238,19 @@ private:
       (void)readBytes(state, summary.Address, summary.Size, instruction.Bytes);
       state.addInstruction(std::move(instruction));
     }
-    std::vector<uint64_t> successors;
+    std::map<uint64_t, DecodedFlowInfo> flowInfos;
     if (rangeStart == address && rangeStart < rangeEnd) {
-      addDirectControlFlow(state, decode.Pcode, successors);
+      flowInfos = addDirectControlFlow(state, decode.Pcode);
     }
-    addDecodedFunctionBlock(state, address, rangeStart, rangeEnd, successors);
+    addDecodedFunctionBlocks(state, address, rangeStart, rangeEnd,
+                             decode.Instructions, flowInfos);
   }
 
-  static void addDecodedFunctionBlock(NativeProgramState &state,
-                                      uint64_t entry, uint64_t rangeStart,
-                                      uint64_t rangeEnd,
-                                      std::vector<uint64_t> successors) {
+  static void addDecodedFunctionBlocks(
+      NativeProgramState &state, uint64_t entry, uint64_t rangeStart,
+      uint64_t rangeEnd,
+      const std::vector<SleighInstructionSummary> &instructions,
+      const std::map<uint64_t, DecodedFlowInfo> &flowInfos) {
     if (rangeStart == 0 || rangeStart != entry || rangeStart >= rangeEnd) {
       return;
     }
@@ -1255,39 +1265,42 @@ private:
       function.Name = seedIterator->second.PrimaryName;
     }
 
-    NativeBasicBlock block;
-    block.Start = rangeStart;
-    block.End = rangeEnd;
-    block.Successors = std::move(successors);
-    function.Blocks.push_back(std::move(block));
+    function.Blocks =
+        buildDecodedBlocks(instructions, flowInfos, rangeStart, rangeEnd);
     state.addFunction(std::move(function));
   }
 
-  static void addDirectControlFlow(NativeProgramState &state,
-                                   const PcodeProgram &program,
-                                   std::vector<uint64_t> &successors) {
-    std::set<std::pair<uint64_t, uint64_t>> seenFlowSuccessors;
+  static std::map<uint64_t, DecodedFlowInfo>
+  addDirectControlFlow(NativeProgramState &state, const PcodeProgram &program) {
+    std::map<uint64_t, DecodedFlowInfo> flowInfos;
     std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> seenXrefs;
     for (const PcodeOpView &op : program.Ops) {
       std::optional<uint64_t> target = directRamTarget(op);
-      if (!target || !state.isExecutableAddress(*target)) {
-        continue;
-      }
-
       if (op.Opcode == PcodeOpcode::Call) {
-        addUniqueXref(state, seenXrefs, op.Address, *target,
-                      NativeXrefKind::Call);
+        if (target && state.isExecutableAddress(*target)) {
+          addUniqueXref(state, seenXrefs, op.Address, *target,
+                        NativeXrefKind::Call);
+        }
       } else if (op.Opcode == PcodeOpcode::Branch ||
                  op.Opcode == PcodeOpcode::CBranch) {
-        addUniqueXref(state, seenXrefs, op.Address, *target,
-                      NativeXrefKind::Flow);
-        if (seenFlowSuccessors.insert({op.Address, *target}).second &&
-            std::find(successors.begin(), successors.end(), *target) ==
-                successors.end()) {
-          successors.push_back(*target);
+        DecodedFlowInfo &info = flowInfos[op.Address];
+        if (op.Opcode == PcodeOpcode::CBranch) {
+          info.HasConditionalBranch = true;
+        } else {
+          info.HasUnconditionalBranch = true;
         }
+        if (target && state.isExecutableAddress(*target)) {
+          addUniqueXref(state, seenXrefs, op.Address, *target,
+                        NativeXrefKind::Flow);
+          addUniqueAddress(info.BranchTargets, *target);
+        }
+      } else if (op.Opcode == PcodeOpcode::BranchInd) {
+        flowInfos[op.Address].HasIndirectBranch = true;
+      } else if (op.Opcode == PcodeOpcode::Return) {
+        flowInfos[op.Address].HasReturn = true;
       }
     }
+    return flowInfos;
   }
 
   static std::optional<uint64_t> directRamTarget(const PcodeOpView &op) {
@@ -1318,6 +1331,69 @@ private:
     xref.Kind = kind;
     xref.Source = "sleigh-pcode-direct-flow";
     state.addXref(std::move(xref));
+  }
+
+  static std::vector<NativeBasicBlock> buildDecodedBlocks(
+      const std::vector<SleighInstructionSummary> &instructions,
+      const std::map<uint64_t, DecodedFlowInfo> &flowInfos, uint64_t rangeStart,
+      uint64_t rangeEnd) {
+    std::vector<NativeBasicBlock> blocks;
+    if (instructions.empty()) {
+      return blocks;
+    }
+
+    uint64_t blockStart = rangeStart;
+    for (size_t index = 0; index < instructions.size(); ++index) {
+      const SleighInstructionSummary &instruction = instructions[index];
+      uint64_t instructionEnd = instruction.Address + instruction.Size;
+      bool isLastInstruction = index + 1 == instructions.size();
+      const DecodedFlowInfo *flowInfo = nullptr;
+      auto flowIterator = flowInfos.find(instruction.Address);
+      if (flowIterator != flowInfos.end()) {
+        flowInfo = &flowIterator->second;
+      }
+
+      std::vector<uint64_t> successors;
+      bool endBlock = isLastInstruction;
+      if (flowInfo != nullptr) {
+        if (flowInfo->HasConditionalBranch) {
+          successors = flowInfo->BranchTargets;
+          if (!isLastInstruction) {
+            addUniqueAddress(successors, instructions[index + 1].Address);
+          }
+          endBlock = true;
+        } else if (flowInfo->HasUnconditionalBranch) {
+          successors = flowInfo->BranchTargets;
+          endBlock = true;
+        } else if (flowInfo->HasIndirectBranch || flowInfo->HasReturn) {
+          endBlock = true;
+        }
+      }
+
+      if (!endBlock) {
+        continue;
+      }
+
+      NativeBasicBlock block;
+      block.Start = blockStart;
+      block.End = std::min(instructionEnd, rangeEnd);
+      block.Successors = std::move(successors);
+      if (block.Start < block.End) {
+        blocks.push_back(std::move(block));
+      }
+      if (!isLastInstruction) {
+        blockStart = instructions[index + 1].Address;
+      }
+    }
+    return blocks;
+  }
+
+  static void addUniqueAddress(std::vector<uint64_t> &addresses,
+                               uint64_t address) {
+    if (std::find(addresses.begin(), addresses.end(), address) ==
+        addresses.end()) {
+      addresses.push_back(address);
+    }
   }
 
   static std::optional<uint64_t>
