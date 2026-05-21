@@ -145,7 +145,8 @@ struct NativeBasicBlock {
 
 // NativeFunction is separate from NativeFunctionSeed.  A seed says "try here";
 // a confirmed function says decode has accepted an entry and at least a
-// conservative body/range can be queried by later analyzers.
+// conservative body/range can be queried by later analyzers.  The range may
+// grow as direct branch targets add more decoded blocks.
 struct NativeFunction {
   uint64_t Entry = 0;
   uint64_t RangeStart = 0;

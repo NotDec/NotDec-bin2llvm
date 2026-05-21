@@ -1153,26 +1153,34 @@ public:
       return;
     }
 
-    std::deque<uint64_t> decodeQueue;
-    std::set<uint64_t> queuedSeeds;
-    std::set<uint64_t> decodedSeedAddresses;
+    std::deque<DecodeQueueItem> decodeQueue;
+    std::set<std::pair<uint64_t, uint64_t>> queuedSeeds;
+    std::set<std::pair<uint64_t, uint64_t>> decodedSeeds;
     enqueueInitialSeeds(state, decodeQueue, queuedSeeds);
 
     uint64_t decodedSeedCount = 0;
     while (!decodeQueue.empty() && decodedSeedCount < MaxSeeds) {
-      uint64_t address = decodeQueue.front();
+      DecodeQueueItem item = decodeQueue.front();
       decodeQueue.pop_front();
-      if (!decodedSeedAddresses.insert(address).second ||
-          !state.isExecutableAddress(address)) {
+      std::pair<uint64_t, uint64_t> seedKey{item.FunctionEntry,
+                                            item.BlockAddress};
+      if (!decodedSeeds.insert(seedKey).second ||
+          !state.isExecutableAddress(item.BlockAddress)) {
         continue;
       }
       std::vector<uint64_t> callTargets;
-      decodeSeed(state, loadImage, address, callTargets);
+      std::vector<uint64_t> branchTargets;
+      decodeSeed(state, loadImage, item.FunctionEntry, item.BlockAddress,
+                 callTargets, branchTargets);
       ++decodedSeedCount;
       for (uint64_t target : callTargets) {
         state.addFunctionSeed(target, 0, "", "sleigh-direct-call",
                               NativeFunctionConfidence::High);
-        enqueueSeed(state, target, decodeQueue, queuedSeeds);
+        enqueueSeed(state, target, target, decodeQueue, queuedSeeds);
+      }
+      for (uint64_t target : branchTargets) {
+        enqueueSeed(state, item.FunctionEntry, target, decodeQueue,
+                    queuedSeeds);
       }
     }
   }
@@ -1197,6 +1205,13 @@ private:
   struct DirectControlFlowResult {
     std::map<uint64_t, DecodedFlowInfo> FlowInfos;
     std::vector<uint64_t> CallTargets;
+  };
+
+  // Direct calls start a new function.  Direct branches keep the same function
+  // entry and decode another block for that function.
+  struct DecodeQueueItem {
+    uint64_t FunctionEntry = 0;
+    uint64_t BlockAddress = 0;
   };
 
   std::ostringstream NullErrors;
@@ -1228,32 +1243,39 @@ private:
   }
 
   static void enqueueInitialSeeds(NativeProgramState &state,
-                                  std::deque<uint64_t> &decodeQueue,
-                                  std::set<uint64_t> &queuedSeeds) {
+                                  std::deque<DecodeQueueItem> &decodeQueue,
+                                  std::set<std::pair<uint64_t, uint64_t>>
+                                      &queuedSeeds) {
     uint64_t initialSeeds = 0;
     for (const NativeFunctionWorkItem &item : state.functionWorklist()) {
       if (initialSeeds == MaxInitialSeeds) {
         break;
       }
-      if (enqueueSeed(state, item.Address, decodeQueue, queuedSeeds)) {
+      if (enqueueSeed(state, item.Address, item.Address, decodeQueue,
+                      queuedSeeds)) {
         ++initialSeeds;
       }
     }
   }
 
-  static bool enqueueSeed(NativeProgramState &state, uint64_t address,
-                          std::deque<uint64_t> &decodeQueue,
-                          std::set<uint64_t> &queuedSeeds) {
-    if (!state.isExecutableAddress(address) ||
-        !queuedSeeds.insert(address).second) {
+  static bool enqueueSeed(NativeProgramState &state, uint64_t functionEntry,
+                          uint64_t blockAddress,
+                          std::deque<DecodeQueueItem> &decodeQueue,
+                          std::set<std::pair<uint64_t, uint64_t>>
+                              &queuedSeeds) {
+    if (!state.isExecutableAddress(functionEntry) ||
+        !state.isExecutableAddress(blockAddress) ||
+        !queuedSeeds.insert({functionEntry, blockAddress}).second) {
       return false;
     }
-    decodeQueue.push_back(address);
+    decodeQueue.push_back({functionEntry, blockAddress});
     return true;
   }
 
   void decodeSeed(NativeProgramState &state, LiefElfLoadImage &loadImage,
-                  uint64_t address, std::vector<uint64_t> &callTargets) {
+                  uint64_t functionEntry, uint64_t address,
+                  std::vector<uint64_t> &callTargets,
+                  std::vector<uint64_t> &branchTargets) {
     std::optional<uint64_t> availableBytes = executableBytesFrom(state, address);
     if (!availableBytes || *availableBytes == 0) {
       return;
@@ -1290,16 +1312,37 @@ private:
         addUniqueAddress(callTargets, target);
       }
     }
-    addDecodedFunctionBlocks(state, address, rangeStart, rangeEnd,
-                             decode.Instructions, flowInfos);
+    addDecodedFunctionBlocks(state, functionEntry, rangeStart, rangeEnd,
+                             decode.Instructions, flowInfos, branchTargets);
   }
 
   static void addDecodedFunctionBlocks(
       NativeProgramState &state, uint64_t entry, uint64_t rangeStart,
       uint64_t rangeEnd,
       const std::vector<SleighInstructionSummary> &instructions,
-      const std::map<uint64_t, DecodedFlowInfo> &flowInfos) {
-    if (rangeStart == 0 || rangeStart != entry || rangeStart >= rangeEnd) {
+      const std::map<uint64_t, DecodedFlowInfo> &flowInfos,
+      std::vector<uint64_t> &branchTargets) {
+    if (rangeStart == 0 || rangeStart >= rangeEnd) {
+      return;
+    }
+
+    std::vector<NativeBasicBlock> blocks =
+        buildDecodedBlocks(instructions, flowInfos, rangeStart, rangeEnd);
+    for (const NativeBasicBlock &block : blocks) {
+      for (uint64_t successor : block.Successors) {
+        if (successor < rangeStart || successor >= rangeEnd) {
+          addUniqueAddress(branchTargets, successor);
+        }
+      }
+    }
+    if (blocks.empty()) {
+      return;
+    }
+
+    if (state.functionAt(entry) != nullptr) {
+      for (NativeBasicBlock &block : blocks) {
+        state.addBasicBlock(entry, std::move(block));
+      }
       return;
     }
 
@@ -1313,8 +1356,7 @@ private:
       function.Name = seedIterator->second.PrimaryName;
     }
 
-    function.Blocks =
-        buildDecodedBlocks(instructions, flowInfos, rangeStart, rangeEnd);
+    function.Blocks = std::move(blocks);
     state.addFunction(std::move(function));
   }
 
@@ -1937,11 +1979,13 @@ bool NativeProgramState::addBasicBlock(uint64_t functionEntry,
   }
 
   NativeFunction &function = iterator->second;
-  if (block.Start < function.RangeStart || block.End > function.RangeEnd) {
-    Notes.push_back("basic block outside function range at " +
-                    hexAddress(functionEntry));
-    return false;
+  for (const NativeBasicBlock &existing : function.Blocks) {
+    if (existing.Start == block.Start && existing.End == block.End) {
+      return false;
+    }
   }
+  function.RangeStart = std::min(function.RangeStart, block.Start);
+  function.RangeEnd = std::max(function.RangeEnd, block.End);
   function.Blocks.push_back(std::move(block));
   return true;
 }

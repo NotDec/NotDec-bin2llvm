@@ -39,7 +39,8 @@ basic block、instruction 和 xref 数量。
 - `lib/SleighLift.cpp::collectSleighInstructionSummaries(...)` 用
   `Sleigh::printAssembly(...)` 解码指令地址、长度和显示文本。
 - `lib/NativeAnalysis.cpp::SleighSeedInstructionAnalyzer` 先从 function worklist 取前 8 个
-  seed 入本地队列，每个 seed 最多解码 8 条 / 64 字节，并写入 `NativeInstruction`。
+  seed 入本地队列。队列元素区分 function entry 和 block address，每个 block 最多解码
+  8 条 / 64 字节，并写入 `NativeInstruction`。
 - 如果某个 seed 成功解码出指令，它会被保守写成一个 `NativeFunction`，并带一个覆盖已解码
   指令前缀的 `NativeBasicBlock`。
 - `lib/SleighLift.cpp::collectSleighInstructionDecode(...)` 在同一次 Sleigh 初始化里收集指令摘要
@@ -51,8 +52,10 @@ basic block、instruction 和 xref 数量。
   目标，`BRANCHIND` / `RETURN` block 暂不记录 successor。
 - direct `CALL` 的可执行目标会作为 `sleigh-direct-call` function seed 写入，并进入同一个本地
   decode 队列。本轮总 decode 上限是 16 个 seed，已入队或已 decode 的地址不会重复处理。
-- 这一步只用于受控消费 direct call seed。它还不沿 branch successor 递归，也不处理间接
-  branch/call。
+- direct `BRANCH` / `CBRANCH` 的可执行 successor 会作为同一个 function entry 下的 block
+  address 入队。追加 block 时，`NativeFunction` 的 decoded range 会随 block 扩展。
+- 这一步只用于受控消费 direct call seed 和 direct branch successor。它还不处理间接
+  branch/call，也不做完整函数边界判断。
 
 因此 Bench2 运行时 instruction、confirmed function、basic block、xref 数量应该已经大于 0。
 
