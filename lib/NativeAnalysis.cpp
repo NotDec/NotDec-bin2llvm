@@ -2019,8 +2019,10 @@ const NativeFunction *
 NativeProgramState::functionContaining(uint64_t address) const {
   for (const auto &[entry, function] : Functions) {
     (void)entry;
-    if (function.RangeStart <= address && address < function.RangeEnd) {
-      return &function;
+    for (const NativeBasicBlock &block : function.Blocks) {
+      if (block.Start <= address && address < block.End) {
+        return &function;
+      }
     }
   }
   return nullptr;

@@ -72,6 +72,8 @@ block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址
   decode 队列。本轮总 decode 上限是 16 个 seed，已入队或已 decode 的地址不会重复处理。
 - direct `BRANCH` / `CBRANCH` 的可执行 successor 会作为同一个 function entry 下的 block
   address 入队。追加 block 时，`NativeFunction` 的 decoded range 会随 block 扩展。
+- `NativeProgramState::functionContaining(...)` 按 `NativeFunction::Blocks` 判断地址归属，
+  不再用 `RangeStart/RangeEnd` 把 block 之间的空洞算进函数。
 - 如果 direct branch successor 是已知的其他 function seed 入口，它会保留 direct flow xref，
   但不会作为当前函数 block successor 或本地 decode block 入队。
 - 这一步只用于受控消费 direct call seed 和 direct branch successor。间接 branch/call 目前只记录，

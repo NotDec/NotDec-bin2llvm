@@ -19,6 +19,7 @@
   - [x] 已补 unresolved indirect flow 记录：`CALLIND` / `BRANCHIND` 进入 native state 和 report。
   - [x] 已补已知函数入口边界：direct branch 到其他 function seed 时不并入当前函数。
   - [x] 已补已知 function seed range 对 Sleigh decode 字节数的截断，减少跨函数线性 decode。
+  - [x] 已补 `functionContaining(...)` 按 confirmed basic block 判断，避免 block 空洞误判。
   - [ ] 尚未解析间接 branch/call 目标，也还没有完整函数边界判断。
 - [ ] 阶段 4: CLI query
   - [x] 已补 `notdec-native-discover --summary-json` 最小 summary 输出。
