@@ -136,6 +136,8 @@ check_ir_features() {
       "$name GOT external indirect call"
     require_ir_pattern "$ll" "call void @_ITM_deregisterTMCloneTable()" \
       "$name GOT external indirect tail jump"
+    require_ir_pattern "$ll" "call void @notdec_plt0_resolver()" \
+      "$name PLT0 resolver tail jump"
     require_ir_pattern "$ll" "call void @getegid()" \
       "$name PLT GOT indirect branch"
     require_ir_pattern "$ll" "call void @SSL_get_error()" \
@@ -162,6 +164,8 @@ check_ir_features() {
       "$name GOT external indirect call"
     require_ir_pattern "$ll" "call void @_ITM_deregisterTMCloneTable()" \
       "$name GOT external indirect tail jump"
+    require_ir_pattern "$ll" "call void @notdec_plt0_resolver()" \
+      "$name PLT0 resolver tail jump"
     require_ir_pattern "$ll" "call void @SSL_CTX_use_PrivateKey_file()" \
       "$name PLT GOT indirect branch"
     require_ir_pattern "$ll" "call void @pthread_cond_signal()" \
@@ -173,6 +177,8 @@ check_ir_features() {
     "$name duplicate external symbol regression"
   forbid_ir_regex "$ll" 'ram_[0-9a-f]+_[0-9]+_in = freeze' \
     "$name direct RAM poison read regression"
+  forbid_ir_pattern "$ll" "notdec_exit" \
+    "$name anonymous branch exit regression"
 
   forbid_ir_pattern "$ll" "notdec_pcode_CALL_void" \
     "$name direct call helper regression"

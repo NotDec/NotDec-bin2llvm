@@ -302,6 +302,18 @@ struct NativeCallTargets {
   std::unordered_map<uint64_t, std::string> IndirectExternal;
 };
 
+std::optional<notdec::bin2llvm::NativeSectionInfo>
+sectionByName(const notdec::bin2llvm::NativeProgramState &state,
+              const std::string &name) {
+  for (const notdec::bin2llvm::NativeSectionInfo &section :
+       state.sections()) {
+    if (section.Name == name) {
+      return section;
+    }
+  }
+  return std::nullopt;
+}
+
 NativeCallTargets planNativeCallTargets(
     const notdec::bin2llvm::NativeProgramState &state) {
   NativeCallTargets targets;
@@ -333,6 +345,15 @@ NativeCallTargets planNativeCallTargets(
     std::string name = externalNameFor(entry.SymbolName);
     targets.External.emplace(entry.StubAddress, name);
     targets.IndirectExternal.emplace(entry.GotAddress, name);
+  }
+
+  std::optional<notdec::bin2llvm::NativeSectionInfo> plt =
+      sectionByName(state, ".plt");
+  std::optional<notdec::bin2llvm::NativeSectionInfo> got =
+      sectionByName(state, ".got");
+  if (plt && got) {
+    targets.IndirectExternal.emplace(
+        got->Address + 16, externalNameFor("notdec_plt0_resolver"));
   }
 
   for (const notdec::bin2llvm::NativeRelocationInfo &relocation :

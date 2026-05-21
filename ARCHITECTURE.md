@@ -137,9 +137,10 @@ external/NotDec-bin2llvm/
   PLT 外部符号映射，所以已知 direct call 仍能落到符号名。`CALLIND` 如果输入来源能追到
   直接 RAM GOT slot，并且该 slot 是外部 `GLOB_DAT` 符号，会生成为对应外部函数调用。
   `BRANCHIND` 命中同一类外部 GOT slot 或已知 `NativePltEntry::GotAddress` 时，会生成外部
-  `void ()` call 后结束当前函数，用于保守表达 external tail jump。PLT stub 地址和 GOT
-  slot 共享同一个外部 LLVM symbol，避免同一符号生成重复声明。x86 `CALLOTHER` userop
-  17/18（`LOCK` / `UNLOCK`）会 no-op，因为普通内存读写 P-Code 已经保留交换语义。
+  `void ()` call 后结束当前函数，用于保守表达 external tail jump。PLT0 resolver 的
+  `.got + 16` slot 会落到 synthetic 外部符号 `notdec_plt0_resolver`，避免生成匿名
+  `notdec_exit`。PLT stub 地址和 GOT slot 共享同一个外部 LLVM symbol，避免同一符号生成重复声明。
+  x86 `CALLOTHER` userop 17/18（`LOCK` / `UNLOCK`）会 no-op，因为普通内存读写 P-Code 已经保留交换语义。
   未命中目标和其他 `CALLOTHER` 仍走 helper call。
 - `scripts/bench2-native-smoke.sh`：Bench2 native smoke 入口。它固定跑 `vsftpd`、
   `libuv.so.1.0.0`、`memcached`，先用 `notdec-native-discover --summary-json` 确认
@@ -149,7 +150,7 @@ external/NotDec-bin2llvm/
   若干固定 IR pattern，确认最近补上的 direct call、PLT external call、GOT external
   indirect call / tail jump 没有退回 helper，并禁止最近清掉的 `CALL` / `CALLIND` /
   `CALLOTHER` helper 回到 Bench2 smoke 输出；同时禁止 direct `ram` 输入重新 lower 成
-  `freeze poison`。
+  `freeze poison`，也禁止当前三目标重新出现 `notdec_exit`。
 - `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。
 - `include/notdec-bin2llvm/ModuleBuilder.h`、`lib/ModuleBuilder.cpp`、`tools/notdec-bin2llvm.cpp`：最早的 demo module 入口，只生成一个空函数。
 

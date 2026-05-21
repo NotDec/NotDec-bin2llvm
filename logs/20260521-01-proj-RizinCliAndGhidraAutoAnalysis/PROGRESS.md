@@ -56,6 +56,7 @@
   - [x] 已补来源可追到外部 `GLOB_DAT` GOT slot 的 `BRANCHIND` external tail jump lowering。
   - [x] 已补 `NativePltEntry::GotAddress` 的 `BRANCHIND` external tail jump lowering，并复用同一外部 LLVM symbol。
   - [x] 已补 direct `ram` varnode 输入到 `@notdec_ram` load，避免继续生成 `freeze poison`。
+  - [x] 已补 PLT0 resolver `BRANCHIND` 到 `notdec_plt0_resolver` 的保守 tail jump lowering。
 - [ ] 阶段 7: Bench2 regression
   - [x] 已补 `scripts/bench2-native-smoke.sh`，固定跑 `vsftpd`、`libuv`、`memcached` 的 native discovery 和 LLVM verify。
   - [x] 已补 Bench2 smoke 的固定 IR pattern 检查，覆盖内部 direct call 和 libuv PLT external call。
@@ -70,6 +71,7 @@
   - [x] 已补 `vsftpd` / `memcached` `.plt.sec` GOT indirect branch 的 smoke pattern。
   - [x] 已把当前三目标 unresolved indirect branch 基线收紧到 0。
   - [x] 已补 Bench2 smoke 禁止 direct `ram` 输入重新 lower 成 `freeze poison`。
+  - [x] 已补 Bench2 smoke 禁止当前三目标重新出现 `notdec_exit`，并检查 PLT0 resolver call。
 
 ## 记录规则
 
