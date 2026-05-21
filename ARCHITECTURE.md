@@ -34,8 +34,10 @@ Ghidra 那种完整数据库：
 `notdec-native-discover` 默认输出文本 report，包含 function seed、worklist、confirmed
 function、basic block、instruction、xref 和 unresolved indirect flow 数量。加
 `--summary-json` 时会跳过文本 report，输出同口径的最小 JSON summary，供 Bench2 smoke
-做机器检查。`--functions-json` 输出已确认函数列表，包含入口、保守范围、名字、来源和
-block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址、大小和 successor。
+做机器检查。`--seeds-json` 输出 function seed 列表，包含地址、名字、alias、来源、
+confidence 和保守 range，方便解释入口发现来源。`--functions-json` 输出已确认函数列表，
+包含入口、保守范围、名字、来源和 block 数。`--blocks-json` 输出已确认函数里的 basic
+block 起止地址、大小和 successor。
 `--xrefs-json` 输出当前 direct control-flow xref 列表，`--xrefs-from-json <addr>` 和
 `--xrefs-to-json <addr>` 按地址查引用。`--instructions-json` 输出已接受指令的地址、
 大小、字节、显示文本和来源，`--instructions-range-json <start> <end>` 按地址范围过滤同一批
@@ -121,9 +123,10 @@ external/NotDec-bin2llvm/
 - `tools/notdec-heritage-check.cpp`：单函数 JSON 检查工具。
 - `tools/notdec-native-discover.cpp`：native discovery smoke 入口。默认打印文本 report，
   `--summary-json` 打印 function、block、instruction、xref 和 unresolved indirect flow
-  的汇总 JSON，`--functions-json` 打印 confirmed function 列表 JSON，`--blocks-json`
-  打印 confirmed function 下的 basic block 列表 JSON，`--xrefs-json` 打印 xref 列表
-  JSON，`--xrefs-from-json` / `--xrefs-to-json` 按地址查 xref，`--instructions-json`
+  的汇总 JSON，`--seeds-json` 打印 function seed 列表 JSON，包含地址、range、
+  name、alias、来源和 confidence，`--functions-json` 打印 confirmed function 列表
+  JSON，`--blocks-json` 打印 confirmed function 下的 basic block 列表 JSON，
+  `--xrefs-json` 打印 xref 列表 JSON，`--xrefs-from-json` / `--xrefs-to-json` 按地址查 xref，`--instructions-json`
   打印 instruction 列表 JSON，`--instructions-range-json` 按地址范围打印 instruction
   列表 JSON，`--instructions-function-json` 按 confirmed function 入口打印 instruction
   列表 JSON，`--plt-json` 打印 `.plt.sec` / `.plt.got` stub、GOT slot 和外部符号名映射，

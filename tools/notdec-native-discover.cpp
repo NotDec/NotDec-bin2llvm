@@ -19,6 +19,7 @@ namespace {
 enum class OutputMode {
   TextReport,
   SummaryJson,
+  SeedsJson,
   FunctionsJson,
   BlocksJson,
   XrefsJson,
@@ -43,6 +44,7 @@ struct CliOptions {
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0 << " <elf-file>\n";
   std::cerr << "       " << argv0 << " --summary-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --seeds-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
@@ -121,6 +123,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
 
   if (mode == "--summary-json") {
     options.Mode = OutputMode::SummaryJson;
+  } else if (mode == "--seeds-json") {
+    options.Mode = OutputMode::SeedsJson;
   } else if (mode == "--functions-json") {
     options.Mode = OutputMode::FunctionsJson;
   } else if (mode == "--blocks-json") {
@@ -252,6 +256,51 @@ void printSummaryJson(std::ostream &output,
          << unresolvedFlowCounts[NativeUnresolvedFlowKind::IndirectBranch]
          << "\n";
   output << "  }\n";
+  output << "}\n";
+}
+
+void printStringArray(std::ostream &output,
+                      const std::vector<std::string> &values) {
+  output << "[";
+  for (size_t index = 0; index < values.size(); ++index) {
+    output << (index == 0 ? "" : ", ");
+    output << "\"" << jsonEscape(values[index]) << "\"";
+  }
+  output << "]";
+}
+
+void printSeedsJson(std::ostream &output,
+                    const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"seeds\": [";
+  bool firstSeed = true;
+  for (const auto &[address, seed] : state.functionSeeds()) {
+    (void)address;
+    output << (firstSeed ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"address\": \"" << hexString(seed.Address) << "\",\n";
+    output << "      \"size\": " << seed.Size << ",\n";
+    output << "      \"range_start\": \"" << hexString(seed.RangeStart)
+           << "\",\n";
+    output << "      \"range_end\": \"" << hexString(seed.RangeEnd)
+           << "\",\n";
+    output << "      \"range_source\": \"" << jsonEscape(seed.RangeSource)
+           << "\",\n";
+    output << "      \"primary_name\": \"" << jsonEscape(seed.PrimaryName)
+           << "\",\n";
+    output << "      \"aliases\": ";
+    printStringArray(output, seed.Aliases);
+    output << ",\n";
+    output << "      \"sources\": ";
+    printStringArray(output, seed.Sources);
+    output << ",\n";
+    output << "      \"confidence\": \""
+           << notdec::bin2llvm::toString(seed.Confidence) << "\"\n";
+    output << "    }";
+    firstSeed = false;
+  }
+  output << (firstSeed ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << state.functionSeeds().size() << "\n";
   output << "}\n";
 }
 
@@ -529,6 +578,8 @@ int main(int argc, char **argv) {
     manager.run(state);
     if (options->Mode == OutputMode::SummaryJson) {
       printSummaryJson(std::cout, state);
+    } else if (options->Mode == OutputMode::SeedsJson) {
+      printSeedsJson(std::cout, state);
     } else if (options->Mode == OutputMode::FunctionsJson) {
       printFunctionsJson(std::cout, state);
     } else if (options->Mode == OutputMode::BlocksJson) {

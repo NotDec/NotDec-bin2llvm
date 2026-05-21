@@ -9,6 +9,7 @@
   - [x] 已补 function seed 到 recursive decode worklist 的最小桥接。
   - [x] 已补 `.dynsym` 已定义函数符号的 seed 来源。
   - [x] 已补 Bench2 smoke 的入口 source baseline，覆盖 dynamic init/fini、init/fini array、`.eh_frame`、executable `elf-entry` 和 shared object 无 `elf-entry`。
+  - [x] 已补 function seed JSON 查询，能直接查看入口地址、range、名字、alias、来源和 confidence。
 - [ ] 阶段 3: Recursive disassembly CFG
   - [x] 已补从 function worklist 到 `NativeInstruction` 的最小 Sleigh 线性解码。
   - [x] 已补已解码 seed 到 confirmed function / 单 basic block 的保守落地。
@@ -29,6 +30,7 @@
   - [ ] 尚未解析间接 branch/call 目标，也还没有完整函数边界判断。
 - [ ] 阶段 4: CLI query
   - [x] 已补 `notdec-native-discover --summary-json` 最小 summary 输出。
+  - [x] 已补 `notdec-native-discover --seeds-json` 输出 function seed 列表。
   - [x] 已补 `notdec-native-discover --functions-json` 最小 confirmed function 列表输出。
   - [x] 已补 `notdec-native-discover --blocks-json` 最小 basic block 列表输出。
   - [x] 已补 `notdec-native-discover --xrefs-json` 最小 xref 列表输出。
