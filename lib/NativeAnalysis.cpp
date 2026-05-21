@@ -1365,7 +1365,10 @@ private:
       return;
     }
 
-    uint64_t decodeBytes = std::min(MaxBytesPerSeed, *availableBytes);
+    uint64_t decodeBytes = std::min(
+        MaxBytesPerSeed,
+        boundedBytesForFunctionSeed(state, functionEntry, address,
+                                    *availableBytes));
     SleighInstructionDecode decode = collectSleighInstructionDecode(
         loadImage, SpecOptions, address, MaxInstructionsPerSeed, decodeBytes,
         NullErrors);
@@ -1646,6 +1649,26 @@ private:
       return range.Size - (address - range.Start);
     }
     return std::nullopt;
+  }
+
+  static uint64_t boundedBytesForFunctionSeed(const NativeProgramState &state,
+                                              uint64_t functionEntry,
+                                              uint64_t blockAddress,
+                                              uint64_t availableBytes) {
+    auto seedIterator = state.functionSeeds().find(functionEntry);
+    if (seedIterator == state.functionSeeds().end()) {
+      return availableBytes;
+    }
+
+    const NativeFunctionSeed &seed = seedIterator->second;
+    // Known seed ranges come from stronger boundaries such as symbol sizes or
+    // .eh_frame FDEs.  Use them as a decode cap, but only when the queued block
+    // is actually inside the recorded half-open range.
+    if (seed.RangeStart == 0 || seed.RangeEnd <= seed.RangeStart ||
+        blockAddress < seed.RangeStart || blockAddress >= seed.RangeEnd) {
+      return availableBytes;
+    }
+    return std::min(availableBytes, seed.RangeEnd - blockAddress);
   }
 };
 

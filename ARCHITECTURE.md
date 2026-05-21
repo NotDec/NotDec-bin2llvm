@@ -46,7 +46,8 @@ block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址
   `Sleigh::printAssembly(...)` 解码指令地址、长度和显示文本。
 - `lib/NativeAnalysis.cpp::SleighSeedInstructionAnalyzer` 先从 function worklist 取前 8 个
   seed 入本地队列。队列元素区分 function entry 和 block address，每个 block 最多解码
-  8 条 / 64 字节，并写入 `NativeInstruction`。
+  8 条 / 64 字节，并写入 `NativeInstruction`。如果当前 function seed 已有 symbol size
+  或 `.eh_frame` FDE 给出的 `[RangeStart, RangeEnd)`，decode 字节数还会被这个已知范围截断。
 - 如果某个 seed 成功解码出指令，它会被保守写成一个 `NativeFunction`，并带一个覆盖已解码
   指令前缀的 `NativeBasicBlock`。
 - `lib/SleighLift.cpp::collectSleighInstructionDecode(...)` 在同一次 Sleigh 初始化里收集指令摘要
