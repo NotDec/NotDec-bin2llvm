@@ -10,6 +10,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -19,6 +20,7 @@ enum class OutputMode {
   TextReport,
   SummaryJson,
   FunctionsJson,
+  BlocksJson,
 };
 
 struct CliOptions {
@@ -30,6 +32,7 @@ void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0 << " <elf-file>\n";
   std::cerr << "       " << argv0 << " --summary-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
@@ -48,6 +51,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::SummaryJson;
   } else if (mode == "--functions-json") {
     options.Mode = OutputMode::FunctionsJson;
+  } else if (mode == "--blocks-json") {
+    options.Mode = OutputMode::BlocksJson;
   } else {
     return std::nullopt;
   }
@@ -184,6 +189,43 @@ void printFunctionsJson(std::ostream &output,
   output << "}\n";
 }
 
+void printAddressArray(std::ostream &output,
+                       const std::vector<uint64_t> &addresses) {
+  output << "[";
+  for (size_t index = 0; index < addresses.size(); ++index) {
+    output << (index == 0 ? "" : ", ");
+    output << "\"" << hexString(addresses[index]) << "\"";
+  }
+  output << "]";
+}
+
+void printBlocksJson(std::ostream &output,
+                     const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"blocks\": [";
+  bool firstBlock = true;
+  uint64_t blockCount = 0;
+  for (const auto &[entry, function] : state.functions()) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block : function.Blocks) {
+      output << (firstBlock ? "\n" : ",\n");
+      output << "    {\n";
+      output << "      \"function_entry\": \"" << hexString(entry) << "\",\n";
+      output << "      \"start\": \"" << hexString(block.Start) << "\",\n";
+      output << "      \"end\": \"" << hexString(block.End) << "\",\n";
+      output << "      \"size\": " << (block.End - block.Start) << ",\n";
+      output << "      \"successors\": ";
+      printAddressArray(output, block.Successors);
+      output << "\n";
+      output << "    }";
+      firstBlock = false;
+      ++blockCount;
+    }
+  }
+  output << (firstBlock ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << blockCount << "\n";
+  output << "}\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -218,6 +260,8 @@ int main(int argc, char **argv) {
       printSummaryJson(std::cout, state);
     } else if (options->Mode == OutputMode::FunctionsJson) {
       printFunctionsJson(std::cout, state);
+    } else if (options->Mode == OutputMode::BlocksJson) {
+      printBlocksJson(std::cout, state);
     }
     return 0;
   } catch (const std::exception &error) {

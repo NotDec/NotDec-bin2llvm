@@ -22,6 +22,7 @@
 - [ ] 阶段 4: CLI query
   - [x] 已补 `notdec-native-discover --summary-json` 最小 summary 输出。
   - [x] 已补 `notdec-native-discover --functions-json` 最小 confirmed function 列表输出。
+  - [x] 已补 `notdec-native-discover --blocks-json` 最小 basic block 列表输出。
 - [ ] 阶段 5: XRef enhancement
 - [ ] 阶段 6: Lowering integration
 - [ ] 阶段 7: Bench2 regression
