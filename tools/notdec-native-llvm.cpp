@@ -296,6 +296,37 @@ std::string externalFunctionLlvmName(const std::string &symbolName,
   return uniqueFunctionName(name, usedNames);
 }
 
+struct NativeCallTargets {
+  std::unordered_map<uint64_t, std::string> Direct;
+  std::unordered_map<uint64_t, std::string> External;
+};
+
+NativeCallTargets planNativeCallTargets(
+    const notdec::bin2llvm::NativeProgramState &state) {
+  NativeCallTargets targets;
+  std::set<std::string> usedNames;
+
+  for (const auto &[entry, function] : state.functions()) {
+    (void)entry;
+    if (function.RangeEnd <= function.Entry) {
+      continue;
+    }
+    targets.Direct.emplace(function.Entry,
+                           nativeFunctionLlvmName(function, usedNames));
+  }
+
+  for (const notdec::bin2llvm::NativePltEntry &entry : state.pltEntries()) {
+    if (entry.SymbolName.empty()) {
+      continue;
+    }
+    targets.External.emplace(
+        entry.StubAddress,
+        externalFunctionLlvmName(entry.SymbolName, usedNames));
+  }
+
+  return targets;
+}
+
 bool moduleVerifies(const llvm::Module &module, std::string &message) {
   std::string buffer;
   llvm::raw_string_ostream stream(buffer);
@@ -316,26 +347,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
   auto module =
       std::make_unique<llvm::Module>("notdec.bin2llvm.native.confirmed", context);
 
-  std::set<std::string> usedNames;
-  std::unordered_map<uint64_t, std::string> namesByEntry;
-  for (const auto &[entry, function] : state.functions()) {
-    (void)entry;
-    if (function.RangeEnd <= function.Entry) {
-      continue;
-    }
-    namesByEntry.emplace(function.Entry,
-                         nativeFunctionLlvmName(function, usedNames));
-  }
-
-  std::unordered_map<uint64_t, std::string> externalNamesByStub;
-  for (const notdec::bin2llvm::NativePltEntry &entry : state.pltEntries()) {
-    if (entry.SymbolName.empty()) {
-      continue;
-    }
-    externalNamesByStub.emplace(
-        entry.StubAddress,
-        externalFunctionLlvmName(entry.SymbolName, usedNames));
-  }
+  NativeCallTargets callTargets = planNativeCallTargets(state);
 
   unsigned appended = 0;
   for (const auto &[entry, function] : state.functions()) {
@@ -355,13 +367,13 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
 
     notdec::bin2llvm::PcodeLoweringConfig config;
     config.ModuleName = "notdec.bin2llvm.native.confirmed.check";
-    auto nameIt = namesByEntry.find(function.Entry);
-    if (nameIt == namesByEntry.end()) {
+    auto nameIt = callTargets.Direct.find(function.Entry);
+    if (nameIt == callTargets.Direct.end()) {
       continue;
     }
     config.EntryFunctionName = nameIt->second;
-    config.DirectCallTargets = namesByEntry;
-    config.ExternalCallTargets = externalNamesByStub;
+    config.DirectCallTargets = callTargets.Direct;
+    config.ExternalCallTargets = callTargets.External;
 
     llvm::LLVMContext checkContext;
     std::string checkError;
@@ -454,6 +466,14 @@ int main(int argc, char **argv) {
             sanitizeLlvmFunctionName(options->FunctionName);
       } else if (options->FunctionEntry) {
         config.EntryFunctionName = entryFunctionName(*options->FunctionEntry);
+      }
+      if (options->FunctionEntry) {
+        notdec::bin2llvm::NativeProgramState state =
+            runNativeDiscovery(*binary);
+        NativeCallTargets callTargets = planNativeCallTargets(state);
+        callTargets.Direct[*options->FunctionEntry] = config.EntryFunctionName;
+        config.DirectCallTargets = std::move(callTargets.Direct);
+        config.ExternalCallTargets = std::move(callTargets.External);
       }
       module = notdec::bin2llvm::buildPcodeModule(context, program, config,
                                                   errorMessage);

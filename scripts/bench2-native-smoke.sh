@@ -147,6 +147,52 @@ for index in "${!TARGET_NAMES[@]}"; do
   "$LLVM_AS" "$ll" -o "$bc" >"$llvm_as_stdout" 2>"$llvm_as_stderr"
   "$OPT" -passes=verify "$bc" -o "$opt_bc" >"$opt_stdout" 2>"$opt_stderr"
   check_ir_features "$name" "$ll"
+
+  if [[ "$name" == "libuv" ]]; then
+    single_ll="$OUT_DIR/$name.single-function.ll"
+    single_bc="$OUT_DIR/$name.single-function.bc"
+    single_opt_bc="$OUT_DIR/$name.single-function.opt.bc"
+    single_stdout="$OUT_DIR/$name.single-function.native-llvm.stdout"
+    single_stderr="$OUT_DIR/$name.single-function.native-llvm.stderr"
+    single_llvm_as_stdout="$OUT_DIR/$name.single-function.llvm-as.stdout"
+    single_llvm_as_stderr="$OUT_DIR/$name.single-function.llvm-as.stderr"
+    single_opt_stdout="$OUT_DIR/$name.single-function.opt.stdout"
+    single_opt_stderr="$OUT_DIR/$name.single-function.opt.stderr"
+
+    "$NATIVE_LLVM" "$target" -f 0x9df0 -o "$single_ll" \
+      >"$single_stdout" 2>"$single_stderr"
+    "$LLVM_AS" "$single_ll" -o "$single_bc" \
+      >"$single_llvm_as_stdout" 2>"$single_llvm_as_stderr"
+    "$OPT" -passes=verify "$single_bc" -o "$single_opt_bc" \
+      >"$single_opt_stdout" 2>"$single_opt_stderr"
+    require_ir_pattern "$single_ll" "call void @__cxa_finalize()" \
+      "$name single-function PLT.GOT external direct call"
+    require_ir_pattern "$single_ll" "call void @notdec_native_9d80()" \
+      "$name single-function internal direct call"
+    if grep -Fq "notdec_pcode_CALL_void" "$single_ll"; then
+      echo "single-function libuv still contains helper call" >&2
+      exit 1
+    fi
+
+    named_ll="$OUT_DIR/$name.named-function.ll"
+    named_bc="$OUT_DIR/$name.named-function.bc"
+    named_opt_bc="$OUT_DIR/$name.named-function.opt.bc"
+    named_stdout="$OUT_DIR/$name.named-function.native-llvm.stdout"
+    named_stderr="$OUT_DIR/$name.named-function.native-llvm.stderr"
+    named_llvm_as_stdout="$OUT_DIR/$name.named-function.llvm-as.stdout"
+    named_llvm_as_stderr="$OUT_DIR/$name.named-function.llvm-as.stderr"
+    named_opt_stdout="$OUT_DIR/$name.named-function.opt.stdout"
+    named_opt_stderr="$OUT_DIR/$name.named-function.opt.stderr"
+
+    "$NATIVE_LLVM" "$target" -n uv_key_delete -o "$named_ll" \
+      >"$named_stdout" 2>"$named_stderr"
+    "$LLVM_AS" "$named_ll" -o "$named_bc" \
+      >"$named_llvm_as_stdout" 2>"$named_llvm_as_stderr"
+    "$OPT" -passes=verify "$named_bc" -o "$named_opt_bc" \
+      >"$named_opt_stdout" 2>"$named_opt_stderr"
+    require_ir_pattern "$named_ll" "call void @pthread_key_delete()" \
+      "$name named-function PLT external direct call"
+  fi
   finished_at="$(date +%s)"
 
   echo "$name ok elapsed=$((finished_at - started_at))s summary=$summary ll=$ll"
