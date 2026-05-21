@@ -751,16 +751,24 @@ bool appendPcodeFunction(llvm::LLVMContext &context, llvm::Module &module,
                          const PcodeProgram &program,
                          const PcodeLoweringConfig &config,
                          std::string &errorMessage) {
-  if (module.getFunction(config.EntryFunctionName) != nullptr) {
-    errorMessage = "duplicate function name: " + config.EntryFunctionName;
-    return false;
-  }
-
   auto *functionType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), false);
-  auto *function =
-      llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
-                             config.EntryFunctionName, &module);
+  llvm::Function *function = module.getFunction(config.EntryFunctionName);
+  if (function != nullptr) {
+    if (!function->empty()) {
+      errorMessage = "duplicate function name: " + config.EntryFunctionName;
+      return false;
+    }
+    if (function->getFunctionType() != functionType) {
+      errorMessage =
+          "function declaration type mismatch: " + config.EntryFunctionName;
+      return false;
+    }
+  } else {
+    function =
+        llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
+                               config.EntryFunctionName, &module);
+  }
 
   auto *entryBlock = llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entryBlock);

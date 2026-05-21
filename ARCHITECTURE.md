@@ -114,7 +114,8 @@ external/NotDec-bin2llvm/
   再生成 `.ll`。P-Code lowering 会把 LLVM `%entry` 作为单独跳板，真实机器入口放在
   `bb_<address>`，所以 CFG 可以有回边跳到机器入口。`--all-confirmed` 会先规划本模块
   confirmed function 的入口地址到 LLVM symbol 的映射，P-Code direct `CALL` 如果命中这个
-  映射，会生成为普通 LLVM direct call；未命中目标、`CALLIND`、`CALLOTHER` 仍走 helper call。
+  映射，会生成为普通 LLVM direct call；forward call 先创建的空 declaration 可以在后续
+  lowering 中补成函数体。未命中目标、`CALLIND`、`CALLOTHER` 仍走 helper call。
 - `scripts/bench2-native-smoke.sh`：Bench2 native smoke 入口。它固定跑 `vsftpd`、
   `libuv.so.1.0.0`、`memcached`，先用 `notdec-native-discover --summary-json` 确认
   native discovery 至少产出 confirmed function，再用 `notdec-native-llvm --all-confirmed`
