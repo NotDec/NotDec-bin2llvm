@@ -24,6 +24,7 @@
   - [x] 已补 direct `ram` GOT 命中 `NativePltEntry` 的 `BRANCHIND` xref，并从 unresolved indirect branch 中移除。
   - [x] 已补 `.plt.got` thunk byte-match 后的 `BRANCHIND` 解析，进一步减少 unresolved indirect branch。
   - [x] 已补来源可追到外部 `GLOB_DAT` GOT slot 的 `BRANCHIND` xref，并从 unresolved indirect branch 中移除。
+  - [x] 已补 PLT0 resolver `BRANCHIND` xref，并从 unresolved indirect branch 中移除。
   - [ ] 尚未解析间接 branch/call 目标，也还没有完整函数边界判断。
 - [ ] 阶段 4: CLI query
   - [x] 已补 `notdec-native-discover --summary-json` 最小 summary 输出。
@@ -66,6 +67,7 @@
   - [x] 已把当前 branch 基线收紧到 `vsftpd` / `memcached` <= 1，`libuv` <= 0。
   - [x] 已补三个目标 `_ITM_deregisterTMCloneTable` GOT external tail jump 的 smoke pattern。
   - [x] 已补 `vsftpd` / `memcached` `.plt.sec` GOT indirect branch 的 smoke pattern。
+  - [x] 已把当前三目标 unresolved indirect branch 基线收紧到 0。
 
 ## 记录规则
 

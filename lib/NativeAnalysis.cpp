@@ -1577,6 +1577,12 @@ private:
                           "sleigh-pcode-plt-indirect-branch");
             continue;
           }
+          if (isPlt0ResolverSlot(state, op.Address, *gotAddress)) {
+            addUniqueXref(state, seenXrefs, op.Address, *gotAddress,
+                          NativeXrefKind::Flow,
+                          "sleigh-pcode-plt0-resolver-branch");
+            continue;
+          }
         }
         // Guarded external tail jumps load the GOT slot into a register before
         // BRANCHIND. Only accept slots proven by relocation as external GLOB_DAT.
@@ -1698,6 +1704,16 @@ private:
       }
     }
     return false;
+  }
+
+  static bool isPlt0ResolverSlot(const NativeProgramState &state,
+                                 uint64_t branchAddress, uint64_t gotAddress) {
+    std::optional<NativeSectionInfo> plt = findSection(state, ".plt");
+    std::optional<NativeSectionInfo> got = findSection(state, ".got");
+    if (!plt || !got) {
+      return false;
+    }
+    return branchAddress == plt->Address + 6 && gotAddress == got->Address + 16;
   }
 
   static void addDirectDataXrefs(

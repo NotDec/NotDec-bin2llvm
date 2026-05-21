@@ -208,14 +208,7 @@ for index in "${!TARGET_NAMES[@]}"; do
     exit 1
   fi
   require_no_unresolved_indirect_calls "$summary" "$name"
-  case "$name" in
-  vsftpd | memcached)
-    require_unresolved_indirect_branches_at_most "$summary" "$name" 1
-    ;;
-  libuv)
-    require_unresolved_indirect_branches_at_most "$summary" "$name" 0
-    ;;
-  esac
+  require_unresolved_indirect_branches_at_most "$summary" "$name" 0
 
   "$NATIVE_LLVM" "$target" --all-confirmed -o "$ll" \
     >"$native_stdout" 2>"$native_stderr"
