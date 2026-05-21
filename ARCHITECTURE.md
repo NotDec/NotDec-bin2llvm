@@ -58,6 +58,10 @@ block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址
   NUL 结尾 ASCII C 字符串时，记为 `NativeXrefKind::String`，来源是
   `sleigh-pcode-direct-string`；否则仍记为 `NativeXrefKind::Data`，来源是
   `sleigh-pcode-direct-data`。
+- `RelocationPltAnalyzer` 会把已应用的本地 relocated pointer 也写成 xref：relocation
+  slot 是 from，computed pointer 是 to。目标像只读 C 字符串时记 string，来源
+  `elf-relocation-string`；其他落在已加载内存里的目标记 data，来源
+  `elf-relocation-pointer`。
 - 当前 block 不是单纯整段线性范围：`SleighSeedInstructionAnalyzer` 会按控制流指令切分已解码
   前缀。`CBRANCH` block 同时记录直接目标和下一条指令 fallthrough，`BRANCH` block 只记录直接
   目标，`BRANCHIND` / `RETURN` block 暂不记录 successor。

@@ -144,6 +144,18 @@ bool looksLikeReadOnlyCString(const NativeProgramState &state,
   return false;
 }
 
+bool isMappedAddress(const NativeProgramState &state, uint64_t address) {
+  for (const NativeMemoryRange &range : state.memoryRanges()) {
+    if (range.Start > address) {
+      break;
+    }
+    if (containsAddress(range.Start, range.Size, address)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool executableRangeContains(const NativeProgramState &state, uint64_t start,
                              uint64_t end) {
   if (start >= end) {
@@ -298,9 +310,32 @@ public:
     }
 
     addPltEntries(state, jumpSlots);
+    addRelocationPointerXrefs(state);
   }
 
 private:
+  void addRelocationPointerXrefs(NativeProgramState &state) {
+    std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> seenXrefs;
+    for (const auto &[address, target] : state.relocatedPointers()) {
+      if (!isMappedAddress(state, target)) {
+        continue;
+      }
+      NativeXrefKind kind = looksLikeReadOnlyCString(state, target)
+                                ? NativeXrefKind::String
+                                : NativeXrefKind::Data;
+      NativeXref xref;
+      xref.From = address;
+      xref.To = target;
+      xref.Kind = kind;
+      xref.Source = kind == NativeXrefKind::String ? "elf-relocation-string"
+                                                    : "elf-relocation-pointer";
+      if (!seenXrefs.insert({xref.From, xref.To, xref.Kind}).second) {
+        continue;
+      }
+      state.addXref(std::move(xref));
+    }
+  }
+
   void addPltEntries(NativeProgramState &state,
                      std::vector<NativeRelocationInfo> jumpSlots) {
     if (jumpSlots.empty()) {

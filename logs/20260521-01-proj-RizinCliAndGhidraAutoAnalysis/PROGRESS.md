@@ -29,6 +29,7 @@
 - [ ] 阶段 5: XRef enhancement
   - [x] 已补 direct `ram` P-Code 数据访问到 `data` xref 的保守记录。
   - [x] 已补 direct `ram` 数据引用到只读 C 字符串时的 `string` xref 分类。
+  - [x] 已补 ELF relocated pointer 到 `data` / `string` xref 的记录。
 - [ ] 阶段 6: Lowering integration
 - [ ] 阶段 7: Bench2 regression
 
