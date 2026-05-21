@@ -552,9 +552,19 @@ private:
     // in IR without pretending we already understand binary sections or ABI.
     auto *byteType = llvm::Type::getInt8Ty(Context);
     auto *arrayType = llvm::ArrayType::get(byteType, 1024 * 1024);
+    std::string name = "notdec_ram";
+    unsigned index = 1;
+    while (llvm::Value *existing = Module.getNamedValue(name)) {
+      auto *global = llvm::dyn_cast<llvm::GlobalVariable>(existing);
+      if (global != nullptr && global->getValueType() == arrayType) {
+        Memory = global;
+        return Memory;
+      }
+      name = "notdec_ram." + std::to_string(index++);
+    }
     Memory = new llvm::GlobalVariable(Module, arrayType, false,
                                       llvm::GlobalValue::ExternalLinkage,
-                                      nullptr, "notdec_ram");
+                                      nullptr, name);
     return Memory;
   }
 
@@ -716,21 +726,36 @@ private:
 
 } // namespace
 
-std::unique_ptr<llvm::Module>
-buildPcodeModule(llvm::LLVMContext &context, const PcodeProgram &program,
-                 const PcodeLoweringConfig &config, std::string &errorMessage) {
-  auto module = std::make_unique<llvm::Module>(config.ModuleName, context);
+bool appendPcodeFunction(llvm::LLVMContext &context, llvm::Module &module,
+                         const PcodeProgram &program,
+                         const PcodeLoweringConfig &config,
+                         std::string &errorMessage) {
+  if (module.getFunction(config.EntryFunctionName) != nullptr) {
+    errorMessage = "duplicate function name: " + config.EntryFunctionName;
+    return false;
+  }
 
   auto *functionType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), false);
   auto *function =
       llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
-                             config.EntryFunctionName, module.get());
+                             config.EntryFunctionName, &module);
 
   auto *entryBlock = llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entryBlock);
-  PcodeLowerer lowerer(context, *module, *function, builder);
+  PcodeLowerer lowerer(context, module, *function, builder);
   if (!lowerer.lower(program, errorMessage)) {
+    function->eraseFromParent();
+    return false;
+  }
+  return true;
+}
+
+std::unique_ptr<llvm::Module>
+buildPcodeModule(llvm::LLVMContext &context, const PcodeProgram &program,
+                 const PcodeLoweringConfig &config, std::string &errorMessage) {
+  auto module = std::make_unique<llvm::Module>(config.ModuleName, context);
+  if (!appendPcodeFunction(context, *module, program, config, errorMessage)) {
     return nullptr;
   }
   return module;

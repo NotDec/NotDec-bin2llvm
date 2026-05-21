@@ -21,4 +21,9 @@ std::unique_ptr<llvm::Module>
 buildPcodeModule(llvm::LLVMContext &context, const PcodeProgram &program,
                  const PcodeLoweringConfig &config, std::string &errorMessage);
 
+bool appendPcodeFunction(llvm::LLVMContext &context, llvm::Module &module,
+                         const PcodeProgram &program,
+                         const PcodeLoweringConfig &config,
+                         std::string &errorMessage);
+
 } // namespace notdec::bin2llvm

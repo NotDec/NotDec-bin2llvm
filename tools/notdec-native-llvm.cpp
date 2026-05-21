@@ -18,6 +18,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -36,13 +37,15 @@ struct CliOptions {
   uint64_t Length = 0;
   std::optional<uint64_t> FunctionEntry;
   std::string FunctionName;
+  bool AllConfirmed = false;
   std::string OutputPath;
 };
 
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0
             << " <elf-file> [sla-file] "
-               "(-a <address> -l <length> | -f <entry> | -n <name>) "
+               "(-a <address> -l <length> | -f <entry> | -n <name> | "
+               "--all-confirmed) "
                "-o <output.ll> [-p root-sla-dir] [-s pspec-file]\n";
 }
 
@@ -72,6 +75,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
 
   for (; argIndex < argc; ++argIndex) {
     std::string flag = argv[argIndex];
+    if (flag == "--all-confirmed") {
+      options.AllConfirmed = true;
+      continue;
+    }
     if (argIndex + 1 >= argc) {
       std::cerr << "flag has no value: " << flag << '\n';
       return std::nullopt;
@@ -111,20 +118,28 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
   }
 
-  if (options.FunctionEntry && !options.FunctionName.empty()) {
-    std::cerr << "-f cannot be combined with -n\n";
+  unsigned selectionCount = 0;
+  if (options.FunctionEntry) {
+    ++selectionCount;
+  }
+  if (!options.FunctionName.empty()) {
+    ++selectionCount;
+  }
+  if (options.AllConfirmed) {
+    ++selectionCount;
+  }
+  if (hasAddress || hasLength) {
+    ++selectionCount;
+  }
+  if (selectionCount != 1) {
+    std::cerr << "choose exactly one of -a/-l, -f, -n, or --all-confirmed\n";
     return std::nullopt;
   }
-  if ((options.FunctionEntry || !options.FunctionName.empty()) &&
-      (hasAddress || hasLength)) {
-    std::cerr << "-f or -n cannot be combined with -a or -l\n";
-    return std::nullopt;
-  }
-  if (!options.FunctionEntry && options.FunctionName.empty() && !hasAddress) {
+  if ((hasAddress || hasLength) && !hasAddress) {
     std::cerr << "missing -a <address>\n";
     return std::nullopt;
   }
-  if (!options.FunctionEntry && options.FunctionName.empty() && !hasLength) {
+  if ((hasAddress || hasLength) && !hasLength) {
     std::cerr << "missing -l <length>\n";
     return std::nullopt;
   }
@@ -190,11 +205,8 @@ std::string sanitizeLlvmFunctionName(const std::string &name) {
   return result;
 }
 
-bool resolveFunctionRange(const LIEF::ELF::Binary &binary, CliOptions &options) {
-  if (!options.FunctionEntry && options.FunctionName.empty()) {
-    return true;
-  }
-
+notdec::bin2llvm::NativeProgramState
+runNativeDiscovery(const LIEF::ELF::Binary &binary) {
   notdec::bin2llvm::NativeProgramState state(binary);
   notdec::bin2llvm::NativeAnalysisManager manager;
   manager.addAnalyzer(notdec::bin2llvm::createElfLoadAnalyzer());
@@ -204,6 +216,15 @@ bool resolveFunctionRange(const LIEF::ELF::Binary &binary, CliOptions &options) 
   manager.addAnalyzer(notdec::bin2llvm::createEhFrameAnalyzer());
   manager.addAnalyzer(notdec::bin2llvm::createSleighSeedInstructionAnalyzer());
   manager.run(state);
+  return state;
+}
+
+bool resolveFunctionRange(const LIEF::ELF::Binary &binary, CliOptions &options) {
+  if (!options.FunctionEntry && options.FunctionName.empty()) {
+    return true;
+  }
+
+  notdec::bin2llvm::NativeProgramState state = runNativeDiscovery(binary);
 
   const notdec::bin2llvm::NativeFunction *function = nullptr;
   if (options.FunctionEntry) {
@@ -244,6 +265,96 @@ bool resolveFunctionRange(const LIEF::ELF::Binary &binary, CliOptions &options) 
     options.FunctionEntry = function->Entry;
   }
   return true;
+}
+
+std::string uniqueFunctionName(const std::string &baseName,
+                               std::set<std::string> &usedNames) {
+  std::string name = baseName.empty() ? "notdec_native_function" : baseName;
+  std::string unique = name;
+  unsigned index = 1;
+  while (!usedNames.insert(unique).second) {
+    unique = name + "_" + std::to_string(index++);
+  }
+  return unique;
+}
+
+std::string nativeFunctionLlvmName(const notdec::bin2llvm::NativeFunction &func,
+                                   std::set<std::string> &usedNames) {
+  if (!func.Name.empty()) {
+    return uniqueFunctionName(sanitizeLlvmFunctionName(func.Name), usedNames);
+  }
+  return uniqueFunctionName(entryFunctionName(func.Entry), usedNames);
+}
+
+bool moduleVerifies(const llvm::Module &module, std::string &message) {
+  std::string buffer;
+  llvm::raw_string_ostream stream(buffer);
+  bool failed = llvm::verifyModule(module, &stream);
+  stream.flush();
+  if (failed) {
+    message = buffer;
+  }
+  return !failed;
+}
+
+std::unique_ptr<llvm::Module> buildConfirmedModule(
+    llvm::LLVMContext &context, const LIEF::ELF::Binary &binary,
+    notdec::bin2llvm::LiefElfLoadImage &loadImage,
+    const notdec::bin2llvm::SleighSpecOptions &specOptions,
+    std::string &errorMessage) {
+  notdec::bin2llvm::NativeProgramState state = runNativeDiscovery(binary);
+  auto module =
+      std::make_unique<llvm::Module>("notdec.bin2llvm.native.confirmed", context);
+
+  std::set<std::string> usedNames;
+  unsigned appended = 0;
+  for (const auto &[entry, function] : state.functions()) {
+    (void)entry;
+    if (function.RangeEnd <= function.Entry) {
+      continue;
+    }
+
+    uint64_t length = function.RangeEnd - function.Entry;
+    auto program = notdec::bin2llvm::collectSleighPcode(
+        loadImage, specOptions, function.Entry, length, std::cerr);
+    if (program.Ops.empty()) {
+      std::cerr << "skip native function 0x" << std::hex << function.Entry
+                << std::dec << ": empty p-code\n";
+      continue;
+    }
+
+    notdec::bin2llvm::PcodeLoweringConfig config;
+    config.ModuleName = "notdec.bin2llvm.native.confirmed.check";
+    config.EntryFunctionName = nativeFunctionLlvmName(function, usedNames);
+
+    llvm::LLVMContext checkContext;
+    std::string checkError;
+    auto checkModule = notdec::bin2llvm::buildPcodeModule(
+        checkContext, program, config, checkError);
+    if (!checkModule) {
+      std::cerr << "skip native function 0x" << std::hex << function.Entry
+                << std::dec << ": " << checkError << '\n';
+      continue;
+    }
+    std::string verifyMessage;
+    if (!moduleVerifies(*checkModule, verifyMessage)) {
+      std::cerr << "skip native function 0x" << std::hex << function.Entry
+                << std::dec << ": " << verifyMessage;
+      continue;
+    }
+
+    if (!notdec::bin2llvm::appendPcodeFunction(context, *module, program,
+                                               config, errorMessage)) {
+      return nullptr;
+    }
+    ++appended;
+  }
+
+  if (appended == 0) {
+    errorMessage = "no confirmed native functions lowered successfully";
+    return nullptr;
+  }
+  return module;
 }
 
 int writeModule(const llvm::Module &module, const std::string &outputPath) {
@@ -287,23 +398,30 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    auto program = notdec::bin2llvm::collectSleighPcode(
-        loadImage, options->SpecOptions, options->Address, options->Length,
-        std::cerr);
-    if (program.Ops.empty()) {
-      return 1;
-    }
-
     llvm::LLVMContext context;
-    notdec::bin2llvm::PcodeLoweringConfig config;
-    if (!options->FunctionName.empty()) {
-      config.EntryFunctionName = sanitizeLlvmFunctionName(options->FunctionName);
-    } else if (options->FunctionEntry) {
-      config.EntryFunctionName = entryFunctionName(*options->FunctionEntry);
-    }
     std::string errorMessage;
-    auto module = notdec::bin2llvm::buildPcodeModule(context, program, config,
-                                                     errorMessage);
+    std::unique_ptr<llvm::Module> module;
+    if (options->AllConfirmed) {
+      module = buildConfirmedModule(context, *binary, loadImage,
+                                    options->SpecOptions, errorMessage);
+    } else {
+      auto program = notdec::bin2llvm::collectSleighPcode(
+          loadImage, options->SpecOptions, options->Address, options->Length,
+          std::cerr);
+      if (program.Ops.empty()) {
+        return 1;
+      }
+
+      notdec::bin2llvm::PcodeLoweringConfig config;
+      if (!options->FunctionName.empty()) {
+        config.EntryFunctionName =
+            sanitizeLlvmFunctionName(options->FunctionName);
+      } else if (options->FunctionEntry) {
+        config.EntryFunctionName = entryFunctionName(*options->FunctionEntry);
+      }
+      module = notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                                  errorMessage);
+    }
     if (!module) {
       std::cerr << "failed to lower p-code: " << errorMessage << '\n';
       return 1;

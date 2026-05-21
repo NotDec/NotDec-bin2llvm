@@ -140,13 +140,18 @@ llvm::GlobalVariable *RegisterStorage::globalFor(RegisterUnit &unit) {
   if (baseName.empty()) {
     baseName = fallbackName(unit.Space, unit.Offset, unit.Size);
   }
+  auto *type = llvm::IntegerType::get(Context, bitWidth(unit.Size));
   std::string name = baseName;
   unsigned index = 1;
-  while (Module.getNamedValue(name) != nullptr) {
+  while (llvm::Value *existing = Module.getNamedValue(name)) {
+    auto *global = llvm::dyn_cast<llvm::GlobalVariable>(existing);
+    if (global != nullptr && global->getValueType() == type) {
+      unit.Global = global;
+      return unit.Global;
+    }
     name = baseName + "." + std::to_string(index++);
   }
 
-  auto *type = llvm::IntegerType::get(Context, bitWidth(unit.Size));
   unit.Global = new llvm::GlobalVariable(
       Module, type, false, llvm::GlobalValue::ExternalLinkage, nullptr, name);
 
