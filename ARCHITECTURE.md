@@ -15,7 +15,7 @@ native 路线的共享分析状态在 `include/notdec-bin2llvm/NativeAnalysis.h`
 Ghidra 那种完整数据库：
 
 1. `NativeFunctionSeed`：候选函数入口，来自 ELF entry、dynamic init/fini、
-   symbol、PLT、`.eh_frame`。
+   static symbol、dynamic symbol、PLT、`.eh_frame`。
 2. `NativeFunctionWorkItem`：待递归 decode 的函数入口。新 seed 首次插入时进入这个队列。
 3. `NativeFunction`：已经确认的函数。它和 seed 分开，避免还没 decode 就把候选入口当
    成真实函数。

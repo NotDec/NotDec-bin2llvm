@@ -346,22 +346,34 @@ public:
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
     std::set<std::pair<uint64_t, std::string>> seenSymbols;
     for (const LIEF::ELF::Symbol &symbol : state.binary().symbols()) {
-      if (symbol.type() != LIEF::ELF::Symbol::TYPE::FUNC ||
-          symbol.shndx() == LIEF::ELF::Symbol::SECTION_INDEX::UNDEF ||
-          symbol.value() == 0) {
-        continue;
-      }
-      uint64_t address = symbol.value();
-      if (!state.isExecutableAddress(address)) {
-        continue;
-      }
-      std::string name = symbol.name();
-      if (!seenSymbols.insert({address, name}).second) {
-        continue;
-      }
-      state.addFunctionSeed(address, symbol.size(), std::move(name),
-                            "elf-symbol", NativeFunctionConfidence::High);
+      addSymbolSeed(state, symbol, "elf-symbol", seenSymbols);
     }
+
+    for (const LIEF::ELF::Symbol &symbol : state.binary().dynamic_symbols()) {
+      addSymbolSeed(state, symbol, "elf-dynamic-symbol", seenSymbols);
+    }
+  }
+
+private:
+  static void
+  addSymbolSeed(NativeProgramState &state, const LIEF::ELF::Symbol &symbol,
+                const std::string &source,
+                std::set<std::pair<uint64_t, std::string>> &seenSymbols) {
+    if (symbol.type() != LIEF::ELF::Symbol::TYPE::FUNC ||
+        symbol.shndx() == LIEF::ELF::Symbol::SECTION_INDEX::UNDEF ||
+        symbol.value() == 0) {
+      return;
+    }
+    uint64_t address = symbol.value();
+    if (!state.isExecutableAddress(address)) {
+      return;
+    }
+    std::string name = symbol.name();
+    if (!seenSymbols.insert({address, source + "\n" + name}).second) {
+      return;
+    }
+    state.addFunctionSeed(address, symbol.size(), std::move(name), source,
+                          NativeFunctionConfidence::High);
   }
 };
 
