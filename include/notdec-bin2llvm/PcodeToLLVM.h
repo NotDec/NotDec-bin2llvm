@@ -22,6 +22,11 @@ struct PcodeLoweringConfig {
   // generated module.  Raw Sleigh P-Code only gives CALL a target address, so
   // the module builder has to provide the symbol name when it knows one.
   std::unordered_map<uint64_t, std::string> DirectCallTargets;
+
+  // Address-to-symbol table for dynamic-linker PLT stubs.  This is separate
+  // from DirectCallTargets so a PLT call is not mistaken for a local function
+  // even if the stub bytes were decoded earlier.
+  std::unordered_map<uint64_t, std::string> ExternalCallTargets;
 };
 
 std::unique_ptr<llvm::Module>

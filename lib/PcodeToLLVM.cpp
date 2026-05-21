@@ -647,6 +647,16 @@ private:
     // recovery exists.
     if (!op.Output) {
       if (auto target = directTarget(op, 0)) {
+        auto externalIt = Config.ExternalCallTargets.find(*target);
+        if (externalIt != Config.ExternalCallTargets.end()) {
+          auto *calleeType =
+              llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
+          llvm::FunctionCallee callee =
+              Module.getOrInsertFunction(externalIt->second, calleeType);
+          Builder.CreateCall(callee, {});
+          return true;
+        }
+
         auto it = Config.DirectCallTargets.find(*target);
         if (it != Config.DirectCallTargets.end()) {
           auto *calleeType =

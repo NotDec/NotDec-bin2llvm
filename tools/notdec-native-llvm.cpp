@@ -287,6 +287,15 @@ std::string nativeFunctionLlvmName(const notdec::bin2llvm::NativeFunction &func,
   return uniqueFunctionName(entryFunctionName(func.Entry), usedNames);
 }
 
+std::string externalFunctionLlvmName(const std::string &symbolName,
+                                     std::set<std::string> &usedNames) {
+  std::string name = sanitizeLlvmFunctionName(symbolName);
+  if (name.empty()) {
+    name = "notdec_external_function";
+  }
+  return uniqueFunctionName(name, usedNames);
+}
+
 bool moduleVerifies(const llvm::Module &module, std::string &message) {
   std::string buffer;
   llvm::raw_string_ostream stream(buffer);
@@ -318,6 +327,16 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
                          nativeFunctionLlvmName(function, usedNames));
   }
 
+  std::unordered_map<uint64_t, std::string> externalNamesByStub;
+  for (const notdec::bin2llvm::NativePltEntry &entry : state.pltEntries()) {
+    if (entry.SymbolName.empty()) {
+      continue;
+    }
+    externalNamesByStub.emplace(
+        entry.StubAddress,
+        externalFunctionLlvmName(entry.SymbolName, usedNames));
+  }
+
   unsigned appended = 0;
   for (const auto &[entry, function] : state.functions()) {
     (void)entry;
@@ -342,6 +361,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
     }
     config.EntryFunctionName = nameIt->second;
     config.DirectCallTargets = namesByEntry;
+    config.ExternalCallTargets = externalNamesByStub;
 
     llvm::LLVMContext checkContext;
     std::string checkError;
