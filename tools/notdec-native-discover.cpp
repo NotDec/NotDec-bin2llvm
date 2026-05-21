@@ -23,6 +23,7 @@ enum class OutputMode {
   BlocksJson,
   XrefsJson,
   InstructionsJson,
+  InstructionsRangeJson,
   PltJson,
   UnresolvedJson,
   XrefsFromJson,
@@ -33,6 +34,8 @@ struct CliOptions {
   std::string ElfPath;
   OutputMode Mode = OutputMode::TextReport;
   std::optional<uint64_t> QueryAddress;
+  std::optional<uint64_t> QueryStart;
+  std::optional<uint64_t> QueryEnd;
 };
 
 void printUsage(const char *argv0) {
@@ -42,6 +45,8 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
+  std::cerr << "       " << argv0
+            << " --instructions-range-json <start> <end> <elf-file>\n";
   std::cerr << "       " << argv0 << " --plt-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --unresolved-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-from-json <addr> <elf-file>\n";
@@ -62,7 +67,7 @@ std::optional<uint64_t> parseAddress(const std::string &text) {
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
-  if (argc != 2 && argc != 3 && argc != 4) {
+  if (argc != 2 && argc != 3 && argc != 4 && argc != 5) {
     return std::nullopt;
   }
 
@@ -73,6 +78,20 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
   }
 
   std::string mode = argv[1];
+  if (argc == 5) {
+    if (mode != "--instructions-range-json") {
+      return std::nullopt;
+    }
+    options.Mode = OutputMode::InstructionsRangeJson;
+    options.QueryStart = parseAddress(argv[2]);
+    options.QueryEnd = parseAddress(argv[3]);
+    if (!options.QueryStart || !options.QueryEnd) {
+      return std::nullopt;
+    }
+    options.ElfPath = argv[4];
+    return options;
+  }
+
   if (argc == 4) {
     if (mode == "--xrefs-from-json") {
       options.Mode = OutputMode::XrefsFromJson;
@@ -336,29 +355,63 @@ void printXrefsQueryJson(std::ostream &output,
   output << "}\n";
 }
 
-void printInstructionsJson(
+void printInstructionObject(
     std::ostream &output,
-    const notdec::bin2llvm::NativeProgramState &state) {
-  output << "{\n";
-  output << "  \"instructions\": [";
+    const notdec::bin2llvm::NativeInstruction &instruction,
+    const char *indent) {
+  output << indent << "{\n";
+  output << indent << "  \"address\": \"" << hexString(instruction.Address)
+         << "\",\n";
+  output << indent << "  \"size\": " << instruction.Size << ",\n";
+  output << indent << "  \"bytes\": \"" << bytesHex(instruction.Bytes)
+         << "\",\n";
+  output << indent << "  \"text\": \""
+         << jsonEscape(instruction.Mnemonic) << "\",\n";
+  output << indent << "  \"source\": \"" << jsonEscape(instruction.Source)
+         << "\"\n";
+  output << indent << "}";
+}
+
+void printInstructionListJson(
+    std::ostream &output,
+    const std::vector<const notdec::bin2llvm::NativeInstruction *> &instructions,
+    const std::string &prefix) {
+  output << prefix << "\"instructions\": [";
   bool firstInstruction = true;
-  for (const auto &[address, instruction] : state.instructions()) {
-    (void)address;
+  for (const notdec::bin2llvm::NativeInstruction *instruction : instructions) {
     output << (firstInstruction ? "\n" : ",\n");
-    output << "    {\n";
-    output << "      \"address\": \"" << hexString(instruction.Address)
-           << "\",\n";
-    output << "      \"size\": " << instruction.Size << ",\n";
-    output << "      \"bytes\": \"" << bytesHex(instruction.Bytes) << "\",\n";
-    output << "      \"text\": \"" << jsonEscape(instruction.Mnemonic)
-           << "\",\n";
-    output << "      \"source\": \"" << jsonEscape(instruction.Source)
-           << "\"\n";
-    output << "    }";
+    printInstructionObject(output, *instruction, "    ");
     firstInstruction = false;
   }
   output << (firstInstruction ? "],\n" : "\n  ],\n");
-  output << "  \"count\": " << state.instructions().size() << "\n";
+  output << prefix << "\"count\": " << instructions.size() << "\n";
+}
+
+void printInstructionsJson(
+    std::ostream &output,
+    const notdec::bin2llvm::NativeProgramState &state) {
+  std::vector<const notdec::bin2llvm::NativeInstruction *> instructions;
+  for (const auto &[address, instruction] : state.instructions()) {
+    (void)address;
+    instructions.push_back(&instruction);
+  }
+  output << "{\n";
+  printInstructionListJson(output, instructions, "  ");
+  output << "}\n";
+}
+
+void printInstructionsRangeJson(
+    std::ostream &output,
+    const notdec::bin2llvm::NativeProgramState &state, uint64_t start,
+    uint64_t end) {
+  std::vector<const notdec::bin2llvm::NativeInstruction *> instructions =
+      state.instructionsInRange(start, end);
+  output << "{\n";
+  output << "  \"query\": {\n";
+  output << "    \"start\": \"" << hexString(start) << "\",\n";
+  output << "    \"end\": \"" << hexString(end) << "\"\n";
+  output << "  },\n";
+  printInstructionListJson(output, instructions, "  ");
   output << "}\n";
 }
 
@@ -443,6 +496,9 @@ int main(int argc, char **argv) {
       printXrefsJson(std::cout, state);
     } else if (options->Mode == OutputMode::InstructionsJson) {
       printInstructionsJson(std::cout, state);
+    } else if (options->Mode == OutputMode::InstructionsRangeJson) {
+      printInstructionsRangeJson(std::cout, state, *options->QueryStart,
+                                 *options->QueryEnd);
     } else if (options->Mode == OutputMode::PltJson) {
       printPltJson(std::cout, state);
     } else if (options->Mode == OutputMode::UnresolvedJson) {
