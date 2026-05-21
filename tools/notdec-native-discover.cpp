@@ -21,6 +21,7 @@ enum class OutputMode {
   SummaryJson,
   MemoryJson,
   RelocationsJson,
+  NotesJson,
   SeedsJson,
   FunctionsJson,
   BlocksJson,
@@ -50,6 +51,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --summary-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --memory-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --relocations-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --notes-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --seeds-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
@@ -164,6 +166,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::MemoryJson;
   } else if (mode == "--relocations-json") {
     options.Mode = OutputMode::RelocationsJson;
+  } else if (mode == "--notes-json") {
+    options.Mode = OutputMode::NotesJson;
   } else if (mode == "--seeds-json") {
     options.Mode = OutputMode::SeedsJson;
   } else if (mode == "--functions-json") {
@@ -392,6 +396,16 @@ void printRelocationsJson(std::ostream &output,
   }
   output << (firstRelocation ? "],\n" : "\n  ],\n");
   output << "  \"count\": " << state.relocations().size() << "\n";
+  output << "}\n";
+}
+
+void printNotesJson(std::ostream &output,
+                    const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"notes\": ";
+  printStringArray(output, state.notes());
+  output << ",\n";
+  output << "  \"count\": " << state.notes().size() << "\n";
   output << "}\n";
 }
 
@@ -730,6 +744,8 @@ int main(int argc, char **argv) {
       printMemoryJson(std::cout, state);
     } else if (options->Mode == OutputMode::RelocationsJson) {
       printRelocationsJson(std::cout, state);
+    } else if (options->Mode == OutputMode::NotesJson) {
+      printNotesJson(std::cout, state);
     } else if (options->Mode == OutputMode::SeedsJson) {
       printSeedsJson(std::cout, state);
     } else if (options->Mode == OutputMode::FunctionsJson) {

@@ -36,7 +36,8 @@ function、basic block、instruction、xref 和 unresolved indirect flow 数量�
 `--summary-json` 时会跳过文本 report，输出同口径的最小 JSON summary，供 Bench2 smoke
 做机器检查。`--memory-json` 输出 native loader 看到的 load range 和 section 布局，
 包含地址范围、权限和 loaded size。`--relocations-json` 输出 native relocation 表，
-包含类型、符号、状态和已计算值。`--seeds-json` 输出 function seed 列表，包含地址、名字、
+包含类型、符号、状态和已计算值。`--notes-json` 输出 native 分析过程里的非致命提示。
+`--seeds-json` 输出 function seed 列表，包含地址、名字、
 alias、来源、confidence 和保守 range，方便解释入口发现来源。`--functions-json` 输出已确认函数列表，
 包含入口、保守范围、名字、来源和 block 数。`--blocks-json` 输出已确认函数里的 basic
 block 起止地址、大小和 successor。
@@ -129,7 +130,8 @@ external/NotDec-bin2llvm/
 - `tools/notdec-native-discover.cpp`：native discovery smoke 入口。默认打印文本 report，
   `--summary-json` 打印 function、block、instruction、xref 和 unresolved indirect flow
   的汇总 JSON，`--memory-json` 打印 load range 和 section 布局 JSON，
-  `--relocations-json` 打印 relocation 表 JSON，`--seeds-json` 打印 function seed 列表 JSON，
+  `--relocations-json` 打印 relocation 表 JSON，`--notes-json` 打印 native 分析提示 JSON，
+  `--seeds-json` 打印 function seed 列表 JSON，
   包含地址、range、name、alias、来源和 confidence，
   `--functions-json` 打印 confirmed function 列表 JSON，`--blocks-json` 打印 confirmed function 下的 basic block 列表 JSON，
   `--xrefs-json` 打印 xref 列表 JSON，`--xrefs-kind-json` 按 xref kind 过滤，
