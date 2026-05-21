@@ -134,6 +134,13 @@ enum class NativeXrefKind {
 
 std::string toString(NativeXrefKind kind);
 
+enum class NativeUnresolvedFlowKind {
+  IndirectCall,
+  IndirectBranch,
+};
+
+std::string toString(NativeUnresolvedFlowKind kind);
+
 // NativeBasicBlock is the smallest CFG unit shared by native analyzers.  It is
 // address based on purpose: recursive decode owns instruction details later,
 // while lowering and CLI queries mostly need stable block ranges and edges.
@@ -163,6 +170,15 @@ struct NativeXref {
   uint64_t From = 0;
   uint64_t To = 0;
   NativeXrefKind Kind = NativeXrefKind::Flow;
+  std::string Source;
+};
+
+// NativeUnresolvedFlow records computed control-flow sites that native decode
+// has seen but not resolved yet.  Keeping these sites explicit lets later
+// jump-table and function-pointer analysis work from real samples.
+struct NativeUnresolvedFlow {
+  uint64_t Address = 0;
+  NativeUnresolvedFlowKind Kind = NativeUnresolvedFlowKind::IndirectBranch;
   std::string Source;
 };
 
@@ -218,6 +234,9 @@ public:
     return Functions;
   }
   const std::vector<NativeXref> &xrefs() const { return Xrefs; }
+  const std::vector<NativeUnresolvedFlow> &unresolvedFlows() const {
+    return UnresolvedFlows;
+  }
   const std::map<uint64_t, NativeInstruction> &instructions() const {
     return Instructions;
   }
@@ -240,6 +259,7 @@ public:
   bool addFunction(NativeFunction function);
   bool addBasicBlock(uint64_t functionEntry, NativeBasicBlock block);
   void addXref(NativeXref xref);
+  bool addUnresolvedFlow(NativeUnresolvedFlow flow);
   bool addInstruction(NativeInstruction instruction);
   void addFunctionRange(uint64_t address, uint64_t start, uint64_t end,
                         std::string source);
@@ -262,6 +282,7 @@ private:
   NativeEhFrameStats EhFrameStats;
   std::map<uint64_t, NativeFunction> Functions;
   std::vector<NativeXref> Xrefs;
+  std::vector<NativeUnresolvedFlow> UnresolvedFlows;
   std::map<uint64_t, std::vector<size_t>> XrefsByFrom;
   std::map<uint64_t, std::vector<size_t>> XrefsByTo;
   std::map<uint64_t, NativeInstruction> Instructions;

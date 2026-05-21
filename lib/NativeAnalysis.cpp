@@ -1372,6 +1372,12 @@ private:
                         NativeXrefKind::Call);
           addUniqueAddress(result.CallTargets, *target);
         }
+      } else if (op.Opcode == PcodeOpcode::CallInd) {
+        NativeUnresolvedFlow flow;
+        flow.Address = op.Address;
+        flow.Kind = NativeUnresolvedFlowKind::IndirectCall;
+        flow.Source = "sleigh-pcode-indirect-flow";
+        state.addUnresolvedFlow(std::move(flow));
       } else if (op.Opcode == PcodeOpcode::Branch ||
                  op.Opcode == PcodeOpcode::CBranch) {
         DecodedFlowInfo &info = result.FlowInfos[op.Address];
@@ -1387,6 +1393,11 @@ private:
         }
       } else if (op.Opcode == PcodeOpcode::BranchInd) {
         result.FlowInfos[op.Address].HasIndirectBranch = true;
+        NativeUnresolvedFlow flow;
+        flow.Address = op.Address;
+        flow.Kind = NativeUnresolvedFlowKind::IndirectBranch;
+        flow.Source = "sleigh-pcode-indirect-flow";
+        state.addUnresolvedFlow(std::move(flow));
       } else if (op.Opcode == PcodeOpcode::Return) {
         result.FlowInfos[op.Address].HasReturn = true;
       }
@@ -1602,6 +1613,18 @@ public:
       Output << "    " << toString(kind) << ": " << xrefKindCounts[kind]
              << '\n';
     }
+    std::map<NativeUnresolvedFlowKind, uint64_t> unresolvedFlowCounts;
+    for (const NativeUnresolvedFlow &flow : state.unresolvedFlows()) {
+      ++unresolvedFlowCounts[flow.Kind];
+    }
+    Output << "  unresolved indirect flows:\n";
+    Output << "    total: " << state.unresolvedFlows().size() << '\n';
+    for (NativeUnresolvedFlowKind kind :
+         {NativeUnresolvedFlowKind::IndirectCall,
+          NativeUnresolvedFlowKind::IndirectBranch}) {
+      Output << "    " << toString(kind) << ": "
+             << unresolvedFlowCounts[kind] << '\n';
+    }
 
     const NativeEhFrameStats &ehFrame = state.ehFrameStats();
     Output << "  eh_frame:\n";
@@ -1718,6 +1741,16 @@ std::string toString(NativeXrefKind kind) {
     return "data";
   case NativeXrefKind::String:
     return "string";
+  }
+  return "unknown";
+}
+
+std::string toString(NativeUnresolvedFlowKind kind) {
+  switch (kind) {
+  case NativeUnresolvedFlowKind::IndirectCall:
+    return "indirect call";
+  case NativeUnresolvedFlowKind::IndirectBranch:
+    return "indirect branch";
   }
   return "unknown";
 }
@@ -1999,6 +2032,19 @@ void NativeProgramState::addXref(NativeXref xref) {
   Xrefs.push_back(std::move(xref));
   XrefsByFrom[Xrefs[index].From].push_back(index);
   XrefsByTo[Xrefs[index].To].push_back(index);
+}
+
+bool NativeProgramState::addUnresolvedFlow(NativeUnresolvedFlow flow) {
+  if (flow.Address == 0) {
+    return false;
+  }
+  for (const NativeUnresolvedFlow &existing : UnresolvedFlows) {
+    if (existing.Address == flow.Address && existing.Kind == flow.Kind) {
+      return false;
+    }
+  }
+  UnresolvedFlows.push_back(std::move(flow));
+  return true;
 }
 
 bool NativeProgramState::addInstruction(NativeInstruction instruction) {
