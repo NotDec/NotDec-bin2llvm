@@ -73,6 +73,22 @@ require_no_unresolved_indirect_calls() {
   fi
 }
 
+require_unresolved_indirect_branches_at_most() {
+  local file="$1"
+  local name="$2"
+  local max_count="$3"
+  local count
+  count="$(sed -n 's/.*"indirect branch":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$file")"
+  if [[ -z "$count" ]]; then
+    echo "$name: missing unresolved indirect branch count in $file" >&2
+    exit 1
+  fi
+  if ((count > max_count)); then
+    echo "$name: unresolved indirect branches $count > $max_count in $file" >&2
+    exit 1
+  fi
+}
+
 require_ir_pattern() {
   local file="$1"
   local pattern="$2"
@@ -175,6 +191,14 @@ for index in "${!TARGET_NAMES[@]}"; do
     exit 1
   fi
   require_no_unresolved_indirect_calls "$summary" "$name"
+  case "$name" in
+  vsftpd | memcached)
+    require_unresolved_indirect_branches_at_most "$summary" "$name" 3
+    ;;
+  libuv)
+    require_unresolved_indirect_branches_at_most "$summary" "$name" 1
+    ;;
+  esac
 
   "$NATIVE_LLVM" "$target" --all-confirmed -o "$ll" \
     >"$native_stdout" 2>"$native_stderr"

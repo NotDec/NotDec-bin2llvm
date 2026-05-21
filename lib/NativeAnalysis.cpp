@@ -1547,6 +1547,15 @@ private:
         }
       } else if (op.Opcode == PcodeOpcode::BranchInd) {
         result.FlowInfos[op.Address].HasIndirectBranch = true;
+        if (auto gotAddress = branchIndGotTarget(op)) {
+          if (isPltGotSlot(state, *gotAddress)) {
+            addUniqueXref(state, seenXrefs, op.Address, *gotAddress,
+                          NativeXrefKind::Flow,
+                          "sleigh-pcode-plt-indirect-branch");
+            continue;
+          }
+        }
+
         NativeUnresolvedFlow flow;
         flow.Address = op.Address;
         flow.Kind = NativeUnresolvedFlowKind::IndirectBranch;
@@ -1600,6 +1609,13 @@ private:
     return sourceRam(sources, op.Inputs[0]);
   }
 
+  static std::optional<uint64_t> branchIndGotTarget(const PcodeOpView &op) {
+    if (op.Inputs.size() != 1 || op.Inputs[0].Space != "ram") {
+      return std::nullopt;
+    }
+    return op.Inputs[0].Offset;
+  }
+
   static std::optional<uint64_t>
   sourceRam(const std::map<std::string, uint64_t> &sources,
             const VarnodeView &varnode) {
@@ -1629,6 +1645,15 @@ private:
         continue;
       }
       return true;
+    }
+    return false;
+  }
+
+  static bool isPltGotSlot(const NativeProgramState &state, uint64_t address) {
+    for (const NativePltEntry &entry : state.pltEntries()) {
+      if (entry.GotAddress == address && !entry.SymbolName.empty()) {
+        return true;
+      }
     }
     return false;
   }
