@@ -24,6 +24,7 @@ enum class OutputMode {
   XrefsJson,
   InstructionsJson,
   PltJson,
+  UnresolvedJson,
   XrefsFromJson,
   XrefsToJson,
 };
@@ -42,6 +43,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --plt-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --unresolved-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-from-json <addr> <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-to-json <addr> <elf-file>\n";
 }
@@ -99,6 +101,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::InstructionsJson;
   } else if (mode == "--plt-json") {
     options.Mode = OutputMode::PltJson;
+  } else if (mode == "--unresolved-json") {
+    options.Mode = OutputMode::UnresolvedJson;
   } else {
     return std::nullopt;
   }
@@ -377,6 +381,28 @@ void printPltJson(std::ostream &output,
   output << "}\n";
 }
 
+void printUnresolvedJson(
+    std::ostream &output,
+    const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"unresolved\": [";
+  bool firstFlow = true;
+  for (const notdec::bin2llvm::NativeUnresolvedFlow &flow :
+       state.unresolvedFlows()) {
+    output << (firstFlow ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"address\": \"" << hexString(flow.Address) << "\",\n";
+    output << "      \"kind\": \""
+           << notdec::bin2llvm::toString(flow.Kind) << "\",\n";
+    output << "      \"source\": \"" << jsonEscape(flow.Source) << "\"\n";
+    output << "    }";
+    firstFlow = false;
+  }
+  output << (firstFlow ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << state.unresolvedFlows().size() << "\n";
+  output << "}\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -419,6 +445,8 @@ int main(int argc, char **argv) {
       printInstructionsJson(std::cout, state);
     } else if (options->Mode == OutputMode::PltJson) {
       printPltJson(std::cout, state);
+    } else if (options->Mode == OutputMode::UnresolvedJson) {
+      printUnresolvedJson(std::cout, state);
     } else if (options->Mode == OutputMode::XrefsFromJson) {
       printXrefsQueryJson(std::cout, state, *options->QueryAddress, true);
     } else if (options->Mode == OutputMode::XrefsToJson) {
