@@ -32,6 +32,7 @@
   - [x] 已补 ELF relocated pointer 到 `data` / `string` xref 的记录。
 - [ ] 阶段 6: Lowering integration
   - [x] 已补 `notdec-native-llvm -f <entry>`，按 native confirmed function 入口生成 LLVM IR。
+  - [x] 已补 `notdec-native-llvm -n <name>`，按 native confirmed function 名字生成 LLVM IR。
 - [ ] 阶段 7: Bench2 regression
 
 ## 记录规则

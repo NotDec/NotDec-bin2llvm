@@ -35,12 +35,14 @@ struct CliOptions {
   uint64_t Address = 0;
   uint64_t Length = 0;
   std::optional<uint64_t> FunctionEntry;
+  std::string FunctionName;
   std::string OutputPath;
 };
 
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0
-            << " <elf-file> [sla-file] (-a <address> -l <length> | -f <entry>) "
+            << " <elf-file> [sla-file] "
+               "(-a <address> -l <length> | -f <entry> | -n <name>) "
                "-o <output.ll> [-p root-sla-dir] [-s pspec-file]\n";
 }
 
@@ -89,6 +91,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
         return std::nullopt;
       }
       options.FunctionEntry = entry;
+    } else if (flag == "-n") {
+      options.FunctionName = std::move(value);
     } else if (flag == "-l") {
       if (!parseUint64(value, options.Length) || options.Length == 0) {
         std::cerr << "invalid length: " << value << '\n';
@@ -107,15 +111,20 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
   }
 
-  if (options.FunctionEntry && (hasAddress || hasLength)) {
-    std::cerr << "-f cannot be combined with -a or -l\n";
+  if (options.FunctionEntry && !options.FunctionName.empty()) {
+    std::cerr << "-f cannot be combined with -n\n";
     return std::nullopt;
   }
-  if (!options.FunctionEntry && !hasAddress) {
+  if ((options.FunctionEntry || !options.FunctionName.empty()) &&
+      (hasAddress || hasLength)) {
+    std::cerr << "-f or -n cannot be combined with -a or -l\n";
+    return std::nullopt;
+  }
+  if (!options.FunctionEntry && options.FunctionName.empty() && !hasAddress) {
     std::cerr << "missing -a <address>\n";
     return std::nullopt;
   }
-  if (!options.FunctionEntry && !hasLength) {
+  if (!options.FunctionEntry && options.FunctionName.empty() && !hasLength) {
     std::cerr << "missing -l <length>\n";
     return std::nullopt;
   }
@@ -158,14 +167,31 @@ bool resolveSpecOptions(const LIEF::ELF::Binary &binary,
   return true;
 }
 
-std::string functionName(uint64_t entry) {
+std::string entryFunctionName(uint64_t entry) {
   std::ostringstream stream;
   stream << "notdec_native_" << std::hex << entry;
   return stream.str();
 }
 
+std::string sanitizeLlvmFunctionName(const std::string &name) {
+  std::string result;
+  result.reserve(name.size());
+  for (char ch : name) {
+    bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+              (ch >= '0' && ch <= '9') || ch == '_' || ch == '.';
+    result.push_back(ok ? ch : '_');
+  }
+  if (result.empty()) {
+    return "";
+  }
+  if (result.front() >= '0' && result.front() <= '9') {
+    result.insert(result.begin(), '_');
+  }
+  return result;
+}
+
 bool resolveFunctionRange(const LIEF::ELF::Binary &binary, CliOptions &options) {
-  if (!options.FunctionEntry) {
+  if (!options.FunctionEntry && options.FunctionName.empty()) {
     return true;
   }
 
@@ -179,11 +205,31 @@ bool resolveFunctionRange(const LIEF::ELF::Binary &binary, CliOptions &options) 
   manager.addAnalyzer(notdec::bin2llvm::createSleighSeedInstructionAnalyzer());
   manager.run(state);
 
-  const notdec::bin2llvm::NativeFunction *function =
-      state.functionAt(*options.FunctionEntry);
+  const notdec::bin2llvm::NativeFunction *function = nullptr;
+  if (options.FunctionEntry) {
+    function = state.functionAt(*options.FunctionEntry);
+  } else {
+    for (const auto &[entry, candidate] : state.functions()) {
+      (void)entry;
+      if (candidate.Name != options.FunctionName) {
+        continue;
+      }
+      if (function != nullptr) {
+        std::cerr << "native discovery found duplicate function name: "
+                  << options.FunctionName << '\n';
+        return false;
+      }
+      function = &candidate;
+    }
+  }
   if (function == nullptr) {
-    std::cerr << "native discovery did not confirm function at 0x" << std::hex
-              << *options.FunctionEntry << std::dec << '\n';
+    if (options.FunctionEntry) {
+      std::cerr << "native discovery did not confirm function at 0x" << std::hex
+                << *options.FunctionEntry << std::dec << '\n';
+    } else {
+      std::cerr << "native discovery did not confirm function named "
+                << options.FunctionName << '\n';
+    }
     return false;
   }
   if (function->RangeEnd <= function->Entry) {
@@ -194,6 +240,9 @@ bool resolveFunctionRange(const LIEF::ELF::Binary &binary, CliOptions &options) 
 
   options.Address = function->Entry;
   options.Length = function->RangeEnd - function->Entry;
+  if (!options.FunctionEntry) {
+    options.FunctionEntry = function->Entry;
+  }
   return true;
 }
 
@@ -247,8 +296,10 @@ int main(int argc, char **argv) {
 
     llvm::LLVMContext context;
     notdec::bin2llvm::PcodeLoweringConfig config;
-    if (options->FunctionEntry) {
-      config.EntryFunctionName = functionName(*options->FunctionEntry);
+    if (!options->FunctionName.empty()) {
+      config.EntryFunctionName = sanitizeLlvmFunctionName(options->FunctionName);
+    } else if (options->FunctionEntry) {
+      config.EntryFunctionName = entryFunctionName(*options->FunctionEntry);
     }
     std::string errorMessage;
     auto module = notdec::bin2llvm::buildPcodeModule(context, program, config,
