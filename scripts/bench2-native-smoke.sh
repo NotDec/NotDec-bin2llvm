@@ -193,10 +193,10 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_no_unresolved_indirect_calls "$summary" "$name"
   case "$name" in
   vsftpd | memcached)
-    require_unresolved_indirect_branches_at_most "$summary" "$name" 2
+    require_unresolved_indirect_branches_at_most "$summary" "$name" 1
     ;;
   libuv)
-    require_unresolved_indirect_branches_at_most "$summary" "$name" 1
+    require_unresolved_indirect_branches_at_most "$summary" "$name" 0
     ;;
   esac
 

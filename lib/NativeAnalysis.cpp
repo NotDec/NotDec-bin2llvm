@@ -1578,6 +1578,16 @@ private:
             continue;
           }
         }
+        // Guarded external tail jumps load the GOT slot into a register before
+        // BRANCHIND. Only accept slots proven by relocation as external GLOB_DAT.
+        if (auto gotAddress = branchIndGotSource(sourceRamByVarnode, op)) {
+          if (isExternalGlobDatSymbolAt(state, *gotAddress)) {
+            addUniqueXref(state, seenXrefs, op.Address, *gotAddress,
+                          NativeXrefKind::Flow,
+                          "sleigh-pcode-got-indirect-branch");
+            continue;
+          }
+        }
 
         NativeUnresolvedFlow flow;
         flow.Address = op.Address;
@@ -1637,6 +1647,15 @@ private:
       return std::nullopt;
     }
     return op.Inputs[0].Offset;
+  }
+
+  static std::optional<uint64_t>
+  branchIndGotSource(const std::map<std::string, uint64_t> &sources,
+                     const PcodeOpView &op) {
+    if (op.Inputs.size() != 1) {
+      return std::nullopt;
+    }
+    return sourceRam(sources, op.Inputs[0]);
   }
 
   static std::optional<uint64_t>

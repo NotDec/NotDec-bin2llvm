@@ -60,7 +60,9 @@ block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址
   不再把该点计入 unresolved。其他 indirect call 仍记录 unresolved。
 - analyzer 对 `BRANCHIND` 也会先识别直接 `ram` GOT slot。如果该 slot 命中已知
   `NativePltEntry::GotAddress`，会记录 `sleigh-pcode-plt-indirect-branch` flow xref，并且
-  不再把该 PLT stub 计入 unresolved。PLT0、普通函数指针和 jump table 仍保留 unresolved。
+  不再把该 PLT stub 计入 unresolved。未命中 PLT 时，如果输入来源能追到带外部符号名的
+  `X86_64_GLOB_DAT` GOT slot，会记录 `sleigh-pcode-got-indirect-branch` flow xref，并且
+  不再把该点计入 unresolved。PLT0、普通函数指针和 jump table 仍保留 unresolved。
 - analyzer 也会从非控制流 P-Code 里识别 direct `ram` varnode。如果目标不是 executable
   address，会记录为 data 或 string xref。目标在可读、不可写、不可执行内存里，并且像
   NUL 结尾 ASCII C 字符串时，记为 `NativeXrefKind::String`，来源是
@@ -137,8 +139,9 @@ external/NotDec-bin2llvm/
 - `scripts/bench2-native-smoke.sh`：Bench2 native smoke 入口。它固定跑 `vsftpd`、
   `libuv.so.1.0.0`、`memcached`，先用 `notdec-native-discover --summary-json` 确认
   native discovery 至少产出 confirmed function，且当前三目标不再保留 unresolved indirect
-  call，unresolved indirect branch 数也不超过当前基线，再用 `notdec-native-llvm --all-confirmed`
-  生成 IR，并用本地 LLVM 22 的 `llvm-as` 和 `opt -passes=verify` 验证；随后还会检查
+  call，unresolved indirect branch 数也不超过当前基线：`vsftpd` / `memcached` 为 1，
+  `libuv` 为 0；再用 `notdec-native-llvm --all-confirmed` 生成 IR，并用本地 LLVM 22 的
+  `llvm-as` 和 `opt -passes=verify` 验证；随后还会检查
   若干固定 IR pattern，确认最近补上的 direct call / PLT external call 没有退回 helper，
   并禁止最近清掉的 `CALL` / `CALLIND` / `CALLOTHER` helper 回到 Bench2 smoke 输出。
 - `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。
