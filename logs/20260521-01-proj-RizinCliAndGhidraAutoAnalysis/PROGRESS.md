@@ -44,6 +44,7 @@
   - [x] 已补 direct `CALL` 命中已知 PLT stub 时 lower 成外部 LLVM function call。
 - [ ] 阶段 7: Bench2 regression
   - [x] 已补 `scripts/bench2-native-smoke.sh`，固定跑 `vsftpd`、`libuv`、`memcached` 的 native discovery 和 LLVM verify。
+  - [x] 已补 Bench2 smoke 的固定 IR pattern 检查，覆盖内部 direct call 和 libuv PLT external call。
 
 ## 记录规则
 

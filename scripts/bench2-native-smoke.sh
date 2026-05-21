@@ -64,6 +64,43 @@ require_file() {
   fi
 }
 
+require_ir_pattern() {
+  local file="$1"
+  local pattern="$2"
+  local description="$3"
+  if ! grep -Fq "$pattern" "$file"; then
+    echo "missing IR pattern for $description: $pattern" >&2
+    echo "  file: $file" >&2
+    exit 1
+  fi
+}
+
+check_ir_features() {
+  local name="$1"
+  local ll="$2"
+
+  case "$name" in
+  vsftpd)
+    require_ir_pattern "$ll" "call void @notdec_native_5ba0()" \
+      "$name internal direct call"
+    require_ir_pattern "$ll" "call void @notdec_native_8290()" \
+      "$name internal direct call"
+    ;;
+  libuv)
+    require_ir_pattern "$ll" "call void @notdec_native_9d80()" \
+      "$name internal direct call"
+    require_ir_pattern "$ll" "call void @pthread_key_delete()" \
+      "$name PLT external direct call"
+    ;;
+  memcached)
+    require_ir_pattern "$ll" "call void @notdec_native_5b80()" \
+      "$name internal direct call"
+    require_ir_pattern "$ll" "call void @notdec_native_b950()" \
+      "$name internal direct call"
+    ;;
+  esac
+}
+
 require_executable "$DISCOVER"
 require_executable "$NATIVE_LLVM"
 require_executable "$LLVM_AS"
@@ -107,6 +144,7 @@ for index in "${!TARGET_NAMES[@]}"; do
     >"$native_stdout" 2>"$native_stderr"
   "$LLVM_AS" "$ll" -o "$bc" >"$llvm_as_stdout" 2>"$llvm_as_stderr"
   "$OPT" -passes=verify "$bc" -o "$opt_bc" >"$opt_stdout" 2>"$opt_stderr"
+  check_ir_features "$name" "$ll"
   finished_at="$(date +%s)"
 
   echo "$name ok elapsed=$((finished_at - started_at))s summary=$summary ll=$ll"
