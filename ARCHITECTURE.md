@@ -85,6 +85,7 @@ external/NotDec-bin2llvm/
   ghidra_scripts/   Ghidra headless 导出脚本
   include/          对外头文件和主要数据结构
   lib/              JSON 读取、P-Code 表达、LLVM IR lowering
+  scripts/          手动 smoke / 回归脚本
   tools/            命令行工具
   cmake/            LLVM 查找逻辑
 ```
@@ -112,6 +113,10 @@ external/NotDec-bin2llvm/
   `--all-confirmed` 先跑 native discovery，从 confirmed function 取入口到保守 range end，
   再生成 `.ll`。P-Code lowering 会把 LLVM `%entry` 作为单独跳板，真实机器入口放在
   `bb_<address>`，所以 CFG 可以有回边跳到机器入口。
+- `scripts/bench2-native-smoke.sh`：Bench2 native smoke 入口。它固定跑 `vsftpd`、
+  `libuv.so.1.0.0`、`memcached`，先用 `notdec-native-discover --summary-json` 确认
+  native discovery 至少产出 confirmed function，再用 `notdec-native-llvm --all-confirmed`
+  生成 IR，并用本地 LLVM 22 的 `llvm-as` 和 `opt -passes=verify` 验证。
 - `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。
 - `include/notdec-bin2llvm/ModuleBuilder.h`、`lib/ModuleBuilder.cpp`、`tools/notdec-bin2llvm.cpp`：最早的 demo module 入口，只生成一个空函数。
 
