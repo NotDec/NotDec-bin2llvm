@@ -1135,6 +1135,8 @@ public:
     Output << "  memory ranges: " << state.memoryRanges().size() << '\n';
     Output << "  sections: " << state.sections().size() << '\n';
     Output << "  function seeds: " << state.functionSeeds().size() << '\n';
+    Output << "  function worklist: " << state.functionWorklist().size()
+           << '\n';
 
     Output << "  sources:\n";
     for (const auto &[source, count] : state.sourceCounts()) {
@@ -1545,6 +1547,9 @@ bool NativeProgramState::addFunctionSeed(uint64_t address, uint64_t size,
     seed.Confidence = mergeConfidence(seed.Confidence, confidence);
   }
 
+  if (inserted) {
+    FunctionWorklist.push_back({address, source});
+  }
   if (std::find(seed.Sources.begin(), seed.Sources.end(), source) ==
       seed.Sources.end()) {
     seed.Sources.push_back(std::move(source));

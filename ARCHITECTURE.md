@@ -16,22 +16,24 @@ Ghidra 那种完整数据库：
 
 1. `NativeFunctionSeed`：候选函数入口，来自 ELF entry、dynamic init/fini、
    symbol、PLT、`.eh_frame`。
-2. `NativeFunction`：已经确认的函数。它和 seed 分开，避免还没 decode 就把候选入口当
+2. `NativeFunctionWorkItem`：待递归 decode 的函数入口。新 seed 首次插入时进入这个队列。
+3. `NativeFunction`：已经确认的函数。它和 seed 分开，避免还没 decode 就把候选入口当
    成真实函数。
-3. `NativeBasicBlock`：函数内的最小 block 范围和 successor 地址。
-4. `NativeXref`：统一记录 flow/call/data/string 四类引用，支持 from/to 查询。
-5. `NativeInstruction`：已接受的指令，保留地址、长度、字节和来源。
+4. `NativeBasicBlock`：函数内的最小 block 范围和 successor 地址。
+5. `NativeXref`：统一记录 flow/call/data/string 四类引用，支持 from/to 查询。
+6. `NativeInstruction`：已接受的指令，保留地址、长度、字节和来源。
 
 `NativeProgramState` 现在提供：
 
 - `functionAt(...)`、`functionContaining(...)`
+- `functionWorklist()`
 - `xrefsFrom(...)`、`xrefsTo(...)`
 - `instructionAt(...)`、`instructionsInRange(...)`
 - `addFunction(...)`、`addBasicBlock(...)`、`addXref(...)`、`addInstruction(...)`
 
-`notdec-native-discover` 的 report 会输出 confirmed function、basic block 和 xref
-数量，也会输出 instruction 数量。当前 recursive decode 还没接入，所以 Bench2 运行时这些
-数量仍可能是 0。
+`notdec-native-discover` 的 report 会输出 function seed、worklist、confirmed function、
+basic block、instruction 和 xref 数量。当前 recursive decode 还没接入，所以 Bench2 运行时
+confirmed function、basic block、instruction 和 xref 数量仍可能是 0。
 
 ## 目录
 

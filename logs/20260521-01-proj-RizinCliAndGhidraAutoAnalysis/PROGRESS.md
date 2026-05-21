@@ -6,6 +6,7 @@
   - [x] 已补 confirmed function / basic block / xref 的内存态和查询接口。
   - [x] 已补 instruction 的内存态和查询接口。
 - [ ] 阶段 2: Entry discovery
+  - [x] 已补 function seed 到 recursive decode worklist 的最小桥接。
 - [ ] 阶段 3: Recursive disassembly CFG
 - [ ] 阶段 4: CLI query
 - [ ] 阶段 5: XRef enhancement

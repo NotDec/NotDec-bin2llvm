@@ -48,6 +48,14 @@ struct NativeFunctionSeed {
   NativeFunctionConfidence Confidence = NativeFunctionConfidence::Low;
 };
 
+// NativeFunctionWorkItem is the handoff from entry discovery to recursive
+// decode.  It records only the address and the source that first queued it;
+// later decode can look up merged names/ranges in FunctionSeeds.
+struct NativeFunctionWorkItem {
+  uint64_t Address = 0;
+  std::string Source;
+};
+
 struct NativeSectionInfo {
   std::string Name;
   uint64_t Address = 0;
@@ -190,6 +198,9 @@ public:
   const std::map<uint64_t, NativeFunctionSeed> &functionSeeds() const {
     return FunctionSeeds;
   }
+  const std::vector<NativeFunctionWorkItem> &functionWorklist() const {
+    return FunctionWorklist;
+  }
   const std::map<std::string, uint64_t> &sourceCounts() const {
     return SourceCounts;
   }
@@ -242,6 +253,7 @@ private:
   std::vector<NativeMemoryRange> MemoryRanges;
   std::vector<NativeSectionInfo> Sections;
   std::map<uint64_t, NativeFunctionSeed> FunctionSeeds;
+  std::vector<NativeFunctionWorkItem> FunctionWorklist;
   std::map<std::string, uint64_t> SourceCounts;
   std::vector<NativeRelocationInfo> Relocations;
   std::map<uint64_t, uint64_t> RelocatedPointers;
