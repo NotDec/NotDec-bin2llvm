@@ -22,6 +22,7 @@ enum class OutputMode {
   MemoryJson,
   RelocationsJson,
   NotesJson,
+  EhFrameJson,
   SeedsJson,
   FunctionsJson,
   BlocksJson,
@@ -52,6 +53,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --memory-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --relocations-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --notes-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --eh-frame-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --seeds-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
@@ -168,6 +170,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::RelocationsJson;
   } else if (mode == "--notes-json") {
     options.Mode = OutputMode::NotesJson;
+  } else if (mode == "--eh-frame-json") {
+    options.Mode = OutputMode::EhFrameJson;
   } else if (mode == "--seeds-json") {
     options.Mode = OutputMode::SeedsJson;
   } else if (mode == "--functions-json") {
@@ -406,6 +410,79 @@ void printNotesJson(std::ostream &output,
   printStringArray(output, state.notes());
   output << ",\n";
   output << "  \"count\": " << state.notes().size() << "\n";
+  output << "}\n";
+}
+
+void printEhFrameJson(std::ostream &output,
+                      const notdec::bin2llvm::NativeProgramState &state) {
+  const notdec::bin2llvm::NativeEhFrameStats &stats = state.ehFrameStats();
+
+  output << "{\n";
+  output << "  \"has_eh_frame_hdr\": "
+         << (stats.HasEhFrameHdr ? "true" : "false") << ",\n";
+  output << "  \"has_eh_frame\": " << (stats.HasEhFrame ? "true" : "false")
+         << ",\n";
+  output << "  \"parsed_eh_frame_hdr\": "
+         << (stats.ParsedEhFrameHdr ? "true" : "false") << ",\n";
+  output << "  \"cie_count\": " << stats.CieCount << ",\n";
+  output << "  \"fde_count\": " << stats.FdeCount << ",\n";
+  output << "  \"parsed_fde_count\": " << stats.ParsedFdeCount << ",\n";
+  output << "  \"added_seed_count\": " << stats.AddedSeedCount << ",\n";
+  output << "  \"overlapped_seed_count\": " << stats.OverlappedSeedCount
+         << ",\n";
+  output << "  \"hdr_fde_count\": " << stats.HdrFdeCount << ",\n";
+  output << "  \"hdr_table_entries\": " << stats.HdrTableEntries << ",\n";
+  output << "  \"hdr_matched_starts\": " << stats.HdrMatchedStarts << ",\n";
+  output << "  \"hdr_missing_in_frame\": " << stats.HdrMissingInFrame
+         << ",\n";
+  output << "  \"hdr_extra_frame_fdes\": " << stats.HdrExtraFrameFdes
+         << ",\n";
+  output << "  \"hdr_fde_address_matches\": " << stats.HdrFdeAddressMatches
+         << ",\n";
+  output << "  \"hdr_fde_address_mismatches\": "
+         << stats.HdrFdeAddressMismatches << ",\n";
+  output << "  \"hdr_invalid_count\": " << stats.HdrInvalidCount << ",\n";
+  output << "  \"hdr_unsupported_count\": " << stats.HdrUnsupportedCount
+         << ",\n";
+  output << "  \"invalid_count\": " << stats.InvalidCount << ",\n";
+  output << "  \"unsupported_count\": " << stats.UnsupportedCount << ",\n";
+
+  output << "  \"frame_fdes\": [";
+  bool firstFrameFde = true;
+  for (const notdec::bin2llvm::NativeEhFrameFdeInfo &fde :
+       stats.FrameFdes) {
+    output << (firstFrameFde ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"pc_begin\": \"" << hexString(fde.PcBegin) << "\",\n";
+    output << "      \"fde_address\": \"" << hexString(fde.FdeAddress)
+           << "\"\n";
+    output << "    }";
+    firstFrameFde = false;
+  }
+  output << (firstFrameFde ? "],\n" : "\n  ],\n");
+  output << "  \"frame_fdes_count\": " << stats.FrameFdes.size() << ",\n";
+
+  output << "  \"hdr_entries\": [";
+  bool firstHdrEntry = true;
+  for (const notdec::bin2llvm::NativeEhFrameHdrEntry &entry :
+       stats.HdrEntries) {
+    output << (firstHdrEntry ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"initial_location\": \""
+           << hexString(entry.InitialLocation) << "\",\n";
+    output << "      \"fde_address\": \"" << hexString(entry.FdeAddress)
+           << "\"\n";
+    output << "    }";
+    firstHdrEntry = false;
+  }
+  output << (firstHdrEntry ? "],\n" : "\n  ],\n");
+  output << "  \"hdr_entries_count\": " << stats.HdrEntries.size() << ",\n";
+  output << "  \"hdr_mismatch_samples\": ";
+  printStringArray(output, stats.HdrMismatchSamples);
+  output << ",\n";
+  output << "  \"unsupported_samples\": ";
+  printStringArray(output, stats.UnsupportedSamples);
+  output << "\n";
   output << "}\n";
 }
 
@@ -746,6 +823,8 @@ int main(int argc, char **argv) {
       printRelocationsJson(std::cout, state);
     } else if (options->Mode == OutputMode::NotesJson) {
       printNotesJson(std::cout, state);
+    } else if (options->Mode == OutputMode::EhFrameJson) {
+      printEhFrameJson(std::cout, state);
     } else if (options->Mode == OutputMode::SeedsJson) {
       printSeedsJson(std::cout, state);
     } else if (options->Mode == OutputMode::FunctionsJson) {

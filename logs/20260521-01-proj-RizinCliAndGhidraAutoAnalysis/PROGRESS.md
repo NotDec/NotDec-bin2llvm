@@ -34,6 +34,7 @@
   - [x] 已补 `notdec-native-discover --memory-json` 输出 load range 和 section 布局。
   - [x] 已补 `notdec-native-discover --relocations-json` 输出 relocation 表。
   - [x] 已补 `notdec-native-discover --notes-json` 输出 native 分析提示列表。
+  - [x] 已补 `notdec-native-discover --eh-frame-json` 输出 `.eh_frame` / `.eh_frame_hdr` 解析统计和 FDE 列表。
   - [x] 已补 `notdec-native-discover --seeds-json` 输出 function seed 列表。
   - [x] 已补 `notdec-native-discover --functions-json` 最小 confirmed function 列表输出。
   - [x] 已补 `notdec-native-discover --blocks-json` 最小 basic block 列表输出。
