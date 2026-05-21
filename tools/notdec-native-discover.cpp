@@ -23,11 +23,14 @@ enum class OutputMode {
   BlocksJson,
   XrefsJson,
   InstructionsJson,
+  XrefsFromJson,
+  XrefsToJson,
 };
 
 struct CliOptions {
   std::string ElfPath;
   OutputMode Mode = OutputMode::TextReport;
+  std::optional<uint64_t> QueryAddress;
 };
 
 void printUsage(const char *argv0) {
@@ -37,10 +40,25 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --xrefs-from-json <addr> <elf-file>\n";
+  std::cerr << "       " << argv0 << " --xrefs-to-json <addr> <elf-file>\n";
+}
+
+std::optional<uint64_t> parseAddress(const std::string &text) {
+  try {
+    size_t parsedLength = 0;
+    uint64_t value = std::stoull(text, &parsedLength, 0);
+    if (parsedLength != text.size()) {
+      return std::nullopt;
+    }
+    return value;
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
-  if (argc != 2 && argc != 3) {
+  if (argc != 2 && argc != 3 && argc != 4) {
     return std::nullopt;
   }
 
@@ -51,6 +69,22 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
   }
 
   std::string mode = argv[1];
+  if (argc == 4) {
+    if (mode == "--xrefs-from-json") {
+      options.Mode = OutputMode::XrefsFromJson;
+    } else if (mode == "--xrefs-to-json") {
+      options.Mode = OutputMode::XrefsToJson;
+    } else {
+      return std::nullopt;
+    }
+    options.QueryAddress = parseAddress(argv[2]);
+    if (!options.QueryAddress) {
+      return std::nullopt;
+    }
+    options.ElfPath = argv[3];
+    return options;
+  }
+
   if (mode == "--summary-json") {
     options.Mode = OutputMode::SummaryJson;
   } else if (mode == "--functions-json") {
@@ -245,6 +279,19 @@ void printBlocksJson(std::ostream &output,
   output << "}\n";
 }
 
+void printXrefObject(std::ostream &output,
+                     const notdec::bin2llvm::NativeXref &xref,
+                     const char *indent) {
+  output << indent << "{\n";
+  output << indent << "  \"from\": \"" << hexString(xref.From) << "\",\n";
+  output << indent << "  \"to\": \"" << hexString(xref.To) << "\",\n";
+  output << indent << "  \"kind\": \""
+         << notdec::bin2llvm::toString(xref.Kind) << "\",\n";
+  output << indent << "  \"source\": \"" << jsonEscape(xref.Source)
+         << "\"\n";
+  output << indent << "}";
+}
+
 void printXrefsJson(std::ostream &output,
                     const notdec::bin2llvm::NativeProgramState &state) {
   output << "{\n";
@@ -252,17 +299,32 @@ void printXrefsJson(std::ostream &output,
   bool firstXref = true;
   for (const notdec::bin2llvm::NativeXref &xref : state.xrefs()) {
     output << (firstXref ? "\n" : ",\n");
-    output << "    {\n";
-    output << "      \"from\": \"" << hexString(xref.From) << "\",\n";
-    output << "      \"to\": \"" << hexString(xref.To) << "\",\n";
-    output << "      \"kind\": \"" << notdec::bin2llvm::toString(xref.Kind)
-           << "\",\n";
-    output << "      \"source\": \"" << jsonEscape(xref.Source) << "\"\n";
-    output << "    }";
+    printXrefObject(output, xref, "    ");
     firstXref = false;
   }
   output << (firstXref ? "],\n" : "\n  ],\n");
   output << "  \"count\": " << state.xrefs().size() << "\n";
+  output << "}\n";
+}
+
+void printXrefsQueryJson(std::ostream &output,
+                         const notdec::bin2llvm::NativeProgramState &state,
+                         uint64_t address, bool fromQuery) {
+  std::vector<const notdec::bin2llvm::NativeXref *> xrefs =
+      fromQuery ? state.xrefsFrom(address) : state.xrefsTo(address);
+
+  output << "{\n";
+  output << "  \"query\": \"" << hexString(address) << "\",\n";
+  output << "  \"direction\": \"" << (fromQuery ? "from" : "to") << "\",\n";
+  output << "  \"xrefs\": [";
+  bool firstXref = true;
+  for (const notdec::bin2llvm::NativeXref *xref : xrefs) {
+    output << (firstXref ? "\n" : ",\n");
+    printXrefObject(output, *xref, "    ");
+    firstXref = false;
+  }
+  output << (firstXref ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << xrefs.size() << "\n";
   output << "}\n";
 }
 
@@ -332,6 +394,10 @@ int main(int argc, char **argv) {
       printXrefsJson(std::cout, state);
     } else if (options->Mode == OutputMode::InstructionsJson) {
       printInstructionsJson(std::cout, state);
+    } else if (options->Mode == OutputMode::XrefsFromJson) {
+      printXrefsQueryJson(std::cout, state, *options->QueryAddress, true);
+    } else if (options->Mode == OutputMode::XrefsToJson) {
+      printXrefsQueryJson(std::cout, state, *options->QueryAddress, false);
     }
     return 0;
   } catch (const std::exception &error) {
