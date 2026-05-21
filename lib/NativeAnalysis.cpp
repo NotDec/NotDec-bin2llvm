@@ -1213,7 +1213,14 @@ private:
                                           std::min(MaxBytesPerSeed,
                                                    *availableBytes),
                                           NullErrors);
+    uint64_t rangeStart = 0;
+    uint64_t rangeEnd = 0;
     for (const SleighInstructionSummary &summary : summaries) {
+      if (rangeStart == 0) {
+        rangeStart = summary.Address;
+      }
+      rangeEnd = summary.Address + summary.Size;
+
       NativeInstruction instruction;
       instruction.Address = summary.Address;
       instruction.Size = summary.Size;
@@ -1224,6 +1231,31 @@ private:
       (void)readBytes(state, summary.Address, summary.Size, instruction.Bytes);
       state.addInstruction(std::move(instruction));
     }
+    addDecodedFunctionBlock(state, address, rangeStart, rangeEnd);
+  }
+
+  static void addDecodedFunctionBlock(NativeProgramState &state,
+                                      uint64_t entry, uint64_t rangeStart,
+                                      uint64_t rangeEnd) {
+    if (rangeStart == 0 || rangeStart != entry || rangeStart >= rangeEnd) {
+      return;
+    }
+
+    NativeFunction function;
+    function.Entry = entry;
+    function.RangeStart = rangeStart;
+    function.RangeEnd = rangeEnd;
+    function.Source = "sleigh-seed-linear";
+    auto seedIterator = state.functionSeeds().find(entry);
+    if (seedIterator != state.functionSeeds().end()) {
+      function.Name = seedIterator->second.PrimaryName;
+    }
+
+    NativeBasicBlock block;
+    block.Start = rangeStart;
+    block.End = rangeEnd;
+    function.Blocks.push_back(std::move(block));
+    state.addFunction(std::move(function));
   }
 
   static std::optional<uint64_t>

@@ -40,10 +40,12 @@ basic block、instruction 和 xref 数量。
   `Sleigh::printAssembly(...)` 解码指令地址、长度和显示文本。
 - `lib/NativeAnalysis.cpp::SleighSeedInstructionAnalyzer` 从 function worklist 取前 8 个
   seed，每个 seed 最多解码 8 条 / 64 字节，并写入 `NativeInstruction`。
-- 这一步只用于打通 native seed 到 instruction state 的链路，不确认函数，不建 CFG，也不产
-  生 branch/call xref。
+- 如果某个 seed 成功解码出指令，它会被保守写成一个 `NativeFunction`，并带一个覆盖已解码
+  指令前缀的 `NativeBasicBlock`。
+- 这一步只用于打通 native seed 到 instruction/function/block state 的链路，不恢复真实 CFG，
+  也不产生 branch/call xref。
 
-因此 Bench2 运行时 instruction 数量应该已经大于 0，但 confirmed function、basic block 和
+因此 Bench2 运行时 instruction、confirmed function、basic block 数量应该已经大于 0，但
 xref 数量仍可能是 0。
 
 ## 目录

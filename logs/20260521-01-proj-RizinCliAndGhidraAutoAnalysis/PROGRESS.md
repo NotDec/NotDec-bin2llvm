@@ -10,7 +10,8 @@
   - [x] 已补 `.dynsym` 已定义函数符号的 seed 来源。
 - [ ] 阶段 3: Recursive disassembly CFG
   - [x] 已补从 function worklist 到 `NativeInstruction` 的最小 Sleigh 线性解码。
-  - [ ] 尚未恢复 CFG、basic block、branch/call xref。
+  - [x] 已补已解码 seed 到 confirmed function / 单 basic block 的保守落地。
+  - [ ] 尚未恢复真实 CFG、branch/call xref。
 - [ ] 阶段 4: CLI query
 - [ ] 阶段 5: XRef enhancement
 - [ ] 阶段 6: Lowering integration
