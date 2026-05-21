@@ -49,6 +49,8 @@ basic block、instruction 和 xref 数量。
 - 当前 block 不是单纯整段线性范围：`SleighSeedInstructionAnalyzer` 会按控制流指令切分已解码
   前缀。`CBRANCH` block 同时记录直接目标和下一条指令 fallthrough，`BRANCH` block 只记录直接
   目标，`BRANCHIND` / `RETURN` block 暂不记录 successor。
+- direct `CALL` 的可执行目标会作为 `sleigh-direct-call` function seed 写入。analyzer 会先复制
+  当前 worklist 快照，decode 完再追加新 seed，避免遍历 worklist 时修改底层 vector。
 - 这一步只用于打通 native seed 到 instruction/function/block/xref state 的链路，还不恢复递归
   CFG，也不处理间接 branch/call。
 

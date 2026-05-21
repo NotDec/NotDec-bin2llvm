@@ -1152,16 +1152,23 @@ public:
       return;
     }
 
+    std::vector<NativeFunctionWorkItem> worklistSnapshot =
+        state.functionWorklist();
+    std::vector<uint64_t> pendingCallSeeds;
     uint64_t decodedSeeds = 0;
-    for (const NativeFunctionWorkItem &item : state.functionWorklist()) {
+    for (const NativeFunctionWorkItem &item : worklistSnapshot) {
       if (decodedSeeds == MaxSeeds) {
         break;
       }
       if (!state.isExecutableAddress(item.Address)) {
         continue;
       }
-      decodeSeed(state, loadImage, item.Address);
+      decodeSeed(state, loadImage, item.Address, pendingCallSeeds);
       ++decodedSeeds;
+    }
+    for (uint64_t target : pendingCallSeeds) {
+      state.addFunctionSeed(target, 0, "", "sleigh-direct-call",
+                            NativeFunctionConfidence::High);
     }
   }
 
@@ -1179,6 +1186,11 @@ private:
     bool HasUnconditionalBranch = false;
     bool HasIndirectBranch = false;
     bool HasReturn = false;
+  };
+
+  struct DirectControlFlowResult {
+    std::map<uint64_t, DecodedFlowInfo> FlowInfos;
+    std::vector<uint64_t> CallTargets;
   };
 
   std::ostringstream NullErrors;
@@ -1210,7 +1222,7 @@ private:
   }
 
   void decodeSeed(NativeProgramState &state, LiefElfLoadImage &loadImage,
-                  uint64_t address) {
+                  uint64_t address, std::vector<uint64_t> &pendingCallSeeds) {
     std::optional<uint64_t> availableBytes = executableBytesFrom(state, address);
     if (!availableBytes || *availableBytes == 0) {
       return;
@@ -1240,7 +1252,12 @@ private:
     }
     std::map<uint64_t, DecodedFlowInfo> flowInfos;
     if (rangeStart == address && rangeStart < rangeEnd) {
-      flowInfos = addDirectControlFlow(state, decode.Pcode);
+      DirectControlFlowResult flowResult =
+          addDirectControlFlow(state, decode.Pcode);
+      flowInfos = std::move(flowResult.FlowInfos);
+      for (uint64_t target : flowResult.CallTargets) {
+        addUniqueAddress(pendingCallSeeds, target);
+      }
     }
     addDecodedFunctionBlocks(state, address, rangeStart, rangeEnd,
                              decode.Instructions, flowInfos);
@@ -1270,9 +1287,9 @@ private:
     state.addFunction(std::move(function));
   }
 
-  static std::map<uint64_t, DecodedFlowInfo>
+  static DirectControlFlowResult
   addDirectControlFlow(NativeProgramState &state, const PcodeProgram &program) {
-    std::map<uint64_t, DecodedFlowInfo> flowInfos;
+    DirectControlFlowResult result;
     std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> seenXrefs;
     for (const PcodeOpView &op : program.Ops) {
       std::optional<uint64_t> target = directRamTarget(op);
@@ -1280,10 +1297,11 @@ private:
         if (target && state.isExecutableAddress(*target)) {
           addUniqueXref(state, seenXrefs, op.Address, *target,
                         NativeXrefKind::Call);
+          addUniqueAddress(result.CallTargets, *target);
         }
       } else if (op.Opcode == PcodeOpcode::Branch ||
                  op.Opcode == PcodeOpcode::CBranch) {
-        DecodedFlowInfo &info = flowInfos[op.Address];
+        DecodedFlowInfo &info = result.FlowInfos[op.Address];
         if (op.Opcode == PcodeOpcode::CBranch) {
           info.HasConditionalBranch = true;
         } else {
@@ -1295,12 +1313,12 @@ private:
           addUniqueAddress(info.BranchTargets, *target);
         }
       } else if (op.Opcode == PcodeOpcode::BranchInd) {
-        flowInfos[op.Address].HasIndirectBranch = true;
+        result.FlowInfos[op.Address].HasIndirectBranch = true;
       } else if (op.Opcode == PcodeOpcode::Return) {
-        flowInfos[op.Address].HasReturn = true;
+        result.FlowInfos[op.Address].HasReturn = true;
       }
     }
-    return flowInfos;
+    return result;
   }
 
   static std::optional<uint64_t> directRamTarget(const PcodeOpView &op) {
