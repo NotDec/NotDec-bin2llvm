@@ -27,6 +27,7 @@
   - [x] 已补 `notdec-native-discover --xrefs-from-json` / `--xrefs-to-json` 按地址查 xref。
   - [x] 已补 `notdec-native-discover --instructions-json` 最小 instruction 列表输出。
 - [ ] 阶段 5: XRef enhancement
+  - [x] 已补 direct `ram` P-Code 数据访问到 `data` xref 的保守记录。
 - [ ] 阶段 6: Lowering integration
 - [ ] 阶段 7: Bench2 regression
 

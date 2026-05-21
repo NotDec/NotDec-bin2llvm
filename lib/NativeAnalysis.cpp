@@ -1370,7 +1370,7 @@ private:
       if (op.Opcode == PcodeOpcode::Call) {
         if (target && state.isExecutableAddress(*target)) {
           addUniqueXref(state, seenXrefs, op.Address, *target,
-                        NativeXrefKind::Call);
+                        NativeXrefKind::Call, "sleigh-pcode-direct-flow");
           addUniqueAddress(result.CallTargets, *target);
         }
       } else if (op.Opcode == PcodeOpcode::CallInd) {
@@ -1389,7 +1389,7 @@ private:
         }
         if (target && state.isExecutableAddress(*target)) {
           addUniqueXref(state, seenXrefs, op.Address, *target,
-                        NativeXrefKind::Flow);
+                        NativeXrefKind::Flow, "sleigh-pcode-direct-flow");
           addUniqueAddress(info.BranchTargets, *target);
         }
       } else if (op.Opcode == PcodeOpcode::BranchInd) {
@@ -1401,9 +1401,34 @@ private:
         state.addUnresolvedFlow(std::move(flow));
       } else if (op.Opcode == PcodeOpcode::Return) {
         result.FlowInfos[op.Address].HasReturn = true;
+      } else {
+        addDirectDataXrefs(state, seenXrefs, op);
       }
     }
     return result;
+  }
+
+  static void addDirectDataXrefs(
+      NativeProgramState &state,
+      std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> &seenXrefs,
+      const PcodeOpView &op) {
+    if (op.Output) {
+      addDirectDataXref(state, seenXrefs, op.Address, *op.Output);
+    }
+    for (const VarnodeView &input : op.Inputs) {
+      addDirectDataXref(state, seenXrefs, op.Address, input);
+    }
+  }
+
+  static void addDirectDataXref(
+      NativeProgramState &state,
+      std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> &seenXrefs,
+      uint64_t from, const VarnodeView &varnode) {
+    if (varnode.Space != "ram" || state.isExecutableAddress(varnode.Offset)) {
+      return;
+    }
+    addUniqueXref(state, seenXrefs, from, varnode.Offset, NativeXrefKind::Data,
+                  "sleigh-pcode-direct-data");
   }
 
   static std::optional<uint64_t> directRamTarget(const PcodeOpView &op) {
@@ -1424,7 +1449,7 @@ private:
   static void addUniqueXref(
       NativeProgramState &state,
       std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> &seenXrefs,
-      uint64_t from, uint64_t to, NativeXrefKind kind) {
+      uint64_t from, uint64_t to, NativeXrefKind kind, const char *source) {
     if (!seenXrefs.insert({from, to, kind}).second) {
       return;
     }
@@ -1432,7 +1457,7 @@ private:
     xref.From = from;
     xref.To = to;
     xref.Kind = kind;
-    xref.Source = "sleigh-pcode-direct-flow";
+    xref.Source = source;
     state.addXref(std::move(xref));
   }
 
