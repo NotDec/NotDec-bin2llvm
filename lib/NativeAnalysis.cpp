@@ -399,24 +399,47 @@ private:
       return;
     }
 
-    size_t slotCount = static_cast<size_t>(pltGot->Size / 16);
-    if (slotCount != globDatFunctions.size()) {
-      state.addNote("could not match .plt.got stubs to function GLOB_DAT "
-                    "relocations");
-      return;
-    }
-
     std::sort(
         globDatFunctions.begin(), globDatFunctions.end(),
         [](const NativeRelocationInfo &lhs, const NativeRelocationInfo &rhs) {
           return lhs.Address < rhs.Address;
         });
 
-    for (size_t index = 0; index < globDatFunctions.size(); ++index) {
+    for (size_t index = 0; index < pltGot->Size / 16; ++index) {
+      uint64_t stubAddress = pltGot->Address + index * 16;
+      std::vector<uint8_t> stubBytes;
+      if (!readBytes(state, stubAddress, 10, stubBytes) ||
+          stubBytes.size() != 10) {
+        continue;
+      }
+      if (stubBytes[0] != 0xf3 || stubBytes[1] != 0x0f ||
+          stubBytes[2] != 0x1e || stubBytes[3] != 0xfa ||
+          stubBytes[4] != 0xff || stubBytes[5] != 0x25) {
+        continue;
+      }
+
+      uint32_t rawDisplacement = 0;
+      for (size_t byteIndex = 0; byteIndex < 4; ++byteIndex) {
+        rawDisplacement |= static_cast<uint32_t>(stubBytes[6 + byteIndex])
+                           << (byteIndex * 8);
+      }
+      int32_t displacement = static_cast<int32_t>(rawDisplacement);
+
+      uint64_t gotAddress =
+          stubAddress + 10 + static_cast<int64_t>(displacement);
+      auto relocationIt = std::find_if(
+          globDatFunctions.begin(), globDatFunctions.end(),
+          [&](const NativeRelocationInfo &relocation) {
+            return relocation.Address == gotAddress;
+          });
+      if (relocationIt == globDatFunctions.end()) {
+        continue;
+      }
+
       NativePltEntry entry;
-      entry.StubAddress = pltGot->Address + index * 16;
-      entry.GotAddress = globDatFunctions[index].Address;
-      entry.SymbolName = globDatFunctions[index].SymbolName;
+      entry.StubAddress = stubAddress;
+      entry.GotAddress = gotAddress;
+      entry.SymbolName = relocationIt->SymbolName;
       state.addPltEntry(std::move(entry));
     }
   }

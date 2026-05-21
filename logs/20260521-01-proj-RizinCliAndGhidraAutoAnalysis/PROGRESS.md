@@ -22,6 +22,7 @@
   - [x] 已补 `functionContaining(...)` 按 confirmed basic block 判断，避免 block 空洞误判。
   - [x] 已补来源可追到外部 `GLOB_DAT` GOT slot 的 `CALLIND` xref，并从 unresolved indirect call 中移除。
   - [x] 已补 direct `ram` GOT 命中 `NativePltEntry` 的 `BRANCHIND` xref，并从 unresolved indirect branch 中移除。
+  - [x] 已补 `.plt.got` thunk byte-match 后的 `BRANCHIND` 解析，进一步减少 unresolved indirect branch。
   - [ ] 尚未解析间接 branch/call 目标，也还没有完整函数边界判断。
 - [ ] 阶段 4: CLI query
   - [x] 已补 `notdec-native-discover --summary-json` 最小 summary 输出。
@@ -32,6 +33,7 @@
   - [x] 已补 `notdec-native-discover --instructions-json` 最小 instruction 列表输出。
   - [x] 已补 `notdec-native-discover --plt-json` 输出 PLT stub / GOT / 外部符号映射。
   - [x] 已补 `.plt.got` 函数型 `GLOB_DAT` thunk 到 PLT 外部映射。
+  - [x] 已补 `.plt.got` 机器码反查 GOT slot，覆盖 relocation 数量不对齐的外部 thunk。
   - [x] 已补 `notdec-native-discover --unresolved-json` 输出 indirect call / branch 未解析样本。
 - [ ] 阶段 5: XRef enhancement
   - [x] 已补 direct `ram` P-Code 数据访问到 `data` xref 的保守记录。

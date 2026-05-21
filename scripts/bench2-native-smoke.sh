@@ -117,8 +117,8 @@ check_ir_features() {
 
   case "$name" in
   vsftpd)
-    require_ir_pattern "$ll" "call void @notdec_native_5ba0()" \
-      "$name internal direct call"
+    require_ir_pattern "$ll" "call void @__cxa_finalize()" \
+      "$name PLT.GOT external direct call"
     require_ir_pattern "$ll" "call void @notdec_native_8290()" \
       "$name internal direct call"
     require_ir_pattern "$ll" "call void @__gmon_start__()" \
@@ -135,8 +135,8 @@ check_ir_features() {
       "$name PLT external direct call"
     ;;
   memcached)
-    require_ir_pattern "$ll" "call void @notdec_native_5b80()" \
-      "$name internal direct call"
+    require_ir_pattern "$ll" "call void @__cxa_finalize()" \
+      "$name PLT.GOT external direct call"
     require_ir_pattern "$ll" "call void @notdec_native_b950()" \
       "$name internal direct call"
     require_ir_pattern "$ll" "call void @__gmon_start__()" \
@@ -193,7 +193,7 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_no_unresolved_indirect_calls "$summary" "$name"
   case "$name" in
   vsftpd | memcached)
-    require_unresolved_indirect_branches_at_most "$summary" "$name" 3
+    require_unresolved_indirect_branches_at_most "$summary" "$name" 2
     ;;
   libuv)
     require_unresolved_indirect_branches_at_most "$summary" "$name" 1

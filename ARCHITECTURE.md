@@ -70,7 +70,8 @@ block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址
   slot 是 from，computed pointer 是 to。目标像只读 C 字符串时记 string，来源
   `elf-relocation-string`；其他落在已加载内存里的目标记 data，来源
   `elf-relocation-pointer`。它还会把 `.plt.sec` / legacy `.plt` 的 `JUMP_SLOT` stub 和
-  `.plt.got` 里函数型 `GLOB_DAT` thunk 统一记录成 `NativePltEntry`。
+  `.plt.got` 里可从 `endbr64; jmp *rip+disp32` 机器码反查到外部 `GLOB_DAT` 的 thunk
+  统一记录成 `NativePltEntry`。
 - 当前 block 不是单纯整段线性范围：`SleighSeedInstructionAnalyzer` 会按控制流指令切分已解码
   前缀。`CBRANCH` block 同时记录直接目标和下一条指令 fallthrough，`BRANCH` block 只记录直接
   目标，`BRANCHIND` / `RETURN` block 暂不记录 successor。
