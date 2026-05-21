@@ -34,6 +34,7 @@
   - [x] 已补 `notdec-native-discover --functions-json` 最小 confirmed function 列表输出。
   - [x] 已补 `notdec-native-discover --blocks-json` 最小 basic block 列表输出。
   - [x] 已补 `notdec-native-discover --xrefs-json` 最小 xref 列表输出。
+  - [x] 已补 `notdec-native-discover --xrefs-kind-json` 按 flow/call/data/string 过滤 xref。
   - [x] 已补 `notdec-native-discover --xrefs-from-json` / `--xrefs-to-json` 按地址查 xref。
   - [x] 已补 `notdec-native-discover --instructions-json` 最小 instruction 列表输出。
   - [x] 已补 `notdec-native-discover --instructions-range-json` 按地址范围查 instruction。

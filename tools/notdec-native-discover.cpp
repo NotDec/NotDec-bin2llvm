@@ -28,6 +28,7 @@ enum class OutputMode {
   InstructionsFunctionJson,
   PltJson,
   UnresolvedJson,
+  XrefsKindJson,
   XrefsFromJson,
   XrefsToJson,
 };
@@ -39,6 +40,7 @@ struct CliOptions {
   std::optional<uint64_t> QueryStart;
   std::optional<uint64_t> QueryEnd;
   std::optional<uint64_t> QueryFunctionEntry;
+  std::optional<notdec::bin2llvm::NativeXrefKind> QueryXrefKind;
 };
 
 void printUsage(const char *argv0) {
@@ -55,6 +57,8 @@ void printUsage(const char *argv0) {
             << " --instructions-function-json <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --plt-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --unresolved-json <elf-file>\n";
+  std::cerr << "       " << argv0
+            << " --xrefs-kind-json <flow|call|data|string> <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-from-json <addr> <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-to-json <addr> <elf-file>\n";
 }
@@ -70,6 +74,25 @@ std::optional<uint64_t> parseAddress(const std::string &text) {
   } catch (const std::exception &) {
     return std::nullopt;
   }
+}
+
+std::optional<notdec::bin2llvm::NativeXrefKind>
+parseXrefKind(const std::string &text) {
+  using notdec::bin2llvm::NativeXrefKind;
+
+  if (text == "flow") {
+    return NativeXrefKind::Flow;
+  }
+  if (text == "call") {
+    return NativeXrefKind::Call;
+  }
+  if (text == "data") {
+    return NativeXrefKind::Data;
+  }
+  if (text == "string") {
+    return NativeXrefKind::String;
+  }
+  return std::nullopt;
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
@@ -103,10 +126,20 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.Mode = OutputMode::XrefsFromJson;
     } else if (mode == "--xrefs-to-json") {
       options.Mode = OutputMode::XrefsToJson;
+    } else if (mode == "--xrefs-kind-json") {
+      options.Mode = OutputMode::XrefsKindJson;
     } else if (mode == "--instructions-function-json") {
       options.Mode = OutputMode::InstructionsFunctionJson;
     } else {
       return std::nullopt;
+    }
+    if (options.Mode == OutputMode::XrefsKindJson) {
+      options.QueryXrefKind = parseXrefKind(argv[2]);
+      if (!options.QueryXrefKind) {
+        return std::nullopt;
+      }
+      options.ElfPath = argv[3];
+      return options;
     }
     std::optional<uint64_t> address = parseAddress(argv[2]);
     if (!address) {
@@ -394,6 +427,28 @@ void printXrefsJson(std::ostream &output,
   output << "}\n";
 }
 
+void printXrefsKindJson(std::ostream &output,
+                        const notdec::bin2llvm::NativeProgramState &state,
+                        notdec::bin2llvm::NativeXrefKind kind) {
+  output << "{\n";
+  output << "  \"kind\": \"" << notdec::bin2llvm::toString(kind) << "\",\n";
+  output << "  \"xrefs\": [";
+  bool firstXref = true;
+  uint64_t count = 0;
+  for (const notdec::bin2llvm::NativeXref &xref : state.xrefs()) {
+    if (xref.Kind != kind) {
+      continue;
+    }
+    output << (firstXref ? "\n" : ",\n");
+    printXrefObject(output, xref, "    ");
+    firstXref = false;
+    ++count;
+  }
+  output << (firstXref ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << count << "\n";
+  output << "}\n";
+}
+
 void printXrefsQueryJson(std::ostream &output,
                          const notdec::bin2llvm::NativeProgramState &state,
                          uint64_t address, bool fromQuery) {
@@ -598,6 +653,8 @@ int main(int argc, char **argv) {
       printPltJson(std::cout, state);
     } else if (options->Mode == OutputMode::UnresolvedJson) {
       printUnresolvedJson(std::cout, state);
+    } else if (options->Mode == OutputMode::XrefsKindJson) {
+      printXrefsKindJson(std::cout, state, *options->QueryXrefKind);
     } else if (options->Mode == OutputMode::XrefsFromJson) {
       printXrefsQueryJson(std::cout, state, *options->QueryAddress, true);
     } else if (options->Mode == OutputMode::XrefsToJson) {
