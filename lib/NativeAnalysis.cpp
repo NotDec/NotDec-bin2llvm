@@ -11,6 +11,7 @@
 #include <LIEF/ELF/Symbol.hpp>
 
 #include <algorithm>
+#include <deque>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
@@ -1152,23 +1153,27 @@ public:
       return;
     }
 
-    std::vector<NativeFunctionWorkItem> worklistSnapshot =
-        state.functionWorklist();
-    std::vector<uint64_t> pendingCallSeeds;
-    uint64_t decodedSeeds = 0;
-    for (const NativeFunctionWorkItem &item : worklistSnapshot) {
-      if (decodedSeeds == MaxSeeds) {
-        break;
-      }
-      if (!state.isExecutableAddress(item.Address)) {
+    std::deque<uint64_t> decodeQueue;
+    std::set<uint64_t> queuedSeeds;
+    std::set<uint64_t> decodedSeedAddresses;
+    enqueueInitialSeeds(state, decodeQueue, queuedSeeds);
+
+    uint64_t decodedSeedCount = 0;
+    while (!decodeQueue.empty() && decodedSeedCount < MaxSeeds) {
+      uint64_t address = decodeQueue.front();
+      decodeQueue.pop_front();
+      if (!decodedSeedAddresses.insert(address).second ||
+          !state.isExecutableAddress(address)) {
         continue;
       }
-      decodeSeed(state, loadImage, item.Address, pendingCallSeeds);
-      ++decodedSeeds;
-    }
-    for (uint64_t target : pendingCallSeeds) {
-      state.addFunctionSeed(target, 0, "", "sleigh-direct-call",
-                            NativeFunctionConfidence::High);
+      std::vector<uint64_t> callTargets;
+      decodeSeed(state, loadImage, address, callTargets);
+      ++decodedSeedCount;
+      for (uint64_t target : callTargets) {
+        state.addFunctionSeed(target, 0, "", "sleigh-direct-call",
+                              NativeFunctionConfidence::High);
+        enqueueSeed(state, target, decodeQueue, queuedSeeds);
+      }
     }
   }
 
@@ -1176,7 +1181,8 @@ private:
   // This analyzer is only a bounded smoke path for recursive decode.  Larger
   // limits should come with CFG stop rules first, otherwise linear decode after
   // branches can look more precise than it is.
-  static constexpr uint64_t MaxSeeds = 8;
+  static constexpr uint64_t MaxInitialSeeds = 8;
+  static constexpr uint64_t MaxSeeds = 16;
   static constexpr uint64_t MaxInstructionsPerSeed = 8;
   static constexpr uint64_t MaxBytesPerSeed = 64;
 
@@ -1221,8 +1227,33 @@ private:
     return true;
   }
 
+  static void enqueueInitialSeeds(NativeProgramState &state,
+                                  std::deque<uint64_t> &decodeQueue,
+                                  std::set<uint64_t> &queuedSeeds) {
+    uint64_t initialSeeds = 0;
+    for (const NativeFunctionWorkItem &item : state.functionWorklist()) {
+      if (initialSeeds == MaxInitialSeeds) {
+        break;
+      }
+      if (enqueueSeed(state, item.Address, decodeQueue, queuedSeeds)) {
+        ++initialSeeds;
+      }
+    }
+  }
+
+  static bool enqueueSeed(NativeProgramState &state, uint64_t address,
+                          std::deque<uint64_t> &decodeQueue,
+                          std::set<uint64_t> &queuedSeeds) {
+    if (!state.isExecutableAddress(address) ||
+        !queuedSeeds.insert(address).second) {
+      return false;
+    }
+    decodeQueue.push_back(address);
+    return true;
+  }
+
   void decodeSeed(NativeProgramState &state, LiefElfLoadImage &loadImage,
-                  uint64_t address, std::vector<uint64_t> &pendingCallSeeds) {
+                  uint64_t address, std::vector<uint64_t> &callTargets) {
     std::optional<uint64_t> availableBytes = executableBytesFrom(state, address);
     if (!availableBytes || *availableBytes == 0) {
       return;
@@ -1256,7 +1287,7 @@ private:
           addDirectControlFlow(state, decode.Pcode);
       flowInfos = std::move(flowResult.FlowInfos);
       for (uint64_t target : flowResult.CallTargets) {
-        addUniqueAddress(pendingCallSeeds, target);
+        addUniqueAddress(callTargets, target);
       }
     }
     addDecodedFunctionBlocks(state, address, rangeStart, rangeEnd,
