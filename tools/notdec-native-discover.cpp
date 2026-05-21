@@ -23,6 +23,7 @@ enum class OutputMode {
   BlocksJson,
   XrefsJson,
   InstructionsJson,
+  PltJson,
   XrefsFromJson,
   XrefsToJson,
 };
@@ -40,6 +41,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --plt-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-from-json <addr> <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-to-json <addr> <elf-file>\n";
 }
@@ -95,6 +97,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::XrefsJson;
   } else if (mode == "--instructions-json") {
     options.Mode = OutputMode::InstructionsJson;
+  } else if (mode == "--plt-json") {
+    options.Mode = OutputMode::PltJson;
   } else {
     return std::nullopt;
   }
@@ -354,6 +358,25 @@ void printInstructionsJson(
   output << "}\n";
 }
 
+void printPltJson(std::ostream &output,
+                  const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"plt\": [";
+  bool firstEntry = true;
+  for (const notdec::bin2llvm::NativePltEntry &entry : state.pltEntries()) {
+    output << (firstEntry ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"stub\": \"" << hexString(entry.StubAddress) << "\",\n";
+    output << "      \"got\": \"" << hexString(entry.GotAddress) << "\",\n";
+    output << "      \"symbol\": \"" << jsonEscape(entry.SymbolName) << "\"\n";
+    output << "    }";
+    firstEntry = false;
+  }
+  output << (firstEntry ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << state.pltEntries().size() << "\n";
+  output << "}\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -394,6 +417,8 @@ int main(int argc, char **argv) {
       printXrefsJson(std::cout, state);
     } else if (options->Mode == OutputMode::InstructionsJson) {
       printInstructionsJson(std::cout, state);
+    } else if (options->Mode == OutputMode::PltJson) {
+      printPltJson(std::cout, state);
     } else if (options->Mode == OutputMode::XrefsFromJson) {
       printXrefsQueryJson(std::cout, state, *options->QueryAddress, true);
     } else if (options->Mode == OutputMode::XrefsToJson) {

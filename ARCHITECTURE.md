@@ -110,7 +110,7 @@ external/NotDec-bin2llvm/
   的汇总 JSON，`--functions-json` 打印 confirmed function 列表 JSON，`--blocks-json`
   打印 confirmed function 下的 basic block 列表 JSON，`--xrefs-json` 打印 xref 列表
   JSON，`--xrefs-from-json` / `--xrefs-to-json` 按地址查 xref，`--instructions-json`
-  打印 instruction 列表 JSON。
+  打印 instruction 列表 JSON，`--plt-json` 打印 PLT stub、GOT slot 和外部符号名映射。
 - `tools/notdec-native-llvm.cpp`：native P-Code 到 LLVM IR 的入口。可以继续用
   `-a <address> -l <length>` 手工指定范围，也可以用 `-f <entry>`、`-n <name>` 或
   `--all-confirmed` 先跑 native discovery，从 confirmed function 取入口到保守 range end，

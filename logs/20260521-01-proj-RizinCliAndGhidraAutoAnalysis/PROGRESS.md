@@ -28,6 +28,7 @@
   - [x] 已补 `notdec-native-discover --xrefs-json` 最小 xref 列表输出。
   - [x] 已补 `notdec-native-discover --xrefs-from-json` / `--xrefs-to-json` 按地址查 xref。
   - [x] 已补 `notdec-native-discover --instructions-json` 最小 instruction 列表输出。
+  - [x] 已补 `notdec-native-discover --plt-json` 输出 PLT stub / GOT / 外部符号映射。
 - [ ] 阶段 5: XRef enhancement
   - [x] 已补 direct `ram` P-Code 数据访问到 `data` xref 的保守记录。
   - [x] 已补 direct `ram` 数据引用到只读 C 字符串时的 `string` xref 分类。
