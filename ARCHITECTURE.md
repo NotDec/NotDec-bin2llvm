@@ -134,10 +134,11 @@ external/NotDec-bin2llvm/
   direct call。`-f` / `-n` 单函数模式也会先规划 native discovery 的 confirmed function 和
   PLT 外部符号映射，所以已知 direct call 仍能落到符号名。`CALLIND` 如果输入来源能追到
   直接 RAM GOT slot，并且该 slot 是外部 `GLOB_DAT` 符号，会生成为对应外部函数调用。
-  `BRANCHIND` 命中同一类外部 GOT slot 时，会生成外部 `void ()` call 后结束当前函数，
-  用于保守表达 external tail jump。x86 `CALLOTHER` userop 17/18（`LOCK` / `UNLOCK`）
-  会 no-op，因为普通内存读写 P-Code 已经保留交换语义。未命中目标和其他 `CALLOTHER`
-  仍走 helper call。
+  `BRANCHIND` 命中同一类外部 GOT slot 或已知 `NativePltEntry::GotAddress` 时，会生成外部
+  `void ()` call 后结束当前函数，用于保守表达 external tail jump。PLT stub 地址和 GOT
+  slot 共享同一个外部 LLVM symbol，避免同一符号生成重复声明。x86 `CALLOTHER` userop
+  17/18（`LOCK` / `UNLOCK`）会 no-op，因为普通内存读写 P-Code 已经保留交换语义。
+  未命中目标和其他 `CALLOTHER` 仍走 helper call。
 - `scripts/bench2-native-smoke.sh`：Bench2 native smoke 入口。它固定跑 `vsftpd`、
   `libuv.so.1.0.0`、`memcached`，先用 `notdec-native-discover --summary-json` 确认
   native discovery 至少产出 confirmed function，且当前三目标不再保留 unresolved indirect

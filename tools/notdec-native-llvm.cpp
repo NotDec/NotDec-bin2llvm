@@ -306,6 +306,16 @@ NativeCallTargets planNativeCallTargets(
     const notdec::bin2llvm::NativeProgramState &state) {
   NativeCallTargets targets;
   std::set<std::string> usedNames;
+  std::unordered_map<std::string, std::string> externalNamesBySymbol;
+  auto externalNameFor = [&](const std::string &symbolName) -> std::string {
+    auto it = externalNamesBySymbol.find(symbolName);
+    if (it != externalNamesBySymbol.end()) {
+      return it->second;
+    }
+    std::string name = externalFunctionLlvmName(symbolName, usedNames);
+    externalNamesBySymbol.emplace(symbolName, name);
+    return name;
+  };
 
   for (const auto &[entry, function] : state.functions()) {
     (void)entry;
@@ -320,9 +330,9 @@ NativeCallTargets planNativeCallTargets(
     if (entry.SymbolName.empty()) {
       continue;
     }
-    targets.External.emplace(
-        entry.StubAddress,
-        externalFunctionLlvmName(entry.SymbolName, usedNames));
+    std::string name = externalNameFor(entry.SymbolName);
+    targets.External.emplace(entry.StubAddress, name);
+    targets.IndirectExternal.emplace(entry.GotAddress, name);
   }
 
   for (const notdec::bin2llvm::NativeRelocationInfo &relocation :
@@ -333,9 +343,8 @@ NativeCallTargets planNativeCallTargets(
     if (relocation.TypeName != "X86_64_GLOB_DAT") {
       continue;
     }
-    targets.IndirectExternal.emplace(
-        relocation.Address,
-        externalFunctionLlvmName(relocation.SymbolName, usedNames));
+    targets.IndirectExternal.emplace(relocation.Address,
+                                     externalNameFor(relocation.SymbolName));
   }
 
   return targets;

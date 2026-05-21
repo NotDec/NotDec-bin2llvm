@@ -125,6 +125,10 @@ check_ir_features() {
       "$name GOT external indirect call"
     require_ir_pattern "$ll" "call void @_ITM_deregisterTMCloneTable()" \
       "$name GOT external indirect tail jump"
+    require_ir_pattern "$ll" "call void @getegid()" \
+      "$name PLT GOT indirect branch"
+    require_ir_pattern "$ll" "call void @SSL_get_error()" \
+      "$name PLT GOT indirect branch"
     ;;
   libuv)
     require_ir_pattern "$ll" "call void @notdec_native_9d80()" \
@@ -147,8 +151,15 @@ check_ir_features() {
       "$name GOT external indirect call"
     require_ir_pattern "$ll" "call void @_ITM_deregisterTMCloneTable()" \
       "$name GOT external indirect tail jump"
+    require_ir_pattern "$ll" "call void @SSL_CTX_use_PrivateKey_file()" \
+      "$name PLT GOT indirect branch"
+    require_ir_pattern "$ll" "call void @pthread_cond_signal()" \
+      "$name PLT GOT indirect branch"
     ;;
   esac
+
+  forbid_ir_pattern "$ll" "__cxa_finalize_1" \
+    "$name duplicate external symbol regression"
 
   forbid_ir_pattern "$ll" "notdec_pcode_CALL_void" \
     "$name direct call helper regression"
