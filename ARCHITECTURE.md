@@ -56,8 +56,10 @@ basic block、instruction 和 xref 数量。
   decode 队列。本轮总 decode 上限是 16 个 seed，已入队或已 decode 的地址不会重复处理。
 - direct `BRANCH` / `CBRANCH` 的可执行 successor 会作为同一个 function entry 下的 block
   address 入队。追加 block 时，`NativeFunction` 的 decoded range 会随 block 扩展。
+- 如果 direct branch successor 是已知的其他 function seed 入口，它会保留 direct flow xref，
+  但不会作为当前函数 block successor 或本地 decode block 入队。
 - 这一步只用于受控消费 direct call seed 和 direct branch successor。间接 branch/call 目前只记录，
-  不跟随，也不做完整函数边界判断。
+  不跟随；函数边界也只处理已知其他函数入口。
 
 因此 Bench2 运行时 instruction、confirmed function、basic block、xref 数量应该已经大于 0。
 

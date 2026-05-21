@@ -1328,7 +1328,8 @@ private:
 
     std::vector<NativeBasicBlock> blocks =
         buildDecodedBlocks(instructions, flowInfos, rangeStart, rangeEnd);
-    for (const NativeBasicBlock &block : blocks) {
+    for (NativeBasicBlock &block : blocks) {
+      eraseKnownOtherFunctionSuccessors(state, entry, block.Successors);
       for (uint64_t successor : block.Successors) {
         if (successor < rangeStart || successor >= rangeEnd) {
           addUniqueAddress(branchTargets, successor);
@@ -1488,6 +1489,26 @@ private:
       }
     }
     return blocks;
+  }
+
+  static void
+  eraseKnownOtherFunctionSuccessors(NativeProgramState &state, uint64_t entry,
+                                    std::vector<uint64_t> &successors) {
+    successors.erase(
+        std::remove_if(successors.begin(), successors.end(),
+                       [&](uint64_t successor) {
+                         return isKnownOtherFunctionEntry(state, entry,
+                                                          successor);
+                       }),
+        successors.end());
+  }
+
+  static bool isKnownOtherFunctionEntry(NativeProgramState &state,
+                                        uint64_t entry, uint64_t address) {
+    if (address == entry) {
+      return false;
+    }
+    return state.functionSeeds().find(address) != state.functionSeeds().end();
   }
 
   static void addUniqueAddress(std::vector<uint64_t> &addresses,

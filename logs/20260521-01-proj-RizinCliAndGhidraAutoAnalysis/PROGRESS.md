@@ -17,6 +17,7 @@
   - [x] 已补本轮 bounded direct call seed 消费：初始 8 个 seed，同轮最多 decode 16 个 seed。
   - [x] 已补本轮 bounded direct branch successor 消费：branch target 作为同函数 block 入队。
   - [x] 已补 unresolved indirect flow 记录：`CALLIND` / `BRANCHIND` 进入 native state 和 report。
+  - [x] 已补已知函数入口边界：direct branch 到其他 function seed 时不并入当前函数。
   - [ ] 尚未解析间接 branch/call 目标，也还没有完整函数边界判断。
 - [ ] 阶段 4: CLI query
 - [ ] 阶段 5: XRef enhancement
