@@ -17,6 +17,7 @@
 #include <ostream>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <utility>
 
 namespace notdec::bin2llvm {
@@ -1207,15 +1208,13 @@ private:
       return;
     }
 
-    std::vector<SleighInstructionSummary> summaries =
-        collectSleighInstructionSummaries(loadImage, SpecOptions, address,
-                                          MaxInstructionsPerSeed,
-                                          std::min(MaxBytesPerSeed,
-                                                   *availableBytes),
-                                          NullErrors);
+    uint64_t decodeBytes = std::min(MaxBytesPerSeed, *availableBytes);
+    SleighInstructionDecode decode = collectSleighInstructionDecode(
+        loadImage, SpecOptions, address, MaxInstructionsPerSeed, decodeBytes,
+        NullErrors);
     uint64_t rangeStart = 0;
     uint64_t rangeEnd = 0;
-    for (const SleighInstructionSummary &summary : summaries) {
+    for (const SleighInstructionSummary &summary : decode.Instructions) {
       if (rangeStart == 0) {
         rangeStart = summary.Address;
       }
@@ -1231,12 +1230,17 @@ private:
       (void)readBytes(state, summary.Address, summary.Size, instruction.Bytes);
       state.addInstruction(std::move(instruction));
     }
-    addDecodedFunctionBlock(state, address, rangeStart, rangeEnd);
+    std::vector<uint64_t> successors;
+    if (rangeStart == address && rangeStart < rangeEnd) {
+      addDirectControlFlow(state, decode.Pcode, successors);
+    }
+    addDecodedFunctionBlock(state, address, rangeStart, rangeEnd, successors);
   }
 
   static void addDecodedFunctionBlock(NativeProgramState &state,
                                       uint64_t entry, uint64_t rangeStart,
-                                      uint64_t rangeEnd) {
+                                      uint64_t rangeEnd,
+                                      std::vector<uint64_t> successors) {
     if (rangeStart == 0 || rangeStart != entry || rangeStart >= rangeEnd) {
       return;
     }
@@ -1254,8 +1258,66 @@ private:
     NativeBasicBlock block;
     block.Start = rangeStart;
     block.End = rangeEnd;
+    block.Successors = std::move(successors);
     function.Blocks.push_back(std::move(block));
     state.addFunction(std::move(function));
+  }
+
+  static void addDirectControlFlow(NativeProgramState &state,
+                                   const PcodeProgram &program,
+                                   std::vector<uint64_t> &successors) {
+    std::set<std::pair<uint64_t, uint64_t>> seenFlowSuccessors;
+    std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> seenXrefs;
+    for (const PcodeOpView &op : program.Ops) {
+      std::optional<uint64_t> target = directRamTarget(op);
+      if (!target || !state.isExecutableAddress(*target)) {
+        continue;
+      }
+
+      if (op.Opcode == PcodeOpcode::Call) {
+        addUniqueXref(state, seenXrefs, op.Address, *target,
+                      NativeXrefKind::Call);
+      } else if (op.Opcode == PcodeOpcode::Branch ||
+                 op.Opcode == PcodeOpcode::CBranch) {
+        addUniqueXref(state, seenXrefs, op.Address, *target,
+                      NativeXrefKind::Flow);
+        if (seenFlowSuccessors.insert({op.Address, *target}).second &&
+            std::find(successors.begin(), successors.end(), *target) ==
+                successors.end()) {
+          successors.push_back(*target);
+        }
+      }
+    }
+  }
+
+  static std::optional<uint64_t> directRamTarget(const PcodeOpView &op) {
+    if (op.Inputs.empty()) {
+      return std::nullopt;
+    }
+    if (op.Opcode != PcodeOpcode::Call && op.Opcode != PcodeOpcode::Branch &&
+        op.Opcode != PcodeOpcode::CBranch) {
+      return std::nullopt;
+    }
+    const VarnodeView &target = op.Inputs.front();
+    if (target.Space != "ram") {
+      return std::nullopt;
+    }
+    return target.Offset;
+  }
+
+  static void addUniqueXref(
+      NativeProgramState &state,
+      std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> &seenXrefs,
+      uint64_t from, uint64_t to, NativeXrefKind kind) {
+    if (!seenXrefs.insert({from, to, kind}).second) {
+      return;
+    }
+    NativeXref xref;
+    xref.From = from;
+    xref.To = to;
+    xref.Kind = kind;
+    xref.Source = "sleigh-pcode-direct-flow";
+    state.addXref(std::move(xref));
   }
 
   static std::optional<uint64_t>

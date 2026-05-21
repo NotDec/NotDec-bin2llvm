@@ -35,6 +35,14 @@ struct SleighInstructionSummary {
   std::string Body;
 };
 
+// SleighInstructionDecode keeps the instruction display facts and matching
+// raw P-Code from one bounded decode pass.  Native CFG recovery uses this to
+// avoid initializing Sleigh twice for the same seed.
+struct SleighInstructionDecode {
+  std::vector<SleighInstructionSummary> Instructions;
+  PcodeProgram Pcode;
+};
+
 std::optional<std::filesystem::path>
 findSleighSpecPath(const std::string &fileName,
                    const std::optional<std::string> &rootDir);
@@ -50,5 +58,11 @@ collectSleighInstructionSummaries(ghidra::LoadImage &loadImage,
                                   uint64_t address, uint64_t maxInstructions,
                                   uint64_t maxBytes,
                                   std::ostream &errorStream);
+
+SleighInstructionDecode
+collectSleighInstructionDecode(ghidra::LoadImage &loadImage,
+                               const SleighSpecOptions &options,
+                               uint64_t address, uint64_t maxInstructions,
+                               uint64_t maxBytes, std::ostream &errorStream);
 
 } // namespace notdec::bin2llvm

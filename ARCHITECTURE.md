@@ -42,11 +42,14 @@ basic block、instruction 和 xref 数量。
   seed，每个 seed 最多解码 8 条 / 64 字节，并写入 `NativeInstruction`。
 - 如果某个 seed 成功解码出指令，它会被保守写成一个 `NativeFunction`，并带一个覆盖已解码
   指令前缀的 `NativeBasicBlock`。
-- 这一步只用于打通 native seed 到 instruction/function/block state 的链路，不恢复真实 CFG，
-  也不产生 branch/call xref。
+- `lib/SleighLift.cpp::collectSleighInstructionDecode(...)` 在同一次 Sleigh 初始化里收集指令摘要
+  和对应 P-Code，避免为了 xref 再解码一次。
+- analyzer 会从 P-Code 里识别直接 `CALL`、`BRANCH`、`CBRANCH`。第一个输入是 `ram` 地址时，
+  写入 `NativeXref`；直接 branch 目标也会写入当前 block 的 `Successors`。
+- 这一步只用于打通 native seed 到 instruction/function/block/xref state 的链路，还不恢复递归
+  CFG，也不处理间接 branch/call。
 
-因此 Bench2 运行时 instruction、confirmed function、basic block 数量应该已经大于 0，但
-xref 数量仍可能是 0。
+因此 Bench2 运行时 instruction、confirmed function、basic block、xref 数量应该已经大于 0。
 
 ## 目录
 

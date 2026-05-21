@@ -351,9 +351,19 @@ collectSleighInstructionSummaries(ghidra::LoadImage &loadImage,
                                   uint64_t address, uint64_t maxInstructions,
                                   uint64_t maxBytes,
                                   std::ostream &errorStream) {
-  std::vector<SleighInstructionSummary> instructions;
+  return collectSleighInstructionDecode(loadImage, options, address,
+                                        maxInstructions, maxBytes, errorStream)
+      .Instructions;
+}
+
+SleighInstructionDecode
+collectSleighInstructionDecode(ghidra::LoadImage &loadImage,
+                               const SleighSpecOptions &options,
+                               uint64_t address, uint64_t maxInstructions,
+                               uint64_t maxBytes, std::ostream &errorStream) {
+  SleighInstructionDecode decode;
   if (maxInstructions == 0 || maxBytes == 0) {
-    return instructions;
+    return decode;
   }
 
   ghidra::ContextInternal context;
@@ -362,16 +372,19 @@ collectSleighInstructionSummaries(ghidra::LoadImage &loadImage,
   std::filesystem::path slaFilePath;
   if (!initializeSleighEngine(loadImage, options, errorStream, context, engine,
                               storage, slaFilePath)) {
-    return instructions;
+    return decode;
   }
+  decode.Pcode.IsBigEndian = engine.isBigEndian();
+  collectRegisters(engine, decode.Pcode);
 
   AssemblyCollector collector;
+  PcodeCollector pcodeCollector(engine, decode.Pcode);
   ghidra::Address current(engine.getDefaultCodeSpace(), address);
   if (address > std::numeric_limits<uint64_t>::max() - maxBytes) {
     maxBytes = std::numeric_limits<uint64_t>::max() - address;
   }
   ghidra::Address end(engine.getDefaultCodeSpace(), address + maxBytes);
-  while (instructions.size() < maxInstructions && current < end) {
+  while (decode.Instructions.size() < maxInstructions && current < end) {
     try {
       int32_t instructionLength = engine.printAssembly(collector, current);
       if (instructionLength <= 0 ||
@@ -379,21 +392,27 @@ collectSleighInstructionSummaries(ghidra::LoadImage &loadImage,
               end.getOffset() - current.getOffset()) {
         break;
       }
-      instructions.push_back(
+      int32_t pcodeLength = engine.oneInstruction(pcodeCollector, current);
+      if (pcodeLength != instructionLength) {
+        errorStream << "Sleigh decode length mismatch @ " << current << ": "
+                    << instructionLength << " vs " << pcodeLength << '\n';
+        break;
+      }
+      decode.Instructions.push_back(
           collector.take(static_cast<uint64_t>(instructionLength)));
       current = current + instructionLength;
     } catch (ghidra::UnimplError &error) {
       errorStream << "UnimplError @ " << current << ": " << error.explain
                   << '\n';
-      return instructions;
+      return decode;
     } catch (ghidra::BadDataError &error) {
       errorStream << "BadDataError @ " << current << ": " << error.explain
                   << '\n';
-      return instructions;
+      return decode;
     }
   }
 
-  return instructions;
+  return decode;
 }
 
 } // namespace notdec::bin2llvm
