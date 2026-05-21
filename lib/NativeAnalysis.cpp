@@ -262,6 +262,7 @@ public:
     }
 
     std::vector<NativeRelocationInfo> jumpSlots;
+    std::vector<NativeRelocationInfo> globDatFunctions;
     for (const LIEF::ELF::Relocation &relocation :
          state.binary().relocations()) {
       NativeRelocationInfo info;
@@ -271,9 +272,11 @@ public:
       info.TableKind = relocationPurposeName(relocation);
       info.Addend = relocation.addend();
 
+      bool symbolIsFunction = false;
       if (const LIEF::ELF::Symbol *symbol = relocation.symbol()) {
         info.SymbolName = symbol->name();
         info.SymbolValue = symbol->value();
+        symbolIsFunction = symbol->type() == LIEF::ELF::Symbol::TYPE::FUNC;
       }
 
       switch (relocation.type()) {
@@ -292,6 +295,9 @@ public:
         } else {
           info.Status = "external";
         }
+        if (symbolIsFunction && !info.SymbolName.empty()) {
+          globDatFunctions.push_back(info);
+        }
         break;
       case LIEF::ELF::Relocation::TYPE::X86_64_JUMP_SLOT:
         info.Status = "external";
@@ -309,6 +315,7 @@ public:
       state.addRelocation(std::move(info));
     }
 
+    addPltGotEntries(state, std::move(globDatFunctions));
     addPltEntries(state, jumpSlots);
     addRelocationPointerXrefs(state);
   }
@@ -374,6 +381,43 @@ private:
 
     if (usesLegacyPlt) {
       state.addNote("PLT external mapping uses legacy .plt entries");
+    }
+  }
+
+  void addPltGotEntries(NativeProgramState &state,
+                        std::vector<NativeRelocationInfo> globDatFunctions) {
+    if (globDatFunctions.empty()) {
+      return;
+    }
+
+    std::optional<NativeSectionInfo> pltGot = findSection(state, ".plt.got");
+    if (!pltGot) {
+      return;
+    }
+    if (pltGot->Size % 16 != 0) {
+      state.addNote("could not match .plt.got stubs: unexpected section size");
+      return;
+    }
+
+    size_t slotCount = static_cast<size_t>(pltGot->Size / 16);
+    if (slotCount != globDatFunctions.size()) {
+      state.addNote("could not match .plt.got stubs to function GLOB_DAT "
+                    "relocations");
+      return;
+    }
+
+    std::sort(
+        globDatFunctions.begin(), globDatFunctions.end(),
+        [](const NativeRelocationInfo &lhs, const NativeRelocationInfo &rhs) {
+          return lhs.Address < rhs.Address;
+        });
+
+    for (size_t index = 0; index < globDatFunctions.size(); ++index) {
+      NativePltEntry entry;
+      entry.StubAddress = pltGot->Address + index * 16;
+      entry.GotAddress = globDatFunctions[index].Address;
+      entry.SymbolName = globDatFunctions[index].SymbolName;
+      state.addPltEntry(std::move(entry));
     }
   }
 };

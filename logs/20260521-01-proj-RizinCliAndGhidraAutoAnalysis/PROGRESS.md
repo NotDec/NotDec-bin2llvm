@@ -29,6 +29,7 @@
   - [x] 已补 `notdec-native-discover --xrefs-from-json` / `--xrefs-to-json` 按地址查 xref。
   - [x] 已补 `notdec-native-discover --instructions-json` 最小 instruction 列表输出。
   - [x] 已补 `notdec-native-discover --plt-json` 输出 PLT stub / GOT / 外部符号映射。
+  - [x] 已补 `.plt.got` 函数型 `GLOB_DAT` thunk 到 PLT 外部映射。
 - [ ] 阶段 5: XRef enhancement
   - [x] 已补 direct `ram` P-Code 数据访问到 `data` xref 的保守记录。
   - [x] 已补 direct `ram` 数据引用到只读 C 字符串时的 `string` xref 分类。
@@ -45,6 +46,7 @@
 - [ ] 阶段 7: Bench2 regression
   - [x] 已补 `scripts/bench2-native-smoke.sh`，固定跑 `vsftpd`、`libuv`、`memcached` 的 native discovery 和 LLVM verify。
   - [x] 已补 Bench2 smoke 的固定 IR pattern 检查，覆盖内部 direct call 和 libuv PLT external call。
+  - [x] 已补 libuv `.plt.got` external call 的 smoke pattern。
 
 ## 记录规则
 

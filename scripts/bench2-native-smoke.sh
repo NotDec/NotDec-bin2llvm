@@ -89,6 +89,8 @@ check_ir_features() {
   libuv)
     require_ir_pattern "$ll" "call void @notdec_native_9d80()" \
       "$name internal direct call"
+    require_ir_pattern "$ll" "call void @__cxa_finalize()" \
+      "$name PLT.GOT external direct call"
     require_ir_pattern "$ll" "call void @pthread_key_delete()" \
       "$name PLT external direct call"
     ;;

@@ -63,7 +63,8 @@ block 数。`--blocks-json` 输出已确认函数里的 basic block 起止地址
 - `RelocationPltAnalyzer` 会把已应用的本地 relocated pointer 也写成 xref：relocation
   slot 是 from，computed pointer 是 to。目标像只读 C 字符串时记 string，来源
   `elf-relocation-string`；其他落在已加载内存里的目标记 data，来源
-  `elf-relocation-pointer`。
+  `elf-relocation-pointer`。它还会把 `.plt.sec` / legacy `.plt` 的 `JUMP_SLOT` stub 和
+  `.plt.got` 里函数型 `GLOB_DAT` thunk 统一记录成 `NativePltEntry`。
 - 当前 block 不是单纯整段线性范围：`SleighSeedInstructionAnalyzer` 会按控制流指令切分已解码
   前缀。`CBRANCH` block 同时记录直接目标和下一条指令 fallthrough，`BRANCH` block 只记录直接
   目标，`BRANCHIND` / `RETURN` block 暂不记录 successor。
@@ -111,7 +112,8 @@ external/NotDec-bin2llvm/
   的汇总 JSON，`--functions-json` 打印 confirmed function 列表 JSON，`--blocks-json`
   打印 confirmed function 下的 basic block 列表 JSON，`--xrefs-json` 打印 xref 列表
   JSON，`--xrefs-from-json` / `--xrefs-to-json` 按地址查 xref，`--instructions-json`
-  打印 instruction 列表 JSON，`--plt-json` 打印 PLT stub、GOT slot 和外部符号名映射。
+  打印 instruction 列表 JSON，`--plt-json` 打印 `.plt.sec` / `.plt.got` stub、GOT slot
+  和外部符号名映射。
 - `tools/notdec-native-llvm.cpp`：native P-Code 到 LLVM IR 的入口。可以继续用
   `-a <address> -l <length>` 手工指定范围，也可以用 `-f <entry>`、`-n <name>` 或
   `--all-confirmed` 先跑 native discovery，从 confirmed function 取入口到保守 range end，
