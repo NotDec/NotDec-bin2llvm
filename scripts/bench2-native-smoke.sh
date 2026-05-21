@@ -184,6 +184,61 @@ require_summary_number() {
   fi
 }
 
+check_block_cfg() {
+  local name="$1"
+  local summary="$2"
+  local blocks="$3"
+
+  python3 - "$name" "$summary" "$blocks" <<'PY'
+import json
+import sys
+
+name, summary_path, blocks_path = sys.argv[1:]
+with open(summary_path, "r", encoding="utf-8") as handle:
+    summary = json.load(handle)
+with open(blocks_path, "r", encoding="utf-8") as handle:
+    blocks_root = json.load(handle)
+
+blocks = blocks_root.get("blocks", [])
+if blocks_root.get("count") != len(blocks):
+    raise SystemExit(
+        f"{name}: blocks-json count {blocks_root.get('count')} != {len(blocks)}"
+    )
+if summary.get("basic_blocks") != len(blocks):
+    raise SystemExit(
+        f"{name}: summary basic_blocks {summary.get('basic_blocks')} != {len(blocks)}"
+    )
+
+by_function = {}
+for block in blocks:
+    by_function.setdefault(block["function_entry"], []).append(block)
+
+for function_entry, function_blocks in by_function.items():
+    intervals = [
+        (int(block["start"], 16), int(block["end"], 16), block)
+        for block in function_blocks
+    ]
+    for index, (start, end, block) in enumerate(intervals):
+        if start >= end:
+            raise SystemExit(f"{name}: invalid block range {block}")
+        for other_start, other_end, other in intervals[index + 1 :]:
+            if max(start, other_start) < min(end, other_end):
+                raise SystemExit(
+                    f"{name}: overlapping blocks in {function_entry}: {block} {other}"
+                )
+
+    for block in function_blocks:
+        for successor_text in block.get("successors", []):
+            successor = int(successor_text, 16)
+            for start, end, owner in intervals:
+                if start < successor < end:
+                    raise SystemExit(
+                        f"{name}: successor {successor_text} from {block['start']} "
+                        f"points inside block {owner['start']}..{owner['end']}"
+                    )
+PY
+}
+
 parse_heritage_metric() {
   local file="$1"
   local label="$2"
@@ -319,7 +374,9 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_file "$target"
 
   summary="$OUT_DIR/$name.summary.json"
+  blocks="$OUT_DIR/$name.blocks.json"
   discover_stderr="$OUT_DIR/$name.discover.stderr"
+  blocks_stderr="$OUT_DIR/$name.blocks.stderr"
   ll="$OUT_DIR/$name.all-confirmed.ll"
   bc="$OUT_DIR/$name.all-confirmed.bc"
   opt_bc="$OUT_DIR/$name.all-confirmed.opt.bc"
@@ -339,6 +396,8 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_no_unresolved_indirect_calls "$summary" "$name"
   require_unresolved_indirect_branches_at_most "$summary" "$name" 0
   check_entry_sources "$name" "$summary"
+  "$DISCOVER" --blocks-json "$target" >"$blocks" 2>"$blocks_stderr"
+  check_block_cfg "$name" "$summary" "$blocks"
 
   "$NATIVE_LLVM" "$target" --all-confirmed -o "$ll" \
     >"$native_stdout" 2>"$native_stderr"

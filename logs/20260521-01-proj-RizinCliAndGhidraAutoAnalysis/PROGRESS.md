@@ -81,6 +81,7 @@
   - [x] 已补 Bench2 smoke 禁止当前三目标重新出现 `notdec_exit`，并检查 PLT0 resolver call。
   - [x] 已补 Bench2 smoke 的 `metrics.tsv` 汇总，记录函数、block、instruction、xref、unresolved 和耗时。
   - [x] 已补 Bench2 smoke 消费已有 heritage module，输出 `heritage-metrics.tsv` 和 `native-heritage-compare.tsv`。
+  - [x] 已补 Bench2 smoke 的 native block CFG 不变量检查：同函数 block 不重叠，successor 不指向同函数 block 内部。
 
 ## 记录规则
 
