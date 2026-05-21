@@ -3,6 +3,8 @@
 ## 当前状态
 
 - [ ] 阶段 1: State skeleton
+  - [x] 已补 confirmed function / basic block / xref 的内存态和查询接口。
+  - [ ] instruction 存储还未做。
 - [ ] 阶段 2: Entry discovery
 - [ ] 阶段 3: Recursive disassembly CFG
 - [ ] 阶段 4: CLI query

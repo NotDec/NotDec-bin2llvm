@@ -1190,6 +1190,27 @@ public:
       ++shownPltEntries;
     }
 
+    Output << "  confirmed functions:\n";
+    Output << "    total: " << state.functions().size() << '\n';
+    uint64_t blockCount = 0;
+    for (const auto &[entry, function] : state.functions()) {
+      (void)entry;
+      blockCount += function.Blocks.size();
+    }
+    Output << "    basic blocks: " << blockCount << '\n';
+
+    std::map<NativeXrefKind, uint64_t> xrefKindCounts;
+    for (const NativeXref &xref : state.xrefs()) {
+      ++xrefKindCounts[xref.Kind];
+    }
+    Output << "  xrefs:\n";
+    Output << "    total: " << state.xrefs().size() << '\n';
+    for (NativeXrefKind kind : {NativeXrefKind::Flow, NativeXrefKind::Call,
+                                NativeXrefKind::Data, NativeXrefKind::String}) {
+      Output << "    " << toString(kind) << ": " << xrefKindCounts[kind]
+             << '\n';
+    }
+
     const NativeEhFrameStats &ehFrame = state.ehFrameStats();
     Output << "  eh_frame:\n";
     Output << "    .eh_frame_hdr: " << (ehFrame.HasEhFrameHdr ? "yes" : "no")
@@ -1295,6 +1316,20 @@ std::string toString(NativeFunctionConfidence confidence) {
   return "unknown";
 }
 
+std::string toString(NativeXrefKind kind) {
+  switch (kind) {
+  case NativeXrefKind::Flow:
+    return "flow";
+  case NativeXrefKind::Call:
+    return "call";
+  case NativeXrefKind::Data:
+    return "data";
+  case NativeXrefKind::String:
+    return "string";
+  }
+  return "unknown";
+}
+
 NativeProgramState::NativeProgramState(const LIEF::ELF::Binary &binary)
     : Binary(binary), PointerSize(binary.ptr_size()) {
   for (const LIEF::ELF::Segment &segment : binary.segments()) {
@@ -1388,6 +1423,54 @@ NativeProgramState::lookupPltExternal(uint64_t address) const {
   return std::nullopt;
 }
 
+const NativeFunction *
+NativeProgramState::functionAt(uint64_t entry) const {
+  auto iterator = Functions.find(entry);
+  if (iterator == Functions.end()) {
+    return nullptr;
+  }
+  return &iterator->second;
+}
+
+const NativeFunction *
+NativeProgramState::functionContaining(uint64_t address) const {
+  for (const auto &[entry, function] : Functions) {
+    (void)entry;
+    if (function.RangeStart <= address && address < function.RangeEnd) {
+      return &function;
+    }
+  }
+  return nullptr;
+}
+
+std::vector<const NativeXref *>
+NativeProgramState::xrefsFrom(uint64_t address) const {
+  std::vector<const NativeXref *> result;
+  auto iterator = XrefsByFrom.find(address);
+  if (iterator == XrefsByFrom.end()) {
+    return result;
+  }
+  result.reserve(iterator->second.size());
+  for (size_t index : iterator->second) {
+    result.push_back(&Xrefs[index]);
+  }
+  return result;
+}
+
+std::vector<const NativeXref *>
+NativeProgramState::xrefsTo(uint64_t address) const {
+  std::vector<const NativeXref *> result;
+  auto iterator = XrefsByTo.find(address);
+  if (iterator == XrefsByTo.end()) {
+    return result;
+  }
+  result.reserve(iterator->second.size());
+  for (size_t index : iterator->second) {
+    result.push_back(&Xrefs[index]);
+  }
+  return result;
+}
+
 bool NativeProgramState::addFunctionSeed(uint64_t address, uint64_t size,
                                          std::string name, std::string source,
                                          NativeFunctionConfidence confidence) {
@@ -1442,6 +1525,60 @@ bool NativeProgramState::addFunctionSeed(uint64_t address, uint64_t size,
     seed.Sources.push_back(std::move(source));
   }
   return inserted;
+}
+
+bool NativeProgramState::addFunction(NativeFunction function) {
+  if (function.Entry == 0 || function.RangeStart >= function.RangeEnd) {
+    return false;
+  }
+  if (!isExecutableAddress(function.Entry)) {
+    Notes.push_back("confirmed function entry outside executable memory: " +
+                    hexAddress(function.Entry));
+    return false;
+  }
+  if (Functions.find(function.Entry) != Functions.end()) {
+    return false;
+  }
+
+  for (const NativeBasicBlock &block : function.Blocks) {
+    if (block.Start < function.RangeStart || block.End > function.RangeEnd ||
+        block.Start >= block.End) {
+      Notes.push_back("confirmed function has invalid block range at " +
+                      hexAddress(function.Entry));
+      return false;
+    }
+  }
+
+  Functions.emplace(function.Entry, std::move(function));
+  return true;
+}
+
+bool NativeProgramState::addBasicBlock(uint64_t functionEntry,
+                                       NativeBasicBlock block) {
+  auto iterator = Functions.find(functionEntry);
+  if (iterator == Functions.end() || block.Start >= block.End) {
+    return false;
+  }
+
+  NativeFunction &function = iterator->second;
+  if (block.Start < function.RangeStart || block.End > function.RangeEnd) {
+    Notes.push_back("basic block outside function range at " +
+                    hexAddress(functionEntry));
+    return false;
+  }
+  function.Blocks.push_back(std::move(block));
+  return true;
+}
+
+void NativeProgramState::addXref(NativeXref xref) {
+  if (xref.From == 0 || xref.To == 0) {
+    return;
+  }
+
+  size_t index = Xrefs.size();
+  Xrefs.push_back(std::move(xref));
+  XrefsByFrom[Xrefs[index].From].push_back(index);
+  XrefsByTo[Xrefs[index].To].push_back(index);
 }
 
 void NativeProgramState::addFunctionRange(uint64_t address, uint64_t start,

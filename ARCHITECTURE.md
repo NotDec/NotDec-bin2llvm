@@ -8,6 +8,28 @@
 
 Sleigh 相关代码仍在，但默认不开启，当前 Bench2 主要不走那条路径。
 
+## native discovery 状态骨架
+
+native 路线的共享分析状态在 `include/notdec-bin2llvm/NativeAnalysis.h` 和
+`lib/NativeAnalysis.cpp`。当前它先复刻 Ghidra Program 里最需要的几类事实，但不做
+Ghidra 那种完整数据库：
+
+1. `NativeFunctionSeed`：候选函数入口，来自 ELF entry、dynamic init/fini、
+   symbol、PLT、`.eh_frame`。
+2. `NativeFunction`：已经确认的函数。它和 seed 分开，避免还没 decode 就把候选入口当
+   成真实函数。
+3. `NativeBasicBlock`：函数内的最小 block 范围和 successor 地址。
+4. `NativeXref`：统一记录 flow/call/data/string 四类引用，支持 from/to 查询。
+
+`NativeProgramState` 现在提供：
+
+- `functionAt(...)`、`functionContaining(...)`
+- `xrefsFrom(...)`、`xrefsTo(...)`
+- `addFunction(...)`、`addBasicBlock(...)`、`addXref(...)`
+
+`notdec-native-discover` 的 report 会输出 confirmed function、basic block 和 xref
+数量。当前 recursive decode 还没接入，所以 Bench2 运行时这些数量仍可能是 0。
+
 ## 目录
 
 ```text

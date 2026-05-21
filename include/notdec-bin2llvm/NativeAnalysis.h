@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 #include <map>
@@ -116,6 +117,46 @@ struct NativePltEntry {
   std::string SymbolName;
 };
 
+enum class NativeXrefKind {
+  Flow,
+  Call,
+  Data,
+  String,
+};
+
+std::string toString(NativeXrefKind kind);
+
+// NativeBasicBlock is the smallest CFG unit shared by native analyzers.  It is
+// address based on purpose: recursive decode owns instruction details later,
+// while lowering and CLI queries mostly need stable block ranges and edges.
+struct NativeBasicBlock {
+  uint64_t Start = 0;
+  uint64_t End = 0;
+  std::vector<uint64_t> Successors;
+};
+
+// NativeFunction is separate from NativeFunctionSeed.  A seed says "try here";
+// a confirmed function says decode has accepted an entry and at least a
+// conservative body/range can be queried by later analyzers.
+struct NativeFunction {
+  uint64_t Entry = 0;
+  uint64_t RangeStart = 0;
+  uint64_t RangeEnd = 0;
+  std::string Name;
+  std::vector<NativeBasicBlock> Blocks;
+  std::string Source;
+};
+
+// NativeXref keeps only the common reference shape used by CFG, callgraph, and
+// CLI queries.  More detailed operand metadata can be added when decode starts
+// producing it; the indexes below only depend on from/to/kind.
+struct NativeXref {
+  uint64_t From = 0;
+  uint64_t To = 0;
+  NativeXrefKind Kind = NativeXrefKind::Flow;
+  std::string Source;
+};
+
 // NativeProgramState is the shared state for the native lifter's first
 // AutoAnalysis pass.  It is intentionally much smaller than Ghidra's Program:
 // the current goal is to let analyzers exchange memory, relocation, PLT,
@@ -147,15 +188,26 @@ public:
   const std::vector<NativePltEntry> &pltEntries() const { return PltEntries; }
   const NativeEhFrameStats &ehFrameStats() const { return EhFrameStats; }
   NativeEhFrameStats &ehFrameStats() { return EhFrameStats; }
+  const std::map<uint64_t, NativeFunction> &functions() const {
+    return Functions;
+  }
+  const std::vector<NativeXref> &xrefs() const { return Xrefs; }
   const std::vector<std::string> &notes() const { return Notes; }
 
   bool isExecutableAddress(uint64_t address) const;
   std::optional<uint64_t> readPointer(uint64_t address) const;
   std::optional<uint64_t> readRawPointer(uint64_t address) const;
   std::optional<std::string> lookupPltExternal(uint64_t address) const;
+  const NativeFunction *functionAt(uint64_t entry) const;
+  const NativeFunction *functionContaining(uint64_t address) const;
+  std::vector<const NativeXref *> xrefsFrom(uint64_t address) const;
+  std::vector<const NativeXref *> xrefsTo(uint64_t address) const;
 
   bool addFunctionSeed(uint64_t address, uint64_t size, std::string name,
                        std::string source, NativeFunctionConfidence confidence);
+  bool addFunction(NativeFunction function);
+  bool addBasicBlock(uint64_t functionEntry, NativeBasicBlock block);
+  void addXref(NativeXref xref);
   void addFunctionRange(uint64_t address, uint64_t start, uint64_t end,
                         std::string source);
   void addRelocation(NativeRelocationInfo relocation);
@@ -174,6 +226,10 @@ private:
   std::map<uint64_t, uint64_t> RelocatedPointers;
   std::vector<NativePltEntry> PltEntries;
   NativeEhFrameStats EhFrameStats;
+  std::map<uint64_t, NativeFunction> Functions;
+  std::vector<NativeXref> Xrefs;
+  std::map<uint64_t, std::vector<size_t>> XrefsByFrom;
+  std::map<uint64_t, std::vector<size_t>> XrefsByTo;
   std::vector<std::string> Notes;
 };
 
