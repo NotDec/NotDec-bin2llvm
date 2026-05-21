@@ -1,5 +1,6 @@
 #include "SleighBytes.h"
 #include "notdec-bin2llvm/LiefElfLoadImage.h"
+#include "notdec-bin2llvm/NativeAnalysis.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
 
@@ -17,6 +18,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -32,12 +34,13 @@ struct CliOptions {
   notdec::bin2llvm::SleighSpecOptions SpecOptions;
   uint64_t Address = 0;
   uint64_t Length = 0;
+  std::optional<uint64_t> FunctionEntry;
   std::string OutputPath;
 };
 
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0
-            << " <elf-file> [sla-file] -a <address> -l <length> "
+            << " <elf-file> [sla-file] (-a <address> -l <length> | -f <entry>) "
                "-o <output.ll> [-p root-sla-dir] [-s pspec-file]\n";
 }
 
@@ -52,7 +55,7 @@ bool parseUint64(const std::string &text, uint64_t &value) {
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
-  if (argc < 7) {
+  if (argc < 5) {
     return std::nullopt;
   }
 
@@ -79,6 +82,13 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
         return std::nullopt;
       }
       hasAddress = true;
+    } else if (flag == "-f") {
+      uint64_t entry = 0;
+      if (!parseUint64(value, entry)) {
+        std::cerr << "invalid function entry: " << value << '\n';
+        return std::nullopt;
+      }
+      options.FunctionEntry = entry;
     } else if (flag == "-l") {
       if (!parseUint64(value, options.Length) || options.Length == 0) {
         std::cerr << "invalid length: " << value << '\n';
@@ -97,11 +107,15 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
   }
 
-  if (!hasAddress) {
+  if (options.FunctionEntry && (hasAddress || hasLength)) {
+    std::cerr << "-f cannot be combined with -a or -l\n";
+    return std::nullopt;
+  }
+  if (!options.FunctionEntry && !hasAddress) {
     std::cerr << "missing -a <address>\n";
     return std::nullopt;
   }
-  if (!hasLength) {
+  if (!options.FunctionEntry && !hasLength) {
     std::cerr << "missing -l <length>\n";
     return std::nullopt;
   }
@@ -144,6 +158,45 @@ bool resolveSpecOptions(const LIEF::ELF::Binary &binary,
   return true;
 }
 
+std::string functionName(uint64_t entry) {
+  std::ostringstream stream;
+  stream << "notdec_native_" << std::hex << entry;
+  return stream.str();
+}
+
+bool resolveFunctionRange(const LIEF::ELF::Binary &binary, CliOptions &options) {
+  if (!options.FunctionEntry) {
+    return true;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(binary);
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createElfLoadAnalyzer());
+  manager.addAnalyzer(notdec::bin2llvm::createRelocationPltAnalyzer());
+  manager.addAnalyzer(notdec::bin2llvm::createElfEntryAnalyzer());
+  manager.addAnalyzer(notdec::bin2llvm::createElfSymbolAnalyzer());
+  manager.addAnalyzer(notdec::bin2llvm::createEhFrameAnalyzer());
+  manager.addAnalyzer(notdec::bin2llvm::createSleighSeedInstructionAnalyzer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeFunction *function =
+      state.functionAt(*options.FunctionEntry);
+  if (function == nullptr) {
+    std::cerr << "native discovery did not confirm function at 0x" << std::hex
+              << *options.FunctionEntry << std::dec << '\n';
+    return false;
+  }
+  if (function->RangeEnd <= function->Entry) {
+    std::cerr << "native function has empty range at 0x" << std::hex
+              << function->Entry << std::dec << '\n';
+    return false;
+  }
+
+  options.Address = function->Entry;
+  options.Length = function->RangeEnd - function->Entry;
+  return true;
+}
+
 int writeModule(const llvm::Module &module, const std::string &outputPath) {
   std::error_code errorCode;
   llvm::raw_fd_ostream output(outputPath, errorCode);
@@ -176,6 +229,9 @@ int main(int argc, char **argv) {
     if (!resolveSpecOptions(*binary, options->SpecOptions)) {
       return 1;
     }
+    if (!resolveFunctionRange(*binary, *options)) {
+      return 1;
+    }
 
     notdec::bin2llvm::LiefElfLoadImage loadImage(*binary, std::cerr);
     if (!loadImage.hasExecutableBytes()) {
@@ -191,6 +247,9 @@ int main(int argc, char **argv) {
 
     llvm::LLVMContext context;
     notdec::bin2llvm::PcodeLoweringConfig config;
+    if (options->FunctionEntry) {
+      config.EntryFunctionName = functionName(*options->FunctionEntry);
+    }
     std::string errorMessage;
     auto module = notdec::bin2llvm::buildPcodeModule(context, program, config,
                                                      errorMessage);
