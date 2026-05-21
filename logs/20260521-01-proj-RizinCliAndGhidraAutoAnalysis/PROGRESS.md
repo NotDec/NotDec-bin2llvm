@@ -72,6 +72,7 @@
   - [x] 已把当前三目标 unresolved indirect branch 基线收紧到 0。
   - [x] 已补 Bench2 smoke 禁止 direct `ram` 输入重新 lower 成 `freeze poison`。
   - [x] 已补 Bench2 smoke 禁止当前三目标重新出现 `notdec_exit`，并检查 PLT0 resolver call。
+  - [x] 已补 Bench2 smoke 的 `metrics.tsv` 汇总，记录函数、block、instruction、xref、unresolved 和耗时。
 
 ## 记录规则
 

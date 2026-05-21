@@ -122,6 +122,30 @@ forbid_ir_regex() {
   fi
 }
 
+summary_number_first() {
+  local file="$1"
+  local key="$2"
+  sed -n "s/.*\"$key\":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" |
+    head -n 1
+}
+
+summary_number_last() {
+  local file="$1"
+  local key="$2"
+  sed -n "s/.*\"$key\":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" |
+    tail -n 1
+}
+
+require_summary_number() {
+  local value="$1"
+  local file="$2"
+  local key="$3"
+  if [[ -z "$value" ]]; then
+    echo "missing summary metric $key in $file" >&2
+    exit 1
+  fi
+}
+
 check_ir_features() {
   local name="$1"
   local ll="$2"
@@ -202,6 +226,9 @@ TARGET_PATHS=(
 
 mkdir -p "$OUT_DIR"
 echo "out_dir=$OUT_DIR"
+METRICS="$OUT_DIR/metrics.tsv"
+printf 'target\telapsed_seconds\tconfirmed_functions\tbasic_blocks\tinstructions\txrefs_total\txrefs_flow\txrefs_call\txrefs_data\txrefs_string\tunresolved_total\tunresolved_indirect_call\tunresolved_indirect_branch\n' \
+  >"$METRICS"
 
 for index in "${!TARGET_NAMES[@]}"; do
   name="${TARGET_NAMES[$index]}"
@@ -289,6 +316,37 @@ for index in "${!TARGET_NAMES[@]}"; do
       "$name named-function CALLOTHER helper regression"
   fi
   finished_at="$(date +%s)"
+  elapsed_seconds=$((finished_at - started_at))
 
-  echo "$name ok elapsed=$((finished_at - started_at))s summary=$summary ll=$ll"
+  confirmed_functions="$(summary_number_first "$summary" "confirmed_functions")"
+  basic_blocks="$(summary_number_first "$summary" "basic_blocks")"
+  instructions="$(summary_number_first "$summary" "instructions")"
+  xrefs_total="$(summary_number_first "$summary" "total")"
+  xrefs_flow="$(summary_number_first "$summary" "flow")"
+  xrefs_call="$(summary_number_first "$summary" "call")"
+  xrefs_data="$(summary_number_first "$summary" "data")"
+  xrefs_string="$(summary_number_first "$summary" "string")"
+  unresolved_total="$(summary_number_last "$summary" "total")"
+  unresolved_indirect_call="$(summary_number_first "$summary" "indirect call")"
+  unresolved_indirect_branch="$(summary_number_first "$summary" "indirect branch")"
+
+  require_summary_number "$confirmed_functions" "$summary" "confirmed_functions"
+  require_summary_number "$basic_blocks" "$summary" "basic_blocks"
+  require_summary_number "$instructions" "$summary" "instructions"
+  require_summary_number "$xrefs_total" "$summary" "xrefs.total"
+  require_summary_number "$xrefs_flow" "$summary" "xrefs.flow"
+  require_summary_number "$xrefs_call" "$summary" "xrefs.call"
+  require_summary_number "$xrefs_data" "$summary" "xrefs.data"
+  require_summary_number "$xrefs_string" "$summary" "xrefs.string"
+  require_summary_number "$unresolved_total" "$summary" "unresolved_indirect_flows.total"
+  require_summary_number "$unresolved_indirect_call" "$summary" "unresolved_indirect_flows.indirect call"
+  require_summary_number "$unresolved_indirect_branch" "$summary" "unresolved_indirect_flows.indirect branch"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$name" "$elapsed_seconds" "$confirmed_functions" "$basic_blocks" \
+    "$instructions" "$xrefs_total" "$xrefs_flow" "$xrefs_call" \
+    "$xrefs_data" "$xrefs_string" "$unresolved_total" \
+    "$unresolved_indirect_call" "$unresolved_indirect_branch" >>"$METRICS"
+
+  echo "$name ok elapsed=${elapsed_seconds}s summary=$summary ll=$ll"
 done
