@@ -20,6 +20,7 @@
   - [x] 已补已知函数入口边界：direct branch 到其他 function seed 时不并入当前函数。
   - [ ] 尚未解析间接 branch/call 目标，也还没有完整函数边界判断。
 - [ ] 阶段 4: CLI query
+  - [x] 已补 `notdec-native-discover --summary-json` 最小 summary 输出。
 - [ ] 阶段 5: XRef enhancement
 - [ ] 阶段 6: Lowering integration
 - [ ] 阶段 7: Bench2 regression
