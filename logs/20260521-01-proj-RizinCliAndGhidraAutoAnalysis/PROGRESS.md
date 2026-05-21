@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-- [ ] 阶段 1: State skeleton
+- [x] 阶段 1: State skeleton
   - [x] 已补 confirmed function / basic block / xref 的内存态和查询接口。
   - [x] 已补 instruction 的内存态和查询接口。
 - [ ] 阶段 2: Entry discovery
