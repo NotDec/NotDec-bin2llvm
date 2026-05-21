@@ -111,6 +111,17 @@ forbid_ir_pattern() {
   fi
 }
 
+forbid_ir_regex() {
+  local file="$1"
+  local pattern="$2"
+  local description="$3"
+  if grep -Eq "$pattern" "$file"; then
+    echo "unexpected IR pattern for $description: $pattern" >&2
+    echo "  file: $file" >&2
+    exit 1
+  fi
+}
+
 check_ir_features() {
   local name="$1"
   local ll="$2"
@@ -160,6 +171,8 @@ check_ir_features() {
 
   forbid_ir_pattern "$ll" "__cxa_finalize_1" \
     "$name duplicate external symbol regression"
+  forbid_ir_regex "$ll" 'ram_[0-9a-f]+_[0-9]+_in = freeze' \
+    "$name direct RAM poison read regression"
 
   forbid_ir_pattern "$ll" "notdec_pcode_CALL_void" \
     "$name direct call helper regression"

@@ -295,6 +295,14 @@ private:
       return resize(it->second, varnode.Size);
     }
 
+    if (varnode.Space == "ram") {
+      auto *address = llvm::ConstantInt::get(intType(8), varnode.Offset);
+      auto *load = Builder.CreateLoad(type, memoryPointer(address),
+                                      valueName(varnode) + "_in");
+      load->setAlignment(llvm::Align(1));
+      return load;
+    }
+
     if (varnode.IsRegister && Registers != nullptr) {
       RegisterAccess access{varnode.Space, varnode.Offset, varnode.Size,
                             varnode.RegisterName};

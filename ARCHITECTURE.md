@@ -148,7 +148,8 @@ external/NotDec-bin2llvm/
   `llvm-as` 和 `opt -passes=verify` 验证；随后还会检查
   若干固定 IR pattern，确认最近补上的 direct call、PLT external call、GOT external
   indirect call / tail jump 没有退回 helper，并禁止最近清掉的 `CALL` / `CALLIND` /
-  `CALLOTHER` helper 回到 Bench2 smoke 输出。
+  `CALLOTHER` helper 回到 Bench2 smoke 输出；同时禁止 direct `ram` 输入重新 lower 成
+  `freeze poison`。
 - `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。
 - `include/notdec-bin2llvm/ModuleBuilder.h`、`lib/ModuleBuilder.cpp`、`tools/notdec-bin2llvm.cpp`：最早的 demo module 入口，只生成一个空函数。
 
@@ -328,7 +329,9 @@ notdec-heritage-module-llvm /tmp/module.json -o /tmp/module.ll
 
 读写 varnode 的基础函数：
 
-- `read(...)`：优先从 `Values` 取值；常量 varnode 生成 `ConstantInt`；未初始化 varnode 目前生成 `freeze poison` 并打印 warning。
+- `read(...)`：优先从 `Values` 取值；常量 varnode 生成 `ConstantInt`；direct `ram`
+  varnode 会通过现有 `@notdec_ram` 生成 load；其他未初始化 varnode 目前生成
+  `freeze poison` 并打印 warning。
 - `write(...)`：按 varnode size resize 后写回 `Values`。
 - `resize(...)`：用 zero extend 或 truncate 调整 integer bit width。
 
@@ -339,6 +342,8 @@ notdec-heritage-module-llvm /tmp/module.json -o /tmp/module.ll
 - `memoryGlobal()` 创建外部全局数组 `@notdec_ram`。
 - `memoryPointer(...)` 用地址对 `@notdec_ram` 做 GEP。
 - `lowerLoad(...)` 和 `lowerStore(...)` 只接受常量 address-space selector，按 1 字节对齐生成 load/store。
+- direct `ram` varnode 输入也复用 `memoryPointer(...)`，按 varnode size 从
+  `@notdec_ram` 生成 1 字节对齐的 load。
 
 调用：
 
@@ -491,6 +496,7 @@ notdec-native-llvm ...
 1. 源类型到 LLVM 类型的映射很粗，很多类型都落到整数。
 2. 外部函数和 call-site prototype 仍使用 vararg。
 3. `notdec_ram` 只是临时内存模型，还没表达真实 ELF section、stack object、GOT/PLT 和 relocation。
+   direct `ram` 输入已经会从这里 load，但内容仍由外部环境决定。
 4. 未初始化 varnode、部分 PHI incoming、间接跳转失败路径会使用 poison fallback。
 5. 部分 P-Code op 通过 helper call 保留，不是精确 lowering。
 6. 模块级 lowering 能隔离单函数失败，但失败函数只有 declaration，没有 body。
