@@ -19,6 +19,7 @@ namespace {
 enum class OutputMode {
   TextReport,
   SummaryJson,
+  MemoryJson,
   SeedsJson,
   FunctionsJson,
   BlocksJson,
@@ -46,6 +47,7 @@ struct CliOptions {
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0 << " <elf-file>\n";
   std::cerr << "       " << argv0 << " --summary-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --memory-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --seeds-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
@@ -156,6 +158,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
 
   if (mode == "--summary-json") {
     options.Mode = OutputMode::SummaryJson;
+  } else if (mode == "--memory-json") {
+    options.Mode = OutputMode::MemoryJson;
   } else if (mode == "--seeds-json") {
     options.Mode = OutputMode::SeedsJson;
   } else if (mode == "--functions-json") {
@@ -300,6 +304,54 @@ void printStringArray(std::ostream &output,
     output << "\"" << jsonEscape(values[index]) << "\"";
   }
   output << "]";
+}
+
+void printMemoryJson(std::ostream &output,
+                     const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"pointer_size\": " << static_cast<unsigned>(state.pointerSize())
+         << ",\n";
+  output << "  \"ranges\": [";
+  bool firstRange = true;
+  for (const notdec::bin2llvm::NativeMemoryRange &range :
+       state.memoryRanges()) {
+    output << (firstRange ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"start\": \"" << hexString(range.Start) << "\",\n";
+    output << "      \"end\": \"" << hexString(range.end()) << "\",\n";
+    output << "      \"size\": " << range.Size << ",\n";
+    output << "      \"loaded_size\": " << range.Bytes.size() << ",\n";
+    output << "      \"readable\": " << (range.Readable ? "true" : "false")
+           << ",\n";
+    output << "      \"writable\": " << (range.Writable ? "true" : "false")
+           << ",\n";
+    output << "      \"executable\": "
+           << (range.Executable ? "true" : "false") << "\n";
+    output << "    }";
+    firstRange = false;
+  }
+  output << (firstRange ? "],\n" : "\n  ],\n");
+
+  output << "  \"sections\": [";
+  bool firstSection = true;
+  for (const notdec::bin2llvm::NativeSectionInfo &section :
+       state.sections()) {
+    output << (firstSection ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"name\": \"" << jsonEscape(section.Name) << "\",\n";
+    output << "      \"address\": \"" << hexString(section.Address) << "\",\n";
+    output << "      \"end\": \"" << hexString(section.Address + section.Size)
+           << "\",\n";
+    output << "      \"size\": " << section.Size << ",\n";
+    output << "      \"executable\": "
+           << (section.Executable ? "true" : "false") << "\n";
+    output << "    }";
+    firstSection = false;
+  }
+  output << (firstSection ? "],\n" : "\n  ],\n");
+  output << "  \"ranges_count\": " << state.memoryRanges().size() << ",\n";
+  output << "  \"sections_count\": " << state.sections().size() << "\n";
+  output << "}\n";
 }
 
 void printSeedsJson(std::ostream &output,
@@ -633,6 +685,8 @@ int main(int argc, char **argv) {
     manager.run(state);
     if (options->Mode == OutputMode::SummaryJson) {
       printSummaryJson(std::cout, state);
+    } else if (options->Mode == OutputMode::MemoryJson) {
+      printMemoryJson(std::cout, state);
     } else if (options->Mode == OutputMode::SeedsJson) {
       printSeedsJson(std::cout, state);
     } else if (options->Mode == OutputMode::FunctionsJson) {
