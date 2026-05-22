@@ -87,7 +87,8 @@ instruction，`--instructions-function-json <entry>` 按 confirmed function 入�
   `sleigh-pcode-direct-string`；否则仍记为 `NativeXrefKind::Data`，来源是
   `sleigh-pcode-direct-data`。
 - `RelocationPltAnalyzer` 会把已应用的本地 relocated pointer 也写成 xref：relocation
-  slot 是 from，computed pointer 是 to。目标像只读 C 字符串时记 string，来源
+  slot 是 from，computed pointer 是 to。目标落在 executable memory 时记 flow，来源
+  `elf-relocation-code`；目标像只读 C 字符串时记 string，来源
   `elf-relocation-string`；其他落在已加载内存里的目标记 data，来源
   `elf-relocation-pointer`。它还会把 `.plt.sec` / legacy `.plt` 的 `JUMP_SLOT` stub 和
   `.plt.got` 里可从 `endbr64; jmp *rip+disp32` 机器码反查到外部 `GLOB_DAT` 的 thunk

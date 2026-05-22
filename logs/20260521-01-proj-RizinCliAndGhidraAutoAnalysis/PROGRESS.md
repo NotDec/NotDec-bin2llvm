@@ -61,6 +61,7 @@
   - [x] 已补 direct `ram` P-Code 数据访问到 `data` xref 的保守记录。
   - [x] 已补 direct `ram` 数据引用到只读 C 字符串时的 `string` xref 分类。
   - [x] 已补 ELF relocated pointer 到 `data` / `string` xref 的记录。
+  - [x] 已补 ELF relocated pointer 指向 executable address 时的 `flow` xref 分类。
   - [x] 已补 direct `CALL` 命中 PLT stub 时的 `sleigh-pcode-plt-call` xref 分类，并避免把 PLT 当内部函数 seed。
 - [ ] 阶段 6: Lowering integration
   - [x] 已补 `notdec-native-llvm -f <entry>`，按 native confirmed function 入口生成 LLVM IR。

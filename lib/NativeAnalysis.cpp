@@ -327,15 +327,20 @@ private:
       if (!isMappedAddress(state, target)) {
         continue;
       }
-      NativeXrefKind kind = looksLikeReadOnlyCString(state, target)
-                                ? NativeXrefKind::String
-                                : NativeXrefKind::Data;
+      NativeXrefKind kind = NativeXrefKind::Data;
+      const char *source = "elf-relocation-pointer";
+      if (state.isExecutableAddress(target)) {
+        kind = NativeXrefKind::Flow;
+        source = "elf-relocation-code";
+      } else if (looksLikeReadOnlyCString(state, target)) {
+        kind = NativeXrefKind::String;
+        source = "elf-relocation-string";
+      }
       NativeXref xref;
       xref.From = address;
       xref.To = target;
       xref.Kind = kind;
-      xref.Source = kind == NativeXrefKind::String ? "elf-relocation-string"
-                                                    : "elf-relocation-pointer";
+      xref.Source = source;
       if (!seenXrefs.insert({xref.From, xref.To, xref.Kind}).second) {
         continue;
       }
