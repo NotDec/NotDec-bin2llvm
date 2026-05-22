@@ -16,7 +16,7 @@
   - [x] 已补直接 `CALL` / `BRANCH` / `CBRANCH` 的 xref 和 block successor。
   - [x] 已补按控制流指令切分 block，并为条件跳转补 fallthrough successor。
   - [x] 已补 direct call 目标到 function seed / worklist 的桥接。
-  - [x] 已补本轮 bounded direct call seed 消费：初始 8 个 seed，同轮最多 decode 16 个 seed。
+  - [x] 已补本轮 bounded direct call seed 消费：初始 10 个 seed，同轮最多 decode 20 个 seed。
   - [x] 已补本轮 bounded direct branch successor 消费：branch target 作为同函数 block 入队。
   - [x] 已补已解码 direct branch target 对 basic block 起点的反向切分，并避免同函数 block 重叠。
   - [x] 已补 unresolved indirect flow 记录：`CALLIND` / `BRANCHIND` 进入 native state 和 report。

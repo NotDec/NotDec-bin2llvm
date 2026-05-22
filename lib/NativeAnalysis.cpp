@@ -1337,11 +1337,10 @@ public:
   }
 
 private:
-  // This analyzer is only a bounded smoke path for recursive decode.  Larger
-  // limits should come with CFG stop rules first, otherwise linear decode after
-  // branches can look more precise than it is.
-  static constexpr uint64_t MaxInitialSeeds = 8;
-  static constexpr uint64_t MaxSeeds = 16;
+  // This analyzer is only a bounded smoke path for recursive decode.  Keep the
+  // per-seed window narrow while allowing more known entry points to be tested.
+  static constexpr uint64_t MaxInitialSeeds = 10;
+  static constexpr uint64_t MaxSeeds = 20;
   static constexpr uint64_t MaxInstructionsPerSeed = 8;
   static constexpr uint64_t MaxBytesPerSeed = 64;
 

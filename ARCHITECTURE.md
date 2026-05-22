@@ -59,7 +59,7 @@ instruction，`--instructions-function-json <entry>` 按 confirmed function 入�
 
 - `lib/SleighLift.cpp::collectSleighInstructionSummaries(...)` 用
   `Sleigh::printAssembly(...)` 解码指令地址、长度和显示文本。
-- `lib/NativeAnalysis.cpp::SleighSeedInstructionAnalyzer` 先从 function worklist 取前 8 个
+- `lib/NativeAnalysis.cpp::SleighSeedInstructionAnalyzer` 先从 function worklist 取前 10 个
   seed 入本地队列。队列元素区分 function entry 和 block address，每个 block 最多解码
   8 条 / 64 字节，并写入 `NativeInstruction`。如果当前 function seed 已有 symbol size
   或 `.eh_frame` FDE 给出的 `[RangeStart, RangeEnd)`，decode 字节数还会被这个已知范围截断。
@@ -100,7 +100,7 @@ instruction，`--instructions-function-json <entry>` 按 confirmed function 入�
 - `CALLIND` / `BRANCHIND` 会写入 `NativeUnresolvedFlow`，report 按 indirect call / indirect
   branch 统计。这里不猜普通函数指针和跳表，只保留后续分析需要的样本。
 - direct `CALL` 的可执行目标会作为 `sleigh-direct-call` function seed 写入，并进入同一个本地
-  decode 队列。本轮总 decode 上限是 16 个 seed，已入队或已 decode 的地址不会重复处理。
+  decode 队列。本轮总 decode 上限是 20 个 seed，已入队或已 decode 的地址不会重复处理。
 - direct `BRANCH` / `CBRANCH` 的可执行 successor 会作为同一个 function entry 下的 block
   address 入队。追加 block 时，`NativeFunction` 的 decoded range 会随 block 扩展。
 - `NativeProgramState::functionContaining(...)` 按 `NativeFunction::Blocks` 判断地址归属，
