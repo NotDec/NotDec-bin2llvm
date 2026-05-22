@@ -29,6 +29,7 @@ enum class OutputMode {
   CfgJson,
   CfgDot,
   CallgraphJson,
+  CallgraphDot,
   XrefsJson,
   InstructionsJson,
   InstructionsRangeJson,
@@ -63,6 +64,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --cfg-json <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --cfg-dot <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --callgraph-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --callgraph-dot <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
   std::cerr << "       " << argv0
@@ -194,6 +196,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::BlocksJson;
   } else if (mode == "--callgraph-json") {
     options.Mode = OutputMode::CallgraphJson;
+  } else if (mode == "--callgraph-dot") {
+    options.Mode = OutputMode::CallgraphDot;
   } else if (mode == "--xrefs-json") {
     options.Mode = OutputMode::XrefsJson;
   } else if (mode == "--instructions-json") {
@@ -782,6 +786,55 @@ void printCallgraphJson(std::ostream &output,
   output << "}\n";
 }
 
+void printCallgraphDot(std::ostream &output,
+                       const notdec::bin2llvm::NativeProgramState &state) {
+  using namespace notdec::bin2llvm;
+
+  output << "digraph \"notdec_callgraph\" {\n";
+  output << "  graph [label=\"notdec callgraph\"];\n";
+  output << "  node [shape=box];\n";
+  for (const NativeXref &xref : state.xrefs()) {
+    if (xref.Kind != NativeXrefKind::Call) {
+      continue;
+    }
+
+    const NativeFunction *caller = state.functionContaining(xref.From);
+    const NativeFunction *callee = state.functionAt(xref.To);
+    std::optional<std::string> external =
+        lookupExternalCallTarget(state, xref.To);
+
+    std::string callerId =
+        caller != nullptr ? "func_" + hexString(caller->Entry)
+                          : "unknown_caller_" + hexString(xref.From);
+    std::string callerLabel =
+        caller != nullptr ? hexString(caller->Entry) + " " + caller->Name
+                          : "unknown caller " + hexString(xref.From);
+
+    std::string calleeId;
+    std::string calleeLabel;
+    if (callee != nullptr) {
+      calleeId = "func_" + hexString(callee->Entry);
+      calleeLabel = hexString(callee->Entry) + " " + callee->Name;
+    } else if (external) {
+      calleeId = "external_" + *external;
+      calleeLabel = "external " + *external;
+    } else {
+      calleeId = "unknown_target_" + hexString(xref.To);
+      calleeLabel = "unknown target " + hexString(xref.To);
+    }
+
+    output << "  \"" << dotEscape(callerId) << "\" [label=\""
+           << dotEscape(callerLabel) << "\"];\n";
+    output << "  \"" << dotEscape(calleeId) << "\" [label=\""
+           << dotEscape(calleeLabel) << "\"];\n";
+    output << "  \"" << dotEscape(callerId) << "\" -> \""
+           << dotEscape(calleeId) << "\" [label=\"callsite="
+           << dotEscape(hexString(xref.From)) << " source="
+           << dotEscape(xref.Source) << "\"];\n";
+  }
+  output << "}\n";
+}
+
 void printXrefObject(std::ostream &output,
                      const notdec::bin2llvm::NativeXref &xref,
                      const char *indent) {
@@ -1036,6 +1089,8 @@ int main(int argc, char **argv) {
       printCfgDot(std::cout, state, *options->QueryFunctionEntry);
     } else if (options->Mode == OutputMode::CallgraphJson) {
       printCallgraphJson(std::cout, state);
+    } else if (options->Mode == OutputMode::CallgraphDot) {
+      printCallgraphDot(std::cout, state);
     } else if (options->Mode == OutputMode::XrefsJson) {
       printXrefsJson(std::cout, state);
     } else if (options->Mode == OutputMode::InstructionsJson) {
