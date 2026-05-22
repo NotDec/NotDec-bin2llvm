@@ -37,6 +37,7 @@
   - [x] 已补 `notdec-native-discover --notes-json` 输出 native 分析提示列表。
   - [x] 已补 `notdec-native-discover --eh-frame-json` 输出 `.eh_frame` / `.eh_frame_hdr` 解析统计和 FDE 列表。
   - [x] 已补 `notdec-native-discover --seeds-json` 输出 function seed 列表。
+  - [x] 已补 `notdec-native-discover --function-json` 按 confirmed function 入口输出单函数摘要。
   - [x] 已补 `notdec-native-discover --functions-json` 最小 confirmed function 列表输出。
   - [x] 已补 `notdec-native-discover --blocks-json` 最小 basic block 列表输出。
   - [x] 已补 `notdec-native-discover --cfg-json` 按 confirmed function 入口输出单函数 CFG。

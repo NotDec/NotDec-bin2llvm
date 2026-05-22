@@ -24,6 +24,7 @@ enum class OutputMode {
   NotesJson,
   EhFrameJson,
   SeedsJson,
+  FunctionJson,
   FunctionsJson,
   BlocksJson,
   CfgJson,
@@ -60,6 +61,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --notes-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --eh-frame-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --seeds-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --function-json <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --cfg-json <entry> <elf-file>\n";
@@ -148,6 +150,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.Mode = OutputMode::XrefsKindJson;
     } else if (mode == "--instructions-function-json") {
       options.Mode = OutputMode::InstructionsFunctionJson;
+    } else if (mode == "--function-json") {
+      options.Mode = OutputMode::FunctionJson;
     } else if (mode == "--cfg-json") {
       options.Mode = OutputMode::CfgJson;
     } else if (mode == "--cfg-dot") {
@@ -168,6 +172,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       return std::nullopt;
     }
     if (options.Mode == OutputMode::InstructionsFunctionJson) {
+      options.QueryFunctionEntry = *address;
+    } else if (options.Mode == OutputMode::FunctionJson) {
       options.QueryFunctionEntry = *address;
     } else if (options.Mode == OutputMode::CfgJson) {
       options.QueryFunctionEntry = *address;
@@ -590,6 +596,52 @@ void printFunctionsJson(std::ostream &output,
   }
   output << (firstFunction ? "],\n" : "\n  ],\n");
   output << "  \"count\": " << state.functions().size() << "\n";
+  output << "}\n";
+}
+
+void printFunctionJson(std::ostream &output,
+                       const notdec::bin2llvm::NativeProgramState &state,
+                       uint64_t entry) {
+  using namespace notdec::bin2llvm;
+
+  const NativeFunction *function = state.functionAt(entry);
+  output << "{\n";
+  output << "  \"query\": \"" << hexString(entry) << "\",\n";
+  if (function == nullptr) {
+    output << "  \"found\": false\n";
+    output << "}\n";
+    return;
+  }
+
+  uint64_t outgoingXrefs = 0;
+  for (const NativeXref &xref : state.xrefs()) {
+    const NativeFunction *owner = state.functionContaining(xref.From);
+    if (owner != nullptr && owner->Entry == function->Entry) {
+      ++outgoingXrefs;
+    }
+  }
+  std::vector<const NativeInstruction *> instructions =
+      state.instructionsInRange(function->RangeStart, function->RangeEnd);
+  std::vector<const NativeXref *> incomingEntryXrefs =
+      state.xrefsTo(function->Entry);
+
+  output << "  \"found\": true,\n";
+  output << "  \"function\": {\n";
+  output << "    \"entry\": \"" << hexString(function->Entry) << "\",\n";
+  output << "    \"range_start\": \"" << hexString(function->RangeStart)
+         << "\",\n";
+  output << "    \"range_end\": \"" << hexString(function->RangeEnd)
+         << "\",\n";
+  output << "    \"size\": " << (function->RangeEnd - function->RangeStart)
+         << ",\n";
+  output << "    \"name\": \"" << jsonEscape(function->Name) << "\",\n";
+  output << "    \"source\": \"" << jsonEscape(function->Source) << "\",\n";
+  output << "    \"block_count\": " << function->Blocks.size() << ",\n";
+  output << "    \"instruction_count\": " << instructions.size() << ",\n";
+  output << "    \"outgoing_xref_count\": " << outgoingXrefs << ",\n";
+  output << "    \"incoming_entry_xref_count\": "
+         << incomingEntryXrefs.size() << "\n";
+  output << "  }\n";
   output << "}\n";
 }
 
@@ -1103,6 +1155,8 @@ int main(int argc, char **argv) {
       printEhFrameJson(std::cout, state);
     } else if (options->Mode == OutputMode::SeedsJson) {
       printSeedsJson(std::cout, state);
+    } else if (options->Mode == OutputMode::FunctionJson) {
+      printFunctionJson(std::cout, state, *options->QueryFunctionEntry);
     } else if (options->Mode == OutputMode::FunctionsJson) {
       printFunctionsJson(std::cout, state);
     } else if (options->Mode == OutputMode::BlocksJson) {
