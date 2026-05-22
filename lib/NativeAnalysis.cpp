@@ -1415,13 +1415,22 @@ private:
                                   std::set<std::pair<uint64_t, uint64_t>>
                                       &queuedSeeds) {
     uint64_t initialSeeds = 0;
-    for (const NativeFunctionWorkItem &item : state.functionWorklist()) {
-      if (initialSeeds == MaxInitialSeeds) {
-        break;
-      }
-      if (enqueueSeed(state, item.Address, item.Address, decodeQueue,
-                      queuedSeeds)) {
-        ++initialSeeds;
+    for (NativeFunctionConfidence confidence :
+         {NativeFunctionConfidence::High, NativeFunctionConfidence::Medium,
+          NativeFunctionConfidence::Low}) {
+      for (const NativeFunctionWorkItem &item : state.functionWorklist()) {
+        if (initialSeeds == MaxInitialSeeds) {
+          return;
+        }
+        auto seedIterator = state.functionSeeds().find(item.Address);
+        if (seedIterator == state.functionSeeds().end() ||
+            seedIterator->second.Confidence != confidence) {
+          continue;
+        }
+        if (enqueueSeed(state, item.Address, item.Address, decodeQueue,
+                        queuedSeeds)) {
+          ++initialSeeds;
+        }
       }
     }
   }
