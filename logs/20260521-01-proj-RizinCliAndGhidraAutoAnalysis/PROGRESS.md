@@ -103,6 +103,7 @@
   - [x] 已补 Bench2 smoke 的 function seed 边界检查：confirmed block 不覆盖其他非 Low seed 入口。
   - [x] 已补 Bench2 smoke 的 xref source baseline，检查 relocation code/data/string 分类。
   - [x] 已补 Bench2 smoke 的 `elf-relocation-code` function seed source baseline。
+  - [x] 已补 Bench2 smoke 的 seed confidence 计数一致性检查，并写入 `metrics.tsv`。
 
 ## 记录规则
 

@@ -184,6 +184,27 @@ require_summary_number() {
   fi
 }
 
+check_summary_confidence() {
+  local name="$1"
+  local summary="$2"
+  local seeds="$3"
+  local high="$4"
+  local medium="$5"
+  local low="$6"
+
+  require_summary_number "$seeds" "$summary" "function_seeds"
+  require_summary_number "$high" "$summary" "confidence.high"
+  require_summary_number "$medium" "$summary" "confidence.medium"
+  require_summary_number "$low" "$summary" "confidence.low"
+
+  # Confidence buckets are the smoke-visible partition of all function seeds.
+  if ((high + medium + low != seeds)); then
+    echo "$name: confidence counts do not sum to function_seeds in $summary" >&2
+    echo "  function_seeds=$seeds high=$high medium=$medium low=$low" >&2
+    exit 1
+  fi
+}
+
 check_block_cfg() {
   local name="$1"
   local summary="$2"
@@ -437,7 +458,7 @@ TARGET_PATHS=(
 mkdir -p "$OUT_DIR"
 echo "out_dir=$OUT_DIR"
 METRICS="$OUT_DIR/metrics.tsv"
-printf 'target\telapsed_seconds\tconfirmed_functions\tbasic_blocks\tinstructions\txrefs_total\txrefs_flow\txrefs_call\txrefs_data\txrefs_string\tunresolved_total\tunresolved_indirect_call\tunresolved_indirect_branch\n' \
+printf 'target\telapsed_seconds\tfunction_seeds\tseed_confidence_high\tseed_confidence_medium\tseed_confidence_low\tconfirmed_functions\tbasic_blocks\tinstructions\txrefs_total\txrefs_flow\txrefs_call\txrefs_data\txrefs_string\tunresolved_total\tunresolved_indirect_call\tunresolved_indirect_branch\n' \
   >"$METRICS"
 HERITAGE_METRICS="$OUT_DIR/heritage-metrics.tsv"
 printf 'target\theritage_available\tfunctions\texternals\tfailures\tdirect_calls\tresolved_internal_calls\tresolved_external_calls\tunknown_calls\n' \
@@ -547,6 +568,10 @@ for index in "${!TARGET_NAMES[@]}"; do
   finished_at="$(date +%s)"
   elapsed_seconds=$((finished_at - started_at))
 
+  function_seeds="$(summary_number_first "$summary" "function_seeds")"
+  seed_confidence_high="$(summary_number_first "$summary" "high")"
+  seed_confidence_medium="$(summary_number_first "$summary" "medium")"
+  seed_confidence_low="$(summary_number_first "$summary" "low")"
   confirmed_functions="$(summary_number_first "$summary" "confirmed_functions")"
   basic_blocks="$(summary_number_first "$summary" "basic_blocks")"
   instructions="$(summary_number_first "$summary" "instructions")"
@@ -559,6 +584,8 @@ for index in "${!TARGET_NAMES[@]}"; do
   unresolved_indirect_call="$(summary_number_first "$summary" "indirect call")"
   unresolved_indirect_branch="$(summary_number_first "$summary" "indirect branch")"
 
+  check_summary_confidence "$name" "$summary" "$function_seeds" \
+    "$seed_confidence_high" "$seed_confidence_medium" "$seed_confidence_low"
   require_summary_number "$confirmed_functions" "$summary" "confirmed_functions"
   require_summary_number "$basic_blocks" "$summary" "basic_blocks"
   require_summary_number "$instructions" "$summary" "instructions"
@@ -571,8 +598,10 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_summary_number "$unresolved_indirect_call" "$summary" "unresolved_indirect_flows.indirect call"
   require_summary_number "$unresolved_indirect_branch" "$summary" "unresolved_indirect_flows.indirect branch"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$name" "$elapsed_seconds" "$confirmed_functions" "$basic_blocks" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$name" "$elapsed_seconds" "$function_seeds" \
+    "$seed_confidence_high" "$seed_confidence_medium" \
+    "$seed_confidence_low" "$confirmed_functions" "$basic_blocks" \
     "$instructions" "$xrefs_total" "$xrefs_flow" "$xrefs_call" \
     "$xrefs_data" "$xrefs_string" "$unresolved_total" \
     "$unresolved_indirect_call" "$unresolved_indirect_branch" >>"$METRICS"
