@@ -404,6 +404,7 @@ check_entry_sources() {
   require_summary_source "$summary" "$name" "dt-init-array"
   require_summary_source "$summary" "$name" "dt-fini-array"
   require_summary_source "$summary" "$name" "eh-frame"
+  require_summary_source "$summary" "$name" "elf-relocation-code"
 
   case "$name" in
   libuv)

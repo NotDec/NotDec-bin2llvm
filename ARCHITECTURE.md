@@ -181,7 +181,7 @@ external/NotDec-bin2llvm/
   native discovery 至少产出 confirmed function，且当前三目标不再保留 unresolved indirect
   call / branch；它还会检查入口 source baseline：可执行文件需要有 `elf-entry`，shared
   object `libuv` 不能有 `elf-entry`，并且三目标都要有 dynamic init/fini、init/fini array
-  和 `.eh_frame` 来源。它还会用 `--blocks-json` 检查同函数 block 不重叠，并禁止
+  和 `.eh_frame` 来源，也要求存在 `elf-relocation-code` seed source。它还会用 `--blocks-json` 检查同函数 block 不重叠，并禁止
   successor 指向同函数已知 block 的内部；再结合 `--seeds-json` 检查 confirmed block
   不覆盖其他已知 function seed 入口；用 `--xrefs-json` 检查 relocation code/data/string
   xref source baseline。然后再用 `notdec-native-llvm --all-confirmed`

@@ -99,6 +99,7 @@
   - [x] 已补 Bench2 smoke 的 native block CFG 不变量检查：同函数 block 不重叠，successor 不指向同函数 block 内部。
   - [x] 已补 Bench2 smoke 的 function seed 边界检查：confirmed block 不覆盖其他已知 seed 入口。
   - [x] 已补 Bench2 smoke 的 xref source baseline，检查 relocation code/data/string 分类。
+  - [x] 已补 Bench2 smoke 的 `elf-relocation-code` function seed source baseline。
 
 ## 记录规则
 
