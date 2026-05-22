@@ -38,6 +38,7 @@ function、basic block、instruction、xref 和 unresolved indirect flow 数量�
 包含地址范围、权限和 loaded size。`--relocations-json` 输出 native relocation 表，
 包含类型、符号、状态和已计算值。`--notes-json` 输出 native 分析过程里的非致命提示。
 `--eh-frame-json` 输出 `.eh_frame` / `.eh_frame_hdr` 解析统计、FDE 列表和 hdr 表。
+`--callgraph-json` 输出 callsite、caller、callee kind 和 external symbol 名字。
 `--seeds-json` 输出 function seed 列表，包含地址、名字、
 alias、来源、confidence 和保守 range，方便解释入口发现来源。`--functions-json` 输出已确认函数列表，
 包含入口、保守范围、名字、来源和 block 数。`--blocks-json` 输出已确认函数里的 basic
@@ -133,6 +134,7 @@ external/NotDec-bin2llvm/
   的汇总 JSON，`--memory-json` 打印 load range 和 section 布局 JSON，
   `--relocations-json` 打印 relocation 表 JSON，`--notes-json` 打印 native 分析提示 JSON，
   `--eh-frame-json` 打印 `.eh_frame` / `.eh_frame_hdr` 解析统计和 FDE 列表 JSON，
+  `--callgraph-json` 打印 callgraph JSON，基于 call xref、confirmed function、PLT 和 external relocation 目标，
   `--seeds-json` 打印 function seed 列表 JSON，
   包含地址、range、name、alias、来源和 confidence，
   `--functions-json` 打印 confirmed function 列表 JSON，`--blocks-json` 打印 confirmed function 下的 basic block 列表 JSON，

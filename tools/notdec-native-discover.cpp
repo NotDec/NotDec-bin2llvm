@@ -26,6 +26,7 @@ enum class OutputMode {
   SeedsJson,
   FunctionsJson,
   BlocksJson,
+  CallgraphJson,
   XrefsJson,
   InstructionsJson,
   InstructionsRangeJson,
@@ -57,6 +58,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --seeds-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --callgraph-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
   std::cerr << "       " << argv0
@@ -178,6 +180,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::FunctionsJson;
   } else if (mode == "--blocks-json") {
     options.Mode = OutputMode::BlocksJson;
+  } else if (mode == "--callgraph-json") {
+    options.Mode = OutputMode::CallgraphJson;
   } else if (mode == "--xrefs-json") {
     options.Mode = OutputMode::XrefsJson;
   } else if (mode == "--instructions-json") {
@@ -583,6 +587,86 @@ void printBlocksJson(std::ostream &output,
   output << "}\n";
 }
 
+std::optional<std::string>
+lookupExternalCallTarget(const notdec::bin2llvm::NativeProgramState &state,
+                         uint64_t address) {
+  if (std::optional<std::string> symbol = state.lookupPltExternal(address)) {
+    return symbol;
+  }
+  for (const notdec::bin2llvm::NativePltEntry &entry : state.pltEntries()) {
+    if (entry.GotAddress == address) {
+      return entry.SymbolName;
+    }
+  }
+  for (const notdec::bin2llvm::NativeRelocationInfo &relocation :
+       state.relocations()) {
+    if (relocation.Address == address && relocation.Status == "external" &&
+        !relocation.SymbolName.empty()) {
+      return relocation.SymbolName;
+    }
+  }
+  return std::nullopt;
+}
+
+void printCallgraphJson(std::ostream &output,
+                        const notdec::bin2llvm::NativeProgramState &state) {
+  using namespace notdec::bin2llvm;
+
+  output << "{\n";
+  output << "  \"edges\": [";
+  bool firstEdge = true;
+  uint64_t count = 0;
+  for (const NativeXref &xref : state.xrefs()) {
+    if (xref.Kind != NativeXrefKind::Call) {
+      continue;
+    }
+
+    const NativeFunction *caller = state.functionContaining(xref.From);
+    const NativeFunction *callee = state.functionAt(xref.To);
+    std::optional<std::string> external =
+        lookupExternalCallTarget(state, xref.To);
+
+    output << (firstEdge ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"callsite\": \"" << hexString(xref.From) << "\",\n";
+    output << "      \"target\": \"" << hexString(xref.To) << "\",\n";
+    output << "      \"source\": \"" << jsonEscape(xref.Source) << "\",\n";
+    output << "      \"caller_found\": " << (caller != nullptr ? "true" : "false")
+           << ",\n";
+    output << "      \"caller_entry\": ";
+    if (caller != nullptr) {
+      output << "\"" << hexString(caller->Entry) << "\"";
+    } else {
+      output << "null";
+    }
+    output << ",\n";
+    output << "      \"caller_name\": \""
+           << jsonEscape(caller != nullptr ? caller->Name : "") << "\",\n";
+    if (callee != nullptr) {
+      output << "      \"callee_kind\": \"internal\",\n";
+      output << "      \"callee_entry\": \"" << hexString(callee->Entry)
+             << "\",\n";
+      output << "      \"callee_name\": \"" << jsonEscape(callee->Name)
+             << "\"\n";
+    } else if (external) {
+      output << "      \"callee_kind\": \"external\",\n";
+      output << "      \"callee_entry\": null,\n";
+      output << "      \"callee_name\": \"" << jsonEscape(*external)
+             << "\"\n";
+    } else {
+      output << "      \"callee_kind\": \"unknown\",\n";
+      output << "      \"callee_entry\": null,\n";
+      output << "      \"callee_name\": \"\"\n";
+    }
+    output << "    }";
+    firstEdge = false;
+    ++count;
+  }
+  output << (firstEdge ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << count << "\n";
+  output << "}\n";
+}
+
 void printXrefObject(std::ostream &output,
                      const notdec::bin2llvm::NativeXref &xref,
                      const char *indent) {
@@ -831,6 +915,8 @@ int main(int argc, char **argv) {
       printFunctionsJson(std::cout, state);
     } else if (options->Mode == OutputMode::BlocksJson) {
       printBlocksJson(std::cout, state);
+    } else if (options->Mode == OutputMode::CallgraphJson) {
+      printCallgraphJson(std::cout, state);
     } else if (options->Mode == OutputMode::XrefsJson) {
       printXrefsJson(std::cout, state);
     } else if (options->Mode == OutputMode::InstructionsJson) {
