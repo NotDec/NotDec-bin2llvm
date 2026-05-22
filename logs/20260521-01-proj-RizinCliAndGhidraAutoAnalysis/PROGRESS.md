@@ -10,6 +10,7 @@
   - [x] 已补 `.dynsym` 已定义函数符号的 seed 来源。
   - [x] 已补 Bench2 smoke 的入口 source baseline，覆盖 dynamic init/fini、init/fini array、`.eh_frame`、executable `elf-entry` 和 shared object 无 `elf-entry`。
   - [x] 已补 function seed JSON 查询，能直接查看入口地址、range、名字、alias、来源和 confidence。
+  - [x] 已补 relocated pointer 指向 executable address 时的低可信 function seed 来源。
 - [ ] 阶段 3: Recursive disassembly CFG
   - [x] 已补从 function worklist 到 `NativeInstruction` 的最小 Sleigh 线性解码。
   - [x] 已补已解码 seed 到 confirmed function / 单 basic block 的保守落地。

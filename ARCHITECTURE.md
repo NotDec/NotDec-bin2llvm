@@ -15,7 +15,7 @@ native 路线的共享分析状态在 `include/notdec-bin2llvm/NativeAnalysis.h`
 Ghidra 那种完整数据库：
 
 1. `NativeFunctionSeed`：候选函数入口，来自 ELF entry、dynamic init/fini、
-   static symbol、dynamic symbol、PLT、`.eh_frame`。
+   static symbol、dynamic symbol、PLT、`.eh_frame` 和 executable relocation target。
 2. `NativeFunctionWorkItem`：待递归 decode 的函数入口。新 seed 首次插入时进入这个队列。
 3. `NativeFunction`：已经确认的函数。它和 seed 分开，避免还没 decode 就把候选入口当
    成真实函数。
@@ -64,6 +64,8 @@ instruction，`--instructions-function-json <entry>` 按 confirmed function 入�
   8 条 / 64 字节，并写入 `NativeInstruction`。如果当前 function seed 已有 symbol size
   或 `.eh_frame` FDE 给出的 `[RangeStart, RangeEnd)`，decode 字节数还会被这个已知范围截断。
   没有 range 的 seed 会被后续最近的已知 function seed 入口截断，避免线性 decode 跨到下一个函数。
+- analyzer 开始前会把 relocated pointer 里指向 executable memory 的 target 追加成低可信
+  `elf-relocation-code` function seed。它不提供 range，只作为后续受控 decode 的候选入口。
 - 如果某个 seed 成功解码出指令，它会被保守写成一个 `NativeFunction`，并带一个覆盖已解码
   指令前缀的 `NativeBasicBlock`。
 - `lib/SleighLift.cpp::collectSleighInstructionDecode(...)` 在同一次 Sleigh 初始化里收集指令摘要

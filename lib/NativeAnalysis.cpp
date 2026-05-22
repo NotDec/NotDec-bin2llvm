@@ -1309,6 +1309,8 @@ public:
       return;
     }
 
+    addRelocationCodeSeeds(state);
+
     std::deque<DecodeQueueItem> decodeQueue;
     std::set<std::pair<uint64_t, uint64_t>> queuedSeeds;
     std::set<std::pair<uint64_t, uint64_t>> decodedSeeds;
@@ -1371,6 +1373,17 @@ private:
 
   std::ostringstream NullErrors;
   SleighSpecOptions SpecOptions;
+
+  static void addRelocationCodeSeeds(NativeProgramState &state) {
+    for (const auto &[slot, target] : state.relocatedPointers()) {
+      (void)slot;
+      if (!state.isExecutableAddress(target)) {
+        continue;
+      }
+      state.addFunctionSeed(target, 0, "", "elf-relocation-code",
+                            NativeFunctionConfidence::Low);
+    }
+  }
 
   bool resolveSpecOptions(NativeProgramState &state) {
     const LIEF::ELF::Binary &binary = state.binary();
