@@ -303,6 +303,44 @@ for block in blocks_root.get("blocks", []):
 PY
 }
 
+check_seed_confidence_summary() {
+  local name="$1"
+  local summary="$2"
+  local seeds="$3"
+
+  python3 - "$name" "$summary" "$seeds" <<'PY'
+import collections
+import json
+import sys
+
+name, summary_path, seeds_path = sys.argv[1:]
+with open(summary_path, "r", encoding="utf-8") as handle:
+    summary = json.load(handle)
+with open(seeds_path, "r", encoding="utf-8") as handle:
+    seeds_root = json.load(handle)
+
+seeds = seeds_root.get("seeds", [])
+if seeds_root.get("count") != len(seeds):
+    raise SystemExit(
+        f"{name}: seeds-json count {seeds_root.get('count')} != {len(seeds)}"
+    )
+if summary.get("function_seeds") != len(seeds):
+    raise SystemExit(
+        f"{name}: summary function_seeds {summary.get('function_seeds')} != {len(seeds)}"
+    )
+
+counts = collections.Counter(seed.get("confidence") for seed in seeds)
+summary_confidence = summary.get("confidence", {})
+for confidence in ("high", "medium", "low"):
+    summary_count = summary_confidence.get(confidence)
+    if summary_count != counts[confidence]:
+        raise SystemExit(
+            f"{name}: summary confidence {confidence}={summary_count} "
+            f"!= seeds-json {counts[confidence]}"
+        )
+PY
+}
+
 check_xref_sources() {
   local name="$1"
   local xrefs="$2"
@@ -503,6 +541,7 @@ for index in "${!TARGET_NAMES[@]}"; do
   "$DISCOVER" --blocks-json "$target" >"$blocks" 2>"$blocks_stderr"
   check_block_cfg "$name" "$summary" "$blocks"
   check_seed_boundaries "$name" "$seeds" "$blocks"
+  check_seed_confidence_summary "$name" "$summary" "$seeds"
   "$DISCOVER" --xrefs-json "$target" >"$xrefs" 2>"$xrefs_stderr"
   check_xref_sources "$name" "$xrefs"
 

@@ -104,6 +104,7 @@
   - [x] 已补 Bench2 smoke 的 xref source baseline，检查 relocation code/data/string 分类。
   - [x] 已补 Bench2 smoke 的 `elf-relocation-code` function seed source baseline。
   - [x] 已补 Bench2 smoke 的 seed confidence 计数一致性检查，并写入 `metrics.tsv`。
+  - [x] 已补 Bench2 smoke 对 `--summary-json` 和 `--seeds-json` 的 seed confidence 交叉检查。
 
 ## 记录规则
 

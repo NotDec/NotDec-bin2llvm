@@ -186,7 +186,7 @@ external/NotDec-bin2llvm/
   和 `.eh_frame` 来源，也要求存在 `elf-relocation-code` seed source，并检查 seed confidence
   计数之和等于 `function_seeds`。它还会用 `--blocks-json` 检查同函数 block 不重叠，并禁止
   successor 指向同函数已知 block 的内部；再结合 `--seeds-json` 检查 confirmed block
-  不覆盖其他非 Low confidence function seed 入口；用 `--xrefs-json` 检查 relocation code/data/string
+  不覆盖其他非 Low confidence function seed 入口，并确认 summary confidence 计数和 seed 列表一致；用 `--xrefs-json` 检查 relocation code/data/string
   xref source baseline。然后再用 `notdec-native-llvm --all-confirmed`
   生成 IR，并用本地 LLVM 22 的 `llvm-as` 和 `opt -passes=verify` 验证；输出目录会生成
   `metrics.tsv`，汇总每个目标的
