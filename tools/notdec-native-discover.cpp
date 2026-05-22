@@ -28,6 +28,7 @@ enum class OutputMode {
   FunctionXrefsJson,
   FunctionsJson,
   BlocksJson,
+  BlockJson,
   CfgJson,
   CfgDot,
   CallgraphJson,
@@ -67,6 +68,7 @@ void printUsage(const char *argv0) {
             << " --function-xrefs-json <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --block-json <start> <elf-file>\n";
   std::cerr << "       " << argv0 << " --cfg-json <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --cfg-dot <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --callgraph-json <elf-file>\n";
@@ -157,6 +159,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.Mode = OutputMode::FunctionJson;
     } else if (mode == "--function-xrefs-json") {
       options.Mode = OutputMode::FunctionXrefsJson;
+    } else if (mode == "--block-json") {
+      options.Mode = OutputMode::BlockJson;
     } else if (mode == "--cfg-json") {
       options.Mode = OutputMode::CfgJson;
     } else if (mode == "--cfg-dot") {
@@ -186,6 +190,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.QueryFunctionEntry = *address;
     } else if (options.Mode == OutputMode::CfgDot) {
       options.QueryFunctionEntry = *address;
+    } else if (options.Mode == OutputMode::BlockJson) {
+      options.QueryAddress = *address;
     } else {
       options.QueryAddress = *address;
     }
@@ -686,6 +692,67 @@ void printBlocksJson(std::ostream &output,
   }
   output << (firstBlock ? "],\n" : "\n  ],\n");
   output << "  \"count\": " << blockCount << "\n";
+  output << "}\n";
+}
+
+void printInstructionObject(
+    std::ostream &output,
+    const notdec::bin2llvm::NativeInstruction &instruction,
+    const char *indent);
+
+void printBlockJson(std::ostream &output,
+                    const notdec::bin2llvm::NativeProgramState &state,
+                    uint64_t start) {
+  const notdec::bin2llvm::NativeFunction *matchedFunction = nullptr;
+  const notdec::bin2llvm::NativeBasicBlock *matchedBlock = nullptr;
+  for (const auto &[entry, function] : state.functions()) {
+    (void)entry;
+    for (const notdec::bin2llvm::NativeBasicBlock &block : function.Blocks) {
+      if (block.Start == start) {
+        matchedFunction = &function;
+        matchedBlock = &block;
+        break;
+      }
+    }
+    if (matchedBlock != nullptr) {
+      break;
+    }
+  }
+
+  std::vector<const notdec::bin2llvm::NativeInstruction *> instructions;
+  output << "{\n";
+  output << "  \"query\": \"" << hexString(start) << "\",\n";
+  if (matchedBlock == nullptr) {
+    output << "  \"found\": false,\n";
+    output << "  \"instructions\": [],\n";
+    output << "  \"instruction_count\": 0\n";
+    output << "}\n";
+    return;
+  }
+
+  instructions =
+      state.instructionsInRange(matchedBlock->Start, matchedBlock->End);
+  output << "  \"found\": true,\n";
+  output << "  \"function_entry\": \"" << hexString(matchedFunction->Entry)
+         << "\",\n";
+  output << "  \"block\": {\n";
+  output << "    \"start\": \"" << hexString(matchedBlock->Start) << "\",\n";
+  output << "    \"end\": \"" << hexString(matchedBlock->End) << "\",\n";
+  output << "    \"size\": " << (matchedBlock->End - matchedBlock->Start)
+         << ",\n";
+  output << "    \"successors\": ";
+  printAddressArray(output, matchedBlock->Successors);
+  output << "\n";
+  output << "  },\n";
+  output << "  \"instructions\": [";
+  bool firstInstruction = true;
+  for (const notdec::bin2llvm::NativeInstruction *instruction : instructions) {
+    output << (firstInstruction ? "\n" : ",\n");
+    printInstructionObject(output, *instruction, "    ");
+    firstInstruction = false;
+  }
+  output << (firstInstruction ? "],\n" : "\n  ],\n");
+  output << "  \"instruction_count\": " << instructions.size() << "\n";
   output << "}\n";
 }
 
@@ -1220,6 +1287,8 @@ int main(int argc, char **argv) {
       printFunctionsJson(std::cout, state);
     } else if (options->Mode == OutputMode::BlocksJson) {
       printBlocksJson(std::cout, state);
+    } else if (options->Mode == OutputMode::BlockJson) {
+      printBlockJson(std::cout, state, *options->QueryAddress);
     } else if (options->Mode == OutputMode::CfgJson) {
       printCfgJson(std::cout, state, *options->QueryFunctionEntry);
     } else if (options->Mode == OutputMode::CfgDot) {

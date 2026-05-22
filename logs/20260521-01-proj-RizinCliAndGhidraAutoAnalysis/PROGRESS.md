@@ -41,6 +41,7 @@
   - [x] 已补 `notdec-native-discover --function-xrefs-json` 按 confirmed function 入口输出单函数引用。
   - [x] 已补 `notdec-native-discover --functions-json` 最小 confirmed function 列表输出。
   - [x] 已补 `notdec-native-discover --blocks-json` 最小 basic block 列表输出。
+  - [x] 已补 `notdec-native-discover --block-json` 按 confirmed basic block 起点查单 block 和指令。
   - [x] 已补 `notdec-native-discover --cfg-json` 按 confirmed function 入口输出单函数 CFG。
   - [x] 已补 `notdec-native-discover --cfg-dot` 按 confirmed function 入口输出单函数 CFG DOT。
   - [x] 已补 `notdec-native-discover --callgraph-json` 输出 callsite 粒度调用图。
