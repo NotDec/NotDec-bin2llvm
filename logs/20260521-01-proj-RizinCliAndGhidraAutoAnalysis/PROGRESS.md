@@ -44,6 +44,7 @@
   - [x] 已补 `notdec-native-discover --callgraph-json` 输出 callsite 粒度调用图。
   - [x] 已补 `notdec-native-discover --callgraph-dot` 输出 callsite 粒度调用图 DOT。
   - [x] 已补 `notdec-native-discover --xrefs-json` 最小 xref 列表输出。
+  - [x] 已补 `notdec-native-discover --xrefs-dot` 输出全量 xref DOT。
   - [x] 已补 `notdec-native-discover --xrefs-kind-json` 按 flow/call/data/string 过滤 xref。
   - [x] 已补 `notdec-native-discover --xrefs-from-json` / `--xrefs-to-json` 按地址查 xref。
   - [x] 已补 `notdec-native-discover --instructions-json` 最小 instruction 列表输出。

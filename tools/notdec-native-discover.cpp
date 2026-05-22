@@ -31,6 +31,7 @@ enum class OutputMode {
   CallgraphJson,
   CallgraphDot,
   XrefsJson,
+  XrefsDot,
   InstructionsJson,
   InstructionsRangeJson,
   InstructionsFunctionJson,
@@ -66,6 +67,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --callgraph-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --callgraph-dot <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --xrefs-dot <elf-file>\n";
   std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
   std::cerr << "       " << argv0
             << " --instructions-range-json <start> <end> <elf-file>\n";
@@ -200,6 +202,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::CallgraphDot;
   } else if (mode == "--xrefs-json") {
     options.Mode = OutputMode::XrefsJson;
+  } else if (mode == "--xrefs-dot") {
+    options.Mode = OutputMode::XrefsDot;
   } else if (mode == "--instructions-json") {
     options.Mode = OutputMode::InstructionsJson;
   } else if (mode == "--plt-json") {
@@ -863,6 +867,26 @@ void printXrefsJson(std::ostream &output,
   output << "}\n";
 }
 
+void printXrefsDot(std::ostream &output,
+                   const notdec::bin2llvm::NativeProgramState &state) {
+  output << "digraph \"notdec_xrefs\" {\n";
+  output << "  graph [label=\"notdec xrefs\"];\n";
+  output << "  node [shape=box];\n";
+  for (const notdec::bin2llvm::NativeXref &xref : state.xrefs()) {
+    std::string from = hexString(xref.From);
+    std::string to = hexString(xref.To);
+    output << "  \"" << dotEscape(from) << "\" [label=\""
+           << dotEscape(from) << "\"];\n";
+    output << "  \"" << dotEscape(to) << "\" [label=\"" << dotEscape(to)
+           << "\"];\n";
+    output << "  \"" << dotEscape(from) << "\" -> \"" << dotEscape(to)
+           << "\" [label=\"kind="
+           << dotEscape(notdec::bin2llvm::toString(xref.Kind)) << " source="
+           << dotEscape(xref.Source) << "\"];\n";
+  }
+  output << "}\n";
+}
+
 void printXrefsKindJson(std::ostream &output,
                         const notdec::bin2llvm::NativeProgramState &state,
                         notdec::bin2llvm::NativeXrefKind kind) {
@@ -1093,6 +1117,8 @@ int main(int argc, char **argv) {
       printCallgraphDot(std::cout, state);
     } else if (options->Mode == OutputMode::XrefsJson) {
       printXrefsJson(std::cout, state);
+    } else if (options->Mode == OutputMode::XrefsDot) {
+      printXrefsDot(std::cout, state);
     } else if (options->Mode == OutputMode::InstructionsJson) {
       printInstructionsJson(std::cout, state);
     } else if (options->Mode == OutputMode::InstructionsRangeJson) {

@@ -45,7 +45,8 @@ alias、来源、confidence 和保守 range，方便解释入口发现来源。`
 包含入口、保守范围、名字、来源和 block 数。`--blocks-json` 输出已确认函数里的 basic
 block 起止地址、大小和 successor。`--cfg-json <entry>` 按 confirmed function 入口输出单函数 CFG，
 `--cfg-dot <entry>` 输出同一份 CFG 的 Graphviz DOT。
-`--xrefs-json` 输出当前 xref 列表，`--xrefs-kind-json <kind>` 按 flow、call、data、
+`--xrefs-json` 输出当前 xref 列表，`--xrefs-dot` 输出同一批 xref 的 Graphviz DOT，
+`--xrefs-kind-json <kind>` 按 flow、call、data、
 string 过滤，`--xrefs-from-json <addr>` 和
 `--xrefs-to-json <addr>` 按地址查引用。`--instructions-json` 输出已接受指令的地址、
 大小、字节、显示文本和来源，`--instructions-range-json <start> <end>` 按地址范围过滤同一批
@@ -143,7 +144,8 @@ external/NotDec-bin2llvm/
   `--seeds-json` 打印 function seed 列表 JSON，
   包含地址、range、name、alias、来源和 confidence，
   `--functions-json` 打印 confirmed function 列表 JSON，`--blocks-json` 打印 confirmed function 下的 basic block 列表 JSON，
-  `--xrefs-json` 打印 xref 列表 JSON，`--xrefs-kind-json` 按 xref kind 过滤，
+  `--xrefs-json` 打印 xref 列表 JSON，`--xrefs-dot` 打印 xref DOT，
+  `--xrefs-kind-json` 按 xref kind 过滤，
   `--xrefs-from-json` / `--xrefs-to-json` 按地址查 xref，`--instructions-json`
   打印 instruction 列表 JSON，`--instructions-range-json` 按地址范围打印 instruction
   列表 JSON，`--instructions-function-json` 按 confirmed function 入口打印 instruction
