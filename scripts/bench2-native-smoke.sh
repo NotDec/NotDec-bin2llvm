@@ -239,6 +239,45 @@ for function_entry, function_blocks in by_function.items():
 PY
 }
 
+check_seed_boundaries() {
+  local name="$1"
+  local seeds="$2"
+  local blocks="$3"
+
+  python3 - "$name" "$seeds" "$blocks" <<'PY'
+import json
+import sys
+
+name, seeds_path, blocks_path = sys.argv[1:]
+with open(seeds_path, "r", encoding="utf-8") as handle:
+    seeds_root = json.load(handle)
+with open(blocks_path, "r", encoding="utf-8") as handle:
+    blocks_root = json.load(handle)
+
+seeds = seeds_root.get("seeds", [])
+if seeds_root.get("count") != len(seeds):
+    raise SystemExit(
+        f"{name}: seeds-json count {seeds_root.get('count')} != {len(seeds)}"
+    )
+
+seed_addresses = sorted(int(seed["address"], 16) for seed in seeds)
+for block in blocks_root.get("blocks", []):
+    function_entry = int(block["function_entry"], 16)
+    start = int(block["start"], 16)
+    end = int(block["end"], 16)
+    for seed_address in seed_addresses:
+        if seed_address <= start:
+            continue
+        if seed_address >= end:
+            break
+        if seed_address != function_entry:
+            raise SystemExit(
+                f"{name}: block {block['start']}..{block['end']} in "
+                f"{block['function_entry']} covers seed {seed_address:#x}"
+            )
+PY
+}
+
 parse_heritage_metric() {
   local file="$1"
   local label="$2"
@@ -374,8 +413,10 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_file "$target"
 
   summary="$OUT_DIR/$name.summary.json"
+  seeds="$OUT_DIR/$name.seeds.json"
   blocks="$OUT_DIR/$name.blocks.json"
   discover_stderr="$OUT_DIR/$name.discover.stderr"
+  seeds_stderr="$OUT_DIR/$name.seeds.stderr"
   blocks_stderr="$OUT_DIR/$name.blocks.stderr"
   ll="$OUT_DIR/$name.all-confirmed.ll"
   bc="$OUT_DIR/$name.all-confirmed.bc"
@@ -396,8 +437,10 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_no_unresolved_indirect_calls "$summary" "$name"
   require_unresolved_indirect_branches_at_most "$summary" "$name" 0
   check_entry_sources "$name" "$summary"
+  "$DISCOVER" --seeds-json "$target" >"$seeds" 2>"$seeds_stderr"
   "$DISCOVER" --blocks-json "$target" >"$blocks" 2>"$blocks_stderr"
   check_block_cfg "$name" "$summary" "$blocks"
+  check_seed_boundaries "$name" "$seeds" "$blocks"
 
   "$NATIVE_LLVM" "$target" --all-confirmed -o "$ll" \
     >"$native_stdout" 2>"$native_stderr"
