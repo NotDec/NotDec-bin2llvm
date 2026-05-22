@@ -42,7 +42,7 @@ function、basic block、instruction、xref 和 unresolved indirect flow 数量�
 `--seeds-json` 输出 function seed 列表，包含地址、名字、
 alias、来源、confidence 和保守 range，方便解释入口发现来源。`--functions-json` 输出已确认函数列表，
 包含入口、保守范围、名字、来源和 block 数。`--blocks-json` 输出已确认函数里的 basic
-block 起止地址、大小和 successor。
+block 起止地址、大小和 successor。`--cfg-json <entry>` 按 confirmed function 入口输出单函数 CFG。
 `--xrefs-json` 输出当前 xref 列表，`--xrefs-kind-json <kind>` 按 flow、call、data、
 string 过滤，`--xrefs-from-json <addr>` 和
 `--xrefs-to-json <addr>` 按地址查引用。`--instructions-json` 输出已接受指令的地址、
@@ -135,6 +135,7 @@ external/NotDec-bin2llvm/
   `--relocations-json` 打印 relocation 表 JSON，`--notes-json` 打印 native 分析提示 JSON，
   `--eh-frame-json` 打印 `.eh_frame` / `.eh_frame_hdr` 解析统计和 FDE 列表 JSON，
   `--callgraph-json` 打印 callgraph JSON，基于 call xref、confirmed function、PLT 和 external relocation 目标，
+  `--cfg-json` 按 confirmed function 入口打印单函数 CFG JSON，
   `--seeds-json` 打印 function seed 列表 JSON，
   包含地址、range、name、alias、来源和 confidence，
   `--functions-json` 打印 confirmed function 列表 JSON，`--blocks-json` 打印 confirmed function 下的 basic block 列表 JSON，

@@ -26,6 +26,7 @@ enum class OutputMode {
   SeedsJson,
   FunctionsJson,
   BlocksJson,
+  CfgJson,
   CallgraphJson,
   XrefsJson,
   InstructionsJson,
@@ -58,6 +59,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --seeds-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --cfg-json <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --callgraph-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
@@ -140,6 +142,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.Mode = OutputMode::XrefsKindJson;
     } else if (mode == "--instructions-function-json") {
       options.Mode = OutputMode::InstructionsFunctionJson;
+    } else if (mode == "--cfg-json") {
+      options.Mode = OutputMode::CfgJson;
     } else {
       return std::nullopt;
     }
@@ -156,6 +160,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       return std::nullopt;
     }
     if (options.Mode == OutputMode::InstructionsFunctionJson) {
+      options.QueryFunctionEntry = *address;
+    } else if (options.Mode == OutputMode::CfgJson) {
       options.QueryFunctionEntry = *address;
     } else {
       options.QueryAddress = *address;
@@ -587,6 +593,49 @@ void printBlocksJson(std::ostream &output,
   output << "}\n";
 }
 
+void printCfgJson(std::ostream &output,
+                  const notdec::bin2llvm::NativeProgramState &state,
+                  uint64_t entry) {
+  const notdec::bin2llvm::NativeFunction *function = state.functionAt(entry);
+  output << "{\n";
+  output << "  \"query\": \"" << hexString(entry) << "\",\n";
+  if (function == nullptr) {
+    output << "  \"found\": false,\n";
+    output << "  \"blocks\": [],\n";
+    output << "  \"count\": 0\n";
+    output << "}\n";
+    return;
+  }
+
+  output << "  \"found\": true,\n";
+  output << "  \"function\": {\n";
+  output << "    \"entry\": \"" << hexString(function->Entry) << "\",\n";
+  output << "    \"range_start\": \"" << hexString(function->RangeStart)
+         << "\",\n";
+  output << "    \"range_end\": \"" << hexString(function->RangeEnd)
+         << "\",\n";
+  output << "    \"name\": \"" << jsonEscape(function->Name) << "\",\n";
+  output << "    \"source\": \"" << jsonEscape(function->Source) << "\"\n";
+  output << "  },\n";
+  output << "  \"blocks\": [";
+  bool firstBlock = true;
+  for (const notdec::bin2llvm::NativeBasicBlock &block : function->Blocks) {
+    output << (firstBlock ? "\n" : ",\n");
+    output << "    {\n";
+    output << "      \"start\": \"" << hexString(block.Start) << "\",\n";
+    output << "      \"end\": \"" << hexString(block.End) << "\",\n";
+    output << "      \"size\": " << (block.End - block.Start) << ",\n";
+    output << "      \"successors\": ";
+    printAddressArray(output, block.Successors);
+    output << "\n";
+    output << "    }";
+    firstBlock = false;
+  }
+  output << (firstBlock ? "],\n" : "\n  ],\n");
+  output << "  \"count\": " << function->Blocks.size() << "\n";
+  output << "}\n";
+}
+
 std::optional<std::string>
 lookupExternalCallTarget(const notdec::bin2llvm::NativeProgramState &state,
                          uint64_t address) {
@@ -915,6 +964,8 @@ int main(int argc, char **argv) {
       printFunctionsJson(std::cout, state);
     } else if (options->Mode == OutputMode::BlocksJson) {
       printBlocksJson(std::cout, state);
+    } else if (options->Mode == OutputMode::CfgJson) {
+      printCfgJson(std::cout, state, *options->QueryFunctionEntry);
     } else if (options->Mode == OutputMode::CallgraphJson) {
       printCallgraphJson(std::cout, state);
     } else if (options->Mode == OutputMode::XrefsJson) {
