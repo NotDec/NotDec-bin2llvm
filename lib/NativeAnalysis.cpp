@@ -1911,7 +1911,7 @@ private:
                                               uint64_t availableBytes) {
     auto seedIterator = state.functionSeeds().find(functionEntry);
     if (seedIterator == state.functionSeeds().end()) {
-      return availableBytes;
+      return capBytesAtNextFunctionSeed(state, blockAddress, availableBytes);
     }
 
     const NativeFunctionSeed &seed = seedIterator->second;
@@ -1920,9 +1920,27 @@ private:
     // is actually inside the recorded half-open range.
     if (seed.RangeStart == 0 || seed.RangeEnd <= seed.RangeStart ||
         blockAddress < seed.RangeStart || blockAddress >= seed.RangeEnd) {
-      return availableBytes;
+      return capBytesAtNextFunctionSeed(state, blockAddress, availableBytes);
     }
     return std::min(availableBytes, seed.RangeEnd - blockAddress);
+  }
+
+  static uint64_t capBytesAtNextFunctionSeed(const NativeProgramState &state,
+                                             uint64_t blockAddress,
+                                             uint64_t availableBytes) {
+    uint64_t cappedBytes = availableBytes;
+    for (const auto &[address, seed] : state.functionSeeds()) {
+      (void)seed;
+      if (address <= blockAddress) {
+        continue;
+      }
+      uint64_t distance = address - blockAddress;
+      if (distance < cappedBytes) {
+        cappedBytes = distance;
+      }
+      break;
+    }
+    return cappedBytes;
   }
 };
 

@@ -22,6 +22,7 @@
   - [x] 已补 unresolved indirect flow 记录：`CALLIND` / `BRANCHIND` 进入 native state 和 report。
   - [x] 已补已知函数入口边界：direct branch 到其他 function seed 时不并入当前函数。
   - [x] 已补已知 function seed range 对 Sleigh decode 字节数的截断，减少跨函数线性 decode。
+  - [x] 已补无 range seed 按后续最近已知 function seed 截断 decode 字节数。
   - [x] 已补 `functionContaining(...)` 按 confirmed basic block 判断，避免 block 空洞误判。
   - [x] 已补来源可追到外部 `GLOB_DAT` GOT slot 的 `CALLIND` xref，并从 unresolved indirect call 中移除。
   - [x] 已补 direct `ram` GOT 命中 `NativePltEntry` 的 `BRANCHIND` xref，并从 unresolved indirect branch 中移除。

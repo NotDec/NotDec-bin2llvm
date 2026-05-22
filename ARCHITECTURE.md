@@ -57,6 +57,7 @@ instruction，`--instructions-function-json <entry>` 按 confirmed function 入�
   seed 入本地队列。队列元素区分 function entry 和 block address，每个 block 最多解码
   8 条 / 64 字节，并写入 `NativeInstruction`。如果当前 function seed 已有 symbol size
   或 `.eh_frame` FDE 给出的 `[RangeStart, RangeEnd)`，decode 字节数还会被这个已知范围截断。
+  没有 range 的 seed 会被后续最近的已知 function seed 入口截断，避免线性 decode 跨到下一个函数。
 - 如果某个 seed 成功解码出指令，它会被保守写成一个 `NativeFunction`，并带一个覆盖已解码
   指令前缀的 `NativeBasicBlock`。
 - `lib/SleighLift.cpp::collectSleighInstructionDecode(...)` 在同一次 Sleigh 初始化里收集指令摘要
