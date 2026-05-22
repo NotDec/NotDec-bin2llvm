@@ -27,6 +27,7 @@ enum class OutputMode {
   FunctionsJson,
   BlocksJson,
   CfgJson,
+  CfgDot,
   CallgraphJson,
   XrefsJson,
   InstructionsJson,
@@ -60,6 +61,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --cfg-json <entry> <elf-file>\n";
+  std::cerr << "       " << argv0 << " --cfg-dot <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --callgraph-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --xrefs-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --instructions-json <elf-file>\n";
@@ -144,6 +146,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.Mode = OutputMode::InstructionsFunctionJson;
     } else if (mode == "--cfg-json") {
       options.Mode = OutputMode::CfgJson;
+    } else if (mode == "--cfg-dot") {
+      options.Mode = OutputMode::CfgDot;
     } else {
       return std::nullopt;
     }
@@ -162,6 +166,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     if (options.Mode == OutputMode::InstructionsFunctionJson) {
       options.QueryFunctionEntry = *address;
     } else if (options.Mode == OutputMode::CfgJson) {
+      options.QueryFunctionEntry = *address;
+    } else if (options.Mode == OutputMode::CfgDot) {
       options.QueryFunctionEntry = *address;
     } else {
       options.QueryAddress = *address;
@@ -244,6 +250,29 @@ std::string jsonEscape(const std::string &text) {
       break;
     case '\t':
       escaped += "\\t";
+      break;
+    default:
+      escaped += ch;
+      break;
+    }
+  }
+  return escaped;
+}
+
+std::string dotEscape(const std::string &text) {
+  std::string escaped;
+  for (char ch : text) {
+    switch (ch) {
+    case '"':
+      escaped += "\\\"";
+      break;
+    case '\\':
+      escaped += "\\\\";
+      break;
+    case '\n':
+    case '\r':
+    case '\t':
+      escaped += ' ';
       break;
     default:
       escaped += ch;
@@ -636,6 +665,43 @@ void printCfgJson(std::ostream &output,
   output << "}\n";
 }
 
+void printCfgDot(std::ostream &output,
+                 const notdec::bin2llvm::NativeProgramState &state,
+                 uint64_t entry) {
+  const notdec::bin2llvm::NativeFunction *function = state.functionAt(entry);
+  std::string query = hexString(entry);
+  output << "digraph \"notdec_cfg_" << dotEscape(query) << "\" {\n";
+  output << "  graph [label=\"notdec cfg " << dotEscape(query) << "\"];\n";
+  output << "  node [shape=box];\n";
+  if (function == nullptr) {
+    output << "  \"not_found\" [label=\"found=false query=" << dotEscape(query)
+           << "\"];\n";
+    output << "}\n";
+    return;
+  }
+
+  output << "  \"function\" [shape=plaintext, label=\"entry="
+         << dotEscape(hexString(function->Entry)) << " range="
+         << dotEscape(hexString(function->RangeStart)) << ".."
+         << dotEscape(hexString(function->RangeEnd)) << " name="
+         << dotEscape(function->Name) << "\"];\n";
+  for (const notdec::bin2llvm::NativeBasicBlock &block : function->Blocks) {
+    std::string start = hexString(block.Start);
+    std::string end = hexString(block.End);
+    output << "  \"" << dotEscape(start) << "\" [label=\""
+           << dotEscape(start) << ".." << dotEscape(end) << " size="
+           << (block.End - block.Start) << "\"];\n";
+  }
+  for (const notdec::bin2llvm::NativeBasicBlock &block : function->Blocks) {
+    std::string start = hexString(block.Start);
+    for (uint64_t successor : block.Successors) {
+      output << "  \"" << dotEscape(start) << "\" -> \""
+             << dotEscape(hexString(successor)) << "\";\n";
+    }
+  }
+  output << "}\n";
+}
+
 std::optional<std::string>
 lookupExternalCallTarget(const notdec::bin2llvm::NativeProgramState &state,
                          uint64_t address) {
@@ -966,6 +1032,8 @@ int main(int argc, char **argv) {
       printBlocksJson(std::cout, state);
     } else if (options->Mode == OutputMode::CfgJson) {
       printCfgJson(std::cout, state, *options->QueryFunctionEntry);
+    } else if (options->Mode == OutputMode::CfgDot) {
+      printCfgDot(std::cout, state, *options->QueryFunctionEntry);
     } else if (options->Mode == OutputMode::CallgraphJson) {
       printCallgraphJson(std::cout, state);
     } else if (options->Mode == OutputMode::XrefsJson) {
