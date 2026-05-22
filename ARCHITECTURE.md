@@ -33,8 +33,8 @@ Ghidra 那种完整数据库：
 
 `notdec-native-discover` 默认输出文本 report，包含 function seed、worklist、confirmed
 function、basic block、instruction、xref 和 unresolved indirect flow 数量。加
-`--summary-json` 时会跳过文本 report，输出同口径的最小 JSON summary，供 Bench2 smoke
-做机器检查。`--memory-json` 输出 native loader 看到的 load range 和 section 布局，
+`--summary-json` 时会跳过文本 report，输出同口径的最小 JSON summary，包含 seed source
+和 confidence 计数，供 Bench2 smoke 做机器检查。`--memory-json` 输出 native loader 看到的 load range 和 section 布局，
 包含地址范围、权限和 loaded size。`--relocations-json` 输出 native relocation 表，
 包含类型、符号、状态和已计算值。`--notes-json` 输出 native 分析过程里的非致命提示。
 `--eh-frame-json` 输出 `.eh_frame` / `.eh_frame_hdr` 解析统计、FDE 列表和 hdr 表。
@@ -142,7 +142,7 @@ external/NotDec-bin2llvm/
 - `tools/notdec-heritage-llvm.cpp`：单函数 JSON 到 `.ll` 的命令行入口。
 - `tools/notdec-heritage-check.cpp`：单函数 JSON 检查工具。
 - `tools/notdec-native-discover.cpp`：native discovery smoke 入口。默认打印文本 report，
-  `--summary-json` 打印 function、block、instruction、xref 和 unresolved indirect flow
+  `--summary-json` 打印 function、block、instruction、xref、seed confidence 和 unresolved indirect flow
   的汇总 JSON，`--memory-json` 打印 load range 和 section 布局 JSON，
   `--relocations-json` 打印 relocation 表 JSON，`--notes-json` 打印 native 分析提示 JSON，
   `--eh-frame-json` 打印 `.eh_frame` / `.eh_frame_hdr` 解析统计和 FDE 列表 JSON，

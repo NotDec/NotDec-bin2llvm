@@ -35,6 +35,7 @@
   - [ ] 尚未解析间接 branch/call 目标，也还没有完整函数边界判断。
 - [ ] 阶段 4: CLI query
   - [x] 已补 `notdec-native-discover --summary-json` 最小 summary 输出。
+  - [x] 已补 `notdec-native-discover --summary-json` 输出 seed confidence 计数。
   - [x] 已补 `notdec-native-discover --memory-json` 输出 load range 和 section 布局。
   - [x] 已补 `notdec-native-discover --relocations-json` 输出 relocation 表。
   - [x] 已补 `notdec-native-discover --notes-json` 输出 native 分析提示列表。

@@ -332,6 +332,12 @@ void printSummaryJson(std::ostream &output,
     ++unresolvedFlowCounts[flow.Kind];
   }
 
+  std::map<NativeFunctionConfidence, uint64_t> confidenceCounts;
+  for (const auto &[address, seed] : state.functionSeeds()) {
+    (void)address;
+    ++confidenceCounts[seed.Confidence];
+  }
+
   output << "{\n";
   output << "  \"function_seeds\": " << state.functionSeeds().size() << ",\n";
   output << "  \"function_worklist\": " << state.functionWorklist().size()
@@ -345,6 +351,16 @@ void printSummaryJson(std::ostream &output,
     firstSource = false;
   }
   output << (firstSource ? "},\n" : "\n  },\n");
+
+  output << "  \"confidence\": {\n";
+  for (NativeFunctionConfidence confidence :
+       {NativeFunctionConfidence::High, NativeFunctionConfidence::Medium,
+        NativeFunctionConfidence::Low}) {
+    output << "    \"" << toString(confidence) << "\": "
+           << confidenceCounts[confidence]
+           << (confidence == NativeFunctionConfidence::Low ? "\n" : ",\n");
+  }
+  output << "  },\n";
 
   output << "  \"confirmed_functions\": " << state.functions().size()
          << ",\n";
