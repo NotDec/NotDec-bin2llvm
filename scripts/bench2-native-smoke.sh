@@ -278,6 +278,40 @@ for block in blocks_root.get("blocks", []):
 PY
 }
 
+check_xref_sources() {
+  local name="$1"
+  local xrefs="$2"
+
+  python3 - "$name" "$xrefs" <<'PY'
+import collections
+import json
+import sys
+
+name, xrefs_path = sys.argv[1:]
+with open(xrefs_path, "r", encoding="utf-8") as handle:
+    root = json.load(handle)
+
+xrefs = root.get("xrefs", [])
+if root.get("count") != len(xrefs):
+    raise SystemExit(
+        f"{name}: xrefs-json count {root.get('count')} != {len(xrefs)}"
+    )
+
+counts = collections.Counter((xref.get("kind"), xref.get("source")) for xref in xrefs)
+required = [
+    ("flow", "elf-relocation-code"),
+    ("data", "elf-relocation-pointer"),
+]
+if name in {"vsftpd", "memcached"}:
+    required.append(("string", "elf-relocation-string"))
+
+for key in required:
+    if counts[key] == 0:
+        kind, source = key
+        raise SystemExit(f"{name}: missing xref source {kind}/{source}")
+PY
+}
+
 parse_heritage_metric() {
   local file="$1"
   local label="$2"
@@ -415,9 +449,11 @@ for index in "${!TARGET_NAMES[@]}"; do
   summary="$OUT_DIR/$name.summary.json"
   seeds="$OUT_DIR/$name.seeds.json"
   blocks="$OUT_DIR/$name.blocks.json"
+  xrefs="$OUT_DIR/$name.xrefs.json"
   discover_stderr="$OUT_DIR/$name.discover.stderr"
   seeds_stderr="$OUT_DIR/$name.seeds.stderr"
   blocks_stderr="$OUT_DIR/$name.blocks.stderr"
+  xrefs_stderr="$OUT_DIR/$name.xrefs.stderr"
   ll="$OUT_DIR/$name.all-confirmed.ll"
   bc="$OUT_DIR/$name.all-confirmed.bc"
   opt_bc="$OUT_DIR/$name.all-confirmed.opt.bc"
@@ -441,6 +477,8 @@ for index in "${!TARGET_NAMES[@]}"; do
   "$DISCOVER" --blocks-json "$target" >"$blocks" 2>"$blocks_stderr"
   check_block_cfg "$name" "$summary" "$blocks"
   check_seed_boundaries "$name" "$seeds" "$blocks"
+  "$DISCOVER" --xrefs-json "$target" >"$xrefs" 2>"$xrefs_stderr"
+  check_xref_sources "$name" "$xrefs"
 
   "$NATIVE_LLVM" "$target" --all-confirmed -o "$ll" \
     >"$native_stdout" 2>"$native_stderr"
