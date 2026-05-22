@@ -25,6 +25,7 @@ enum class OutputMode {
   EhFrameJson,
   SeedsJson,
   FunctionJson,
+  FunctionXrefsJson,
   FunctionsJson,
   BlocksJson,
   CfgJson,
@@ -62,6 +63,8 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --eh-frame-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --seeds-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --function-json <entry> <elf-file>\n";
+  std::cerr << "       " << argv0
+            << " --function-xrefs-json <entry> <elf-file>\n";
   std::cerr << "       " << argv0 << " --functions-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --blocks-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --cfg-json <entry> <elf-file>\n";
@@ -152,6 +155,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.Mode = OutputMode::InstructionsFunctionJson;
     } else if (mode == "--function-json") {
       options.Mode = OutputMode::FunctionJson;
+    } else if (mode == "--function-xrefs-json") {
+      options.Mode = OutputMode::FunctionXrefsJson;
     } else if (mode == "--cfg-json") {
       options.Mode = OutputMode::CfgJson;
     } else if (mode == "--cfg-dot") {
@@ -174,6 +179,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     if (options.Mode == OutputMode::InstructionsFunctionJson) {
       options.QueryFunctionEntry = *address;
     } else if (options.Mode == OutputMode::FunctionJson) {
+      options.QueryFunctionEntry = *address;
+    } else if (options.Mode == OutputMode::FunctionXrefsJson) {
       options.QueryFunctionEntry = *address;
     } else if (options.Mode == OutputMode::CfgJson) {
       options.QueryFunctionEntry = *address;
@@ -904,6 +911,56 @@ void printXrefObject(std::ostream &output,
   output << indent << "}";
 }
 
+void printFunctionXrefsJson(
+    std::ostream &output, const notdec::bin2llvm::NativeProgramState &state,
+    uint64_t entry) {
+  using namespace notdec::bin2llvm;
+
+  const NativeFunction *function = state.functionAt(entry);
+  output << "{\n";
+  output << "  \"query\": \"" << hexString(entry) << "\",\n";
+  if (function == nullptr) {
+    output << "  \"found\": false,\n";
+    output << "  \"outgoing\": [],\n";
+    output << "  \"outgoing_count\": 0,\n";
+    output << "  \"incoming_entry\": [],\n";
+    output << "  \"incoming_entry_count\": 0\n";
+    output << "}\n";
+    return;
+  }
+
+  std::vector<const NativeXref *> outgoing;
+  for (const NativeXref &xref : state.xrefs()) {
+    const NativeFunction *owner = state.functionContaining(xref.From);
+    if (owner != nullptr && owner->Entry == function->Entry) {
+      outgoing.push_back(&xref);
+    }
+  }
+  std::vector<const NativeXref *> incomingEntry = state.xrefsTo(function->Entry);
+
+  output << "  \"found\": true,\n";
+  output << "  \"function_entry\": \"" << hexString(function->Entry) << "\",\n";
+  output << "  \"outgoing\": [";
+  bool firstXref = true;
+  for (const NativeXref *xref : outgoing) {
+    output << (firstXref ? "\n" : ",\n");
+    printXrefObject(output, *xref, "    ");
+    firstXref = false;
+  }
+  output << (firstXref ? "],\n" : "\n  ],\n");
+  output << "  \"outgoing_count\": " << outgoing.size() << ",\n";
+  output << "  \"incoming_entry\": [";
+  firstXref = true;
+  for (const NativeXref *xref : incomingEntry) {
+    output << (firstXref ? "\n" : ",\n");
+    printXrefObject(output, *xref, "    ");
+    firstXref = false;
+  }
+  output << (firstXref ? "],\n" : "\n  ],\n");
+  output << "  \"incoming_entry_count\": " << incomingEntry.size() << "\n";
+  output << "}\n";
+}
+
 void printXrefsJson(std::ostream &output,
                     const notdec::bin2llvm::NativeProgramState &state) {
   output << "{\n";
@@ -1157,6 +1214,8 @@ int main(int argc, char **argv) {
       printSeedsJson(std::cout, state);
     } else if (options->Mode == OutputMode::FunctionJson) {
       printFunctionJson(std::cout, state, *options->QueryFunctionEntry);
+    } else if (options->Mode == OutputMode::FunctionXrefsJson) {
+      printFunctionXrefsJson(std::cout, state, *options->QueryFunctionEntry);
     } else if (options->Mode == OutputMode::FunctionsJson) {
       printFunctionsJson(std::cout, state);
     } else if (options->Mode == OutputMode::BlocksJson) {
