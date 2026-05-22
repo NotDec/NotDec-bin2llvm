@@ -1905,7 +1905,9 @@ private:
     if (address == entry) {
       return false;
     }
-    return state.functionSeeds().find(address) != state.functionSeeds().end();
+    auto seedIterator = state.functionSeeds().find(address);
+    return seedIterator != state.functionSeeds().end() &&
+           isBoundarySeed(seedIterator->second);
   }
 
   static void addUniqueAddress(std::vector<uint64_t> &addresses,
@@ -1956,8 +1958,10 @@ private:
                                              uint64_t availableBytes) {
     uint64_t cappedBytes = availableBytes;
     for (const auto &[address, seed] : state.functionSeeds()) {
-      (void)seed;
       if (address <= blockAddress) {
+        continue;
+      }
+      if (!isBoundarySeed(seed)) {
         continue;
       }
       uint64_t distance = address - blockAddress;
@@ -1967,6 +1971,10 @@ private:
       break;
     }
     return cappedBytes;
+  }
+
+  static bool isBoundarySeed(const NativeFunctionSeed &seed) {
+    return seed.Confidence != NativeFunctionConfidence::Low;
   }
 };
 

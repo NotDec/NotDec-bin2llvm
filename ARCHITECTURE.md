@@ -64,9 +64,10 @@ instruction，`--instructions-function-json <entry>` 按 confirmed function 入�
   队列元素区分 function entry 和 block address，每个 block 最多解码
   8 条 / 64 字节，并写入 `NativeInstruction`。如果当前 function seed 已有 symbol size
   或 `.eh_frame` FDE 给出的 `[RangeStart, RangeEnd)`，decode 字节数还会被这个已知范围截断。
-  没有 range 的 seed 会被后续最近的已知 function seed 入口截断，避免线性 decode 跨到下一个函数。
+  没有 range 的 seed 会被后续最近的非 Low confidence function seed 入口截断，避免线性 decode
+  跨到下一个可信函数入口。
 - analyzer 开始前会把 relocated pointer 里指向 executable memory 的 target 追加成低可信
-  `elf-relocation-code` function seed。它不提供 range，只作为后续受控 decode 的候选入口。
+  `elf-relocation-code` function seed。它不提供 range，也不作为边界，只作为后续受控 decode 的候选入口。
 - 如果某个 seed 成功解码出指令，它会被保守写成一个 `NativeFunction`，并带一个覆盖已解码
   指令前缀的 `NativeBasicBlock`。
 - `lib/SleighLift.cpp::collectSleighInstructionDecode(...)` 在同一次 Sleigh 初始化里收集指令摘要
@@ -184,7 +185,7 @@ external/NotDec-bin2llvm/
   object `libuv` 不能有 `elf-entry`，并且三目标都要有 dynamic init/fini、init/fini array
   和 `.eh_frame` 来源，也要求存在 `elf-relocation-code` seed source。它还会用 `--blocks-json` 检查同函数 block 不重叠，并禁止
   successor 指向同函数已知 block 的内部；再结合 `--seeds-json` 检查 confirmed block
-  不覆盖其他已知 function seed 入口；用 `--xrefs-json` 检查 relocation code/data/string
+  不覆盖其他非 Low confidence function seed 入口；用 `--xrefs-json` 检查 relocation code/data/string
   xref source baseline。然后再用 `notdec-native-llvm --all-confirmed`
   生成 IR，并用本地 LLVM 22 的 `llvm-as` 和 `opt -passes=verify` 验证；输出目录会生成
   `metrics.tsv`，汇总每个目标的

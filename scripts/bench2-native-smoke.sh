@@ -260,7 +260,11 @@ if seeds_root.get("count") != len(seeds):
         f"{name}: seeds-json count {seeds_root.get('count')} != {len(seeds)}"
     )
 
-seed_addresses = sorted(int(seed["address"], 16) for seed in seeds)
+seed_addresses = sorted(
+    int(seed["address"], 16)
+    for seed in seeds
+    if seed.get("confidence") != "low"
+)
 for block in blocks_root.get("blocks", []):
     function_entry = int(block["function_entry"], 16)
     start = int(block["start"], 16)
