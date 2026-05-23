@@ -189,26 +189,47 @@ struct HeritageModuleSymbolPlan {
   std::vector<std::string> InternalNames;
   std::vector<std::string> ExternalNames;
   std::unordered_map<std::string, std::string> NameByEntry;
-  std::unordered_map<std::string, std::string> NameByOriginalName;
+  // Short function names are not identities in Ghidra.  C++ modules can have
+  // many functions named `append` or destructors with the same display name.
+  // Keep only names that are unique in the whole module for name-only call
+  // fallback; address-based resolution stays authoritative.
+  std::unordered_map<std::string, std::string> UniqueNameByOriginalName;
+  std::unordered_set<std::string> AmbiguousOriginalNames;
 };
 
 HeritageModuleSymbolPlan planModuleSymbols(const HeritageModule &module) {
   HeritageModuleSymbolPlan plan;
   std::set<std::string> usedNames;
+  std::unordered_map<std::string, unsigned> originalNameCounts;
+
+  for (const HeritageModuleFunction &function : module.Functions) {
+    originalNameCounts[function.Program.Function.Name]++;
+  }
+  for (const HeritageExternalFunction &external : module.Externals) {
+    originalNameCounts[external.Name]++;
+  }
 
   for (const HeritageModuleFunction &function : module.Functions) {
     const HeritageFunction &heritageFunction = function.Program.Function;
     std::string name = uniqueSymbolName(heritageFunction.Name,
                                         heritageFunction.Entry, usedNames);
     plan.NameByEntry.emplace(heritageFunction.Entry, name);
-    plan.NameByOriginalName.emplace(heritageFunction.Name, name);
+    if (originalNameCounts[heritageFunction.Name] == 1) {
+      plan.UniqueNameByOriginalName.emplace(heritageFunction.Name, name);
+    } else {
+      plan.AmbiguousOriginalNames.insert(heritageFunction.Name);
+    }
     plan.InternalNames.push_back(std::move(name));
   }
 
   for (const HeritageExternalFunction &external : module.Externals) {
     std::string name =
         uniqueSymbolName(external.Name, external.Address, usedNames);
-    plan.NameByOriginalName.emplace(external.Name, name);
+    if (originalNameCounts[external.Name] == 1) {
+      plan.UniqueNameByOriginalName.emplace(external.Name, name);
+    } else {
+      plan.AmbiguousOriginalNames.insert(external.Name);
+    }
     plan.ExternalNames.push_back(std::move(name));
   }
 
@@ -275,9 +296,12 @@ std::string resolveCallTargetName(const HeritageOp &op,
     }
   }
   if (op.CallTargetName) {
-    auto it = symbols->NameByOriginalName.find(*op.CallTargetName);
-    if (it != symbols->NameByOriginalName.end()) {
+    auto it = symbols->UniqueNameByOriginalName.find(*op.CallTargetName);
+    if (it != symbols->UniqueNameByOriginalName.end()) {
       return it->second;
+    }
+    if (symbols->AmbiguousOriginalNames.count(*op.CallTargetName)) {
+      return "";
     }
     return *op.CallTargetName;
   }
