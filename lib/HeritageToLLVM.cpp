@@ -1763,6 +1763,21 @@ private:
                                 errorMessage);
   }
 
+  bool allSuccessorsStartAt(const HeritageBlock &block,
+                            const std::string &address) const {
+    if (block.Out.empty()) {
+      return false;
+    }
+    for (const std::string &successor : block.Out) {
+      auto blockIt = Program.BlockById.find(successor);
+      if (blockIt == Program.BlockById.end() ||
+          blockIt->second->Start != address) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool lowerBranch(const HeritageOp &op, const HeritageBlock &block,
                    std::string &errorMessage) {
     if (op.Mnemonic == "CBRANCH") {
@@ -1777,7 +1792,11 @@ private:
       const HeritageBlock *trueHeritageBlock =
           resolveSuccessorByAddress(block, target->Address, errorMessage);
       if (!errorMessage.empty()) {
-        return false;
+        if (block.Out.size() != 2 ||
+            !allSuccessorsStartAt(block, target->Address)) {
+          return false;
+        }
+        errorMessage.clear();
       }
       if (trueHeritageBlock == nullptr && block.Out.size() < 2) {
         errorMessage = "CBRANCH target block is unknown: " + target->Address;
