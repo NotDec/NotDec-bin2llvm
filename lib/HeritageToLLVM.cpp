@@ -1703,9 +1703,16 @@ private:
     if (op.Inputs.size() < 2) {
       llvm::errs() << "Warning: RETURN op " << op.Id << " in "
                    << Program.Function.Name << " block " << op.Parent
-                   << " has no value input; returning undef for "
+                   << " has no value input; using helper return value for "
                    << Program.Function.ReturnType << '\n';
-      return llvm::UndefValue::get(returnType);
+      std::string helperName = "notdec_heritage_RETURN_i" +
+                               std::to_string(returnType->getIntegerBitWidth());
+      auto *helperType = llvm::FunctionType::get(returnType, {}, true);
+      llvm::FunctionCallee helper =
+          Module.getOrInsertFunction(helperName, helperType);
+      llvm::CallInst *call = Builder.CreateCall(helper, {});
+      rememberOpInstruction(op, call);
+      return call;
     }
     llvm::Value *value = read(op.Inputs[1]);
     if (value == nullptr) {
