@@ -287,7 +287,13 @@ registerInfosForHeritageModule(const HeritageModule &module) {
 std::string resolveCallTargetName(const HeritageOp &op,
                                   const HeritageModuleSymbolPlan *symbols) {
   if (symbols == nullptr) {
-    return op.CallTargetName.value_or("");
+    if (op.CallTargetName) {
+      return *op.CallTargetName;
+    }
+    if (op.CallTarget) {
+      return "sub_" + addressSuffix(*op.CallTarget);
+    }
+    return "";
   }
   if (op.CallTarget) {
     auto it = symbols->NameByEntry.find(*op.CallTarget);

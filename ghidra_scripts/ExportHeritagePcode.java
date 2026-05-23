@@ -80,7 +80,11 @@ public class ExportHeritagePcode extends GhidraScript {
 			if (atAddress != null) {
 				return atAddress;
 			}
-			return currentProgram.getFunctionManager().getFunctionContaining(address);
+			Function containing = currentProgram.getFunctionManager().getFunctionContaining(address);
+			if (containing != null) {
+				return containing;
+			}
+			return createFunction(address, null);
 		}
 		catch (Exception ignored) {
 			// Not an address. Try function name below.
