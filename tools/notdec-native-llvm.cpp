@@ -47,6 +47,7 @@ struct CliOptions {
   bool AllConfirmed = false;
   std::string OutputPath;
   std::string SummaryJsonPath;
+  notdec::bin2llvm::NativeSleighDecodeOptions DecodeOptions;
 };
 
 void printUsage(const char *argv0) {
@@ -55,7 +56,8 @@ void printUsage(const char *argv0) {
                "(-a <address> -l <length> | -f <entry> | -n <name> | "
                "--all-confirmed) "
                "-o <output.ll> [--summary-json-out <path>] "
-               "[-p root-sla-dir] [-s pspec-file]\n";
+               "[--decode-seed-limit <count>] [-p root-sla-dir] "
+               "[-s pspec-file]\n";
 }
 
 bool parseUint64(const std::string &text, uint64_t &value) {
@@ -119,6 +121,13 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.OutputPath = std::move(value);
     } else if (flag == "--summary-json-out") {
       options.SummaryJsonPath = std::move(value);
+    } else if (flag == "--decode-seed-limit") {
+      uint64_t limit = 0;
+      if (!parseUint64(value, limit)) {
+        std::cerr << "invalid decode seed limit: " << value << '\n';
+        return std::nullopt;
+      }
+      options.DecodeOptions.MaxDecodedSeeds = limit;
     } else if (flag == "-p") {
       options.SpecOptions.RootSlaDir = std::move(value);
     } else if (flag == "-s") {
@@ -241,7 +250,9 @@ std::string jsonEscape(const std::string &text) {
 }
 
 notdec::bin2llvm::NativeProgramState
-runNativeDiscovery(const LIEF::ELF::Binary &binary) {
+runNativeDiscovery(
+    const LIEF::ELF::Binary &binary,
+    notdec::bin2llvm::NativeSleighDecodeOptions decodeOptions = {}) {
   notdec::bin2llvm::NativeProgramState state(binary);
   notdec::bin2llvm::NativeAnalysisManager manager;
   manager.addAnalyzer(notdec::bin2llvm::createElfLoadAnalyzer());
@@ -249,7 +260,8 @@ runNativeDiscovery(const LIEF::ELF::Binary &binary) {
   manager.addAnalyzer(notdec::bin2llvm::createElfEntryAnalyzer());
   manager.addAnalyzer(notdec::bin2llvm::createElfSymbolAnalyzer());
   manager.addAnalyzer(notdec::bin2llvm::createEhFrameAnalyzer());
-  manager.addAnalyzer(notdec::bin2llvm::createSleighSeedInstructionAnalyzer());
+  manager.addAnalyzer(
+      notdec::bin2llvm::createSleighSeedInstructionAnalyzer(decodeOptions));
   manager.run(state);
   return state;
 }
@@ -628,7 +640,7 @@ int main(int argc, char **argv) {
         !options->FunctionName.empty()) {
       selectedState =
           std::make_unique<notdec::bin2llvm::NativeProgramState>(
-              runNativeDiscovery(*binary));
+              runNativeDiscovery(*binary, options->DecodeOptions));
     }
     if (selectedState && !options->SummaryJsonPath.empty() &&
         !writeSummaryJson(*selectedState, options->SummaryJsonPath)) {
@@ -680,7 +692,8 @@ int main(int argc, char **argv) {
       if (options->FunctionEntry) {
         NativeCallTargets callTargets =
             selectedState ? planNativeCallTargets(*selectedState)
-                          : planNativeCallTargets(runNativeDiscovery(*binary));
+                          : planNativeCallTargets(runNativeDiscovery(
+                                *binary, options->DecodeOptions));
         callTargets.Direct[*options->FunctionEntry] = config.EntryFunctionName;
         config.DirectCallTargets = std::move(callTargets.Direct);
         config.ExternalCallTargets = std::move(callTargets.External);
