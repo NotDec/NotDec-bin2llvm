@@ -93,7 +93,7 @@ libuv --all-confirmed: 241.92s / 247.19s
 - `notdec-native-llvm -f` / `--all-confirmed` 仍会全量跑 discovery。
 - Bench2 coverage 仍需要单独脚本和 debug-info oracle。
 
-## 3. 用 debug info 做 discovery oracle
+## 3. 用 debug info 做 discovery oracle（已添加脚本）
 
 现状：
 
@@ -126,6 +126,18 @@ scripts/bench2-native-discovery-debug-check.py
 - 能清楚区分“入口 seed 没发现”和“seed 已有但 decode 没 confirmed”。
 - 对 libuv、vsftpd、memcached 先形成 baseline。
 - 后续 native discovery 改动能用 debug oracle 量化收益和误报。
+
+实现记录：
+
+- 见 `20260524-07-native-debug-info-oracle.md`。
+- 已新增 `scripts/bench2-native-discovery-debug-check.py`。
+- 脚本读取 Bench2 manifest/debug_path，用 LLVM 22 `llvm-dwarfdump --debug-info` 提取 concrete `DW_TAG_subprogram` low_pc。
+- 已用 `libuv`、`vsftpd`、`memcached` 的 `--decode-seed-limit 20` 跑通 sanity。
+- 已用 `php:extension-calendar` 跑通默认全量 sanity。
+
+剩余问题：
+
+- 脚本当前分别跑 `--seeds-json` 和 `--functions-json`，默认全量时会重复 discovery。
 
 ## 4. `--all-confirmed` 重复跑 discovery
 
@@ -199,6 +211,5 @@ native opcode 表已经补齐，但下面这些 opcode 当前走 helper：
 
 ## 建议优先级
 
-1. 补 debug-info oracle 脚本，用它衡量 native discovery。
-2. 处理 `--all-confirmed` 重复 discovery。
-3. 最后按 Bench2 实际出现频率逐个精确化 helper opcode。
+1. 处理 `--all-confirmed` / debug oracle 脚本重复 discovery。
+2. 按 Bench2 实际出现频率逐个精确化 helper opcode。
