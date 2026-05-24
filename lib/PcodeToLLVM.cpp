@@ -340,6 +340,30 @@ private:
     return llvm::IntegerType::get(Context, bitWidth(byteSize));
   }
 
+  llvm::Type *floatType(uint32_t byteSize) {
+    if (byteSize == 4) {
+      return llvm::Type::getFloatTy(Context);
+    }
+    if (byteSize == 8) {
+      return llvm::Type::getDoubleTy(Context);
+    }
+    return nullptr;
+  }
+
+  uint32_t floatByteSize(llvm::Type *type) const {
+    return type->isDoubleTy() ? 8 : 4;
+  }
+
+  llvm::Value *readFloatBits(const VarnodeView &varnode, llvm::Type *floatTy) {
+    return Builder.CreateBitCast(resize(read(varnode), floatByteSize(floatTy)),
+                                 floatTy);
+  }
+
+  void writeFloatBits(const VarnodeView &varnode, llvm::Value *value) {
+    llvm::Type *bitsTy = intType(floatByteSize(value->getType()));
+    write(varnode, Builder.CreateBitCast(value, bitsTy));
+  }
+
   llvm::Value *resize(llvm::Value *value, uint32_t byteSize) {
     llvm::Type *targetType = intType(byteSize);
     if (value->getType() == targetType) {
@@ -726,6 +750,121 @@ private:
     return true;
   }
 
+  bool lowerFloatBinary(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 2, errorMessage)) {
+      return false;
+    }
+    llvm::Type *floatTy = floatType(op.Output->Size);
+    if (floatTy == nullptr) {
+      return lowerHelperCall(op, errorMessage);
+    }
+
+    llvm::Value *lhs = readFloatBits(op.Inputs[0], floatTy);
+    llvm::Value *rhs = readFloatBits(op.Inputs[1], floatTy);
+    llvm::Value *result = nullptr;
+    switch (op.Opcode) {
+    case PcodeOpcode::FloatAdd:
+      result = Builder.CreateFAdd(lhs, rhs);
+      break;
+    case PcodeOpcode::FloatSub:
+      result = Builder.CreateFSub(lhs, rhs);
+      break;
+    case PcodeOpcode::FloatMult:
+      result = Builder.CreateFMul(lhs, rhs);
+      break;
+    case PcodeOpcode::FloatDiv:
+      result = Builder.CreateFDiv(lhs, rhs);
+      break;
+    default:
+      errorMessage = "unsupported float binary opcode: " + op.OpcodeName;
+      return false;
+    }
+    writeFloatBits(*op.Output, result);
+    return true;
+  }
+
+  bool lowerFloatCompare(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 2, errorMessage)) {
+      return false;
+    }
+    llvm::Type *floatTy = floatType(op.Inputs[0].Size);
+    if (floatTy == nullptr) {
+      return lowerHelperCall(op, errorMessage);
+    }
+
+    llvm::Value *lhs = readFloatBits(op.Inputs[0], floatTy);
+    llvm::Value *rhs = readFloatBits(op.Inputs[1], floatTy);
+    llvm::Value *result = nullptr;
+    switch (op.Opcode) {
+    case PcodeOpcode::FloatEqual:
+      result = Builder.CreateFCmpOEQ(lhs, rhs);
+      break;
+    case PcodeOpcode::FloatNotEqual:
+      result = Builder.CreateFCmpUNE(lhs, rhs);
+      break;
+    case PcodeOpcode::FloatLess:
+      result = Builder.CreateFCmpOLT(lhs, rhs);
+      break;
+    case PcodeOpcode::FloatLessEqual:
+      result = Builder.CreateFCmpOLE(lhs, rhs);
+      break;
+    default:
+      errorMessage = "unsupported float compare opcode: " + op.OpcodeName;
+      return false;
+    }
+    write(*op.Output, result);
+    return true;
+  }
+
+  bool lowerFloatNan(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 1, errorMessage)) {
+      return false;
+    }
+    llvm::Type *floatTy = floatType(op.Inputs[0].Size);
+    if (floatTy == nullptr) {
+      return lowerHelperCall(op, errorMessage);
+    }
+    llvm::Value *input = readFloatBits(op.Inputs[0], floatTy);
+    write(*op.Output, Builder.CreateFCmpUNO(input, input));
+    return true;
+  }
+
+  bool lowerFloatCast(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 1, errorMessage)) {
+      return false;
+    }
+
+    llvm::Type *outputFloatTy = floatType(op.Output->Size);
+    if (op.Opcode == PcodeOpcode::FloatInt2Float) {
+      if (outputFloatTy == nullptr) {
+        return lowerHelperCall(op, errorMessage);
+      }
+      writeFloatBits(*op.Output,
+                     Builder.CreateSIToFP(read(op.Inputs[0]), outputFloatTy));
+      return true;
+    }
+
+    llvm::Type *inputFloatTy = floatType(op.Inputs[0].Size);
+    if (inputFloatTy == nullptr) {
+      return lowerHelperCall(op, errorMessage);
+    }
+    llvm::Value *input = readFloatBits(op.Inputs[0], inputFloatTy);
+    if (op.Opcode == PcodeOpcode::FloatFloat2Float) {
+      if (outputFloatTy == nullptr) {
+        return lowerHelperCall(op, errorMessage);
+      }
+      writeFloatBits(*op.Output, Builder.CreateFPCast(input, outputFloatTy));
+      return true;
+    }
+    if (op.Opcode == PcodeOpcode::FloatTrunc) {
+      write(*op.Output, Builder.CreateFPToSI(input, intType(op.Output->Size)));
+      return true;
+    }
+
+    errorMessage = "unsupported float cast opcode: " + op.OpcodeName;
+    return false;
+  }
+
   llvm::GlobalVariable *memoryGlobal() {
     if (Memory) {
       return Memory;
@@ -974,17 +1113,21 @@ private:
     case PcodeOpcode::FloatNotEqual:
     case PcodeOpcode::FloatLess:
     case PcodeOpcode::FloatLessEqual:
+      return lowerFloatCompare(op, errorMessage);
     case PcodeOpcode::FloatNan:
+      return lowerFloatNan(op, errorMessage);
     case PcodeOpcode::FloatAdd:
     case PcodeOpcode::FloatDiv:
     case PcodeOpcode::FloatMult:
     case PcodeOpcode::FloatSub:
-    case PcodeOpcode::FloatNeg:
-    case PcodeOpcode::FloatAbs:
-    case PcodeOpcode::FloatSqrt:
+      return lowerFloatBinary(op, errorMessage);
     case PcodeOpcode::FloatInt2Float:
     case PcodeOpcode::FloatFloat2Float:
     case PcodeOpcode::FloatTrunc:
+      return lowerFloatCast(op, errorMessage);
+    case PcodeOpcode::FloatNeg:
+    case PcodeOpcode::FloatAbs:
+    case PcodeOpcode::FloatSqrt:
     case PcodeOpcode::FloatCeil:
     case PcodeOpcode::FloatFloor:
     case PcodeOpcode::FloatRound:
