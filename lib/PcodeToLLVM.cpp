@@ -122,6 +122,12 @@ private:
     return os.str();
   }
 
+  std::string addressFunctionName(uint64_t address) {
+    std::ostringstream os;
+    os << "notdec_native_" << std::hex << address;
+    return os.str();
+  }
+
   std::optional<uint64_t> directTarget(const PcodeOpView &op,
                                        size_t inputIndex) {
     if (op.Inputs.size() <= inputIndex ||
@@ -853,6 +859,8 @@ private:
         if (it != Config.DirectCallTargets.end()) {
           return lowerKnownVoidCall(it->second);
         }
+
+        return lowerKnownVoidCall(addressFunctionName(*target));
       }
     }
 
