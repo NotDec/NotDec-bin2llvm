@@ -211,12 +211,11 @@ def main() -> int:
         discover_prefix = [str(discover)]
         if args.decode_seed_limit is not None:
             discover_prefix += ["--decode-seed-limit", str(args.decode_seed_limit)]
-        seeds_json = run_json(discover_prefix + ["--seeds-json", str(elf_path)])
-        functions_json = run_json(discover_prefix + ["--functions-json", str(elf_path)])
+        discovery_json = run_json(discover_prefix + ["--discovery-json", str(elf_path)])
 
-        seed_addrs = {parse_int(seed["address"]) for seed in seeds_json["seeds"]}
+        seed_addrs = {parse_int(seed["address"]) for seed in discovery_json["seeds"]}
         confirmed_addrs = {
-            parse_int(function["entry"]) for function in functions_json["functions"]
+            parse_int(function["entry"]) for function in discovery_json["functions"]
         }
         seed_hits = len(debug_addrs & seed_addrs)
         confirmed_hits = len(debug_addrs & confirmed_addrs)

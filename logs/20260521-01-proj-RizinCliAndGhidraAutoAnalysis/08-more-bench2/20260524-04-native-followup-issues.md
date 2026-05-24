@@ -139,7 +139,7 @@ scripts/bench2-native-discovery-debug-check.py
 
 - 脚本当前分别跑 `--seeds-json` 和 `--functions-json`，默认全量时会重复 discovery。
 
-## 4. `--all-confirmed` 重复跑 discovery
+## 4. `--all-confirmed` / 脚本重复跑 discovery（debug oracle 已优化）
 
 现象：
 
@@ -162,6 +162,8 @@ notdec-native-llvm --all-confirmed
 - 在 bounded discovery 时问题不明显。
 - 全量 discovery 后，这会让每个目标多付出一次几十秒到几分钟的成本。
 
+debug oracle 脚本也有同类问题：初版分别跑 `--seeds-json` 和 `--functions-json`。
+
 建议路线：
 
 短期：
@@ -176,6 +178,18 @@ notdec-native-llvm --all-confirmed
 
 - selected-targets-native 重跑时间明显下降。
 - 输出 IR 和 summary 仍能对应同一份 discovery 事实。
+
+实现记录：
+
+- 见 `20260524-08-native-discovery-combined-json.md`。
+- 已给 `notdec-native-discover` 增加 `--discovery-json`，一次输出 seeds 和 confirmed functions。
+- `scripts/bench2-native-discovery-debug-check.py` 已改成只跑一次 discovery。
+- `php:extension-calendar` debug oracle 从 33.08 秒降到 16.39 秒。
+
+剩余问题：
+
+- `notdec-native-llvm --all-confirmed` 内部仍会重新跑 discovery。
+- selected-targets-native 脚本如果先跑 discover 再跑 native-llvm，仍会付出重复成本。
 
 ## 5. helper opcode 不是精确语义
 

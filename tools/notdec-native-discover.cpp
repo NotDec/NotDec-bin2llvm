@@ -24,6 +24,7 @@ enum class OutputMode {
   NotesJson,
   EhFrameJson,
   SeedsJson,
+  DiscoveryJson,
   FunctionJson,
   FunctionXrefsJson,
   FunctionsJson,
@@ -66,6 +67,7 @@ void printUsage(const char *argv0) {
   std::cerr << "       " << argv0 << " --notes-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --eh-frame-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --seeds-json <elf-file>\n";
+  std::cerr << "       " << argv0 << " --discovery-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --function-json <entry> <elf-file>\n";
   std::cerr << "       " << argv0
             << " --function-xrefs-json <entry> <elf-file>\n";
@@ -233,6 +235,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     options.Mode = OutputMode::EhFrameJson;
   } else if (mode == "--seeds-json") {
     options.Mode = OutputMode::SeedsJson;
+  } else if (mode == "--discovery-json") {
+    options.Mode = OutputMode::DiscoveryJson;
   } else if (mode == "--functions-json") {
     options.Mode = OutputMode::FunctionsJson;
   } else if (mode == "--blocks-json") {
@@ -590,63 +594,99 @@ void printEhFrameJson(std::ostream &output,
   output << "}\n";
 }
 
-void printSeedsJson(std::ostream &output,
-                    const notdec::bin2llvm::NativeProgramState &state) {
-  output << "{\n";
-  output << "  \"seeds\": [";
+void printSeedsArrayJson(std::ostream &output,
+                         const notdec::bin2llvm::NativeProgramState &state,
+                         const std::string &indent) {
+  output << "[";
   bool firstSeed = true;
   for (const auto &[address, seed] : state.functionSeeds()) {
     (void)address;
     output << (firstSeed ? "\n" : ",\n");
-    output << "    {\n";
-    output << "      \"address\": \"" << hexString(seed.Address) << "\",\n";
-    output << "      \"size\": " << seed.Size << ",\n";
-    output << "      \"range_start\": \"" << hexString(seed.RangeStart)
+    output << indent << "{\n";
+    output << indent << "  \"address\": \"" << hexString(seed.Address)
            << "\",\n";
-    output << "      \"range_end\": \"" << hexString(seed.RangeEnd)
+    output << indent << "  \"size\": " << seed.Size << ",\n";
+    output << indent << "  \"range_start\": \"" << hexString(seed.RangeStart)
            << "\",\n";
-    output << "      \"range_source\": \"" << jsonEscape(seed.RangeSource)
+    output << indent << "  \"range_end\": \"" << hexString(seed.RangeEnd)
            << "\",\n";
-    output << "      \"primary_name\": \"" << jsonEscape(seed.PrimaryName)
+    output << indent << "  \"range_source\": \"" << jsonEscape(seed.RangeSource)
            << "\",\n";
-    output << "      \"aliases\": ";
+    output << indent << "  \"primary_name\": \"" << jsonEscape(seed.PrimaryName)
+           << "\",\n";
+    output << indent << "  \"aliases\": ";
     printStringArray(output, seed.Aliases);
     output << ",\n";
-    output << "      \"sources\": ";
+    output << indent << "  \"sources\": ";
     printStringArray(output, seed.Sources);
     output << ",\n";
-    output << "      \"confidence\": \""
+    output << indent << "  \"confidence\": \""
            << notdec::bin2llvm::toString(seed.Confidence) << "\"\n";
-    output << "    }";
+    output << indent << "}";
     firstSeed = false;
   }
-  output << (firstSeed ? "],\n" : "\n  ],\n");
+  output << (firstSeed ? "]" : "\n" + indent.substr(0, indent.size() - 2) + "]");
+}
+
+void printSeedsJson(std::ostream &output,
+                    const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"seeds\": ";
+  printSeedsArrayJson(output, state, "    ");
+  output << ",\n";
   output << "  \"count\": " << state.functionSeeds().size() << "\n";
   output << "}\n";
+}
+
+void printFunctionsArrayJson(
+    std::ostream &output,
+    const notdec::bin2llvm::NativeProgramState &state,
+    const std::string &indent) {
+  output << "[";
+  bool firstFunction = true;
+  for (const auto &[entry, function] : state.functions()) {
+    (void)entry;
+    output << (firstFunction ? "\n" : ",\n");
+    output << indent << "{\n";
+    output << indent << "  \"entry\": \"" << hexString(function.Entry)
+           << "\",\n";
+    output << indent << "  \"range_start\": \"" << hexString(function.RangeStart)
+           << "\",\n";
+    output << indent << "  \"range_end\": \"" << hexString(function.RangeEnd)
+           << "\",\n";
+    output << indent << "  \"name\": \"" << jsonEscape(function.Name)
+           << "\",\n";
+    output << indent << "  \"source\": \"" << jsonEscape(function.Source)
+           << "\",\n";
+    output << indent << "  \"block_count\": " << function.Blocks.size()
+           << "\n";
+    output << indent << "}";
+    firstFunction = false;
+  }
+  output << (firstFunction ? "]" : "\n" + indent.substr(0, indent.size() - 2) + "]");
 }
 
 void printFunctionsJson(std::ostream &output,
                         const notdec::bin2llvm::NativeProgramState &state) {
   output << "{\n";
-  output << "  \"functions\": [";
-  bool firstFunction = true;
-  for (const auto &[entry, function] : state.functions()) {
-    (void)entry;
-    output << (firstFunction ? "\n" : ",\n");
-    output << "    {\n";
-    output << "      \"entry\": \"" << hexString(function.Entry) << "\",\n";
-    output << "      \"range_start\": \"" << hexString(function.RangeStart)
-           << "\",\n";
-    output << "      \"range_end\": \"" << hexString(function.RangeEnd)
-           << "\",\n";
-    output << "      \"name\": \"" << jsonEscape(function.Name) << "\",\n";
-    output << "      \"source\": \"" << jsonEscape(function.Source) << "\",\n";
-    output << "      \"block_count\": " << function.Blocks.size() << "\n";
-    output << "    }";
-    firstFunction = false;
-  }
-  output << (firstFunction ? "],\n" : "\n  ],\n");
+  output << "  \"functions\": ";
+  printFunctionsArrayJson(output, state, "    ");
+  output << ",\n";
   output << "  \"count\": " << state.functions().size() << "\n";
+  output << "}\n";
+}
+
+void printDiscoveryJson(std::ostream &output,
+                        const notdec::bin2llvm::NativeProgramState &state) {
+  output << "{\n";
+  output << "  \"seeds\": ";
+  printSeedsArrayJson(output, state, "    ");
+  output << ",\n";
+  output << "  \"seed_count\": " << state.functionSeeds().size() << ",\n";
+  output << "  \"functions\": ";
+  printFunctionsArrayJson(output, state, "    ");
+  output << ",\n";
+  output << "  \"function_count\": " << state.functions().size() << "\n";
   output << "}\n";
 }
 
@@ -1318,6 +1358,8 @@ int main(int argc, char **argv) {
       printEhFrameJson(std::cout, state);
     } else if (options->Mode == OutputMode::SeedsJson) {
       printSeedsJson(std::cout, state);
+    } else if (options->Mode == OutputMode::DiscoveryJson) {
+      printDiscoveryJson(std::cout, state);
     } else if (options->Mode == OutputMode::FunctionJson) {
       printFunctionJson(std::cout, state, *options->QueryFunctionEntry);
     } else if (options->Mode == OutputMode::FunctionXrefsJson) {
