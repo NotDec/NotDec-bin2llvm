@@ -139,7 +139,7 @@ scripts/bench2-native-discovery-debug-check.py
 
 - 脚本当前分别跑 `--seeds-json` 和 `--functions-json`，默认全量时会重复 discovery。
 
-## 4. `--all-confirmed` / 脚本重复跑 discovery（debug oracle 已优化）
+## 4. `--all-confirmed` / 脚本重复跑 discovery（selected-targets 已优化）
 
 现象：
 
@@ -188,8 +188,8 @@ debug oracle 脚本也有同类问题：初版分别跑 `--seeds-json` 和 `--fu
 
 剩余问题：
 
-- `notdec-native-llvm --all-confirmed` 内部仍会重新跑 discovery。
-- selected-targets-native 脚本如果先跑 discover 再跑 native-llvm，仍会付出重复成本。
+- `notdec-native-llvm --all-confirmed` 仍会跑 discovery，这是生成 confirmed module 的必要输入。
+- selected-targets-native 脚本已改成用 `notdec-native-llvm --summary-json-out`，不再先跑一次 `notdec-native-discover --summary-json`。
 
 ## 5. helper opcode 不是精确语义
 

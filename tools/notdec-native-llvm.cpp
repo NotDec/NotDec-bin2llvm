@@ -14,8 +14,10 @@
 
 #include <cstdint>
 #include <exception>
+#include <fstream>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -44,6 +46,7 @@ struct CliOptions {
       FunctionBlockSuccessors;
   bool AllConfirmed = false;
   std::string OutputPath;
+  std::string SummaryJsonPath;
 };
 
 void printUsage(const char *argv0) {
@@ -51,7 +54,8 @@ void printUsage(const char *argv0) {
             << " <elf-file> [sla-file] "
                "(-a <address> -l <length> | -f <entry> | -n <name> | "
                "--all-confirmed) "
-               "-o <output.ll> [-p root-sla-dir] [-s pspec-file]\n";
+               "-o <output.ll> [--summary-json-out <path>] "
+               "[-p root-sla-dir] [-s pspec-file]\n";
 }
 
 bool parseUint64(const std::string &text, uint64_t &value) {
@@ -113,6 +117,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       hasLength = true;
     } else if (flag == "-o") {
       options.OutputPath = std::move(value);
+    } else if (flag == "--summary-json-out") {
+      options.SummaryJsonPath = std::move(value);
     } else if (flag == "-p") {
       options.SpecOptions.RootSlaDir = std::move(value);
     } else if (flag == "-s") {
@@ -210,6 +216,30 @@ std::string sanitizeLlvmFunctionName(const std::string &name) {
   return result;
 }
 
+std::string jsonEscape(const std::string &text) {
+  std::string escaped;
+  escaped.reserve(text.size());
+  for (char ch : text) {
+    switch (ch) {
+    case '"':
+      escaped += "\\\"";
+      break;
+    case '\\':
+      escaped += "\\\\";
+      break;
+    case '\n':
+    case '\r':
+    case '\t':
+      escaped += ' ';
+      break;
+    default:
+      escaped += ch;
+      break;
+    }
+  }
+  return escaped;
+}
+
 notdec::bin2llvm::NativeProgramState
 runNativeDiscovery(const LIEF::ELF::Binary &binary) {
   notdec::bin2llvm::NativeProgramState state(binary);
@@ -222,6 +252,89 @@ runNativeDiscovery(const LIEF::ELF::Binary &binary) {
   manager.addAnalyzer(notdec::bin2llvm::createSleighSeedInstructionAnalyzer());
   manager.run(state);
   return state;
+}
+
+uint64_t countBasicBlocks(const notdec::bin2llvm::NativeProgramState &state) {
+  uint64_t count = 0;
+  for (const auto &[entry, function] : state.functions()) {
+    (void)entry;
+    count += function.Blocks.size();
+  }
+  return count;
+}
+
+bool writeSummaryJson(const notdec::bin2llvm::NativeProgramState &state,
+                      const std::string &path) {
+  using namespace notdec::bin2llvm;
+
+  std::ofstream output(path);
+  if (!output) {
+    std::cerr << "failed to open summary json: " << path << '\n';
+    return false;
+  }
+
+  std::map<NativeFunctionConfidence, uint64_t> confidenceCounts;
+  for (const auto &[address, seed] : state.functionSeeds()) {
+    (void)address;
+    ++confidenceCounts[seed.Confidence];
+  }
+
+  std::map<NativeXrefKind, uint64_t> xrefKindCounts;
+  for (const NativeXref &xref : state.xrefs()) {
+    ++xrefKindCounts[xref.Kind];
+  }
+
+  std::map<NativeUnresolvedFlowKind, uint64_t> unresolvedFlowCounts;
+  for (const NativeUnresolvedFlow &flow : state.unresolvedFlows()) {
+    ++unresolvedFlowCounts[flow.Kind];
+  }
+
+  output << "{\n";
+  output << "  \"function_seeds\": " << state.functionSeeds().size() << ",\n";
+  output << "  \"function_worklist\": " << state.functionWorklist().size()
+         << ",\n";
+  output << "  \"confirmed_functions\": " << state.functions().size() << ",\n";
+  output << "  \"basic_blocks\": " << countBasicBlocks(state) << ",\n";
+  output << "  \"instructions\": " << state.instructions().size() << ",\n";
+  output << "  \"sources\": {\n";
+  bool firstSource = true;
+  for (const auto &[source, count] : state.sourceCounts()) {
+    output << (firstSource ? "" : ",\n");
+    output << "    \"" << jsonEscape(source) << "\": " << count;
+    firstSource = false;
+  }
+  output << "\n  },\n";
+  output << "  \"confidence\": {\n";
+  output << "    \"high\": "
+         << confidenceCounts[NativeFunctionConfidence::High] << ",\n";
+  output << "    \"medium\": "
+         << confidenceCounts[NativeFunctionConfidence::Medium] << ",\n";
+  output << "    \"low\": "
+         << confidenceCounts[NativeFunctionConfidence::Low] << "\n";
+  output << "  },\n";
+  output << "  \"xrefs\": {\n";
+  output << "    \"total\": " << state.xrefs().size() << ",\n";
+  output << "    \"flow\": " << xrefKindCounts[NativeXrefKind::Flow]
+         << ",\n";
+  output << "    \"call\": " << xrefKindCounts[NativeXrefKind::Call]
+         << ",\n";
+  output << "    \"data\": " << xrefKindCounts[NativeXrefKind::Data]
+         << ",\n";
+  output << "    \"string\": " << xrefKindCounts[NativeXrefKind::String]
+         << "\n";
+  output << "  },\n";
+  output << "  \"unresolved_indirect_flows\": {\n";
+  output << "    \"total\": " << state.unresolvedFlows().size() << ",\n";
+  output << "    \"indirect call\": "
+         << unresolvedFlowCounts[NativeUnresolvedFlowKind::IndirectCall]
+         << ",\n";
+  output << "    \"indirect branch\": "
+         << unresolvedFlowCounts[NativeUnresolvedFlowKind::IndirectBranch]
+         << "\n";
+  output << "  },\n";
+  output << "  \"notes\": " << state.notes().size() << "\n";
+  output << "}\n";
+  return true;
 }
 
 bool resolveFunctionRange(const notdec::bin2llvm::NativeProgramState &state,
@@ -411,11 +524,11 @@ bool moduleVerifies(const llvm::Module &module, std::string &message) {
 }
 
 std::unique_ptr<llvm::Module> buildConfirmedModule(
-    llvm::LLVMContext &context, const LIEF::ELF::Binary &binary,
+    llvm::LLVMContext &context,
+    const notdec::bin2llvm::NativeProgramState &state,
     notdec::bin2llvm::LiefElfLoadImage &loadImage,
     const notdec::bin2llvm::SleighSpecOptions &specOptions,
     std::string &errorMessage) {
-  notdec::bin2llvm::NativeProgramState state = runNativeDiscovery(binary);
   auto module =
       std::make_unique<llvm::Module>("notdec.bin2llvm.native.confirmed", context);
 
@@ -511,10 +624,21 @@ int main(int argc, char **argv) {
       return 1;
     }
     std::unique_ptr<notdec::bin2llvm::NativeProgramState> selectedState;
-    if (options->FunctionEntry || !options->FunctionName.empty()) {
+    if (options->AllConfirmed || options->FunctionEntry ||
+        !options->FunctionName.empty()) {
       selectedState =
           std::make_unique<notdec::bin2llvm::NativeProgramState>(
               runNativeDiscovery(*binary));
+    }
+    if (selectedState && !options->SummaryJsonPath.empty() &&
+        !writeSummaryJson(*selectedState, options->SummaryJsonPath)) {
+      return 1;
+    }
+    if (!selectedState && !options->SummaryJsonPath.empty()) {
+      std::cerr << "--summary-json-out requires -f, -n, or --all-confirmed\n";
+      return 1;
+    }
+    if (options->FunctionEntry || !options->FunctionName.empty()) {
       if (!resolveFunctionRange(*selectedState, *options)) {
         return 1;
       }
@@ -529,7 +653,7 @@ int main(int argc, char **argv) {
     std::string errorMessage;
     std::unique_ptr<llvm::Module> module;
     if (options->AllConfirmed) {
-      module = buildConfirmedModule(context, *binary, loadImage,
+      module = buildConfirmedModule(context, *selectedState, loadImage,
                                     options->SpecOptions, errorMessage);
     } else {
       notdec::bin2llvm::PcodeProgram program;
