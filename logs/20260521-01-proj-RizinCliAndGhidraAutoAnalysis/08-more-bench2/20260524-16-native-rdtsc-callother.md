@@ -79,5 +79,43 @@ notdec.native_llvm.x86_64_smoke passed 0.59s
 
 ## 剩余问题
 
-- 需要再跑一次 limited selected-targets，确认所有 `.ll` 里没有 `notdec_pcode_`。
 - wolfssl full discovery 仍慢，这是 discovery 性能问题。
+
+## 补充验证
+
+用 `--decode-seed-limit 200` 重跑 selected-targets-native 到临时目录：
+
+```text
+/usr/bin/time -f 'TIME selected-limited2 %e' \
+  /sn640/NotDec-Exp/Bench2/scripts/export-bin2llvm-selected-targets.py \
+  --decode-seed-limit 200 \
+  --output-root /tmp/notdec-selected-native-ir-limited2 \
+  --native-project-root /tmp/notdec-selected-native-projects-limited2
+
+TIME selected-limited2 1064.23
+```
+
+结果：
+
+- 14 个 selected targets 全部 `ok`。
+- 所有 `module-all.ll` 都没有 `notdec_pcode_`。
+- 每个目标的 `llvm-as` / `opt -passes=verify` 都已由脚本通过。
+
+confirmed function 数：
+
+```text
+ffmpeg-resample-library    148
+libicu-common-library      200
+libuv-shared-library       200
+lighttpd-executable        200
+memcached-executable       200
+openssh-client             200
+php-extension-calendar     52
+python-shared-library      200
+redis-server-symlink       200
+tmux-executable            200
+vim-executable             200
+vsftpd-executable          186
+wolfssl-shared-library     200
+wrk-executable             142
+```
