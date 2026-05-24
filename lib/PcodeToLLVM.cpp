@@ -347,10 +347,16 @@ private:
     if (byteSize == 8) {
       return llvm::Type::getDoubleTy(Context);
     }
+    if (byteSize == 10) {
+      return llvm::Type::getX86_FP80Ty(Context);
+    }
     return nullptr;
   }
 
   uint32_t floatByteSize(llvm::Type *type) const {
+    if (type->isX86_FP80Ty()) {
+      return 10;
+    }
     return type->isDoubleTy() ? 8 : 4;
   }
 
