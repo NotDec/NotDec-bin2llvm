@@ -30,8 +30,12 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
     return "INT_NOTEQUAL";
   case PcodeOpcode::IntSLess:
     return "INT_SLESS";
+  case PcodeOpcode::IntSLessEqual:
+    return "INT_SLESSEQUAL";
   case PcodeOpcode::IntLess:
     return "INT_LESS";
+  case PcodeOpcode::IntLessEqual:
+    return "INT_LESSEQUAL";
   case PcodeOpcode::IntZExt:
     return "INT_ZEXT";
   case PcodeOpcode::IntSExt:
@@ -46,6 +50,10 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
     return "INT_SUB";
   case PcodeOpcode::IntSBorrow:
     return "INT_SBORROW";
+  case PcodeOpcode::Int2Comp:
+    return "INT_2COMP";
+  case PcodeOpcode::IntNegate:
+    return "INT_NEGATE";
   case PcodeOpcode::IntXor:
     return "INT_XOR";
   case PcodeOpcode::IntAnd:
@@ -62,8 +70,12 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
     return "INT_MULT";
   case PcodeOpcode::IntDiv:
     return "INT_DIV";
+  case PcodeOpcode::IntSDiv:
+    return "INT_SDIV";
   case PcodeOpcode::IntRem:
     return "INT_REM";
+  case PcodeOpcode::IntSRem:
+    return "INT_SREM";
   case PcodeOpcode::BoolNegate:
     return "BOOL_NEGATE";
   case PcodeOpcode::BoolAnd:
@@ -72,12 +84,70 @@ const char *pcodeOpcodeName(PcodeOpcode opcode) {
     return "BOOL_OR";
   case PcodeOpcode::BoolXor:
     return "BOOL_XOR";
+  case PcodeOpcode::FloatEqual:
+    return "FLOAT_EQUAL";
+  case PcodeOpcode::FloatNotEqual:
+    return "FLOAT_NOTEQUAL";
+  case PcodeOpcode::FloatLess:
+    return "FLOAT_LESS";
+  case PcodeOpcode::FloatLessEqual:
+    return "FLOAT_LESSEQUAL";
+  case PcodeOpcode::FloatNan:
+    return "FLOAT_NAN";
+  case PcodeOpcode::FloatAdd:
+    return "FLOAT_ADD";
+  case PcodeOpcode::FloatDiv:
+    return "FLOAT_DIV";
+  case PcodeOpcode::FloatMult:
+    return "FLOAT_MULT";
+  case PcodeOpcode::FloatSub:
+    return "FLOAT_SUB";
+  case PcodeOpcode::FloatNeg:
+    return "FLOAT_NEG";
+  case PcodeOpcode::FloatAbs:
+    return "FLOAT_ABS";
+  case PcodeOpcode::FloatSqrt:
+    return "FLOAT_SQRT";
+  case PcodeOpcode::FloatInt2Float:
+    return "INT2FLOAT";
+  case PcodeOpcode::FloatFloat2Float:
+    return "FLOAT2FLOAT";
+  case PcodeOpcode::FloatTrunc:
+    return "TRUNC";
+  case PcodeOpcode::FloatCeil:
+    return "CEIL";
+  case PcodeOpcode::FloatFloor:
+    return "FLOOR";
+  case PcodeOpcode::FloatRound:
+    return "ROUND";
+  case PcodeOpcode::Multiequal:
+    return "MULTIEQUAL";
+  case PcodeOpcode::Indirect:
+    return "INDIRECT";
   case PcodeOpcode::Piece:
     return "PIECE";
   case PcodeOpcode::Subpiece:
     return "SUBPIECE";
+  case PcodeOpcode::Cast:
+    return "CAST";
+  case PcodeOpcode::PtrAdd:
+    return "PTRADD";
+  case PcodeOpcode::PtrSub:
+    return "PTRSUB";
+  case PcodeOpcode::SegmentOp:
+    return "SEGMENTOP";
+  case PcodeOpcode::CpoolRef:
+    return "CPOOLREF";
+  case PcodeOpcode::New:
+    return "NEW";
+  case PcodeOpcode::Insert:
+    return "INSERT";
+  case PcodeOpcode::Extract:
+    return "EXTRACT";
   case PcodeOpcode::Popcount:
     return "POPCOUNT";
+  case PcodeOpcode::Lzcount:
+    return "LZCOUNT";
   case PcodeOpcode::Unsupported:
     return "UNSUPPORTED";
   }

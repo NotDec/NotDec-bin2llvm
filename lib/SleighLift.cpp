@@ -59,8 +59,12 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
     return PcodeOpcode::IntNotEqual;
   case ghidra::CPUI_INT_SLESS:
     return PcodeOpcode::IntSLess;
+  case ghidra::CPUI_INT_SLESSEQUAL:
+    return PcodeOpcode::IntSLessEqual;
   case ghidra::CPUI_INT_LESS:
     return PcodeOpcode::IntLess;
+  case ghidra::CPUI_INT_LESSEQUAL:
+    return PcodeOpcode::IntLessEqual;
   case ghidra::CPUI_INT_ZEXT:
     return PcodeOpcode::IntZExt;
   case ghidra::CPUI_INT_SEXT:
@@ -75,6 +79,10 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
     return PcodeOpcode::IntSub;
   case ghidra::CPUI_INT_SBORROW:
     return PcodeOpcode::IntSBorrow;
+  case ghidra::CPUI_INT_2COMP:
+    return PcodeOpcode::Int2Comp;
+  case ghidra::CPUI_INT_NEGATE:
+    return PcodeOpcode::IntNegate;
   case ghidra::CPUI_INT_XOR:
     return PcodeOpcode::IntXor;
   case ghidra::CPUI_INT_AND:
@@ -91,8 +99,12 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
     return PcodeOpcode::IntMult;
   case ghidra::CPUI_INT_DIV:
     return PcodeOpcode::IntDiv;
+  case ghidra::CPUI_INT_SDIV:
+    return PcodeOpcode::IntSDiv;
   case ghidra::CPUI_INT_REM:
     return PcodeOpcode::IntRem;
+  case ghidra::CPUI_INT_SREM:
+    return PcodeOpcode::IntSRem;
   case ghidra::CPUI_BOOL_NEGATE:
     return PcodeOpcode::BoolNegate;
   case ghidra::CPUI_BOOL_AND:
@@ -101,12 +113,70 @@ PcodeOpcode convertOpcode(ghidra::OpCode opcode) {
     return PcodeOpcode::BoolOr;
   case ghidra::CPUI_BOOL_XOR:
     return PcodeOpcode::BoolXor;
+  case ghidra::CPUI_FLOAT_EQUAL:
+    return PcodeOpcode::FloatEqual;
+  case ghidra::CPUI_FLOAT_NOTEQUAL:
+    return PcodeOpcode::FloatNotEqual;
+  case ghidra::CPUI_FLOAT_LESS:
+    return PcodeOpcode::FloatLess;
+  case ghidra::CPUI_FLOAT_LESSEQUAL:
+    return PcodeOpcode::FloatLessEqual;
+  case ghidra::CPUI_FLOAT_NAN:
+    return PcodeOpcode::FloatNan;
+  case ghidra::CPUI_FLOAT_ADD:
+    return PcodeOpcode::FloatAdd;
+  case ghidra::CPUI_FLOAT_DIV:
+    return PcodeOpcode::FloatDiv;
+  case ghidra::CPUI_FLOAT_MULT:
+    return PcodeOpcode::FloatMult;
+  case ghidra::CPUI_FLOAT_SUB:
+    return PcodeOpcode::FloatSub;
+  case ghidra::CPUI_FLOAT_NEG:
+    return PcodeOpcode::FloatNeg;
+  case ghidra::CPUI_FLOAT_ABS:
+    return PcodeOpcode::FloatAbs;
+  case ghidra::CPUI_FLOAT_SQRT:
+    return PcodeOpcode::FloatSqrt;
+  case ghidra::CPUI_FLOAT_INT2FLOAT:
+    return PcodeOpcode::FloatInt2Float;
+  case ghidra::CPUI_FLOAT_FLOAT2FLOAT:
+    return PcodeOpcode::FloatFloat2Float;
+  case ghidra::CPUI_FLOAT_TRUNC:
+    return PcodeOpcode::FloatTrunc;
+  case ghidra::CPUI_FLOAT_CEIL:
+    return PcodeOpcode::FloatCeil;
+  case ghidra::CPUI_FLOAT_FLOOR:
+    return PcodeOpcode::FloatFloor;
+  case ghidra::CPUI_FLOAT_ROUND:
+    return PcodeOpcode::FloatRound;
+  case ghidra::CPUI_MULTIEQUAL:
+    return PcodeOpcode::Multiequal;
+  case ghidra::CPUI_INDIRECT:
+    return PcodeOpcode::Indirect;
   case ghidra::CPUI_PIECE:
     return PcodeOpcode::Piece;
   case ghidra::CPUI_SUBPIECE:
     return PcodeOpcode::Subpiece;
+  case ghidra::CPUI_CAST:
+    return PcodeOpcode::Cast;
+  case ghidra::CPUI_PTRADD:
+    return PcodeOpcode::PtrAdd;
+  case ghidra::CPUI_PTRSUB:
+    return PcodeOpcode::PtrSub;
+  case ghidra::CPUI_SEGMENTOP:
+    return PcodeOpcode::SegmentOp;
+  case ghidra::CPUI_CPOOLREF:
+    return PcodeOpcode::CpoolRef;
+  case ghidra::CPUI_NEW:
+    return PcodeOpcode::New;
+  case ghidra::CPUI_INSERT:
+    return PcodeOpcode::Insert;
+  case ghidra::CPUI_EXTRACT:
+    return PcodeOpcode::Extract;
   case ghidra::CPUI_POPCOUNT:
     return PcodeOpcode::Popcount;
+  case ghidra::CPUI_LZCOUNT:
+    return PcodeOpcode::Lzcount;
   default:
     return PcodeOpcode::Unsupported;
   }

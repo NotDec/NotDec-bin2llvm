@@ -388,8 +388,14 @@ private:
     case PcodeOpcode::IntDiv:
       result = Builder.CreateUDiv(lhs, rhs);
       break;
+    case PcodeOpcode::IntSDiv:
+      result = Builder.CreateSDiv(lhs, rhs);
+      break;
     case PcodeOpcode::IntRem:
       result = Builder.CreateURem(lhs, rhs);
+      break;
+    case PcodeOpcode::IntSRem:
+      result = Builder.CreateSRem(lhs, rhs);
       break;
     case PcodeOpcode::IntAnd:
       result = Builder.CreateAnd(lhs, rhs);
@@ -437,8 +443,14 @@ private:
     case PcodeOpcode::IntLess:
       result = Builder.CreateICmpULT(lhs, rhs);
       break;
+    case PcodeOpcode::IntLessEqual:
+      result = Builder.CreateICmpULE(lhs, rhs);
+      break;
     case PcodeOpcode::IntSLess:
       result = Builder.CreateICmpSLT(lhs, rhs);
+      break;
+    case PcodeOpcode::IntSLessEqual:
+      result = Builder.CreateICmpSLE(lhs, rhs);
       break;
     default:
       return false;
@@ -460,6 +472,25 @@ private:
       result = Builder.CreateZExt(input, outputType);
     } else {
       result = Builder.CreateSExt(input, outputType);
+    }
+    write(*op.Output, result);
+    return true;
+  }
+
+  bool lowerUnary(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 1, errorMessage)) {
+      return false;
+    }
+
+    llvm::Value *input = resize(read(op.Inputs[0]), op.Output->Size);
+    llvm::Value *result = nullptr;
+    if (op.Opcode == PcodeOpcode::IntNegate) {
+      result = Builder.CreateNot(input);
+    } else if (op.Opcode == PcodeOpcode::Int2Comp) {
+      result = Builder.CreateNeg(input);
+    } else {
+      errorMessage = "unsupported unary opcode: " + op.OpcodeName;
+      return false;
     }
     write(*op.Output, result);
     return true;
@@ -495,15 +526,64 @@ private:
     return true;
   }
 
-  bool lowerPopcount(const PcodeOpView &op, std::string &errorMessage) {
+  bool lowerCountBits(const PcodeOpView &op, std::string &errorMessage) {
     if (!op.Output || !requireInputCount(op, 1, errorMessage)) {
       return false;
     }
 
     llvm::Value *input = read(op.Inputs[0]);
+    llvm::Intrinsic::ID intrinsicId =
+        op.Opcode == PcodeOpcode::Popcount ? llvm::Intrinsic::ctpop
+                                           : llvm::Intrinsic::ctlz;
     llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
-        &Module, llvm::Intrinsic::ctpop, {input->getType()});
-    write(*op.Output, Builder.CreateCall(intrinsic, {input}));
+        &Module, intrinsicId, {input->getType()});
+    if (op.Opcode == PcodeOpcode::Lzcount) {
+      auto *zeroUndef = llvm::ConstantInt::getFalse(Context);
+      write(*op.Output, Builder.CreateCall(intrinsic, {input, zeroUndef}));
+    } else {
+      write(*op.Output, Builder.CreateCall(intrinsic, {input}));
+    }
+    return true;
+  }
+
+  bool lowerCopyLike(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 1, errorMessage)) {
+      return false;
+    }
+    write(*op.Output, read(op.Inputs[0]));
+    return true;
+  }
+
+  bool lowerPtrAdd(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 3, errorMessage)) {
+      return false;
+    }
+    if (op.Inputs[2].Space != "const") {
+      errorMessage = "PTRADD element size must be constant";
+      return false;
+    }
+
+    llvm::Value *base = resize(read(op.Inputs[0]), op.Output->Size);
+    llvm::Value *index = resize(read(op.Inputs[1]), op.Output->Size);
+    llvm::Value *scale =
+        llvm::ConstantInt::get(base->getType(), op.Inputs[2].Offset);
+    write(*op.Output, Builder.CreateAdd(base, Builder.CreateMul(index, scale)));
+    return true;
+  }
+
+  bool lowerPtrSub(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 2, errorMessage)) {
+      return false;
+    }
+    if (op.Inputs[1].Space != "const") {
+      errorMessage = "PTRSUB offset must be constant";
+      return false;
+    }
+
+    llvm::Value *base = resize(read(op.Inputs[0]), op.Output->Size);
+    llvm::Value *offset =
+        llvm::ConstantInt::get(base->getType(), op.Inputs[1].Offset);
+    write(*op.Output, Builder.CreateAdd(base, offset));
     return true;
   }
 
@@ -769,7 +849,9 @@ private:
     case PcodeOpcode::IntSub:
     case PcodeOpcode::IntMult:
     case PcodeOpcode::IntDiv:
+    case PcodeOpcode::IntSDiv:
     case PcodeOpcode::IntRem:
+    case PcodeOpcode::IntSRem:
     case PcodeOpcode::IntAnd:
     case PcodeOpcode::IntOr:
     case PcodeOpcode::IntXor:
@@ -781,16 +863,29 @@ private:
     case PcodeOpcode::IntNotEqual:
     case PcodeOpcode::IntLess:
     case PcodeOpcode::IntSLess:
+    case PcodeOpcode::IntLessEqual:
+    case PcodeOpcode::IntSLessEqual:
       return lowerCompare(op, errorMessage);
     case PcodeOpcode::IntZExt:
     case PcodeOpcode::IntSExt:
       return lowerCast(op, errorMessage);
+    case PcodeOpcode::IntNegate:
+    case PcodeOpcode::Int2Comp:
+      return lowerUnary(op, errorMessage);
+    case PcodeOpcode::Cast:
+    case PcodeOpcode::Indirect:
+      return lowerCopyLike(op, errorMessage);
     case PcodeOpcode::Piece:
       return lowerPiece(op, errorMessage);
     case PcodeOpcode::Subpiece:
       return lowerSubpiece(op, errorMessage);
+    case PcodeOpcode::PtrAdd:
+      return lowerPtrAdd(op, errorMessage);
+    case PcodeOpcode::PtrSub:
+      return lowerPtrSub(op, errorMessage);
     case PcodeOpcode::Popcount:
-      return lowerPopcount(op, errorMessage);
+    case PcodeOpcode::Lzcount:
+      return lowerCountBits(op, errorMessage);
     case PcodeOpcode::IntCarry:
     case PcodeOpcode::IntSCarry:
       return lowerAddOverflow(op, errorMessage);
@@ -802,6 +897,33 @@ private:
     case PcodeOpcode::BoolOr:
     case PcodeOpcode::BoolXor:
       return lowerBoolBinary(op, errorMessage);
+    case PcodeOpcode::FloatEqual:
+    case PcodeOpcode::FloatNotEqual:
+    case PcodeOpcode::FloatLess:
+    case PcodeOpcode::FloatLessEqual:
+    case PcodeOpcode::FloatNan:
+    case PcodeOpcode::FloatAdd:
+    case PcodeOpcode::FloatDiv:
+    case PcodeOpcode::FloatMult:
+    case PcodeOpcode::FloatSub:
+    case PcodeOpcode::FloatNeg:
+    case PcodeOpcode::FloatAbs:
+    case PcodeOpcode::FloatSqrt:
+    case PcodeOpcode::FloatInt2Float:
+    case PcodeOpcode::FloatFloat2Float:
+    case PcodeOpcode::FloatTrunc:
+    case PcodeOpcode::FloatCeil:
+    case PcodeOpcode::FloatFloor:
+    case PcodeOpcode::FloatRound:
+    case PcodeOpcode::SegmentOp:
+    case PcodeOpcode::CpoolRef:
+    case PcodeOpcode::New:
+    case PcodeOpcode::Insert:
+    case PcodeOpcode::Extract:
+      return lowerHelperCall(op, errorMessage);
+    case PcodeOpcode::Multiequal:
+      errorMessage = "MULTIEQUAL is not expected in raw Sleigh P-Code";
+      return false;
     case PcodeOpcode::Unsupported:
       break;
     }
