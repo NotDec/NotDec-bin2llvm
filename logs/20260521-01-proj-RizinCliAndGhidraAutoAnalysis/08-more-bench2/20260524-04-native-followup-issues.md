@@ -193,7 +193,7 @@ debug oracle 脚本也有同类问题：初版分别跑 `--seeds-json` 和 `--fu
 
 ## 5. helper opcode 不是精确语义
 
-现状：
+现状（已部分修复）：
 
 native opcode 表已经补齐，但下面这些 opcode 当前走 helper：
 
@@ -222,6 +222,21 @@ native opcode 表已经补齐，但下面这些 opcode 当前走 helper：
 - helper opcode 数量逐步下降。
 - 每补一个 opcode，都有对应 Bench2 样本验证。
 - 不为了“覆盖完整”写不确定语义。
+
+实现记录：
+
+- 见 `20260524-11-native-direct-call-fallback.md`。
+  - 已修 direct `CALL` helper fallback：已知 direct target 但不是 confirmed/external symbol 时，生成 `notdec_native_<addr>` 声明调用。
+- 见 `20260524-12-native-float32-64-lowering.md`。
+  - 已修 4/8-byte `FLOAT_ADD` / `FLOAT_SUB` / `FLOAT_MULT` / `FLOAT_DIV` / compare / `FLOAT_NAN` / `INT2FLOAT` / `FLOAT2FLOAT` / `FLOAT_TRUNC`。
+- 见 `20260524-13-native-x87-float-lowering.md`。
+  - 已把 10-byte x87 float 映射到 LLVM `x86_fp80`。
+  - `wrk --all-confirmed` 已无 `notdec_pcode_` helper，并通过 LLVM 22 `llvm-as` / `opt -passes=verify`。
+
+剩余问题：
+
+- selected-targets-native 需要用新版本全量重跑后再确认是否还有 `CALLIND`、`INSERT`、`EXTRACT`、`SEGMENTOP` 等 helper。
+- 如果仍有 `CALLIND`，需要先看具体样本来源，不能直接猜目标。
 
 ## 6. 函数范围 / CFG 可能过大
 
@@ -253,6 +268,6 @@ native opcode 表已经补齐，但下面这些 opcode 当前走 helper：
 
 ## 建议优先级
 
-1. 修函数范围 / CFG 过大问题，先看 `libuv` 的 `0x9c38`。
-2. 处理 `notdec-native-llvm --all-confirmed` 和 selected-targets-native 脚本的重复 discovery。
-3. 统计 Bench2 helper opcode 频率，再按真实出现频率补精确语义。
+1. 用新版本重跑 selected-targets-native，重新统计 `notdec_pcode_` helper 和失败目标。
+2. 如果还有 `CALLIND` helper，优先按真实 GOT/source tracking 样本修。
+3. 如果还有 `INSERT` / `EXTRACT` / `SEGMENTOP` 等特殊 opcode，再按样本补精确语义。
