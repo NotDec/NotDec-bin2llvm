@@ -53,7 +53,7 @@ skip native function 0x9c38: CBRANCH target must be a direct ram address
 - 已在 native lowering 里支持 `BRANCH` / `CBRANCH` 的 const relative target。
 - 验证结果：`libuv --all-confirmed` 输出 485 个 LLVM function，并通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
 
-## 2. 全量 discovery / lowering 太慢
+## 2. 全量 discovery / lowering 太慢（smoke 已拆分）
 
 现象：
 
@@ -79,6 +79,19 @@ libuv --all-confirmed: 241.92s / 247.19s
 - CTest smoke 回到秒级或十几秒级。
 - Bench2 coverage 脚本仍能跑全量并记录 confirmed/function 覆盖。
 - 不再用隐藏常量把默认 correctness 路线截断。
+
+实现记录：
+
+- 见 `20260524-06-native-discovery-smoke-limit.md`。
+- 已给 `notdec-native-discover` 增加显式参数 `--decode-seed-limit <count>`。
+- 默认 discovery 仍然全量。
+- CTest `notdec.native_discover.x86_64_smoke` 改用 `--decode-seed-limit 20`。
+- 验证结果：discover smoke 3.85 秒，native LLVM smoke 0.57 秒，总 CTest 4.43 秒。
+
+剩余问题：
+
+- `notdec-native-llvm -f` / `--all-confirmed` 仍会全量跑 discovery。
+- Bench2 coverage 仍需要单独脚本和 debug-info oracle。
 
 ## 3. 用 debug info 做 discovery oracle
 
@@ -186,7 +199,6 @@ native opcode 表已经补齐，但下面这些 opcode 当前走 helper：
 
 ## 建议优先级
 
-1. 拆 smoke / coverage 模式，避免 CTest 长期 60 秒。
-2. 同时补 debug-info oracle 脚本，用它衡量 native discovery。
-3. 再处理 `--all-confirmed` 重复 discovery。
-4. 最后按 Bench2 实际出现频率逐个精确化 helper opcode。
+1. 补 debug-info oracle 脚本，用它衡量 native discovery。
+2. 处理 `--all-confirmed` 重复 discovery。
+3. 最后按 Bench2 实际出现频率逐个精确化 helper opcode。

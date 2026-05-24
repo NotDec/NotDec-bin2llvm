@@ -48,6 +48,7 @@ enum class OutputMode {
 struct CliOptions {
   std::string ElfPath;
   OutputMode Mode = OutputMode::TextReport;
+  notdec::bin2llvm::NativeSleighDecodeOptions DecodeOptions;
   std::optional<uint64_t> QueryAddress;
   std::optional<uint64_t> QueryStart;
   std::optional<uint64_t> QueryEnd;
@@ -57,6 +58,8 @@ struct CliOptions {
 
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0 << " <elf-file>\n";
+  std::cerr << "       " << argv0
+            << " [--decode-seed-limit <count>] <mode> <elf-file>\n";
   std::cerr << "       " << argv0 << " --summary-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --memory-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --relocations-json <elf-file>\n";
@@ -121,32 +124,51 @@ parseXrefKind(const std::string &text) {
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
-  if (argc != 2 && argc != 3 && argc != 4 && argc != 5) {
+  CliOptions options;
+  std::vector<std::string> args;
+  for (int index = 1; index < argc; ++index) {
+    std::string arg = argv[index];
+    if (arg == "--decode-seed-limit") {
+      if (index + 1 >= argc) {
+        return std::nullopt;
+      }
+      std::optional<uint64_t> limit = parseAddress(argv[++index]);
+      if (!limit) {
+        return std::nullopt;
+      }
+      options.DecodeOptions.MaxDecodedSeeds = *limit;
+      continue;
+    }
+    args.push_back(std::move(arg));
+  }
+
+  int effectiveArgc = static_cast<int>(args.size()) + 1;
+  if (effectiveArgc != 2 && effectiveArgc != 3 && effectiveArgc != 4 &&
+      effectiveArgc != 5) {
     return std::nullopt;
   }
 
-  CliOptions options;
-  if (argc == 2) {
-    options.ElfPath = argv[1];
+  if (effectiveArgc == 2) {
+    options.ElfPath = args[0];
     return options;
   }
 
-  std::string mode = argv[1];
-  if (argc == 5) {
+  std::string mode = args[0];
+  if (effectiveArgc == 5) {
     if (mode != "--instructions-range-json") {
       return std::nullopt;
     }
     options.Mode = OutputMode::InstructionsRangeJson;
-    options.QueryStart = parseAddress(argv[2]);
-    options.QueryEnd = parseAddress(argv[3]);
+    options.QueryStart = parseAddress(args[1]);
+    options.QueryEnd = parseAddress(args[2]);
     if (!options.QueryStart || !options.QueryEnd) {
       return std::nullopt;
     }
-    options.ElfPath = argv[4];
+    options.ElfPath = args[3];
     return options;
   }
 
-  if (argc == 4) {
+  if (effectiveArgc == 4) {
     if (mode == "--xrefs-from-json") {
       options.Mode = OutputMode::XrefsFromJson;
     } else if (mode == "--xrefs-to-json") {
@@ -169,14 +191,14 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       return std::nullopt;
     }
     if (options.Mode == OutputMode::XrefsKindJson) {
-      options.QueryXrefKind = parseXrefKind(argv[2]);
+      options.QueryXrefKind = parseXrefKind(args[1]);
       if (!options.QueryXrefKind) {
         return std::nullopt;
       }
-      options.ElfPath = argv[3];
+      options.ElfPath = args[2];
       return options;
     }
-    std::optional<uint64_t> address = parseAddress(argv[2]);
+    std::optional<uint64_t> address = parseAddress(args[1]);
     if (!address) {
       return std::nullopt;
     }
@@ -195,7 +217,7 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     } else {
       options.QueryAddress = *address;
     }
-    options.ElfPath = argv[3];
+    options.ElfPath = args[2];
     return options;
   }
 
@@ -232,7 +254,7 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
   } else {
     return std::nullopt;
   }
-  options.ElfPath = argv[2];
+  options.ElfPath = args[1];
   return options;
 }
 
@@ -1278,7 +1300,8 @@ int main(int argc, char **argv) {
     manager.addAnalyzer(notdec::bin2llvm::createElfSymbolAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createEhFrameAnalyzer());
     manager.addAnalyzer(
-        notdec::bin2llvm::createSleighSeedInstructionAnalyzer());
+        notdec::bin2llvm::createSleighSeedInstructionAnalyzer(
+            options->DecodeOptions));
     if (options->Mode == OutputMode::TextReport) {
       manager.addAnalyzer(notdec::bin2llvm::createReportAnalyzer(std::cout));
     }

@@ -314,12 +314,19 @@ private:
   std::vector<std::unique_ptr<NativeAnalyzer>> Analyzers;
 };
 
+// Native Sleigh decode defaults to full coverage.  Tests and smoke scripts can
+// pass explicit limits without changing the correctness-oriented default path.
+struct NativeSleighDecodeOptions {
+  std::optional<uint64_t> MaxDecodedSeeds;
+};
+
 std::unique_ptr<NativeAnalyzer> createElfLoadAnalyzer();
 std::unique_ptr<NativeAnalyzer> createRelocationPltAnalyzer();
 std::unique_ptr<NativeAnalyzer> createElfEntryAnalyzer();
 std::unique_ptr<NativeAnalyzer> createElfSymbolAnalyzer();
 std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer();
-std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer();
+std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
+    NativeSleighDecodeOptions options = {});
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output);
 
 } // namespace notdec::bin2llvm

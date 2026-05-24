@@ -1295,6 +1295,9 @@ private:
 
 class SleighSeedInstructionAnalyzer final : public NativeAnalyzer {
 public:
+  explicit SleighSeedInstructionAnalyzer(NativeSleighDecodeOptions options)
+      : Options(options) {}
+
   std::string name() const override { return "SleighSeedInstructionAnalyzer"; }
   int priority() const override { return 60; }
 
@@ -1316,7 +1319,15 @@ public:
     std::set<std::pair<uint64_t, uint64_t>> decodedSeeds;
     enqueueInitialSeeds(state, decodeQueue, queuedSeeds);
 
+    uint64_t decodedSeedCount = 0;
     while (!decodeQueue.empty()) {
+      if (Options.MaxDecodedSeeds &&
+          decodedSeedCount >= *Options.MaxDecodedSeeds) {
+        state.addNote("sleigh instruction decode stopped after explicit seed "
+                      "limit " +
+                      std::to_string(*Options.MaxDecodedSeeds));
+        break;
+      }
       DecodeQueueItem item = decodeQueue.front();
       decodeQueue.pop_front();
       std::pair<uint64_t, uint64_t> seedKey{item.FunctionEntry,
@@ -1329,6 +1340,7 @@ public:
       std::vector<uint64_t> branchTargets;
       decodeSeed(state, loadImage, item.FunctionEntry, item.BlockAddress,
                  callTargets, branchTargets);
+      ++decodedSeedCount;
       for (uint64_t target : callTargets) {
         state.addFunctionSeed(target, 0, "", "sleigh-direct-call",
                               NativeFunctionConfidence::High);
@@ -1370,6 +1382,7 @@ private:
 
   std::ostringstream NullErrors;
   SleighSpecOptions SpecOptions;
+  NativeSleighDecodeOptions Options;
 
   static void addRelocationCodeSeeds(NativeProgramState &state) {
     for (const auto &[slot, target] : state.relocatedPointers()) {
@@ -2630,8 +2643,9 @@ std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer() {
   return std::make_unique<EhFrameAnalyzer>();
 }
 
-std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer() {
-  return std::make_unique<SleighSeedInstructionAnalyzer>();
+std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
+    NativeSleighDecodeOptions options) {
+  return std::make_unique<SleighSeedInstructionAnalyzer>(options);
 }
 
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output) {

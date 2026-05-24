@@ -103,7 +103,7 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
       NAME notdec.native_discover.x86_64_smoke
       COMMAND
         /bin/bash -c
-        "$<TARGET_FILE:notdec-native-discover> /bin/ls > ${PROJECT_BINARY_DIR}/notdec-native-discover-smoke.txt"
+        "$<TARGET_FILE:notdec-native-discover> --decode-seed-limit 20 /bin/ls > ${PROJECT_BINARY_DIR}/notdec-native-discover-smoke.txt"
     )
   endif ()
 
