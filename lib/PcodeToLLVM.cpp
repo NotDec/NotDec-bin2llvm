@@ -980,6 +980,16 @@ private:
     return true;
   }
 
+  bool lowerUnknownVoidIndirectCall(const VarnodeView &target) {
+    auto *calleeType =
+        llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
+    auto *calleePointer =
+        Builder.CreateIntToPtr(resize(read(target), 8),
+                               llvm::PointerType::getUnqual(Context));
+    Builder.CreateCall(calleeType, calleePointer, {});
+    return true;
+  }
+
   bool lowerKnownVoidTailJump(const std::string &calleeName) {
     // Current native lowering has no ABI/prototype model.  For proven external
     // tail jumps, preserve the handoff to the external symbol and end this body.
@@ -1020,6 +1030,7 @@ private:
           return lowerKnownVoidCall(it->second);
         }
       }
+      return lowerUnknownVoidIndirectCall(op.Inputs[0]);
     }
     return lowerHelperCall(op, errorMessage);
   }
