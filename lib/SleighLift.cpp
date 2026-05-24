@@ -257,6 +257,24 @@ void collectRegisters(const ghidra::Sleigh &engine, PcodeProgram &program) {
   }
 }
 
+bool appendInstructionPcode(ghidra::Sleigh &engine, PcodeCollector &collector,
+                            ghidra::Address &current,
+                            std::ostream &errorStream, PcodeProgram &program) {
+  try {
+    int32_t instructionLength = engine.oneInstruction(collector, current);
+    current = current + instructionLength;
+    return true;
+  } catch (ghidra::UnimplError &error) {
+    errorStream << "UnimplError @ " << current << ": " << error.explain
+                << '\n';
+  } catch (ghidra::BadDataError &error) {
+    errorStream << "BadDataError @ " << current << ": " << error.explain
+                << '\n';
+  }
+  program.Ops.clear();
+  return false;
+}
+
 void loadProcessorSpecContext(ghidra::Sleigh &engine,
                               ghidra::ContextInternal &context,
                               ghidra::DocumentStorage &storage) {
@@ -396,19 +414,46 @@ PcodeProgram collectSleighPcode(ghidra::LoadImage &loadImage,
   ghidra::Address current(engine.getDefaultCodeSpace(), address);
   ghidra::Address end(engine.getDefaultCodeSpace(), address + length);
   while (current < end) {
-    try {
-      int32_t instructionLength = engine.oneInstruction(collector, current);
-      current = current + instructionLength;
-    } catch (ghidra::UnimplError &error) {
-      errorStream << "UnimplError @ " << current << ": " << error.explain
-                  << '\n';
-      program.Ops.clear();
+    if (!appendInstructionPcode(engine, collector, current, errorStream,
+                                program)) {
       return program;
-    } catch (ghidra::BadDataError &error) {
-      errorStream << "BadDataError @ " << current << ": " << error.explain
-                  << '\n';
-      program.Ops.clear();
-      return program;
+    }
+  }
+
+  return program;
+}
+
+PcodeProgram
+collectSleighPcodeRanges(ghidra::LoadImage &loadImage,
+                         const SleighSpecOptions &options,
+                         const std::vector<std::pair<uint64_t, uint64_t>>
+                             &ranges,
+                         std::ostream &errorStream) {
+  PcodeProgram program;
+  ghidra::ContextInternal context;
+  XmlCapableSleigh engine(&loadImage, &context);
+  ghidra::DocumentStorage storage;
+  std::filesystem::path slaFilePath;
+  if (!initializeSleighEngine(loadImage, options, errorStream, context, engine,
+                              storage, slaFilePath)) {
+    return program;
+  }
+  program.IsBigEndian = engine.isBigEndian();
+  collectRegisters(engine, program);
+
+  PcodeCollector collector(engine, program);
+  for (const auto &[start, endOffset] : ranges) {
+    if (start >= endOffset) {
+      continue;
+    }
+
+    ghidra::Address current(engine.getDefaultCodeSpace(), start);
+    ghidra::Address end(engine.getDefaultCodeSpace(), endOffset);
+    while (current < end) {
+      if (!appendInstructionPcode(engine, collector, current, errorStream,
+                                  program)) {
+        return program;
+      }
     }
   }
 

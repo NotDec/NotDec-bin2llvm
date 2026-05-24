@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iosfwd>
 #include <optional>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,13 @@ PcodeProgram collectSleighPcode(ghidra::LoadImage &loadImage,
                                 const SleighSpecOptions &options,
                                 uint64_t address, uint64_t length,
                                 std::ostream &errorStream);
+
+PcodeProgram
+collectSleighPcodeRanges(ghidra::LoadImage &loadImage,
+                         const SleighSpecOptions &options,
+                         const std::vector<std::pair<uint64_t, uint64_t>>
+                             &ranges,
+                         std::ostream &errorStream);
 
 std::vector<SleighInstructionSummary>
 collectSleighInstructionSummaries(ghidra::LoadImage &loadImage,

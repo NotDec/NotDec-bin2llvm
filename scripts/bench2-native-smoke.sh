@@ -562,16 +562,18 @@ for index in "${!TARGET_NAMES[@]}"; do
     single_opt_stdout="$OUT_DIR/$name.single-function.opt.stdout"
     single_opt_stderr="$OUT_DIR/$name.single-function.opt.stderr"
 
-    "$NATIVE_LLVM" "$target" -f 0x9df0 -o "$single_ll" \
+    "$NATIVE_LLVM" "$target" -f 0x9c38 -o "$single_ll" \
       >"$single_stdout" 2>"$single_stderr"
     "$LLVM_AS" "$single_ll" -o "$single_bc" \
       >"$single_llvm_as_stdout" 2>"$single_llvm_as_stderr"
     "$OPT" -passes=verify "$single_bc" -o "$single_opt_bc" \
       >"$single_opt_stdout" 2>"$single_opt_stderr"
-    require_ir_pattern "$single_ll" "call void @__cxa_finalize()" \
-      "$name single-function PLT.GOT external direct call"
-    require_ir_pattern "$single_ll" "call void @notdec_native_9d80()" \
-      "$name single-function internal direct call"
+    require_ir_pattern "$single_ll" "call void @perror()" \
+      "$name sparse single-function PLT external direct call"
+    require_ir_pattern "$single_ll" "call void @__assert_fail()" \
+      "$name sparse single-function cold block external call"
+    forbid_ir_pattern "$single_ll" "notdec_exit" \
+      "$name sparse single-function false-edge regression"
     forbid_ir_pattern "$single_ll" "notdec_pcode_CALL_void" \
       "$name single-function direct call helper regression"
     forbid_ir_pattern "$single_ll" "notdec_pcode_CALLIND_void" \

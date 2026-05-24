@@ -93,7 +93,7 @@ public:
       }
 
       if (!ended) {
-        if (llvm::BasicBlock *next = nextBlock(blockIndex)) {
+        if (llvm::BasicBlock *next = nativeFallthroughBlock(blockIndex)) {
           Builder.CreateBr(next);
         } else {
           Builder.CreateRetVoid();
@@ -202,6 +202,19 @@ private:
       return nullptr;
     }
     return BlockForStart[BlockStarts[blockIndex + 1]];
+  }
+
+  llvm::BasicBlock *nativeFallthroughBlock(size_t blockIndex) {
+    uint64_t blockAddress =
+        (*CurrentProgramOps)[BlockStarts[blockIndex]].Address;
+    auto successorIt = Config.BlockSuccessors.find(blockAddress);
+    if (successorIt == Config.BlockSuccessors.end()) {
+      return nextBlock(blockIndex);
+    }
+    if (successorIt->second.size() != 1) {
+      return nullptr;
+    }
+    return blockForTarget(successorIt->second.front());
   }
 
   llvm::BasicBlock *blockForTarget(uint64_t address) {

@@ -344,6 +344,19 @@ uint64_t countBasicBlocks(const notdec::bin2llvm::NativeProgramState &state) {
   return count;
 }
 
+std::vector<const notdec::bin2llvm::NativeInstruction *>
+instructionsInBlocks(const notdec::bin2llvm::NativeProgramState &state,
+                     const notdec::bin2llvm::NativeFunction &function) {
+  std::vector<const notdec::bin2llvm::NativeInstruction *> instructions;
+  for (const notdec::bin2llvm::NativeBasicBlock &block : function.Blocks) {
+    std::vector<const notdec::bin2llvm::NativeInstruction *> blockInstructions =
+        state.instructionsInRange(block.Start, block.End);
+    instructions.insert(instructions.end(), blockInstructions.begin(),
+                        blockInstructions.end());
+  }
+  return instructions;
+}
+
 void printSummaryJson(std::ostream &output,
                       const notdec::bin2llvm::NativeProgramState &state) {
   using namespace notdec::bin2llvm;
@@ -712,7 +725,7 @@ void printFunctionJson(std::ostream &output,
     }
   }
   std::vector<const NativeInstruction *> instructions =
-      state.instructionsInRange(function->RangeStart, function->RangeEnd);
+      instructionsInBlocks(state, *function);
   std::vector<const NativeXref *> incomingEntryXrefs =
       state.xrefsTo(function->Entry);
 
@@ -1258,8 +1271,7 @@ void printInstructionsFunctionJson(
     return;
   }
 
-  instructions = state.instructionsInRange(function->RangeStart,
-                                           function->RangeEnd);
+  instructions = instructionsInBlocks(state, *function);
   output << "  \"found\": true,\n";
   output << "  \"function\": {\n";
   output << "    \"entry\": \"" << hexString(function->Entry) << "\",\n";

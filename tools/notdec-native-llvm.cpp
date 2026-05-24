@@ -24,6 +24,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -38,6 +39,9 @@ struct CliOptions {
   uint64_t Length = 0;
   std::optional<uint64_t> FunctionEntry;
   std::string FunctionName;
+  std::vector<std::pair<uint64_t, uint64_t>> FunctionBlockRanges;
+  std::unordered_map<uint64_t, std::vector<uint64_t>>
+      FunctionBlockSuccessors;
   bool AllConfirmed = false;
   std::string OutputPath;
 };
@@ -220,12 +224,11 @@ runNativeDiscovery(const LIEF::ELF::Binary &binary) {
   return state;
 }
 
-bool resolveFunctionRange(const LIEF::ELF::Binary &binary, CliOptions &options) {
+bool resolveFunctionRange(const notdec::bin2llvm::NativeProgramState &state,
+                          CliOptions &options) {
   if (!options.FunctionEntry && options.FunctionName.empty()) {
     return true;
   }
-
-  notdec::bin2llvm::NativeProgramState state = runNativeDiscovery(binary);
 
   const notdec::bin2llvm::NativeFunction *function = nullptr;
   if (options.FunctionEntry) {
@@ -262,10 +265,35 @@ bool resolveFunctionRange(const LIEF::ELF::Binary &binary, CliOptions &options) 
 
   options.Address = function->Entry;
   options.Length = function->RangeEnd - function->Entry;
+  options.FunctionBlockRanges.clear();
+  options.FunctionBlockSuccessors.clear();
+  for (const notdec::bin2llvm::NativeBasicBlock &block : function->Blocks) {
+    options.FunctionBlockRanges.push_back({block.Start, block.End});
+    options.FunctionBlockSuccessors.emplace(block.Start, block.Successors);
+  }
   if (!options.FunctionEntry) {
     options.FunctionEntry = function->Entry;
   }
   return true;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> blockRanges(
+    const notdec::bin2llvm::NativeFunction &function) {
+  std::vector<std::pair<uint64_t, uint64_t>> ranges;
+  ranges.reserve(function.Blocks.size());
+  for (const notdec::bin2llvm::NativeBasicBlock &block : function.Blocks) {
+    ranges.push_back({block.Start, block.End});
+  }
+  return ranges;
+}
+
+std::unordered_map<uint64_t, std::vector<uint64_t>> blockSuccessors(
+    const notdec::bin2llvm::NativeFunction &function) {
+  std::unordered_map<uint64_t, std::vector<uint64_t>> successors;
+  for (const notdec::bin2llvm::NativeBasicBlock &block : function.Blocks) {
+    successors.emplace(block.Start, block.Successors);
+  }
+  return successors;
 }
 
 std::string uniqueFunctionName(const std::string &baseName,
@@ -400,9 +428,8 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
       continue;
     }
 
-    uint64_t length = function.RangeEnd - function.Entry;
-    auto program = notdec::bin2llvm::collectSleighPcode(
-        loadImage, specOptions, function.Entry, length, std::cerr);
+    auto program = notdec::bin2llvm::collectSleighPcodeRanges(
+        loadImage, specOptions, blockRanges(function), std::cerr);
     if (program.Ops.empty()) {
       std::cerr << "skip native function 0x" << std::hex << function.Entry
                 << std::dec << ": empty p-code\n";
@@ -419,6 +446,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
     config.DirectCallTargets = callTargets.Direct;
     config.ExternalCallTargets = callTargets.External;
     config.IndirectExternalCallTargets = callTargets.IndirectExternal;
+    config.BlockSuccessors = blockSuccessors(function);
 
     llvm::LLVMContext checkContext;
     std::string checkError;
@@ -482,8 +510,14 @@ int main(int argc, char **argv) {
     if (!resolveSpecOptions(*binary, options->SpecOptions)) {
       return 1;
     }
-    if (!resolveFunctionRange(*binary, *options)) {
-      return 1;
+    std::unique_ptr<notdec::bin2llvm::NativeProgramState> selectedState;
+    if (options->FunctionEntry || !options->FunctionName.empty()) {
+      selectedState =
+          std::make_unique<notdec::bin2llvm::NativeProgramState>(
+              runNativeDiscovery(*binary));
+      if (!resolveFunctionRange(*selectedState, *options)) {
+        return 1;
+      }
     }
 
     notdec::bin2llvm::LiefElfLoadImage loadImage(*binary, std::cerr);
@@ -498,9 +532,16 @@ int main(int argc, char **argv) {
       module = buildConfirmedModule(context, *binary, loadImage,
                                     options->SpecOptions, errorMessage);
     } else {
-      auto program = notdec::bin2llvm::collectSleighPcode(
-          loadImage, options->SpecOptions, options->Address, options->Length,
-          std::cerr);
+      notdec::bin2llvm::PcodeProgram program;
+      if (!options->FunctionBlockRanges.empty()) {
+        program = notdec::bin2llvm::collectSleighPcodeRanges(
+            loadImage, options->SpecOptions, options->FunctionBlockRanges,
+            std::cerr);
+      } else {
+        program = notdec::bin2llvm::collectSleighPcode(
+            loadImage, options->SpecOptions, options->Address, options->Length,
+            std::cerr);
+      }
       if (program.Ops.empty()) {
         return 1;
       }
@@ -513,14 +554,15 @@ int main(int argc, char **argv) {
         config.EntryFunctionName = entryFunctionName(*options->FunctionEntry);
       }
       if (options->FunctionEntry) {
-        notdec::bin2llvm::NativeProgramState state =
-            runNativeDiscovery(*binary);
-        NativeCallTargets callTargets = planNativeCallTargets(state);
+        NativeCallTargets callTargets =
+            selectedState ? planNativeCallTargets(*selectedState)
+                          : planNativeCallTargets(runNativeDiscovery(*binary));
         callTargets.Direct[*options->FunctionEntry] = config.EntryFunctionName;
         config.DirectCallTargets = std::move(callTargets.Direct);
         config.ExternalCallTargets = std::move(callTargets.External);
         config.IndirectExternalCallTargets =
             std::move(callTargets.IndirectExternal);
+        config.BlockSuccessors = options->FunctionBlockSuccessors;
       }
       module = notdec::bin2llvm::buildPcodeModule(context, program, config,
                                                   errorMessage);
