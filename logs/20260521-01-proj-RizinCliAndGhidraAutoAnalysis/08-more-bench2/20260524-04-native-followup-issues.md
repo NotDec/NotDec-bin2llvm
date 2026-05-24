@@ -223,7 +223,36 @@ native opcode 表已经补齐，但下面这些 opcode 当前走 helper：
 - 每补一个 opcode，都有对应 Bench2 样本验证。
 - 不为了“覆盖完整”写不确定语义。
 
+## 6. 函数范围 / CFG 可能过大
+
+现象：
+
+- `libuv` 里曾看到函数 `0x9c38` 的范围被扩到 `0x9c38..0x2375f`。
+- 单函数 lowering 可以到 282 秒左右。
+- 这类函数现在能过 `llvm-as` / `opt -passes=verify`，但耗时明显不正常。
+
+当前判断：
+
+- 这不是 LLVM IR 语法问题，而是 native discovery / CFG 边界问题。
+- 可能和 block 合并、branch successor、fallthrough 或 eh-frame seed range 有关。
+- 如果函数边界被扩得过大，后续即使验证通过，也可能把多个真实函数混进一个 LLVM function，语义和性能都会出问题。
+
+建议路线：
+
+1. 用 `notdec-native-discover --function-json 0x9c38` 和 `--cfg-json 0x9c38` 先固定证据。
+2. 检查 `lib/NativeAnalysis.cpp` 里 `addDecodedFunctionBlocks` / `addBasicBlock` / successor 处理。
+3. 对比 debug-info oracle 中同地址附近的函数边界，确认 native 是否越过了 debug 函数范围。
+4. 优先修明显错误的边界扩张，不为了追求覆盖率强行把不确定边都纳入同一个函数。
+
+判断标准：
+
+- 异常大函数的 block/range 明显收敛。
+- 单函数 lowering 时间下降。
+- `libuv --all-confirmed` 仍能输出 485 个 LLVM function，并通过 LLVM 22 `llvm-as` / `opt -passes=verify`。
+- debug-info oracle 的 seed/confirmed 覆盖率不明显下降。
+
 ## 建议优先级
 
-1. 处理 `--all-confirmed` / debug oracle 脚本重复 discovery。
-2. 按 Bench2 实际出现频率逐个精确化 helper opcode。
+1. 修函数范围 / CFG 过大问题，先看 `libuv` 的 `0x9c38`。
+2. 处理 `notdec-native-llvm --all-confirmed` 和 selected-targets-native 脚本的重复 discovery。
+3. 统计 Bench2 helper opcode 频率，再按真实出现频率补精确语义。
