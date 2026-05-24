@@ -1316,8 +1316,7 @@ public:
     std::set<std::pair<uint64_t, uint64_t>> decodedSeeds;
     enqueueInitialSeeds(state, decodeQueue, queuedSeeds);
 
-    uint64_t decodedSeedCount = 0;
-    while (!decodeQueue.empty() && decodedSeedCount < MaxSeeds) {
+    while (!decodeQueue.empty()) {
       DecodeQueueItem item = decodeQueue.front();
       decodeQueue.pop_front();
       std::pair<uint64_t, uint64_t> seedKey{item.FunctionEntry,
@@ -1330,7 +1329,6 @@ public:
       std::vector<uint64_t> branchTargets;
       decodeSeed(state, loadImage, item.FunctionEntry, item.BlockAddress,
                  callTargets, branchTargets);
-      ++decodedSeedCount;
       for (uint64_t target : callTargets) {
         state.addFunctionSeed(target, 0, "", "sleigh-direct-call",
                               NativeFunctionConfidence::High);
@@ -1344,10 +1342,9 @@ public:
   }
 
 private:
-  // This analyzer is only a bounded smoke path for recursive decode.  Keep the
-  // per-seed window narrow while allowing more known entry points to be tested.
-  static constexpr uint64_t MaxInitialSeeds = 10;
-  static constexpr uint64_t MaxSeeds = 20;
+  // Decode every known entry seed, but keep each local decode small.  That makes
+  // module-wide discovery cover real Bench2 binaries without letting one bad
+  // function consume a large linear range.
   static constexpr uint64_t MaxInstructionsPerSeed = 8;
   static constexpr uint64_t MaxBytesPerSeed = 64;
 
@@ -1414,23 +1411,17 @@ private:
                                   std::deque<DecodeQueueItem> &decodeQueue,
                                   std::set<std::pair<uint64_t, uint64_t>>
                                       &queuedSeeds) {
-    uint64_t initialSeeds = 0;
     for (NativeFunctionConfidence confidence :
          {NativeFunctionConfidence::High, NativeFunctionConfidence::Medium,
           NativeFunctionConfidence::Low}) {
       for (const NativeFunctionWorkItem &item : state.functionWorklist()) {
-        if (initialSeeds == MaxInitialSeeds) {
-          return;
-        }
         auto seedIterator = state.functionSeeds().find(item.Address);
         if (seedIterator == state.functionSeeds().end() ||
             seedIterator->second.Confidence != confidence) {
           continue;
         }
-        if (enqueueSeed(state, item.Address, item.Address, decodeQueue,
-                        queuedSeeds)) {
-          ++initialSeeds;
-        }
+        enqueueSeed(state, item.Address, item.Address, decodeQueue,
+                    queuedSeeds);
       }
     }
   }
