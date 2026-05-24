@@ -63,6 +63,7 @@ public:
       return true;
     }
 
+    CurrentProgramOps = &program.Ops;
     buildBasicBlocks(program);
     Builder.CreateBr(BlockForStart[BlockStarts.front()]);
 
@@ -78,7 +79,8 @@ public:
       for (size_t opIndex = start; opIndex < end; ++opIndex) {
         const PcodeOpView &op = program.Ops[opIndex];
         if (isTerminator(op.Opcode)) {
-          if (!lowerTerminator(op, nextBlock(blockIndex), errorMessage)) {
+          if (!lowerTerminator(opIndex, op, nextBlock(blockIndex),
+                               errorMessage)) {
             return false;
           }
           ended = true;
@@ -129,6 +131,26 @@ private:
     return op.Inputs[inputIndex].Offset;
   }
 
+  std::optional<size_t> relativeTargetIndex(size_t opIndex,
+                                            const PcodeOpView &op,
+                                            size_t inputIndex,
+                                            size_t opCount) {
+    if (op.Inputs.size() <= inputIndex ||
+        op.Inputs[inputIndex].Space != "const") {
+      return std::nullopt;
+    }
+
+    uint64_t offset = op.Inputs[inputIndex].Offset;
+    if (offset > opCount || opIndex > opCount - offset) {
+      return std::nullopt;
+    }
+    size_t target = opIndex + static_cast<size_t>(offset);
+    if (target >= opCount) {
+      return std::nullopt;
+    }
+    return target;
+  }
+
   void addBlockStart(std::set<size_t> &starts,
                      const std::map<uint64_t, size_t> &firstOpForAddress,
                      uint64_t address) {
@@ -153,6 +175,9 @@ private:
           op.Opcode == PcodeOpcode::CBranch) {
         if (auto target = directTarget(op, 0)) {
           addBlockStart(starts, firstOpForAddress, *target);
+        } else if (auto targetIndex =
+                       relativeTargetIndex(index, op, 0, program.Ops.size())) {
+          starts.insert(*targetIndex);
         }
       }
 
@@ -192,6 +217,21 @@ private:
     return block;
   }
 
+  llvm::BasicBlock *blockForRelativeTarget(size_t opIndex,
+                                           const PcodeOpView &op,
+                                           size_t inputIndex) {
+    auto targetIndex = relativeTargetIndex(opIndex, op, inputIndex,
+                                           CurrentProgramOps->size());
+    if (!targetIndex) {
+      return nullptr;
+    }
+    auto it = BlockForStart.find(*targetIndex);
+    if (it != BlockForStart.end()) {
+      return it->second;
+    }
+    return blockForTarget((*CurrentProgramOps)[*targetIndex].Address);
+  }
+
   llvm::BasicBlock *exitBlock() {
     if (!ExitBlock) {
       ExitBlock = llvm::BasicBlock::Create(Context, "notdec_exit", &Function);
@@ -208,7 +248,8 @@ private:
                                 llvm::ConstantInt::get(value->getType(), 0));
   }
 
-  bool lowerTerminator(const PcodeOpView &op, llvm::BasicBlock *fallthrough,
+  bool lowerTerminator(size_t opIndex, const PcodeOpView &op,
+                       llvm::BasicBlock *fallthrough,
                        std::string &errorMessage) {
     switch (op.Opcode) {
     case PcodeOpcode::Branch: {
@@ -216,11 +257,16 @@ private:
         return false;
       }
       auto target = directTarget(op, 0);
-      if (!target) {
-        errorMessage = "BRANCH target must be a direct ram address";
+      if (target) {
+        Builder.CreateBr(blockForTarget(*target));
+        return true;
+      }
+      llvm::BasicBlock *relativeTarget = blockForRelativeTarget(opIndex, op, 0);
+      if (relativeTarget == nullptr) {
+        errorMessage = "BRANCH target must be direct ram or relative const";
         return false;
       }
-      Builder.CreateBr(blockForTarget(*target));
+      Builder.CreateBr(relativeTarget);
       return true;
     }
 
@@ -229,13 +275,19 @@ private:
         return false;
       }
       auto target = directTarget(op, 0);
-      if (!target) {
-        errorMessage = "CBRANCH target must be a direct ram address";
+      llvm::BasicBlock *trueBlock = nullptr;
+      if (target) {
+        trueBlock = blockForTarget(*target);
+      } else {
+        trueBlock = blockForRelativeTarget(opIndex, op, 0);
+      }
+      if (trueBlock == nullptr) {
+        errorMessage = "CBRANCH target must be direct ram or relative const";
         return false;
       }
       llvm::BasicBlock *falseBlock = fallthrough ? fallthrough : exitBlock();
-      Builder.CreateCondBr(asCondition(read(op.Inputs[1])),
-                           blockForTarget(*target), falseBlock);
+      Builder.CreateCondBr(asCondition(read(op.Inputs[1])), trueBlock,
+                           falseBlock);
       return true;
     }
 
@@ -943,6 +995,7 @@ private:
   std::unordered_map<size_t, llvm::BasicBlock *> BlockForStart;
   std::unordered_map<uint64_t, llvm::BasicBlock *> BlockForAddress;
   std::vector<llvm::BasicBlock *> ExternalTargetBlocks;
+  const std::vector<PcodeOpView> *CurrentProgramOps = nullptr;
   llvm::BasicBlock *ExitBlock = nullptr;
   llvm::GlobalVariable *Memory = nullptr;
   std::unique_ptr<RegisterStorage> Registers;
