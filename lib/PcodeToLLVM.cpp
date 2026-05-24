@@ -1036,6 +1036,14 @@ private:
   }
 
   bool lowerCallOther(const PcodeOpView &op, std::string &errorMessage) {
+    if (op.Output && requireInputCount(op, 1, errorMessage) &&
+        op.Inputs[0].Space == "const" && op.Inputs[0].Offset == 77) {
+      llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, llvm::Intrinsic::readcyclecounter);
+      write(*op.Output, resize(Builder.CreateCall(intrinsic, {}), op.Output->Size));
+      return true;
+    }
+
     // x86 LOCK/UNLOCK are Sleigh userops around normal memory P-Code.  The
     // read/write ops still carry the value semantics, so keep only that part.
     if (!op.Output && requireInputCount(op, 1, errorMessage) &&
