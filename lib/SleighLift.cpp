@@ -6,6 +6,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <sstream>
 
 namespace notdec::bin2llvm {
@@ -394,6 +395,91 @@ findSleighSpecPath(const std::string &fileName,
   return sleigh::FindSpecFile(fileName);
 }
 
+struct SleighInstructionDecoder::Impl {
+  Impl(ghidra::LoadImage &loadImage, const SleighSpecOptions &options,
+       std::ostream &errorStream)
+      : Engine(&loadImage, &Context) {
+    std::filesystem::path slaFilePath;
+    Valid = initializeSleighEngine(loadImage, options, errorStream, Context,
+                                   Engine, Storage, slaFilePath);
+    if (!Valid) {
+      return;
+    }
+    IsBigEndian = Engine.isBigEndian();
+    PcodeProgram registerProgram;
+    collectRegisters(Engine, registerProgram);
+    Registers = std::move(registerProgram.Registers);
+  }
+
+  ghidra::ContextInternal Context;
+  XmlCapableSleigh Engine;
+  ghidra::DocumentStorage Storage;
+  std::vector<RegisterInfo> Registers;
+  bool IsBigEndian = false;
+  bool Valid = false;
+};
+
+SleighInstructionDecoder::SleighInstructionDecoder(
+    ghidra::LoadImage &loadImage, const SleighSpecOptions &options,
+    std::ostream &errorStream)
+    : Pimpl(std::make_unique<Impl>(loadImage, options, errorStream)) {}
+
+SleighInstructionDecoder::~SleighInstructionDecoder() = default;
+
+bool SleighInstructionDecoder::isValid() const {
+  return Pimpl != nullptr && Pimpl->Valid;
+}
+
+SleighInstructionDecode
+SleighInstructionDecoder::decode(uint64_t address, uint64_t maxInstructions,
+                                 uint64_t maxBytes, std::ostream &errorStream) {
+  SleighInstructionDecode decode;
+  if (!isValid() || maxInstructions == 0 || maxBytes == 0) {
+    return decode;
+  }
+
+  decode.Pcode.IsBigEndian = Pimpl->IsBigEndian;
+  decode.Pcode.Registers = Pimpl->Registers;
+
+  AssemblyCollector collector;
+  PcodeCollector pcodeCollector(Pimpl->Engine, decode.Pcode);
+  ghidra::Address current(Pimpl->Engine.getDefaultCodeSpace(), address);
+  if (address > std::numeric_limits<uint64_t>::max() - maxBytes) {
+    maxBytes = std::numeric_limits<uint64_t>::max() - address;
+  }
+  ghidra::Address end(Pimpl->Engine.getDefaultCodeSpace(), address + maxBytes);
+  while (decode.Instructions.size() < maxInstructions && current < end) {
+    try {
+      int32_t instructionLength =
+          Pimpl->Engine.printAssembly(collector, current);
+      if (instructionLength <= 0 || static_cast<uint64_t>(instructionLength) >
+                                        end.getOffset() - current.getOffset()) {
+        break;
+      }
+      int32_t pcodeLength =
+          Pimpl->Engine.oneInstruction(pcodeCollector, current);
+      if (pcodeLength != instructionLength) {
+        errorStream << "Sleigh decode length mismatch @ " << current << ": "
+                    << instructionLength << " vs " << pcodeLength << '\n';
+        break;
+      }
+      decode.Instructions.push_back(
+          collector.take(static_cast<uint64_t>(instructionLength)));
+      current = current + instructionLength;
+    } catch (ghidra::UnimplError &error) {
+      errorStream << "UnimplError @ " << current << ": " << error.explain
+                  << '\n';
+      return decode;
+    } catch (ghidra::BadDataError &error) {
+      errorStream << "BadDataError @ " << current << ": " << error.explain
+                  << '\n';
+      return decode;
+    }
+  }
+
+  return decode;
+}
+
 PcodeProgram collectSleighPcode(ghidra::LoadImage &loadImage,
                                 const SleighSpecOptions &options,
                                 uint64_t address, uint64_t length,
@@ -476,58 +562,8 @@ collectSleighInstructionDecode(ghidra::LoadImage &loadImage,
                                const SleighSpecOptions &options,
                                uint64_t address, uint64_t maxInstructions,
                                uint64_t maxBytes, std::ostream &errorStream) {
-  SleighInstructionDecode decode;
-  if (maxInstructions == 0 || maxBytes == 0) {
-    return decode;
-  }
-
-  ghidra::ContextInternal context;
-  XmlCapableSleigh engine(&loadImage, &context);
-  ghidra::DocumentStorage storage;
-  std::filesystem::path slaFilePath;
-  if (!initializeSleighEngine(loadImage, options, errorStream, context, engine,
-                              storage, slaFilePath)) {
-    return decode;
-  }
-  decode.Pcode.IsBigEndian = engine.isBigEndian();
-  collectRegisters(engine, decode.Pcode);
-
-  AssemblyCollector collector;
-  PcodeCollector pcodeCollector(engine, decode.Pcode);
-  ghidra::Address current(engine.getDefaultCodeSpace(), address);
-  if (address > std::numeric_limits<uint64_t>::max() - maxBytes) {
-    maxBytes = std::numeric_limits<uint64_t>::max() - address;
-  }
-  ghidra::Address end(engine.getDefaultCodeSpace(), address + maxBytes);
-  while (decode.Instructions.size() < maxInstructions && current < end) {
-    try {
-      int32_t instructionLength = engine.printAssembly(collector, current);
-      if (instructionLength <= 0 ||
-          static_cast<uint64_t>(instructionLength) >
-              end.getOffset() - current.getOffset()) {
-        break;
-      }
-      int32_t pcodeLength = engine.oneInstruction(pcodeCollector, current);
-      if (pcodeLength != instructionLength) {
-        errorStream << "Sleigh decode length mismatch @ " << current << ": "
-                    << instructionLength << " vs " << pcodeLength << '\n';
-        break;
-      }
-      decode.Instructions.push_back(
-          collector.take(static_cast<uint64_t>(instructionLength)));
-      current = current + instructionLength;
-    } catch (ghidra::UnimplError &error) {
-      errorStream << "UnimplError @ " << current << ": " << error.explain
-                  << '\n';
-      return decode;
-    } catch (ghidra::BadDataError &error) {
-      errorStream << "BadDataError @ " << current << ": " << error.explain
-                  << '\n';
-      return decode;
-    }
-  }
-
-  return decode;
+  SleighInstructionDecoder decoder(loadImage, options, errorStream);
+  return decoder.decode(address, maxInstructions, maxBytes, errorStream);
 }
 
 } // namespace notdec::bin2llvm

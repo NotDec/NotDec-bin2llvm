@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <string>
@@ -42,6 +43,30 @@ struct SleighInstructionSummary {
 struct SleighInstructionDecode {
   std::vector<SleighInstructionSummary> Instructions;
   PcodeProgram Pcode;
+};
+
+// SleighInstructionDecoder owns one initialized Sleigh engine and reuses it for
+// many bounded native decode requests.  Native discovery decodes thousands of
+// tiny seed ranges, so reparsing the .sla/.pspec for every seed is much more
+// expensive than the actual instruction work.
+class SleighInstructionDecoder {
+public:
+  SleighInstructionDecoder(ghidra::LoadImage &loadImage,
+                           const SleighSpecOptions &options,
+                           std::ostream &errorStream);
+  ~SleighInstructionDecoder();
+
+  SleighInstructionDecoder(const SleighInstructionDecoder &) = delete;
+  SleighInstructionDecoder &
+  operator=(const SleighInstructionDecoder &) = delete;
+
+  bool isValid() const;
+  SleighInstructionDecode decode(uint64_t address, uint64_t maxInstructions,
+                                 uint64_t maxBytes, std::ostream &errorStream);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> Pimpl;
 };
 
 std::optional<std::filesystem::path>

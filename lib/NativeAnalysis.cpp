@@ -1313,6 +1313,11 @@ public:
     }
 
     addRelocationCodeSeeds(state);
+    SleighInstructionDecoder decoder(loadImage, SpecOptions, NullErrors);
+    if (!decoder.isValid()) {
+      state.addNote("sleigh instruction decode skipped: engine init failed");
+      return;
+    }
 
     std::deque<DecodeQueueItem> decodeQueue;
     std::set<std::pair<uint64_t, uint64_t>> queuedSeeds;
@@ -1338,7 +1343,7 @@ public:
       }
       std::vector<uint64_t> callTargets;
       std::vector<uint64_t> branchTargets;
-      decodeSeed(state, loadImage, item.FunctionEntry, item.BlockAddress,
+      decodeSeed(state, decoder, item.FunctionEntry, item.BlockAddress,
                  callTargets, branchTargets);
       ++decodedSeedCount;
       for (uint64_t target : callTargets) {
@@ -1453,7 +1458,7 @@ private:
     return true;
   }
 
-  void decodeSeed(NativeProgramState &state, LiefElfLoadImage &loadImage,
+  void decodeSeed(NativeProgramState &state, SleighInstructionDecoder &decoder,
                   uint64_t functionEntry, uint64_t address,
                   std::vector<uint64_t> &callTargets,
                   std::vector<uint64_t> &branchTargets) {
@@ -1466,9 +1471,9 @@ private:
         MaxBytesPerSeed,
         boundedBytesForFunctionSeed(state, functionEntry, address,
                                     *availableBytes));
-    SleighInstructionDecode decode = collectSleighInstructionDecode(
-        loadImage, SpecOptions, address, MaxInstructionsPerSeed, decodeBytes,
-        NullErrors);
+    SleighInstructionDecode decode =
+        decoder.decode(address, MaxInstructionsPerSeed, decodeBytes,
+                       NullErrors);
     uint64_t rangeStart = 0;
     uint64_t rangeEnd = 0;
     for (const SleighInstructionSummary &summary : decode.Instructions) {
@@ -1961,10 +1966,9 @@ private:
                                              uint64_t blockAddress,
                                              uint64_t availableBytes) {
     uint64_t cappedBytes = availableBytes;
-    for (const auto &[address, seed] : state.functionSeeds()) {
-      if (address <= blockAddress) {
-        continue;
-      }
+    for (auto iterator = state.functionSeeds().upper_bound(blockAddress);
+         iterator != state.functionSeeds().end(); ++iterator) {
+      const auto &[address, seed] = *iterator;
       if (!isBoundarySeed(seed)) {
         continue;
       }
