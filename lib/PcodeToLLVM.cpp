@@ -835,6 +835,49 @@ private:
     return true;
   }
 
+  bool lowerFloatUnary(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 1, errorMessage)) {
+      return false;
+    }
+    llvm::Type *floatTy = floatType(op.Output->Size);
+    if (floatTy == nullptr) {
+      return lowerHelperCall(op, errorMessage);
+    }
+
+    llvm::Value *input = readFloatBits(op.Inputs[0], floatTy);
+    llvm::Value *result = nullptr;
+    if (op.Opcode == PcodeOpcode::FloatNeg) {
+      result = Builder.CreateFNeg(input);
+    } else if (op.Opcode == PcodeOpcode::FloatAbs) {
+      llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, llvm::Intrinsic::fabs, {floatTy});
+      result = Builder.CreateCall(intrinsic, {input});
+    } else if (op.Opcode == PcodeOpcode::FloatSqrt) {
+      llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, llvm::Intrinsic::sqrt, {floatTy});
+      result = Builder.CreateCall(intrinsic, {input});
+    } else if (op.Opcode == PcodeOpcode::FloatCeil ||
+               op.Opcode == PcodeOpcode::FloatFloor ||
+               op.Opcode == PcodeOpcode::FloatRound) {
+      llvm::Intrinsic::ID intrinsicId = llvm::Intrinsic::not_intrinsic;
+      if (op.Opcode == PcodeOpcode::FloatCeil) {
+        intrinsicId = llvm::Intrinsic::ceil;
+      } else if (op.Opcode == PcodeOpcode::FloatFloor) {
+        intrinsicId = llvm::Intrinsic::floor;
+      } else {
+        intrinsicId = llvm::Intrinsic::round;
+      }
+      llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, intrinsicId, {floatTy});
+      result = Builder.CreateCall(intrinsic, {input});
+    } else {
+      errorMessage = "unsupported float unary opcode: " + op.OpcodeName;
+      return false;
+    }
+    writeFloatBits(*op.Output, result);
+    return true;
+  }
+
   bool lowerFloatCast(const PcodeOpView &op, std::string &errorMessage) {
     if (!op.Output || !requireInputCount(op, 1, errorMessage)) {
       return false;
@@ -1035,6 +1078,36 @@ private:
     return lowerHelperCall(op, errorMessage);
   }
 
+  bool lowerX86Movmskpd(const PcodeOpView &op, std::string &errorMessage) {
+    if (!op.Output || !requireInputCount(op, 3, errorMessage)) {
+      return false;
+    }
+    if (op.Inputs[2].Size == 0 || op.Inputs[2].Size % 8 != 0) {
+      return lowerHelperCall(op, errorMessage);
+    }
+
+    llvm::Value *source = read(op.Inputs[2]);
+    llvm::Value *mask = llvm::ConstantInt::get(intType(op.Output->Size), 0);
+    uint32_t laneCount = op.Inputs[2].Size / 8;
+    for (uint32_t lane = 0; lane < laneCount; ++lane) {
+      llvm::Value *shifted = Builder.CreateLShr(
+          source, llvm::ConstantInt::get(source->getType(), lane * 64 + 63));
+      llvm::Value *bit = Builder.CreateTrunc(
+          Builder.CreateAnd(shifted,
+                            llvm::ConstantInt::get(source->getType(), 1)),
+          intType(1));
+      llvm::Value *wideBit = resize(bit, op.Output->Size);
+      if (lane != 0) {
+        wideBit =
+            Builder.CreateShl(wideBit,
+                              llvm::ConstantInt::get(wideBit->getType(), lane));
+      }
+      mask = Builder.CreateOr(mask, wideBit);
+    }
+    write(*op.Output, mask);
+    return true;
+  }
+
   bool lowerCallOther(const PcodeOpView &op, std::string &errorMessage) {
     if (op.Output && requireInputCount(op, 1, errorMessage) &&
         op.Inputs[0].Space == "const" && op.Inputs[0].Offset == 77) {
@@ -1050,6 +1123,13 @@ private:
         op.Inputs[0].Space == "const" &&
         (op.Inputs[0].Offset == 17 || op.Inputs[0].Offset == 18)) {
       return true;
+    }
+
+    // Ghidra x86 emits MOVMSKPD as a userop.  The operation extracts the sign
+    // bit of each packed double lane into the low bits of the integer result.
+    if (op.Output && !op.Inputs.empty() && op.Inputs[0].Space == "const" &&
+        op.Inputs[0].Offset == 128) {
+      return lowerX86Movmskpd(op, errorMessage);
     }
     return lowerHelperCall(op, errorMessage);
   }
@@ -1156,6 +1236,7 @@ private:
     case PcodeOpcode::FloatCeil:
     case PcodeOpcode::FloatFloor:
     case PcodeOpcode::FloatRound:
+      return lowerFloatUnary(op, errorMessage);
     case PcodeOpcode::SegmentOp:
     case PcodeOpcode::CpoolRef:
     case PcodeOpcode::New:
