@@ -146,15 +146,37 @@ private:
       return std::nullopt;
     }
 
-    uint64_t offset = op.Inputs[inputIndex].Offset;
-    if (offset > opCount || opIndex > opCount - offset) {
+    int64_t offset = relativeBranchOffset(op.Inputs[inputIndex]);
+    if (offset < 0) {
+      uint64_t magnitude = static_cast<uint64_t>(-(offset + 1)) + 1;
+      if (opIndex < magnitude) {
+        return std::nullopt;
+      }
+    }
+    if (offset > 0 &&
+        static_cast<uint64_t>(offset) > opCount - opIndex) {
       return std::nullopt;
     }
-    size_t target = opIndex + static_cast<size_t>(offset);
+    size_t target =
+        static_cast<size_t>(static_cast<int64_t>(opIndex) + offset);
     if (target >= opCount) {
       return std::nullopt;
     }
     return target;
+  }
+
+  int64_t relativeBranchOffset(const VarnodeView &target) {
+    uint32_t bits = bitWidth(target.Size);
+    if (bits >= 64) {
+      return static_cast<int64_t>(target.Offset);
+    }
+    uint64_t signBit = uint64_t{1} << (bits - 1);
+    uint64_t mask = (uint64_t{1} << bits) - 1;
+    uint64_t value = target.Offset & mask;
+    if ((value & signBit) == 0) {
+      return static_cast<int64_t>(value);
+    }
+    return -static_cast<int64_t>((~value & mask) + 1);
   }
 
   void addBlockStart(std::set<size_t> &starts,
