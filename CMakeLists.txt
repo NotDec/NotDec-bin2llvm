@@ -6,6 +6,15 @@ project(notdec-bin2llvm
 
 include(CTest)
 
+if (BUILD_TESTING)
+  add_test(
+    NAME notdec.bench2_native_discovery_debug_oracle_unit
+    COMMAND
+      python3
+      "${PROJECT_SOURCE_DIR}/tests/bench2_native_discovery_debug_check_test.py"
+  )
+endif ()
+
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
 include(FindLLVM)

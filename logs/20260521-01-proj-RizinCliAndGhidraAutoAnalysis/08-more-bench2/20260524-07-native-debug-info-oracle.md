@@ -124,3 +124,92 @@ TIME 33.08
 - 实现效果：8/10。已经能用 debug info 量化 seed / confirmed 覆盖。
 - 复杂度：7/10。脚本独立，依赖 `llvm-dwarfdump`、`readelf` 和现有 `notdec-native-discover`。
 - 维护成本：7/10。DWARF 文本解析足够做当前 oracle，但后续如果要更严谨，可以改成 llvm-dwarfdump JSON 或专门解析库。
+
+## 2026-05-28 修正：不要把 inline 子 DIE 当函数
+
+继续用 debug oracle 检查 selected Bench2 目标时，`vim` 一开始显示：
+
+```text
+vim	executable	4244	5309	5309	3577	3577	0.8428	0.8428	0x40747:,0x41bf8:,0x427aa:,0x46987:,0x470cf:,0x4f042:,0x4f825:,0x56f6d:
+```
+
+抽样查 `llvm-dwarfdump --debug-info` 后发现这些地址不是 `DW_TAG_subprogram` 入口，而是 `DW_TAG_inlined_subroutine` 或 lexical block 的 `DW_AT_low_pc`。脚本原来的 parser 在进入 subprogram 后，会继续接收子 DIE 的属性；如果子 DIE 也有 `DW_AT_low_pc`，就会污染父 subprogram，造成假漏报。
+
+修改：
+
+- [scripts/bench2-native-discovery-debug-check.py:90](/sn640/NotDec/external/NotDec-bin2llvm/scripts/bench2-native-discovery-debug-check.py:90) `parse_debug_functions`
+  - 增加 `accepting_attrs`。
+  - 只接收当前 `DW_TAG_subprogram` 自己的属性。
+  - 遇到子 DIE 后停止接收属性，避免 inline range 覆盖父函数地址。
+- [tests/bench2_native_discovery_debug_check_test.py:29](/sn640/NotDec/external/NotDec-bin2llvm/tests/bench2_native_discovery_debug_check_test.py:29)
+  - 新增最小单测，确认 parser 会忽略 `DW_TAG_inlined_subroutine` 的 `DW_AT_low_pc`。
+- [CMakeLists.txt:9](/sn640/NotDec/external/NotDec-bin2llvm/CMakeLists.txt:9)
+  - 把这个单测接入 CTest：`notdec.bench2_native_discovery_debug_oracle_unit`。
+
+验证：
+
+```bash
+python3 -m py_compile \
+  scripts/bench2-native-discovery-debug-check.py \
+  tests/bench2_native_discovery_debug_check_test.py
+
+python3 tests/bench2_native_discovery_debug_check_test.py
+
+ctest --test-dir /tmp/notdec-bin2llvm-build \
+  -R 'notdec\.(bench2_native_discovery_debug_oracle_unit|native_discover\.x86_64_smoke|native_llvm\.x86_64_smoke)' \
+  --output-on-failure
+```
+
+CTest 结果：
+
+```text
+100% tests passed, 0 tests failed out of 3
+Total Test time (real) =   0.88 sec
+```
+
+修正后 `vim` 单项目标：
+
+```bash
+/usr/bin/time -f 'TIME vim-oracle-fixed %e' \
+  scripts/bench2-native-discovery-debug-check.py --target vim:executable
+```
+
+```text
+vim	executable	3569	5309	5309	3569	3569	1.0000	1.0000
+TIME vim-oracle-fixed 21.43
+```
+
+selected6：
+
+```bash
+/usr/bin/time -f 'TIME debug-oracle-selected6-fixed %e' \
+  scripts/bench2-native-discovery-debug-check.py \
+  --target libuv:shared-library \
+  --target vsftpd:executable \
+  --target memcached:executable \
+  --target python:shared-library \
+  --target vim:executable \
+  --target wolfssl:shared-library
+```
+
+```text
+vsftpd	executable	174	187	187	174	174	1.0000	1.0000
+libuv	shared-library	376	485	485	376	376	1.0000	1.0000
+memcached	executable	216	259	259	216	216	1.0000	1.0000
+wolfssl	shared-library	4127	4160	4160	4127	4127	1.0000	1.0000
+vim	executable	3569	5309	5309	3569	3569	1.0000	1.0000
+python	shared-library	6866	7343	7343	6866	6866	1.0000	1.0000
+TIME debug-oracle-selected6-fixed 102.85
+```
+
+结论：
+
+- selected6 里 native discovery 对 debug subprogram 入口的覆盖是 100%。
+- 之前 `vim` 84.28% 是 oracle 误报，不是 native discovery 漏函数。
+- full oracle 约 103 秒，主要是大 DWARF 文本解析和 discovery；只适合作为手动 coverage gate，不放进默认 CTest。
+
+评分调整：
+
+- 实现效果：9/10。oracle 对 inline 子范围的误报已修掉，并有单测覆盖。
+- 复杂度：7/10。仍然是文本 parser，但逻辑边界更清楚。
+- 维护成本：6/10。新增 CTest 能防止同类回归；后续如果还遇到 DWARF 表达形式问题，再考虑换成结构化 DWARF 读取。

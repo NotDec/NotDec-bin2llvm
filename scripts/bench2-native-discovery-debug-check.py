@@ -93,6 +93,7 @@ def parse_debug_functions(dwarfdump_text: str,
     attr_re = re.compile(r"^\s+(DW_AT_[A-Za-z0-9_]+)\s+\((.*)\)")
     functions: list[DebugFunction] = []
     current_depth: int | None = None
+    accepting_attrs = False
     attrs: dict[str, str] = {}
 
     def flush() -> None:
@@ -121,13 +122,21 @@ def parse_debug_functions(dwarfdump_text: str,
             if current_depth is not None and depth <= current_depth:
                 flush()
                 current_depth = None
+                accepting_attrs = False
                 attrs = {}
+            elif current_depth is not None:
+                # Child DIEs can also carry DW_AT_low_pc, for example
+                # DW_TAG_inlined_subroutine.  Those ranges are not function
+                # entries and must not overwrite the parent subprogram attrs.
+                accepting_attrs = False
+                continue
             if tag == "subprogram":
                 current_depth = depth
+                accepting_attrs = True
                 attrs = {}
             continue
 
-        if current_depth is None:
+        if current_depth is None or not accepting_attrs:
             continue
         attr_match = attr_re.match(line)
         if not attr_match:
