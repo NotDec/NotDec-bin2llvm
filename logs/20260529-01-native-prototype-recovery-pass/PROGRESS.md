@@ -164,6 +164,9 @@
   - [x] Bench2 selected native 全量验证。
     - 记录：`06-pass-pipeline-and-verification/20260529-13-bench2-selected-native-full-verification.md`
     - 文件：`scripts/bench2-native-smoke.sh`
+  - [x] 添加 CLI 显式签名重写开关。
+    - 记录：`06-pass-pipeline-and-verification/20260529-14-cli-signature-rewrite-option.md`
+    - 文件：`tools/notdec-native-llvm.cpp`
 
 ## 记录规则
 

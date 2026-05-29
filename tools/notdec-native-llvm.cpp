@@ -64,6 +64,7 @@ struct CliOptions {
   bool DisableInstCombinePass = false;
   bool DisablePrototypeRecoveryPass = false;
   bool PrintPrototypeRecoverySummary = false;
+  bool RewritePrototypeSignatures = false;
 };
 
 void printUsage(const char *argv0) {
@@ -76,6 +77,7 @@ void printUsage(const char *argv0) {
                "[--no-register-ssa-pass] [--register-ssa-summary] "
                "[--no-prototype-recovery-pass] "
                "[--prototype-recovery-summary] "
+               "[--rewrite-prototype-signatures] "
                "[--decode-seed-limit <count>] "
                "[--memory-model inttoptr|global-array] [-p root-sla-dir] "
                "[-s pspec-file]\n";
@@ -150,6 +152,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
     if (flag == "--prototype-recovery-summary") {
       options.PrintPrototypeRecoverySummary = true;
+      continue;
+    }
+    if (flag == "--rewrite-prototype-signatures") {
+      options.RewritePrototypeSignatures = true;
       continue;
     }
     if (argIndex + 1 >= argc) {
@@ -822,6 +828,7 @@ bool runPrototypeRecoveryPassIfEnabled(llvm::Module &module,
   }
   notdec::bin2llvm::NativePrototypeRecoveryOptions passOptions;
   passOptions.PrintSummary = options.PrintPrototypeRecoverySummary;
+  passOptions.RewriteSignatures = options.RewritePrototypeSignatures;
   notdec::bin2llvm::runNativePrototypeRecovery(module, passOptions);
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after prototype recovery pass\n";
