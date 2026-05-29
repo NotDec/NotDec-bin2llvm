@@ -190,4 +190,19 @@ if (BUILD_TESTING)
     COMMAND
       native_register_effects_test
   )
+
+  add_executable(native_instcombine_metadata_test
+    tests/native_instcombine_metadata_test.cpp
+  )
+
+  target_link_libraries(native_instcombine_metadata_test
+    PRIVATE
+      notdec-bin2llvm-core
+  )
+
+  add_test(
+    NAME notdec.native_instcombine.metadata
+    COMMAND
+      native_instcombine_metadata_test
+  )
 endif ()

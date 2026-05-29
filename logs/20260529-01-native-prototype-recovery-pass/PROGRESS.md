@@ -92,6 +92,9 @@
   - [x] Bench2 smoke 检查 prototype metadata。
     - 记录：`06-pass-pipeline-and-verification/20260529-02-bench2-prototype-metadata-smoke.md`
     - 文件：`scripts/bench2-native-smoke.sh`
+  - [x] 添加 instcombine 对 register access metadata / NativeRegisterSSA 计数的最小安全验证。
+    - 记录：`06-pass-pipeline-and-verification/20260529-03-instcombine-register-metadata-safety.md`
+    - 文件：`tests/native_instcombine_metadata_test.cpp`
   - [ ] Bench2 selected native 全量验证。
 
 ## 记录规则
