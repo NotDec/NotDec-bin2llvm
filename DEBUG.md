@@ -46,3 +46,25 @@ mkdir -p /tmp/notdec-ghidra-proj-memcached-20260519
 - `openssh limit20`
 
 这些结果会继续写进仓库根目录的 `logs/`。这里只放命令骨架，不重复贴每次结果。
+
+## 4. native debug oracle
+
+Bench2 native discovery 的 debug-info oracle 作为手动 coverage gate 使用，不接入默认 CTest。
+
+具体命令和当前期望结果见：
+
+- [`logs/20260521-01-proj-RizinCliAndGhidraAutoAnalysis/08-more-bench2/20260524-01-bench2-selected-targets-rerun-script.md`](logs/20260521-01-proj-RizinCliAndGhidraAutoAnalysis/08-more-bench2/20260524-01-bench2-selected-targets-rerun-script.md)
+
+常用入口：
+
+```bash
+cd /sn640/NotDec/external/NotDec-bin2llvm
+/usr/bin/time -f 'TIME debug-oracle-selected6 %e' \
+  scripts/bench2-native-discovery-debug-check.py \
+  --target libuv:shared-library \
+  --target vsftpd:executable \
+  --target memcached:executable \
+  --target python:shared-library \
+  --target vim:executable \
+  --target wolfssl:shared-library
+```

@@ -93,3 +93,66 @@ rm -rf /tmp/notdec-selected-native-ir-limited2 /tmp/notdec-selected-native-proje
 现在 Bench2 侧有了独立的 native selected targets 重跑入口。native 修复后的受限验证已经能稳定导出 14 个目标，并通过 LLVM 22 verifier。
 
 还没解决的是完整 discovery 性能，主要是 `wolfssl` 这种 `.eh_frame` seed 很多的目标。下一步应该先优化 native discovery 的性能，再去掉 `--decode-seed-limit 200` 跑正式输出目录。
+
+## Debug Oracle 手动测试方法
+
+debug oracle 不接入主项目默认测试。原因是它依赖 `/sn640/NotDec-Exp/Bench2` 里的二进制和 debug 文件，而且 selected6 全量约 103 秒，更适合作为手动 coverage gate。
+
+脚本位置：
+
+```bash
+/sn640/NotDec/external/NotDec-bin2llvm/scripts/bench2-native-discovery-debug-check.py
+```
+
+先确认 native 工具已构建：
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-discover -j2
+```
+
+快速单目标检查，例如 `vim`：
+
+```bash
+cd /sn640/NotDec/external/NotDec-bin2llvm
+/usr/bin/time -f 'TIME vim-oracle %e' \
+  scripts/bench2-native-discovery-debug-check.py \
+  --target vim:executable
+```
+
+当前期望结果：
+
+```text
+vim	executable	3569	5309	5309	3569	3569	1.0000	1.0000
+```
+
+selected6 检查：
+
+```bash
+cd /sn640/NotDec/external/NotDec-bin2llvm
+/usr/bin/time -f 'TIME debug-oracle-selected6 %e' \
+  scripts/bench2-native-discovery-debug-check.py \
+  --target libuv:shared-library \
+  --target vsftpd:executable \
+  --target memcached:executable \
+  --target python:shared-library \
+  --target vim:executable \
+  --target wolfssl:shared-library
+```
+
+当前期望结果：
+
+```text
+vsftpd	executable	174	187	187	174	174	1.0000	1.0000
+libuv	shared-library	376	485	485	376	376	1.0000	1.0000
+memcached	executable	216	259	259	216	216	1.0000	1.0000
+wolfssl	shared-library	4127	4160	4160	4127	4127	1.0000	1.0000
+vim	executable	3569	5309	5309	3569	3569	1.0000	1.0000
+python	shared-library	6866	7343	7343	6866	6866	1.0000	1.0000
+TIME debug-oracle-selected6 102.85
+```
+
+看结果时重点看：
+
+- `seed_coverage`：native function seed 是否覆盖 debug subprogram 入口。
+- `confirmed_coverage`：recursive discovery 是否确认了这些入口。
+- `missing_confirmed_sample`：非空时再用 `llvm-dwarfdump` 或 `objdump` 抽样确认是真漏函数，还是 debug inline / range 误报。
