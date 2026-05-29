@@ -92,6 +92,29 @@ llvm::Function *createFunction(llvm::Module &module, const std::string &name) {
   return function;
 }
 
+llvm::Function *createUnusedExternalInputFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *load =
+      builder.CreateLoad(global->getValueType(), global,
+                         registerName + ".external_input");
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "name=" + registerName),
+      llvm::ValueAsMetadata::get(global),
+  };
+  load->setMetadata("notdec.register.external_input",
+                    llvm::MDNode::get(context, fields));
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createReturnStoreFunction(llvm::Module &module,
                                           const std::string &name,
                                           llvm::GlobalVariable *global,
@@ -314,6 +337,10 @@ int main() {
   llvm::Function *inputFunction = createFunction(module, "input_rdi");
   attachExternalInputs(*inputFunction, {{"RDI", rdi}});
 
+  llvm::Function *unusedInputFunction =
+      createUnusedExternalInputFunction(module, "unused_rdi", rdi, "RDI");
+  attachExternalInputs(*unusedInputFunction, {{"RDI", rdi}});
+
   llvm::Function *savedRegisterFunction = createFunction(module, "saved_rbx");
   attachExternalInputs(*savedRegisterFunction, {{"RBX", rbx}});
   llvm::Function *returnFunction =
@@ -343,8 +370,8 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 8, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 2,
+  ok &= expect(summary.FunctionsSeen == 9, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 3,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 1,
                "unexpected input candidate count");
@@ -353,6 +380,9 @@ int main() {
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
                "RDI was not marked as an input candidate");
+  ok &= expect(!metadataHasRegister(*unusedInputFunction,
+                                    "notdec.prototype.input_candidates", "RDI"),
+               "unused RDI was incorrectly marked as an input candidate");
   ok &= expect(!metadataHasRegister(*savedRegisterFunction,
                                     "notdec.prototype.input_candidates", "RBX"),
                "RBX was incorrectly marked as an input candidate");

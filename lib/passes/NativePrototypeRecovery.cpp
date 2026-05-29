@@ -63,6 +63,32 @@ std::optional<std::string> returnValueKey(llvm::Value &value) {
   return std::nullopt;
 }
 
+bool hasActiveExternalInputUse(llvm::Function &function,
+                               llvm::StringRef registerName) {
+  bool sawExternalInputLoad = false;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (load == nullptr) {
+        continue;
+      }
+      llvm::MDNode *metadata = load->getMetadata("notdec.register.external_input");
+      if (metadata == nullptr) {
+        continue;
+      }
+      std::optional<std::string> name = metadataField(*metadata, "name");
+      if (!name || *name != registerName) {
+        continue;
+      }
+      sawExternalInputLoad = true;
+      if (!load->use_empty()) {
+        return true;
+      }
+    }
+  }
+  return !sawExternalInputLoad;
+}
+
 std::optional<NativeParamTrial> returnTrialBeforeInstruction(
     llvm::Instruction &instruction, const NativePrototypeModel &model) {
   llvm::BasicBlock::reverse_iterator iter(instruction.getIterator());
@@ -184,6 +210,9 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
         }
         if (nativeAbiHasEffectRegister(*abi, NativeAbiEffectKind::Unaffected,
                                        *name)) {
+          continue;
+        }
+        if (!hasActiveExternalInputUse(function, *name)) {
           continue;
         }
 
