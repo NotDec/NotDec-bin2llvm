@@ -3,6 +3,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -414,6 +415,19 @@ bool recoveredPrototypeParamAt(
   return index < params.size() && params[index].RegisterName == name;
 }
 
+bool functionTypeShape(llvm::FunctionType &type, llvm::Type *returnType,
+                       llvm::ArrayRef<llvm::Type *> params) {
+  if (type.getReturnType() != returnType || type.getNumParams() != params.size()) {
+    return false;
+  }
+  for (unsigned index = 0; index < params.size(); ++index) {
+    if (type.getParamType(index) != params[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool expect(bool condition, const std::string &message) {
   if (condition) {
     return true;
@@ -558,6 +572,14 @@ int main() {
                  "recovered input prototype return count was not read");
     ok &= expect(recoveredPrototypeParamAt(inputPrototype->Inputs, 0, "RDI"),
                  "recovered input prototype register was not read");
+    std::optional<llvm::FunctionType *> type =
+        notdec::bin2llvm::buildNativeRecoveredPrototypeFunctionType(
+            context, *inputPrototype);
+    llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+    llvm::Type *voidType = llvm::Type::getVoidTy(context);
+    ok &= expect(type.has_value() &&
+                     functionTypeShape(**type, voidType, llvm::ArrayRef(i64)),
+                 "recovered input prototype type was not void(i64)");
   }
   ok &= expect(recoveredHasField(*returnFunction, "input_count=0"),
                "return-only recovered prototype input count was not written");
@@ -576,6 +598,13 @@ int main() {
                  "recovered return prototype return count was not read");
     ok &= expect(recoveredPrototypeParamAt(returnPrototype->Returns, 0, "RAX"),
                  "recovered return prototype register was not read");
+    std::optional<llvm::FunctionType *> type =
+        notdec::bin2llvm::buildNativeRecoveredPrototypeFunctionType(
+            context, *returnPrototype);
+    llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+    ok &= expect(type.has_value() &&
+                     functionTypeShape(**type, i64, llvm::ArrayRef<llvm::Type *>{}),
+                 "recovered return prototype type was not i64()");
   }
   ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 0, "RAX"),
                "recovered RAX return was not sorted before RDX");
@@ -595,6 +624,9 @@ int main() {
     ok &= expect(
         recoveredPrototypeParamAt(twoOutputPrototype->Returns, 1, "RDX"),
         "recovered RDX return was not read after RAX");
+    ok &= expect(!notdec::bin2llvm::buildNativeRecoveredPrototypeFunctionType(
+                     context, *twoOutputPrototype),
+                 "multi-return recovered prototype type was incorrectly built");
   }
   ok &= expect(unusedInputFunction->getMetadata("notdec.prototype.recovered") ==
                    nullptr,

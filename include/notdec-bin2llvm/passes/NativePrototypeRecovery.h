@@ -7,6 +7,8 @@
 
 namespace llvm {
 class Function;
+class FunctionType;
+class LLVMContext;
 class Module;
 class raw_ostream;
 } // namespace llvm
@@ -71,6 +73,9 @@ runNativePrototypeRecovery(llvm::Module &module,
 
 std::optional<NativeRecoveredPrototype>
 readNativeRecoveredPrototypeMetadata(const llvm::Function &function);
+
+std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
+    llvm::LLVMContext &context, const NativeRecoveredPrototype &prototype);
 
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os);

@@ -7,10 +7,12 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -432,6 +434,27 @@ readNativeRecoveredPrototypeMetadata(const llvm::Function &function) {
   prototype.Inputs = std::move(*inputs);
   prototype.Returns = std::move(*returns);
   return prototype;
+}
+
+std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
+    llvm::LLVMContext &context, const NativeRecoveredPrototype &prototype) {
+  if (prototype.Returns.size() > 1) {
+    return std::nullopt;
+  }
+
+  std::vector<llvm::Type *> paramTypes;
+  llvm::Type *registerType = llvm::Type::getInt64Ty(context);
+  paramTypes.reserve(prototype.Inputs.size());
+  for (const NativeRecoveredPrototypeParam &param : prototype.Inputs) {
+    (void)param;
+    paramTypes.push_back(registerType);
+  }
+
+  llvm::Type *returnType = llvm::Type::getVoidTy(context);
+  if (prototype.Returns.size() == 1) {
+    returnType = registerType;
+  }
+  return llvm::FunctionType::get(returnType, paramTypes, false);
 }
 
 void printNativePrototypeRecoverySummary(
