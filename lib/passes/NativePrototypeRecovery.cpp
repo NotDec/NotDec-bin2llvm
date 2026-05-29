@@ -13,6 +13,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <map>
 #include <optional>
 #include <set>
@@ -169,6 +170,14 @@ void addUniqueTrialBySlot(NativeParamActive &active,
   active.Trials.push_back(std::move(trial));
 }
 
+void sortTrialsBySlot(NativeParamActive &active) {
+  std::stable_sort(active.Trials.begin(), active.Trials.end(),
+                   [](const NativeParamTrial &lhs,
+                      const NativeParamTrial &rhs) {
+                     return lhs.Slot < rhs.Slot;
+                   });
+}
+
 } // namespace
 
 NativePrototypeRecoverySummary runNativePrototypeRecovery(
@@ -223,6 +232,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
         active.Trials.push_back(std::move(trial));
       }
     }
+    sortTrialsBySlot(active);
 
     NativeParamActive returns;
     std::map<uint64_t, NativeParamTrial> returnTrialsBySlot;

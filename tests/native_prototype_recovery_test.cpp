@@ -293,6 +293,26 @@ bool metadataHasRegister(const llvm::Function &function, llvm::StringRef kind,
   return false;
 }
 
+bool metadataRegisterAt(const llvm::Function &function, llvm::StringRef kind,
+                        uint64_t index, llvm::StringRef name) {
+  llvm::MDNode *node = function.getMetadata(kind);
+  if (node == nullptr || index >= node->getNumOperands()) {
+    return false;
+  }
+  auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(node->getOperand(index));
+  if (entry == nullptr) {
+    return false;
+  }
+  std::string prefix = ("name=" + name).str();
+  for (const llvm::MDOperand &fieldOperand : entry->operands()) {
+    auto *field = llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+    if (field != nullptr && field->getString() == prefix) {
+      return true;
+    }
+  }
+  return false;
+}
+
 uint64_t countMetadataRegister(const llvm::Function &function,
                                llvm::StringRef kind, llvm::StringRef name) {
   llvm::MDNode *node = function.getMetadata(kind);
@@ -337,6 +357,10 @@ int main() {
   llvm::Function *inputFunction = createFunction(module, "input_rdi");
   attachExternalInputs(*inputFunction, {{"RDI", rdi}});
 
+  llvm::Function *reversedInputFunction =
+      createFunction(module, "input_reversed");
+  attachExternalInputs(*reversedInputFunction, {{"RSI", rdi}, {"RDI", rdi}});
+
   llvm::Function *unusedInputFunction =
       createUnusedExternalInputFunction(module, "unused_rdi", rdi, "RDI");
   attachExternalInputs(*unusedInputFunction, {{"RDI", rdi}});
@@ -370,16 +394,24 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 9, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 3,
+  ok &= expect(summary.FunctionsSeen == 10, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 5,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 1,
+  ok &= expect(summary.InputCandidates == 3,
                "unexpected input candidate count");
   ok &= expect(summary.ReturnCandidates == 3,
                "unexpected return candidate count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
                "RDI was not marked as an input candidate");
+  ok &= expect(metadataRegisterAt(*reversedInputFunction,
+                                  "notdec.prototype.input_candidates", 0,
+                                  "RDI"),
+               "RDI input candidate was not sorted before RSI");
+  ok &= expect(metadataRegisterAt(*reversedInputFunction,
+                                  "notdec.prototype.input_candidates", 1,
+                                  "RSI"),
+               "RSI input candidate was not sorted after RDI");
   ok &= expect(!metadataHasRegister(*unusedInputFunction,
                                     "notdec.prototype.input_candidates", "RDI"),
                "unused RDI was incorrectly marked as an input candidate");

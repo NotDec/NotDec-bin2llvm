@@ -68,6 +68,9 @@
   - [x] input candidate 过滤明确 unused 的 external input load。
     - 记录：`05-input-output-candidates/20260529-07-input-candidate-active-use.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] input candidates 按 ABI slot 顺序写入 metadata。
+    - 记录：`05-input-output-candidates/20260529-08-input-candidate-slot-order.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。
