@@ -7,6 +7,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -133,6 +134,56 @@ llvm::Function *createUnusedExternalInputFunction(
   };
   load->setMetadata("notdec.register.external_input",
                     llvm::MDNode::get(context, fields));
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::LoadInst *createExternalInputLoad(llvm::IRBuilder<> &builder,
+                                        llvm::GlobalVariable *global,
+                                        const std::string &registerName) {
+  llvm::LLVMContext &context = global->getContext();
+  llvm::LoadInst *load =
+      builder.CreateLoad(global->getValueType(), global,
+                         registerName + ".external_input");
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "name=" + registerName),
+      llvm::ValueAsMetadata::get(global),
+  };
+  load->setMetadata("notdec.register.external_input",
+                    llvm::MDNode::get(context, fields));
+  return load;
+}
+
+llvm::Function *createUsedExternalInputFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName, llvm::LoadInst **inputLoad) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *load = createExternalInputLoad(builder, global, registerName);
+  builder.CreateAdd(load, llvm::ConstantInt::get(global->getValueType(), 1));
+  builder.CreateRetVoid();
+  *inputLoad = load;
+  return function;
+}
+
+llvm::Function *createDuplicateExternalInputLoadFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *first = createExternalInputLoad(builder, global, registerName);
+  llvm::LoadInst *second = createExternalInputLoad(builder, global, registerName);
+  builder.CreateAdd(first, second);
   builder.CreateRetVoid();
   return function;
 }
@@ -463,6 +514,17 @@ int main() {
   llvm::Function *inputFunction = createFunction(module, "input_rdi");
   attachExternalInputs(*inputFunction, {{"RDI", rdi}});
 
+  llvm::LoadInst *bindableInputLoad = nullptr;
+  llvm::Function *bindableInputFunction =
+      createUsedExternalInputFunction(module, "input_rdi_bindable", rdi, "RDI",
+                                      &bindableInputLoad);
+  attachExternalInputs(*bindableInputFunction, {{"RDI", rdi}});
+
+  llvm::Function *duplicateInputLoadFunction =
+      createDuplicateExternalInputLoadFunction(module, "input_rdi_duplicate_load",
+                                               rdi, "RDI");
+  attachExternalInputs(*duplicateInputLoadFunction, {{"RDI", rdi}});
+
   llvm::FunctionType *matchingInputType = llvm::FunctionType::get(
       llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
   llvm::Function *matchingInputFunction =
@@ -514,16 +576,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 13, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 8,
+  ok &= expect(summary.FunctionsSeen == 15, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 10,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 5,
+  ok &= expect(summary.InputCandidates == 7,
                "unexpected input candidate count");
   ok &= expect(summary.ReturnCandidates == 5,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 7,
+  ok &= expect(summary.RewriteEligibleFunctions == 9,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 6,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 8,
                "unexpected signature rewrite needed function count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
@@ -613,6 +675,28 @@ int main() {
     ok &= expect(eligibility.RecoveredType == *type,
                  "input prototype rewrite type did not match recovered type");
   }
+  std::optional<std::vector<notdec::bin2llvm::NativePrototypeInputBinding>>
+      inputBindings =
+          notdec::bin2llvm::getNativePrototypeInputBindings(
+              *bindableInputFunction);
+  ok &= expect(inputBindings.has_value(),
+               "bindable input prototype had no input bindings");
+  if (inputBindings) {
+    ok &= expect(inputBindings->size() == 1,
+                 "bindable input prototype had unexpected binding count");
+    ok &= expect((*inputBindings)[0].Param.RegisterName == "RDI",
+                 "bindable input binding used wrong register");
+    ok &= expect((*inputBindings)[0].Param.Slot == 0,
+                 "bindable input binding used wrong slot");
+    ok &= expect((*inputBindings)[0].ExternalInputLoad == bindableInputLoad,
+                 "bindable input binding used wrong load");
+  }
+  ok &= expect(!notdec::bin2llvm::getNativePrototypeInputBindings(
+                    *inputFunction),
+               "input prototype without external input load was bound");
+  ok &= expect(!notdec::bin2llvm::getNativePrototypeInputBindings(
+                    *duplicateInputLoadFunction),
+               "duplicate external input loads were incorrectly bound");
   notdec::bin2llvm::NativePrototypeRewriteEligibility matchingEligibility =
       notdec::bin2llvm::getNativePrototypeRewriteEligibility(
           *matchingInputFunction);

@@ -9,6 +9,7 @@ namespace llvm {
 class Function;
 class FunctionType;
 class LLVMContext;
+class LoadInst;
 class Module;
 class raw_ostream;
 } // namespace llvm
@@ -62,6 +63,14 @@ struct NativePrototypeRewriteEligibility {
   llvm::FunctionType *RecoveredType = nullptr;
 };
 
+// Read-only bridge from recovered input storage to the SSA load that currently
+// represents the function-entry register value.  Later signature rewriting can
+// replace the load uses with the matching LLVM argument.
+struct NativePrototypeInputBinding {
+  NativeRecoveredPrototypeParam Param;
+  llvm::LoadInst *ExternalInputLoad = nullptr;
+};
+
 struct NativePrototypeRecoveryFunctionSummary {
   std::string FunctionName;
   uint64_t ExternalInputsSeen = 0;
@@ -93,6 +102,9 @@ std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
 
 NativePrototypeRewriteEligibility
 getNativePrototypeRewriteEligibility(const llvm::Function &function);
+
+std::optional<std::vector<NativePrototypeInputBinding>>
+getNativePrototypeInputBindings(llvm::Function &function);
 
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os);

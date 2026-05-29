@@ -139,6 +139,35 @@ bool hasActiveExternalInputUse(llvm::Function &function,
   return !sawExternalInputLoad;
 }
 
+std::optional<llvm::LoadInst *> uniqueExternalInputLoad(
+    llvm::Function &function, llvm::StringRef registerName) {
+  llvm::LoadInst *result = nullptr;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (load == nullptr) {
+        continue;
+      }
+      llvm::MDNode *metadata = load->getMetadata("notdec.register.external_input");
+      if (metadata == nullptr) {
+        continue;
+      }
+      std::optional<std::string> name = metadataField(*metadata, "name");
+      if (!name || *name != registerName) {
+        continue;
+      }
+      if (result != nullptr) {
+        return std::nullopt;
+      }
+      result = load;
+    }
+  }
+  if (result == nullptr) {
+    return std::nullopt;
+  }
+  return result;
+}
+
 std::vector<NativeParamTrial> returnTrialsBeforeInstruction(
     llvm::Instruction &instruction, const NativePrototypeModel &model) {
   std::vector<NativeParamTrial> trials;
@@ -499,6 +528,31 @@ getNativePrototypeRewriteEligibility(const llvm::Function &function) {
   result.NeedsRewrite = function.getFunctionType() != *recoveredType;
   result.Reason = result.NeedsRewrite ? "needs rewrite" : "already matches";
   return result;
+}
+
+std::optional<std::vector<NativePrototypeInputBinding>>
+getNativePrototypeInputBindings(llvm::Function &function) {
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(function);
+  if (!prototype) {
+    return std::nullopt;
+  }
+
+  std::vector<NativePrototypeInputBinding> bindings;
+  bindings.reserve(prototype->Inputs.size());
+  for (const NativeRecoveredPrototypeParam &param : prototype->Inputs) {
+    std::optional<llvm::LoadInst *> load =
+        uniqueExternalInputLoad(function, param.RegisterName);
+    if (!load) {
+      return std::nullopt;
+    }
+
+    NativePrototypeInputBinding binding;
+    binding.Param = param;
+    binding.ExternalInputLoad = *load;
+    bindings.push_back(std::move(binding));
+  }
+  return bindings;
 }
 
 void printNativePrototypeRecoverySummary(
