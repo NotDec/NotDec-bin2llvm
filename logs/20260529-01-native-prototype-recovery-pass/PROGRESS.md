@@ -56,6 +56,9 @@
   - [x] 多 return path 的相同 ABI output slot 去重。
     - 记录：`05-input-output-candidates/20260529-03-deduplicate-return-candidates.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] 多 return path 必须都覆盖同一个 ABI output slot 才标返回候选。
+    - 记录：`05-input-output-candidates/20260529-04-require-all-return-output-slot.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。

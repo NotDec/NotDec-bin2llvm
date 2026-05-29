@@ -10,6 +10,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -150,14 +151,27 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     }
 
     NativeParamActive returns;
-    std::set<uint64_t> returnSlots;
+    std::map<uint64_t, NativeParamTrial> returnTrialsBySlot;
+    std::map<uint64_t, uint64_t> returnSlotCounts;
+    uint64_t returnCount = 0;
     for (llvm::BasicBlock &block : function) {
       if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator())) {
+        ++returnCount;
         if (std::optional<NativeParamTrial> trial =
                 returnTrialBefore(*ret, model)) {
-          addUniqueTrialBySlot(returns, returnSlots, std::move(*trial));
+          uint64_t slot = trial->Slot;
+          ++returnSlotCounts[slot];
+          returnTrialsBySlot.try_emplace(slot, std::move(*trial));
         }
       }
+    }
+    std::set<uint64_t> returnSlots;
+    for (const auto &[slot, count] : returnSlotCounts) {
+      if (count != returnCount) {
+        continue;
+      }
+      addUniqueTrialBySlot(returns, returnSlots,
+                           std::move(returnTrialsBySlot[slot]));
     }
 
     functionSummary.InputCandidates = active.Trials.size();

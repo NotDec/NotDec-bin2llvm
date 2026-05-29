@@ -144,6 +144,37 @@ llvm::Function *createTwoReturnStoreFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createPartialReturnStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *withReturn =
+      llvm::BasicBlock::Create(context, "with_return", function);
+  llvm::BasicBlock *withoutReturn =
+      llvm::BasicBlock::Create(context, "without_return", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), withReturn,
+                       withoutReturn);
+
+  builder.SetInsertPoint(withReturn);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x3333), global);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(withoutReturn);
+  builder.CreateRetVoid();
+
+  return function;
+}
+
 void attachExternalInputs(llvm::Function &function,
                           llvm::ArrayRef<std::pair<std::string,
                                                    llvm::GlobalVariable *>>
@@ -235,6 +266,9 @@ int main() {
       createReturnStoreFunction(module, "return_rbx", rbx, "RBX");
   llvm::Function *twoReturnFunction =
       createTwoReturnStoreFunction(module, "return_rax_twice", rax, "RAX");
+  llvm::Function *partialReturnFunction =
+      createPartialReturnStoreFunction(module, "return_rax_partial", rax,
+                                       "RAX");
 
   notdec::bin2llvm::NativePrototypeRecoveryOptions options;
   notdec::bin2llvm::NativePrototypeRecoverySummary summary =
@@ -246,7 +280,7 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 5, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 6, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 2,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 1,
@@ -269,5 +303,9 @@ int main() {
                                      "notdec.prototype.return_candidates",
                                      "RAX") == 1,
                "RAX return candidate was not deduplicated");
+  ok &= expect(!metadataHasRegister(*partialReturnFunction,
+                                    "notdec.prototype.return_candidates",
+                                    "RAX"),
+               "partial RAX return was incorrectly marked as a candidate");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
