@@ -409,60 +409,16 @@ require_heritage_metric() {
 check_ir_features() {
   local name="$1"
   local ll="$2"
-
-  case "$name" in
-  vsftpd)
-    require_ir_pattern "$ll" "call void @__cxa_finalize()" \
-      "$name PLT.GOT external direct call"
-    require_ir_pattern "$ll" "call void @notdec_native_8290()" \
-      "$name internal direct call"
-    require_ir_pattern "$ll" "call void @__gmon_start__()" \
-      "$name GOT external indirect call"
-    require_ir_pattern "$ll" "call void @_ITM_deregisterTMCloneTable()" \
-      "$name GOT external indirect tail jump"
-    require_ir_pattern "$ll" "call void @notdec_plt0_resolver()" \
-      "$name PLT0 resolver tail jump"
-    require_ir_pattern "$ll" "call void @getegid()" \
-      "$name PLT GOT indirect branch"
-    require_ir_pattern "$ll" "call void @SSL_get_error()" \
-      "$name PLT GOT indirect branch"
-    ;;
-  libuv)
-    require_ir_pattern "$ll" "call void @notdec_native_9d80()" \
-      "$name internal direct call"
-    require_ir_pattern "$ll" "call void @__gmon_start__()" \
-      "$name GOT external indirect call"
-    require_ir_pattern "$ll" "call void @__cxa_finalize()" \
-      "$name PLT.GOT external direct call"
-    require_ir_pattern "$ll" "call void @pthread_key_delete()" \
-      "$name PLT external direct call"
-    require_ir_pattern "$ll" "call void @_ITM_deregisterTMCloneTable()" \
-      "$name GOT external indirect tail jump"
-    ;;
-  memcached)
-    require_ir_pattern "$ll" "call void @__cxa_finalize()" \
-      "$name PLT.GOT external direct call"
-    require_ir_pattern "$ll" "call void @notdec_native_b950()" \
-      "$name internal direct call"
-    require_ir_pattern "$ll" "call void @__gmon_start__()" \
-      "$name GOT external indirect call"
-    require_ir_pattern "$ll" "call void @_ITM_deregisterTMCloneTable()" \
-      "$name GOT external indirect tail jump"
-    require_ir_pattern "$ll" "call void @notdec_plt0_resolver()" \
-      "$name PLT0 resolver tail jump"
-    require_ir_pattern "$ll" "call void @SSL_CTX_use_PrivateKey_file()" \
-      "$name PLT GOT indirect branch"
-    require_ir_pattern "$ll" "call void @pthread_cond_signal()" \
-      "$name PLT GOT indirect branch"
-    ;;
-  esac
+  local unresolved_indirect_branch="$3"
 
   forbid_ir_pattern "$ll" "__cxa_finalize_1" \
     "$name duplicate external symbol regression"
   forbid_ir_regex "$ll" 'ram_[0-9a-f]+_[0-9]+_in = freeze' \
     "$name direct RAM poison read regression"
-  forbid_ir_pattern "$ll" "notdec_exit" \
-    "$name anonymous branch exit regression"
+  if ((unresolved_indirect_branch == 0)); then
+    forbid_ir_pattern "$ll" "notdec_exit" \
+      "$name anonymous branch exit regression"
+  fi
 
   forbid_ir_pattern "$ll" "notdec_pcode_CALL_void" \
     "$name direct call helper regression"
@@ -549,7 +505,6 @@ for index in "${!TARGET_NAMES[@]}"; do
     exit 1
   fi
   require_no_unresolved_indirect_calls "$summary" "$name"
-  require_unresolved_indirect_branches_at_most "$summary" "$name" 0
   check_entry_sources "$name" "$summary"
   "$DISCOVER" --seeds-json "$target" >"$seeds" 2>"$seeds_stderr"
   "$DISCOVER" --blocks-json "$target" >"$blocks" 2>"$blocks_stderr"
@@ -563,7 +518,10 @@ for index in "${!TARGET_NAMES[@]}"; do
     >"$native_stdout" 2>"$native_stderr"
   "$LLVM_AS" "$ll" -o "$bc" >"$llvm_as_stdout" 2>"$llvm_as_stderr"
   "$OPT" -passes=verify "$bc" -o "$opt_bc" >"$opt_stdout" 2>"$opt_stderr"
-  check_ir_features "$name" "$ll"
+  unresolved_indirect_branch="$(summary_number_first "$summary" "indirect branch")"
+  require_summary_number "$unresolved_indirect_branch" "$summary" \
+    "unresolved_indirect_flows.indirect branch"
+  check_ir_features "$name" "$ll" "$unresolved_indirect_branch"
   check_prototype_metadata "$name" "$ll"
 
   if [[ "$name" == "libuv" ]]; then

@@ -122,7 +122,9 @@
   - [x] `notdec-native-llvm` 默认在 register SSA 前跑 instcombine，并提供关闭开关。
     - 记录：`06-pass-pipeline-and-verification/20260529-12-cli-instcombine-pipeline.md`
     - 文件：`tools/notdec-native-llvm.cpp`
-  - [ ] Bench2 selected native 全量验证。
+  - [x] Bench2 selected native 全量验证。
+    - 记录：`06-pass-pipeline-and-verification/20260529-13-bench2-selected-native-full-verification.md`
+    - 文件：`scripts/bench2-native-smoke.sh`
 
 ## 记录规则
 
