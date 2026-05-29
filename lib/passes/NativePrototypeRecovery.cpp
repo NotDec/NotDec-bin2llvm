@@ -11,6 +11,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <optional>
+#include <set>
 #include <string>
 
 namespace notdec::bin2llvm {
@@ -87,6 +88,15 @@ void addFunctionSummary(NativePrototypeRecoverySummary &total,
   total.Functions.push_back(function);
 }
 
+void addUniqueTrialBySlot(NativeParamActive &active,
+                          std::set<uint64_t> &seenSlots,
+                          NativeParamTrial trial) {
+  if (!seenSlots.insert(trial.Slot).second) {
+    return;
+  }
+  active.Trials.push_back(std::move(trial));
+}
+
 } // namespace
 
 NativePrototypeRecoverySummary runNativePrototypeRecovery(
@@ -140,11 +150,12 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     }
 
     NativeParamActive returns;
+    std::set<uint64_t> returnSlots;
     for (llvm::BasicBlock &block : function) {
       if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator())) {
         if (std::optional<NativeParamTrial> trial =
                 returnTrialBefore(*ret, model)) {
-          returns.Trials.push_back(std::move(*trial));
+          addUniqueTrialBySlot(returns, returnSlots, std::move(*trial));
         }
       }
     }

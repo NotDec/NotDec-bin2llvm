@@ -111,6 +111,39 @@ llvm::Function *createReturnStoreFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createTwoReturnStoreFunction(llvm::Module &module,
+                                             const std::string &name,
+                                             llvm::GlobalVariable *global,
+                                             const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x1111), global);
+  leftStore->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(right);
+  llvm::StoreInst *rightStore = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x2222), global);
+  rightStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+
+  return function;
+}
+
 void attachExternalInputs(llvm::Function &function,
                           llvm::ArrayRef<std::pair<std::string,
                                                    llvm::GlobalVariable *>>
@@ -150,6 +183,29 @@ bool metadataHasRegister(const llvm::Function &function, llvm::StringRef kind,
   return false;
 }
 
+uint64_t countMetadataRegister(const llvm::Function &function,
+                               llvm::StringRef kind, llvm::StringRef name) {
+  llvm::MDNode *node = function.getMetadata(kind);
+  if (node == nullptr) {
+    return 0;
+  }
+  uint64_t count = 0;
+  std::string prefix = ("name=" + name).str();
+  for (const llvm::MDOperand &operand : node->operands()) {
+    auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (entry == nullptr) {
+      continue;
+    }
+    for (const llvm::MDOperand &fieldOperand : entry->operands()) {
+      auto *field = llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+      if (field != nullptr && field->getString() == prefix) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
 bool expect(bool condition, const std::string &message) {
   if (condition) {
     return true;
@@ -177,6 +233,8 @@ int main() {
       createReturnStoreFunction(module, "return_rax", rax, "RAX");
   llvm::Function *nonReturnFunction =
       createReturnStoreFunction(module, "return_rbx", rbx, "RBX");
+  llvm::Function *twoReturnFunction =
+      createTwoReturnStoreFunction(module, "return_rax_twice", rax, "RAX");
 
   notdec::bin2llvm::NativePrototypeRecoveryOptions options;
   notdec::bin2llvm::NativePrototypeRecoverySummary summary =
@@ -188,12 +246,12 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 4, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 5, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 2,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 1,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 1,
+  ok &= expect(summary.ReturnCandidates == 2,
                "unexpected return candidate count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
@@ -207,5 +265,9 @@ int main() {
   ok &= expect(!metadataHasRegister(*nonReturnFunction,
                                     "notdec.prototype.return_candidates", "RBX"),
                "RBX was incorrectly marked as a return candidate");
+  ok &= expect(countMetadataRegister(*twoReturnFunction,
+                                     "notdec.prototype.return_candidates",
+                                     "RAX") == 1,
+               "RAX return candidate was not deduplicated");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

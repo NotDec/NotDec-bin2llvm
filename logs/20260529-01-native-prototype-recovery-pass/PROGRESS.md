@@ -53,6 +53,9 @@
   - [x] 标注 `notdec.prototype.return_candidates`。
     - 记录：`05-input-output-candidates/20260529-02-register-return-candidates.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] 多 return path 的相同 ABI output slot 去重。
+    - 记录：`05-input-output-candidates/20260529-03-deduplicate-return-candidates.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。
