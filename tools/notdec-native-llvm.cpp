@@ -10,10 +10,13 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
 
 #include <LIEF/ELF/Binary.hpp>
 #include <LIEF/ELF/Parser.hpp>
@@ -58,6 +61,7 @@ struct CliOptions {
       notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
   bool DisableRegisterSSAPass = false;
   bool PrintRegisterSSASummary = false;
+  bool DisableInstCombinePass = false;
   bool DisablePrototypeRecoveryPass = false;
   bool PrintPrototypeRecoverySummary = false;
 };
@@ -68,6 +72,7 @@ void printUsage(const char *argv0) {
                "(-a <address> -l <length> | -f <entry> | -n <name> | "
                "--all-confirmed) "
                "-o <output.ll> [--summary-json-out <path>] "
+               "[--no-instcombine-pass] "
                "[--no-register-ssa-pass] [--register-ssa-summary] "
                "[--no-prototype-recovery-pass] "
                "[--prototype-recovery-summary] "
@@ -129,6 +134,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
     if (flag == "--no-register-ssa-pass") {
       options.DisableRegisterSSAPass = true;
+      continue;
+    }
+    if (flag == "--no-instcombine-pass") {
+      options.DisableInstCombinePass = true;
       continue;
     }
     if (flag == "--register-ssa-summary") {
@@ -772,6 +781,40 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
   return true;
 }
 
+bool runInstCombinePassIfEnabled(llvm::Module &module,
+                                 const CliOptions &options) {
+  if (options.DisableInstCombinePass) {
+    return true;
+  }
+
+  llvm::LoopAnalysisManager loopAnalysis;
+  llvm::FunctionAnalysisManager functionAnalysis;
+  llvm::CGSCCAnalysisManager cgsccAnalysis;
+  llvm::ModuleAnalysisManager moduleAnalysis;
+
+  llvm::PassBuilder builder;
+  builder.registerModuleAnalyses(moduleAnalysis);
+  builder.registerCGSCCAnalyses(cgsccAnalysis);
+  builder.registerFunctionAnalyses(functionAnalysis);
+  builder.registerLoopAnalyses(loopAnalysis);
+  builder.crossRegisterProxies(loopAnalysis, functionAnalysis, cgsccAnalysis,
+                               moduleAnalysis);
+
+  llvm::FunctionPassManager functionPasses;
+  functionPasses.addPass(llvm::InstCombinePass());
+  for (llvm::Function &function : module) {
+    if (!function.isDeclaration()) {
+      functionPasses.run(function, functionAnalysis);
+    }
+  }
+
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after instcombine pass\n";
+    return false;
+  }
+  return true;
+}
+
 bool runPrototypeRecoveryPassIfEnabled(llvm::Module &module,
                                        const CliOptions &options) {
   if (options.DisablePrototypeRecoveryPass) {
@@ -804,6 +847,9 @@ int main(int argc, char **argv) {
           readIRModule(options->ElfPath, context, errorMessage);
       if (!module) {
         std::cerr << "failed to parse IR input: " << errorMessage << '\n';
+        return 1;
+      }
+      if (!runInstCombinePassIfEnabled(*module, *options)) {
         return 1;
       }
       if (!runRegisterSSAPassIfEnabled(*module, *options)) {
@@ -912,6 +958,9 @@ int main(int argc, char **argv) {
 
     if (llvm::verifyModule(*module, &llvm::errs())) {
       std::cerr << "module verification failed\n";
+      return 1;
+    }
+    if (!runInstCombinePassIfEnabled(*module, *options)) {
       return 1;
     }
     if (!runRegisterSSAPassIfEnabled(*module, *options)) {

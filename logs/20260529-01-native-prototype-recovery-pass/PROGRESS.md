@@ -119,6 +119,9 @@
   - [x] 扩展 instcombine 安全验证，覆盖冲突 return 不误标返回候选。
     - 记录：`06-pass-pipeline-and-verification/20260529-11-instcombine-conflicting-return-safety.md`
     - 文件：`tests/native_instcombine_metadata_test.cpp`
+  - [x] `notdec-native-llvm` 默认在 register SSA 前跑 instcombine，并提供关闭开关。
+    - 记录：`06-pass-pipeline-and-verification/20260529-12-cli-instcombine-pipeline.md`
+    - 文件：`tools/notdec-native-llvm.cpp`
   - [ ] Bench2 selected native 全量验证。
 
 ## 记录规则
