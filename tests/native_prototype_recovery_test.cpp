@@ -1069,7 +1069,7 @@ int main() {
           *usedBindableInputFunction);
   ok &= expect(!usedInputRewriteResult.Rewritten,
                "input-only prototype with uses was rewritten");
-  ok &= expect(usedInputRewriteResult.Reason == "function has uses",
+  ok &= expect(usedInputRewriteResult.Reason == "unsafe callsite input value",
                "input-only prototype with uses had unexpected rewrite reason");
   llvm::Instruction *inputLoadUser =
       llvm::dyn_cast<llvm::Instruction>(*bindableInputLoad->user_begin());
@@ -1216,6 +1216,70 @@ int main() {
                  "input-only rewrite\n";
     return EXIT_FAILURE;
   }
+
+  llvm::Module missingInputCallsiteModule(
+      "native-prototype-input-missing-callsite-value-test", context);
+  llvm::GlobalVariable *missingInputCallsiteRdi =
+      createRegisterGlobal(missingInputCallsiteModule, "RDI");
+  attachTestAbi(missingInputCallsiteModule);
+  llvm::LoadInst *missingInputCallsiteInputLoad = nullptr;
+  llvm::Function *missingInputCallsiteFunction =
+      createUsedExternalInputFunction(missingInputCallsiteModule,
+                                      "missing_callsite_input_rdi",
+                                      missingInputCallsiteRdi, "RDI",
+                                      &missingInputCallsiteInputLoad);
+  attachExternalInputs(*missingInputCallsiteFunction,
+                       {{"RDI", missingInputCallsiteRdi}});
+  createCallerFunction(missingInputCallsiteModule,
+                       "call_missing_callsite_input_rdi",
+                       missingInputCallsiteFunction);
+  notdec::bin2llvm::runNativePrototypeRecovery(missingInputCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      missingInputCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+              *missingInputCallsiteFunction);
+  ok &= expect(!missingInputCallsiteRewriteResult.Rewritten,
+               "input-only prototype rewrite ignored missing callsite argument");
+  ok &= expect(missingInputCallsiteRewriteResult.Reason ==
+                   "unsafe callsite input value",
+               "missing callsite input value had wrong skip reason");
+  if (llvm::verifyModule(missingInputCallsiteModule, &llvm::errs())) {
+    std::cerr << "missing input callsite module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module addressTakenInputModule(
+      "native-prototype-input-address-taken-test", context);
+  llvm::GlobalVariable *addressTakenInputRdi =
+      createRegisterGlobal(addressTakenInputModule, "RDI");
+  attachTestAbi(addressTakenInputModule);
+  llvm::LoadInst *addressTakenInputLoad = nullptr;
+  llvm::Function *addressTakenInputFunction =
+      createUsedExternalInputFunction(addressTakenInputModule,
+                                      "address_taken_input_rdi",
+                                      addressTakenInputRdi, "RDI",
+                                      &addressTakenInputLoad);
+  attachExternalInputs(*addressTakenInputFunction,
+                       {{"RDI", addressTakenInputRdi}});
+  notdec::bin2llvm::runNativePrototypeRecovery(addressTakenInputModule,
+                                               options);
+  new llvm::GlobalVariable(
+      addressTakenInputModule, addressTakenInputFunction->getType(), true,
+      llvm::GlobalValue::ExternalLinkage, addressTakenInputFunction,
+      "address_taken_input_rdi_ptr");
+  notdec::bin2llvm::NativePrototypeRewriteResult addressTakenRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+          *addressTakenInputFunction);
+  ok &= expect(!addressTakenRewriteResult.Rewritten,
+               "address-taken input-only prototype was rewritten");
+  ok &= expect(addressTakenRewriteResult.Reason == "function has uses",
+               "address-taken input-only prototype had unexpected reason");
+  if (llvm::verifyModule(addressTakenInputModule, &llvm::errs())) {
+    std::cerr << "address-taken input module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
   notdec::bin2llvm::NativePrototypeRewriteEligibility matchingEligibility =
       notdec::bin2llvm::getNativePrototypeRewriteEligibility(
           *matchingInputFunction);
@@ -1900,25 +1964,36 @@ int main() {
   createReturnLoadMultiSuccessorCallerFunction(
       batchModule, "call_batch_return_rax_unsafe_callsite",
       batchUnsafeReturnFunction, batchRax, "RAX", &batchUnsafeReturnLoad);
+
+  llvm::LoadInst *batchUnsafeInputLoad = nullptr;
+  llvm::Function *batchUnsafeInputFunction = createUsedExternalInputFunction(
+      batchModule, "batch_input_rdi_unsafe_callsite", batchRdi, "RDI",
+      &batchUnsafeInputLoad);
+  attachExternalInputs(*batchUnsafeInputFunction, {{"RDI", batchRdi}});
+  createCallerFunction(batchModule, "call_batch_input_rdi_unsafe_callsite",
+                       batchUnsafeInputFunction);
   createFunction(batchModule, "batch_missing_recovered");
 
   notdec::bin2llvm::runNativePrototypeRecovery(batchModule, options);
   notdec::bin2llvm::NativePrototypeModuleRewriteSummary batchRewriteSummary =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypes(batchModule);
-  ok &= expect(batchRewriteSummary.FunctionsSeen == 8,
+  ok &= expect(batchRewriteSummary.FunctionsSeen == 10,
                "batch rewrite saw unexpected function count");
   ok &= expect(batchRewriteSummary.FunctionsRewritten == 3,
                "batch rewrite rewrote unexpected function count");
-  ok &= expect(batchRewriteSummary.FunctionsSkipped == 5,
+  ok &= expect(batchRewriteSummary.FunctionsSkipped == 7,
                "batch rewrite skipped unexpected function count");
-  ok &= expect(batchRewriteSummary.SkippedByReason["function has uses"] == 1,
+  ok &= expect(batchRewriteSummary.SkippedByReason["function has uses"] == 0,
                "batch rewrite did not count function-use skip reason");
   ok &= expect(
-      batchRewriteSummary.SkippedByReason["missing recovered prototype"] == 3,
+      batchRewriteSummary.SkippedByReason["missing recovered prototype"] == 4,
       "batch rewrite did not count missing-prototype skip reason");
   ok &= expect(
       batchRewriteSummary.SkippedByReason["unsafe callsite return load"] == 1,
       "batch rewrite did not count unsafe-return-load skip reason");
+  ok &= expect(
+      batchRewriteSummary.SkippedByReason["unsafe callsite input value"] == 2,
+      "batch rewrite did not count unsafe-input-value skip reason");
   ok &= expect(batchModule.getFunction("batch_input_rdi") != nullptr &&
                    functionTypeShape(
                        *batchModule.getFunction("batch_input_rdi")

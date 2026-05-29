@@ -254,29 +254,36 @@ struct NativeInputOnlyCallsiteRewrite {
   llvm::Value *Argument = nullptr;
 };
 
-std::optional<std::vector<NativeInputOnlyCallsiteRewrite>>
+struct InputOnlyCallsiteCollectionResult {
+  std::vector<NativeInputOnlyCallsiteRewrite> Rewrites;
+  std::string FailureReason;
+};
+
+InputOnlyCallsiteCollectionResult
 collectInputOnlyDirectCallsiteRewrites(llvm::Function &function,
                                        llvm::StringRef registerName,
                                        llvm::Type *paramType) {
-  std::vector<NativeInputOnlyCallsiteRewrite> rewrites;
+  InputOnlyCallsiteCollectionResult result;
   for (llvm::User *user : function.users()) {
     auto *call = llvm::dyn_cast<llvm::CallInst>(user);
     if (call == nullptr || call->getCalledFunction() != &function ||
         call->arg_size() != 0 || !call->getType()->isVoidTy()) {
-      return std::nullopt;
+      result.FailureReason = "function has uses";
+      return result;
     }
     std::optional<llvm::Value *> argument =
         callsiteInputValueBeforeCall(*call, registerName, paramType);
     if (!argument) {
-      return std::nullopt;
+      result.FailureReason = "unsafe callsite input value";
+      return result;
     }
 
     NativeInputOnlyCallsiteRewrite rewrite;
     rewrite.Call = call;
     rewrite.Argument = *argument;
-    rewrites.push_back(rewrite);
+    result.Rewrites.push_back(rewrite);
   }
-  return rewrites;
+  return result;
 }
 
 void rewriteInputOnlyDirectCallsites(
@@ -1000,13 +1007,15 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
   }
   std::optional<std::vector<NativeInputOnlyCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
-    callsiteRewrites = collectInputOnlyDirectCallsiteRewrites(
+    InputOnlyCallsiteCollectionResult callsiteCollection =
+        collectInputOnlyDirectCallsiteRewrites(
         function, prototype->Inputs[0].RegisterName,
         (*recoveredType)->getParamType(0));
-    if (!callsiteRewrites) {
-      result.Reason = "function has uses";
+    if (!callsiteCollection.FailureReason.empty()) {
+      result.Reason = callsiteCollection.FailureReason;
       return result;
     }
+    callsiteRewrites = std::move(callsiteCollection.Rewrites);
   }
 
   llvm::Module *module = function.getParent();
@@ -1099,13 +1108,15 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
   }
   std::optional<std::vector<NativeInputOnlyCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
-    callsiteRewrites = collectInputOnlyDirectCallsiteRewrites(
+    InputOnlyCallsiteCollectionResult callsiteCollection =
+        collectInputOnlyDirectCallsiteRewrites(
         function, prototype->Inputs[0].RegisterName,
         (*recoveredType)->getParamType(0));
-    if (!callsiteRewrites) {
-      result.Reason = "function has uses";
+    if (!callsiteCollection.FailureReason.empty()) {
+      result.Reason = callsiteCollection.FailureReason;
       return result;
     }
+    callsiteRewrites = std::move(callsiteCollection.Rewrites);
     for (const NativeInputOnlyCallsiteRewrite &callsite : *callsiteRewrites) {
       if (callsiteHasMismatchedReturnLoad(
               *callsite.Call, prototype->Returns[0].RegisterName,

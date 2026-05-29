@@ -203,6 +203,9 @@
   - [x] 细化 unsafe callsite return load 的签名重写 skip reason。
     - 记录：`06-pass-pipeline-and-verification/20260529-26-callsite-return-skip-reason.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 细化 unsafe callsite input value 的签名重写 skip reason。
+    - 记录：`06-pass-pipeline-and-verification/20260529-27-callsite-input-skip-reason.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
