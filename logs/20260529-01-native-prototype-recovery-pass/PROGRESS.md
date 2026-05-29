@@ -116,6 +116,9 @@
   - [x] 添加默认关闭的签名重写 opt-in 选项。
     - 记录：`05-input-output-candidates/20260529-23-opt-in-signature-rewrite.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] 为多返回寄存器 recovered prototype 构造 LLVM struct return type。
+    - 记录：`05-input-output-candidates/20260529-24-multi-return-function-type.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。

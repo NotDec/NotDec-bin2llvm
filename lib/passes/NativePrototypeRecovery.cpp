@@ -767,10 +767,6 @@ readNativeRecoveredPrototypeMetadata(const llvm::Function &function) {
 
 std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
     llvm::LLVMContext &context, const NativeRecoveredPrototype &prototype) {
-  if (prototype.Returns.size() > 1) {
-    return std::nullopt;
-  }
-
   std::vector<llvm::Type *> paramTypes;
   llvm::Type *registerType = llvm::Type::getInt64Ty(context);
   paramTypes.reserve(prototype.Inputs.size());
@@ -782,6 +778,10 @@ std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
   llvm::Type *returnType = llvm::Type::getVoidTy(context);
   if (prototype.Returns.size() == 1) {
     returnType = registerType;
+  } else if (prototype.Returns.size() > 1) {
+    std::vector<llvm::Type *> returnElements(prototype.Returns.size(),
+                                             registerType);
+    returnType = llvm::StructType::get(context, returnElements);
   }
   return llvm::FunctionType::get(returnType, paramTypes, false);
 }

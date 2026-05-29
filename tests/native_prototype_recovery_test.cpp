@@ -944,9 +944,9 @@ int main() {
                "unexpected input candidate count");
   ok &= expect(summary.ReturnCandidates == 9,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 15,
+  ok &= expect(summary.RewriteEligibleFunctions == 16,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 14,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 15,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -1904,16 +1904,35 @@ int main() {
     ok &= expect(
         recoveredPrototypeParamAt(twoOutputPrototype->Returns, 1, "RDX"),
         "recovered RDX return was not read after RAX");
-    ok &= expect(!notdec::bin2llvm::buildNativeRecoveredPrototypeFunctionType(
-                     context, *twoOutputPrototype),
-                 "multi-return recovered prototype type was incorrectly built");
+    std::optional<llvm::FunctionType *> multiReturnType =
+        notdec::bin2llvm::buildNativeRecoveredPrototypeFunctionType(
+            context, *twoOutputPrototype);
+    auto *multiReturnStruct = multiReturnType
+                                  ? llvm::dyn_cast<llvm::StructType>(
+                                        (*multiReturnType)->getReturnType())
+                                  : nullptr;
+    ok &= expect(multiReturnStruct != nullptr &&
+                     multiReturnStruct->getNumElements() == 2 &&
+                     multiReturnStruct->getElementType(0)->isIntegerTy(64) &&
+                     multiReturnStruct->getElementType(1)->isIntegerTy(64),
+                 "multi-return recovered prototype type was not {i64, i64}()");
     notdec::bin2llvm::NativePrototypeRewriteEligibility eligibility =
         notdec::bin2llvm::getNativePrototypeRewriteEligibility(
             *twoOutputReturnFunction);
-    ok &= expect(!eligibility.Eligible,
-                 "multi-return prototype was incorrectly rewrite eligible");
-    ok &= expect(eligibility.Reason == "unsupported recovered prototype type",
-                 "multi-return prototype had unexpected ineligible reason");
+    ok &= expect(eligibility.Eligible,
+                 "multi-return prototype was not rewrite eligible");
+    ok &= expect(eligibility.NeedsRewrite,
+                 "multi-return prototype did not request rewrite");
+    ok &= expect(multiReturnType && eligibility.RecoveredType == *multiReturnType,
+                 "multi-return prototype rewrite type did not match");
+    notdec::bin2llvm::NativePrototypeRewriteResult multiReturnRewriteResult =
+        notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+            *twoOutputReturnFunction);
+    ok &= expect(!multiReturnRewriteResult.Rewritten,
+                 "multi-return prototype was unexpectedly rewritten");
+    ok &= expect(multiReturnRewriteResult.Reason ==
+                     "unsupported recovered prototype shape",
+                 "multi-return prototype rewrite had unexpected reason");
   }
   ok &= expect(unusedInputFunction->getMetadata("notdec.prototype.recovered") ==
                    nullptr,
