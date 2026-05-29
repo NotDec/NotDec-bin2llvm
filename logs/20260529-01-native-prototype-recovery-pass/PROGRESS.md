@@ -200,6 +200,9 @@
   - [x] 添加 callsite return load CFG 不确定形状的保守阻断和负例测试。
     - 记录：`06-pass-pipeline-and-verification/20260529-25-callsite-return-cfg-negative-tests.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 细化 unsafe callsite return load 的签名重写 skip reason。
+    - 记录：`06-pass-pipeline-and-verification/20260529-26-callsite-return-skip-reason.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

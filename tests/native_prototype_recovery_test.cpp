@@ -1508,6 +1508,9 @@ int main() {
               *clobberReturnCallsiteFunction);
   ok &= expect(!clobberReturnCallsiteRewriteResult.Rewritten,
                "return-only prototype rewrite ignored callsite clobber");
+  ok &= expect(clobberReturnCallsiteRewriteResult.Reason ==
+                   "unsafe callsite return load",
+               "clobbered return callsite had wrong skip reason");
   ok &= expect(!clobberReturnCallsiteLoad->use_empty(),
                "clobbered return load was unexpectedly replaced");
   if (llvm::verifyModule(clobberReturnCallsiteModule, &llvm::errs())) {
@@ -1523,6 +1526,8 @@ int main() {
         notdec::bin2llvm::NativePrototypeRewriteResult result =
             notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(function);
         ok &= expect(!result.Rewritten, message);
+        ok &= expect(result.Reason == "unsafe callsite return load",
+                     "unsafe return callsite had wrong skip reason");
         if (load != nullptr) {
           ok &= expect(!load->use_empty(),
                        "unsafe callsite return load was unexpectedly replaced");
@@ -1888,22 +1893,32 @@ int main() {
   attachExternalInputs(*batchUsedInputFunction, {{"RDI", batchRdi}});
   createCallerFunction(batchModule, "call_batch_input_rdi_used",
                        batchUsedInputFunction);
+
+  llvm::Function *batchUnsafeReturnFunction = createReturnStoreFunction(
+      batchModule, "batch_return_rax_unsafe_callsite", batchRax, "RAX");
+  llvm::LoadInst *batchUnsafeReturnLoad = nullptr;
+  createReturnLoadMultiSuccessorCallerFunction(
+      batchModule, "call_batch_return_rax_unsafe_callsite",
+      batchUnsafeReturnFunction, batchRax, "RAX", &batchUnsafeReturnLoad);
   createFunction(batchModule, "batch_missing_recovered");
 
   notdec::bin2llvm::runNativePrototypeRecovery(batchModule, options);
   notdec::bin2llvm::NativePrototypeModuleRewriteSummary batchRewriteSummary =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypes(batchModule);
-  ok &= expect(batchRewriteSummary.FunctionsSeen == 6,
+  ok &= expect(batchRewriteSummary.FunctionsSeen == 8,
                "batch rewrite saw unexpected function count");
   ok &= expect(batchRewriteSummary.FunctionsRewritten == 3,
                "batch rewrite rewrote unexpected function count");
-  ok &= expect(batchRewriteSummary.FunctionsSkipped == 3,
+  ok &= expect(batchRewriteSummary.FunctionsSkipped == 5,
                "batch rewrite skipped unexpected function count");
   ok &= expect(batchRewriteSummary.SkippedByReason["function has uses"] == 1,
                "batch rewrite did not count function-use skip reason");
   ok &= expect(
-      batchRewriteSummary.SkippedByReason["missing recovered prototype"] == 2,
+      batchRewriteSummary.SkippedByReason["missing recovered prototype"] == 3,
       "batch rewrite did not count missing-prototype skip reason");
+  ok &= expect(
+      batchRewriteSummary.SkippedByReason["unsafe callsite return load"] == 1,
+      "batch rewrite did not count unsafe-return-load skip reason");
   ok &= expect(batchModule.getFunction("batch_input_rdi") != nullptr &&
                    functionTypeShape(
                        *batchModule.getFunction("batch_input_rdi")

@@ -296,6 +296,11 @@ struct ReturnLoadSearchResult {
   bool Blocked = false;
 };
 
+struct ReturnOnlyCallsiteCollectionResult {
+  std::vector<llvm::CallInst *> Callsites;
+  std::string FailureReason;
+};
+
 ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
     llvm::BasicBlock::iterator iter, llvm::BasicBlock::iterator end,
     llvm::StringRef returnRegisterName) {
@@ -400,23 +405,25 @@ bool callsiteHasMismatchedReturnLoad(llvm::CallInst &callsite,
                             result.Load->getType() != returnType);
 }
 
-std::optional<std::vector<llvm::CallInst *>>
+ReturnOnlyCallsiteCollectionResult
 collectReturnOnlyDirectCallsites(llvm::Function &function,
                                  llvm::StringRef returnRegisterName,
                                  llvm::Type *returnType) {
-  std::vector<llvm::CallInst *> callsites;
+  ReturnOnlyCallsiteCollectionResult result;
   for (llvm::User *user : function.users()) {
     auto *call = llvm::dyn_cast<llvm::CallInst>(user);
     if (call == nullptr || call->getCalledFunction() != &function ||
         call->arg_size() != 0 || !call->getType()->isVoidTy()) {
-      return std::nullopt;
+      result.FailureReason = "function has uses";
+      return result;
     }
     if (callsiteHasMismatchedReturnLoad(*call, returnRegisterName, returnType)) {
-      return std::nullopt;
+      result.FailureReason = "unsafe callsite return load";
+      return result;
     }
-    callsites.push_back(call);
+    result.Callsites.push_back(call);
   }
-  return callsites;
+  return result;
 }
 
 void rewriteReturnOnlyDirectCallsites(llvm::Function &rewritten,
@@ -901,14 +908,15 @@ rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
   }
   std::optional<std::vector<llvm::CallInst *>> callsiteRewrites;
   if (!function.use_empty()) {
-    callsiteRewrites =
+    ReturnOnlyCallsiteCollectionResult callsiteCollection =
         collectReturnOnlyDirectCallsites(function,
                                          prototype->Returns[0].RegisterName,
                                          (*recoveredType)->getReturnType());
-    if (!callsiteRewrites) {
-      result.Reason = "function has uses";
+    if (!callsiteCollection.FailureReason.empty()) {
+      result.Reason = callsiteCollection.FailureReason;
       return result;
     }
+    callsiteRewrites = std::move(callsiteCollection.Callsites);
   }
 
   llvm::Module *module = function.getParent();
@@ -1102,7 +1110,7 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
       if (callsiteHasMismatchedReturnLoad(
               *callsite.Call, prototype->Returns[0].RegisterName,
               (*recoveredType)->getReturnType())) {
-        result.Reason = "function has uses";
+        result.Reason = "unsafe callsite return load";
         return result;
       }
     }
