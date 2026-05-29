@@ -14,9 +14,13 @@
     - 文件：`tests/native_abi_cspec_test.cpp`
 
 - [ ] 阶段 2: `02-prototype-storage-model`
-  - [ ] 编写第一小步规划：复刻 `ParamEntry` / `ParamList` 的 register storage 匹配。
-  - [ ] 实现 ABI input/output storage 查询。
-  - [ ] 添加 register / stack storage 匹配测试。
+  - [x] 编写第一小步规划：复刻 `ParamEntry` / `ParamList` 的 register storage 匹配。
+    - 记录：`02-prototype-storage-model/20260529-01-register-param-storage-match.md`
+  - [x] 实现 ABI input/output register storage 查询。
+    - 文件：`include/notdec-bin2llvm/NativePrototypeModel.h`、`lib/NativePrototypeModel.cpp`
+  - [x] 添加 register storage 匹配测试。
+    - 文件：`tests/native_prototype_model_test.cpp`
+  - [ ] 添加 stack storage 匹配测试。
 
 - [ ] 阶段 3: `03-function-register-effects`
   - [ ] 编写第一小步规划：基于 SSA 判断 ABI preserved register。

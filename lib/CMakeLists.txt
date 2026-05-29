@@ -3,6 +3,7 @@ add_library(notdec-bin2llvm-core STATIC
   HeritageToLLVM.cpp
   ModuleBuilder.cpp
   NativeAbi.cpp
+  NativePrototypeModel.cpp
   Pcode.cpp
   PcodeToLLVM.cpp
   passes/NativeRegisterSSA.cpp
