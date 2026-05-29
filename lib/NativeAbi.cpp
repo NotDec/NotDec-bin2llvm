@@ -392,6 +392,95 @@ llvm::MDNode *effectNode(llvm::LLVMContext &context,
   return llvm::MDNode::get(context, fields);
 }
 
+std::optional<std::string> metadataField(const llvm::MDNode &node,
+                                         llvm::StringRef key) {
+  std::string prefix = (key + "=").str();
+  for (const llvm::MDOperand &operand : node.operands()) {
+    auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+    if (field == nullptr || !field->getString().starts_with(prefix)) {
+      continue;
+    }
+    return field->getString().substr(prefix.size()).str();
+  }
+  return std::nullopt;
+}
+
+std::optional<NativeAbiStorage> storageFromMetadata(const llvm::MDNode &node) {
+  std::optional<std::string> kind = metadataField(node, "kind");
+  if (!kind) {
+    return std::nullopt;
+  }
+
+  NativeAbiStorage storage;
+  if (*kind == "register") {
+    storage.Kind = NativeAbiStorageKind::Register;
+  } else if (*kind == "stack") {
+    storage.Kind = NativeAbiStorageKind::Stack;
+  } else {
+    return std::nullopt;
+  }
+  storage.Name = metadataField(node, "name").value_or("");
+  storage.Space = metadataField(node, "space").value_or("");
+  storage.Offset =
+      parseIntegerOr<uint64_t>(metadataField(node, "offset").value_or(""), 0);
+  return storage;
+}
+
+std::optional<NativeAbiParamEntry> paramEntryFromMetadata(
+    const llvm::MDNode &node) {
+  NativeAbiParamEntry entry;
+  entry.MinSize =
+      parseIntegerOr<uint32_t>(metadataField(node, "minsize").value_or(""), 0);
+  entry.MaxSize =
+      parseIntegerOr<uint32_t>(metadataField(node, "maxsize").value_or(""), 0);
+  entry.Align =
+      parseIntegerOr<uint32_t>(metadataField(node, "align").value_or(""), 0);
+  entry.MetaType = metadataField(node, "metatype").value_or("");
+  for (const llvm::MDOperand &operand : node.operands()) {
+    auto *storage = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (storage == nullptr) {
+      continue;
+    }
+    std::optional<NativeAbiStorage> parsed = storageFromMetadata(*storage);
+    if (!parsed) {
+      continue;
+    }
+    entry.Storage = std::move(*parsed);
+    return entry;
+  }
+  return std::nullopt;
+}
+
+std::optional<NativeAbiEffect> effectFromMetadata(const llvm::MDNode &node) {
+  std::optional<std::string> effectName = metadataField(node, "effect");
+  if (!effectName) {
+    return std::nullopt;
+  }
+
+  NativeAbiEffect effect;
+  if (*effectName == "unaffected") {
+    effect.Kind = NativeAbiEffectKind::Unaffected;
+  } else if (*effectName == "killedbycall") {
+    effect.Kind = NativeAbiEffectKind::KilledByCall;
+  } else {
+    return std::nullopt;
+  }
+
+  for (const llvm::MDOperand &operand : node.operands()) {
+    auto *storage = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (storage == nullptr) {
+      continue;
+    }
+    std::optional<NativeAbiStorage> parsed = storageFromMetadata(*storage);
+    if (!parsed) {
+      continue;
+    }
+    effect.Storage = std::move(*parsed);
+    return effect;
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 std::optional<NativeAbiSpec> parseGhidraCspecDefaultAbi(
@@ -480,6 +569,71 @@ void attachNativeAbiMetadata(llvm::Module &module, const NativeAbiSpec &abi) {
 
   module.getOrInsertNamedMetadata("notdec.abi")->addOperand(
       llvm::MDNode::get(context, fields));
+}
+
+std::optional<NativeAbiSpec> readNativeAbiMetadata(const llvm::Module &module) {
+  llvm::NamedMDNode *abiMetadata = module.getNamedMetadata("notdec.abi");
+  if (abiMetadata == nullptr || abiMetadata->getNumOperands() == 0) {
+    return std::nullopt;
+  }
+
+  llvm::MDNode *node = abiMetadata->getOperand(0);
+  NativeAbiSpec abi;
+  abi.PrototypeName = metadataField(*node, "prototype").value_or("");
+  abi.StackPointerRegister =
+      metadataField(*node, "stackpointer.register").value_or("");
+  abi.StackPointerSpace =
+      metadataField(*node, "stackpointer.space").value_or("");
+  abi.ExtraPop =
+      parseIntegerOr<int64_t>(metadataField(*node, "extrapop").value_or(""), 0);
+  abi.StackShift = parseIntegerOr<uint64_t>(
+      metadataField(*node, "stackshift").value_or(""), 0);
+
+  std::vector<llvm::MDNode *> childLists;
+  for (const llvm::MDOperand &operand : node->operands()) {
+    auto *child = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (child != nullptr) {
+      childLists.push_back(child);
+    }
+  }
+  if (childLists.size() < 3) {
+    return std::nullopt;
+  }
+
+  for (const llvm::MDOperand &operand : childLists[0]->operands()) {
+    auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (entry == nullptr) {
+      continue;
+    }
+    if (std::optional<NativeAbiParamEntry> parsed =
+            paramEntryFromMetadata(*entry)) {
+      abi.Inputs.push_back(std::move(*parsed));
+    }
+  }
+  for (const llvm::MDOperand &operand : childLists[1]->operands()) {
+    auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (entry == nullptr) {
+      continue;
+    }
+    if (std::optional<NativeAbiParamEntry> parsed =
+            paramEntryFromMetadata(*entry)) {
+      abi.Outputs.push_back(std::move(*parsed));
+    }
+  }
+  for (const llvm::MDOperand &operand : childLists[2]->operands()) {
+    auto *effect = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (effect == nullptr) {
+      continue;
+    }
+    if (std::optional<NativeAbiEffect> parsed = effectFromMetadata(*effect)) {
+      abi.Effects.push_back(std::move(*parsed));
+    }
+  }
+
+  if (abi.PrototypeName.empty()) {
+    return std::nullopt;
+  }
+  return abi;
 }
 
 } // namespace notdec::bin2llvm

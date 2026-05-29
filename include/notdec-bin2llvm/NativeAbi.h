@@ -69,4 +69,6 @@ std::optional<NativeAbiSpec> parseGhidraCspecDefaultAbi(
 
 void attachNativeAbiMetadata(llvm::Module &module, const NativeAbiSpec &abi);
 
+std::optional<NativeAbiSpec> readNativeAbiMetadata(const llvm::Module &module);
+
 } // namespace notdec::bin2llvm

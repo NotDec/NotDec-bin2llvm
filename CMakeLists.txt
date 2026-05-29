@@ -161,6 +161,21 @@ if (BUILD_TESTING)
       "${NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR}/Ghidra/Processors/x86/data/languages/x86-64-gcc.cspec"
   )
 
+  add_executable(native_prototype_recovery_test
+    tests/native_prototype_recovery_test.cpp
+  )
+
+  target_link_libraries(native_prototype_recovery_test
+    PRIVATE
+      notdec-bin2llvm-core
+  )
+
+  add_test(
+    NAME notdec.native_prototype_recovery.input_candidates
+    COMMAND
+      native_prototype_recovery_test
+  )
+
   add_executable(native_register_effects_test
     tests/native_register_effects_test.cpp
   )
