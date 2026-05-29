@@ -160,4 +160,19 @@ if (BUILD_TESTING)
       native_prototype_model_test
       "${NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR}/Ghidra/Processors/x86/data/languages/x86-64-gcc.cspec"
   )
+
+  add_executable(native_register_effects_test
+    tests/native_register_effects_test.cpp
+  )
+
+  target_link_libraries(native_register_effects_test
+    PRIVATE
+      notdec-bin2llvm-core
+  )
+
+  add_test(
+    NAME notdec.native_register_effects.preserved
+    COMMAND
+      native_register_effects_test
+  )
 endif ()

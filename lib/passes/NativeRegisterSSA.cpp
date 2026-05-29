@@ -104,6 +104,44 @@ std::map<llvm::GlobalVariable *, RegisterUnit> collectRegisterUnits(
   return units;
 }
 
+std::set<std::string> collectAbiUnaffectedRegisters(llvm::Module &module) {
+  std::set<std::string> registers;
+  llvm::NamedMDNode *abiMetadata = module.getNamedMetadata("notdec.abi");
+  if (abiMetadata == nullptr) {
+    return registers;
+  }
+
+  for (llvm::MDNode *abiNode : abiMetadata->operands()) {
+    for (const llvm::MDOperand &operand : abiNode->operands()) {
+      auto *effectList = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+      if (effectList == nullptr) {
+        continue;
+      }
+      for (const llvm::MDOperand &effectOperand : effectList->operands()) {
+        auto *effectNode =
+            llvm::dyn_cast_or_null<llvm::MDNode>(effectOperand.get());
+        if (effectNode == nullptr || mdField(effectNode, "effect") !=
+                                          std::optional<std::string>("unaffected")) {
+          continue;
+        }
+        for (const llvm::MDOperand &storageOperand : effectNode->operands()) {
+          auto *storageNode =
+              llvm::dyn_cast_or_null<llvm::MDNode>(storageOperand.get());
+          if (storageNode == nullptr || mdField(storageNode, "kind") !=
+                                            std::optional<std::string>("register")) {
+            continue;
+          }
+          std::optional<std::string> name = mdField(storageNode, "name");
+          if (name && !name->empty()) {
+            registers.insert(*name);
+          }
+        }
+      }
+    }
+  }
+  return registers;
+}
+
 AccessInfo registerLoad(llvm::LoadInst &load,
                         std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
   auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
@@ -158,9 +196,11 @@ class FunctionPromoter {
 public:
   FunctionPromoter(llvm::Function &function,
                    std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+                   const std::set<std::string> &abiUnaffectedRegisters,
                    bool enableRewrite,
                    NativeRegisterSSAFunctionSummary &summary)
-      : Function(function), Units(units), EnableRewrite(enableRewrite),
+      : Function(function), Units(units),
+        AbiUnaffectedRegisters(abiUnaffectedRegisters), EnableRewrite(enableRewrite),
         Summary(summary) {}
 
   void run() {
@@ -171,9 +211,11 @@ public:
 
     if (EnableRewrite) {
       rewriteLoads();
+      attachPreservedMetadata();
       eraseDeadPhis();
     } else {
       collectExternalInputsOnly();
+      attachPreservedMetadata();
     }
     attachExternalInputMetadata();
   }
@@ -474,8 +516,56 @@ private:
                          llvm::MDNode::get(context, entries));
   }
 
+  void attachPreservedMetadata() {
+    if (AbiUnaffectedRegisters.empty() || ExternalInputValue.empty()) {
+      return;
+    }
+
+    llvm::LLVMContext &context = Function.getContext();
+    std::vector<llvm::Metadata *> entries;
+    for (auto &[global, unit] : Units) {
+      if (AbiUnaffectedRegisters.count(unit.Name) == 0) {
+        continue;
+      }
+      auto inputIt = ExternalInputValue.find(global);
+      if (inputIt == ExternalInputValue.end()) {
+        continue;
+      }
+      llvm::Value *input = resolveValue(inputIt->second);
+      if (input == nullptr || !isPreservedOnAllReturns(unit, input)) {
+        continue;
+      }
+      llvm::Metadata *fields[] = {
+          llvm::MDString::get(context, "name=" + unit.Name),
+          llvm::ValueAsMetadata::get(global),
+      };
+      entries.push_back(llvm::MDNode::get(context, fields));
+    }
+
+    if (!entries.empty()) {
+      Function.setMetadata("notdec.register.preserves",
+                           llvm::MDNode::get(context, entries));
+    }
+  }
+
+  bool isPreservedOnAllReturns(RegisterUnit &unit, llvm::Value *input) {
+    bool sawReturn = false;
+    for (llvm::BasicBlock &block : Function) {
+      if (!llvm::isa<llvm::ReturnInst>(block.getTerminator())) {
+        continue;
+      }
+      sawReturn = true;
+      llvm::Value *exit = resolveValue(readBlockExit(block, unit));
+      if (exit != input) {
+        return false;
+      }
+    }
+    return sawReturn;
+  }
+
   llvm::Function &Function;
   std::map<llvm::GlobalVariable *, RegisterUnit> &Units;
+  const std::set<std::string> &AbiUnaffectedRegisters;
   bool EnableRewrite = true;
   NativeRegisterSSAFunctionSummary &Summary;
   std::vector<llvm::LoadInst *> Loads;
@@ -515,14 +605,16 @@ runNativeRegisterSSA(llvm::Module &module,
   if (units.empty()) {
     return summary;
   }
+  std::set<std::string> abiUnaffectedRegisters =
+      collectAbiUnaffectedRegisters(module);
 
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;
     }
     NativeRegisterSSAFunctionSummary functionSummary;
-    FunctionPromoter promoter(function, units, options.EnableRewrite,
-                              functionSummary);
+    FunctionPromoter promoter(function, units, abiUnaffectedRegisters,
+                              options.EnableRewrite, functionSummary);
     promoter.run();
     addFunctionSummary(summary, functionSummary);
   }

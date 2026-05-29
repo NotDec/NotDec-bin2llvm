@@ -24,10 +24,14 @@
     - 记录：`02-prototype-storage-model/20260529-02-stack-param-storage-match.md`
 
 - [ ] 阶段 3: `03-function-register-effects`
-  - [ ] 编写第一小步规划：基于 SSA 判断 ABI preserved register。
-  - [ ] 标注函数级 `notdec.register.preserves`。
+  - [x] 编写第一小步规划：基于 SSA 判断 ABI preserved register。
+    - 记录：`03-function-register-effects/20260529-01-preserved-unaffected-registers.md`
+  - [x] 标注函数级 `notdec.register.preserves`。
+    - 文件：`lib/passes/NativeRegisterSSA.cpp`
   - [ ] 标注函数级 `notdec.register.clobbers`。
-  - [ ] 添加 preserved / clobber IR 小样例。
+  - [x] 添加 preserved IR 小样例。
+    - 文件：`tests/native_register_effects_test.cpp`
+  - [ ] 添加 clobber IR 小样例。
 
 - [ ] 阶段 4: `04-callsite-effects`
   - [ ] 编写第一小步规划：外部 call 按 ABI killedbycall 处理。
