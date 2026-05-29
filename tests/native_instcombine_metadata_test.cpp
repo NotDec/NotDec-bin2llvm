@@ -114,6 +114,19 @@ void attachPreservesMetadata(llvm::Function &function,
                        llvm::MDNode::get(context, entries));
 }
 
+void attachClobbersMetadata(llvm::Function &function,
+                            llvm::GlobalVariable *global,
+                            const std::string &name) {
+  llvm::LLVMContext &context = function.getContext();
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "name=" + name),
+      llvm::ValueAsMetadata::get(global),
+  };
+  llvm::Metadata *entries[] = {llvm::MDNode::get(context, fields)};
+  function.setMetadata("notdec.register.clobbers",
+                       llvm::MDNode::get(context, entries));
+}
+
 std::unique_ptr<llvm::Module> createDirectPreserveModule(
     llvm::LLVMContext &context) {
   auto module = std::make_unique<llvm::Module>("instcombine-direct-test",
@@ -144,6 +157,42 @@ std::unique_ptr<llvm::Module> createDirectPreserveModule(
   builder.CreateCall(calleeType, callee);
   llvm::LoadInst *load =
       builder.CreateLoad(rdi->getValueType(), rdi, "rdi_after_direct");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, "RDI"));
+  builder.CreateRet(load);
+  return module;
+}
+
+std::unique_ptr<llvm::Module> createDirectClobberModule(
+    llvm::LLVMContext &context) {
+  auto module = std::make_unique<llvm::Module>("instcombine-direct-clobber-test",
+                                               context);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(*module, "RDI");
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "clobbers_rdi", *module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  calleeBuilder.CreateRetVoid();
+  attachClobbersMetadata(*callee, rdi, "RDI");
+
+  auto *funcType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "direct_clobber_then_load_rdi", *module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(rdi->getValueType(), 0x9abc), rdi);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RDI"));
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rdi->getValueType(), rdi, "rdi_after_clobber");
   load->setMetadata("notdec.register.access",
                     registerAccessMetadata(context, "RDI"));
   builder.CreateRet(load);
@@ -345,5 +394,44 @@ int main() {
                "direct call count dropped after instcombine");
   ok &= expect(directCombined.LoadsReplaced >= directBaseline.LoadsReplaced,
                "direct preserving call load replacement dropped");
+
+  llvm::LLVMContext clobberBaselineContext;
+  std::unique_ptr<llvm::Module> clobberBaselineModule =
+      createDirectClobberModule(clobberBaselineContext);
+  notdec::bin2llvm::NativeRegisterSSASummary clobberBaseline =
+      notdec::bin2llvm::runNativeRegisterSSA(*clobberBaselineModule, options);
+  if (llvm::verifyModule(*clobberBaselineModule, &llvm::errs())) {
+    std::cerr << "clobber baseline module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::LLVMContext clobberCombinedContext;
+  std::unique_ptr<llvm::Module> clobberCombinedModule =
+      createDirectClobberModule(clobberCombinedContext);
+  llvm::Function *clobberCombinedCallee =
+      clobberCombinedModule->getFunction("clobbers_rdi");
+  llvm::Function *clobberCombinedFunction =
+      clobberCombinedModule->getFunction("direct_clobber_then_load_rdi");
+  if (clobberCombinedCallee == nullptr || clobberCombinedFunction == nullptr) {
+    std::cerr << "clobber test function missing\n";
+    return EXIT_FAILURE;
+  }
+  runInstCombine(*clobberCombinedCallee);
+  runInstCombine(*clobberCombinedFunction);
+  ok &= expect(functionMetadataHasRegister(*clobberCombinedCallee,
+                                           "notdec.register.clobbers", "RDI"),
+               "instcombine dropped direct callee clobbers metadata");
+
+  notdec::bin2llvm::NativeRegisterSSASummary clobberCombined =
+      notdec::bin2llvm::runNativeRegisterSSA(*clobberCombinedModule, options);
+  if (llvm::verifyModule(*clobberCombinedModule, &llvm::errs())) {
+    std::cerr << "clobber combined module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  ok &= expect(clobberCombined.CallsSeen >= clobberBaseline.CallsSeen,
+               "direct clobber call count dropped after instcombine");
+  ok &= expect(clobberCombined.LoadsReplaced <= clobberBaseline.LoadsReplaced,
+               "direct clobber call load was incorrectly replaced");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
