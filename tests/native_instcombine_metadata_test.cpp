@@ -118,6 +118,42 @@ std::unique_ptr<llvm::Module> createPrototypeCandidateModule(
   return module;
 }
 
+std::unique_ptr<llvm::Module> createMultireturnPrototypeModule(
+    llvm::LLVMContext &context) {
+  auto module =
+      std::make_unique<llvm::Module>("instcombine-multireturn-test", context);
+  llvm::GlobalVariable *rax = createRegisterGlobal(*module, "RAX");
+  attachPrototypeTestAbi(*module);
+
+  auto *funcType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                              {llvm::Type::getInt1Ty(context)}, {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "multireturn_rax", *module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(function->getArg(0), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 0x1111), rax);
+  leftStore->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, "RAX"));
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(right);
+  llvm::StoreInst *rightStore = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 0x1111), rax);
+  rightStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, "RAX"));
+  builder.CreateRetVoid();
+  return module;
+}
+
 std::unique_ptr<llvm::Module> createCallBarrierModule(
     llvm::LLVMContext &context) {
   auto module = std::make_unique<llvm::Module>("instcombine-call-test",
@@ -574,5 +610,32 @@ int main() {
                                            "notdec.prototype.return_candidates",
                                            "RAX"),
                "RAX return candidate was missing after instcombine");
+
+  llvm::LLVMContext multireturnContext;
+  std::unique_ptr<llvm::Module> multireturnModule =
+      createMultireturnPrototypeModule(multireturnContext);
+  llvm::Function *multireturnFunction =
+      multireturnModule->getFunction("multireturn_rax");
+  if (multireturnFunction == nullptr) {
+    std::cerr << "multireturn test function missing\n";
+    return EXIT_FAILURE;
+  }
+  runInstCombine(*multireturnFunction);
+  notdec::bin2llvm::runNativeRegisterSSA(*multireturnModule, options);
+  notdec::bin2llvm::NativePrototypeRecoveryOptions multireturnOptions;
+  notdec::bin2llvm::NativePrototypeRecoverySummary multireturnSummary =
+      notdec::bin2llvm::runNativePrototypeRecovery(*multireturnModule,
+                                                   multireturnOptions);
+  if (llvm::verifyModule(*multireturnModule, &llvm::errs())) {
+    std::cerr << "multireturn module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  ok &= expect(multireturnSummary.ReturnCandidates >= 1,
+               "multireturn return candidate count dropped after instcombine");
+  ok &= expect(functionMetadataHasRegister(*multireturnFunction,
+                                           "notdec.prototype.return_candidates",
+                                           "RAX"),
+               "multireturn RAX return candidate was missing after instcombine");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
