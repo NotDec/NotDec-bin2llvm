@@ -3,8 +3,10 @@
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/NativePrototypeModel.h"
 
+#include "llvm/ADT/SmallString.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
@@ -49,6 +51,18 @@ llvm::MDNode *inputCandidateMetadata(llvm::LLVMContext &context,
   return llvm::MDNode::get(context, entries);
 }
 
+std::optional<std::string> returnValueKey(llvm::Value &value) {
+  if (auto *constantInt = llvm::dyn_cast<llvm::ConstantInt>(&value)) {
+    llvm::SmallString<32> text;
+    constantInt->getValue().toString(text, 10, false);
+    return ("const:" + text).str();
+  }
+  if (value.hasName()) {
+    return ("value:" + value.getName()).str();
+  }
+  return std::nullopt;
+}
+
 std::optional<NativeParamTrial> returnTrialBeforeInstruction(
     llvm::Instruction &instruction, const NativePrototypeModel &model) {
   llvm::BasicBlock::reverse_iterator iter(instruction.getIterator());
@@ -75,6 +89,7 @@ std::optional<NativeParamTrial> returnTrialBeforeInstruction(
     NativeParamTrial trial;
     trial.RegisterName = *name;
     trial.Slot = match->Slot;
+    trial.ValueKey = returnValueKey(*store->getValueOperand());
     trial.Active = true;
     return trial;
   }
@@ -183,6 +198,9 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     NativeParamActive returns;
     std::map<uint64_t, NativeParamTrial> returnTrialsBySlot;
     std::map<uint64_t, uint64_t> returnSlotCounts;
+    std::map<uint64_t, uint64_t> returnSlotKeyCounts;
+    std::map<uint64_t, std::string> returnSlotFirstKey;
+    std::set<uint64_t> returnSlotKeyConflicts;
     uint64_t returnCount = 0;
     for (llvm::BasicBlock &block : function) {
       if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator())) {
@@ -191,6 +209,14 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
                 returnTrialBefore(*ret, model)) {
           uint64_t slot = trial->Slot;
           ++returnSlotCounts[slot];
+          if (trial->ValueKey) {
+            ++returnSlotKeyCounts[slot];
+            auto [iter, inserted] =
+                returnSlotFirstKey.try_emplace(slot, *trial->ValueKey);
+            if (!inserted && iter->second != *trial->ValueKey) {
+              returnSlotKeyConflicts.insert(slot);
+            }
+          }
           returnTrialsBySlot.try_emplace(slot, std::move(*trial));
         }
       }
@@ -198,6 +224,10 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     std::set<uint64_t> returnSlots;
     for (const auto &[slot, count] : returnSlotCounts) {
       if (count != returnCount) {
+        continue;
+      }
+      if (returnSlotKeyCounts[slot] == returnCount &&
+          returnSlotKeyConflicts.find(slot) != returnSlotKeyConflicts.end()) {
         continue;
       }
       addUniqueTrialBySlot(returns, returnSlots,

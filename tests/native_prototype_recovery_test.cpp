@@ -136,7 +136,7 @@ llvm::Function *createTwoReturnStoreFunction(llvm::Module &module,
 
   builder.SetInsertPoint(right);
   llvm::StoreInst *rightStore = builder.CreateStore(
-      llvm::ConstantInt::get(global->getValueType(), 0x2222), global);
+      llvm::ConstantInt::get(global->getValueType(), 0x1111), global);
   rightStore->setMetadata("notdec.register.access",
                           registerAccessMetadata(context, registerName));
   builder.CreateRetVoid();
@@ -194,6 +194,38 @@ llvm::Function *createUniquePredecessorReturnStoreFunction(
   builder.CreateBr(exit);
 
   builder.SetInsertPoint(exit);
+  builder.CreateRetVoid();
+
+  return function;
+}
+
+llvm::Function *createConflictingReturnStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x5555), global);
+  leftStore->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(right);
+  llvm::StoreInst *rightStore = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x6666), global);
+  rightStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, registerName));
   builder.CreateRetVoid();
 
   return function;
@@ -297,6 +329,9 @@ int main() {
       createUniquePredecessorReturnStoreFunction(module,
                                                  "return_rax_unique_pred", rax,
                                                  "RAX");
+  llvm::Function *conflictingReturnFunction =
+      createConflictingReturnStoreFunction(module, "return_rax_conflict", rax,
+                                           "RAX");
 
   notdec::bin2llvm::NativePrototypeRecoveryOptions options;
   notdec::bin2llvm::NativePrototypeRecoverySummary summary =
@@ -308,7 +343,7 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 7, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 8, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 2,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 1,
@@ -338,5 +373,9 @@ int main() {
   ok &= expect(metadataHasRegister(*uniquePredReturnFunction,
                                    "notdec.prototype.return_candidates", "RAX"),
                "unique predecessor RAX return was not marked as a candidate");
+  ok &= expect(!metadataHasRegister(*conflictingReturnFunction,
+                                    "notdec.prototype.return_candidates",
+                                    "RAX"),
+               "conflicting RAX return was incorrectly marked as a candidate");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

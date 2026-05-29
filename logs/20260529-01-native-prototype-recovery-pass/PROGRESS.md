@@ -62,6 +62,9 @@
   - [x] return block 无 store 时查一层唯一前驱的 ABI output store。
     - 记录：`05-input-output-candidates/20260529-05-return-candidate-unique-predecessor.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] 多 return path 同一 output slot 的简单返回值冲突过滤。
+    - 记录：`05-input-output-candidates/20260529-06-return-candidate-value-consistency.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,9 @@ struct NativePrototypeRecoveryOptions {
 struct NativeParamTrial {
   std::string RegisterName;
   uint64_t Slot = 0;
+  // Optional simple value identity used by return recovery.  It is intentionally
+  // small: unknown values are left unset so this first pass stays conservative.
+  std::optional<std::string> ValueKey;
   bool Active = false;
 };
 
