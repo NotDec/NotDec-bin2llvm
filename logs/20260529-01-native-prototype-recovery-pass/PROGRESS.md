@@ -110,6 +110,9 @@
   - [x] 添加当前支持形状的统一签名重写分发 helper。
     - 记录：`05-input-output-candidates/20260529-21-dispatch-signature-rewrite.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] 添加当前支持形状的 module 级显式签名重写 helper。
+    - 记录：`05-input-output-candidates/20260529-22-module-signature-rewrite.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。

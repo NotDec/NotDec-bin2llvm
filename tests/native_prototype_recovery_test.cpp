@@ -1060,5 +1060,76 @@ int main() {
                "missing recovered prototype was incorrectly rewrite eligible");
   ok &= expect(missingEligibility.Reason == "missing recovered prototype",
                "missing recovered prototype had unexpected ineligible reason");
+
+  llvm::Module batchModule("native-prototype-batch-rewrite-test", context);
+  llvm::GlobalVariable *batchRdi = createRegisterGlobal(batchModule, "RDI");
+  llvm::GlobalVariable *batchRax = createRegisterGlobal(batchModule, "RAX");
+  attachTestAbi(batchModule);
+
+  llvm::LoadInst *batchInputLoad = nullptr;
+  llvm::Function *batchInputFunction = createUsedExternalInputFunction(
+      batchModule, "batch_input_rdi", batchRdi, "RDI", &batchInputLoad);
+  attachExternalInputs(*batchInputFunction, {{"RDI", batchRdi}});
+
+  llvm::StoreInst *batchReturnStore = nullptr;
+  createReturnStoreFunction(batchModule, "batch_return_rax", batchRax, "RAX",
+                            &batchReturnStore);
+
+  llvm::LoadInst *batchInputReturnLoad = nullptr;
+  llvm::StoreInst *batchInputReturnStore = nullptr;
+  llvm::Function *batchInputReturnFunction = createInputReturnFunction(
+      batchModule, "batch_input_rdi_return_rax", batchRdi, "RDI", batchRax,
+      "RAX", &batchInputReturnLoad, &batchInputReturnStore);
+  attachExternalInputs(*batchInputReturnFunction, {{"RDI", batchRdi}});
+
+  llvm::LoadInst *batchUsedInputLoad = nullptr;
+  llvm::Function *batchUsedInputFunction = createUsedExternalInputFunction(
+      batchModule, "batch_input_rdi_used", batchRdi, "RDI",
+      &batchUsedInputLoad);
+  attachExternalInputs(*batchUsedInputFunction, {{"RDI", batchRdi}});
+  createCallerFunction(batchModule, "call_batch_input_rdi_used",
+                       batchUsedInputFunction);
+  createFunction(batchModule, "batch_missing_recovered");
+
+  notdec::bin2llvm::runNativePrototypeRecovery(batchModule, options);
+  notdec::bin2llvm::NativePrototypeModuleRewriteSummary batchRewriteSummary =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypes(batchModule);
+  ok &= expect(batchRewriteSummary.FunctionsSeen == 6,
+               "batch rewrite saw unexpected function count");
+  ok &= expect(batchRewriteSummary.FunctionsRewritten == 3,
+               "batch rewrite rewrote unexpected function count");
+  ok &= expect(batchRewriteSummary.FunctionsSkipped == 3,
+               "batch rewrite skipped unexpected function count");
+  ok &= expect(batchModule.getFunction("batch_input_rdi") != nullptr &&
+                   functionTypeShape(
+                       *batchModule.getFunction("batch_input_rdi")
+                            ->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef(i64Param)),
+               "batch input-only function type was not void(i64)");
+  ok &= expect(batchModule.getFunction("batch_return_rax") != nullptr &&
+                   functionTypeShape(
+                       *batchModule.getFunction("batch_return_rax")
+                            ->getFunctionType(),
+                       llvm::Type::getInt64Ty(context),
+                       llvm::ArrayRef<llvm::Type *>{}),
+               "batch return-only function type was not i64()");
+  ok &= expect(batchModule.getFunction("batch_input_rdi_return_rax") !=
+                       nullptr &&
+                   functionTypeShape(
+                       *batchModule.getFunction("batch_input_rdi_return_rax")
+                            ->getFunctionType(),
+                       llvm::Type::getInt64Ty(context),
+                       llvm::ArrayRef(i64Param)),
+               "batch input-return function type was not i64(i64)");
+  ok &= expect(batchModule.getFunction("batch_input_rdi_used") != nullptr &&
+                   batchModule.getFunction("batch_input_rdi_used")
+                       ->getFunctionType()
+                       ->getNumParams() == 0,
+               "batch function with caller was incorrectly rewritten");
+  if (llvm::verifyModule(batchModule, &llvm::errs())) {
+    std::cerr << "batch module verification failed after prototype rewrite\n";
+    return EXIT_FAILURE;
+  }
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

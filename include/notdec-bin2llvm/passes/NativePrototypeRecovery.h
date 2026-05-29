@@ -88,6 +88,14 @@ struct NativePrototypeRewriteResult {
   llvm::Function *Function = nullptr;
 };
 
+// Module-level rewrite statistics.  Keep it small for now because callsite
+// rewrite and detailed reason reporting are not wired into the pass yet.
+struct NativePrototypeModuleRewriteSummary {
+  uint64_t FunctionsSeen = 0;
+  uint64_t FunctionsRewritten = 0;
+  uint64_t FunctionsSkipped = 0;
+};
+
 struct NativePrototypeRecoveryFunctionSummary {
   std::string FunctionName;
   uint64_t ExternalInputsSeen = 0;
@@ -137,6 +145,9 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function);
 
 NativePrototypeRewriteResult
 rewriteNativeRecoveredPrototype(llvm::Function &function);
+
+NativePrototypeModuleRewriteSummary
+rewriteNativeRecoveredPrototypes(llvm::Module &module);
 
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os);

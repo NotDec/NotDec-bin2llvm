@@ -893,6 +893,29 @@ rewriteNativeRecoveredPrototype(llvm::Function &function) {
   return result;
 }
 
+NativePrototypeModuleRewriteSummary
+rewriteNativeRecoveredPrototypes(llvm::Module &module) {
+  NativePrototypeModuleRewriteSummary summary;
+
+  std::vector<llvm::Function *> functions;
+  for (llvm::Function &function : module) {
+    functions.push_back(&function);
+  }
+
+  for (llvm::Function *function : functions) {
+    ++summary.FunctionsSeen;
+    NativePrototypeRewriteResult result =
+        rewriteNativeRecoveredPrototype(*function);
+    if (result.Rewritten) {
+      ++summary.FunctionsRewritten;
+      continue;
+    }
+    ++summary.FunctionsSkipped;
+  }
+
+  return summary;
+}
+
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os) {
   os << "native prototype recovery summary\n";
