@@ -308,6 +308,16 @@ struct ReturnOnlyCallsiteCollectionResult {
   std::string FailureReason;
 };
 
+struct MultiReturnCallsiteRewrite {
+  llvm::CallInst *Call = nullptr;
+  std::vector<llvm::LoadInst *> ReturnLoads;
+};
+
+struct MultiReturnCallsiteCollectionResult {
+  std::vector<MultiReturnCallsiteRewrite> Rewrites;
+  std::string FailureReason;
+};
+
 ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
     llvm::BasicBlock::iterator iter, llvm::BasicBlock::iterator end,
     llvm::StringRef returnRegisterName) {
@@ -443,6 +453,58 @@ void rewriteReturnOnlyDirectCallsites(llvm::Function &rewritten,
     newCall->setCallingConv(callsite->getCallingConv());
     rewriteCallsiteReturnLoad(*callsite, *newCall, returnRegisterName);
     callsite->eraseFromParent();
+  }
+}
+
+MultiReturnCallsiteCollectionResult collectMultiReturnDirectCallsites(
+    llvm::Function &function,
+    llvm::ArrayRef<NativeRecoveredPrototypeParam> returns,
+    llvm::StructType &returnType) {
+  MultiReturnCallsiteCollectionResult result;
+  for (llvm::User *user : function.users()) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+    if (call == nullptr || call->getCalledFunction() != &function ||
+        call->arg_size() != 0 || !call->getType()->isVoidTy()) {
+      result.FailureReason = "function has uses";
+      return result;
+    }
+
+    MultiReturnCallsiteRewrite rewrite;
+    rewrite.Call = call;
+    rewrite.ReturnLoads.reserve(returns.size());
+    for (uint64_t index = 0; index < returns.size(); ++index) {
+      ReturnLoadSearchResult loadResult =
+          findCallsiteReturnLoad(*call, returns[index].RegisterName);
+      if (loadResult.Blocked || loadResult.Load == nullptr ||
+          loadResult.Load->getType() != returnType.getElementType(index)) {
+        result.FailureReason = "unsafe callsite return load";
+        return result;
+      }
+      rewrite.ReturnLoads.push_back(loadResult.Load);
+    }
+    result.Rewrites.push_back(std::move(rewrite));
+  }
+  return result;
+}
+
+void rewriteMultiReturnDirectCallsites(
+    llvm::Function &rewritten,
+    llvm::ArrayRef<MultiReturnCallsiteRewrite> callsites) {
+  for (const MultiReturnCallsiteRewrite &callsite : callsites) {
+    llvm::IRBuilder<> builder(callsite.Call);
+    llvm::CallInst *newCall =
+        builder.CreateCall(rewritten.getFunctionType(), &rewritten, {});
+    newCall->setCallingConv(callsite.Call->getCallingConv());
+    for (uint64_t index = 0; index < callsite.ReturnLoads.size(); ++index) {
+      llvm::LoadInst *load = callsite.ReturnLoads[index];
+      llvm::Value *field =
+          builder.CreateExtractValue(newCall, {static_cast<unsigned>(index)});
+      load->replaceAllUsesWith(field);
+      if (load->use_empty()) {
+        load->eraseFromParent();
+      }
+    }
+    callsite.Call->eraseFromParent();
   }
 }
 
@@ -1190,11 +1252,6 @@ rewriteNativeRecoveredPrototypeMultiReturn(llvm::Function &function) {
     result.Reason = "not multi-return prototype";
     return result;
   }
-  if (!function.use_empty()) {
-    result.Reason = "function has uses";
-    return result;
-  }
-
   std::optional<llvm::FunctionType *> recoveredType =
       buildNativeRecoveredPrototypeFunctionType(function.getContext(),
                                                *prototype);
@@ -1222,6 +1279,17 @@ rewriteNativeRecoveredPrototypeMultiReturn(llvm::Function &function) {
       result.Reason = "return value type mismatch";
       return result;
     }
+  }
+  std::optional<std::vector<MultiReturnCallsiteRewrite>> callsiteRewrites;
+  if (!function.use_empty()) {
+    MultiReturnCallsiteCollectionResult callsiteCollection =
+        collectMultiReturnDirectCallsites(function, prototype->Returns,
+                                          *returnStruct);
+    if (!callsiteCollection.FailureReason.empty()) {
+      result.Reason = callsiteCollection.FailureReason;
+      return result;
+    }
+    callsiteRewrites = std::move(callsiteCollection.Rewrites);
   }
 
   llvm::Module *module = function.getParent();
@@ -1253,6 +1321,9 @@ rewriteNativeRecoveredPrototypeMultiReturn(llvm::Function &function) {
     }
     builder.CreateRet(aggregate);
     ret->eraseFromParent();
+  }
+  if (callsiteRewrites) {
+    rewriteMultiReturnDirectCallsites(*rewritten, *callsiteRewrites);
   }
 
   function.eraseFromParent();
