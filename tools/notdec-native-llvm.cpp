@@ -3,11 +3,14 @@
 #include "notdec-bin2llvm/NativeAnalysis.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
+#include "notdec-bin2llvm/passes/NativeRegisterSSA.h"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <LIEF/ELF/Binary.hpp>
@@ -51,6 +54,8 @@ struct CliOptions {
   notdec::bin2llvm::NativeSleighDecodeOptions DecodeOptions;
   notdec::bin2llvm::PcodeMemoryModel MemoryModel =
       notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
+  bool DisableRegisterSSAPass = false;
+  bool PrintRegisterSSASummary = false;
 };
 
 void printUsage(const char *argv0) {
@@ -59,6 +64,7 @@ void printUsage(const char *argv0) {
                "(-a <address> -l <length> | -f <entry> | -n <name> | "
                "--all-confirmed) "
                "-o <output.ll> [--summary-json-out <path>] "
+               "[--no-register-ssa-pass] [--register-ssa-summary] "
                "[--decode-seed-limit <count>] "
                "[--memory-model inttoptr|global-array] [-p root-sla-dir] "
                "[-s pspec-file]\n";
@@ -87,8 +93,16 @@ bool parseMemoryModel(const std::string &text,
   return false;
 }
 
+bool hasExtension(const std::string &path, llvm::StringRef extension) {
+  return llvm::StringRef(path).ends_with_insensitive(extension);
+}
+
+bool isIRInputPath(const std::string &path) {
+  return hasExtension(path, ".ll") || hasExtension(path, ".bc");
+}
+
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
-  if (argc < 5) {
+  if (argc < 4) {
     return std::nullopt;
   }
 
@@ -105,6 +119,14 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     std::string flag = argv[argIndex];
     if (flag == "--all-confirmed") {
       options.AllConfirmed = true;
+      continue;
+    }
+    if (flag == "--no-register-ssa-pass") {
+      options.DisableRegisterSSAPass = true;
+      continue;
+    }
+    if (flag == "--register-ssa-summary") {
+      options.PrintRegisterSSASummary = true;
       continue;
     }
     if (argIndex + 1 >= argc) {
@@ -174,8 +196,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     ++selectionCount;
   }
   if (selectionCount != 1) {
-    std::cerr << "choose exactly one of -a/-l, -f, -n, or --all-confirmed\n";
-    return std::nullopt;
+    if (!isIRInputPath(options.ElfPath) || selectionCount != 0) {
+      std::cerr << "choose exactly one of -a/-l, -f, -n, or --all-confirmed\n";
+      return std::nullopt;
+    }
   }
   if ((hasAddress || hasLength) && !hasAddress) {
     std::cerr << "missing -a <address>\n";
@@ -671,6 +695,40 @@ int writeModule(const llvm::Module &module, const std::string &outputPath) {
   return 0;
 }
 
+std::unique_ptr<llvm::Module> readIRModule(const std::string &inputPath,
+                                           llvm::LLVMContext &context,
+                                           std::string &errorMessage) {
+  llvm::SMDiagnostic diagnostic;
+  std::unique_ptr<llvm::Module> module =
+      llvm::parseIRFile(inputPath, diagnostic, context);
+  if (module) {
+    return module;
+  }
+
+  std::string message;
+  llvm::raw_string_ostream stream(message);
+  diagnostic.print("notdec-native-llvm", stream);
+  stream.flush();
+  errorMessage = message;
+  return nullptr;
+}
+
+bool runRegisterSSAPassIfEnabled(llvm::Module &module,
+                                 const CliOptions &options) {
+  if (options.DisableRegisterSSAPass) {
+    return true;
+  }
+  notdec::bin2llvm::NativeRegisterSSAOptions passOptions;
+  passOptions.EnableRewrite = true;
+  passOptions.PrintSummary = options.PrintRegisterSSASummary;
+  notdec::bin2llvm::runNativeRegisterSSA(module, passOptions);
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after register SSA pass\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -679,6 +737,21 @@ int main(int argc, char **argv) {
     if (!options) {
       printUsage(argv[0]);
       return 1;
+    }
+
+    if (isIRInputPath(options->ElfPath)) {
+      llvm::LLVMContext context;
+      std::string errorMessage;
+      std::unique_ptr<llvm::Module> module =
+          readIRModule(options->ElfPath, context, errorMessage);
+      if (!module) {
+        std::cerr << "failed to parse IR input: " << errorMessage << '\n';
+        return 1;
+      }
+      if (!runRegisterSSAPassIfEnabled(*module, *options)) {
+        return 1;
+      }
+      return writeModule(*module, options->OutputPath);
     }
 
     std::unique_ptr<LIEF::ELF::Binary> binary =
@@ -775,6 +848,9 @@ int main(int argc, char **argv) {
 
     if (llvm::verifyModule(*module, &llvm::errs())) {
       std::cerr << "module verification failed\n";
+      return 1;
+    }
+    if (!runRegisterSSAPassIfEnabled(*module, *options)) {
       return 1;
     }
 
