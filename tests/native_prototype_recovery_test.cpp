@@ -1104,6 +1104,74 @@ int main() {
     std::cerr << "module verification failed after input-return rewrite\n";
     return EXIT_FAILURE;
   }
+
+  llvm::Module inputReturnCallsiteModule(
+      "native-prototype-input-return-callsite-rewrite-test", context);
+  llvm::GlobalVariable *inputReturnCallsiteRdi =
+      createRegisterGlobal(inputReturnCallsiteModule, "RDI");
+  llvm::GlobalVariable *inputReturnCallsiteRax =
+      createRegisterGlobal(inputReturnCallsiteModule, "RAX");
+  attachTestAbi(inputReturnCallsiteModule);
+  llvm::LoadInst *callsiteInputReturnLoad = nullptr;
+  llvm::StoreInst *callsiteInputReturnStore = nullptr;
+  llvm::Function *callsiteInputReturnFunction = createInputReturnFunction(
+      inputReturnCallsiteModule, "callsite_input_rdi_return_rax",
+      inputReturnCallsiteRdi, "RDI", inputReturnCallsiteRax, "RAX",
+      &callsiteInputReturnLoad, &callsiteInputReturnStore);
+  attachExternalInputs(*callsiteInputReturnFunction,
+                       {{"RDI", inputReturnCallsiteRdi}});
+  llvm::CallInst *oldInputReturnCallsiteCall = nullptr;
+  createInputStoreCallerFunction(
+      inputReturnCallsiteModule, "call_callsite_input_rdi_return_rax",
+      callsiteInputReturnFunction, inputReturnCallsiteRdi, "RDI",
+      &oldInputReturnCallsiteCall);
+  notdec::bin2llvm::runNativePrototypeRecovery(inputReturnCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      inputReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputReturn(
+              *callsiteInputReturnFunction);
+  ok &= expect(inputReturnCallsiteRewriteResult.Rewritten,
+               "input-return prototype with direct callsite was not rewritten");
+  callsiteInputReturnFunction = inputReturnCallsiteRewriteResult.Function;
+  ok &= expect(callsiteInputReturnFunction != nullptr &&
+                   functionTypeShape(
+                       *callsiteInputReturnFunction->getFunctionType(),
+                       llvm::Type::getInt64Ty(context),
+                       llvm::ArrayRef(i64Param)),
+               "callsite rewritten input-return function type was not i64(i64)");
+  llvm::CallInst *rewrittenInputReturnCallsiteCall = nullptr;
+  llvm::Function *inputReturnCallsiteCaller =
+      inputReturnCallsiteModule.getFunction("call_callsite_input_rdi_return_rax");
+  if (inputReturnCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *inputReturnCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr && call->getCalledFunction() ==
+                                   callsiteInputReturnFunction) {
+          rewrittenInputReturnCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenInputReturnCallsiteCall != nullptr,
+               "input-return direct callsite was not rewritten to new callee");
+  ok &= expect(rewrittenInputReturnCallsiteCall != nullptr &&
+                   rewrittenInputReturnCallsiteCall->arg_size() == 1,
+               "input-return direct callsite did not get one argument");
+  ok &= expect(rewrittenInputReturnCallsiteCall != nullptr &&
+                   llvm::isa<llvm::ConstantInt>(
+                       rewrittenInputReturnCallsiteCall->getArgOperand(0)),
+               "input-return direct callsite argument did not use store value");
+  ok &= expect(rewrittenInputReturnCallsiteCall != nullptr &&
+                   rewrittenInputReturnCallsiteCall->getType() ==
+                       llvm::Type::getInt64Ty(context),
+               "input-return direct callsite did not return i64");
+  if (llvm::verifyModule(inputReturnCallsiteModule, &llvm::errs())) {
+    std::cerr
+        << "callsite module verification failed after input-return rewrite\n";
+    return EXIT_FAILURE;
+  }
   notdec::bin2llvm::NativePrototypeRewriteResult dispatchInputResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototype(*dispatchInputFunction);
   ok &= expect(dispatchInputResult.Rewritten,

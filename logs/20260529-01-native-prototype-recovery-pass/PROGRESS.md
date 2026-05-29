@@ -176,6 +176,9 @@
   - [x] 添加 return-only 直接调用点签名重写。
     - 记录：`06-pass-pipeline-and-verification/20260529-17-return-only-direct-callsite-rewrite.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 添加 input-return 直接调用点签名重写。
+    - 记录：`06-pass-pipeline-and-verification/20260529-18-input-return-direct-callsite-rewrite.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

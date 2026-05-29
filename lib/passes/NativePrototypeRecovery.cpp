@@ -267,6 +267,18 @@ void rewriteInputOnlyDirectCallsites(
   }
 }
 
+void rewriteInputReturnDirectCallsites(
+    llvm::Function &rewritten,
+    llvm::ArrayRef<NativeInputOnlyCallsiteRewrite> callsites) {
+  for (const NativeInputOnlyCallsiteRewrite &callsite : callsites) {
+    llvm::IRBuilder<> builder(callsite.Call);
+    llvm::CallInst *newCall = builder.CreateCall(
+        rewritten.getFunctionType(), &rewritten, {callsite.Argument});
+    newCall->setCallingConv(callsite.Call->getCallingConv());
+    callsite.Call->eraseFromParent();
+  }
+}
+
 std::optional<std::vector<llvm::CallInst *>>
 collectReturnOnlyDirectCallsites(llvm::Function &function) {
   std::vector<llvm::CallInst *> callsites;
@@ -893,10 +905,6 @@ NativePrototypeRewriteResult
 rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
   NativePrototypeRewriteResult result;
   result.Function = &function;
-  if (!function.use_empty()) {
-    result.Reason = "function has uses";
-    return result;
-  }
   if (function.getFunctionType()->getNumParams() != 0 ||
       !function.getReturnType()->isVoidTy()) {
     result.Reason = "original function is not void()";
@@ -949,6 +957,16 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
     result.Reason = "return value type mismatch";
     return result;
   }
+  std::optional<std::vector<NativeInputOnlyCallsiteRewrite>> callsiteRewrites;
+  if (!function.use_empty()) {
+    callsiteRewrites = collectInputOnlyDirectCallsiteRewrites(
+        function, prototype->Inputs[0].RegisterName,
+        (*recoveredType)->getParamType(0));
+    if (!callsiteRewrites) {
+      result.Reason = "function has uses";
+      return result;
+    }
+  }
 
   llvm::Module *module = function.getParent();
   if (module == nullptr) {
@@ -980,6 +998,9 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
     llvm::IRBuilder<> builder(ret);
     builder.CreateRet(returnValue);
     ret->eraseFromParent();
+  }
+  if (callsiteRewrites) {
+    rewriteInputReturnDirectCallsites(*rewritten, *callsiteRewrites);
   }
 
   function.eraseFromParent();
