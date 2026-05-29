@@ -95,6 +95,9 @@
   - [x] 添加 instcombine 对 register access metadata / NativeRegisterSSA 计数的最小安全验证。
     - 记录：`06-pass-pipeline-and-verification/20260529-03-instcombine-register-metadata-safety.md`
     - 文件：`tests/native_instcombine_metadata_test.cpp`
+  - [x] 扩展 instcombine 安全验证，覆盖 register store metadata 和 SSA load/store 计数。
+    - 记录：`06-pass-pipeline-and-verification/20260529-04-instcombine-register-store-safety.md`
+    - 文件：`tests/native_instcombine_metadata_test.cpp`
   - [ ] Bench2 selected native 全量验证。
 
 ## 记录规则

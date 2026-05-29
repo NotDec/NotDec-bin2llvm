@@ -63,6 +63,9 @@ std::unique_ptr<llvm::Module> createModule(llvm::LLVMContext &context) {
                     registerAccessMetadata(context, "RDI"));
   llvm::Value *sum =
       builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 1));
+  llvm::StoreInst *store = builder.CreateStore(sum, rdi);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RDI"));
   builder.CreateRet(sum);
   return module;
 }
@@ -94,6 +97,21 @@ bool hasRegisterAccessLoad(const llvm::Function &function) {
         continue;
       }
       if (load->getMetadata("notdec.register.access") != nullptr) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool hasRegisterAccessStore(const llvm::Function &function) {
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &instruction : block) {
+      auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+      if (store == nullptr) {
+        continue;
+      }
+      if (store->getMetadata("notdec.register.access") != nullptr) {
         return true;
       }
     }
@@ -135,6 +153,8 @@ int main() {
   bool ok = true;
   ok &= expect(hasRegisterAccessLoad(*combinedFunction),
                "instcombine dropped register access metadata");
+  ok &= expect(hasRegisterAccessStore(*combinedFunction),
+               "instcombine dropped register store metadata");
 
   notdec::bin2llvm::NativeRegisterSSASummary combined =
       notdec::bin2llvm::runNativeRegisterSSA(*combinedModule, options);
@@ -143,6 +163,10 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  ok &= expect(combined.LoadsSeen >= baseline.LoadsSeen,
+               "load count dropped after instcombine");
+  ok &= expect(combined.StoresSeen >= baseline.StoresSeen,
+               "store count dropped after instcombine");
   ok &= expect(combined.ExternalInputs >= baseline.ExternalInputs,
                "external input count dropped after instcombine");
   ok &= expect(combined.LoadsReplaced >= baseline.LoadsReplaced,
