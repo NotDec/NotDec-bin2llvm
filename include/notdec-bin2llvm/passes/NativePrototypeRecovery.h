@@ -20,6 +20,7 @@ namespace notdec::bin2llvm {
 
 struct NativePrototypeRecoveryOptions {
   bool PrintSummary = false;
+  bool RewriteSignatures = false;
 };
 
 // Native copy of Ghidra ParamTrial for the first input-recovery step.  It only
@@ -112,6 +113,9 @@ struct NativePrototypeRecoverySummary {
   uint64_t ReturnCandidates = 0;
   uint64_t RewriteEligibleFunctions = 0;
   uint64_t SignatureRewriteNeededFunctions = 0;
+  uint64_t SignatureRewriteFunctionsSeen = 0;
+  uint64_t SignatureRewriteFunctionsRewritten = 0;
+  uint64_t SignatureRewriteFunctionsSkipped = 0;
   std::vector<NativePrototypeRecoveryFunctionSummary> Functions;
 };
 

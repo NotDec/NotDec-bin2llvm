@@ -466,6 +466,16 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     addFunctionSummary(summary, functionSummary);
   }
 
+  if (options.RewriteSignatures) {
+    NativePrototypeModuleRewriteSummary rewriteSummary =
+        rewriteNativeRecoveredPrototypes(module);
+    summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
+    summary.SignatureRewriteFunctionsRewritten =
+        rewriteSummary.FunctionsRewritten;
+    summary.SignatureRewriteFunctionsSkipped =
+        rewriteSummary.FunctionsSkipped;
+  }
+
   if (options.PrintSummary) {
     printNativePrototypeRecoverySummary(summary, llvm::errs());
   }
@@ -927,6 +937,12 @@ void printNativePrototypeRecoverySummary(
      << '\n';
   os << "  signature rewrite needed functions: "
      << summary.SignatureRewriteNeededFunctions << '\n';
+  os << "  signature rewrite seen functions: "
+     << summary.SignatureRewriteFunctionsSeen << '\n';
+  os << "  signature rewrite rewritten functions: "
+     << summary.SignatureRewriteFunctionsRewritten << '\n';
+  os << "  signature rewrite skipped functions: "
+     << summary.SignatureRewriteFunctionsSkipped << '\n';
   for (const NativePrototypeRecoveryFunctionSummary &function :
        summary.Functions) {
     os << "  function " << function.FunctionName

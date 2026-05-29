@@ -664,6 +664,12 @@ int main() {
                "unexpected rewrite eligible function count");
   ok &= expect(summary.SignatureRewriteNeededFunctions == 14,
                "unexpected signature rewrite needed function count");
+  ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
+               "default recovery unexpectedly ran signature rewrite");
+  ok &= expect(summary.SignatureRewriteFunctionsRewritten == 0,
+               "default recovery unexpectedly rewrote signatures");
+  ok &= expect(summary.SignatureRewriteFunctionsSkipped == 0,
+               "default recovery unexpectedly skipped signature rewrites");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
                "RDI was not marked as an input candidate");
@@ -1129,6 +1135,43 @@ int main() {
                "batch function with caller was incorrectly rewritten");
   if (llvm::verifyModule(batchModule, &llvm::errs())) {
     std::cerr << "batch module verification failed after prototype rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module optInModule("native-prototype-opt-in-rewrite-test", context);
+  llvm::GlobalVariable *optInRdi = createRegisterGlobal(optInModule, "RDI");
+  llvm::GlobalVariable *optInRax = createRegisterGlobal(optInModule, "RAX");
+  attachTestAbi(optInModule);
+
+  llvm::LoadInst *optInInputReturnLoad = nullptr;
+  llvm::StoreInst *optInInputReturnStore = nullptr;
+  createInputReturnFunction(optInModule, "opt_in_input_rdi_return_rax",
+                            optInRdi, "RDI", optInRax, "RAX",
+                            &optInInputReturnLoad, &optInInputReturnStore);
+  attachExternalInputs(*optInModule.getFunction("opt_in_input_rdi_return_rax"),
+                       {{"RDI", optInRdi}});
+  createFunction(optInModule, "opt_in_missing_recovered");
+
+  notdec::bin2llvm::NativePrototypeRecoveryOptions rewriteOptions;
+  rewriteOptions.RewriteSignatures = true;
+  notdec::bin2llvm::NativePrototypeRecoverySummary optInSummary =
+      notdec::bin2llvm::runNativePrototypeRecovery(optInModule, rewriteOptions);
+  ok &= expect(optInSummary.SignatureRewriteFunctionsSeen == 2,
+               "opt-in rewrite saw unexpected function count");
+  ok &= expect(optInSummary.SignatureRewriteFunctionsRewritten == 1,
+               "opt-in rewrite rewrote unexpected function count");
+  ok &= expect(optInSummary.SignatureRewriteFunctionsSkipped == 1,
+               "opt-in rewrite skipped unexpected function count");
+  ok &= expect(optInModule.getFunction("opt_in_input_rdi_return_rax") !=
+                       nullptr &&
+                   functionTypeShape(
+                       *optInModule.getFunction("opt_in_input_rdi_return_rax")
+                            ->getFunctionType(),
+                       llvm::Type::getInt64Ty(context),
+                       llvm::ArrayRef(i64Param)),
+               "opt-in input-return function type was not i64(i64)");
+  if (llvm::verifyModule(optInModule, &llvm::errs())) {
+    std::cerr << "opt-in module verification failed after prototype rewrite\n";
     return EXIT_FAILURE;
   }
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
