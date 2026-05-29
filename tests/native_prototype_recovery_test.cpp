@@ -965,10 +965,66 @@ int main() {
   notdec::bin2llvm::NativePrototypeRewriteResult usedRewriteResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
           *usedReturnFunction);
-  ok &= expect(!usedRewriteResult.Rewritten,
-               "return-only prototype with uses was rewritten");
-  ok &= expect(usedRewriteResult.Reason == "function has uses",
-               "return-only prototype with uses had unexpected rewrite reason");
+  ok &= expect(usedRewriteResult.Rewritten,
+               "return-only prototype with direct caller was not rewritten");
+  usedReturnFunction = usedRewriteResult.Function;
+  ok &= expect(usedReturnFunction != nullptr &&
+                   functionTypeShape(*usedReturnFunction->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef<llvm::Type *>{}),
+               "return-only prototype with direct caller was not i64()");
+
+  llvm::Module returnCallsiteModule(
+      "native-prototype-return-callsite-rewrite-test", context);
+  llvm::GlobalVariable *returnCallsiteRax =
+      createRegisterGlobal(returnCallsiteModule, "RAX");
+  attachTestAbi(returnCallsiteModule);
+  llvm::StoreInst *returnCallsiteStore = nullptr;
+  llvm::Function *returnCallsiteFunction = createReturnStoreFunction(
+      returnCallsiteModule, "callsite_return_rax", returnCallsiteRax, "RAX",
+      &returnCallsiteStore);
+  createCallerFunction(returnCallsiteModule, "call_callsite_return_rax",
+                       returnCallsiteFunction);
+  notdec::bin2llvm::runNativePrototypeRecovery(returnCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult returnCallsiteRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+          *returnCallsiteFunction);
+  ok &= expect(returnCallsiteRewriteResult.Rewritten,
+               "return-only prototype with direct callsite was not rewritten");
+  returnCallsiteFunction = returnCallsiteRewriteResult.Function;
+  ok &= expect(returnCallsiteFunction != nullptr &&
+                   functionTypeShape(*returnCallsiteFunction->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef<llvm::Type *>{}),
+               "callsite rewritten return function type was not i64()");
+  llvm::CallInst *rewrittenReturnCallsiteCall = nullptr;
+  llvm::Function *returnCallsiteCaller =
+      returnCallsiteModule.getFunction("call_callsite_return_rax");
+  if (returnCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *returnCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr && call->getCalledFunction() ==
+                                   returnCallsiteFunction) {
+          rewrittenReturnCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenReturnCallsiteCall != nullptr,
+               "return direct callsite was not rewritten to new callee");
+  ok &= expect(rewrittenReturnCallsiteCall != nullptr &&
+                   rewrittenReturnCallsiteCall->arg_size() == 0,
+               "return direct callsite got unexpected arguments");
+  ok &= expect(rewrittenReturnCallsiteCall != nullptr &&
+                   rewrittenReturnCallsiteCall->getType() ==
+                       llvm::Type::getInt64Ty(context),
+               "return direct callsite did not return i64");
+  if (llvm::verifyModule(returnCallsiteModule, &llvm::errs())) {
+    std::cerr
+        << "callsite module verification failed after return-only rewrite\n";
+    return EXIT_FAILURE;
+  }
   notdec::bin2llvm::NativePrototypeRewriteResult rewriteResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
           *returnFunction);

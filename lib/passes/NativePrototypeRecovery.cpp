@@ -267,6 +267,31 @@ void rewriteInputOnlyDirectCallsites(
   }
 }
 
+std::optional<std::vector<llvm::CallInst *>>
+collectReturnOnlyDirectCallsites(llvm::Function &function) {
+  std::vector<llvm::CallInst *> callsites;
+  for (llvm::User *user : function.users()) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+    if (call == nullptr || call->getCalledFunction() != &function ||
+        call->arg_size() != 0 || !call->getType()->isVoidTy()) {
+      return std::nullopt;
+    }
+    callsites.push_back(call);
+  }
+  return callsites;
+}
+
+void rewriteReturnOnlyDirectCallsites(llvm::Function &rewritten,
+                                      llvm::ArrayRef<llvm::CallInst *> callsites) {
+  for (llvm::CallInst *callsite : callsites) {
+    llvm::IRBuilder<> builder(callsite);
+    llvm::CallInst *newCall =
+        builder.CreateCall(rewritten.getFunctionType(), &rewritten, {});
+    newCall->setCallingConv(callsite->getCallingConv());
+    callsite->eraseFromParent();
+  }
+}
+
 std::vector<NativeParamTrial> returnTrialsBeforeInstruction(
     llvm::Instruction &instruction, const NativePrototypeModel &model) {
   std::vector<NativeParamTrial> trials;
@@ -696,10 +721,6 @@ NativePrototypeRewriteResult
 rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
   NativePrototypeRewriteResult result;
   result.Function = &function;
-  if (!function.use_empty()) {
-    result.Reason = "function has uses";
-    return result;
-  }
   if (function.getFunctionType()->getNumParams() != 0 ||
       !function.getReturnType()->isVoidTy()) {
     result.Reason = "original function is not void()";
@@ -738,6 +759,14 @@ rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
     result.Reason = "return value type mismatch";
     return result;
   }
+  std::optional<std::vector<llvm::CallInst *>> callsiteRewrites;
+  if (!function.use_empty()) {
+    callsiteRewrites = collectReturnOnlyDirectCallsites(function);
+    if (!callsiteRewrites) {
+      result.Reason = "function has uses";
+      return result;
+    }
+  }
 
   llvm::Module *module = function.getParent();
   if (module == nullptr) {
@@ -762,6 +791,9 @@ rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
     llvm::IRBuilder<> builder(ret);
     builder.CreateRet(returnValue);
     ret->eraseFromParent();
+  }
+  if (callsiteRewrites) {
+    rewriteReturnOnlyDirectCallsites(*rewritten, *callsiteRewrites);
   }
 
   function.eraseFromParent();
