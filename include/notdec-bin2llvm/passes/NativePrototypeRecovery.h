@@ -67,6 +67,8 @@ struct NativePrototypeRecoveryFunctionSummary {
   uint64_t ExternalInputsSeen = 0;
   uint64_t InputCandidates = 0;
   uint64_t ReturnCandidates = 0;
+  bool RewriteEligible = false;
+  bool NeedsSignatureRewrite = false;
 };
 
 struct NativePrototypeRecoverySummary {
@@ -74,6 +76,8 @@ struct NativePrototypeRecoverySummary {
   uint64_t ExternalInputsSeen = 0;
   uint64_t InputCandidates = 0;
   uint64_t ReturnCandidates = 0;
+  uint64_t RewriteEligibleFunctions = 0;
+  uint64_t SignatureRewriteNeededFunctions = 0;
   std::vector<NativePrototypeRecoveryFunctionSummary> Functions;
 };
 

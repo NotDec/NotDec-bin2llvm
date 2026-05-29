@@ -521,6 +521,10 @@ int main() {
                "unexpected input candidate count");
   ok &= expect(summary.ReturnCandidates == 5,
                "unexpected return candidate count");
+  ok &= expect(summary.RewriteEligibleFunctions == 7,
+               "unexpected rewrite eligible function count");
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 6,
+               "unexpected signature rewrite needed function count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
                "RDI was not marked as an input candidate");

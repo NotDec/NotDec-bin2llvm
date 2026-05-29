@@ -212,6 +212,12 @@ void addFunctionSummary(NativePrototypeRecoverySummary &total,
   total.ExternalInputsSeen += function.ExternalInputsSeen;
   total.InputCandidates += function.InputCandidates;
   total.ReturnCandidates += function.ReturnCandidates;
+  if (function.RewriteEligible) {
+    ++total.RewriteEligibleFunctions;
+  }
+  if (function.NeedsSignatureRewrite) {
+    ++total.SignatureRewriteNeededFunctions;
+  }
   total.Functions.push_back(function);
 }
 
@@ -394,6 +400,10 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     } else {
       function.setMetadata("notdec.prototype.recovered", nullptr);
     }
+    NativePrototypeRewriteEligibility rewrite =
+        getNativePrototypeRewriteEligibility(function);
+    functionSummary.RewriteEligible = rewrite.Eligible;
+    functionSummary.NeedsSignatureRewrite = rewrite.NeedsRewrite;
     addFunctionSummary(summary, functionSummary);
   }
 
@@ -498,12 +508,19 @@ void printNativePrototypeRecoverySummary(
   os << "  external inputs: " << summary.ExternalInputsSeen << '\n';
   os << "  input candidates: " << summary.InputCandidates << '\n';
   os << "  return candidates: " << summary.ReturnCandidates << '\n';
+  os << "  rewrite eligible functions: " << summary.RewriteEligibleFunctions
+     << '\n';
+  os << "  signature rewrite needed functions: "
+     << summary.SignatureRewriteNeededFunctions << '\n';
   for (const NativePrototypeRecoveryFunctionSummary &function :
        summary.Functions) {
     os << "  function " << function.FunctionName
        << ": external_inputs=" << function.ExternalInputsSeen
        << " input_candidates=" << function.InputCandidates
-       << " return_candidates=" << function.ReturnCandidates << '\n';
+       << " return_candidates=" << function.ReturnCandidates
+       << " rewrite_eligible=" << (function.RewriteEligible ? 1 : 0)
+       << " needs_signature_rewrite="
+       << (function.NeedsSignatureRewrite ? 1 : 0) << '\n';
   }
 }
 

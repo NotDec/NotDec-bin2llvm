@@ -89,6 +89,9 @@
   - [x] 添加 recovered prototype 后续签名重写 eligibility 判断。
     - 记录：`05-input-output-candidates/20260529-14-prototype-rewrite-eligibility.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] 在 prototype recovery summary 中统计后续签名重写 eligibility。
+    - 记录：`05-input-output-candidates/20260529-15-prototype-rewrite-summary.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。
