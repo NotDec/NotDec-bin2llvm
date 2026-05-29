@@ -101,6 +101,55 @@ std::unique_ptr<llvm::Module> createCallBarrierModule(
   return module;
 }
 
+void attachPreservesMetadata(llvm::Function &function,
+                             llvm::GlobalVariable *global,
+                             const std::string &name) {
+  llvm::LLVMContext &context = function.getContext();
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "name=" + name),
+      llvm::ValueAsMetadata::get(global),
+  };
+  llvm::Metadata *entries[] = {llvm::MDNode::get(context, fields)};
+  function.setMetadata("notdec.register.preserves",
+                       llvm::MDNode::get(context, entries));
+}
+
+std::unique_ptr<llvm::Module> createDirectPreserveModule(
+    llvm::LLVMContext &context) {
+  auto module = std::make_unique<llvm::Module>("instcombine-direct-test",
+                                               context);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(*module, "RDI");
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "preserves_rdi", *module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  calleeBuilder.CreateRetVoid();
+  attachPreservesMetadata(*callee, rdi, "RDI");
+
+  auto *funcType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "direct_then_load_rdi", *module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(rdi->getValueType(), 0x5678), rdi);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RDI"));
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rdi->getValueType(), rdi, "rdi_after_direct");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, "RDI"));
+  builder.CreateRet(load);
+  return module;
+}
+
 void runInstCombine(llvm::Function &function) {
   llvm::LoopAnalysisManager loopAnalysis;
   llvm::FunctionAnalysisManager functionAnalysis;
@@ -143,6 +192,29 @@ bool hasRegisterAccessStore(const llvm::Function &function) {
         continue;
       }
       if (store->getMetadata("notdec.register.access") != nullptr) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool functionMetadataHasRegister(const llvm::Function &function,
+                                 llvm::StringRef kind,
+                                 llvm::StringRef name) {
+  llvm::MDNode *node = function.getMetadata(kind);
+  if (node == nullptr) {
+    return false;
+  }
+  std::string expected = ("name=" + name).str();
+  for (const llvm::MDOperand &operand : node->operands()) {
+    auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (entry == nullptr) {
+      continue;
+    }
+    for (const llvm::MDOperand &fieldOperand : entry->operands()) {
+      auto *field = llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+      if (field != nullptr && field->getString() == expected) {
         return true;
       }
     }
@@ -234,5 +306,44 @@ int main() {
                "call count dropped after instcombine");
   ok &= expect(callCombined.LoadsReplaced <= callBaseline.LoadsReplaced,
                "call barrier load was incorrectly replaced after instcombine");
+
+  llvm::LLVMContext directBaselineContext;
+  std::unique_ptr<llvm::Module> directBaselineModule =
+      createDirectPreserveModule(directBaselineContext);
+  notdec::bin2llvm::NativeRegisterSSASummary directBaseline =
+      notdec::bin2llvm::runNativeRegisterSSA(*directBaselineModule, options);
+  if (llvm::verifyModule(*directBaselineModule, &llvm::errs())) {
+    std::cerr << "direct baseline module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::LLVMContext directCombinedContext;
+  std::unique_ptr<llvm::Module> directCombinedModule =
+      createDirectPreserveModule(directCombinedContext);
+  llvm::Function *directCombinedCallee =
+      directCombinedModule->getFunction("preserves_rdi");
+  llvm::Function *directCombinedFunction =
+      directCombinedModule->getFunction("direct_then_load_rdi");
+  if (directCombinedCallee == nullptr || directCombinedFunction == nullptr) {
+    std::cerr << "direct test function missing\n";
+    return EXIT_FAILURE;
+  }
+  runInstCombine(*directCombinedCallee);
+  runInstCombine(*directCombinedFunction);
+  ok &= expect(functionMetadataHasRegister(*directCombinedCallee,
+                                           "notdec.register.preserves", "RDI"),
+               "instcombine dropped direct callee preserves metadata");
+
+  notdec::bin2llvm::NativeRegisterSSASummary directCombined =
+      notdec::bin2llvm::runNativeRegisterSSA(*directCombinedModule, options);
+  if (llvm::verifyModule(*directCombinedModule, &llvm::errs())) {
+    std::cerr << "direct combined module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  ok &= expect(directCombined.CallsSeen >= directBaseline.CallsSeen,
+               "direct call count dropped after instcombine");
+  ok &= expect(directCombined.LoadsReplaced >= directBaseline.LoadsReplaced,
+               "direct preserving call load replacement dropped");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -101,6 +101,9 @@
   - [x] 扩展 instcombine 安全验证，覆盖普通外部 call barrier。
     - 记录：`06-pass-pipeline-and-verification/20260529-05-instcombine-call-barrier-safety.md`
     - 文件：`tests/native_instcombine_metadata_test.cpp`
+  - [x] 扩展 instcombine 安全验证，覆盖 direct callee preserves metadata。
+    - 记录：`06-pass-pipeline-and-verification/20260529-06-instcombine-direct-callee-metadata-safety.md`
+    - 文件：`tests/native_instcombine_metadata_test.cpp`
   - [ ] Bench2 selected native 全量验证。
 
 ## 记录规则
