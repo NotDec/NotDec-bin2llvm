@@ -42,6 +42,11 @@ struct AccessInfo {
 
 using BlockRegKey = std::pair<llvm::BasicBlock *, llvm::GlobalVariable *>;
 
+struct AbiRegisterEffects {
+  std::set<std::string> Unaffected;
+  std::set<std::string> KilledByCall;
+};
+
 std::optional<std::string> mdField(const llvm::MDNode *node,
                                    llvm::StringRef key) {
   if (node == nullptr) {
@@ -104,11 +109,11 @@ std::map<llvm::GlobalVariable *, RegisterUnit> collectRegisterUnits(
   return units;
 }
 
-std::set<std::string> collectAbiUnaffectedRegisters(llvm::Module &module) {
-  std::set<std::string> registers;
+AbiRegisterEffects collectAbiRegisterEffects(llvm::Module &module) {
+  AbiRegisterEffects effects;
   llvm::NamedMDNode *abiMetadata = module.getNamedMetadata("notdec.abi");
   if (abiMetadata == nullptr) {
-    return registers;
+    return effects;
   }
 
   for (llvm::MDNode *abiNode : abiMetadata->operands()) {
@@ -120,8 +125,14 @@ std::set<std::string> collectAbiUnaffectedRegisters(llvm::Module &module) {
       for (const llvm::MDOperand &effectOperand : effectList->operands()) {
         auto *effectNode =
             llvm::dyn_cast_or_null<llvm::MDNode>(effectOperand.get());
-        if (effectNode == nullptr || mdField(effectNode, "effect") !=
-                                          std::optional<std::string>("unaffected")) {
+        if (effectNode == nullptr) {
+          continue;
+        }
+        std::optional<std::string> effectKind = mdField(effectNode, "effect");
+        bool isUnaffected = effectKind == std::optional<std::string>("unaffected");
+        bool isKilledByCall =
+            effectKind == std::optional<std::string>("killedbycall");
+        if (!isUnaffected && !isKilledByCall) {
           continue;
         }
         for (const llvm::MDOperand &storageOperand : effectNode->operands()) {
@@ -133,13 +144,17 @@ std::set<std::string> collectAbiUnaffectedRegisters(llvm::Module &module) {
           }
           std::optional<std::string> name = mdField(storageNode, "name");
           if (name && !name->empty()) {
-            registers.insert(*name);
+            if (isUnaffected) {
+              effects.Unaffected.insert(*name);
+            } else {
+              effects.KilledByCall.insert(*name);
+            }
           }
         }
       }
     }
   }
-  return registers;
+  return effects;
 }
 
 AccessInfo registerLoad(llvm::LoadInst &load,
@@ -196,11 +211,10 @@ class FunctionPromoter {
 public:
   FunctionPromoter(llvm::Function &function,
                    std::map<llvm::GlobalVariable *, RegisterUnit> &units,
-                   const std::set<std::string> &abiUnaffectedRegisters,
+                   const AbiRegisterEffects &abiEffects,
                    bool enableRewrite,
                    NativeRegisterSSAFunctionSummary &summary)
-      : Function(function), Units(units),
-        AbiUnaffectedRegisters(abiUnaffectedRegisters), EnableRewrite(enableRewrite),
+      : Function(function), Units(units), AbiEffects(abiEffects), EnableRewrite(enableRewrite),
         Summary(summary) {}
 
   void run() {
@@ -287,7 +301,7 @@ private:
     if (local != nullptr) {
       return local;
     }
-    if (hasCallBefore(block, before)) {
+    if (hasCallBefore(block, unit, before)) {
       return nullptr;
     }
     return readBlockEntry(block, unit);
@@ -303,7 +317,7 @@ private:
       if (before != nullptr && !inst.comesBefore(before)) {
         continue;
       }
-      if (isRegisterClobberCall(inst)) {
+      if (isRegisterClobberCall(inst) && callClobbersRegister(unit)) {
         passedBarrier = true;
         continue;
       }
@@ -334,16 +348,24 @@ private:
     return value;
   }
 
-  bool hasCallBefore(llvm::BasicBlock &block, llvm::Instruction *before) {
+  bool hasCallBefore(llvm::BasicBlock &block, RegisterUnit &unit,
+                     llvm::Instruction *before) {
     for (llvm::Instruction &inst : block) {
       if (&inst == before) {
         return false;
       }
-      if (isRegisterClobberCall(inst)) {
+      if (isRegisterClobberCall(inst) && callClobbersRegister(unit)) {
         return true;
       }
     }
     return false;
+  }
+
+  bool callClobbersRegister(const RegisterUnit &unit) const {
+    if (AbiEffects.Unaffected.count(unit.Name) != 0) {
+      return false;
+    }
+    return true;
   }
 
   llvm::Value *readBlockEntry(llvm::BasicBlock &block, RegisterUnit &unit) {
@@ -409,7 +431,7 @@ private:
       ExitValue.emplace(key, local);
       return local;
     }
-    if (HasCall.count(&block) != 0) {
+    if (blockHasClobberingCall(block, unit)) {
       ExitValue.emplace(key, nullptr);
       return nullptr;
     }
@@ -535,7 +557,7 @@ private:
   }
 
   void attachRegisterEffectMetadata() {
-    if (AbiUnaffectedRegisters.empty() || ExternalInputValue.empty()) {
+    if (AbiEffects.Unaffected.empty() || ExternalInputValue.empty()) {
       return;
     }
 
@@ -543,7 +565,7 @@ private:
     std::vector<llvm::GlobalVariable *> preserved;
     std::vector<llvm::GlobalVariable *> clobbered;
     for (auto &[global, unit] : Units) {
-      if (AbiUnaffectedRegisters.count(unit.Name) == 0) {
+      if (AbiEffects.Unaffected.count(unit.Name) == 0) {
         continue;
       }
       auto inputIt = ExternalInputValue.find(global);
@@ -584,9 +606,17 @@ private:
     return sawReturn;
   }
 
+  bool blockHasClobberingCall(llvm::BasicBlock &block,
+                              const RegisterUnit &unit) const {
+    if (HasCall.count(&block) == 0) {
+      return false;
+    }
+    return callClobbersRegister(unit);
+  }
+
   llvm::Function &Function;
   std::map<llvm::GlobalVariable *, RegisterUnit> &Units;
-  const std::set<std::string> &AbiUnaffectedRegisters;
+  const AbiRegisterEffects &AbiEffects;
   bool EnableRewrite = true;
   NativeRegisterSSAFunctionSummary &Summary;
   std::vector<llvm::LoadInst *> Loads;
@@ -626,15 +656,14 @@ runNativeRegisterSSA(llvm::Module &module,
   if (units.empty()) {
     return summary;
   }
-  std::set<std::string> abiUnaffectedRegisters =
-      collectAbiUnaffectedRegisters(module);
+  AbiRegisterEffects abiEffects = collectAbiRegisterEffects(module);
 
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;
     }
     NativeRegisterSSAFunctionSummary functionSummary;
-    FunctionPromoter promoter(function, units, abiUnaffectedRegisters,
+    FunctionPromoter promoter(function, units, abiEffects,
                               options.EnableRewrite, functionSummary);
     promoter.run();
     addFunctionSummary(summary, functionSummary);

@@ -36,10 +36,13 @@
     - 文件：`tests/native_register_effects_test.cpp`
 
 - [ ] 阶段 4: `04-callsite-effects`
-  - [ ] 编写第一小步规划：外部 call 按 ABI killedbycall 处理。
+  - [x] 编写第一小步规划：外部 call 按 ABI killedbycall 处理。
+    - 记录：`04-callsite-effects/20260529-01-abi-call-effect-barrier.md`
   - [ ] 本模块 direct call 读取 callee metadata。
-  - [ ] 未解析 call 保守 fallback。
-  - [ ] 添加 callsite clobber IR 小样例。
+  - [x] 未解析 call 保守 fallback。
+    - 当前实现：ABI `unaffected` 不阻断，其它未知 effect 保守阻断。
+  - [x] 添加 callsite clobber IR 小样例。
+    - 文件：`tests/native_register_effects_test.cpp`
 
 - [ ] 阶段 5: `05-input-output-candidates`
   - [ ] 编写第一小步规划：从 external input 推出寄存器参数候选。

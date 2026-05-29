@@ -17,40 +17,48 @@
 
 namespace {
 
-llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context) {
+llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context,
+                                     const std::string &name) {
   llvm::Metadata *fields[] = {
-      llvm::MDString::get(context, "base=RBX"),
+      llvm::MDString::get(context, "base=" + name),
       llvm::MDString::get(context, "space=register"),
       llvm::MDString::get(context, "offset=0"),
       llvm::MDString::get(context, "size=8"),
-      llvm::MDString::get(context, "name=RBX"),
+      llvm::MDString::get(context, "name=" + name),
   };
   return llvm::MDNode::get(context, fields);
 }
 
-llvm::GlobalVariable *createRbxGlobal(llvm::Module &module) {
+llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
+                                           const std::string &name) {
   llvm::LLVMContext &context = module.getContext();
   auto *type = llvm::Type::getInt64Ty(context);
   auto *global = new llvm::GlobalVariable(
-      module, type, false, llvm::GlobalValue::ExternalLinkage, nullptr, "RBX");
+      module, type, false, llvm::GlobalValue::ExternalLinkage, nullptr, name);
   llvm::Metadata *fields[] = {
       llvm::MDString::get(context, "space=register"),
       llvm::MDString::get(context, "offset=0"),
       llvm::MDString::get(context, "size=8"),
-      llvm::MDString::get(context, "name=RBX"),
+      llvm::MDString::get(context, "name=" + name),
   };
   global->setMetadata("notdec.register", llvm::MDNode::get(context, fields));
   return global;
 }
 
-void attachRbxUnaffectedAbi(llvm::Module &module) {
+void attachTestAbi(llvm::Module &module) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__stdcall";
-  notdec::bin2llvm::NativeAbiEffect effect;
-  effect.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
-  effect.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
-  effect.Storage.Name = "RBX";
-  abi.Effects.push_back(std::move(effect));
+  notdec::bin2llvm::NativeAbiEffect unaffected;
+  unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
+  unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  unaffected.Storage.Name = "RBX";
+  abi.Effects.push_back(std::move(unaffected));
+
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = "RAX";
+  abi.Effects.push_back(std::move(killed));
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
@@ -64,7 +72,7 @@ llvm::Function *createFunction(llvm::Module &module, const std::string &name,
                              module);
   llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
-  llvm::MDNode *accessMetadata = registerAccessMetadata(context);
+  llvm::MDNode *accessMetadata = registerAccessMetadata(context, "RBX");
 
   llvm::LoadInst *entryValue =
       builder.CreateLoad(rbx->getValueType(), rbx, "entry_rbx");
@@ -80,6 +88,57 @@ llvm::Function *createFunction(llvm::Module &module, const std::string &name,
   }
   builder.CreateRetVoid();
   return function;
+}
+
+llvm::Function *createCallEffectFunction(llvm::Module &module,
+                                         llvm::GlobalVariable *rbx,
+                                         llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "external_call", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      funcType, llvm::GlobalValue::ExternalLinkage, "call_effects", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *rbxMetadata = registerAccessMetadata(context, "RBX");
+  llvm::MDNode *raxMetadata = registerAccessMetadata(context, "RAX");
+
+  llvm::StoreInst *storeRbx = builder.CreateStore(
+      llvm::ConstantInt::get(rbx->getValueType(), 0x1111), rbx);
+  storeRbx->setMetadata("notdec.register.access", rbxMetadata);
+  llvm::StoreInst *storeRax = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 0x2222), rax);
+  storeRax->setMetadata("notdec.register.access", raxMetadata);
+  builder.CreateCall(calleeType, callee);
+
+  llvm::LoadInst *loadRbx =
+      builder.CreateLoad(rbx->getValueType(), rbx, "rbx_after_call");
+  loadRbx->setMetadata("notdec.register.access", rbxMetadata);
+  llvm::LoadInst *loadRax =
+      builder.CreateLoad(rax->getValueType(), rax, "rax_after_call");
+  loadRax->setMetadata("notdec.register.access", raxMetadata);
+  builder.CreateRet(builder.CreateAdd(loadRbx, loadRax));
+  return function;
+}
+
+unsigned countRegisterLoads(const llvm::Function &function,
+                            const llvm::GlobalVariable *global) {
+  unsigned count = 0;
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+      if (load == nullptr) {
+        continue;
+      }
+      if (load->getPointerOperand()->stripPointerCasts() == global) {
+        ++count;
+      }
+    }
+  }
+  return count;
 }
 
 bool metadataHasRegister(const llvm::Function &function, llvm::StringRef kind,
@@ -117,12 +176,14 @@ bool expect(bool condition, const std::string &message) {
 int main() {
   llvm::LLVMContext context;
   llvm::Module module("native-register-effects-test", context);
-  llvm::GlobalVariable *rbx = createRbxGlobal(module);
-  attachRbxUnaffectedAbi(module);
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  attachTestAbi(module);
   llvm::Function *preserved =
       createFunction(module, "preserved_rbx", rbx, true);
   llvm::Function *clobbered =
       createFunction(module, "clobbered_rbx", rbx, false);
+  llvm::Function *callEffects = createCallEffectFunction(module, rbx, rax);
 
   notdec::bin2llvm::NativeRegisterSSAOptions options;
   options.EnableRewrite = true;
@@ -146,5 +207,9 @@ int main() {
   ok &= expect(metadataHasRegister(*clobbered, "notdec.register.clobbers",
                                    "RBX"),
                "clobbered RBX was not marked clobbered");
+  ok &= expect(countRegisterLoads(*callEffects, rbx) == 0,
+               "RBX load after call was not propagated");
+  ok &= expect(countRegisterLoads(*callEffects, rax) == 1,
+               "RAX load after call was incorrectly propagated");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
