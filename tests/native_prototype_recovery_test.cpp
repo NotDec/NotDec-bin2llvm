@@ -1874,14 +1874,20 @@ int main() {
   ok &= expect(dispatchMissingResult.Reason == "missing recovered prototype",
                "dispatch missing prototype had unexpected reason");
 
-  notdec::bin2llvm::NativePrototypeRewriteResult dispatchUnsupportedResult =
+  notdec::bin2llvm::NativePrototypeRewriteResult dispatchMultiReturnResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototype(
           *twoOutputReturnFunction);
-  ok &= expect(!dispatchUnsupportedResult.Rewritten,
-               "dispatch unsupported prototype was rewritten");
-  ok &= expect(dispatchUnsupportedResult.Reason ==
-                   "unsupported recovered prototype shape",
-               "dispatch unsupported prototype had unexpected reason");
+  ok &= expect(dispatchMultiReturnResult.Rewritten,
+               "dispatch multi-return prototype was not rewritten");
+  twoOutputReturnFunction = dispatchMultiReturnResult.Function;
+  auto *dispatchMultiReturnStruct =
+      twoOutputReturnFunction != nullptr
+          ? llvm::dyn_cast<llvm::StructType>(
+                twoOutputReturnFunction->getReturnType())
+          : nullptr;
+  ok &= expect(dispatchMultiReturnStruct != nullptr &&
+                   dispatchMultiReturnStruct->getNumElements() == 2,
+               "dispatch multi-return function type was not a two-field struct");
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after dispatch rewrite\n";
     return EXIT_FAILURE;
@@ -1921,18 +1927,28 @@ int main() {
             *twoOutputReturnFunction);
     ok &= expect(eligibility.Eligible,
                  "multi-return prototype was not rewrite eligible");
-    ok &= expect(eligibility.NeedsRewrite,
-                 "multi-return prototype did not request rewrite");
+    ok &= expect(!eligibility.NeedsRewrite,
+                 "rewritten multi-return prototype still requested rewrite");
     ok &= expect(multiReturnType && eligibility.RecoveredType == *multiReturnType,
                  "multi-return prototype rewrite type did not match");
-    notdec::bin2llvm::NativePrototypeRewriteResult multiReturnRewriteResult =
-        notdec::bin2llvm::rewriteNativeRecoveredPrototype(
-            *twoOutputReturnFunction);
-    ok &= expect(!multiReturnRewriteResult.Rewritten,
-                 "multi-return prototype was unexpectedly rewritten");
-    ok &= expect(multiReturnRewriteResult.Reason ==
-                     "unsupported recovered prototype shape",
-                 "multi-return prototype rewrite had unexpected reason");
+    llvm::ReturnInst *multiReturnRet = nullptr;
+    for (llvm::BasicBlock &block : *twoOutputReturnFunction) {
+      if (auto *ret =
+              llvm::dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator())) {
+        multiReturnRet = ret;
+      }
+    }
+    auto *secondInsert = multiReturnRet != nullptr
+                             ? llvm::dyn_cast<llvm::InsertValueInst>(
+                                   multiReturnRet->getReturnValue())
+                             : nullptr;
+    auto *firstInsert =
+        secondInsert != nullptr
+            ? llvm::dyn_cast<llvm::InsertValueInst>(
+                  secondInsert->getAggregateOperand())
+            : nullptr;
+    ok &= expect(firstInsert != nullptr && secondInsert != nullptr,
+                 "multi-return rewrite did not build insertvalue aggregate");
   }
   ok &= expect(unusedInputFunction->getMetadata("notdec.prototype.recovered") ==
                    nullptr,

@@ -119,6 +119,9 @@
   - [x] 为多返回寄存器 recovered prototype 构造 LLVM struct return type。
     - 记录：`05-input-output-candidates/20260529-24-multi-return-function-type.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 添加无调用者多返回寄存器函数的 struct return 签名重写。
+    - 记录：`05-input-output-candidates/20260529-25-multi-return-signature-rewrite.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。

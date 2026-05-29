@@ -1171,6 +1171,98 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
 }
 
 NativePrototypeRewriteResult
+rewriteNativeRecoveredPrototypeMultiReturn(llvm::Function &function) {
+  NativePrototypeRewriteResult result;
+  result.Function = &function;
+  if (function.getFunctionType()->getNumParams() != 0 ||
+      !function.getReturnType()->isVoidTy()) {
+    result.Reason = "original function is not void()";
+    return result;
+  }
+
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(function);
+  if (!prototype) {
+    result.Reason = "missing recovered prototype";
+    return result;
+  }
+  if (!prototype->Inputs.empty() || prototype->Returns.size() <= 1) {
+    result.Reason = "not multi-return prototype";
+    return result;
+  }
+  if (!function.use_empty()) {
+    result.Reason = "function has uses";
+    return result;
+  }
+
+  std::optional<llvm::FunctionType *> recoveredType =
+      buildNativeRecoveredPrototypeFunctionType(function.getContext(),
+                                               *prototype);
+  auto *returnStruct =
+      recoveredType
+          ? llvm::dyn_cast<llvm::StructType>((*recoveredType)->getReturnType())
+          : nullptr;
+  if (!recoveredType || (*recoveredType)->getNumParams() != 0 ||
+      returnStruct == nullptr ||
+      returnStruct->getNumElements() != prototype->Returns.size()) {
+    result.Reason = "unsupported recovered prototype type";
+    return result;
+  }
+
+  std::optional<std::vector<NativePrototypeReturnBinding>> returnBindings =
+      getNativePrototypeReturnBindings(function);
+  if (!returnBindings || returnBindings->size() != prototype->Returns.size()) {
+    result.Reason = "missing return binding";
+    return result;
+  }
+  for (uint64_t index = 0; index < returnBindings->size(); ++index) {
+    llvm::Value *returnValue = (*returnBindings)[index].ReturnValue;
+    if (returnValue == nullptr ||
+        returnValue->getType() != returnStruct->getElementType(index)) {
+      result.Reason = "return value type mismatch";
+      return result;
+    }
+  }
+
+  llvm::Module *module = function.getParent();
+  if (module == nullptr) {
+    result.Reason = "function has no module";
+    return result;
+  }
+
+  std::string originalName = function.getName().str();
+  function.setName(originalName + ".old");
+  llvm::Function *rewritten = llvm::Function::Create(
+      *recoveredType, function.getLinkage(), originalName, module);
+  rewritten->copyAttributesFrom(&function);
+  rewritten->copyMetadata(&function, 0);
+  rewritten->setCallingConv(function.getCallingConv());
+  rewritten->splice(rewritten->end(), &function);
+
+  for (llvm::BasicBlock &block : *rewritten) {
+    auto *ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator());
+    if (ret == nullptr) {
+      continue;
+    }
+    llvm::IRBuilder<> builder(ret);
+    llvm::Value *aggregate = llvm::UndefValue::get(returnStruct);
+    for (uint64_t index = 0; index < returnBindings->size(); ++index) {
+      aggregate = builder.Insert(llvm::InsertValueInst::Create(
+          aggregate, (*returnBindings)[index].ReturnValue,
+          {static_cast<unsigned>(index)}));
+    }
+    builder.CreateRet(aggregate);
+    ret->eraseFromParent();
+  }
+
+  function.eraseFromParent();
+  result.Rewritten = true;
+  result.Reason = "rewritten";
+  result.Function = rewritten;
+  return result;
+}
+
+NativePrototypeRewriteResult
 rewriteNativeRecoveredPrototype(llvm::Function &function) {
   NativePrototypeRewriteResult result;
   result.Function = &function;
@@ -1190,6 +1282,9 @@ rewriteNativeRecoveredPrototype(llvm::Function &function) {
   }
   if (prototype->Inputs.size() == 1 && prototype->Returns.size() == 1) {
     return rewriteNativeRecoveredPrototypeInputReturn(function);
+  }
+  if (prototype->Inputs.empty() && prototype->Returns.size() > 1) {
+    return rewriteNativeRecoveredPrototypeMultiReturn(function);
   }
 
   result.Reason = "unsupported recovered prototype shape";
