@@ -50,10 +50,13 @@
     - 记录：`05-input-output-candidates/20260529-01-register-input-candidates.md`
   - [x] 标注 `notdec.prototype.input_candidates`。
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
-  - [ ] 标注 `notdec.prototype.return_candidates`。
+  - [x] 标注 `notdec.prototype.return_candidates`。
+    - 记录：`05-input-output-candidates/20260529-02-register-return-candidates.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
-  - [ ] 添加返回候选 IR 小样例。
+  - [x] 添加返回候选 IR 小样例。
+    - 文件：`tests/native_prototype_recovery_test.cpp`
 
 - [ ] 阶段 6: `06-pass-pipeline-and-verification`
   - [ ] 编写第一小步规划：CLI 和 pass pipeline 接入。

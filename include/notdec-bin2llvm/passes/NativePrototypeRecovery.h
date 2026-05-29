@@ -35,12 +35,14 @@ struct NativePrototypeRecoveryFunctionSummary {
   std::string FunctionName;
   uint64_t ExternalInputsSeen = 0;
   uint64_t InputCandidates = 0;
+  uint64_t ReturnCandidates = 0;
 };
 
 struct NativePrototypeRecoverySummary {
   uint64_t FunctionsSeen = 0;
   uint64_t ExternalInputsSeen = 0;
   uint64_t InputCandidates = 0;
+  uint64_t ReturnCandidates = 0;
   std::vector<NativePrototypeRecoveryFunctionSummary> Functions;
 };
 

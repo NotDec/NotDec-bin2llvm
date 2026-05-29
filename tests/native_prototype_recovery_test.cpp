@@ -45,6 +45,18 @@ notdec::bin2llvm::NativeAbiParamEntry inputRegister(const std::string &name) {
   return entry;
 }
 
+llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context,
+                                     const std::string &name) {
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "base=" + name),
+      llvm::MDString::get(context, "space=register"),
+      llvm::MDString::get(context, "offset=0"),
+      llvm::MDString::get(context, "size=8"),
+      llvm::MDString::get(context, "name=" + name),
+  };
+  return llvm::MDNode::get(context, fields);
+}
+
 void attachTestAbi(llvm::Module &module) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__stdcall";
@@ -76,6 +88,25 @@ llvm::Function *createFunction(llvm::Module &module, const std::string &name) {
                              module);
   llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createReturnStoreFunction(llvm::Module &module,
+                                          const std::string &name,
+                                          llvm::GlobalVariable *global,
+                                          const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x1234), global);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
   builder.CreateRetVoid();
   return function;
 }
@@ -134,6 +165,7 @@ int main() {
   llvm::Module module("native-prototype-recovery-test", context);
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
   llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
   attachTestAbi(module);
 
   llvm::Function *inputFunction = createFunction(module, "input_rdi");
@@ -141,6 +173,10 @@ int main() {
 
   llvm::Function *savedRegisterFunction = createFunction(module, "saved_rbx");
   attachExternalInputs(*savedRegisterFunction, {{"RBX", rbx}});
+  llvm::Function *returnFunction =
+      createReturnStoreFunction(module, "return_rax", rax, "RAX");
+  llvm::Function *nonReturnFunction =
+      createReturnStoreFunction(module, "return_rbx", rbx, "RBX");
 
   notdec::bin2llvm::NativePrototypeRecoveryOptions options;
   notdec::bin2llvm::NativePrototypeRecoverySummary summary =
@@ -152,16 +188,24 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 2, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 4, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 2,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 1,
                "unexpected input candidate count");
+  ok &= expect(summary.ReturnCandidates == 1,
+               "unexpected return candidate count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
                "RDI was not marked as an input candidate");
   ok &= expect(!metadataHasRegister(*savedRegisterFunction,
                                     "notdec.prototype.input_candidates", "RBX"),
                "RBX was incorrectly marked as an input candidate");
+  ok &= expect(metadataHasRegister(*returnFunction,
+                                   "notdec.prototype.return_candidates", "RAX"),
+               "RAX was not marked as a return candidate");
+  ok &= expect(!metadataHasRegister(*nonReturnFunction,
+                                    "notdec.prototype.return_candidates", "RBX"),
+               "RBX was incorrectly marked as a return candidate");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
