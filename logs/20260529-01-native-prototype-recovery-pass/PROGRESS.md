@@ -170,6 +170,9 @@
   - [x] 添加签名重写 skip reason 统计。
     - 记录：`06-pass-pipeline-and-verification/20260529-15-signature-rewrite-skip-reasons.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 添加 input-only 直接调用点签名重写。
+    - 记录：`06-pass-pipeline-and-verification/20260529-16-input-only-direct-callsite-rewrite.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

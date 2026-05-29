@@ -3,6 +3,7 @@
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/NativePrototypeModel.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
@@ -196,6 +197,74 @@ std::optional<llvm::StoreInst *> uniqueRegisterAccessStore(
     return std::nullopt;
   }
   return result;
+}
+
+std::optional<llvm::Value *> callsiteInputValueBeforeCall(
+    llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *paramType) {
+  llvm::BasicBlock::reverse_iterator iter(call.getIterator());
+  llvm::BasicBlock::reverse_iterator end = call.getParent()->rend();
+  for (; iter != end; ++iter) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter);
+    if (store == nullptr) {
+      continue;
+    }
+    llvm::MDNode *metadata = store->getMetadata("notdec.register.access");
+    if (metadata == nullptr) {
+      continue;
+    }
+    std::optional<std::string> name = metadataField(*metadata, "name");
+    if (!name || *name != registerName) {
+      continue;
+    }
+    llvm::Value *value = store->getValueOperand();
+    if (value == nullptr || value->getType() != paramType) {
+      return std::nullopt;
+    }
+    return value;
+  }
+  return std::nullopt;
+}
+
+struct NativeInputOnlyCallsiteRewrite {
+  llvm::CallInst *Call = nullptr;
+  llvm::Value *Argument = nullptr;
+};
+
+std::optional<std::vector<NativeInputOnlyCallsiteRewrite>>
+collectInputOnlyDirectCallsiteRewrites(llvm::Function &function,
+                                       llvm::StringRef registerName,
+                                       llvm::Type *paramType) {
+  std::vector<NativeInputOnlyCallsiteRewrite> rewrites;
+  for (llvm::User *user : function.users()) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+    if (call == nullptr || call->getCalledFunction() != &function ||
+        call->arg_size() != 0 || !call->getType()->isVoidTy()) {
+      return std::nullopt;
+    }
+    std::optional<llvm::Value *> argument =
+        callsiteInputValueBeforeCall(*call, registerName, paramType);
+    if (!argument) {
+      return std::nullopt;
+    }
+
+    NativeInputOnlyCallsiteRewrite rewrite;
+    rewrite.Call = call;
+    rewrite.Argument = *argument;
+    rewrites.push_back(rewrite);
+  }
+  return rewrites;
+}
+
+void rewriteInputOnlyDirectCallsites(
+    llvm::Function &rewritten,
+    llvm::ArrayRef<NativeInputOnlyCallsiteRewrite> callsites) {
+  for (const NativeInputOnlyCallsiteRewrite &callsite : callsites) {
+    llvm::IRBuilder<> builder(callsite.Call);
+    llvm::CallInst *newCall = builder.CreateCall(
+        rewritten.getFunctionType(), &rewritten, {callsite.Argument});
+    newCall->setCallingConv(callsite.Call->getCallingConv());
+    callsite.Call->eraseFromParent();
+  }
 }
 
 std::vector<NativeParamTrial> returnTrialsBeforeInstruction(
@@ -706,10 +775,6 @@ NativePrototypeRewriteResult
 rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
   NativePrototypeRewriteResult result;
   result.Function = &function;
-  if (!function.use_empty()) {
-    result.Reason = "function has uses";
-    return result;
-  }
   if (function.getFunctionType()->getNumParams() != 0 ||
       !function.getReturnType()->isVoidTy()) {
     result.Reason = "original function is not void()";
@@ -749,6 +814,16 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
     result.Reason = "input load type mismatch";
     return result;
   }
+  std::optional<std::vector<NativeInputOnlyCallsiteRewrite>> callsiteRewrites;
+  if (!function.use_empty()) {
+    callsiteRewrites = collectInputOnlyDirectCallsiteRewrites(
+        function, prototype->Inputs[0].RegisterName,
+        (*recoveredType)->getParamType(0));
+    if (!callsiteRewrites) {
+      result.Reason = "function has uses";
+      return result;
+    }
+  }
 
   llvm::Module *module = function.getParent();
   if (module == nullptr) {
@@ -770,6 +845,9 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
   inputLoad->replaceAllUsesWith(argument);
   if (inputLoad->use_empty()) {
     inputLoad->eraseFromParent();
+  }
+  if (callsiteRewrites) {
+    rewriteInputOnlyDirectCallsites(*rewritten, *callsiteRewrites);
   }
 
   function.eraseFromParent();

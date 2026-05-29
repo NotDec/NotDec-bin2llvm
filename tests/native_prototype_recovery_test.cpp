@@ -130,6 +130,29 @@ llvm::Function *createCallerFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createInputStoreCallerFunction(llvm::Module &module,
+                                               const std::string &name,
+                                               llvm::Function *callee,
+                                               llvm::GlobalVariable *input,
+                                               const std::string &registerName,
+                                               llvm::CallInst **callOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *argument = llvm::ConstantInt::get(input->getValueType(), 0x4567);
+  llvm::StoreInst *store = builder.CreateStore(argument, input);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+  *callOut = call;
+  return function;
+}
+
 llvm::Function *createUnusedExternalInputFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName) {
@@ -821,6 +844,61 @@ int main() {
   }
   ok &= expect(!sawInputLoadAfterRewrite,
                "rewritten input-only function kept old input load");
+
+  llvm::Module callsiteModule("native-prototype-input-callsite-rewrite-test",
+                              context);
+  llvm::GlobalVariable *callsiteRdi =
+      createRegisterGlobal(callsiteModule, "RDI");
+  attachTestAbi(callsiteModule);
+  llvm::LoadInst *callsiteInputLoad = nullptr;
+  llvm::Function *callsiteInputFunction = createUsedExternalInputFunction(
+      callsiteModule, "callsite_input_rdi", callsiteRdi, "RDI",
+      &callsiteInputLoad);
+  attachExternalInputs(*callsiteInputFunction, {{"RDI", callsiteRdi}});
+  llvm::CallInst *oldCallsiteCall = nullptr;
+  createInputStoreCallerFunction(callsiteModule, "call_callsite_input_rdi",
+                                 callsiteInputFunction, callsiteRdi, "RDI",
+                                 &oldCallsiteCall);
+  notdec::bin2llvm::runNativePrototypeRecovery(callsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult callsiteRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+          *callsiteInputFunction);
+  ok &= expect(callsiteRewriteResult.Rewritten,
+               "input-only prototype with direct callsite was not rewritten");
+  callsiteInputFunction = callsiteRewriteResult.Function;
+  ok &= expect(callsiteInputFunction != nullptr &&
+                   functionTypeShape(*callsiteInputFunction->getFunctionType(),
+                                     llvm::Type::getVoidTy(context),
+                                     llvm::ArrayRef(i64Param)),
+               "callsite rewritten input function type was not void(i64)");
+  llvm::CallInst *rewrittenCallsiteCall = nullptr;
+  llvm::Function *callsiteCaller =
+      callsiteModule.getFunction("call_callsite_input_rdi");
+  if (callsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *callsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr && call->getCalledFunction() ==
+                                   callsiteInputFunction) {
+          rewrittenCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenCallsiteCall != nullptr,
+               "direct callsite was not rewritten to new callee");
+  ok &= expect(rewrittenCallsiteCall != nullptr &&
+                   rewrittenCallsiteCall->arg_size() == 1,
+               "direct callsite did not get one argument");
+  ok &= expect(rewrittenCallsiteCall != nullptr &&
+                   llvm::isa<llvm::ConstantInt>(
+                       rewrittenCallsiteCall->getArgOperand(0)),
+               "direct callsite argument did not use register store value");
+  if (llvm::verifyModule(callsiteModule, &llvm::errs())) {
+    std::cerr
+        << "callsite module verification failed after input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
   notdec::bin2llvm::NativePrototypeRewriteEligibility matchingEligibility =
       notdec::bin2llvm::getNativePrototypeRewriteEligibility(
           *matchingInputFunction);
