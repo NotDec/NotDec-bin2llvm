@@ -160,6 +160,20 @@ forbid_ir_regex() {
   fi
 }
 
+check_prototype_metadata() {
+  local name="$1"
+  local ll="$2"
+
+  require_ir_pattern "$ll" "!notdec.abi" \
+    "$name ABI metadata"
+  require_ir_pattern "$ll" "!notdec.register.external_inputs" \
+    "$name register SSA external input metadata"
+  require_ir_pattern "$ll" "!notdec.prototype.input_candidates" \
+    "$name prototype input candidate metadata"
+  require_ir_pattern "$ll" "!notdec.prototype.return_candidates" \
+    "$name prototype return candidate metadata"
+}
+
 summary_number_first() {
   local file="$1"
   local key="$2"
@@ -550,6 +564,7 @@ for index in "${!TARGET_NAMES[@]}"; do
   "$LLVM_AS" "$ll" -o "$bc" >"$llvm_as_stdout" 2>"$llvm_as_stderr"
   "$OPT" -passes=verify "$bc" -o "$opt_bc" >"$opt_stdout" 2>"$opt_stderr"
   check_ir_features "$name" "$ll"
+  check_prototype_metadata "$name" "$ll"
 
   if [[ "$name" == "libuv" ]]; then
     single_ll="$OUT_DIR/$name.single-function.ll"

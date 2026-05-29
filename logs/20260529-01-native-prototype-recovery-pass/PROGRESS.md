@@ -65,6 +65,9 @@
     - 文件：`tools/notdec-native-llvm.cpp`
   - [x] `.ll` / `.bc` 输入支持只跑 prototype recovery。
     - 文件：`tools/notdec-native-llvm.cpp`
+  - [x] Bench2 smoke 检查 prototype metadata。
+    - 记录：`06-pass-pipeline-and-verification/20260529-02-bench2-prototype-metadata-smoke.md`
+    - 文件：`scripts/bench2-native-smoke.sh`
   - [ ] Bench2 selected native 全量验证。
 
 ## 记录规则
