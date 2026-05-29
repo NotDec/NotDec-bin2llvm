@@ -28,10 +28,12 @@
     - 记录：`03-function-register-effects/20260529-01-preserved-unaffected-registers.md`
   - [x] 标注函数级 `notdec.register.preserves`。
     - 文件：`lib/passes/NativeRegisterSSA.cpp`
-  - [ ] 标注函数级 `notdec.register.clobbers`。
+  - [x] 标注函数级 `notdec.register.clobbers`。
+    - 记录：`03-function-register-effects/20260529-02-clobbered-unaffected-registers.md`
   - [x] 添加 preserved IR 小样例。
     - 文件：`tests/native_register_effects_test.cpp`
-  - [ ] 添加 clobber IR 小样例。
+  - [x] 添加 clobber IR 小样例。
+    - 文件：`tests/native_register_effects_test.cpp`
 
 - [ ] 阶段 4: `04-callsite-effects`
   - [ ] 编写第一小步规划：外部 call 按 ABI killedbycall 处理。

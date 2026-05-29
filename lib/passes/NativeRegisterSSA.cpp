@@ -211,11 +211,11 @@ public:
 
     if (EnableRewrite) {
       rewriteLoads();
-      attachPreservedMetadata();
+      attachRegisterEffectMetadata();
       eraseDeadPhis();
     } else {
       collectExternalInputsOnly();
-      attachPreservedMetadata();
+      attachRegisterEffectMetadata();
     }
     attachExternalInputMetadata();
   }
@@ -516,13 +516,32 @@ private:
                          llvm::MDNode::get(context, entries));
   }
 
-  void attachPreservedMetadata() {
+  llvm::MDNode *registerEffectMetadata(
+      llvm::LLVMContext &context,
+      const std::vector<llvm::GlobalVariable *> &globals) {
+    if (globals.empty()) {
+      return nullptr;
+    }
+    std::vector<llvm::Metadata *> entries;
+    for (llvm::GlobalVariable *global : globals) {
+      std::string name = unitName(*global);
+      llvm::Metadata *fields[] = {
+          llvm::MDString::get(context, "name=" + name),
+          llvm::ValueAsMetadata::get(global),
+      };
+      entries.push_back(llvm::MDNode::get(context, fields));
+    }
+    return llvm::MDNode::get(context, entries);
+  }
+
+  void attachRegisterEffectMetadata() {
     if (AbiUnaffectedRegisters.empty() || ExternalInputValue.empty()) {
       return;
     }
 
     llvm::LLVMContext &context = Function.getContext();
-    std::vector<llvm::Metadata *> entries;
+    std::vector<llvm::GlobalVariable *> preserved;
+    std::vector<llvm::GlobalVariable *> clobbered;
     for (auto &[global, unit] : Units) {
       if (AbiUnaffectedRegisters.count(unit.Name) == 0) {
         continue;
@@ -532,19 +551,21 @@ private:
         continue;
       }
       llvm::Value *input = resolveValue(inputIt->second);
-      if (input == nullptr || !isPreservedOnAllReturns(unit, input)) {
+      if (input == nullptr) {
         continue;
       }
-      llvm::Metadata *fields[] = {
-          llvm::MDString::get(context, "name=" + unit.Name),
-          llvm::ValueAsMetadata::get(global),
-      };
-      entries.push_back(llvm::MDNode::get(context, fields));
+      if (isPreservedOnAllReturns(unit, input)) {
+        preserved.push_back(global);
+      } else {
+        clobbered.push_back(global);
+      }
     }
 
-    if (!entries.empty()) {
-      Function.setMetadata("notdec.register.preserves",
-                           llvm::MDNode::get(context, entries));
+    if (llvm::MDNode *node = registerEffectMetadata(context, preserved)) {
+      Function.setMetadata("notdec.register.preserves", node);
+    }
+    if (llvm::MDNode *node = registerEffectMetadata(context, clobbered)) {
+      Function.setMetadata("notdec.register.clobbers", node);
     }
   }
 

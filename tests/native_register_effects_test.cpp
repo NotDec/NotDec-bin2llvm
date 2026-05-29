@@ -137,8 +137,14 @@ int main() {
   ok &= expect(metadataHasRegister(*preserved, "notdec.register.preserves",
                                    "RBX"),
                "restored RBX was not marked preserved");
+  ok &= expect(!metadataHasRegister(*preserved, "notdec.register.clobbers",
+                                    "RBX"),
+               "restored RBX was marked clobbered");
   ok &= expect(!metadataHasRegister(*clobbered, "notdec.register.preserves",
                                     "RBX"),
                "clobbered RBX was marked preserved");
+  ok &= expect(metadataHasRegister(*clobbered, "notdec.register.clobbers",
+                                   "RBX"),
+               "clobbered RBX was not marked clobbered");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
