@@ -127,3 +127,21 @@ include_directories("${PROJECT_SOURCE_DIR}/include/notdec-bin2llvm")
 
 add_subdirectory(lib)
 add_subdirectory(tools)
+
+if (BUILD_TESTING)
+  add_executable(native_abi_cspec_test
+    tests/native_abi_cspec_test.cpp
+  )
+
+  target_link_libraries(native_abi_cspec_test
+    PRIVATE
+      notdec-bin2llvm-core
+  )
+
+  add_test(
+    NAME notdec.native_abi.cspec
+    COMMAND
+      native_abi_cspec_test
+      "${NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR}/Ghidra/Processors/x86/data/languages/x86-64-gcc.cspec"
+  )
+endif ()

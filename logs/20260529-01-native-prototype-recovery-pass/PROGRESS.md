@@ -9,8 +9,9 @@
     - 文件：`include/notdec-bin2llvm/NativeAbi.h`、`lib/NativeAbi.cpp`
   - [x] 输出 module 级 `!notdec.abi` metadata。
     - 文件：`lib/NativeAbi.cpp`、`tools/notdec-native-llvm.cpp`
-  - [ ] 添加 cspec 子集解析单元测试。
-    - 当前只有临时 smoke 验证，后续需要落到 `tests/` 或 CTest。
+  - [x] 添加 cspec 子集解析单元测试。
+    - 记录：`01-cspec-abi-model/20260529-02-cspec-abi-parser-test.md`
+    - 文件：`tests/native_abi_cspec_test.cpp`
 
 - [ ] 阶段 2: `02-prototype-storage-model`
   - [ ] 编写第一小步规划：复刻 `ParamEntry` / `ParamList` 的 register storage 匹配。
