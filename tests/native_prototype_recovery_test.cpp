@@ -213,6 +213,42 @@ llvm::Function *createReturnLoadLinearSuccessorCallerFunction(
   return function;
 }
 
+llvm::Function *createReturnClobberLinearSuccessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, const std::string &registerName,
+    llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *middle =
+      llvm::BasicBlock::Create(context, "after_call", function);
+  llvm::BasicBlock *useBlock =
+      llvm::BasicBlock::Create(context, "use_return", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateBr(middle);
+
+  builder.SetInsertPoint(middle);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(output->getValueType(), 0x9999), output);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(useBlock);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            registerName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *loadOut = load;
+  return function;
+}
+
 llvm::Function *createInputStoreCallerFunction(llvm::Module &module,
                                                const std::string &name,
                                                llvm::Function *callee,
@@ -1358,6 +1394,36 @@ int main() {
                "linear return callsite result was not used");
   if (llvm::verifyModule(linearReturnCallsiteModule, &llvm::errs())) {
     std::cerr << "linear callsite module verification failed after "
+                 "return-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module clobberReturnCallsiteModule(
+      "native-prototype-return-clobber-callsite-rewrite-test", context);
+  llvm::GlobalVariable *clobberReturnCallsiteRax =
+      createRegisterGlobal(clobberReturnCallsiteModule, "RAX");
+  attachTestAbi(clobberReturnCallsiteModule);
+  llvm::StoreInst *clobberReturnCallsiteStore = nullptr;
+  llvm::Function *clobberReturnCallsiteFunction = createReturnStoreFunction(
+      clobberReturnCallsiteModule, "clobber_callsite_return_rax",
+      clobberReturnCallsiteRax, "RAX", &clobberReturnCallsiteStore);
+  llvm::LoadInst *clobberReturnCallsiteLoad = nullptr;
+  createReturnClobberLinearSuccessorCallerFunction(
+      clobberReturnCallsiteModule, "call_clobber_callsite_return_rax",
+      clobberReturnCallsiteFunction, clobberReturnCallsiteRax, "RAX",
+      &clobberReturnCallsiteLoad);
+  notdec::bin2llvm::runNativePrototypeRecovery(clobberReturnCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      clobberReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *clobberReturnCallsiteFunction);
+  ok &= expect(!clobberReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype rewrite ignored callsite clobber");
+  ok &= expect(!clobberReturnCallsiteLoad->use_empty(),
+               "clobbered return load was unexpectedly replaced");
+  if (llvm::verifyModule(clobberReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "clobber callsite module verification failed after "
                  "return-only rewrite\n";
     return EXIT_FAILURE;
   }

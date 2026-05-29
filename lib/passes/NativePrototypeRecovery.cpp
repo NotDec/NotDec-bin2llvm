@@ -291,15 +291,16 @@ void rewriteInputOnlyDirectCallsites(
   }
 }
 
-llvm::LoadInst *findReturnLoadInRange(llvm::BasicBlock::iterator iter,
-                                      llvm::BasicBlock::iterator end,
-                                      llvm::StringRef returnRegisterName) {
+struct ReturnLoadSearchResult {
+  llvm::LoadInst *Load = nullptr;
+  bool Blocked = false;
+};
+
+ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
+    llvm::BasicBlock::iterator iter, llvm::BasicBlock::iterator end,
+    llvm::StringRef returnRegisterName) {
   for (; iter != end; ++iter) {
-    auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter);
-    if (load == nullptr) {
-      continue;
-    }
-    llvm::MDNode *metadata = load->getMetadata("notdec.register.access");
+    llvm::MDNode *metadata = iter->getMetadata("notdec.register.access");
     if (metadata == nullptr) {
       continue;
     }
@@ -307,18 +308,23 @@ llvm::LoadInst *findReturnLoadInRange(llvm::BasicBlock::iterator iter,
     if (!name || *name != returnRegisterName) {
       continue;
     }
-    return load;
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter)) {
+      return {load, false};
+    }
+    if (llvm::isa<llvm::StoreInst>(&*iter)) {
+      return {nullptr, true};
+    }
   }
-  return nullptr;
+  return {};
 }
 
-llvm::LoadInst *findCallsiteReturnLoad(llvm::CallInst &oldCall,
-                                       llvm::StringRef returnRegisterName) {
+ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
+                                              llvm::StringRef returnRegisterName) {
   llvm::BasicBlock::iterator localIter(oldCall.getIterator());
-  llvm::LoadInst *localLoad = findReturnLoadInRange(
+  ReturnLoadSearchResult localResult = findReturnLoadBeforeStoreInRange(
       ++localIter, oldCall.getParent()->end(), returnRegisterName);
-  if (localLoad != nullptr) {
-    return localLoad;
+  if (localResult.Load != nullptr || localResult.Blocked) {
+    return localResult;
   }
 
   std::set<llvm::BasicBlock *> visited;
@@ -327,39 +333,39 @@ llvm::LoadInst *findCallsiteReturnLoad(llvm::CallInst &oldCall,
     llvm::BasicBlock *successor = nullptr;
     for (llvm::BasicBlock *candidate : llvm::successors(current)) {
       if (successor != nullptr) {
-        return nullptr;
+        return {};
       }
       successor = candidate;
     }
     if (successor == nullptr) {
-      return nullptr;
+      return {};
     }
 
     llvm::BasicBlock *predecessor = nullptr;
     for (llvm::BasicBlock *candidate : llvm::predecessors(successor)) {
       if (predecessor != nullptr) {
-        return nullptr;
+        return {};
       }
       predecessor = candidate;
     }
     if (predecessor != current) {
-      return nullptr;
+      return {};
     }
 
-    llvm::LoadInst *successorLoad =
-        findReturnLoadInRange(successor->begin(), successor->end(),
-                              returnRegisterName);
-    if (successorLoad != nullptr) {
-      return successorLoad;
+    ReturnLoadSearchResult successorResult = findReturnLoadBeforeStoreInRange(
+        successor->begin(), successor->end(), returnRegisterName);
+    if (successorResult.Load != nullptr || successorResult.Blocked) {
+      return successorResult;
     }
     current = successor;
   }
-  return nullptr;
+  return {};
 }
 
 void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,
                                llvm::StringRef returnRegisterName) {
-  llvm::LoadInst *load = findCallsiteReturnLoad(oldCall, returnRegisterName);
+  llvm::LoadInst *load =
+      findCallsiteReturnLoad(oldCall, returnRegisterName).Load;
   if (load == nullptr) {
     return;
   }
@@ -385,13 +391,27 @@ void rewriteInputReturnDirectCallsites(
   }
 }
 
+bool callsiteHasMismatchedReturnLoad(llvm::CallInst &callsite,
+                                     llvm::StringRef returnRegisterName,
+                                     llvm::Type *returnType) {
+  ReturnLoadSearchResult result =
+      findCallsiteReturnLoad(callsite, returnRegisterName);
+  return result.Blocked || (result.Load != nullptr &&
+                            result.Load->getType() != returnType);
+}
+
 std::optional<std::vector<llvm::CallInst *>>
-collectReturnOnlyDirectCallsites(llvm::Function &function) {
+collectReturnOnlyDirectCallsites(llvm::Function &function,
+                                 llvm::StringRef returnRegisterName,
+                                 llvm::Type *returnType) {
   std::vector<llvm::CallInst *> callsites;
   for (llvm::User *user : function.users()) {
     auto *call = llvm::dyn_cast<llvm::CallInst>(user);
     if (call == nullptr || call->getCalledFunction() != &function ||
         call->arg_size() != 0 || !call->getType()->isVoidTy()) {
+      return std::nullopt;
+    }
+    if (callsiteHasMismatchedReturnLoad(*call, returnRegisterName, returnType)) {
       return std::nullopt;
     }
     callsites.push_back(call);
@@ -881,7 +901,10 @@ rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
   }
   std::optional<std::vector<llvm::CallInst *>> callsiteRewrites;
   if (!function.use_empty()) {
-    callsiteRewrites = collectReturnOnlyDirectCallsites(function);
+    callsiteRewrites =
+        collectReturnOnlyDirectCallsites(function,
+                                         prototype->Returns[0].RegisterName,
+                                         (*recoveredType)->getReturnType());
     if (!callsiteRewrites) {
       result.Reason = "function has uses";
       return result;
@@ -1074,6 +1097,14 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
     if (!callsiteRewrites) {
       result.Reason = "function has uses";
       return result;
+    }
+    for (const NativeInputOnlyCallsiteRewrite &callsite : *callsiteRewrites) {
+      if (callsiteHasMismatchedReturnLoad(
+              *callsite.Call, prototype->Returns[0].RegisterName,
+              (*recoveredType)->getReturnType())) {
+        result.Reason = "function has uses";
+        return result;
+      }
     }
   }
 

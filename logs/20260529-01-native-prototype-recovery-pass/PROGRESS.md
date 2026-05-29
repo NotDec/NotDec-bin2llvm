@@ -194,6 +194,9 @@
   - [x] 添加 callsite return load 线性唯一后继链查找。
     - 记录：`06-pass-pipeline-and-verification/20260529-23-callsite-return-linear-successor-chain.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 添加 callsite return load 线性链同寄存器 store 阻断。
+    - 记录：`06-pass-pipeline-and-verification/20260529-24-callsite-return-linear-clobber-stop.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
