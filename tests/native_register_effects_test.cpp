@@ -124,6 +124,52 @@ llvm::Function *createCallEffectFunction(llvm::Module &module,
   return function;
 }
 
+void attachRegisterMetadataToFunction(llvm::Function &function,
+                                      llvm::StringRef kind,
+                                      llvm::GlobalVariable *global,
+                                      const std::string &name) {
+  llvm::LLVMContext &context = function.getContext();
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "name=" + name),
+      llvm::ValueAsMetadata::get(global),
+  };
+  llvm::Metadata *entries[] = {llvm::MDNode::get(context, fields)};
+  function.setMetadata(kind, llvm::MDNode::get(context, entries));
+}
+
+llvm::Function *createDirectCallEffectFunction(llvm::Module &module,
+                                               llvm::GlobalVariable *rbx) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "callee_preserves_rbx", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  calleeBuilder.CreateRetVoid();
+  attachRegisterMetadataToFunction(*callee, "notdec.register.preserves", rbx,
+                                   "RBX");
+
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "direct_call_effects", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *rbxMetadata = registerAccessMetadata(context, "RBX");
+
+  llvm::StoreInst *storeRbx = builder.CreateStore(
+      llvm::ConstantInt::get(rbx->getValueType(), 0x3333), rbx);
+  storeRbx->setMetadata("notdec.register.access", rbxMetadata);
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *loadRbx =
+      builder.CreateLoad(rbx->getValueType(), rbx, "rbx_after_direct_call");
+  loadRbx->setMetadata("notdec.register.access", rbxMetadata);
+  builder.CreateRet(loadRbx);
+  return function;
+}
+
 unsigned countRegisterLoads(const llvm::Function &function,
                             const llvm::GlobalVariable *global) {
   unsigned count = 0;
@@ -184,6 +230,8 @@ int main() {
   llvm::Function *clobbered =
       createFunction(module, "clobbered_rbx", rbx, false);
   llvm::Function *callEffects = createCallEffectFunction(module, rbx, rax);
+  llvm::Function *directCallEffects =
+      createDirectCallEffectFunction(module, rbx);
 
   notdec::bin2llvm::NativeRegisterSSAOptions options;
   options.EnableRewrite = true;
@@ -211,5 +259,7 @@ int main() {
                "RBX load after call was not propagated");
   ok &= expect(countRegisterLoads(*callEffects, rax) == 1,
                "RAX load after call was incorrectly propagated");
+  ok &= expect(countRegisterLoads(*directCallEffects, rbx) == 0,
+               "RBX load after direct preserving call was not propagated");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

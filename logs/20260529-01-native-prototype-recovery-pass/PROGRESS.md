@@ -38,7 +38,8 @@
 - [ ] 阶段 4: `04-callsite-effects`
   - [x] 编写第一小步规划：外部 call 按 ABI killedbycall 处理。
     - 记录：`04-callsite-effects/20260529-01-abi-call-effect-barrier.md`
-  - [ ] 本模块 direct call 读取 callee metadata。
+  - [x] 本模块 direct call 读取 callee metadata。
+    - 记录：`04-callsite-effects/20260529-02-direct-callee-register-effects.md`
   - [x] 未解析 call 保守 fallback。
     - 当前实现：ABI `unaffected` 不阻断，其它未知 effect 保守阻断。
   - [x] 添加 callsite clobber IR 小样例。

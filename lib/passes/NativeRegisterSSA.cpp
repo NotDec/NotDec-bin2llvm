@@ -203,6 +203,29 @@ bool isRegisterClobberCall(const llvm::Instruction &inst) {
   return callee == nullptr || !callee->isIntrinsic();
 }
 
+bool functionMetadataHasRegister(const llvm::Function &function,
+                                 llvm::StringRef metadataName,
+                                 llvm::StringRef registerName) {
+  llvm::MDNode *node = function.getMetadata(metadataName);
+  if (node == nullptr) {
+    return false;
+  }
+  std::string expected = ("name=" + registerName).str();
+  for (const llvm::MDOperand &operand : node->operands()) {
+    auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (entry == nullptr) {
+      continue;
+    }
+    for (const llvm::MDOperand &fieldOperand : entry->operands()) {
+      auto *field = llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+      if (field != nullptr && field->getString() == expected) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // FunctionPromoter owns the per-function SSA caches. It follows the on-demand
 // SSA construction shape: a read asks for the reaching value, predecessor reads
 // create PHIs only when needed, and unresolved external reads become one
@@ -317,7 +340,7 @@ private:
       if (before != nullptr && !inst.comesBefore(before)) {
         continue;
       }
-      if (isRegisterClobberCall(inst) && callClobbersRegister(unit)) {
+      if (isRegisterClobberCall(inst) && callClobbersRegister(inst, unit)) {
         passedBarrier = true;
         continue;
       }
@@ -354,14 +377,28 @@ private:
       if (&inst == before) {
         return false;
       }
-      if (isRegisterClobberCall(inst) && callClobbersRegister(unit)) {
+      if (isRegisterClobberCall(inst) && callClobbersRegister(inst, unit)) {
         return true;
       }
     }
     return false;
   }
 
-  bool callClobbersRegister(const RegisterUnit &unit) const {
+  bool callClobbersRegister(const llvm::Instruction &inst,
+                            const RegisterUnit &unit) const {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    llvm::Function *callee =
+        call == nullptr ? nullptr : call->getCalledFunction();
+    if (callee != nullptr && !callee->isDeclaration()) {
+      if (functionMetadataHasRegister(*callee, "notdec.register.preserves",
+                                      unit.Name)) {
+        return false;
+      }
+      if (functionMetadataHasRegister(*callee, "notdec.register.clobbers",
+                                      unit.Name)) {
+        return true;
+      }
+    }
     if (AbiEffects.Unaffected.count(unit.Name) != 0) {
       return false;
     }
@@ -611,7 +648,12 @@ private:
     if (HasCall.count(&block) == 0) {
       return false;
     }
-    return callClobbersRegister(unit);
+    for (llvm::Instruction &inst : block) {
+      if (isRegisterClobberCall(inst) && callClobbersRegister(inst, unit)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   llvm::Function &Function;
