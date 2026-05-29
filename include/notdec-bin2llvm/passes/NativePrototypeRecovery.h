@@ -82,6 +82,12 @@ struct NativePrototypeReturnBinding {
   llvm::Value *ReturnValue = nullptr;
 };
 
+struct NativePrototypeRewriteResult {
+  bool Rewritten = false;
+  std::string Reason;
+  llvm::Function *Function = nullptr;
+};
+
 struct NativePrototypeRecoveryFunctionSummary {
   std::string FunctionName;
   uint64_t ExternalInputsSeen = 0;
@@ -119,6 +125,9 @@ getNativePrototypeInputBindings(llvm::Function &function);
 
 std::optional<std::vector<NativePrototypeReturnBinding>>
 getNativePrototypeReturnBindings(llvm::Function &function);
+
+NativePrototypeRewriteResult
+rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function);
 
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os);

@@ -115,6 +115,21 @@ llvm::Function *createFunctionWithType(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createCallerFunction(llvm::Module &module,
+                                     const std::string &name,
+                                     llvm::Function *callee) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createUnusedExternalInputFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName) {
@@ -555,6 +570,9 @@ int main() {
   llvm::Function *returnFunction =
       createReturnStoreFunction(module, "return_rax", rax, "RAX",
                                 &returnStore);
+  llvm::Function *usedReturnFunction =
+      createReturnStoreFunction(module, "return_rax_used", rax, "RAX");
+  createCallerFunction(module, "call_return_rax_used", usedReturnFunction);
   llvm::Function *nonReturnFunction =
       createReturnStoreFunction(module, "return_rbx", rbx, "RBX");
   llvm::Function *twoReturnFunction =
@@ -583,16 +601,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 15, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 17, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 10,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 7,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 5,
+  ok &= expect(summary.ReturnCandidates == 6,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 9,
+  ok &= expect(summary.RewriteEligibleFunctions == 10,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 8,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 9,
                "unexpected signature rewrite needed function count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
@@ -767,6 +785,43 @@ int main() {
   ok &= expect(!notdec::bin2llvm::getNativePrototypeReturnBindings(
                     *twoReturnFunction),
                "duplicate return stores were incorrectly bound");
+  notdec::bin2llvm::NativePrototypeRewriteResult usedRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+          *usedReturnFunction);
+  ok &= expect(!usedRewriteResult.Rewritten,
+               "return-only prototype with uses was rewritten");
+  ok &= expect(usedRewriteResult.Reason == "function has uses",
+               "return-only prototype with uses had unexpected rewrite reason");
+  notdec::bin2llvm::NativePrototypeRewriteResult rewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+          *returnFunction);
+  ok &= expect(rewriteResult.Rewritten,
+               "return-only prototype was not rewritten");
+  returnFunction = rewriteResult.Function;
+  ok &= expect(returnFunction != nullptr &&
+                   functionTypeShape(*returnFunction->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef<llvm::Type *>{}),
+               "rewritten return-only function type was not i64()");
+  llvm::ReturnInst *rewrittenRet = nullptr;
+  if (returnFunction != nullptr) {
+    for (llvm::BasicBlock &block : *returnFunction) {
+      if (auto *ret =
+              llvm::dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator())) {
+        rewrittenRet = ret;
+      }
+    }
+  }
+  ok &= expect(rewrittenRet != nullptr,
+               "rewritten return-only function had no return instruction");
+  ok &= expect(rewrittenRet != nullptr &&
+                   rewrittenRet->getReturnValue() ==
+                       returnStore->getValueOperand(),
+               "rewritten return-only function returned wrong value");
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after return-only rewrite\n";
+    return EXIT_FAILURE;
+  }
   ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 0, "RAX"),
                "recovered RAX return was not sorted before RDX");
   ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 1, "RDX"),

@@ -98,6 +98,9 @@
   - [x] 添加 recovered return 到唯一 register store 的只读绑定 API。
     - 记录：`05-input-output-candidates/20260529-17-return-store-bindings.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] 添加无调用者 return-only 函数签名重写 helper。
+    - 记录：`05-input-output-candidates/20260529-18-return-only-signature-rewrite.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。
