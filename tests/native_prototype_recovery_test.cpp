@@ -175,6 +175,30 @@ llvm::Function *createPartialReturnStoreFunction(
   return function;
 }
 
+llvm::Function *createUniquePredecessorReturnStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *exit = llvm::BasicBlock::Create(context, "exit", function);
+
+  llvm::IRBuilder<> builder(entry);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x4444), global);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
+  builder.CreateBr(exit);
+
+  builder.SetInsertPoint(exit);
+  builder.CreateRetVoid();
+
+  return function;
+}
+
 void attachExternalInputs(llvm::Function &function,
                           llvm::ArrayRef<std::pair<std::string,
                                                    llvm::GlobalVariable *>>
@@ -269,6 +293,10 @@ int main() {
   llvm::Function *partialReturnFunction =
       createPartialReturnStoreFunction(module, "return_rax_partial", rax,
                                        "RAX");
+  llvm::Function *uniquePredReturnFunction =
+      createUniquePredecessorReturnStoreFunction(module,
+                                                 "return_rax_unique_pred", rax,
+                                                 "RAX");
 
   notdec::bin2llvm::NativePrototypeRecoveryOptions options;
   notdec::bin2llvm::NativePrototypeRecoverySummary summary =
@@ -280,12 +308,12 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 6, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 7, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 2,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 1,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 2,
+  ok &= expect(summary.ReturnCandidates == 3,
                "unexpected return candidate count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
@@ -307,5 +335,8 @@ int main() {
                                     "notdec.prototype.return_candidates",
                                     "RAX"),
                "partial RAX return was incorrectly marked as a candidate");
+  ok &= expect(metadataHasRegister(*uniquePredReturnFunction,
+                                   "notdec.prototype.return_candidates", "RAX"),
+               "unique predecessor RAX return was not marked as a candidate");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

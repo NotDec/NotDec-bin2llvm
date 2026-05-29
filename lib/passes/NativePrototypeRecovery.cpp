@@ -4,6 +4,7 @@
 #include "notdec-bin2llvm/NativePrototypeModel.h"
 
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
@@ -48,10 +49,10 @@ llvm::MDNode *inputCandidateMetadata(llvm::LLVMContext &context,
   return llvm::MDNode::get(context, entries);
 }
 
-std::optional<NativeParamTrial> returnTrialBefore(
-    llvm::ReturnInst &ret, const NativePrototypeModel &model) {
-  llvm::BasicBlock::reverse_iterator iter(ret.getIterator());
-  llvm::BasicBlock::reverse_iterator end = ret.getParent()->rend();
+std::optional<NativeParamTrial> returnTrialBeforeInstruction(
+    llvm::Instruction &instruction, const NativePrototypeModel &model) {
+  llvm::BasicBlock::reverse_iterator iter(instruction.getIterator());
+  llvm::BasicBlock::reverse_iterator end = instruction.getParent()->rend();
   for (; iter != end; ++iter) {
     auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter);
     if (store == nullptr) {
@@ -78,6 +79,35 @@ std::optional<NativeParamTrial> returnTrialBefore(
     return trial;
   }
   return std::nullopt;
+}
+
+llvm::BasicBlock *uniquePredecessor(llvm::BasicBlock &block) {
+  llvm::BasicBlock *result = nullptr;
+  for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
+    if (result != nullptr) {
+      return nullptr;
+    }
+    result = predecessor;
+  }
+  return result;
+}
+
+std::optional<NativeParamTrial> returnTrialBefore(
+    llvm::ReturnInst &ret, const NativePrototypeModel &model) {
+  if (std::optional<NativeParamTrial> trial =
+          returnTrialBeforeInstruction(ret, model)) {
+    return trial;
+  }
+
+  llvm::BasicBlock *predecessor = uniquePredecessor(*ret.getParent());
+  if (predecessor == nullptr) {
+    return std::nullopt;
+  }
+  llvm::Instruction *terminator = predecessor->getTerminator();
+  if (terminator == nullptr) {
+    return std::nullopt;
+  }
+  return returnTrialBeforeInstruction(*terminator, model);
 }
 
 void addFunctionSummary(NativePrototypeRecoverySummary &total,
