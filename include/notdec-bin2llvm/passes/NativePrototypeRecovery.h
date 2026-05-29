@@ -12,6 +12,8 @@ class LLVMContext;
 class LoadInst;
 class Module;
 class raw_ostream;
+class StoreInst;
+class Value;
 } // namespace llvm
 
 namespace notdec::bin2llvm {
@@ -71,6 +73,15 @@ struct NativePrototypeInputBinding {
   llvm::LoadInst *ExternalInputLoad = nullptr;
 };
 
+// Read-only bridge from recovered return storage to the register store that
+// currently carries the return value.  Later signature rewriting can move the
+// store value into LLVM ret instructions.
+struct NativePrototypeReturnBinding {
+  NativeRecoveredPrototypeParam Param;
+  llvm::StoreInst *ReturnStore = nullptr;
+  llvm::Value *ReturnValue = nullptr;
+};
+
 struct NativePrototypeRecoveryFunctionSummary {
   std::string FunctionName;
   uint64_t ExternalInputsSeen = 0;
@@ -105,6 +116,9 @@ getNativePrototypeRewriteEligibility(const llvm::Function &function);
 
 std::optional<std::vector<NativePrototypeInputBinding>>
 getNativePrototypeInputBindings(llvm::Function &function);
+
+std::optional<std::vector<NativePrototypeReturnBinding>>
+getNativePrototypeReturnBindings(llvm::Function &function);
 
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os);

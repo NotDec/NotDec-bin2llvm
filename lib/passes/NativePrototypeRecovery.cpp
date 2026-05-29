@@ -168,6 +168,35 @@ std::optional<llvm::LoadInst *> uniqueExternalInputLoad(
   return result;
 }
 
+std::optional<llvm::StoreInst *> uniqueRegisterAccessStore(
+    llvm::Function &function, llvm::StringRef registerName) {
+  llvm::StoreInst *result = nullptr;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+      if (store == nullptr) {
+        continue;
+      }
+      llvm::MDNode *metadata = store->getMetadata("notdec.register.access");
+      if (metadata == nullptr) {
+        continue;
+      }
+      std::optional<std::string> name = metadataField(*metadata, "name");
+      if (!name || *name != registerName) {
+        continue;
+      }
+      if (result != nullptr) {
+        return std::nullopt;
+      }
+      result = store;
+    }
+  }
+  if (result == nullptr) {
+    return std::nullopt;
+  }
+  return result;
+}
+
 std::vector<NativeParamTrial> returnTrialsBeforeInstruction(
     llvm::Instruction &instruction, const NativePrototypeModel &model) {
   std::vector<NativeParamTrial> trials;
@@ -550,6 +579,32 @@ getNativePrototypeInputBindings(llvm::Function &function) {
     NativePrototypeInputBinding binding;
     binding.Param = param;
     binding.ExternalInputLoad = *load;
+    bindings.push_back(std::move(binding));
+  }
+  return bindings;
+}
+
+std::optional<std::vector<NativePrototypeReturnBinding>>
+getNativePrototypeReturnBindings(llvm::Function &function) {
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(function);
+  if (!prototype) {
+    return std::nullopt;
+  }
+
+  std::vector<NativePrototypeReturnBinding> bindings;
+  bindings.reserve(prototype->Returns.size());
+  for (const NativeRecoveredPrototypeParam &param : prototype->Returns) {
+    std::optional<llvm::StoreInst *> store =
+        uniqueRegisterAccessStore(function, param.RegisterName);
+    if (!store) {
+      return std::nullopt;
+    }
+
+    NativePrototypeReturnBinding binding;
+    binding.Param = param;
+    binding.ReturnStore = *store;
+    binding.ReturnValue = (*store)->getValueOperand();
     bindings.push_back(std::move(binding));
   }
   return bindings;

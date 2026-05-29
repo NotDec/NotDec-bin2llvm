@@ -191,7 +191,9 @@ llvm::Function *createDuplicateExternalInputLoadFunction(
 llvm::Function *createReturnStoreFunction(llvm::Module &module,
                                           const std::string &name,
                                           llvm::GlobalVariable *global,
-                                          const std::string &registerName) {
+                                          const std::string &registerName,
+                                          llvm::StoreInst **returnStore =
+                                              nullptr) {
   llvm::LLVMContext &context = module.getContext();
   auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *function =
@@ -204,6 +206,9 @@ llvm::Function *createReturnStoreFunction(llvm::Module &module,
   store->setMetadata("notdec.register.access",
                      registerAccessMetadata(context, registerName));
   builder.CreateRetVoid();
+  if (returnStore != nullptr) {
+    *returnStore = store;
+  }
   return function;
 }
 
@@ -546,8 +551,10 @@ int main() {
 
   llvm::Function *savedRegisterFunction = createFunction(module, "saved_rbx");
   attachExternalInputs(*savedRegisterFunction, {{"RBX", rbx}});
+  llvm::StoreInst *returnStore = nullptr;
   llvm::Function *returnFunction =
-      createReturnStoreFunction(module, "return_rax", rax, "RAX");
+      createReturnStoreFunction(module, "return_rax", rax, "RAX",
+                                &returnStore);
   llvm::Function *nonReturnFunction =
       createReturnStoreFunction(module, "return_rbx", rbx, "RBX");
   llvm::Function *twoReturnFunction =
@@ -739,6 +746,27 @@ int main() {
     ok &= expect(eligibility.RecoveredType == *type,
                  "return prototype rewrite type did not match recovered type");
   }
+  std::optional<std::vector<notdec::bin2llvm::NativePrototypeReturnBinding>>
+      returnBindings =
+          notdec::bin2llvm::getNativePrototypeReturnBindings(*returnFunction);
+  ok &= expect(returnBindings.has_value(),
+               "return prototype had no return bindings");
+  if (returnBindings) {
+    ok &= expect(returnBindings->size() == 1,
+                 "return prototype had unexpected binding count");
+    ok &= expect((*returnBindings)[0].Param.RegisterName == "RAX",
+                 "return binding used wrong register");
+    ok &= expect((*returnBindings)[0].Param.Slot == 0,
+                 "return binding used wrong slot");
+    ok &= expect((*returnBindings)[0].ReturnStore == returnStore,
+                 "return binding used wrong store");
+    ok &= expect((*returnBindings)[0].ReturnValue ==
+                     returnStore->getValueOperand(),
+                 "return binding used wrong value");
+  }
+  ok &= expect(!notdec::bin2llvm::getNativePrototypeReturnBindings(
+                    *twoReturnFunction),
+               "duplicate return stores were incorrectly bound");
   ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 0, "RAX"),
                "recovered RAX return was not sorted before RDX");
   ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 1, "RDX"),
