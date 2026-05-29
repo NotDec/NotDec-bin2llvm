@@ -35,6 +35,20 @@ struct NativeParamActive {
   std::vector<NativeParamTrial> Trials;
 };
 
+// Minimal native copy of Ghidra FuncProto's recovered storage list.  This does
+// not rewrite LLVM function types yet; it records the ordered storage chosen
+// from input/output trials so the later signature rewrite has one stable source.
+struct NativeRecoveredPrototypeParam {
+  std::string RegisterName;
+  uint64_t Slot = 0;
+};
+
+struct NativeRecoveredPrototype {
+  std::string ModelName;
+  std::vector<NativeRecoveredPrototypeParam> Inputs;
+  std::vector<NativeRecoveredPrototypeParam> Returns;
+};
+
 struct NativePrototypeRecoveryFunctionSummary {
   std::string FunctionName;
   uint64_t ExternalInputsSeen = 0;

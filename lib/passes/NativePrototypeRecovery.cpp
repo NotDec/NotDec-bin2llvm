@@ -52,6 +52,52 @@ llvm::MDNode *inputCandidateMetadata(llvm::LLVMContext &context,
   return llvm::MDNode::get(context, entries);
 }
 
+std::vector<NativeRecoveredPrototypeParam> recoveredParams(
+    const NativeParamActive &active) {
+  std::vector<NativeRecoveredPrototypeParam> params;
+  for (const NativeParamTrial &trial : active.Trials) {
+    NativeRecoveredPrototypeParam param;
+    param.RegisterName = trial.RegisterName;
+    param.Slot = trial.Slot;
+    params.push_back(std::move(param));
+  }
+  return params;
+}
+
+llvm::MDNode *recoveredParamListMetadata(
+    llvm::LLVMContext &context,
+    const std::vector<NativeRecoveredPrototypeParam> &params) {
+  std::vector<llvm::Metadata *> entries;
+  for (const NativeRecoveredPrototypeParam &param : params) {
+    std::vector<llvm::Metadata *> fields = {
+        llvm::MDString::get(context, "name=" + param.RegisterName),
+        llvm::MDString::get(context, "slot=" + std::to_string(param.Slot)),
+    };
+    entries.push_back(llvm::MDNode::get(context, fields));
+  }
+  return llvm::MDNode::get(context, entries);
+}
+
+llvm::MDNode *recoveredPrototypeMetadata(
+    llvm::LLVMContext &context, const NativeRecoveredPrototype &prototype) {
+  if (prototype.Inputs.empty() && prototype.Returns.empty()) {
+    return nullptr;
+  }
+
+  std::vector<llvm::Metadata *> fields = {
+      llvm::MDString::get(context, "model=" + prototype.ModelName),
+      llvm::MDString::get(context,
+                          "input_count=" +
+                              std::to_string(prototype.Inputs.size())),
+      llvm::MDString::get(context,
+                          "return_count=" +
+                              std::to_string(prototype.Returns.size())),
+      recoveredParamListMetadata(context, prototype.Inputs),
+      recoveredParamListMetadata(context, prototype.Returns),
+  };
+  return llvm::MDNode::get(context, fields);
+}
+
 std::optional<std::string> returnValueKey(llvm::Value &value) {
   if (auto *constantInt = llvm::dyn_cast<llvm::ConstantInt>(&value)) {
     llvm::SmallString<32> text;
@@ -295,6 +341,16 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
       function.setMetadata("notdec.prototype.return_candidates", node);
     } else {
       function.setMetadata("notdec.prototype.return_candidates", nullptr);
+    }
+    NativeRecoveredPrototype recovered;
+    recovered.ModelName = abi->PrototypeName;
+    recovered.Inputs = recoveredParams(active);
+    recovered.Returns = recoveredParams(returns);
+    if (llvm::MDNode *node =
+            recoveredPrototypeMetadata(module.getContext(), recovered)) {
+      function.setMetadata("notdec.prototype.recovered", node);
+    } else {
+      function.setMetadata("notdec.prototype.recovered", nullptr);
     }
     addFunctionSummary(summary, functionSummary);
   }

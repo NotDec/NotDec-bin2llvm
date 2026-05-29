@@ -369,6 +369,45 @@ uint64_t countMetadataRegister(const llvm::Function &function,
   return count;
 }
 
+bool recoveredHasField(const llvm::Function &function, llvm::StringRef field) {
+  llvm::MDNode *node = function.getMetadata("notdec.prototype.recovered");
+  if (node == nullptr) {
+    return false;
+  }
+  for (const llvm::MDOperand &operand : node->operands()) {
+    auto *metadata = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+    if (metadata != nullptr && metadata->getString() == field) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool recoveredRegisterAt(const llvm::Function &function, uint64_t listIndex,
+                         uint64_t paramIndex, llvm::StringRef name) {
+  llvm::MDNode *node = function.getMetadata("notdec.prototype.recovered");
+  if (node == nullptr || listIndex >= node->getNumOperands()) {
+    return false;
+  }
+  auto *list = llvm::dyn_cast_or_null<llvm::MDNode>(node->getOperand(listIndex));
+  if (list == nullptr || paramIndex >= list->getNumOperands()) {
+    return false;
+  }
+  auto *param = llvm::dyn_cast_or_null<llvm::MDNode>(list->getOperand(paramIndex));
+  if (param == nullptr) {
+    return false;
+  }
+
+  std::string prefix = ("name=" + name).str();
+  for (const llvm::MDOperand &fieldOperand : param->operands()) {
+    auto *field = llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+    if (field != nullptr && field->getString() == prefix) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool expect(bool condition, const std::string &message) {
   if (condition) {
     return true;
@@ -492,5 +531,26 @@ int main() {
                                   "notdec.prototype.return_candidates", 1,
                                   "RDX"),
                "RDX return candidate was not sorted after RAX");
+  ok &= expect(recoveredHasField(*inputFunction, "model=__stdcall"),
+               "recovered prototype model was not written");
+  ok &= expect(recoveredHasField(*inputFunction, "input_count=1"),
+               "recovered prototype input count was not written");
+  ok &= expect(recoveredHasField(*inputFunction, "return_count=0"),
+               "recovered prototype return count was not written");
+  ok &= expect(recoveredRegisterAt(*inputFunction, 3, 0, "RDI"),
+               "recovered prototype input register was not written");
+  ok &= expect(recoveredHasField(*returnFunction, "input_count=0"),
+               "return-only recovered prototype input count was not written");
+  ok &= expect(recoveredHasField(*returnFunction, "return_count=1"),
+               "return-only recovered prototype return count was not written");
+  ok &= expect(recoveredRegisterAt(*returnFunction, 4, 0, "RAX"),
+               "recovered prototype return register was not written");
+  ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 0, "RAX"),
+               "recovered RAX return was not sorted before RDX");
+  ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 1, "RDX"),
+               "recovered RDX return was not sorted after RAX");
+  ok &= expect(unusedInputFunction->getMetadata("notdec.prototype.recovered") ==
+                   nullptr,
+               "empty recovered prototype metadata was not cleared");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
