@@ -215,6 +215,9 @@
   - [x] 添加 return-only 多返回 direct callsite 的 struct result extract 重写。
     - 记录：`06-pass-pipeline-and-verification/20260529-28-multi-return-direct-callsite-rewrite.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 添加单 input + 多返回 direct callsite 的参数和 struct result extract 重写。
+    - 记录：`06-pass-pipeline-and-verification/20260529-29-input-multi-return-direct-callsite-rewrite.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

@@ -318,6 +318,20 @@ struct MultiReturnCallsiteCollectionResult {
   std::string FailureReason;
 };
 
+// Combined callsite rewrite for the first input + multi-return shape.  It keeps
+// the argument value and old return loads together because the old void call is
+// replaced by one typed call.
+struct InputMultiReturnCallsiteRewrite {
+  llvm::CallInst *Call = nullptr;
+  llvm::Value *Argument = nullptr;
+  std::vector<llvm::LoadInst *> ReturnLoads;
+};
+
+struct InputMultiReturnCallsiteCollectionResult {
+  std::vector<InputMultiReturnCallsiteRewrite> Rewrites;
+  std::string FailureReason;
+};
+
 ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
     llvm::BasicBlock::iterator iter, llvm::BasicBlock::iterator end,
     llvm::StringRef returnRegisterName) {
@@ -494,6 +508,68 @@ void rewriteMultiReturnDirectCallsites(
     llvm::IRBuilder<> builder(callsite.Call);
     llvm::CallInst *newCall =
         builder.CreateCall(rewritten.getFunctionType(), &rewritten, {});
+    newCall->setCallingConv(callsite.Call->getCallingConv());
+    for (uint64_t index = 0; index < callsite.ReturnLoads.size(); ++index) {
+      llvm::LoadInst *load = callsite.ReturnLoads[index];
+      llvm::Value *field =
+          builder.CreateExtractValue(newCall, {static_cast<unsigned>(index)});
+      load->replaceAllUsesWith(field);
+      if (load->use_empty()) {
+        load->eraseFromParent();
+      }
+    }
+    callsite.Call->eraseFromParent();
+  }
+}
+
+InputMultiReturnCallsiteCollectionResult
+collectInputMultiReturnDirectCallsites(
+    llvm::Function &function, const NativeRecoveredPrototypeParam &input,
+    llvm::Type *paramType,
+    llvm::ArrayRef<NativeRecoveredPrototypeParam> returns,
+    llvm::StructType &returnType) {
+  InputMultiReturnCallsiteCollectionResult result;
+  for (llvm::User *user : function.users()) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+    if (call == nullptr || call->getCalledFunction() != &function ||
+        call->arg_size() != 0 || !call->getType()->isVoidTy()) {
+      result.FailureReason = "function has uses";
+      return result;
+    }
+
+    std::optional<llvm::Value *> argument =
+        callsiteInputValueBeforeCall(*call, input.RegisterName, paramType);
+    if (!argument) {
+      result.FailureReason = "unsafe callsite input value";
+      return result;
+    }
+
+    InputMultiReturnCallsiteRewrite rewrite;
+    rewrite.Call = call;
+    rewrite.Argument = *argument;
+    rewrite.ReturnLoads.reserve(returns.size());
+    for (uint64_t index = 0; index < returns.size(); ++index) {
+      ReturnLoadSearchResult loadResult =
+          findCallsiteReturnLoad(*call, returns[index].RegisterName);
+      if (loadResult.Blocked || loadResult.Load == nullptr ||
+          loadResult.Load->getType() != returnType.getElementType(index)) {
+        result.FailureReason = "unsafe callsite return load";
+        return result;
+      }
+      rewrite.ReturnLoads.push_back(loadResult.Load);
+    }
+    result.Rewrites.push_back(std::move(rewrite));
+  }
+  return result;
+}
+
+void rewriteInputMultiReturnDirectCallsites(
+    llvm::Function &rewritten,
+    llvm::ArrayRef<InputMultiReturnCallsiteRewrite> callsites) {
+  for (const InputMultiReturnCallsiteRewrite &callsite : callsites) {
+    llvm::IRBuilder<> builder(callsite.Call);
+    llvm::CallInst *newCall = builder.CreateCall(
+        rewritten.getFunctionType(), &rewritten, {callsite.Argument});
     newCall->setCallingConv(callsite.Call->getCallingConv());
     for (uint64_t index = 0; index < callsite.ReturnLoads.size(); ++index) {
       llvm::LoadInst *load = callsite.ReturnLoads[index];
@@ -1334,6 +1410,130 @@ rewriteNativeRecoveredPrototypeMultiReturn(llvm::Function &function) {
 }
 
 NativePrototypeRewriteResult
+rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
+  NativePrototypeRewriteResult result;
+  result.Function = &function;
+  if (function.getFunctionType()->getNumParams() != 0 ||
+      !function.getReturnType()->isVoidTy()) {
+    result.Reason = "original function is not void()";
+    return result;
+  }
+
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(function);
+  if (!prototype) {
+    result.Reason = "missing recovered prototype";
+    return result;
+  }
+  if (prototype->Inputs.size() != 1 || prototype->Returns.size() <= 1) {
+    result.Reason = "not input multi-return prototype";
+    return result;
+  }
+  std::optional<llvm::FunctionType *> recoveredType =
+      buildNativeRecoveredPrototypeFunctionType(function.getContext(),
+                                               *prototype);
+  auto *returnStruct =
+      recoveredType
+          ? llvm::dyn_cast<llvm::StructType>((*recoveredType)->getReturnType())
+          : nullptr;
+  if (!recoveredType || (*recoveredType)->getNumParams() != 1 ||
+      !(*recoveredType)->getParamType(0)->isIntegerTy(64) ||
+      returnStruct == nullptr ||
+      returnStruct->getNumElements() != prototype->Returns.size()) {
+    result.Reason = "unsupported recovered prototype type";
+    return result;
+  }
+
+  std::optional<std::vector<NativePrototypeInputBinding>> inputBindings =
+      getNativePrototypeInputBindings(function);
+  if (!inputBindings || inputBindings->size() != 1) {
+    result.Reason = "missing input binding";
+    return result;
+  }
+  llvm::LoadInst *inputLoad = (*inputBindings)[0].ExternalInputLoad;
+  if (inputLoad == nullptr ||
+      inputLoad->getType() != (*recoveredType)->getParamType(0)) {
+    result.Reason = "input load type mismatch";
+    return result;
+  }
+
+  std::optional<std::vector<NativePrototypeReturnBinding>> returnBindings =
+      getNativePrototypeReturnBindings(function);
+  if (!returnBindings || returnBindings->size() != prototype->Returns.size()) {
+    result.Reason = "missing return binding";
+    return result;
+  }
+  for (uint64_t index = 0; index < returnBindings->size(); ++index) {
+    llvm::Value *returnValue = (*returnBindings)[index].ReturnValue;
+    if (returnValue == nullptr ||
+        returnValue->getType() != returnStruct->getElementType(index)) {
+      result.Reason = "return value type mismatch";
+      return result;
+    }
+  }
+
+  std::optional<std::vector<InputMultiReturnCallsiteRewrite>> callsiteRewrites;
+  if (!function.use_empty()) {
+    InputMultiReturnCallsiteCollectionResult callsiteCollection =
+        collectInputMultiReturnDirectCallsites(
+            function, prototype->Inputs[0], (*recoveredType)->getParamType(0),
+            prototype->Returns, *returnStruct);
+    if (!callsiteCollection.FailureReason.empty()) {
+      result.Reason = callsiteCollection.FailureReason;
+      return result;
+    }
+    callsiteRewrites = std::move(callsiteCollection.Rewrites);
+  }
+
+  llvm::Module *module = function.getParent();
+  if (module == nullptr) {
+    result.Reason = "function has no module";
+    return result;
+  }
+
+  std::string originalName = function.getName().str();
+  function.setName(originalName + ".old");
+  llvm::Function *rewritten = llvm::Function::Create(
+      *recoveredType, function.getLinkage(), originalName, module);
+  rewritten->copyAttributesFrom(&function);
+  rewritten->copyMetadata(&function, 0);
+  rewritten->setCallingConv(function.getCallingConv());
+  rewritten->splice(rewritten->end(), &function);
+
+  llvm::Argument *argument = &*rewritten->arg_begin();
+  argument->setName(inputLoad->getName());
+  inputLoad->replaceAllUsesWith(argument);
+  if (inputLoad->use_empty()) {
+    inputLoad->eraseFromParent();
+  }
+
+  for (llvm::BasicBlock &block : *rewritten) {
+    auto *ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator());
+    if (ret == nullptr) {
+      continue;
+    }
+    llvm::IRBuilder<> builder(ret);
+    llvm::Value *aggregate = llvm::UndefValue::get(returnStruct);
+    for (uint64_t index = 0; index < returnBindings->size(); ++index) {
+      aggregate = builder.Insert(llvm::InsertValueInst::Create(
+          aggregate, (*returnBindings)[index].ReturnValue,
+          {static_cast<unsigned>(index)}));
+    }
+    builder.CreateRet(aggregate);
+    ret->eraseFromParent();
+  }
+  if (callsiteRewrites) {
+    rewriteInputMultiReturnDirectCallsites(*rewritten, *callsiteRewrites);
+  }
+
+  function.eraseFromParent();
+  result.Rewritten = true;
+  result.Reason = "rewritten";
+  result.Function = rewritten;
+  return result;
+}
+
+NativePrototypeRewriteResult
 rewriteNativeRecoveredPrototype(llvm::Function &function) {
   NativePrototypeRewriteResult result;
   result.Function = &function;
@@ -1356,6 +1556,9 @@ rewriteNativeRecoveredPrototype(llvm::Function &function) {
   }
   if (prototype->Inputs.empty() && prototype->Returns.size() > 1) {
     return rewriteNativeRecoveredPrototypeMultiReturn(function);
+  }
+  if (prototype->Inputs.size() == 1 && prototype->Returns.size() > 1) {
+    return rewriteNativeRecoveredPrototypeInputMultiReturn(function);
   }
 
   result.Reason = "unsupported recovered prototype shape";
