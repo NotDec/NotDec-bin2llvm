@@ -101,6 +101,19 @@ llvm::Function *createFunction(llvm::Module &module, const std::string &name) {
   return function;
 }
 
+llvm::Function *createFunctionWithType(llvm::Module &module,
+                                       const std::string &name,
+                                       llvm::FunctionType *funcType) {
+  llvm::LLVMContext &context = module.getContext();
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createUnusedExternalInputFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName) {
@@ -450,6 +463,13 @@ int main() {
   llvm::Function *inputFunction = createFunction(module, "input_rdi");
   attachExternalInputs(*inputFunction, {{"RDI", rdi}});
 
+  llvm::FunctionType *matchingInputType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *matchingInputFunction =
+      createFunctionWithType(module, "input_rdi_already_typed",
+                             matchingInputType);
+  attachExternalInputs(*matchingInputFunction, {{"RDI", rdi}});
+
   llvm::Function *reversedInputFunction =
       createFunction(module, "input_reversed");
   attachExternalInputs(*reversedInputFunction, {{"RSI", rdi}, {"RDI", rdi}});
@@ -494,10 +514,10 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 12, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 7,
+  ok &= expect(summary.FunctionsSeen == 13, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 8,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 4,
+  ok &= expect(summary.InputCandidates == 5,
                "unexpected input candidate count");
   ok &= expect(summary.ReturnCandidates == 5,
                "unexpected return candidate count");
@@ -580,7 +600,24 @@ int main() {
     ok &= expect(type.has_value() &&
                      functionTypeShape(**type, voidType, llvm::ArrayRef(i64)),
                  "recovered input prototype type was not void(i64)");
+    notdec::bin2llvm::NativePrototypeRewriteEligibility eligibility =
+        notdec::bin2llvm::getNativePrototypeRewriteEligibility(*inputFunction);
+    ok &= expect(eligibility.Eligible,
+                 "input prototype was not marked rewrite eligible");
+    ok &= expect(eligibility.NeedsRewrite,
+                 "input prototype did not request signature rewrite");
+    ok &= expect(eligibility.RecoveredType == *type,
+                 "input prototype rewrite type did not match recovered type");
   }
+  notdec::bin2llvm::NativePrototypeRewriteEligibility matchingEligibility =
+      notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+          *matchingInputFunction);
+  ok &= expect(matchingEligibility.Eligible,
+               "matching input prototype was not rewrite eligible");
+  ok &= expect(!matchingEligibility.NeedsRewrite,
+               "matching input prototype incorrectly requested rewrite");
+  ok &= expect(matchingEligibility.Reason == "already matches",
+               "matching input prototype had unexpected eligibility reason");
   ok &= expect(recoveredHasField(*returnFunction, "input_count=0"),
                "return-only recovered prototype input count was not written");
   ok &= expect(recoveredHasField(*returnFunction, "return_count=1"),
@@ -605,6 +642,14 @@ int main() {
     ok &= expect(type.has_value() &&
                      functionTypeShape(**type, i64, llvm::ArrayRef<llvm::Type *>{}),
                  "recovered return prototype type was not i64()");
+    notdec::bin2llvm::NativePrototypeRewriteEligibility eligibility =
+        notdec::bin2llvm::getNativePrototypeRewriteEligibility(*returnFunction);
+    ok &= expect(eligibility.Eligible,
+                 "return prototype was not marked rewrite eligible");
+    ok &= expect(eligibility.NeedsRewrite,
+                 "return prototype did not request signature rewrite");
+    ok &= expect(eligibility.RecoveredType == *type,
+                 "return prototype rewrite type did not match recovered type");
   }
   ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 0, "RAX"),
                "recovered RAX return was not sorted before RDX");
@@ -627,6 +672,13 @@ int main() {
     ok &= expect(!notdec::bin2llvm::buildNativeRecoveredPrototypeFunctionType(
                      context, *twoOutputPrototype),
                  "multi-return recovered prototype type was incorrectly built");
+    notdec::bin2llvm::NativePrototypeRewriteEligibility eligibility =
+        notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+            *twoOutputReturnFunction);
+    ok &= expect(!eligibility.Eligible,
+                 "multi-return prototype was incorrectly rewrite eligible");
+    ok &= expect(eligibility.Reason == "unsupported recovered prototype type",
+                 "multi-return prototype had unexpected ineligible reason");
   }
   ok &= expect(unusedInputFunction->getMetadata("notdec.prototype.recovered") ==
                    nullptr,
@@ -634,5 +686,12 @@ int main() {
   ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
                     *unusedInputFunction),
                "empty recovered prototype metadata was incorrectly read");
+  notdec::bin2llvm::NativePrototypeRewriteEligibility missingEligibility =
+      notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+          *unusedInputFunction);
+  ok &= expect(!missingEligibility.Eligible,
+               "missing recovered prototype was incorrectly rewrite eligible");
+  ok &= expect(missingEligibility.Reason == "missing recovered prototype",
+               "missing recovered prototype had unexpected ineligible reason");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -457,6 +457,40 @@ std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
   return llvm::FunctionType::get(returnType, paramTypes, false);
 }
 
+NativePrototypeRewriteEligibility
+getNativePrototypeRewriteEligibility(const llvm::Function &function) {
+  NativePrototypeRewriteEligibility result;
+  if (function.isDeclaration()) {
+    result.Reason = "declaration";
+    return result;
+  }
+  if (function.isVarArg()) {
+    result.Reason = "vararg function";
+    return result;
+  }
+
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(function);
+  if (!prototype) {
+    result.Reason = "missing recovered prototype";
+    return result;
+  }
+
+  std::optional<llvm::FunctionType *> recoveredType =
+      buildNativeRecoveredPrototypeFunctionType(function.getContext(),
+                                               *prototype);
+  if (!recoveredType) {
+    result.Reason = "unsupported recovered prototype type";
+    return result;
+  }
+
+  result.Eligible = true;
+  result.RecoveredType = *recoveredType;
+  result.NeedsRewrite = function.getFunctionType() != *recoveredType;
+  result.Reason = result.NeedsRewrite ? "needs rewrite" : "already matches";
+  return result;
+}
+
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os) {
   os << "native prototype recovery summary\n";

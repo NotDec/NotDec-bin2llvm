@@ -52,6 +52,16 @@ struct NativeRecoveredPrototype {
   std::vector<NativeRecoveredPrototypeParam> Returns;
 };
 
+// Gate before the later IR rewrite step.  It keeps the reason next to the
+// decision so tests and CLI reporting can distinguish "no prototype" from
+// "prototype exists but this native subset cannot rewrite it yet".
+struct NativePrototypeRewriteEligibility {
+  bool Eligible = false;
+  bool NeedsRewrite = false;
+  std::string Reason;
+  llvm::FunctionType *RecoveredType = nullptr;
+};
+
 struct NativePrototypeRecoveryFunctionSummary {
   std::string FunctionName;
   uint64_t ExternalInputsSeen = 0;
@@ -76,6 +86,9 @@ readNativeRecoveredPrototypeMetadata(const llvm::Function &function);
 
 std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
     llvm::LLVMContext &context, const NativeRecoveredPrototype &prototype);
+
+NativePrototypeRewriteEligibility
+getNativePrototypeRewriteEligibility(const llvm::Function &function);
 
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os);
