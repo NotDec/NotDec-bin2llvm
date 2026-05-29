@@ -135,6 +135,9 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function);
 NativePrototypeRewriteResult
 rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function);
 
+NativePrototypeRewriteResult
+rewriteNativeRecoveredPrototype(llvm::Function &function);
+
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os);
 

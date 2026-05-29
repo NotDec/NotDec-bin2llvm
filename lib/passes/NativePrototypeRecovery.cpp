@@ -867,6 +867,32 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
   return result;
 }
 
+NativePrototypeRewriteResult
+rewriteNativeRecoveredPrototype(llvm::Function &function) {
+  NativePrototypeRewriteResult result;
+  result.Function = &function;
+
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(function);
+  if (!prototype) {
+    result.Reason = "missing recovered prototype";
+    return result;
+  }
+
+  if (prototype->Inputs.empty() && prototype->Returns.size() == 1) {
+    return rewriteNativeRecoveredPrototypeReturnOnly(function);
+  }
+  if (prototype->Inputs.size() == 1 && prototype->Returns.empty()) {
+    return rewriteNativeRecoveredPrototypeInputOnly(function);
+  }
+  if (prototype->Inputs.size() == 1 && prototype->Returns.size() == 1) {
+    return rewriteNativeRecoveredPrototypeInputReturn(function);
+  }
+
+  result.Reason = "unsupported recovered prototype shape";
+  return result;
+}
+
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os) {
   os << "native prototype recovery summary\n";

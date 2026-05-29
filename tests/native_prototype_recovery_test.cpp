@@ -629,6 +629,19 @@ int main() {
       module, "input_rdi_return_rax", rdi, "RDI", rax, "RAX",
       &inputReturnLoad, &inputReturnStore);
   attachExternalInputs(*inputReturnFunction, {{"RDI", rdi}});
+  llvm::LoadInst *dispatchInputLoad = nullptr;
+  llvm::Function *dispatchInputFunction = createUsedExternalInputFunction(
+      module, "dispatch_input_rdi", rdi, "RDI", &dispatchInputLoad);
+  attachExternalInputs(*dispatchInputFunction, {{"RDI", rdi}});
+  llvm::StoreInst *dispatchReturnStore = nullptr;
+  llvm::Function *dispatchReturnFunction = createReturnStoreFunction(
+      module, "dispatch_return_rax", rax, "RAX", &dispatchReturnStore);
+  llvm::LoadInst *dispatchInputReturnLoad = nullptr;
+  llvm::StoreInst *dispatchInputReturnStore = nullptr;
+  llvm::Function *dispatchInputReturnFunction = createInputReturnFunction(
+      module, "dispatch_input_rdi_return_rax", rdi, "RDI", rax, "RAX",
+      &dispatchInputReturnLoad, &dispatchInputReturnStore);
+  attachExternalInputs(*dispatchInputReturnFunction, {{"RDI", rdi}});
 
   notdec::bin2llvm::NativePrototypeRecoveryOptions options;
   notdec::bin2llvm::NativePrototypeRecoverySummary summary =
@@ -640,16 +653,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 20, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 12,
+  ok &= expect(summary.FunctionsSeen == 23, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 14,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 9,
+  ok &= expect(summary.InputCandidates == 11,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 7,
+  ok &= expect(summary.ReturnCandidates == 9,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 12,
+  ok &= expect(summary.RewriteEligibleFunctions == 15,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 11,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 14,
                "unexpected signature rewrite needed function count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
@@ -949,6 +962,60 @@ int main() {
                "rewritten input-return function returned wrong value");
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after input-return rewrite\n";
+    return EXIT_FAILURE;
+  }
+  notdec::bin2llvm::NativePrototypeRewriteResult dispatchInputResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototype(*dispatchInputFunction);
+  ok &= expect(dispatchInputResult.Rewritten,
+               "dispatch input-only prototype was not rewritten");
+  dispatchInputFunction = dispatchInputResult.Function;
+  ok &= expect(dispatchInputFunction != nullptr &&
+                   functionTypeShape(*dispatchInputFunction->getFunctionType(),
+                                     llvm::Type::getVoidTy(context),
+                                     llvm::ArrayRef(i64Param)),
+               "dispatch input-only function type was not void(i64)");
+
+  notdec::bin2llvm::NativePrototypeRewriteResult dispatchReturnResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototype(*dispatchReturnFunction);
+  ok &= expect(dispatchReturnResult.Rewritten,
+               "dispatch return-only prototype was not rewritten");
+  dispatchReturnFunction = dispatchReturnResult.Function;
+  ok &= expect(dispatchReturnFunction != nullptr &&
+                   functionTypeShape(*dispatchReturnFunction->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef<llvm::Type *>{}),
+               "dispatch return-only function type was not i64()");
+
+  notdec::bin2llvm::NativePrototypeRewriteResult dispatchInputReturnResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+          *dispatchInputReturnFunction);
+  ok &= expect(dispatchInputReturnResult.Rewritten,
+               "dispatch input-return prototype was not rewritten");
+  dispatchInputReturnFunction = dispatchInputReturnResult.Function;
+  ok &= expect(dispatchInputReturnFunction != nullptr &&
+                   functionTypeShape(
+                       *dispatchInputReturnFunction->getFunctionType(),
+                       llvm::Type::getInt64Ty(context),
+                       llvm::ArrayRef(i64Param)),
+               "dispatch input-return function type was not i64(i64)");
+
+  notdec::bin2llvm::NativePrototypeRewriteResult dispatchMissingResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototype(*unusedInputFunction);
+  ok &= expect(!dispatchMissingResult.Rewritten,
+               "dispatch missing prototype was rewritten");
+  ok &= expect(dispatchMissingResult.Reason == "missing recovered prototype",
+               "dispatch missing prototype had unexpected reason");
+
+  notdec::bin2llvm::NativePrototypeRewriteResult dispatchUnsupportedResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+          *twoOutputReturnFunction);
+  ok &= expect(!dispatchUnsupportedResult.Rewritten,
+               "dispatch unsupported prototype was rewritten");
+  ok &= expect(dispatchUnsupportedResult.Reason ==
+                   "unsupported recovered prototype shape",
+               "dispatch unsupported prototype had unexpected reason");
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after dispatch rewrite\n";
     return EXIT_FAILURE;
   }
   ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 0, "RAX"),
