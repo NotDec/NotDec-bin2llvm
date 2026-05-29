@@ -20,7 +20,8 @@
     - 文件：`include/notdec-bin2llvm/NativePrototypeModel.h`、`lib/NativePrototypeModel.cpp`
   - [x] 添加 register storage 匹配测试。
     - 文件：`tests/native_prototype_model_test.cpp`
-  - [ ] 添加 stack storage 匹配测试。
+  - [x] 添加 stack storage 匹配测试。
+    - 记录：`02-prototype-storage-model/20260529-02-stack-param-storage-match.md`
 
 - [ ] 阶段 3: `03-function-register-effects`
   - [ ] 编写第一小步规划：基于 SSA 判断 ABI preserved register。

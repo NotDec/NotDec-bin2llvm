@@ -37,6 +37,10 @@ int main(int argc, char **argv) {
       model.findInputRegister("RDI");
   std::optional<notdec::bin2llvm::NativeStorageMatch> rax =
       model.findOutputRegister("RAX");
+  std::optional<notdec::bin2llvm::NativeStorageMatch> stack8 =
+      model.findInputStack("stack", 8, 8);
+  std::optional<notdec::bin2llvm::NativeStorageMatch> stack16 =
+      model.findInputStack("stack", 16, 8);
 
   bool ok = true;
   ok &= expect(rdi.has_value(), "RDI did not match input storage");
@@ -53,6 +57,15 @@ int main(int argc, char **argv) {
                    *abi, notdec::bin2llvm::NativeAbiEffectKind::Unaffected,
                    "RBX"),
                "RBX is not marked unaffected");
+  ok &= expect(stack8.has_value(), "stack offset 8 did not match input");
+  ok &= expect(stack8 && stack8->Slot == 14, "stack input slot changed");
+  ok &= expect(stack8 && stack8->Entry->Align == 8,
+               "stack input alignment changed");
+  ok &= expect(stack16.has_value(), "stack offset 16 did not match input");
+  ok &= expect(!model.findInputStack("stack", 9, 8).has_value(),
+               "unaligned stack offset unexpectedly matched input");
+  ok &= expect(!model.findInputStack("stack", 0, 8).has_value(),
+               "return address offset unexpectedly matched input");
 
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

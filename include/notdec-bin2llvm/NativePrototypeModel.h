@@ -27,11 +27,17 @@ public:
       const std::string &name) const;
   std::optional<NativeStorageMatch> findOutputRegister(
       const std::string &name) const;
+  std::optional<NativeStorageMatch> findInputStack(const std::string &space,
+                                                   uint64_t offset,
+                                                   uint32_t size) const;
 
 private:
   std::optional<NativeStorageMatch> findRegister(
       const std::vector<NativeAbiParamEntry> &entries,
       const std::string &name) const;
+  std::optional<NativeStorageMatch> findStack(
+      const std::vector<NativeAbiParamEntry> &entries,
+      const std::string &space, uint64_t offset, uint32_t size) const;
 
   const NativeAbiSpec &Abi;
 };
