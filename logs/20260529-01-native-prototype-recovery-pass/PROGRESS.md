@@ -185,6 +185,9 @@
   - [x] 添加 input-return 直接调用点返回值 load 重写。
     - 记录：`06-pass-pipeline-and-verification/20260529-20-input-return-callsite-result-load-rewrite.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 添加 callsite input 参数唯一前驱查找。
+    - 记录：`06-pass-pipeline-and-verification/20260529-21-callsite-input-unique-predecessor.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

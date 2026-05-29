@@ -199,10 +199,9 @@ std::optional<llvm::StoreInst *> uniqueRegisterAccessStore(
   return result;
 }
 
-std::optional<llvm::Value *> callsiteInputValueBeforeCall(
-    llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *paramType) {
-  llvm::BasicBlock::reverse_iterator iter(call.getIterator());
-  llvm::BasicBlock::reverse_iterator end = call.getParent()->rend();
+std::optional<llvm::Value *> registerStoreValueInReverseRange(
+    llvm::BasicBlock::reverse_iterator iter, llvm::BasicBlock::reverse_iterator end,
+    llvm::StringRef registerName, llvm::Type *valueType) {
   for (; iter != end; ++iter) {
     auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter);
     if (store == nullptr) {
@@ -217,12 +216,36 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
       continue;
     }
     llvm::Value *value = store->getValueOperand();
-    if (value == nullptr || value->getType() != paramType) {
+    if (value == nullptr || value->getType() != valueType) {
       return std::nullopt;
     }
     return value;
   }
   return std::nullopt;
+}
+
+std::optional<llvm::Value *> callsiteInputValueBeforeCall(
+    llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *paramType) {
+  std::optional<llvm::Value *> localValue = registerStoreValueInReverseRange(
+      llvm::BasicBlock::reverse_iterator(call.getIterator()),
+      call.getParent()->rend(), registerName, paramType);
+  if (localValue) {
+    return localValue;
+  }
+
+  llvm::BasicBlock *predecessor = nullptr;
+  for (llvm::BasicBlock *candidate : llvm::predecessors(call.getParent())) {
+    if (predecessor != nullptr) {
+      return std::nullopt;
+    }
+    predecessor = candidate;
+  }
+  if (predecessor == nullptr) {
+    return std::nullopt;
+  }
+  return registerStoreValueInReverseRange(predecessor->rbegin(),
+                                          predecessor->rend(), registerName,
+                                          paramType);
 }
 
 struct NativeInputOnlyCallsiteRewrite {
