@@ -116,6 +116,9 @@
   - [x] 扩展 instcombine 安全验证，覆盖多 return 返回候选 metadata。
     - 记录：`06-pass-pipeline-and-verification/20260529-10-instcombine-multireturn-prototype-safety.md`
     - 文件：`tests/native_instcombine_metadata_test.cpp`
+  - [x] 扩展 instcombine 安全验证，覆盖冲突 return 不误标返回候选。
+    - 记录：`06-pass-pipeline-and-verification/20260529-11-instcombine-conflicting-return-safety.md`
+    - 文件：`tests/native_instcombine_metadata_test.cpp`
   - [ ] Bench2 selected native 全量验证。
 
 ## 记录规则
