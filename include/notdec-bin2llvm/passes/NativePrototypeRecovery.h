@@ -6,6 +6,7 @@
 #include <vector>
 
 namespace llvm {
+class Function;
 class Module;
 class raw_ostream;
 } // namespace llvm
@@ -67,6 +68,9 @@ struct NativePrototypeRecoverySummary {
 NativePrototypeRecoverySummary
 runNativePrototypeRecovery(llvm::Module &module,
                            const NativePrototypeRecoveryOptions &options = {});
+
+std::optional<NativeRecoveredPrototype>
+readNativeRecoveredPrototypeMetadata(const llvm::Function &function);
 
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os);

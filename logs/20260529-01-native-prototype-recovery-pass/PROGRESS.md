@@ -80,6 +80,9 @@
   - [x] 将 input/return candidates 汇总成 `notdec.prototype.recovered` metadata。
     - 记录：`05-input-output-candidates/20260529-11-recovered-prototype-metadata.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] 添加 `notdec.prototype.recovered` metadata 读回 API。
+    - 记录：`05-input-output-candidates/20260529-12-read-recovered-prototype-metadata.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。

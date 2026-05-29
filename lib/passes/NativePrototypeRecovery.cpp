@@ -14,6 +14,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <exception>
 #include <map>
 #include <optional>
 #include <set>
@@ -229,6 +230,45 @@ void sortTrialsBySlot(NativeParamActive &active) {
                    });
 }
 
+std::optional<uint64_t> parseUint64Field(const llvm::MDNode &node,
+                                         llvm::StringRef key) {
+  std::optional<std::string> text = metadataField(node, key);
+  if (!text) {
+    return std::nullopt;
+  }
+  try {
+    size_t parsed = 0;
+    uint64_t value = std::stoull(*text, &parsed, 0);
+    if (parsed != text->size()) {
+      return std::nullopt;
+    }
+    return value;
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+}
+
+std::optional<std::vector<NativeRecoveredPrototypeParam>>
+readRecoveredParamList(const llvm::MDNode &node) {
+  std::vector<NativeRecoveredPrototypeParam> params;
+  for (const llvm::MDOperand &operand : node.operands()) {
+    auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (entry == nullptr) {
+      return std::nullopt;
+    }
+    std::optional<std::string> name = metadataField(*entry, "name");
+    std::optional<uint64_t> slot = parseUint64Field(*entry, "slot");
+    if (!name || !slot) {
+      return std::nullopt;
+    }
+    NativeRecoveredPrototypeParam param;
+    param.RegisterName = *name;
+    param.Slot = *slot;
+    params.push_back(std::move(param));
+  }
+  return params;
+}
+
 } // namespace
 
 NativePrototypeRecoverySummary runNativePrototypeRecovery(
@@ -359,6 +399,39 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     printNativePrototypeRecoverySummary(summary, llvm::errs());
   }
   return summary;
+}
+
+std::optional<NativeRecoveredPrototype>
+readNativeRecoveredPrototypeMetadata(const llvm::Function &function) {
+  llvm::MDNode *node = function.getMetadata("notdec.prototype.recovered");
+  if (node == nullptr || node->getNumOperands() < 5) {
+    return std::nullopt;
+  }
+
+  std::optional<std::string> model = metadataField(*node, "model");
+  if (!model) {
+    return std::nullopt;
+  }
+
+  auto *inputsNode = llvm::dyn_cast_or_null<llvm::MDNode>(node->getOperand(3));
+  auto *returnsNode = llvm::dyn_cast_or_null<llvm::MDNode>(node->getOperand(4));
+  if (inputsNode == nullptr || returnsNode == nullptr) {
+    return std::nullopt;
+  }
+
+  std::optional<std::vector<NativeRecoveredPrototypeParam>> inputs =
+      readRecoveredParamList(*inputsNode);
+  std::optional<std::vector<NativeRecoveredPrototypeParam>> returns =
+      readRecoveredParamList(*returnsNode);
+  if (!inputs || !returns) {
+    return std::nullopt;
+  }
+
+  NativeRecoveredPrototype prototype;
+  prototype.ModelName = *model;
+  prototype.Inputs = std::move(*inputs);
+  prototype.Returns = std::move(*returns);
+  return prototype;
 }
 
 void printNativePrototypeRecoverySummary(

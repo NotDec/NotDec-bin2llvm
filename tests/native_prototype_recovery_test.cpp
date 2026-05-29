@@ -408,6 +408,12 @@ bool recoveredRegisterAt(const llvm::Function &function, uint64_t listIndex,
   return false;
 }
 
+bool recoveredPrototypeParamAt(
+    const std::vector<notdec::bin2llvm::NativeRecoveredPrototypeParam> &params,
+    uint64_t index, llvm::StringRef name) {
+  return index < params.size() && params[index].RegisterName == name;
+}
+
 bool expect(bool condition, const std::string &message) {
   if (condition) {
     return true;
@@ -539,18 +545,62 @@ int main() {
                "recovered prototype return count was not written");
   ok &= expect(recoveredRegisterAt(*inputFunction, 3, 0, "RDI"),
                "recovered prototype input register was not written");
+  std::optional<notdec::bin2llvm::NativeRecoveredPrototype> inputPrototype =
+      notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(*inputFunction);
+  ok &= expect(inputPrototype.has_value(),
+               "recovered input prototype was not readable");
+  if (inputPrototype) {
+    ok &= expect(inputPrototype->ModelName == "__stdcall",
+                 "recovered input prototype model was not read");
+    ok &= expect(inputPrototype->Inputs.size() == 1,
+                 "recovered input prototype input count was not read");
+    ok &= expect(inputPrototype->Returns.empty(),
+                 "recovered input prototype return count was not read");
+    ok &= expect(recoveredPrototypeParamAt(inputPrototype->Inputs, 0, "RDI"),
+                 "recovered input prototype register was not read");
+  }
   ok &= expect(recoveredHasField(*returnFunction, "input_count=0"),
                "return-only recovered prototype input count was not written");
   ok &= expect(recoveredHasField(*returnFunction, "return_count=1"),
                "return-only recovered prototype return count was not written");
   ok &= expect(recoveredRegisterAt(*returnFunction, 4, 0, "RAX"),
                "recovered prototype return register was not written");
+  std::optional<notdec::bin2llvm::NativeRecoveredPrototype> returnPrototype =
+      notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(*returnFunction);
+  ok &= expect(returnPrototype.has_value(),
+               "recovered return prototype was not readable");
+  if (returnPrototype) {
+    ok &= expect(returnPrototype->Inputs.empty(),
+                 "recovered return prototype input count was not read");
+    ok &= expect(returnPrototype->Returns.size() == 1,
+                 "recovered return prototype return count was not read");
+    ok &= expect(recoveredPrototypeParamAt(returnPrototype->Returns, 0, "RAX"),
+                 "recovered return prototype register was not read");
+  }
   ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 0, "RAX"),
                "recovered RAX return was not sorted before RDX");
   ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 1, "RDX"),
                "recovered RDX return was not sorted after RAX");
+  std::optional<notdec::bin2llvm::NativeRecoveredPrototype> twoOutputPrototype =
+      notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+          *twoOutputReturnFunction);
+  ok &= expect(twoOutputPrototype.has_value(),
+               "recovered two-output prototype was not readable");
+  if (twoOutputPrototype) {
+    ok &= expect(twoOutputPrototype->Returns.size() == 2,
+                 "recovered two-output prototype return count was not read");
+    ok &= expect(
+        recoveredPrototypeParamAt(twoOutputPrototype->Returns, 0, "RAX"),
+        "recovered RAX return was not read before RDX");
+    ok &= expect(
+        recoveredPrototypeParamAt(twoOutputPrototype->Returns, 1, "RDX"),
+        "recovered RDX return was not read after RAX");
+  }
   ok &= expect(unusedInputFunction->getMetadata("notdec.prototype.recovered") ==
                    nullptr,
                "empty recovered prototype metadata was not cleared");
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *unusedInputFunction),
+               "empty recovered prototype metadata was incorrectly read");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
