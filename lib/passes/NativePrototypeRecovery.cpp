@@ -267,14 +267,43 @@ void rewriteInputOnlyDirectCallsites(
   }
 }
 
+void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,
+                               llvm::StringRef returnRegisterName) {
+  llvm::BasicBlock::iterator iter(oldCall.getIterator());
+  llvm::BasicBlock::iterator end = oldCall.getParent()->end();
+  for (++iter; iter != end; ++iter) {
+    auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter);
+    if (load == nullptr) {
+      continue;
+    }
+    llvm::MDNode *metadata = load->getMetadata("notdec.register.access");
+    if (metadata == nullptr) {
+      continue;
+    }
+    std::optional<std::string> name = metadataField(*metadata, "name");
+    if (!name || *name != returnRegisterName) {
+      continue;
+    }
+    if (load->getType() == newCall.getType()) {
+      load->replaceAllUsesWith(&newCall);
+      if (load->use_empty()) {
+        load->eraseFromParent();
+      }
+    }
+    break;
+  }
+}
+
 void rewriteInputReturnDirectCallsites(
     llvm::Function &rewritten,
-    llvm::ArrayRef<NativeInputOnlyCallsiteRewrite> callsites) {
+    llvm::ArrayRef<NativeInputOnlyCallsiteRewrite> callsites,
+    llvm::StringRef returnRegisterName) {
   for (const NativeInputOnlyCallsiteRewrite &callsite : callsites) {
     llvm::IRBuilder<> builder(callsite.Call);
     llvm::CallInst *newCall = builder.CreateCall(
         rewritten.getFunctionType(), &rewritten, {callsite.Argument});
     newCall->setCallingConv(callsite.Call->getCallingConv());
+    rewriteCallsiteReturnLoad(*callsite.Call, *newCall, returnRegisterName);
     callsite.Call->eraseFromParent();
   }
 }
@@ -301,29 +330,7 @@ void rewriteReturnOnlyDirectCallsites(llvm::Function &rewritten,
     llvm::CallInst *newCall =
         builder.CreateCall(rewritten.getFunctionType(), &rewritten, {});
     newCall->setCallingConv(callsite->getCallingConv());
-    llvm::BasicBlock::iterator iter(callsite->getIterator());
-    llvm::BasicBlock::iterator end = callsite->getParent()->end();
-    for (++iter; iter != end; ++iter) {
-      auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter);
-      if (load == nullptr) {
-        continue;
-      }
-      llvm::MDNode *metadata = load->getMetadata("notdec.register.access");
-      if (metadata == nullptr) {
-        continue;
-      }
-      std::optional<std::string> name = metadataField(*metadata, "name");
-      if (!name || *name != returnRegisterName) {
-        continue;
-      }
-      if (load->getType() == newCall->getType()) {
-        load->replaceAllUsesWith(newCall);
-        if (load->use_empty()) {
-          load->eraseFromParent();
-        }
-      }
-      break;
-    }
+    rewriteCallsiteReturnLoad(*callsite, *newCall, returnRegisterName);
     callsite->eraseFromParent();
   }
 }
@@ -1025,7 +1032,8 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
     ret->eraseFromParent();
   }
   if (callsiteRewrites) {
-    rewriteInputReturnDirectCallsites(*rewritten, *callsiteRewrites);
+    rewriteInputReturnDirectCallsites(*rewritten, *callsiteRewrites,
+                                      prototype->Returns[0].RegisterName);
   }
 
   function.eraseFromParent();

@@ -177,6 +177,34 @@ llvm::Function *createInputStoreCallerFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createInputStoreReturnLoadCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *input, const std::string &inputRegisterName,
+    llvm::GlobalVariable *output, const std::string &outputRegisterName,
+    llvm::CallInst **callOut, llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *argument = llvm::ConstantInt::get(input->getValueType(), 0x4567);
+  llvm::StoreInst *store = builder.CreateStore(argument, input);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, inputRegisterName));
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            outputRegisterName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, outputRegisterName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *callOut = call;
+  *loadOut = load;
+  return function;
+}
+
 llvm::Function *createUnusedExternalInputFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName) {
@@ -1164,10 +1192,12 @@ int main() {
   attachExternalInputs(*callsiteInputReturnFunction,
                        {{"RDI", inputReturnCallsiteRdi}});
   llvm::CallInst *oldInputReturnCallsiteCall = nullptr;
-  createInputStoreCallerFunction(
+  llvm::LoadInst *oldInputReturnCallsiteLoad = nullptr;
+  createInputStoreReturnLoadCallerFunction(
       inputReturnCallsiteModule, "call_callsite_input_rdi_return_rax",
       callsiteInputReturnFunction, inputReturnCallsiteRdi, "RDI",
-      &oldInputReturnCallsiteCall);
+      inputReturnCallsiteRax, "RAX", &oldInputReturnCallsiteCall,
+      &oldInputReturnCallsiteLoad);
   notdec::bin2llvm::runNativePrototypeRecovery(inputReturnCallsiteModule,
                                                options);
   notdec::bin2llvm::NativePrototypeRewriteResult
@@ -1210,6 +1240,23 @@ int main() {
                    rewrittenInputReturnCallsiteCall->getType() ==
                        llvm::Type::getInt64Ty(context),
                "input-return direct callsite did not return i64");
+  bool sawOldInputReturnCallsiteLoad = false;
+  if (inputReturnCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *inputReturnCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+        if (load != nullptr &&
+            load->getMetadata("notdec.register.access") != nullptr) {
+          sawOldInputReturnCallsiteLoad = true;
+        }
+      }
+    }
+  }
+  ok &= expect(!sawOldInputReturnCallsiteLoad,
+               "input-return direct callsite kept old return register load");
+  ok &= expect(rewrittenInputReturnCallsiteCall != nullptr &&
+                   !rewrittenInputReturnCallsiteCall->use_empty(),
+               "input-return direct callsite result was not used");
   if (llvm::verifyModule(inputReturnCallsiteModule, &llvm::errs())) {
     std::cerr
         << "callsite module verification failed after input-return rewrite\n";
