@@ -71,6 +71,14 @@ void attachTestAbi(llvm::Module &module) {
   output.Storage.Name = "RAX";
   abi.Outputs.push_back(std::move(output));
 
+  notdec::bin2llvm::NativeAbiParamEntry secondOutput;
+  secondOutput.MinSize = 1;
+  secondOutput.MaxSize = 8;
+  secondOutput.Align = 8;
+  secondOutput.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  secondOutput.Storage.Name = "RDX";
+  abi.Outputs.push_back(std::move(secondOutput));
+
   notdec::bin2llvm::NativeAbiEffect unaffected;
   unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
   unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
@@ -254,6 +262,31 @@ llvm::Function *createConflictingReturnStoreFunction(
   return function;
 }
 
+llvm::Function *createTwoOutputReturnStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *first,
+    const std::string &firstRegisterName, llvm::GlobalVariable *second,
+    const std::string &secondRegisterName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  llvm::StoreInst *firstStore = builder.CreateStore(
+      llvm::ConstantInt::get(first->getValueType(), 0x7777), first);
+  firstStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, firstRegisterName));
+
+  llvm::StoreInst *secondStore = builder.CreateStore(
+      llvm::ConstantInt::get(second->getValueType(), 0x8888), second);
+  secondStore->setMetadata("notdec.register.access",
+                           registerAccessMetadata(context, secondRegisterName));
+  builder.CreateRetVoid();
+  return function;
+}
+
 void attachExternalInputs(llvm::Function &function,
                           llvm::ArrayRef<std::pair<std::string,
                                                    llvm::GlobalVariable *>>
@@ -352,6 +385,7 @@ int main() {
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
   llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
   attachTestAbi(module);
 
   llvm::Function *inputFunction = createFunction(module, "input_rdi");
@@ -383,6 +417,9 @@ int main() {
   llvm::Function *conflictingReturnFunction =
       createConflictingReturnStoreFunction(module, "return_rax_conflict", rax,
                                            "RAX");
+  llvm::Function *twoOutputReturnFunction =
+      createTwoOutputReturnStoreFunction(module, "return_rdx_rax_order", rdx,
+                                         "RDX", rax, "RAX");
 
   notdec::bin2llvm::NativePrototypeRecoveryOptions options;
   notdec::bin2llvm::NativePrototypeRecoverySummary summary =
@@ -394,12 +431,12 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 10, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 11, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 5,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 3,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 3,
+  ok &= expect(summary.ReturnCandidates == 5,
                "unexpected return candidate count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
@@ -439,5 +476,13 @@ int main() {
                                     "notdec.prototype.return_candidates",
                                     "RAX"),
                "conflicting RAX return was incorrectly marked as a candidate");
+  ok &= expect(metadataRegisterAt(*twoOutputReturnFunction,
+                                  "notdec.prototype.return_candidates", 0,
+                                  "RAX"),
+               "RAX return candidate was not sorted before RDX");
+  ok &= expect(metadataRegisterAt(*twoOutputReturnFunction,
+                                  "notdec.prototype.return_candidates", 1,
+                                  "RDX"),
+               "RDX return candidate was not sorted after RAX");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

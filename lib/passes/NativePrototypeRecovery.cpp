@@ -90,8 +90,10 @@ bool hasActiveExternalInputUse(llvm::Function &function,
   return !sawExternalInputLoad;
 }
 
-std::optional<NativeParamTrial> returnTrialBeforeInstruction(
+std::vector<NativeParamTrial> returnTrialsBeforeInstruction(
     llvm::Instruction &instruction, const NativePrototypeModel &model) {
+  std::vector<NativeParamTrial> trials;
+  std::set<uint64_t> seenSlots;
   llvm::BasicBlock::reverse_iterator iter(instruction.getIterator());
   llvm::BasicBlock::reverse_iterator end = instruction.getParent()->rend();
   for (; iter != end; ++iter) {
@@ -112,15 +114,18 @@ std::optional<NativeParamTrial> returnTrialBeforeInstruction(
     if (!match) {
       continue;
     }
+    if (!seenSlots.insert(match->Slot).second) {
+      continue;
+    }
 
     NativeParamTrial trial;
     trial.RegisterName = *name;
     trial.Slot = match->Slot;
     trial.ValueKey = returnValueKey(*store->getValueOperand());
     trial.Active = true;
-    return trial;
+    trials.push_back(std::move(trial));
   }
-  return std::nullopt;
+  return trials;
 }
 
 llvm::BasicBlock *uniquePredecessor(llvm::BasicBlock &block) {
@@ -134,22 +139,22 @@ llvm::BasicBlock *uniquePredecessor(llvm::BasicBlock &block) {
   return result;
 }
 
-std::optional<NativeParamTrial> returnTrialBefore(
+std::vector<NativeParamTrial> returnTrialsBefore(
     llvm::ReturnInst &ret, const NativePrototypeModel &model) {
-  if (std::optional<NativeParamTrial> trial =
-          returnTrialBeforeInstruction(ret, model)) {
-    return trial;
+  std::vector<NativeParamTrial> trials = returnTrialsBeforeInstruction(ret, model);
+  if (!trials.empty()) {
+    return trials;
   }
 
   llvm::BasicBlock *predecessor = uniquePredecessor(*ret.getParent());
   if (predecessor == nullptr) {
-    return std::nullopt;
+    return {};
   }
   llvm::Instruction *terminator = predecessor->getTerminator();
   if (terminator == nullptr) {
-    return std::nullopt;
+    return {};
   }
-  return returnTrialBeforeInstruction(*terminator, model);
+  return returnTrialsBeforeInstruction(*terminator, model);
 }
 
 void addFunctionSummary(NativePrototypeRecoverySummary &total,
@@ -244,19 +249,18 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     for (llvm::BasicBlock &block : function) {
       if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator())) {
         ++returnCount;
-        if (std::optional<NativeParamTrial> trial =
-                returnTrialBefore(*ret, model)) {
-          uint64_t slot = trial->Slot;
+        for (NativeParamTrial &trial : returnTrialsBefore(*ret, model)) {
+          uint64_t slot = trial.Slot;
           ++returnSlotCounts[slot];
-          if (trial->ValueKey) {
+          if (trial.ValueKey) {
             ++returnSlotKeyCounts[slot];
             auto [iter, inserted] =
-                returnSlotFirstKey.try_emplace(slot, *trial->ValueKey);
-            if (!inserted && iter->second != *trial->ValueKey) {
+                returnSlotFirstKey.try_emplace(slot, *trial.ValueKey);
+            if (!inserted && iter->second != *trial.ValueKey) {
               returnSlotKeyConflicts.insert(slot);
             }
           }
-          returnTrialsBySlot.try_emplace(slot, std::move(*trial));
+          returnTrialsBySlot.try_emplace(slot, std::move(trial));
         }
       }
     }
@@ -272,6 +276,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
       addUniqueTrialBySlot(returns, returnSlots,
                            std::move(returnTrialsBySlot[slot]));
     }
+    sortTrialsBySlot(returns);
 
     functionSummary.InputCandidates = active.Trials.size();
     functionSummary.ReturnCandidates = returns.Trials.size();
