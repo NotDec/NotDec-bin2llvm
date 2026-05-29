@@ -227,6 +227,31 @@ llvm::Function *createReturnStoreFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createInputReturnFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *input,
+    const std::string &inputRegisterName, llvm::GlobalVariable *output,
+    const std::string &outputRegisterName, llvm::LoadInst **inputLoad,
+    llvm::StoreInst **returnStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *load =
+      createExternalInputLoad(builder, input, inputRegisterName);
+  llvm::Value *value =
+      builder.CreateAdd(load, llvm::ConstantInt::get(input->getValueType(), 7));
+  llvm::StoreInst *store = builder.CreateStore(value, output);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, outputRegisterName));
+  builder.CreateRetVoid();
+  *inputLoad = load;
+  *returnStore = store;
+  return function;
+}
+
 llvm::Function *createTwoReturnStoreFunction(llvm::Module &module,
                                              const std::string &name,
                                              llvm::GlobalVariable *global,
@@ -598,6 +623,12 @@ int main() {
   llvm::Function *twoOutputReturnFunction =
       createTwoOutputReturnStoreFunction(module, "return_rdx_rax_order", rdx,
                                          "RDX", rax, "RAX");
+  llvm::LoadInst *inputReturnLoad = nullptr;
+  llvm::StoreInst *inputReturnStore = nullptr;
+  llvm::Function *inputReturnFunction = createInputReturnFunction(
+      module, "input_rdi_return_rax", rdi, "RDI", rax, "RAX",
+      &inputReturnLoad, &inputReturnStore);
+  attachExternalInputs(*inputReturnFunction, {{"RDI", rdi}});
 
   notdec::bin2llvm::NativePrototypeRecoveryOptions options;
   notdec::bin2llvm::NativePrototypeRecoverySummary summary =
@@ -609,16 +640,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 19, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 11,
+  ok &= expect(summary.FunctionsSeen == 20, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 12,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 8,
+  ok &= expect(summary.InputCandidates == 9,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 6,
+  ok &= expect(summary.ReturnCandidates == 7,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 11,
+  ok &= expect(summary.RewriteEligibleFunctions == 12,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 10,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 11,
                "unexpected signature rewrite needed function count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
@@ -869,6 +900,55 @@ int main() {
                "rewritten return-only function returned wrong value");
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after return-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+  llvm::Instruction *inputReturnUser =
+      llvm::dyn_cast<llvm::Instruction>(*inputReturnLoad->user_begin());
+  llvm::Value *inputReturnValue = inputReturnStore->getValueOperand();
+  notdec::bin2llvm::NativePrototypeRewriteResult inputReturnRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputReturn(
+          *inputReturnFunction);
+  ok &= expect(inputReturnRewriteResult.Rewritten,
+               "input-return prototype was not rewritten");
+  inputReturnFunction = inputReturnRewriteResult.Function;
+  ok &= expect(inputReturnFunction != nullptr &&
+                   functionTypeShape(*inputReturnFunction->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef(i64Param)),
+               "rewritten input-return function type was not i64(i64)");
+  ok &= expect(inputReturnFunction != nullptr &&
+                   !inputReturnFunction->arg_empty() &&
+                   inputReturnUser != nullptr &&
+                   inputReturnUser->getOperand(0) ==
+                       &*inputReturnFunction->arg_begin(),
+               "rewritten input-return function did not use new argument");
+  llvm::ReturnInst *rewrittenInputReturnRet = nullptr;
+  bool sawInputReturnLoadAfterRewrite = false;
+  if (inputReturnFunction != nullptr) {
+    for (llvm::BasicBlock &block : *inputReturnFunction) {
+      if (auto *ret =
+              llvm::dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator())) {
+        rewrittenInputReturnRet = ret;
+      }
+      for (llvm::Instruction &instruction : block) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+        if (load != nullptr &&
+            load->getMetadata("notdec.register.external_input") != nullptr) {
+          sawInputReturnLoadAfterRewrite = true;
+        }
+      }
+    }
+  }
+  ok &= expect(!sawInputReturnLoadAfterRewrite,
+               "rewritten input-return function kept old input load");
+  ok &= expect(rewrittenInputReturnRet != nullptr,
+               "rewritten input-return function had no return instruction");
+  ok &= expect(rewrittenInputReturnRet != nullptr &&
+                   rewrittenInputReturnRet->getReturnValue() ==
+                       inputReturnValue,
+               "rewritten input-return function returned wrong value");
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after input-return rewrite\n";
     return EXIT_FAILURE;
   }
   ok &= expect(recoveredRegisterAt(*twoOutputReturnFunction, 4, 0, "RAX"),
