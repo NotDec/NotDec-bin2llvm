@@ -690,6 +690,83 @@ rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
   return result;
 }
 
+NativePrototypeRewriteResult
+rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
+  NativePrototypeRewriteResult result;
+  result.Function = &function;
+  if (!function.use_empty()) {
+    result.Reason = "function has uses";
+    return result;
+  }
+  if (function.getFunctionType()->getNumParams() != 0 ||
+      !function.getReturnType()->isVoidTy()) {
+    result.Reason = "original function is not void()";
+    return result;
+  }
+
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(function);
+  if (!prototype) {
+    result.Reason = "missing recovered prototype";
+    return result;
+  }
+  if (prototype->Inputs.size() != 1 || !prototype->Returns.empty()) {
+    result.Reason = "not input-only prototype";
+    return result;
+  }
+
+  std::optional<llvm::FunctionType *> recoveredType =
+      buildNativeRecoveredPrototypeFunctionType(function.getContext(),
+                                               *prototype);
+  if (!recoveredType || (*recoveredType)->getNumParams() != 1 ||
+      !(*recoveredType)->getReturnType()->isVoidTy() ||
+      !(*recoveredType)->getParamType(0)->isIntegerTy(64)) {
+    result.Reason = "unsupported recovered prototype type";
+    return result;
+  }
+
+  std::optional<std::vector<NativePrototypeInputBinding>> inputBindings =
+      getNativePrototypeInputBindings(function);
+  if (!inputBindings || inputBindings->size() != 1) {
+    result.Reason = "missing input binding";
+    return result;
+  }
+  llvm::LoadInst *inputLoad = (*inputBindings)[0].ExternalInputLoad;
+  if (inputLoad == nullptr ||
+      inputLoad->getType() != (*recoveredType)->getParamType(0)) {
+    result.Reason = "input load type mismatch";
+    return result;
+  }
+
+  llvm::Module *module = function.getParent();
+  if (module == nullptr) {
+    result.Reason = "function has no module";
+    return result;
+  }
+
+  std::string originalName = function.getName().str();
+  function.setName(originalName + ".old");
+  llvm::Function *rewritten = llvm::Function::Create(
+      *recoveredType, function.getLinkage(), originalName, module);
+  rewritten->copyAttributesFrom(&function);
+  rewritten->copyMetadata(&function, 0);
+  rewritten->setCallingConv(function.getCallingConv());
+  rewritten->splice(rewritten->end(), &function);
+
+  llvm::Argument *argument = &*rewritten->arg_begin();
+  argument->setName(inputLoad->getName());
+  inputLoad->replaceAllUsesWith(argument);
+  if (inputLoad->use_empty()) {
+    inputLoad->eraseFromParent();
+  }
+
+  function.eraseFromParent();
+  result.Rewritten = true;
+  result.Reason = "rewritten";
+  result.Function = rewritten;
+  return result;
+}
+
 void printNativePrototypeRecoverySummary(
     const NativePrototypeRecoverySummary &summary, llvm::raw_ostream &os) {
   os << "native prototype recovery summary\n";

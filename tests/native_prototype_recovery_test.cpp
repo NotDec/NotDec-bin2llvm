@@ -540,6 +540,14 @@ int main() {
                                       &bindableInputLoad);
   attachExternalInputs(*bindableInputFunction, {{"RDI", rdi}});
 
+  llvm::LoadInst *usedBindableInputLoad = nullptr;
+  llvm::Function *usedBindableInputFunction =
+      createUsedExternalInputFunction(module, "input_rdi_bindable_used", rdi,
+                                      "RDI", &usedBindableInputLoad);
+  attachExternalInputs(*usedBindableInputFunction, {{"RDI", rdi}});
+  createCallerFunction(module, "call_input_rdi_bindable_used",
+                       usedBindableInputFunction);
+
   llvm::Function *duplicateInputLoadFunction =
       createDuplicateExternalInputLoadFunction(module, "input_rdi_duplicate_load",
                                                rdi, "RDI");
@@ -601,16 +609,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 17, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 10,
+  ok &= expect(summary.FunctionsSeen == 19, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 11,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 7,
+  ok &= expect(summary.InputCandidates == 8,
                "unexpected input candidate count");
   ok &= expect(summary.ReturnCandidates == 6,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 10,
+  ok &= expect(summary.RewriteEligibleFunctions == 11,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 9,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 10,
                "unexpected signature rewrite needed function count");
   ok &= expect(metadataHasRegister(*inputFunction,
                                    "notdec.prototype.input_candidates", "RDI"),
@@ -722,6 +730,47 @@ int main() {
   ok &= expect(!notdec::bin2llvm::getNativePrototypeInputBindings(
                     *duplicateInputLoadFunction),
                "duplicate external input loads were incorrectly bound");
+  notdec::bin2llvm::NativePrototypeRewriteResult usedInputRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+          *usedBindableInputFunction);
+  ok &= expect(!usedInputRewriteResult.Rewritten,
+               "input-only prototype with uses was rewritten");
+  ok &= expect(usedInputRewriteResult.Reason == "function has uses",
+               "input-only prototype with uses had unexpected rewrite reason");
+  llvm::Instruction *inputLoadUser =
+      llvm::dyn_cast<llvm::Instruction>(*bindableInputLoad->user_begin());
+  notdec::bin2llvm::NativePrototypeRewriteResult inputRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+          *bindableInputFunction);
+  ok &= expect(inputRewriteResult.Rewritten,
+               "input-only prototype was not rewritten");
+  bindableInputFunction = inputRewriteResult.Function;
+  llvm::Type *i64Param = llvm::Type::getInt64Ty(context);
+  ok &= expect(bindableInputFunction != nullptr &&
+                   functionTypeShape(*bindableInputFunction->getFunctionType(),
+                                     llvm::Type::getVoidTy(context),
+                                     llvm::ArrayRef(i64Param)),
+               "rewritten input-only function type was not void(i64)");
+  ok &= expect(bindableInputFunction != nullptr &&
+                   !bindableInputFunction->arg_empty() &&
+                   inputLoadUser != nullptr &&
+                   inputLoadUser->getOperand(0) ==
+                       &*bindableInputFunction->arg_begin(),
+               "rewritten input-only function did not use new argument");
+  bool sawInputLoadAfterRewrite = false;
+  if (bindableInputFunction != nullptr) {
+    for (llvm::BasicBlock &block : *bindableInputFunction) {
+      for (llvm::Instruction &instruction : block) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+        if (load != nullptr &&
+            load->getMetadata("notdec.register.external_input") != nullptr) {
+          sawInputLoadAfterRewrite = true;
+        }
+      }
+    }
+  }
+  ok &= expect(!sawInputLoadAfterRewrite,
+               "rewritten input-only function kept old input load");
   notdec::bin2llvm::NativePrototypeRewriteEligibility matchingEligibility =
       notdec::bin2llvm::getNativePrototypeRewriteEligibility(
           *matchingInputFunction);
