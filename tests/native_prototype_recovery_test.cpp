@@ -1106,6 +1106,11 @@ int main() {
                "batch rewrite rewrote unexpected function count");
   ok &= expect(batchRewriteSummary.FunctionsSkipped == 3,
                "batch rewrite skipped unexpected function count");
+  ok &= expect(batchRewriteSummary.SkippedByReason["function has uses"] == 1,
+               "batch rewrite did not count function-use skip reason");
+  ok &= expect(
+      batchRewriteSummary.SkippedByReason["missing recovered prototype"] == 2,
+      "batch rewrite did not count missing-prototype skip reason");
   ok &= expect(batchModule.getFunction("batch_input_rdi") != nullptr &&
                    functionTypeShape(
                        *batchModule.getFunction("batch_input_rdi")
@@ -1162,6 +1167,9 @@ int main() {
                "opt-in rewrite rewrote unexpected function count");
   ok &= expect(optInSummary.SignatureRewriteFunctionsSkipped == 1,
                "opt-in rewrite skipped unexpected function count");
+  ok &= expect(optInSummary.SignatureRewriteSkippedByReason
+                   ["missing recovered prototype"] == 1,
+               "opt-in rewrite did not count missing-prototype skip reason");
   ok &= expect(optInModule.getFunction("opt_in_input_rdi_return_rax") !=
                        nullptr &&
                    functionTypeShape(

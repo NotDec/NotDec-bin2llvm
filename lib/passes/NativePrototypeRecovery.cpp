@@ -474,6 +474,8 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
         rewriteSummary.FunctionsRewritten;
     summary.SignatureRewriteFunctionsSkipped =
         rewriteSummary.FunctionsSkipped;
+    summary.SignatureRewriteSkippedByReason =
+        rewriteSummary.SkippedByReason;
   }
 
   if (options.PrintSummary) {
@@ -921,6 +923,7 @@ rewriteNativeRecoveredPrototypes(llvm::Module &module) {
       continue;
     }
     ++summary.FunctionsSkipped;
+    ++summary.SkippedByReason[result.Reason];
   }
 
   return summary;
@@ -943,6 +946,10 @@ void printNativePrototypeRecoverySummary(
      << summary.SignatureRewriteFunctionsRewritten << '\n';
   os << "  signature rewrite skipped functions: "
      << summary.SignatureRewriteFunctionsSkipped << '\n';
+  for (const auto &[reason, count] : summary.SignatureRewriteSkippedByReason) {
+    os << "  signature rewrite skipped reason " << reason << ": " << count
+       << '\n';
+  }
   for (const NativePrototypeRecoveryFunctionSummary &function :
        summary.Functions) {
     os << "  function " << function.FunctionName

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -89,12 +90,13 @@ struct NativePrototypeRewriteResult {
   llvm::Function *Function = nullptr;
 };
 
-// Module-level rewrite statistics.  Keep it small for now because callsite
-// rewrite and detailed reason reporting are not wired into the pass yet.
+// Module-level rewrite statistics.  Skip reasons make the conservative rewrite
+// boundary visible while callsite rewrite is still not implemented.
 struct NativePrototypeModuleRewriteSummary {
   uint64_t FunctionsSeen = 0;
   uint64_t FunctionsRewritten = 0;
   uint64_t FunctionsSkipped = 0;
+  std::map<std::string, uint64_t> SkippedByReason;
 };
 
 struct NativePrototypeRecoveryFunctionSummary {
@@ -116,6 +118,7 @@ struct NativePrototypeRecoverySummary {
   uint64_t SignatureRewriteFunctionsSeen = 0;
   uint64_t SignatureRewriteFunctionsRewritten = 0;
   uint64_t SignatureRewriteFunctionsSkipped = 0;
+  std::map<std::string, uint64_t> SignatureRewriteSkippedByReason;
   std::vector<NativePrototypeRecoveryFunctionSummary> Functions;
 };
 
