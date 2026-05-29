@@ -70,6 +70,37 @@ std::unique_ptr<llvm::Module> createModule(llvm::LLVMContext &context) {
   return module;
 }
 
+std::unique_ptr<llvm::Module> createCallBarrierModule(
+    llvm::LLVMContext &context) {
+  auto module = std::make_unique<llvm::Module>("instcombine-call-test",
+                                               context);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(*module, "RDI");
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "external_call", *module);
+
+  auto *funcType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "call_then_load_rdi", *module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(rdi->getValueType(), 0x1234), rdi);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RDI"));
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rdi->getValueType(), rdi, "rdi_after_call");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, "RDI"));
+  builder.CreateRet(load);
+  return module;
+}
+
 void runInstCombine(llvm::Function &function) {
   llvm::LoopAnalysisManager loopAnalysis;
   llvm::FunctionAnalysisManager functionAnalysis;
@@ -171,5 +202,37 @@ int main() {
                "external input count dropped after instcombine");
   ok &= expect(combined.LoadsReplaced >= baseline.LoadsReplaced,
                "replaced load count dropped after instcombine");
+
+  llvm::LLVMContext callBaselineContext;
+  std::unique_ptr<llvm::Module> callBaselineModule =
+      createCallBarrierModule(callBaselineContext);
+  notdec::bin2llvm::NativeRegisterSSASummary callBaseline =
+      notdec::bin2llvm::runNativeRegisterSSA(*callBaselineModule, options);
+  if (llvm::verifyModule(*callBaselineModule, &llvm::errs())) {
+    std::cerr << "call baseline module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::LLVMContext callCombinedContext;
+  std::unique_ptr<llvm::Module> callCombinedModule =
+      createCallBarrierModule(callCombinedContext);
+  llvm::Function *callCombinedFunction =
+      callCombinedModule->getFunction("call_then_load_rdi");
+  if (callCombinedFunction == nullptr) {
+    std::cerr << "call test function missing\n";
+    return EXIT_FAILURE;
+  }
+  runInstCombine(*callCombinedFunction);
+  notdec::bin2llvm::NativeRegisterSSASummary callCombined =
+      notdec::bin2llvm::runNativeRegisterSSA(*callCombinedModule, options);
+  if (llvm::verifyModule(*callCombinedModule, &llvm::errs())) {
+    std::cerr << "call combined module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  ok &= expect(callCombined.CallsSeen >= callBaseline.CallsSeen,
+               "call count dropped after instcombine");
+  ok &= expect(callCombined.LoadsReplaced <= callBaseline.LoadsReplaced,
+               "call barrier load was incorrectly replaced after instcombine");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -98,6 +98,9 @@
   - [x] 扩展 instcombine 安全验证，覆盖 register store metadata 和 SSA load/store 计数。
     - 记录：`06-pass-pipeline-and-verification/20260529-04-instcombine-register-store-safety.md`
     - 文件：`tests/native_instcombine_metadata_test.cpp`
+  - [x] 扩展 instcombine 安全验证，覆盖普通外部 call barrier。
+    - 记录：`06-pass-pipeline-and-verification/20260529-05-instcombine-call-barrier-safety.md`
+    - 文件：`tests/native_instcombine_metadata_test.cpp`
   - [ ] Bench2 selected native 全量验证。
 
 ## 记录规则
