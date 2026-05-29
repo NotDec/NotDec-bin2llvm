@@ -74,6 +74,9 @@
   - [x] return candidates 支持同一 return 点多个 output slot，并按 ABI slot 顺序写入 metadata。
     - 记录：`05-input-output-candidates/20260529-09-return-candidate-slot-order.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] input candidates 按 ABI slot 去重，避免重复 metadata 产生重复参数候选。
+    - 记录：`05-input-output-candidates/20260529-10-input-candidate-deduplicate-slot.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。

@@ -395,6 +395,10 @@ int main() {
       createFunction(module, "input_reversed");
   attachExternalInputs(*reversedInputFunction, {{"RSI", rdi}, {"RDI", rdi}});
 
+  llvm::Function *duplicateInputFunction =
+      createFunction(module, "input_duplicate");
+  attachExternalInputs(*duplicateInputFunction, {{"RDI", rdi}, {"RDI", rdi}});
+
   llvm::Function *unusedInputFunction =
       createUnusedExternalInputFunction(module, "unused_rdi", rdi, "RDI");
   attachExternalInputs(*unusedInputFunction, {{"RDI", rdi}});
@@ -431,10 +435,10 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 11, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 5,
+  ok &= expect(summary.FunctionsSeen == 12, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 7,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 3,
+  ok &= expect(summary.InputCandidates == 4,
                "unexpected input candidate count");
   ok &= expect(summary.ReturnCandidates == 5,
                "unexpected return candidate count");
@@ -449,6 +453,10 @@ int main() {
                                   "notdec.prototype.input_candidates", 1,
                                   "RSI"),
                "RSI input candidate was not sorted after RDI");
+  ok &= expect(countMetadataRegister(*duplicateInputFunction,
+                                     "notdec.prototype.input_candidates",
+                                     "RDI") == 1,
+               "duplicate RDI input candidate was not deduplicated");
   ok &= expect(!metadataHasRegister(*unusedInputFunction,
                                     "notdec.prototype.input_candidates", "RDI"),
                "unused RDI was incorrectly marked as an input candidate");

@@ -203,6 +203,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     functionSummary.FunctionName = function.getName().str();
 
     NativeParamActive active;
+    std::set<uint64_t> inputSlots;
     llvm::MDNode *externalInputs =
         function.getMetadata("notdec.register.external_inputs");
     if (externalInputs != nullptr) {
@@ -227,6 +228,9 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
           continue;
         }
         if (!hasActiveExternalInputUse(function, *name)) {
+          continue;
+        }
+        if (!inputSlots.insert(match->Slot).second) {
           continue;
         }
 
