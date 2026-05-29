@@ -1,3 +1,5 @@
+#include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/passes/NativePrototypeRecovery.h"
 #include "notdec-bin2llvm/passes/NativeRegisterSSA.h"
 
 #include "llvm/IR/Constants.h"
@@ -47,6 +49,25 @@ llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
   return global;
 }
 
+notdec::bin2llvm::NativeAbiParamEntry registerParamEntry(
+    const std::string &name) {
+  notdec::bin2llvm::NativeAbiParamEntry entry;
+  entry.MinSize = 1;
+  entry.MaxSize = 8;
+  entry.Align = 8;
+  entry.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  entry.Storage.Name = name;
+  return entry;
+}
+
+void attachPrototypeTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+  abi.Inputs.push_back(registerParamEntry("RDI"));
+  abi.Outputs.push_back(registerParamEntry("RAX"));
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 std::unique_ptr<llvm::Module> createModule(llvm::LLVMContext &context) {
   auto module = std::make_unique<llvm::Module>("instcombine-metadata-test",
                                                context);
@@ -67,6 +88,33 @@ std::unique_ptr<llvm::Module> createModule(llvm::LLVMContext &context) {
   store->setMetadata("notdec.register.access",
                      registerAccessMetadata(context, "RDI"));
   builder.CreateRet(sum);
+  return module;
+}
+
+std::unique_ptr<llvm::Module> createPrototypeCandidateModule(
+    llvm::LLVMContext &context) {
+  auto module =
+      std::make_unique<llvm::Module>("instcombine-prototype-test", context);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(*module, "RDI");
+  llvm::GlobalVariable *rax = createRegisterGlobal(*module, "RAX");
+  attachPrototypeTestAbi(*module);
+
+  auto *funcType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "prototype_rdi_to_rax", *module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *input = builder.CreateLoad(rdi->getValueType(), rdi, "rdi");
+  input->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RDI"));
+  llvm::Value *result =
+      builder.CreateAdd(input, llvm::ConstantInt::get(input->getType(), 1));
+  llvm::StoreInst *store = builder.CreateStore(result, rax);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RAX"));
+  builder.CreateRetVoid();
   return module;
 }
 
@@ -493,5 +541,38 @@ int main() {
                "indirect call count dropped after instcombine");
   ok &= expect(indirectCombined.LoadsReplaced <= indirectBaseline.LoadsReplaced,
                "indirect call barrier load was incorrectly replaced");
+
+  llvm::LLVMContext prototypeContext;
+  std::unique_ptr<llvm::Module> prototypeModule =
+      createPrototypeCandidateModule(prototypeContext);
+  llvm::Function *prototypeFunction =
+      prototypeModule->getFunction("prototype_rdi_to_rax");
+  if (prototypeFunction == nullptr) {
+    std::cerr << "prototype test function missing\n";
+    return EXIT_FAILURE;
+  }
+  runInstCombine(*prototypeFunction);
+  notdec::bin2llvm::runNativeRegisterSSA(*prototypeModule, options);
+  notdec::bin2llvm::NativePrototypeRecoveryOptions prototypeOptions;
+  notdec::bin2llvm::NativePrototypeRecoverySummary prototypeSummary =
+      notdec::bin2llvm::runNativePrototypeRecovery(*prototypeModule,
+                                                   prototypeOptions);
+  if (llvm::verifyModule(*prototypeModule, &llvm::errs())) {
+    std::cerr << "prototype module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  ok &= expect(prototypeSummary.InputCandidates >= 1,
+               "prototype input candidate count dropped after instcombine");
+  ok &= expect(prototypeSummary.ReturnCandidates >= 1,
+               "prototype return candidate count dropped after instcombine");
+  ok &= expect(functionMetadataHasRegister(*prototypeFunction,
+                                           "notdec.prototype.input_candidates",
+                                           "RDI"),
+               "RDI input candidate was missing after instcombine");
+  ok &= expect(functionMetadataHasRegister(*prototypeFunction,
+                                           "notdec.prototype.return_candidates",
+                                           "RAX"),
+               "RAX return candidate was missing after instcombine");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
