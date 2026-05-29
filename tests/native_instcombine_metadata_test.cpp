@@ -199,6 +199,34 @@ std::unique_ptr<llvm::Module> createDirectClobberModule(
   return module;
 }
 
+std::unique_ptr<llvm::Module> createIndirectCallModule(
+    llvm::LLVMContext &context) {
+  auto module = std::make_unique<llvm::Module>("instcombine-indirect-test",
+                                               context);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(*module, "RDI");
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  auto *calleePtrType = llvm::PointerType::getUnqual(context);
+  auto *funcType = llvm::FunctionType::get(
+      llvm::Type::getInt64Ty(context), {calleePtrType}, {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "indirect_then_load_rdi", *module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(rdi->getValueType(), 0xbeef), rdi);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RDI"));
+  builder.CreateCall(calleeType, function->getArg(0));
+  llvm::LoadInst *load =
+      builder.CreateLoad(rdi->getValueType(), rdi, "rdi_after_indirect");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, "RDI"));
+  builder.CreateRet(load);
+  return module;
+}
+
 void runInstCombine(llvm::Function &function) {
   llvm::LoopAnalysisManager loopAnalysis;
   llvm::FunctionAnalysisManager functionAnalysis;
@@ -433,5 +461,37 @@ int main() {
                "direct clobber call count dropped after instcombine");
   ok &= expect(clobberCombined.LoadsReplaced <= clobberBaseline.LoadsReplaced,
                "direct clobber call load was incorrectly replaced");
+
+  llvm::LLVMContext indirectBaselineContext;
+  std::unique_ptr<llvm::Module> indirectBaselineModule =
+      createIndirectCallModule(indirectBaselineContext);
+  notdec::bin2llvm::NativeRegisterSSASummary indirectBaseline =
+      notdec::bin2llvm::runNativeRegisterSSA(*indirectBaselineModule, options);
+  if (llvm::verifyModule(*indirectBaselineModule, &llvm::errs())) {
+    std::cerr << "indirect baseline module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::LLVMContext indirectCombinedContext;
+  std::unique_ptr<llvm::Module> indirectCombinedModule =
+      createIndirectCallModule(indirectCombinedContext);
+  llvm::Function *indirectCombinedFunction =
+      indirectCombinedModule->getFunction("indirect_then_load_rdi");
+  if (indirectCombinedFunction == nullptr) {
+    std::cerr << "indirect test function missing\n";
+    return EXIT_FAILURE;
+  }
+  runInstCombine(*indirectCombinedFunction);
+  notdec::bin2llvm::NativeRegisterSSASummary indirectCombined =
+      notdec::bin2llvm::runNativeRegisterSSA(*indirectCombinedModule, options);
+  if (llvm::verifyModule(*indirectCombinedModule, &llvm::errs())) {
+    std::cerr << "indirect combined module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  ok &= expect(indirectCombined.CallsSeen >= indirectBaseline.CallsSeen,
+               "indirect call count dropped after instcombine");
+  ok &= expect(indirectCombined.LoadsReplaced <= indirectBaseline.LoadsReplaced,
+               "indirect call barrier load was incorrectly replaced");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
