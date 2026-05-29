@@ -23,6 +23,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace notdec::bin2llvm {
 namespace {
@@ -320,29 +321,40 @@ llvm::LoadInst *findCallsiteReturnLoad(llvm::CallInst &oldCall,
     return localLoad;
   }
 
-  llvm::BasicBlock *successor = nullptr;
-  for (llvm::BasicBlock *candidate : llvm::successors(oldCall.getParent())) {
-    if (successor != nullptr) {
+  std::set<llvm::BasicBlock *> visited;
+  llvm::BasicBlock *current = oldCall.getParent();
+  while (visited.insert(current).second) {
+    llvm::BasicBlock *successor = nullptr;
+    for (llvm::BasicBlock *candidate : llvm::successors(current)) {
+      if (successor != nullptr) {
+        return nullptr;
+      }
+      successor = candidate;
+    }
+    if (successor == nullptr) {
       return nullptr;
     }
-    successor = candidate;
-  }
-  if (successor == nullptr) {
-    return nullptr;
-  }
 
-  llvm::BasicBlock *predecessor = nullptr;
-  for (llvm::BasicBlock *candidate : llvm::predecessors(successor)) {
-    if (predecessor != nullptr) {
+    llvm::BasicBlock *predecessor = nullptr;
+    for (llvm::BasicBlock *candidate : llvm::predecessors(successor)) {
+      if (predecessor != nullptr) {
+        return nullptr;
+      }
+      predecessor = candidate;
+    }
+    if (predecessor != current) {
       return nullptr;
     }
-    predecessor = candidate;
+
+    llvm::LoadInst *successorLoad =
+        findReturnLoadInRange(successor->begin(), successor->end(),
+                              returnRegisterName);
+    if (successorLoad != nullptr) {
+      return successorLoad;
+    }
+    current = successor;
   }
-  if (predecessor != oldCall.getParent()) {
-    return nullptr;
-  }
-  return findReturnLoadInRange(successor->begin(), successor->end(),
-                               returnRegisterName);
+  return nullptr;
 }
 
 void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,

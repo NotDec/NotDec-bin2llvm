@@ -181,6 +181,38 @@ llvm::Function *createReturnLoadUniqueSuccessorCallerFunction(
   return function;
 }
 
+llvm::Function *createReturnLoadLinearSuccessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, const std::string &registerName,
+    llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *middle =
+      llvm::BasicBlock::Create(context, "after_call", function);
+  llvm::BasicBlock *useBlock =
+      llvm::BasicBlock::Create(context, "use_return", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateBr(middle);
+
+  builder.SetInsertPoint(middle);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(useBlock);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            registerName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *loadOut = load;
+  return function;
+}
+
 llvm::Function *createInputStoreCallerFunction(llvm::Module &module,
                                                const std::string &name,
                                                llvm::Function *callee,
@@ -1264,6 +1296,68 @@ int main() {
                "successor return callsite result was not used");
   if (llvm::verifyModule(successorReturnCallsiteModule, &llvm::errs())) {
     std::cerr << "successor callsite module verification failed after "
+                 "return-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module linearReturnCallsiteModule(
+      "native-prototype-return-linear-callsite-rewrite-test", context);
+  llvm::GlobalVariable *linearReturnCallsiteRax =
+      createRegisterGlobal(linearReturnCallsiteModule, "RAX");
+  attachTestAbi(linearReturnCallsiteModule);
+  llvm::StoreInst *linearReturnCallsiteStore = nullptr;
+  llvm::Function *linearReturnCallsiteFunction = createReturnStoreFunction(
+      linearReturnCallsiteModule, "linear_callsite_return_rax",
+      linearReturnCallsiteRax, "RAX", &linearReturnCallsiteStore);
+  llvm::LoadInst *linearReturnCallsiteLoad = nullptr;
+  createReturnLoadLinearSuccessorCallerFunction(
+      linearReturnCallsiteModule, "call_linear_callsite_return_rax",
+      linearReturnCallsiteFunction, linearReturnCallsiteRax, "RAX",
+      &linearReturnCallsiteLoad);
+  notdec::bin2llvm::runNativePrototypeRecovery(linearReturnCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      linearReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *linearReturnCallsiteFunction);
+  ok &= expect(linearReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype with linear callsite was not rewritten");
+  linearReturnCallsiteFunction = linearReturnCallsiteRewriteResult.Function;
+  llvm::CallInst *rewrittenLinearReturnCallsiteCall = nullptr;
+  llvm::Function *linearReturnCallsiteCaller =
+      linearReturnCallsiteModule.getFunction("call_linear_callsite_return_rax");
+  if (linearReturnCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *linearReturnCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == linearReturnCallsiteFunction) {
+          rewrittenLinearReturnCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenLinearReturnCallsiteCall != nullptr,
+               "linear return callsite was not rewritten to new callee");
+  bool sawOldLinearReturnLoad = false;
+  if (linearReturnCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *linearReturnCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+        if (load != nullptr &&
+            load->getMetadata("notdec.register.access") != nullptr) {
+          sawOldLinearReturnLoad = true;
+        }
+      }
+    }
+  }
+  ok &= expect(!sawOldLinearReturnLoad,
+               "linear return callsite kept old return register load");
+  ok &= expect(rewrittenLinearReturnCallsiteCall != nullptr &&
+                   !rewrittenLinearReturnCallsiteCall->use_empty(),
+               "linear return callsite result was not used");
+  if (llvm::verifyModule(linearReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "linear callsite module verification failed after "
                  "return-only rewrite\n";
     return EXIT_FAILURE;
   }
