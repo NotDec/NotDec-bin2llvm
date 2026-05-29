@@ -290,11 +290,10 @@ void rewriteInputOnlyDirectCallsites(
   }
 }
 
-void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,
-                               llvm::StringRef returnRegisterName) {
-  llvm::BasicBlock::iterator iter(oldCall.getIterator());
-  llvm::BasicBlock::iterator end = oldCall.getParent()->end();
-  for (++iter; iter != end; ++iter) {
+llvm::LoadInst *findReturnLoadInRange(llvm::BasicBlock::iterator iter,
+                                      llvm::BasicBlock::iterator end,
+                                      llvm::StringRef returnRegisterName) {
+  for (; iter != end; ++iter) {
     auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter);
     if (load == nullptr) {
       continue;
@@ -307,13 +306,56 @@ void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,
     if (!name || *name != returnRegisterName) {
       continue;
     }
-    if (load->getType() == newCall.getType()) {
-      load->replaceAllUsesWith(&newCall);
-      if (load->use_empty()) {
-        load->eraseFromParent();
-      }
+    return load;
+  }
+  return nullptr;
+}
+
+llvm::LoadInst *findCallsiteReturnLoad(llvm::CallInst &oldCall,
+                                       llvm::StringRef returnRegisterName) {
+  llvm::BasicBlock::iterator localIter(oldCall.getIterator());
+  llvm::LoadInst *localLoad = findReturnLoadInRange(
+      ++localIter, oldCall.getParent()->end(), returnRegisterName);
+  if (localLoad != nullptr) {
+    return localLoad;
+  }
+
+  llvm::BasicBlock *successor = nullptr;
+  for (llvm::BasicBlock *candidate : llvm::successors(oldCall.getParent())) {
+    if (successor != nullptr) {
+      return nullptr;
     }
-    break;
+    successor = candidate;
+  }
+  if (successor == nullptr) {
+    return nullptr;
+  }
+
+  llvm::BasicBlock *predecessor = nullptr;
+  for (llvm::BasicBlock *candidate : llvm::predecessors(successor)) {
+    if (predecessor != nullptr) {
+      return nullptr;
+    }
+    predecessor = candidate;
+  }
+  if (predecessor != oldCall.getParent()) {
+    return nullptr;
+  }
+  return findReturnLoadInRange(successor->begin(), successor->end(),
+                               returnRegisterName);
+}
+
+void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,
+                               llvm::StringRef returnRegisterName) {
+  llvm::LoadInst *load = findCallsiteReturnLoad(oldCall, returnRegisterName);
+  if (load == nullptr) {
+    return;
+  }
+  if (load->getType() == newCall.getType()) {
+    load->replaceAllUsesWith(&newCall);
+    if (load->use_empty()) {
+      load->eraseFromParent();
+    }
   }
 }
 
