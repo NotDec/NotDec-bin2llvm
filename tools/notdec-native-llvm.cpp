@@ -4,6 +4,7 @@
 #include "notdec-bin2llvm/NativeAnalysis.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
+#include "notdec-bin2llvm/passes/NativePrototypeRecovery.h"
 #include "notdec-bin2llvm/passes/NativeRegisterSSA.h"
 
 #include "llvm/IR/LLVMContext.h"
@@ -57,6 +58,8 @@ struct CliOptions {
       notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
   bool DisableRegisterSSAPass = false;
   bool PrintRegisterSSASummary = false;
+  bool DisablePrototypeRecoveryPass = false;
+  bool PrintPrototypeRecoverySummary = false;
 };
 
 void printUsage(const char *argv0) {
@@ -66,6 +69,8 @@ void printUsage(const char *argv0) {
                "--all-confirmed) "
                "-o <output.ll> [--summary-json-out <path>] "
                "[--no-register-ssa-pass] [--register-ssa-summary] "
+               "[--no-prototype-recovery-pass] "
+               "[--prototype-recovery-summary] "
                "[--decode-seed-limit <count>] "
                "[--memory-model inttoptr|global-array] [-p root-sla-dir] "
                "[-s pspec-file]\n";
@@ -128,6 +133,14 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
     if (flag == "--register-ssa-summary") {
       options.PrintRegisterSSASummary = true;
+      continue;
+    }
+    if (flag == "--no-prototype-recovery-pass") {
+      options.DisablePrototypeRecoveryPass = true;
+      continue;
+    }
+    if (flag == "--prototype-recovery-summary") {
+      options.PrintPrototypeRecoverySummary = true;
       continue;
     }
     if (argIndex + 1 >= argc) {
@@ -228,8 +241,8 @@ std::filesystem::path defaultX86CspecPath() {
 
 std::filesystem::path resolveX86CspecPath(
     const notdec::bin2llvm::SleighSpecOptions &options) {
-  if (!options.RootSlaDir.empty()) {
-    return std::filesystem::path(options.RootSlaDir) / "x86-64-gcc.cspec";
+  if (options.RootSlaDir) {
+    return std::filesystem::path(*options.RootSlaDir) / "x86-64-gcc.cspec";
   }
   return defaultX86CspecPath();
 }
@@ -759,6 +772,21 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
   return true;
 }
 
+bool runPrototypeRecoveryPassIfEnabled(llvm::Module &module,
+                                       const CliOptions &options) {
+  if (options.DisablePrototypeRecoveryPass) {
+    return true;
+  }
+  notdec::bin2llvm::NativePrototypeRecoveryOptions passOptions;
+  passOptions.PrintSummary = options.PrintPrototypeRecoverySummary;
+  notdec::bin2llvm::runNativePrototypeRecovery(module, passOptions);
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after prototype recovery pass\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -779,6 +807,9 @@ int main(int argc, char **argv) {
         return 1;
       }
       if (!runRegisterSSAPassIfEnabled(*module, *options)) {
+        return 1;
+      }
+      if (!runPrototypeRecoveryPassIfEnabled(*module, *options)) {
         return 1;
       }
       return writeModule(*module, options->OutputPath);
@@ -884,6 +915,9 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (!runRegisterSSAPassIfEnabled(*module, *options)) {
+      return 1;
+    }
+    if (!runPrototypeRecoveryPassIfEnabled(*module, *options)) {
       return 1;
     }
 

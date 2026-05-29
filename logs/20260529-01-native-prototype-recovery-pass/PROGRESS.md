@@ -59,9 +59,12 @@
     - 文件：`tests/native_prototype_recovery_test.cpp`
 
 - [ ] 阶段 6: `06-pass-pipeline-and-verification`
-  - [ ] 编写第一小步规划：CLI 和 pass pipeline 接入。
-  - [ ] `notdec-native-llvm` 默认输出 ABI/prototype metadata。
-  - [ ] `.ll` / `.bc` 输入支持只跑 prototype recovery。
+  - [x] 编写第一小步规划：CLI 和 pass pipeline 接入。
+    - 记录：`06-pass-pipeline-and-verification/20260529-01-cli-prototype-recovery-pipeline.md`
+  - [x] `notdec-native-llvm` 默认输出 ABI/prototype metadata。
+    - 文件：`tools/notdec-native-llvm.cpp`
+  - [x] `.ll` / `.bc` 输入支持只跑 prototype recovery。
+    - 文件：`tools/notdec-native-llvm.cpp`
   - [ ] Bench2 selected native 全量验证。
 
 ## 记录规则
