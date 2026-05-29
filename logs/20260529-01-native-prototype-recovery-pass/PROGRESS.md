@@ -3,10 +3,14 @@
 ## 当前状态
 
 - [ ] 阶段 1: `01-cspec-abi-model`
-  - [ ] 编写第一小步规划：复用 Ghidra XML 基础解析 x86-64 `.cspec` ABI 子集。
-  - [ ] 实现 `NativeAbiSpec` / `NativeAbiPrototype` / `NativeAbiStorage`。
-  - [ ] 输出 module 级 `!notdec.abi` metadata。
+  - [x] 编写第一小步规划：复用 Ghidra XML 基础解析 x86-64 `.cspec` ABI 子集。
+    - 记录：`01-cspec-abi-model/20260529-01-default-proto-register-abi.md`
+  - [x] 实现 `NativeAbiSpec` / `NativeAbiStorage` / `NativeAbiParamEntry` / `NativeAbiEffect`。
+    - 文件：`include/notdec-bin2llvm/NativeAbi.h`、`lib/NativeAbi.cpp`
+  - [x] 输出 module 级 `!notdec.abi` metadata。
+    - 文件：`lib/NativeAbi.cpp`、`tools/notdec-native-llvm.cpp`
   - [ ] 添加 cspec 子集解析单元测试。
+    - 当前只有临时 smoke 验证，后续需要落到 `tests/` 或 CTest。
 
 - [ ] 阶段 2: `02-prototype-storage-model`
   - [ ] 编写第一小步规划：复刻 `ParamEntry` / `ParamList` 的 register storage 匹配。

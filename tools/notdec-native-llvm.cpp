@@ -1,5 +1,6 @@
 #include "SleighBytes.h"
 #include "notdec-bin2llvm/LiefElfLoadImage.h"
+#include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/NativeAnalysis.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
@@ -219,6 +220,18 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
 std::filesystem::path defaultX86SpecRoot() {
   return std::filesystem::path(NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR) /
          "Ghidra/Processors/x86/data/languages";
+}
+
+std::filesystem::path defaultX86CspecPath() {
+  return defaultX86SpecRoot() / "x86-64-gcc.cspec";
+}
+
+std::filesystem::path resolveX86CspecPath(
+    const notdec::bin2llvm::SleighSpecOptions &options) {
+  if (!options.RootSlaDir.empty()) {
+    return std::filesystem::path(options.RootSlaDir) / "x86-64-gcc.cspec";
+  }
+  return defaultX86CspecPath();
 }
 
 bool resolveSpecOptions(const LIEF::ELF::Binary &binary,
@@ -612,6 +625,23 @@ void attachMemoryMapMetadata(
       llvm::MDNode::get(context, entries));
 }
 
+bool attachDefaultAbiMetadata(
+    llvm::Module &module,
+    const notdec::bin2llvm::SleighSpecOptions &specOptions) {
+  std::filesystem::path cspecPath = resolveX86CspecPath(specOptions);
+  std::string errorMessage;
+  std::optional<notdec::bin2llvm::NativeAbiSpec> abi =
+      notdec::bin2llvm::parseGhidraCspecDefaultAbi(cspecPath.string(),
+                                                   errorMessage);
+  if (!abi) {
+    std::cerr << "failed to parse ABI cspec " << cspecPath.string() << ": "
+              << errorMessage << '\n';
+    return false;
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, *abi);
+  return true;
+}
+
 std::unique_ptr<llvm::Module> buildConfirmedModule(
     llvm::LLVMContext &context,
     const notdec::bin2llvm::NativeProgramState &state,
@@ -844,6 +874,9 @@ int main(int argc, char **argv) {
     } else {
       notdec::bin2llvm::NativeProgramState memoryState(*binary);
       attachMemoryMapMetadata(*module, memoryState);
+    }
+    if (!attachDefaultAbiMetadata(*module, options->SpecOptions)) {
+      return 1;
     }
 
     if (llvm::verifyModule(*module, &llvm::errs())) {
