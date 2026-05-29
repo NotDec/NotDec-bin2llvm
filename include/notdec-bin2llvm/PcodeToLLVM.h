@@ -15,9 +15,19 @@ class Module;
 
 namespace notdec::bin2llvm {
 
+enum class PcodeMemoryModel {
+  GlobalArray,
+  IntToPtr,
+};
+
 struct PcodeLoweringConfig {
   std::string ModuleName = "notdec.bin2llvm.pcode";
   std::string EntryFunctionName = "notdec_pcode";
+
+  // GlobalArray keeps the old synthetic @notdec_ram object.  IntToPtr maps
+  // P-Code RAM addresses to real LLVM pointers, which is better for native ELF
+  // modules whose addresses should line up with debug info and relocations.
+  PcodeMemoryModel MemoryModel = PcodeMemoryModel::GlobalArray;
 
   // Address-to-symbol table for already-confirmed functions in the same
   // generated module.  Raw Sleigh P-Code only gives CALL a target address, so

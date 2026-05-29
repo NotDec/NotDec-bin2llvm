@@ -962,6 +962,11 @@ private:
   }
 
   llvm::Value *memoryPointer(llvm::Value *address) {
+    if (Config.MemoryModel == PcodeMemoryModel::IntToPtr) {
+      return Builder.CreateIntToPtr(address, llvm::PointerType::get(Context, 0),
+                                    "notdec_ram_ptr");
+    }
+
     llvm::Value *zero = llvm::ConstantInt::get(address->getType(), 0);
     return Builder.CreateGEP(memoryGlobal()->getValueType(), memoryGlobal(),
                              {zero, address}, "notdec_ram_ptr");

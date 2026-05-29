@@ -5,6 +5,7 @@
 #include "notdec-bin2llvm/SleighLift.h"
 
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
@@ -48,6 +49,8 @@ struct CliOptions {
   std::string OutputPath;
   std::string SummaryJsonPath;
   notdec::bin2llvm::NativeSleighDecodeOptions DecodeOptions;
+  notdec::bin2llvm::PcodeMemoryModel MemoryModel =
+      notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
 };
 
 void printUsage(const char *argv0) {
@@ -56,7 +59,8 @@ void printUsage(const char *argv0) {
                "(-a <address> -l <length> | -f <entry> | -n <name> | "
                "--all-confirmed) "
                "-o <output.ll> [--summary-json-out <path>] "
-               "[--decode-seed-limit <count>] [-p root-sla-dir] "
+               "[--decode-seed-limit <count>] "
+               "[--memory-model inttoptr|global-array] [-p root-sla-dir] "
                "[-s pspec-file]\n";
 }
 
@@ -68,6 +72,19 @@ bool parseUint64(const std::string &text, uint64_t &value) {
   } catch (const std::exception &) {
     return false;
   }
+}
+
+bool parseMemoryModel(const std::string &text,
+                      notdec::bin2llvm::PcodeMemoryModel &model) {
+  if (text == "inttoptr") {
+    model = notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
+    return true;
+  }
+  if (text == "global-array") {
+    model = notdec::bin2llvm::PcodeMemoryModel::GlobalArray;
+    return true;
+  }
+  return false;
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
@@ -128,6 +145,11 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
         return std::nullopt;
       }
       options.DecodeOptions.MaxDecodedSeeds = limit;
+    } else if (flag == "--memory-model") {
+      if (!parseMemoryModel(value, options.MemoryModel)) {
+        std::cerr << "invalid memory model: " << value << '\n';
+        return std::nullopt;
+      }
     } else if (flag == "-p") {
       options.SpecOptions.RootSlaDir = std::move(value);
     } else if (flag == "-s") {
@@ -205,6 +227,12 @@ bool resolveSpecOptions(const LIEF::ELF::Binary &binary,
 std::string entryFunctionName(uint64_t entry) {
   std::ostringstream stream;
   stream << "notdec_native_" << std::hex << entry;
+  return stream.str();
+}
+
+std::string hexAddress(uint64_t address) {
+  std::ostringstream stream;
+  stream << std::hex << address;
   return stream.str();
 }
 
@@ -535,11 +563,37 @@ bool moduleVerifies(const llvm::Module &module, std::string &message) {
   return !failed;
 }
 
+void attachMemoryMapMetadata(
+    llvm::Module &module, const notdec::bin2llvm::NativeProgramState &state) {
+  llvm::LLVMContext &context = module.getContext();
+  std::vector<llvm::Metadata *> entries;
+  for (const notdec::bin2llvm::NativeMemoryRange &range :
+       state.memoryRanges()) {
+    std::vector<llvm::Metadata *> fields = {
+        llvm::MDString::get(context, "start=0x" + hexAddress(range.Start)),
+        llvm::MDString::get(context, "end=0x" + hexAddress(range.end())),
+        llvm::MDString::get(context,
+                            std::string("read=") +
+                                (range.Readable ? "true" : "false")),
+        llvm::MDString::get(context,
+                            std::string("write=") +
+                                (range.Writable ? "true" : "false")),
+        llvm::MDString::get(context,
+                            std::string("execute=") +
+                                (range.Executable ? "true" : "false")),
+    };
+    entries.push_back(llvm::MDNode::get(context, fields));
+  }
+  module.getOrInsertNamedMetadata("notdec.memory_map")->addOperand(
+      llvm::MDNode::get(context, entries));
+}
+
 std::unique_ptr<llvm::Module> buildConfirmedModule(
     llvm::LLVMContext &context,
     const notdec::bin2llvm::NativeProgramState &state,
     notdec::bin2llvm::LiefElfLoadImage &loadImage,
     const notdec::bin2llvm::SleighSpecOptions &specOptions,
+    notdec::bin2llvm::PcodeMemoryModel memoryModel,
     std::string &errorMessage) {
   auto module =
       std::make_unique<llvm::Module>("notdec.bin2llvm.native.confirmed", context);
@@ -563,6 +617,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
 
     notdec::bin2llvm::PcodeLoweringConfig config;
     config.ModuleName = "notdec.bin2llvm.native.confirmed.check";
+    config.MemoryModel = memoryModel;
     auto nameIt = callTargets.Direct.find(function.Entry);
     if (nameIt == callTargets.Direct.end()) {
       continue;
@@ -666,7 +721,8 @@ int main(int argc, char **argv) {
     std::unique_ptr<llvm::Module> module;
     if (options->AllConfirmed) {
       module = buildConfirmedModule(context, *selectedState, loadImage,
-                                    options->SpecOptions, errorMessage);
+                                    options->SpecOptions, options->MemoryModel,
+                                    errorMessage);
     } else {
       notdec::bin2llvm::PcodeProgram program;
       if (!options->FunctionBlockRanges.empty()) {
@@ -683,6 +739,7 @@ int main(int argc, char **argv) {
       }
 
       notdec::bin2llvm::PcodeLoweringConfig config;
+      config.MemoryModel = options->MemoryModel;
       if (!options->FunctionName.empty()) {
         config.EntryFunctionName =
             sanitizeLlvmFunctionName(options->FunctionName);
@@ -707,6 +764,13 @@ int main(int argc, char **argv) {
     if (!module) {
       std::cerr << "failed to lower p-code: " << errorMessage << '\n';
       return 1;
+    }
+
+    if (selectedState) {
+      attachMemoryMapMetadata(*module, *selectedState);
+    } else {
+      notdec::bin2llvm::NativeProgramState memoryState(*binary);
+      attachMemoryMapMetadata(*module, memoryState);
     }
 
     if (llvm::verifyModule(*module, &llvm::errs())) {
