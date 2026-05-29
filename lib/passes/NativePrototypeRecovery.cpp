@@ -333,7 +333,7 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
     llvm::BasicBlock *successor = nullptr;
     for (llvm::BasicBlock *candidate : llvm::successors(current)) {
       if (successor != nullptr) {
-        return {};
+        return {nullptr, true};
       }
       successor = candidate;
     }
@@ -344,12 +344,12 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
     llvm::BasicBlock *predecessor = nullptr;
     for (llvm::BasicBlock *candidate : llvm::predecessors(successor)) {
       if (predecessor != nullptr) {
-        return {};
+        return {nullptr, true};
       }
       predecessor = candidate;
     }
     if (predecessor != current) {
-      return {};
+      return {nullptr, true};
     }
 
     ReturnLoadSearchResult successorResult = findReturnLoadBeforeStoreInRange(
@@ -359,7 +359,7 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
     }
     current = successor;
   }
-  return {};
+  return {nullptr, true};
 }
 
 void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,

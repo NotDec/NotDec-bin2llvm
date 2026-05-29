@@ -249,6 +249,94 @@ llvm::Function *createReturnClobberLinearSuccessorCallerFunction(
   return function;
 }
 
+llvm::Function *createReturnLoadMultiSuccessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, const std::string &registerName,
+    llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *useBlock =
+      llvm::BasicBlock::Create(context, "use_return", function);
+  llvm::BasicBlock *skipBlock =
+      llvm::BasicBlock::Create(context, "skip_return", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), useBlock, skipBlock);
+
+  builder.SetInsertPoint(useBlock);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            registerName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(skipBlock);
+  builder.CreateRetVoid();
+  *loadOut = load;
+  return function;
+}
+
+llvm::Function *createReturnLoadMultiPredecessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, const std::string &registerName,
+    llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::BasicBlock *otherBlock =
+      llvm::BasicBlock::Create(context, "other_pred", function);
+  llvm::BasicBlock *useBlock =
+      llvm::BasicBlock::Create(context, "use_return", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), callBlock,
+                       otherBlock);
+
+  builder.SetInsertPoint(callBlock);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(otherBlock);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(useBlock);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            registerName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *loadOut = load;
+  return function;
+}
+
+llvm::Function *createReturnLoadLoopCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *loop = llvm::BasicBlock::Create(context, "loop", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateBr(loop);
+
+  builder.SetInsertPoint(loop);
+  builder.CreateBr(loop);
+  return function;
+}
+
 llvm::Function *createInputStoreCallerFunction(llvm::Module &module,
                                                const std::string &name,
                                                llvm::Function *callee,
@@ -1427,6 +1515,88 @@ int main() {
                  "return-only rewrite\n";
     return EXIT_FAILURE;
   }
+
+  auto expectReturnOnlyRewriteRejected =
+      [&](llvm::Module &module, llvm::Function &function,
+          llvm::LoadInst *load, const char *message) {
+        notdec::bin2llvm::runNativePrototypeRecovery(module, options);
+        notdec::bin2llvm::NativePrototypeRewriteResult result =
+            notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(function);
+        ok &= expect(!result.Rewritten, message);
+        if (load != nullptr) {
+          ok &= expect(!load->use_empty(),
+                       "unsafe callsite return load was unexpectedly replaced");
+        }
+        if (llvm::verifyModule(module, &llvm::errs())) {
+          std::cerr << "unsafe return callsite module verification failed\n";
+          return false;
+        }
+        return true;
+      };
+
+  llvm::Module multiSuccessorReturnCallsiteModule(
+      "native-prototype-return-multi-successor-callsite-test", context);
+  llvm::GlobalVariable *multiSuccessorReturnCallsiteRax =
+      createRegisterGlobal(multiSuccessorReturnCallsiteModule, "RAX");
+  attachTestAbi(multiSuccessorReturnCallsiteModule);
+  llvm::Function *multiSuccessorReturnCallsiteFunction =
+      createReturnStoreFunction(multiSuccessorReturnCallsiteModule,
+                                "multi_successor_callsite_return_rax",
+                                multiSuccessorReturnCallsiteRax, "RAX");
+  llvm::LoadInst *multiSuccessorReturnCallsiteLoad = nullptr;
+  createReturnLoadMultiSuccessorCallerFunction(
+      multiSuccessorReturnCallsiteModule,
+      "call_multi_successor_callsite_return_rax",
+      multiSuccessorReturnCallsiteFunction, multiSuccessorReturnCallsiteRax,
+      "RAX", &multiSuccessorReturnCallsiteLoad);
+  if (!expectReturnOnlyRewriteRejected(
+          multiSuccessorReturnCallsiteModule,
+          *multiSuccessorReturnCallsiteFunction,
+          multiSuccessorReturnCallsiteLoad,
+          "return-only prototype rewrite accepted multi-successor callsite")) {
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module multiPredecessorReturnCallsiteModule(
+      "native-prototype-return-multi-predecessor-callsite-test", context);
+  llvm::GlobalVariable *multiPredecessorReturnCallsiteRax =
+      createRegisterGlobal(multiPredecessorReturnCallsiteModule, "RAX");
+  attachTestAbi(multiPredecessorReturnCallsiteModule);
+  llvm::Function *multiPredecessorReturnCallsiteFunction =
+      createReturnStoreFunction(multiPredecessorReturnCallsiteModule,
+                                "multi_predecessor_callsite_return_rax",
+                                multiPredecessorReturnCallsiteRax, "RAX");
+  llvm::LoadInst *multiPredecessorReturnCallsiteLoad = nullptr;
+  createReturnLoadMultiPredecessorCallerFunction(
+      multiPredecessorReturnCallsiteModule,
+      "call_multi_predecessor_callsite_return_rax",
+      multiPredecessorReturnCallsiteFunction, multiPredecessorReturnCallsiteRax,
+      "RAX", &multiPredecessorReturnCallsiteLoad);
+  if (!expectReturnOnlyRewriteRejected(
+          multiPredecessorReturnCallsiteModule,
+          *multiPredecessorReturnCallsiteFunction,
+          multiPredecessorReturnCallsiteLoad,
+          "return-only prototype rewrite accepted multi-predecessor callsite")) {
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module loopReturnCallsiteModule(
+      "native-prototype-return-loop-callsite-test", context);
+  llvm::GlobalVariable *loopReturnCallsiteRax =
+      createRegisterGlobal(loopReturnCallsiteModule, "RAX");
+  attachTestAbi(loopReturnCallsiteModule);
+  llvm::Function *loopReturnCallsiteFunction = createReturnStoreFunction(
+      loopReturnCallsiteModule, "loop_callsite_return_rax",
+      loopReturnCallsiteRax, "RAX");
+  createReturnLoadLoopCallerFunction(loopReturnCallsiteModule,
+                                     "call_loop_callsite_return_rax",
+                                     loopReturnCallsiteFunction);
+  if (!expectReturnOnlyRewriteRejected(
+          loopReturnCallsiteModule, *loopReturnCallsiteFunction, nullptr,
+          "return-only prototype rewrite accepted loop callsite")) {
+    return EXIT_FAILURE;
+  }
+
   notdec::bin2llvm::NativePrototypeRewriteResult rewriteResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
           *returnFunction);

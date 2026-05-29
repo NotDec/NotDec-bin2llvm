@@ -197,6 +197,9 @@
   - [x] 添加 callsite return load 线性链同寄存器 store 阻断。
     - 记录：`06-pass-pipeline-and-verification/20260529-24-callsite-return-linear-clobber-stop.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 添加 callsite return load CFG 不确定形状的保守阻断和负例测试。
+    - 记录：`06-pass-pipeline-and-verification/20260529-25-callsite-return-cfg-negative-tests.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
