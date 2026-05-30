@@ -52,6 +52,17 @@ entry:
   ret void
 }
 
+define void @cli_input_rdi_rsi_return_rax_rdx() !notdec.register.external_inputs !15 {
+entry:
+  %RDI.external_input = load i64, ptr @RDI, align 8, !notdec.register.external_input !2
+  %RSI.external_input = load i64, ptr @RSI, align 8, !notdec.register.external_input !14
+  %sum = add i64 %RDI.external_input, %RSI.external_input
+  %diff = sub i64 %RDI.external_input, %RSI.external_input
+  store i64 %diff, ptr @RDX, align 8, !notdec.register.access !19
+  store i64 %sum, ptr @RAX, align 8, !notdec.register.access !4
+  ret void
+}
+
 !notdec.abi = !{!5}
 
 !0 = !{!"space=register", !"offset=0", !"size=8", !"name=RDI"}
