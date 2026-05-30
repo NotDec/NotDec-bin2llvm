@@ -255,6 +255,32 @@ std::optional<llvm::Value *> registerStoreValueInReverseRange(
   return std::nullopt;
 }
 
+std::optional<llvm::Value *> equivalentInputValueFromPredecessors(
+    llvm::BasicBlock &block, llvm::StringRef registerName,
+    llvm::Type *paramType) {
+  llvm::Value *result = nullptr;
+  uint64_t predecessorCount = 0;
+  for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
+    ++predecessorCount;
+    std::optional<llvm::Value *> value = registerStoreValueInReverseRange(
+        predecessor->rbegin(), predecessor->rend(), registerName, paramType);
+    if (!value) {
+      return std::nullopt;
+    }
+    if (result == nullptr) {
+      result = *value;
+      continue;
+    }
+    if (!sameReturnStoreValue(*result, **value)) {
+      return std::nullopt;
+    }
+  }
+  if (predecessorCount < 2) {
+    return std::nullopt;
+  }
+  return result;
+}
+
 std::optional<llvm::Value *> callsiteInputValueBeforeCall(
     llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *paramType) {
   std::optional<llvm::Value *> localValue = registerStoreValueInReverseRange(
@@ -268,11 +294,17 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
   llvm::BasicBlock *current = call.getParent();
   while (visited.insert(current).second) {
     llvm::BasicBlock *predecessor = nullptr;
+    bool sawMultiplePredecessors = false;
     for (llvm::BasicBlock *candidate : llvm::predecessors(current)) {
       if (predecessor != nullptr) {
-        return std::nullopt;
+        sawMultiplePredecessors = true;
+        break;
       }
       predecessor = candidate;
+    }
+    if (sawMultiplePredecessors) {
+      return equivalentInputValueFromPredecessors(*current, registerName,
+                                                 paramType);
     }
     if (predecessor == nullptr) {
       return std::nullopt;

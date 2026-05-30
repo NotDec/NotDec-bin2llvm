@@ -359,6 +359,9 @@
   - [x] return binding 只绑定 return 点前的返回寄存器 store。
     - 记录：`06-pass-pipeline-and-verification/20260529-62-return-binding-return-point-stores.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] callsite input 支持多前驱全等价参数值。
+    - 记录：`06-pass-pipeline-and-verification/20260529-63-callsite-input-equivalent-predecessors.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

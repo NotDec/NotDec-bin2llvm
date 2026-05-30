@@ -565,6 +565,82 @@ llvm::Function *createInputStoreLinearPredecessorCallerFunction(
   return function;
 }
 
+llvm::Function *createInputStoreEquivalentPredecessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *input, const std::string &registerName,
+    llvm::CallInst **callOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+
+  llvm::Value *argument = llvm::ConstantInt::get(input->getValueType(), 0x789a);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(argument, input);
+  leftStore->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, registerName));
+  builder.CreateBr(callBlock);
+
+  builder.SetInsertPoint(right);
+  llvm::StoreInst *rightStore = builder.CreateStore(argument, input);
+  rightStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, registerName));
+  builder.CreateBr(callBlock);
+
+  builder.SetInsertPoint(callBlock);
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+  *callOut = call;
+  return function;
+}
+
+llvm::Function *createInputStoreConflictingPredecessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *input, const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(
+      llvm::ConstantInt::get(input->getValueType(), 0x789a), input);
+  leftStore->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, registerName));
+  builder.CreateBr(callBlock);
+
+  builder.SetInsertPoint(right);
+  llvm::StoreInst *rightStore = builder.CreateStore(
+      llvm::ConstantInt::get(input->getValueType(), 0x789b), input);
+  rightStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, registerName));
+  builder.CreateBr(callBlock);
+
+  builder.SetInsertPoint(callBlock);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createInputStoreReturnLoadCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *input, const std::string &inputRegisterName,
@@ -2030,6 +2106,102 @@ int main() {
   if (llvm::verifyModule(linearPredecessorCallsiteModule, &llvm::errs())) {
     std::cerr << "linear predecessor callsite module verification failed after "
                  "input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module equivalentPredecessorCallsiteModule(
+      "native-prototype-input-equivalent-predecessor-callsite-rewrite-test",
+      context);
+  llvm::GlobalVariable *equivalentPredecessorCallsiteRdi =
+      createRegisterGlobal(equivalentPredecessorCallsiteModule, "RDI");
+  attachTestAbi(equivalentPredecessorCallsiteModule);
+  llvm::LoadInst *equivalentPredecessorCallsiteInputLoad = nullptr;
+  llvm::Function *equivalentPredecessorCallsiteInputFunction =
+      createUsedExternalInputFunction(equivalentPredecessorCallsiteModule,
+                                      "equivalent_predecessor_callsite_input_rdi",
+                                      equivalentPredecessorCallsiteRdi, "RDI",
+                                      &equivalentPredecessorCallsiteInputLoad);
+  attachExternalInputs(*equivalentPredecessorCallsiteInputFunction,
+                       {{"RDI", equivalentPredecessorCallsiteRdi}});
+  llvm::CallInst *oldEquivalentPredecessorCallsiteCall = nullptr;
+  createInputStoreEquivalentPredecessorCallerFunction(
+      equivalentPredecessorCallsiteModule,
+      "call_equivalent_predecessor_callsite_input_rdi",
+      equivalentPredecessorCallsiteInputFunction,
+      equivalentPredecessorCallsiteRdi, "RDI",
+      &oldEquivalentPredecessorCallsiteCall);
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      equivalentPredecessorCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      equivalentPredecessorCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+              *equivalentPredecessorCallsiteInputFunction);
+  ok &= expect(equivalentPredecessorCallsiteRewriteResult.Rewritten,
+               "input-only prototype with equivalent predecessors was not rewritten");
+  equivalentPredecessorCallsiteInputFunction =
+      equivalentPredecessorCallsiteRewriteResult.Function;
+  llvm::CallInst *rewrittenEquivalentPredecessorCallsiteCall = nullptr;
+  llvm::Function *equivalentPredecessorCallsiteCaller =
+      equivalentPredecessorCallsiteModule.getFunction(
+          "call_equivalent_predecessor_callsite_input_rdi");
+  if (equivalentPredecessorCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *equivalentPredecessorCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr && call->getCalledFunction() ==
+                                   equivalentPredecessorCallsiteInputFunction) {
+          rewrittenEquivalentPredecessorCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenEquivalentPredecessorCallsiteCall != nullptr,
+               "equivalent predecessor callsite was not rewritten to new callee");
+  ok &= expect(rewrittenEquivalentPredecessorCallsiteCall != nullptr &&
+                   rewrittenEquivalentPredecessorCallsiteCall->arg_size() == 1,
+               "equivalent predecessor callsite did not get one argument");
+  ok &= expect(rewrittenEquivalentPredecessorCallsiteCall != nullptr &&
+                   llvm::isa<llvm::ConstantInt>(
+                       rewrittenEquivalentPredecessorCallsiteCall->getArgOperand(0)),
+               "equivalent predecessor callsite argument did not use register store value");
+  if (llvm::verifyModule(equivalentPredecessorCallsiteModule, &llvm::errs())) {
+    std::cerr << "equivalent predecessor callsite module verification failed "
+                 "after input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module conflictingPredecessorCallsiteModule(
+      "native-prototype-input-conflicting-predecessor-callsite-test", context);
+  llvm::GlobalVariable *conflictingPredecessorCallsiteRdi =
+      createRegisterGlobal(conflictingPredecessorCallsiteModule, "RDI");
+  attachTestAbi(conflictingPredecessorCallsiteModule);
+  llvm::LoadInst *conflictingPredecessorCallsiteInputLoad = nullptr;
+  llvm::Function *conflictingPredecessorCallsiteInputFunction =
+      createUsedExternalInputFunction(
+          conflictingPredecessorCallsiteModule,
+          "conflicting_predecessor_callsite_input_rdi",
+          conflictingPredecessorCallsiteRdi, "RDI",
+          &conflictingPredecessorCallsiteInputLoad);
+  attachExternalInputs(*conflictingPredecessorCallsiteInputFunction,
+                       {{"RDI", conflictingPredecessorCallsiteRdi}});
+  createInputStoreConflictingPredecessorCallerFunction(
+      conflictingPredecessorCallsiteModule,
+      "call_conflicting_predecessor_callsite_input_rdi",
+      conflictingPredecessorCallsiteInputFunction,
+      conflictingPredecessorCallsiteRdi, "RDI");
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      conflictingPredecessorCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      conflictingPredecessorCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+              *conflictingPredecessorCallsiteInputFunction);
+  ok &= expect(!conflictingPredecessorCallsiteRewriteResult.Rewritten,
+               "input-only prototype with conflicting predecessors was rewritten");
+  ok &= expect(conflictingPredecessorCallsiteRewriteResult.Reason ==
+                   "unsafe callsite input value",
+               "conflicting predecessor callsite had wrong skip reason");
+  if (llvm::verifyModule(conflictingPredecessorCallsiteModule, &llvm::errs())) {
+    std::cerr << "conflicting predecessor callsite module verification failed\n";
     return EXIT_FAILURE;
   }
 
