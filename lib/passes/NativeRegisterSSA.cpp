@@ -275,6 +275,9 @@ private:
         AccessInfo access = registerStore(*store, Units);
         if (access.Unit != nullptr) {
           ++Summary.StoresSeen;
+          if (access.IsFullUnit) {
+            StoredFullUnits.insert(access.Unit->Global);
+          }
         }
         continue;
       }
@@ -595,7 +598,7 @@ private:
   }
 
   void attachRegisterEffectMetadata() {
-    if (AbiEffects.Unaffected.empty() || ExternalInputValue.empty()) {
+    if (AbiEffects.Unaffected.empty() && AbiEffects.KilledByCall.empty()) {
       Function.setMetadata("notdec.register.preserves", nullptr);
       Function.setMetadata("notdec.register.clobbers", nullptr);
       return;
@@ -604,7 +607,13 @@ private:
     llvm::LLVMContext &context = Function.getContext();
     std::vector<llvm::GlobalVariable *> preserved;
     std::vector<llvm::GlobalVariable *> clobbered;
+    std::set<llvm::GlobalVariable *> clobberedSet;
     for (auto &[global, unit] : Units) {
+      if (AbiEffects.KilledByCall.count(unit.Name) != 0 &&
+          StoredFullUnits.count(global) != 0 &&
+          clobberedSet.insert(global).second) {
+        clobbered.push_back(global);
+      }
       if (AbiEffects.Unaffected.count(unit.Name) == 0) {
         continue;
       }
@@ -618,7 +627,7 @@ private:
       }
       if (isPreservedOnAllReturns(unit, input)) {
         preserved.push_back(global);
-      } else {
+      } else if (clobberedSet.insert(global).second) {
         clobbered.push_back(global);
       }
     }
@@ -665,6 +674,7 @@ private:
   std::vector<llvm::LoadInst *> Loads;
   std::vector<llvm::Instruction *> PendingErase;
   std::vector<llvm::PHINode *> DeadPhis;
+  std::set<llvm::GlobalVariable *> StoredFullUnits;
   std::map<llvm::Value *, llvm::Value *> Replacement;
   std::map<BlockRegKey, llvm::Value *> EntryValue;
   std::map<BlockRegKey, llvm::Value *> ExitValue;

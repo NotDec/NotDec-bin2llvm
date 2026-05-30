@@ -33,6 +33,9 @@
   - [x] 清理本轮为空的 register effect metadata，避免 stale `external_inputs` / `preserves` / `clobbers`。
     - 记录：`03-function-register-effects/20260529-03-clear-stale-register-effect-metadata.md`
     - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+  - [x] 写过 ABI killedbycall register 的函数标成 clobber。
+    - 记录：`03-function-register-effects/20260529-04-killedbycall-register-clobbers.md`
+    - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
   - [x] 添加 preserved IR 小样例。
     - 文件：`tests/native_register_effects_test.cpp`
   - [x] 添加 clobber IR 小样例。

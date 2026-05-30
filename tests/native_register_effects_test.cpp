@@ -316,6 +316,9 @@ int main() {
   ok &= expect(metadataHasRegister(*clobbered, "notdec.register.clobbers",
                                    "RBX"),
                "clobbered RBX was not marked clobbered");
+  ok &= expect(metadataHasRegister(*callEffects, "notdec.register.clobbers",
+                                   "RAX"),
+               "written killed-by-call RAX was not marked clobbered");
   ok &= expect(countRegisterLoads(*callEffects, rbx) == 0,
                "RBX load after call was not propagated");
   ok &= expect(countRegisterLoads(*callEffects, rax) == 1,
