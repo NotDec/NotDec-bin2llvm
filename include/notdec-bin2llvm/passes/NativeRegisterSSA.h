@@ -25,6 +25,8 @@ struct NativeRegisterSSAFunctionSummary {
   uint64_t PhisSimplified = 0;
   uint64_t ExternalInputs = 0;
   uint64_t CallsSeen = 0;
+  uint64_t PreservedRegisters = 0;
+  uint64_t ClobberedRegisters = 0;
 };
 
 struct NativeRegisterSSASummary {
@@ -36,6 +38,8 @@ struct NativeRegisterSSASummary {
   uint64_t PhisSimplified = 0;
   uint64_t ExternalInputs = 0;
   uint64_t CallsSeen = 0;
+  uint64_t PreservedRegisters = 0;
+  uint64_t ClobberedRegisters = 0;
   std::vector<NativeRegisterSSAFunctionSummary> Functions;
 };
 

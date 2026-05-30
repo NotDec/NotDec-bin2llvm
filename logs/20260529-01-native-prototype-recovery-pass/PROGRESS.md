@@ -36,6 +36,9 @@
   - [x] 写过 ABI killedbycall register 的函数标成 clobber。
     - 记录：`03-function-register-effects/20260529-04-killedbycall-register-clobbers.md`
     - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+  - [x] RegisterSSA summary 统计 preserved / clobbered register 数。
+    - 记录：`03-function-register-effects/20260529-05-register-effect-summary-counts.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativeRegisterSSA.h`、`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
   - [x] 添加 preserved IR 小样例。
     - 文件：`tests/native_register_effects_test.cpp`
   - [x] 添加 clobber IR 小样例。

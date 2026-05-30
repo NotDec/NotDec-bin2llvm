@@ -296,7 +296,8 @@ int main() {
 
   notdec::bin2llvm::NativeRegisterSSAOptions options;
   options.EnableRewrite = true;
-  notdec::bin2llvm::runNativeRegisterSSA(module, options);
+  notdec::bin2llvm::NativeRegisterSSASummary summary =
+      notdec::bin2llvm::runNativeRegisterSSA(module, options);
 
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after register SSA\n";
@@ -319,6 +320,10 @@ int main() {
   ok &= expect(metadataHasRegister(*callEffects, "notdec.register.clobbers",
                                    "RAX"),
                "written killed-by-call RAX was not marked clobbered");
+  ok &= expect(summary.PreservedRegisters == 1,
+               "register effect summary had unexpected preserved count");
+  ok &= expect(summary.ClobberedRegisters == 3,
+               "register effect summary had unexpected clobber count");
   ok &= expect(countRegisterLoads(*callEffects, rbx) == 0,
                "RBX load after call was not propagated");
   ok &= expect(countRegisterLoads(*callEffects, rax) == 1,

@@ -636,6 +636,8 @@ private:
                          registerEffectMetadata(context, preserved));
     Function.setMetadata("notdec.register.clobbers",
                          registerEffectMetadata(context, clobbered));
+    Summary.PreservedRegisters = preserved.size();
+    Summary.ClobberedRegisters = clobbered.size();
   }
 
   bool isPreservedOnAllReturns(RegisterUnit &unit, llvm::Value *input) {
@@ -695,6 +697,8 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.PhisSimplified += function.PhisSimplified;
   total.ExternalInputs += function.ExternalInputs;
   total.CallsSeen += function.CallsSeen;
+  total.PreservedRegisters += function.PreservedRegisters;
+  total.ClobberedRegisters += function.ClobberedRegisters;
   total.Functions.push_back(function);
 }
 
@@ -779,6 +783,8 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
   os << "  phis simplified: " << summary.PhisSimplified << '\n';
   os << "  external inputs: " << summary.ExternalInputs << '\n';
   os << "  calls: " << summary.CallsSeen << '\n';
+  os << "  preserved registers: " << summary.PreservedRegisters << '\n';
+  os << "  clobbered registers: " << summary.ClobberedRegisters << '\n';
   for (const NativeRegisterSSAFunctionSummary &function : summary.Functions) {
     os << "  function " << function.FunctionName << ": loads="
        << function.LoadsSeen << " stores=" << function.StoresSeen
@@ -786,7 +792,9 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
        << " phis=" << function.PhisCreated
        << " simplified=" << function.PhisSimplified
        << " external_inputs=" << function.ExternalInputs
-       << " calls=" << function.CallsSeen << '\n';
+       << " calls=" << function.CallsSeen
+       << " preserved=" << function.PreservedRegisters
+       << " clobbered=" << function.ClobberedRegisters << '\n';
   }
 }
 
