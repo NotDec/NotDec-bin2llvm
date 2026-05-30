@@ -428,6 +428,17 @@ require_positive_prototype_metric() {
   fi
 }
 
+check_tsv_columns() {
+  local file="$1"
+  awk -F '\t' '
+    NR == 1 { expected = NF; next }
+    NF != expected {
+      printf "%s:%d: got %d columns, expected %d\n", FILENAME, NR, NF, expected > "/dev/stderr"
+      exit 1
+    }
+  ' "$file"
+}
+
 check_ir_features() {
   local name="$1"
   local ll="$2"
@@ -488,7 +499,7 @@ TARGET_PATHS=(
 mkdir -p "$OUT_DIR"
 echo "out_dir=$OUT_DIR"
 METRICS="$OUT_DIR/metrics.tsv"
-printf 'target\telapsed_seconds\tfunction_seeds\tseed_confidence_high\tseed_confidence_medium\tseed_confidence_low\tconfirmed_functions\tbasic_blocks\tinstructions\txrefs_total\txrefs_flow\txrefs_call\txrefs_data\txrefs_string\tunresolved_total\tunresolved_indirect_call\tunresolved_indirect_branch\n' \
+printf 'target\telapsed_seconds\tfunction_seeds\tseed_confidence_high\tseed_confidence_medium\tseed_confidence_low\tconfirmed_functions\tbasic_blocks\tinstructions\txrefs_total\txrefs_flow\txrefs_call\txrefs_data\txrefs_string\tunresolved_total\tunresolved_indirect_call\tunresolved_indirect_branch\tprototype_functions\tprototype_external_inputs\tprototype_input_candidates\tprototype_return_candidates\n' \
   >"$METRICS"
 HERITAGE_METRICS="$OUT_DIR/heritage-metrics.tsv"
 printf 'target\theritage_available\tfunctions\texternals\tfailures\tdirect_calls\tresolved_internal_calls\tresolved_external_calls\tunknown_calls\n' \
@@ -650,13 +661,15 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_summary_number "$unresolved_indirect_call" "$summary" "unresolved_indirect_flows.indirect call"
   require_summary_number "$unresolved_indirect_branch" "$summary" "unresolved_indirect_flows.indirect branch"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$name" "$elapsed_seconds" "$function_seeds" \
     "$seed_confidence_high" "$seed_confidence_medium" \
     "$seed_confidence_low" "$confirmed_functions" "$basic_blocks" \
     "$instructions" "$xrefs_total" "$xrefs_flow" "$xrefs_call" \
     "$xrefs_data" "$xrefs_string" "$unresolved_total" \
-    "$unresolved_indirect_call" "$unresolved_indirect_branch" >>"$METRICS"
+    "$unresolved_indirect_call" "$unresolved_indirect_branch" \
+    "$prototype_functions" "$prototype_external_inputs" \
+    "$prototype_input_candidates" "$prototype_return_candidates" >>"$METRICS"
 
   heritage_module="$BENCH2_IR_ROOT/$name/module-limit5.json"
   if [[ -f "$heritage_module" ]]; then
@@ -700,3 +713,5 @@ for index in "${!TARGET_NAMES[@]}"; do
 
   echo "$name ok elapsed=${elapsed_seconds}s summary=$summary ll=$ll"
 done
+
+check_tsv_columns "$METRICS"

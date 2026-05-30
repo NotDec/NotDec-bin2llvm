@@ -308,6 +308,9 @@
   - [x] Bench2 smoke 检查 prototype recovery summary 非零指标。
     - 记录：`06-pass-pipeline-and-verification/20260529-53-bench2-prototype-summary-smoke.md`
     - 文件：`scripts/bench2-native-smoke.sh`
+  - [x] Bench2 metrics 记录 prototype recovery summary 总数。
+    - 记录：`06-pass-pipeline-and-verification/20260529-54-bench2-prototype-summary-metrics.md`
+    - 文件：`scripts/bench2-native-smoke.sh`
 
 ## 记录规则
 
