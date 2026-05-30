@@ -1,6 +1,7 @@
 @RDI = external global i64, !notdec.register !0
 @RSI = external global i64, !notdec.register !13
 @RAX = external global i64, !notdec.register !3
+@RDX = external global i64, !notdec.register !18
 @SINK = external global i64
 
 define void @cli_input_rdi() !notdec.register.external_inputs !1 {
@@ -34,6 +35,13 @@ entry:
   ret void
 }
 
+define void @cli_return_rax_rdx() {
+entry:
+  store i64 22136, ptr @RDX, align 8, !notdec.register.access !19
+  store i64 4660, ptr @RAX, align 8, !notdec.register.access !4
+  ret void
+}
+
 !notdec.abi = !{!5}
 
 !0 = !{!"space=register", !"offset=0", !"size=8", !"name=RDI"}
@@ -45,7 +53,7 @@ entry:
 !6 = !{!7, !16}
 !7 = !{!"minsize=1", !"maxsize=8", !"align=8", !"metatype=", !8}
 !8 = !{!"kind=register", !"name=RDI", !"space=", !"offset=0"}
-!9 = !{!10}
+!9 = !{!10, !20}
 !10 = !{!"minsize=1", !"maxsize=8", !"align=8", !"metatype=", !11}
 !11 = !{!"kind=register", !"name=RAX", !"space=", !"offset=0"}
 !12 = !{}
@@ -54,3 +62,7 @@ entry:
 !15 = !{!2, !14}
 !16 = !{!"minsize=1", !"maxsize=8", !"align=8", !"metatype=", !17}
 !17 = !{!"kind=register", !"name=RSI", !"space=", !"offset=0"}
+!18 = !{!"space=register", !"offset=0", !"size=8", !"name=RDX"}
+!19 = !{!"base=RDX", !"space=register", !"offset=0", !"size=8", !"name=RDX"}
+!20 = !{!"minsize=1", !"maxsize=8", !"align=8", !"metatype=", !21}
+!21 = !{!"kind=register", !"name=RDX", !"space=", !"offset=0"}
