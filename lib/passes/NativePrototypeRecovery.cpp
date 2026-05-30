@@ -424,10 +424,102 @@ struct InputMultiReturnCallsiteCollectionResult {
   std::string FailureReason;
 };
 
+// This local call-effect check is only used to stop return-load search at an
+// intermediate call that overwrites the ABI return register.
+bool functionMetadataHasRegister(const llvm::Function &function,
+                                 llvm::StringRef metadataName,
+                                 llvm::StringRef registerName) {
+  llvm::MDNode *node = function.getMetadata(metadataName);
+  if (node == nullptr) {
+    return false;
+  }
+  std::string expected = ("name=" + registerName).str();
+  for (const llvm::MDOperand &operand : node->operands()) {
+    auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (entry == nullptr) {
+      continue;
+    }
+    for (const llvm::MDOperand &fieldOperand : entry->operands()) {
+      auto *field = llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+      if (field != nullptr && field->getString() == expected) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::set<std::string> collectAbiUnaffectedRegisters(llvm::Module &module) {
+  std::set<std::string> unaffected;
+  llvm::NamedMDNode *abiMetadata = module.getNamedMetadata("notdec.abi");
+  if (abiMetadata == nullptr) {
+    return unaffected;
+  }
+  for (llvm::MDNode *abiNode : abiMetadata->operands()) {
+    for (const llvm::MDOperand &operand : abiNode->operands()) {
+      auto *effectList = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+      if (effectList == nullptr) {
+        continue;
+      }
+      for (const llvm::MDOperand &effectOperand : effectList->operands()) {
+        auto *effectNode =
+            llvm::dyn_cast_or_null<llvm::MDNode>(effectOperand.get());
+        if (effectNode == nullptr ||
+            metadataField(*effectNode, "effect") !=
+                std::optional<std::string>("unaffected")) {
+          continue;
+        }
+        for (const llvm::MDOperand &storageOperand : effectNode->operands()) {
+          auto *storageNode =
+              llvm::dyn_cast_or_null<llvm::MDNode>(storageOperand.get());
+          if (storageNode == nullptr ||
+              metadataField(*storageNode, "kind") !=
+                  std::optional<std::string>("register")) {
+            continue;
+          }
+          std::optional<std::string> name = metadataField(*storageNode, "name");
+          if (name && !name->empty()) {
+            unaffected.insert(*name);
+          }
+        }
+      }
+    }
+  }
+  return unaffected;
+}
+
+bool callClobbersRegister(llvm::CallBase &call, llvm::StringRef registerName) {
+  llvm::Function *callee = call.getCalledFunction();
+  if (callee != nullptr && callee->isIntrinsic()) {
+    return false;
+  }
+  if (callee != nullptr && !callee->isDeclaration()) {
+    if (functionMetadataHasRegister(*callee, "notdec.register.preserves",
+                                    registerName)) {
+      return false;
+    }
+    if (functionMetadataHasRegister(*callee, "notdec.register.clobbers",
+                                    registerName)) {
+      return true;
+    }
+  }
+  llvm::Module *module = call.getModule();
+  if (module == nullptr) {
+    return true;
+  }
+  std::set<std::string> unaffected = collectAbiUnaffectedRegisters(*module);
+  return unaffected.count(registerName.str()) == 0;
+}
+
 ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
     llvm::BasicBlock::iterator iter, llvm::BasicBlock::iterator end,
     llvm::StringRef returnRegisterName) {
   for (; iter != end; ++iter) {
+    if (auto *call = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
+      if (callClobbersRegister(*call, returnRegisterName)) {
+        return {nullptr, false, true};
+      }
+    }
     std::optional<std::string> name;
     if (llvm::MDNode *metadata =
             iter->getMetadata("notdec.register.access")) {

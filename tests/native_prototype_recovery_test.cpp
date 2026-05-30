@@ -173,6 +173,32 @@ llvm::Function *createUnmarkedReturnLoadCallerFunction(
   return function;
 }
 
+llvm::Function *createIntermediateCallReturnLoadCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, const std::string &registerName,
+    llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::Function *intermediate =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             name + "_intermediate", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateCall(intermediate->getFunctionType(), intermediate);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            registerName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *loadOut = load;
+  return function;
+}
+
 llvm::Function *createTwoReturnLoadCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *firstOutput, const std::string &firstRegisterName,
@@ -2630,6 +2656,42 @@ int main() {
   if (llvm::verifyModule(unmarkedReturnCallsiteModule, &llvm::errs())) {
     std::cerr << "unmarked return callsite module verification failed after "
                  "rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module intermediateCallReturnCallsiteModule(
+      "native-prototype-return-intermediate-call-callsite-rewrite-test",
+      context);
+  llvm::GlobalVariable *intermediateCallReturnCallsiteRax =
+      createRegisterGlobal(intermediateCallReturnCallsiteModule, "RAX");
+  attachTestAbi(intermediateCallReturnCallsiteModule);
+  llvm::StoreInst *intermediateCallReturnCallsiteStore = nullptr;
+  llvm::Function *intermediateCallReturnCallsiteFunction =
+      createReturnStoreFunction(intermediateCallReturnCallsiteModule,
+                                "intermediate_call_callsite_return_rax",
+                                intermediateCallReturnCallsiteRax, "RAX",
+                                &intermediateCallReturnCallsiteStore);
+  llvm::LoadInst *intermediateCallReturnCallsiteLoad = nullptr;
+  createIntermediateCallReturnLoadCallerFunction(
+      intermediateCallReturnCallsiteModule,
+      "call_intermediate_call_callsite_return_rax",
+      intermediateCallReturnCallsiteFunction, intermediateCallReturnCallsiteRax,
+      "RAX", &intermediateCallReturnCallsiteLoad);
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      intermediateCallReturnCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      intermediateCallReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *intermediateCallReturnCallsiteFunction);
+  ok &= expect(intermediateCallReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype with intermediate clobbering call was "
+               "not rewritten");
+  ok &= expect(!intermediateCallReturnCallsiteLoad->use_empty(),
+               "intermediate-call return register load was unexpectedly "
+               "replaced");
+  if (llvm::verifyModule(intermediateCallReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "intermediate call return callsite module verification failed "
+                 "after rewrite\n";
     return EXIT_FAILURE;
   }
 
