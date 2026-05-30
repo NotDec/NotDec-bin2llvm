@@ -534,6 +534,37 @@ llvm::Function *createInputStoreUniquePredecessorCallerFunction(
   return function;
 }
 
+llvm::Function *createInputStoreLinearPredecessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *input, const std::string &registerName,
+    llvm::CallInst **callOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *middle =
+      llvm::BasicBlock::Create(context, "before_call", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *argument = llvm::ConstantInt::get(input->getValueType(), 0x789a);
+  llvm::StoreInst *store = builder.CreateStore(argument, input);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
+  builder.CreateBr(middle);
+
+  builder.SetInsertPoint(middle);
+  builder.CreateBr(callBlock);
+
+  builder.SetInsertPoint(callBlock);
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+  *callOut = call;
+  return function;
+}
+
 llvm::Function *createInputStoreReturnLoadCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *input, const std::string &inputRegisterName,
@@ -1809,6 +1840,66 @@ int main() {
                "predecessor callsite argument did not use register store value");
   if (llvm::verifyModule(predecessorCallsiteModule, &llvm::errs())) {
     std::cerr << "predecessor callsite module verification failed after "
+                 "input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module linearPredecessorCallsiteModule(
+      "native-prototype-input-linear-predecessor-callsite-rewrite-test",
+      context);
+  llvm::GlobalVariable *linearPredecessorCallsiteRdi =
+      createRegisterGlobal(linearPredecessorCallsiteModule, "RDI");
+  attachTestAbi(linearPredecessorCallsiteModule);
+  llvm::LoadInst *linearPredecessorCallsiteInputLoad = nullptr;
+  llvm::Function *linearPredecessorCallsiteInputFunction =
+      createUsedExternalInputFunction(linearPredecessorCallsiteModule,
+                                      "linear_predecessor_callsite_input_rdi",
+                                      linearPredecessorCallsiteRdi, "RDI",
+                                      &linearPredecessorCallsiteInputLoad);
+  attachExternalInputs(*linearPredecessorCallsiteInputFunction,
+                       {{"RDI", linearPredecessorCallsiteRdi}});
+  llvm::CallInst *oldLinearPredecessorCallsiteCall = nullptr;
+  createInputStoreLinearPredecessorCallerFunction(
+      linearPredecessorCallsiteModule,
+      "call_linear_predecessor_callsite_input_rdi",
+      linearPredecessorCallsiteInputFunction, linearPredecessorCallsiteRdi,
+      "RDI", &oldLinearPredecessorCallsiteCall);
+  notdec::bin2llvm::runNativePrototypeRecovery(linearPredecessorCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      linearPredecessorCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+              *linearPredecessorCallsiteInputFunction);
+  ok &= expect(linearPredecessorCallsiteRewriteResult.Rewritten,
+               "input-only prototype with linear predecessor callsite was not rewritten");
+  linearPredecessorCallsiteInputFunction =
+      linearPredecessorCallsiteRewriteResult.Function;
+  llvm::CallInst *rewrittenLinearPredecessorCallsiteCall = nullptr;
+  llvm::Function *linearPredecessorCallsiteCaller =
+      linearPredecessorCallsiteModule.getFunction(
+          "call_linear_predecessor_callsite_input_rdi");
+  if (linearPredecessorCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *linearPredecessorCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr && call->getCalledFunction() ==
+                                   linearPredecessorCallsiteInputFunction) {
+          rewrittenLinearPredecessorCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenLinearPredecessorCallsiteCall != nullptr,
+               "linear predecessor callsite was not rewritten to new callee");
+  ok &= expect(rewrittenLinearPredecessorCallsiteCall != nullptr &&
+                   rewrittenLinearPredecessorCallsiteCall->arg_size() == 1,
+               "linear predecessor callsite did not get one argument");
+  ok &= expect(rewrittenLinearPredecessorCallsiteCall != nullptr &&
+                   llvm::isa<llvm::ConstantInt>(
+                       rewrittenLinearPredecessorCallsiteCall->getArgOperand(0)),
+               "linear predecessor callsite argument did not use register store value");
+  if (llvm::verifyModule(linearPredecessorCallsiteModule, &llvm::errs())) {
+    std::cerr << "linear predecessor callsite module verification failed after "
                  "input-only rewrite\n";
     return EXIT_FAILURE;
   }

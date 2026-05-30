@@ -341,6 +341,9 @@
   - [x] module 级显式签名重写按 direct callee 优先处理。
     - 记录：`06-pass-pipeline-and-verification/20260529-56-callee-first-signature-rewrite.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] callsite input 参数值查找支持线性唯一前驱链。
+    - 记录：`06-pass-pipeline-and-verification/20260529-57-callsite-input-linear-predecessor-chain.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

@@ -259,19 +259,41 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
     return localValue;
   }
 
-  llvm::BasicBlock *predecessor = nullptr;
-  for (llvm::BasicBlock *candidate : llvm::predecessors(call.getParent())) {
-    if (predecessor != nullptr) {
+  std::set<llvm::BasicBlock *> visited;
+  llvm::BasicBlock *current = call.getParent();
+  while (visited.insert(current).second) {
+    llvm::BasicBlock *predecessor = nullptr;
+    for (llvm::BasicBlock *candidate : llvm::predecessors(current)) {
+      if (predecessor != nullptr) {
+        return std::nullopt;
+      }
+      predecessor = candidate;
+    }
+    if (predecessor == nullptr) {
       return std::nullopt;
     }
-    predecessor = candidate;
+
+    llvm::BasicBlock *successor = nullptr;
+    for (llvm::BasicBlock *candidate : llvm::successors(predecessor)) {
+      if (successor != nullptr) {
+        return std::nullopt;
+      }
+      successor = candidate;
+    }
+    if (successor != current) {
+      return std::nullopt;
+    }
+
+    std::optional<llvm::Value *> predecessorValue =
+        registerStoreValueInReverseRange(predecessor->rbegin(),
+                                         predecessor->rend(), registerName,
+                                         paramType);
+    if (predecessorValue) {
+      return predecessorValue;
+    }
+    current = predecessor;
   }
-  if (predecessor == nullptr) {
-    return std::nullopt;
-  }
-  return registerStoreValueInReverseRange(predecessor->rbegin(),
-                                          predecessor->rend(), registerName,
-                                          paramType);
+  return std::nullopt;
 }
 
 // Multi-input form of Ghidra FuncCallSpecs::buildInputFromTrials(...): keep
