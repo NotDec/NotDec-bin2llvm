@@ -122,6 +122,15 @@ std::optional<std::string> returnValueKey(llvm::Value &value) {
   return std::nullopt;
 }
 
+bool sameReturnStoreValue(llvm::Value &first, llvm::Value &second) {
+  if (&first == &second) {
+    return true;
+  }
+  std::optional<std::string> firstKey = returnValueKey(first);
+  std::optional<std::string> secondKey = returnValueKey(second);
+  return firstKey && secondKey && *firstKey == *secondKey;
+}
+
 bool hasActiveExternalInputUse(llvm::Function &function,
                                llvm::StringRef registerName) {
   bool sawExternalInputLoad = false;
@@ -1123,17 +1132,12 @@ getNativePrototypeReturnBindings(llvm::Function &function) {
       bindings.push_back(std::move(binding));
       continue;
     }
-    std::optional<std::string> firstKey = returnValueKey(*binding.ReturnValue);
-    if (!firstKey) {
-      return std::nullopt;
-    }
     for (llvm::StoreInst *store : stores) {
       llvm::Value *value = store->getValueOperand();
       if (value == nullptr || value->getType() != binding.ReturnValue->getType()) {
         return std::nullopt;
       }
-      std::optional<std::string> key = returnValueKey(*value);
-      if (!key || *key != *firstKey) {
+      if (!sameReturnStoreValue(*binding.ReturnValue, *value)) {
         return std::nullopt;
       }
     }

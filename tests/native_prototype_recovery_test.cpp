@@ -884,6 +884,43 @@ llvm::Function *createTwoReturnStoreFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createTwoReturnSameValueStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+
+  llvm::IRBuilder<> builder(entry);
+  llvm::AllocaInst *local =
+      builder.CreateAlloca(global->getValueType(), nullptr, "local");
+  builder.CreateStore(llvm::ConstantInt::get(global->getValueType(), 0x2222),
+                      local);
+  llvm::Value *loaded = builder.CreateLoad(global->getValueType(), local);
+  llvm::Value *value = builder.CreateAdd(
+      loaded, llvm::ConstantInt::get(global->getValueType(), 1));
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(value, global);
+  leftStore->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(right);
+  llvm::StoreInst *rightStore = builder.CreateStore(value, global);
+  rightStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+
+  return function;
+}
+
 llvm::Function *createPartialReturnStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName) {
@@ -1364,6 +1401,10 @@ int main() {
       createReturnStoreFunction(module, "return_rbx", rbx, "RBX");
   llvm::Function *twoReturnFunction =
       createTwoReturnStoreFunction(module, "return_rax_twice", rax, "RAX");
+  llvm::Function *sameValueReturnFunction =
+      createTwoReturnSameValueStoreFunction(module,
+                                            "return_rax_same_value_twice", rax,
+                                            "RAX");
   llvm::Function *partialReturnFunction =
       createPartialReturnStoreFunction(module, "return_rax_partial", rax,
                                        "RAX");
@@ -1455,16 +1496,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 31, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 32, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 18,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 15,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 17,
+  ok &= expect(summary.ReturnCandidates == 18,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 21,
+  ok &= expect(summary.RewriteEligibleFunctions == 22,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 20,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 21,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -2047,6 +2088,18 @@ int main() {
     ok &= expect((*duplicateReturnBindings)[0].ReturnStores.size() == 2,
                  "duplicate return stores had wrong store list size");
   }
+  std::optional<std::vector<notdec::bin2llvm::NativePrototypeReturnBinding>>
+      sameValueReturnBindings =
+          notdec::bin2llvm::getNativePrototypeReturnBindings(
+              *sameValueReturnFunction);
+  ok &= expect(sameValueReturnBindings.has_value(),
+               "same-value duplicate return stores were not bound");
+  if (sameValueReturnBindings) {
+    ok &= expect(sameValueReturnBindings->size() == 1,
+                 "same-value duplicate return stores had wrong binding count");
+    ok &= expect((*sameValueReturnBindings)[0].ReturnStores.size() == 2,
+                 "same-value duplicate return stores had wrong store list size");
+  }
   ok &= expect(!notdec::bin2llvm::getNativePrototypeReturnBindings(
                     *conflictingReturnFunction),
                "conflicting return stores were incorrectly bound");
@@ -2063,6 +2116,21 @@ int main() {
                "rewritten duplicate-return function type was not i64()");
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after duplicate-return rewrite\n";
+    return EXIT_FAILURE;
+  }
+  notdec::bin2llvm::NativePrototypeRewriteResult sameValueReturnRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+          *sameValueReturnFunction);
+  ok &= expect(sameValueReturnRewriteResult.Rewritten,
+               "same-value duplicate return stores were not rewritten");
+  sameValueReturnFunction = sameValueReturnRewriteResult.Function;
+  ok &= expect(sameValueReturnFunction != nullptr &&
+                   functionTypeShape(*sameValueReturnFunction->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef<llvm::Type *>{}),
+               "rewritten same-value duplicate-return function type was not i64()");
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after same-value return rewrite\n";
     return EXIT_FAILURE;
   }
   notdec::bin2llvm::NativePrototypeRewriteResult usedRewriteResult =

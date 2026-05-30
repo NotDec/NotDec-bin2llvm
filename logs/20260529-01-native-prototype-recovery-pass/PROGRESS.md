@@ -347,6 +347,9 @@
   - [x] return binding 支持同值多 return store。
     - 记录：`06-pass-pipeline-and-verification/20260529-58-return-binding-equivalent-stores.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] return binding 支持同一 LLVM Value 的多 return store。
+    - 记录：`06-pass-pipeline-and-verification/20260529-59-return-binding-same-value-stores.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
