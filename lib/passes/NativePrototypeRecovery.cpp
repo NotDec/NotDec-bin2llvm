@@ -1027,6 +1027,12 @@ void eraseReturnBindingStores(
   }
 }
 
+void clearTransientPrototypeRecoveryMetadata(llvm::Function &function) {
+  function.setMetadata("notdec.register.external_inputs", nullptr);
+  function.setMetadata("notdec.prototype.input_candidates", nullptr);
+  function.setMetadata("notdec.prototype.return_candidates", nullptr);
+}
+
 NativePrototypeRewriteResult
 rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
   NativePrototypeRewriteResult result;
@@ -1094,6 +1100,7 @@ rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
       *recoveredType, function.getLinkage(), originalName, module);
   rewritten->copyAttributesFrom(&function);
   rewritten->copyMetadata(&function, 0);
+  clearTransientPrototypeRecoveryMetadata(*rewritten);
   rewritten->setCallingConv(function.getCallingConv());
   rewritten->splice(rewritten->end(), &function);
 
@@ -1193,6 +1200,7 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
       *recoveredType, function.getLinkage(), originalName, module);
   rewritten->copyAttributesFrom(&function);
   rewritten->copyMetadata(&function, 0);
+  clearTransientPrototypeRecoveryMetadata(*rewritten);
   rewritten->setCallingConv(function.getCallingConv());
   rewritten->splice(rewritten->end(), &function);
 
@@ -1313,6 +1321,7 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
       *recoveredType, function.getLinkage(), originalName, module);
   rewritten->copyAttributesFrom(&function);
   rewritten->copyMetadata(&function, 0);
+  clearTransientPrototypeRecoveryMetadata(*rewritten);
   rewritten->setCallingConv(function.getCallingConv());
   rewritten->splice(rewritten->end(), &function);
 
@@ -1421,6 +1430,7 @@ rewriteNativeRecoveredPrototypeMultiReturn(llvm::Function &function) {
       *recoveredType, function.getLinkage(), originalName, module);
   rewritten->copyAttributesFrom(&function);
   rewritten->copyMetadata(&function, 0);
+  clearTransientPrototypeRecoveryMetadata(*rewritten);
   rewritten->setCallingConv(function.getCallingConv());
   rewritten->splice(rewritten->end(), &function);
 
@@ -1547,6 +1557,7 @@ rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
       *recoveredType, function.getLinkage(), originalName, module);
   rewritten->copyAttributesFrom(&function);
   rewritten->copyMetadata(&function, 0);
+  clearTransientPrototypeRecoveryMetadata(*rewritten);
   rewritten->setCallingConv(function.getCallingConv());
   rewritten->splice(rewritten->end(), &function);
 

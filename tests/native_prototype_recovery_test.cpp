@@ -1464,6 +1464,16 @@ int main() {
   }
   ok &= expect(!sawInputLoadAfterRewrite,
                "rewritten input-only function kept old input load");
+  ok &= expect(bindableInputFunction != nullptr &&
+                   bindableInputFunction->getMetadata(
+                       "notdec.register.external_inputs") == nullptr &&
+                   bindableInputFunction->getMetadata(
+                       "notdec.prototype.input_candidates") == nullptr,
+               "rewritten input-only function kept transient input metadata");
+  ok &= expect(bindableInputFunction != nullptr &&
+                   bindableInputFunction->getMetadata(
+                       "notdec.prototype.recovered") != nullptr,
+               "rewritten input-only function lost recovered prototype metadata");
 
   llvm::Module callsiteModule("native-prototype-input-callsite-rewrite-test",
                               context);
@@ -1838,6 +1848,14 @@ int main() {
   ok &= expect(returnCallsiteFunction != nullptr &&
                    !hasRegisterStore(*returnCallsiteFunction, "RAX"),
                "callsite rewritten return function kept old RAX store");
+  ok &= expect(returnCallsiteFunction != nullptr &&
+                   returnCallsiteFunction->getMetadata(
+                       "notdec.prototype.return_candidates") == nullptr,
+               "callsite rewritten return function kept transient return metadata");
+  ok &= expect(returnCallsiteFunction != nullptr &&
+                   returnCallsiteFunction->getMetadata(
+                       "notdec.prototype.recovered") != nullptr,
+               "callsite rewritten return function lost recovered prototype metadata");
   llvm::CallInst *rewrittenReturnCallsiteCall = nullptr;
   llvm::Function *returnCallsiteCaller =
       returnCallsiteModule.getFunction("call_callsite_return_rax");
