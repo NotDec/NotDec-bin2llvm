@@ -402,6 +402,8 @@ struct ReturnOnlyCallsiteCollectionResult {
 
 struct MultiReturnCallsiteRewrite {
   llvm::CallInst *Call = nullptr;
+  // Kept ABI-slot aligned.  A null entry means the caller does not use that
+  // return component before it is overwritten or before control leaves the path.
   std::vector<llvm::LoadInst *> ReturnLoads;
 };
 
@@ -416,6 +418,7 @@ struct MultiReturnCallsiteCollectionResult {
 struct InputMultiReturnCallsiteRewrite {
   llvm::CallInst *Call = nullptr;
   std::vector<llvm::Value *> Arguments;
+  // Same slot order as the recovered returns; null entries are unused results.
   std::vector<llvm::LoadInst *> ReturnLoads;
 };
 
@@ -720,8 +723,9 @@ MultiReturnCallsiteCollectionResult collectMultiReturnDirectCallsites(
     for (uint64_t index = 0; index < returns.size(); ++index) {
       ReturnLoadSearchResult loadResult =
           findCallsiteReturnLoad(*call, returns[index].RegisterName);
-      if (loadResult.Blocked || loadResult.Load == nullptr ||
-          loadResult.Load->getType() != returnType.getElementType(index)) {
+      if (loadResult.Blocked ||
+          (loadResult.Load != nullptr &&
+           loadResult.Load->getType() != returnType.getElementType(index))) {
         result.FailureReason = "unsafe callsite return load";
         return result;
       }
@@ -742,6 +746,9 @@ void rewriteMultiReturnDirectCallsites(
     newCall->setCallingConv(callsite.Call->getCallingConv());
     for (uint64_t index = 0; index < callsite.ReturnLoads.size(); ++index) {
       llvm::LoadInst *load = callsite.ReturnLoads[index];
+      if (load == nullptr) {
+        continue;
+      }
       llvm::Value *field =
           builder.CreateExtractValue(newCall, {static_cast<unsigned>(index)});
       load->replaceAllUsesWith(field);
@@ -785,8 +792,9 @@ collectInputMultiReturnDirectCallsites(
     for (uint64_t index = 0; index < returns.size(); ++index) {
       ReturnLoadSearchResult loadResult =
           findCallsiteReturnLoad(*call, returns[index].RegisterName);
-      if (loadResult.Blocked || loadResult.Load == nullptr ||
-          loadResult.Load->getType() != returnType.getElementType(index)) {
+      if (loadResult.Blocked ||
+          (loadResult.Load != nullptr &&
+           loadResult.Load->getType() != returnType.getElementType(index))) {
         result.FailureReason = "unsafe callsite return load";
         return result;
       }
@@ -807,6 +815,9 @@ void rewriteInputMultiReturnDirectCallsites(
     newCall->setCallingConv(callsite.Call->getCallingConv());
     for (uint64_t index = 0; index < callsite.ReturnLoads.size(); ++index) {
       llvm::LoadInst *load = callsite.ReturnLoads[index];
+      if (load == nullptr) {
+        continue;
+      }
       llvm::Value *field =
           builder.CreateExtractValue(newCall, {static_cast<unsigned>(index)});
       load->replaceAllUsesWith(field);

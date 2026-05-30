@@ -266,6 +266,40 @@ llvm::Function *createInputStoreTwoReturnLoadCallerFunction(
   return function;
 }
 
+llvm::Function *createInputStoreIntermediateReturnLoadCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *input, const std::string &inputRegisterName,
+    llvm::GlobalVariable *output, const std::string &outputRegisterName,
+    llvm::CallInst **callOut, llvm::LoadInst **loadOut,
+    llvm::Value **argumentOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::Function *intermediate =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             name + "_intermediate", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *argument = llvm::ConstantInt::get(input->getValueType(), 0x2468);
+  llvm::StoreInst *store = builder.CreateStore(argument, input);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, inputRegisterName));
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateCall(intermediate->getFunctionType(), intermediate);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            outputRegisterName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, outputRegisterName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *callOut = call;
+  *loadOut = load;
+  *argumentOut = argument;
+  return function;
+}
+
 llvm::Function *createTwoInputStoreTwoReturnLoadCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *firstInput, const std::string &firstInputName,
@@ -1683,6 +1717,19 @@ int main() {
       module, "call_input_rdi_return_rdx_rax", inputTwoOutputFunction, rdi,
       "RDI", rax, "RAX", rdx, "RDX", &inputTwoOutputOldCall,
       &inputTwoOutputRaxLoad, &inputTwoOutputRdxLoad);
+  llvm::Function *unusedInputTwoOutputFunction =
+      createInputTwoOutputReturnStoreFunction(
+          module, "input_rdi_return_rdx_rax_unused", rdi, "RDI", rdx, "RDX",
+          rax, "RAX");
+  attachExternalInputs(*unusedInputTwoOutputFunction, {{"RDI", rdi}});
+  llvm::CallInst *unusedInputTwoOutputOldCall = nullptr;
+  llvm::LoadInst *unusedInputTwoOutputRaxLoad = nullptr;
+  llvm::Value *unusedInputTwoOutputArgument = nullptr;
+  createInputStoreIntermediateReturnLoadCallerFunction(
+      module, "call_input_rdi_return_rdx_rax_unused",
+      unusedInputTwoOutputFunction, rdi, "RDI", rax, "RAX",
+      &unusedInputTwoOutputOldCall, &unusedInputTwoOutputRaxLoad,
+      &unusedInputTwoOutputArgument);
   llvm::Function *multiInputTwoOutputFunction =
       createTwoInputTwoOutputReturnStoreFunction(
           module, "input_rdi_rsi_return_rdx_rax", rdi, "RDI", rsi, "RSI",
@@ -1738,16 +1785,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 34, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 18,
+  ok &= expect(summary.FunctionsSeen == 36, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 19,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 15,
+  ok &= expect(summary.InputCandidates == 16,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 20,
+  ok &= expect(summary.ReturnCandidates == 22,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 24,
+  ok &= expect(summary.RewriteEligibleFunctions == 25,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 23,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 24,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -3557,6 +3604,53 @@ int main() {
                "input multi-return callsite did not extract both fields");
   ok &= expect(!sawOldInputMultiReturnLoad,
                "input multi-return callsite kept old return register load");
+
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      unusedInputMultiReturnRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+              *unusedInputTwoOutputFunction);
+  ok &= expect(unusedInputMultiReturnRewriteResult.Rewritten,
+               "unused input multi-return prototype was not rewritten");
+  unusedInputTwoOutputFunction = unusedInputMultiReturnRewriteResult.Function;
+  llvm::Function *unusedInputTwoOutputCaller =
+      module.getFunction("call_input_rdi_return_rdx_rax_unused");
+  llvm::CallInst *rewrittenUnusedInputMultiReturnCall = nullptr;
+  uint64_t unusedInputMultiReturnExtracts = 0;
+  if (unusedInputTwoOutputCaller != nullptr) {
+    for (llvm::BasicBlock &block : *unusedInputTwoOutputCaller) {
+      for (llvm::Instruction &instruction : block) {
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          if (call->getCalledFunction() == unusedInputTwoOutputFunction) {
+            rewrittenUnusedInputMultiReturnCall = call;
+          }
+        }
+        if (llvm::isa<llvm::ExtractValueInst>(&instruction)) {
+          ++unusedInputMultiReturnExtracts;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenUnusedInputMultiReturnCall != nullptr,
+               "unused input multi-return callsite was not rewritten to new callee");
+  ok &= expect(rewrittenUnusedInputMultiReturnCall != nullptr &&
+                   rewrittenUnusedInputMultiReturnCall->arg_size() == 1,
+               "unused input multi-return callsite did not get one argument");
+  ok &= expect(rewrittenUnusedInputMultiReturnCall != nullptr &&
+                   unusedInputTwoOutputArgument ==
+                       rewrittenUnusedInputMultiReturnCall->getArgOperand(0),
+               "unused input multi-return callsite argument was not preserved");
+  ok &= expect(rewrittenUnusedInputMultiReturnCall != nullptr &&
+                   llvm::isa<llvm::StructType>(
+                       rewrittenUnusedInputMultiReturnCall->getType()),
+               "unused input multi-return direct call did not return struct");
+  ok &= expect(rewrittenUnusedInputMultiReturnCall != nullptr &&
+                   rewrittenUnusedInputMultiReturnCall->use_empty(),
+               "unused input multi-return call result was unexpectedly used");
+  ok &= expect(unusedInputMultiReturnExtracts == 0,
+               "unused input multi-return callsite extracted unused fields");
+  ok &= expect(unusedInputTwoOutputRaxLoad != nullptr &&
+                   !unusedInputTwoOutputRaxLoad->use_empty(),
+               "intermediate-call return load was unexpectedly replaced");
 
   notdec::bin2llvm::NativePrototypeRewriteResult
       multiInputMultiReturnRewriteResult =
