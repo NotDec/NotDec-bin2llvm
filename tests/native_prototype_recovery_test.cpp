@@ -2829,11 +2829,20 @@ int main() {
       "call_multi_successor_callsite_return_rax",
       multiSuccessorReturnCallsiteFunction, multiSuccessorReturnCallsiteRax,
       "RAX", &multiSuccessorReturnCallsiteLoad);
-  if (!expectReturnOnlyRewriteRejected(
-          multiSuccessorReturnCallsiteModule,
-          *multiSuccessorReturnCallsiteFunction,
-          multiSuccessorReturnCallsiteLoad,
-          "return-only prototype rewrite accepted multi-successor callsite")) {
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      multiSuccessorReturnCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      multiSuccessorReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *multiSuccessorReturnCallsiteFunction);
+  ok &= expect(multiSuccessorReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype rewrite rejected mixed multi-successor "
+               "callsite");
+  ok &= expect(multiSuccessorReturnCallsiteLoad->use_empty(),
+               "mixed multi-successor return load was not replaced");
+  if (llvm::verifyModule(multiSuccessorReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "mixed multi-successor return callsite module verification "
+                 "failed after rewrite\n";
     return EXIT_FAILURE;
   }
 
@@ -3869,9 +3878,9 @@ int main() {
       notdec::bin2llvm::rewriteNativeRecoveredPrototypes(batchModule);
   ok &= expect(batchRewriteSummary.FunctionsSeen == 11,
                "batch rewrite saw unexpected function count");
-  ok &= expect(batchRewriteSummary.FunctionsRewritten == 3,
+  ok &= expect(batchRewriteSummary.FunctionsRewritten == 4,
                "batch rewrite rewrote unexpected function count");
-  ok &= expect(batchRewriteSummary.FunctionsSkipped == 8,
+  ok &= expect(batchRewriteSummary.FunctionsSkipped == 7,
                "batch rewrite skipped unexpected function count");
   ok &= expect(batchRewriteSummary.SkippedByReason["already matches"] == 1,
                "batch rewrite did not count already-matches skip reason");
@@ -3881,7 +3890,7 @@ int main() {
       batchRewriteSummary.SkippedByReason["missing recovered prototype"] == 4,
       "batch rewrite did not count missing-prototype skip reason");
   ok &= expect(
-      batchRewriteSummary.SkippedByReason["unsafe callsite return load"] == 1,
+      batchRewriteSummary.SkippedByReason["unsafe callsite return load"] == 0,
       "batch rewrite did not count unsafe-return-load skip reason");
   ok &= expect(
       batchRewriteSummary.SkippedByReason["unsafe callsite input value"] == 2,

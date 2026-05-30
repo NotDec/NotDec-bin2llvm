@@ -368,6 +368,9 @@
   - [x] signature rewrite summary 输出每个函数的重写结果和跳过原因。
     - 记录：`06-pass-pipeline-and-verification/20260529-65-signature-rewrite-function-reasons.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] callsite return 支持直接多后继中单个后继读取返回寄存器的形状。
+    - 记录：`06-pass-pipeline-and-verification/20260529-66-callsite-return-mixed-multi-successor.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

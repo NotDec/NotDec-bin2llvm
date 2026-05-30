@@ -444,36 +444,35 @@ ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
   return {};
 }
 
-bool blockHasNoReturnRegisterAccess(llvm::BasicBlock &block,
-                                    llvm::StringRef returnRegisterName) {
-  for (llvm::Instruction &instruction : block) {
-    llvm::MDNode *metadata =
-        instruction.getMetadata("notdec.register.access");
-    if (metadata == nullptr) {
-      continue;
-    }
-    std::optional<std::string> name = metadataField(*metadata, "name");
-    if (name && *name == returnRegisterName) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool allSuccessorsEndWithoutReturnRegisterAccess(
+ReturnLoadSearchResult findMixedSuccessorReturnLoad(
     llvm::BasicBlock &block, llvm::StringRef returnRegisterName) {
+  llvm::LoadInst *load = nullptr;
   uint64_t successorCount = 0;
+  // A call result dominates each direct successor.  Keep this narrow: one
+  // successor may read the return register, the rest must end without touching it.
   for (llvm::BasicBlock *successor : llvm::successors(&block)) {
     ++successorCount;
+    ReturnLoadSearchResult successorResult = findReturnLoadBeforeStoreInRange(
+        successor->begin(), successor->end(), returnRegisterName);
+    if (successorResult.Blocked) {
+      return {nullptr, true};
+    }
+    if (successorResult.Load != nullptr) {
+      if (load != nullptr) {
+        return {nullptr, true};
+      }
+      load = successorResult.Load;
+      continue;
+    }
     if (successor->getTerminator() == nullptr ||
         successor->getTerminator()->getNumSuccessors() != 0) {
-      return false;
-    }
-    if (!blockHasNoReturnRegisterAccess(*successor, returnRegisterName)) {
-      return false;
+      return {nullptr, true};
     }
   }
-  return successorCount > 1;
+  if (successorCount <= 1) {
+    return {};
+  }
+  return {load, false};
 }
 
 ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
@@ -491,11 +490,7 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
     llvm::BasicBlock *successor = nullptr;
     for (llvm::BasicBlock *candidate : llvm::successors(current)) {
       if (successor != nullptr) {
-        if (allSuccessorsEndWithoutReturnRegisterAccess(
-                *current, returnRegisterName)) {
-          return {};
-        }
-        return {nullptr, true};
+        return findMixedSuccessorReturnLoad(*current, returnRegisterName);
       }
       successor = candidate;
     }
