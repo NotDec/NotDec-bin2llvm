@@ -16,6 +16,14 @@ entry:
   ret void
 }
 
+define void @cli_input_rdi_return_rax() !notdec.register.external_inputs !1 {
+entry:
+  %RDI.external_input = load i64, ptr @RDI, align 8, !notdec.register.external_input !2
+  %ret = add i64 %RDI.external_input, 2
+  store i64 %ret, ptr @RAX, align 8, !notdec.register.access !4
+  ret void
+}
+
 !notdec.abi = !{!5}
 
 !0 = !{!"space=register", !"offset=0", !"size=8", !"name=RDI"}
