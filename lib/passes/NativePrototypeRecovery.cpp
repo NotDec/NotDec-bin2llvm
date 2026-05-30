@@ -737,7 +737,7 @@ readRecoveredParamList(const llvm::MDNode &node) {
     }
     std::optional<std::string> name = metadataField(*entry, "name");
     std::optional<uint64_t> slot = parseUint64Field(*entry, "slot");
-    if (!name || !slot) {
+    if (!name || name->empty() || !slot) {
       return std::nullopt;
     }
     if (previousSlot && *slot <= *previousSlot) {
@@ -928,7 +928,7 @@ readNativeRecoveredPrototypeMetadata(const llvm::Function &function) {
   }
 
   std::optional<std::string> model = metadataField(*node, "model");
-  if (!model) {
+  if (!model || model->empty()) {
     return std::nullopt;
   }
   std::optional<uint64_t> inputCount = parseUint64Field(*node, "input_count");

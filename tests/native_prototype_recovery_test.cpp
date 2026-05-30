@@ -2911,6 +2911,40 @@ int main() {
                     *duplicateReturnSlotFunction),
                "duplicate recovered prototype return slots were read");
 
+  llvm::Module emptyFieldModule(
+      "native-prototype-empty-recovered-field-test", context);
+  llvm::Function *emptyModelFunction =
+      createFunction(emptyFieldModule, "empty_recovered_model");
+  emptyModelFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "", {{"RDI", 0}}, {}));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *emptyModelFunction),
+               "empty recovered prototype model was read");
+  notdec::bin2llvm::NativePrototypeRewriteEligibility emptyModelEligibility =
+      notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+          *emptyModelFunction);
+  ok &= expect(!emptyModelEligibility.Eligible,
+               "empty recovered model was incorrectly rewrite eligible");
+  ok &= expect(emptyModelEligibility.Reason == "missing recovered prototype",
+               "empty recovered model had unexpected ineligible reason");
+  llvm::Function *emptyInputNameFunction =
+      createFunction(emptyFieldModule, "empty_recovered_input_name");
+  emptyInputNameFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {{"", 0}}, {}));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *emptyInputNameFunction),
+               "empty recovered prototype input name was read");
+  llvm::Function *emptyReturnNameFunction =
+      createFunction(emptyFieldModule, "empty_recovered_return_name");
+  emptyReturnNameFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {{"", 0}}));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *emptyReturnNameFunction),
+               "empty recovered prototype return name was read");
+
   llvm::Module batchModule("native-prototype-batch-rewrite-test", context);
   llvm::GlobalVariable *batchRdi = createRegisterGlobal(batchModule, "RDI");
   llvm::GlobalVariable *batchRax = createRegisterGlobal(batchModule, "RAX");

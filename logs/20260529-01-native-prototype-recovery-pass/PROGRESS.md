@@ -146,6 +146,9 @@
   - [x] 读回 recovered prototype metadata 时校验 slot 顺序。
     - 记录：`05-input-output-candidates/20260529-29-recovered-metadata-slot-order-validation.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 读回 recovered prototype metadata 时拒绝空 model / register name。
+    - 记录：`05-input-output-candidates/20260529-30-recovered-metadata-nonempty-fields.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。
