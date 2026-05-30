@@ -428,6 +428,17 @@ require_positive_prototype_metric() {
   fi
 }
 
+require_prototype_metric() {
+  local name="$1"
+  local value="$2"
+  local file="$3"
+  local label="$4"
+  if [[ -z "$value" ]]; then
+    echo "$name: missing prototype recovery metric $label in $file" >&2
+    exit 1
+  fi
+}
+
 check_tsv_columns() {
   local file="$1"
   awk -F '\t' '
@@ -499,7 +510,7 @@ TARGET_PATHS=(
 mkdir -p "$OUT_DIR"
 echo "out_dir=$OUT_DIR"
 METRICS="$OUT_DIR/metrics.tsv"
-printf 'target\telapsed_seconds\tfunction_seeds\tseed_confidence_high\tseed_confidence_medium\tseed_confidence_low\tconfirmed_functions\tbasic_blocks\tinstructions\txrefs_total\txrefs_flow\txrefs_call\txrefs_data\txrefs_string\tunresolved_total\tunresolved_indirect_call\tunresolved_indirect_branch\tprototype_functions\tprototype_external_inputs\tprototype_input_candidates\tprototype_return_candidates\n' \
+printf 'target\telapsed_seconds\tfunction_seeds\tseed_confidence_high\tseed_confidence_medium\tseed_confidence_low\tconfirmed_functions\tbasic_blocks\tinstructions\txrefs_total\txrefs_flow\txrefs_call\txrefs_data\txrefs_string\tunresolved_total\tunresolved_indirect_call\tunresolved_indirect_branch\tprototype_functions\tprototype_external_inputs\tprototype_input_candidates\tprototype_return_candidates\tsignature_rewrite_seen\tsignature_rewrite_rewritten\tsignature_rewrite_skipped\n' \
   >"$METRICS"
 HERITAGE_METRICS="$OUT_DIR/heritage-metrics.tsv"
 printf 'target\theritage_available\tfunctions\texternals\tfailures\tdirect_calls\tresolved_internal_calls\tresolved_external_calls\tunknown_calls\n' \
@@ -530,6 +541,15 @@ for index in "${!TARGET_NAMES[@]}"; do
   llvm_as_stderr="$OUT_DIR/$name.llvm-as.stderr"
   opt_stdout="$OUT_DIR/$name.opt.stdout"
   opt_stderr="$OUT_DIR/$name.opt.stderr"
+  rewrite_ll="$OUT_DIR/$name.signature-rewrite.ll"
+  rewrite_bc="$OUT_DIR/$name.signature-rewrite.bc"
+  rewrite_opt_bc="$OUT_DIR/$name.signature-rewrite.opt.bc"
+  rewrite_stdout="$OUT_DIR/$name.signature-rewrite.native-llvm.stdout"
+  rewrite_stderr="$OUT_DIR/$name.signature-rewrite.native-llvm.stderr"
+  rewrite_llvm_as_stdout="$OUT_DIR/$name.signature-rewrite.llvm-as.stdout"
+  rewrite_llvm_as_stderr="$OUT_DIR/$name.signature-rewrite.llvm-as.stderr"
+  rewrite_opt_stdout="$OUT_DIR/$name.signature-rewrite.opt.stdout"
+  rewrite_opt_stderr="$OUT_DIR/$name.signature-rewrite.opt.stderr"
 
   started_at="$(date +%s)"
   "$DISCOVER" --summary-json "$target" >"$summary" 2>"$discover_stderr"
@@ -572,6 +592,28 @@ for index in "${!TARGET_NAMES[@]}"; do
     "$native_stderr" "input candidates"
   require_positive_prototype_metric "$name" "$prototype_return_candidates" \
     "$native_stderr" "return candidates"
+
+  "$NATIVE_LLVM" "$target" --all-confirmed --prototype-recovery-summary \
+    --rewrite-prototype-signatures -o "$rewrite_ll" \
+    >"$rewrite_stdout" 2>"$rewrite_stderr"
+  "$LLVM_AS" "$rewrite_ll" -o "$rewrite_bc" \
+    >"$rewrite_llvm_as_stdout" 2>"$rewrite_llvm_as_stderr"
+  "$OPT" -passes=verify "$rewrite_bc" -o "$rewrite_opt_bc" \
+    >"$rewrite_opt_stdout" 2>"$rewrite_opt_stderr"
+  check_ir_features "$name signature rewrite" "$rewrite_ll" \
+    "$unresolved_indirect_branch"
+  signature_rewrite_seen="$(parse_prototype_metric "$rewrite_stderr" \
+    "signature rewrite seen functions")"
+  signature_rewrite_rewritten="$(parse_prototype_metric "$rewrite_stderr" \
+    "signature rewrite rewritten functions")"
+  signature_rewrite_skipped="$(parse_prototype_metric "$rewrite_stderr" \
+    "signature rewrite skipped functions")"
+  require_prototype_metric "$name" "$signature_rewrite_seen" "$rewrite_stderr" \
+    "signature rewrite seen functions"
+  require_prototype_metric "$name" "$signature_rewrite_rewritten" \
+    "$rewrite_stderr" "signature rewrite rewritten functions"
+  require_prototype_metric "$name" "$signature_rewrite_skipped" \
+    "$rewrite_stderr" "signature rewrite skipped functions"
 
   if [[ "$name" == "libuv" ]]; then
     single_ll="$OUT_DIR/$name.single-function.ll"
@@ -661,7 +703,7 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_summary_number "$unresolved_indirect_call" "$summary" "unresolved_indirect_flows.indirect call"
   require_summary_number "$unresolved_indirect_branch" "$summary" "unresolved_indirect_flows.indirect branch"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$name" "$elapsed_seconds" "$function_seeds" \
     "$seed_confidence_high" "$seed_confidence_medium" \
     "$seed_confidence_low" "$confirmed_functions" "$basic_blocks" \
@@ -669,7 +711,9 @@ for index in "${!TARGET_NAMES[@]}"; do
     "$xrefs_data" "$xrefs_string" "$unresolved_total" \
     "$unresolved_indirect_call" "$unresolved_indirect_branch" \
     "$prototype_functions" "$prototype_external_inputs" \
-    "$prototype_input_candidates" "$prototype_return_candidates" >>"$METRICS"
+    "$prototype_input_candidates" "$prototype_return_candidates" \
+    "$signature_rewrite_seen" "$signature_rewrite_rewritten" \
+    "$signature_rewrite_skipped" >>"$METRICS"
 
   heritage_module="$BENCH2_IR_ROOT/$name/module-limit5.json"
   if [[ -f "$heritage_module" ]]; then

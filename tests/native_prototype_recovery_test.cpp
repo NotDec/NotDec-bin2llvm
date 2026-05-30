@@ -721,6 +721,29 @@ llvm::Function *createReturnStoreFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createReturnRegisterLoadFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName, llvm::LoadInst **returnLoad = nullptr) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *load = builder.CreateLoad(global->getValueType(), global);
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  llvm::StoreInst *store = builder.CreateStore(load, global);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+  if (returnLoad != nullptr) {
+    *returnLoad = load;
+  }
+  return function;
+}
+
 llvm::Function *createInputReturnFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *input,
     const std::string &inputRegisterName, llvm::GlobalVariable *output,
@@ -738,6 +761,29 @@ llvm::Function *createInputReturnFunction(
   llvm::Value *value =
       builder.CreateAdd(load, llvm::ConstantInt::get(input->getValueType(), 7));
   llvm::StoreInst *store = builder.CreateStore(value, output);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, outputRegisterName));
+  builder.CreateRetVoid();
+  *inputLoad = load;
+  *returnStore = store;
+  return function;
+}
+
+llvm::Function *createInputForwardReturnFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *input,
+    const std::string &inputRegisterName, llvm::GlobalVariable *output,
+    const std::string &outputRegisterName, llvm::LoadInst **inputLoad,
+    llvm::StoreInst **returnStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *load =
+      createExternalInputLoad(builder, input, inputRegisterName);
+  llvm::StoreInst *store = builder.CreateStore(load, output);
   store->setMetadata("notdec.register.access",
                      registerAccessMetadata(context, outputRegisterName));
   builder.CreateRetVoid();
@@ -1346,6 +1392,14 @@ int main() {
       module, "input_rdi_return_rax", rdi, "RDI", rax, "RAX",
       &inputReturnLoad, &inputReturnStore);
   attachExternalInputs(*inputReturnFunction, {{"RDI", rdi}});
+  llvm::LoadInst *inputForwardReturnLoad = nullptr;
+  llvm::StoreInst *inputForwardReturnStore = nullptr;
+  llvm::Function *inputForwardReturnFunction =
+      createInputForwardReturnFunction(module, "input_rdi_forward_return_rax",
+                                       rdi, "RDI", rax, "RAX",
+                                       &inputForwardReturnLoad,
+                                       &inputForwardReturnStore);
+  attachExternalInputs(*inputForwardReturnFunction, {{"RDI", rdi}});
   llvm::LoadInst *dispatchInputLoad = nullptr;
   llvm::Function *dispatchInputFunction = createUsedExternalInputFunction(
       module, "dispatch_input_rdi", rdi, "RDI", &dispatchInputLoad);
@@ -1370,16 +1424,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 30, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 17,
+  ok &= expect(summary.FunctionsSeen == 31, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 18,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 14,
+  ok &= expect(summary.InputCandidates == 15,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 16,
+  ok &= expect(summary.ReturnCandidates == 17,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 20,
+  ok &= expect(summary.RewriteEligibleFunctions == 21,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 19,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 20,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -2225,6 +2279,32 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  llvm::Module returnValueLoadModule(
+      "native-prototype-return-value-load-rewrite-test", context);
+  llvm::GlobalVariable *returnValueLoadRax =
+      createRegisterGlobal(returnValueLoadModule, "RAX");
+  attachTestAbi(returnValueLoadModule);
+  llvm::LoadInst *returnValueLoad = nullptr;
+  llvm::Function *returnValueLoadFunction = createReturnRegisterLoadFunction(
+      returnValueLoadModule, "return_value_load_rax", returnValueLoadRax,
+      "RAX", &returnValueLoad);
+  notdec::bin2llvm::runNativePrototypeRecovery(returnValueLoadModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult returnValueLoadRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+          *returnValueLoadFunction);
+  ok &= expect(!returnValueLoadRewriteResult.Rewritten,
+               "return-only prototype rewrite accepted register-load return");
+  ok &= expect(returnValueLoadRewriteResult.Reason ==
+                   "unsafe return value load",
+               "register-load return had wrong skip reason");
+  ok &= expect(returnValueLoad != nullptr && !returnValueLoad->use_empty(),
+               "register-load return value was unexpectedly erased");
+  if (llvm::verifyModule(returnValueLoadModule, &llvm::errs())) {
+    std::cerr << "return-value-load module verification failed after "
+                 "return-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
   llvm::Value *returnFunctionValue = returnStore->getValueOperand();
   notdec::bin2llvm::NativePrototypeRewriteResult rewriteResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
@@ -2302,6 +2382,43 @@ int main() {
                "rewritten input-return function returned wrong value");
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after input-return rewrite\n";
+    return EXIT_FAILURE;
+  }
+  notdec::bin2llvm::NativePrototypeRewriteResult inputForwardRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputReturn(
+          *inputForwardReturnFunction);
+  ok &= expect(inputForwardRewriteResult.Rewritten,
+               "input-forward-return prototype was not rewritten");
+  inputForwardReturnFunction = inputForwardRewriteResult.Function;
+  llvm::ReturnInst *rewrittenInputForwardRet = nullptr;
+  bool sawInputForwardLoadAfterRewrite = false;
+  if (inputForwardReturnFunction != nullptr) {
+    for (llvm::BasicBlock &block : *inputForwardReturnFunction) {
+      if (auto *ret =
+              llvm::dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator())) {
+        rewrittenInputForwardRet = ret;
+      }
+      for (llvm::Instruction &instruction : block) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+        if (load != nullptr &&
+            load->getMetadata("notdec.register.external_input") != nullptr) {
+          sawInputForwardLoadAfterRewrite = true;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenInputForwardRet != nullptr,
+               "rewritten input-forward-return function had no return");
+  ok &= expect(inputForwardReturnFunction != nullptr &&
+                   rewrittenInputForwardRet != nullptr &&
+                   !inputForwardReturnFunction->arg_empty() &&
+                   rewrittenInputForwardRet->getReturnValue() ==
+                       &*inputForwardReturnFunction->arg_begin(),
+               "rewritten input-forward-return did not return new argument");
+  ok &= expect(!sawInputForwardLoadAfterRewrite,
+               "rewritten input-forward-return kept old input load");
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after input-forward-return rewrite\n";
     return EXIT_FAILURE;
   }
 

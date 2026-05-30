@@ -335,6 +335,9 @@
   - [x] Bench2 metrics 记录 prototype recovery summary 总数。
     - 记录：`06-pass-pipeline-and-verification/20260529-54-bench2-prototype-summary-metrics.md`
     - 文件：`scripts/bench2-native-smoke.sh`
+  - [x] Bench2 smoke 覆盖显式签名重写 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260529-55-bench2-signature-rewrite-verify.md`
+    - 文件：`scripts/bench2-native-smoke.sh`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

@@ -206,6 +206,25 @@ std::optional<llvm::StoreInst *> uniqueRegisterAccessStore(
   return result;
 }
 
+bool isRegisterAccessLoad(llvm::Value *value) {
+  auto *load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
+  return load != nullptr &&
+         load->getMetadata("notdec.register.access") != nullptr;
+}
+
+bool hasUnsafeReturnValueLoad(
+    llvm::ArrayRef<NativePrototypeReturnBinding> returnBindings) {
+  // A return value that is still a register load can also be a direct
+  // callsite's old return load.  Batch rewriting another callee may erase that
+  // load later, so skip it until rewrite ordering tracks that dependency.
+  for (const NativePrototypeReturnBinding &binding : returnBindings) {
+    if (isRegisterAccessLoad(binding.ReturnValue)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::optional<llvm::Value *> registerStoreValueInReverseRange(
     llvm::BasicBlock::reverse_iterator iter, llvm::BasicBlock::reverse_iterator end,
     llvm::StringRef registerName, llvm::Type *valueType) {
@@ -1142,6 +1161,10 @@ rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
     result.Reason = "return value type mismatch";
     return result;
   }
+  if (hasUnsafeReturnValueLoad(*returnBindings)) {
+    result.Reason = "unsafe return value load";
+    return result;
+  }
   std::optional<std::vector<llvm::CallInst *>> callsiteRewrites;
   if (!function.use_empty()) {
     ReturnOnlyCallsiteCollectionResult callsiteCollection =
@@ -1356,6 +1379,10 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
     result.Reason = "return value type mismatch";
     return result;
   }
+  if (hasUnsafeReturnValueLoad(*returnBindings)) {
+    result.Reason = "unsafe return value load";
+    return result;
+  }
   std::optional<std::vector<MultiInputCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
     MultiInputCallsiteCollectionResult callsiteCollection =
@@ -1396,6 +1423,9 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
   for (const NativePrototypeInputBinding &binding : *inputBindings) {
     llvm::LoadInst *inputLoad = binding.ExternalInputLoad;
     argument->setName(inputLoad->getName());
+    if (returnValue == inputLoad) {
+      returnValue = &*argument;
+    }
     inputLoad->replaceAllUsesWith(&*argument);
     if (inputLoad->use_empty()) {
       inputLoad->eraseFromParent();
@@ -1472,6 +1502,10 @@ rewriteNativeRecoveredPrototypeMultiReturn(llvm::Function &function) {
       result.Reason = "return value type mismatch";
       return result;
     }
+  }
+  if (hasUnsafeReturnValueLoad(*returnBindings)) {
+    result.Reason = "unsafe return value load";
+    return result;
   }
   std::optional<std::vector<MultiReturnCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
@@ -1598,6 +1632,10 @@ rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
       return result;
     }
   }
+  if (hasUnsafeReturnValueLoad(*returnBindings)) {
+    result.Reason = "unsafe return value load";
+    return result;
+  }
 
   std::optional<std::vector<InputMultiReturnCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
@@ -1632,6 +1670,11 @@ rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
   for (const NativePrototypeInputBinding &binding : *inputBindings) {
     llvm::LoadInst *inputLoad = binding.ExternalInputLoad;
     argument->setName(inputLoad->getName());
+    for (NativePrototypeReturnBinding &returnBinding : *returnBindings) {
+      if (returnBinding.ReturnValue == inputLoad) {
+        returnBinding.ReturnValue = &*argument;
+      }
+    }
     inputLoad->replaceAllUsesWith(&*argument);
     if (inputLoad->use_empty()) {
       inputLoad->eraseFromParent();
