@@ -3020,6 +3020,58 @@ int main() {
                     *duplicateReturnNameFunction),
                "duplicate recovered prototype return names were read");
 
+  llvm::Module extraParamFieldModule(
+      "native-prototype-extra-recovered-param-field-test", context);
+  llvm::MDNode *extraInputParam = llvm::MDNode::get(
+      context, {llvm::MDString::get(context, "name=RDI"),
+                llvm::MDString::get(context, "slot=0"),
+                llvm::MDString::get(context, "extra=true")});
+  llvm::MDNode *emptyParamList = llvm::MDNode::get(context, {});
+  llvm::Metadata *extraInputFields[] = {
+      llvm::MDString::get(context, "model=__stdcall"),
+      llvm::MDString::get(context, "input_count=1"),
+      llvm::MDString::get(context, "return_count=0"),
+      llvm::MDNode::get(context, {extraInputParam}),
+      emptyParamList,
+  };
+  llvm::Function *extraInputParamFieldFunction =
+      createFunction(extraParamFieldModule, "extra_input_param_field");
+  extraInputParamFieldFunction->setMetadata(
+      "notdec.prototype.recovered",
+      llvm::MDNode::get(context, extraInputFields));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *extraInputParamFieldFunction),
+               "extra recovered input param field was ignored");
+  notdec::bin2llvm::NativePrototypeRewriteEligibility
+      extraInputParamFieldEligibility =
+          notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+              *extraInputParamFieldFunction);
+  ok &= expect(!extraInputParamFieldEligibility.Eligible,
+               "extra recovered input param field was rewrite eligible");
+  ok &= expect(extraInputParamFieldEligibility.Reason ==
+                   "missing recovered prototype",
+               "extra recovered input param field had unexpected ineligible reason");
+
+  llvm::MDNode *extraReturnParam = llvm::MDNode::get(
+      context, {llvm::MDString::get(context, "name=RAX"),
+                llvm::MDString::get(context, "slot=0"),
+                llvm::MDString::get(context, "extra=true")});
+  llvm::Metadata *extraReturnFields[] = {
+      llvm::MDString::get(context, "model=__stdcall"),
+      llvm::MDString::get(context, "input_count=0"),
+      llvm::MDString::get(context, "return_count=1"),
+      emptyParamList,
+      llvm::MDNode::get(context, {extraReturnParam}),
+  };
+  llvm::Function *extraReturnParamFieldFunction =
+      createFunction(extraParamFieldModule, "extra_return_param_field");
+  extraReturnParamFieldFunction->setMetadata(
+      "notdec.prototype.recovered",
+      llvm::MDNode::get(context, extraReturnFields));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *extraReturnParamFieldFunction),
+               "extra recovered return param field was ignored");
+
   llvm::Module batchModule("native-prototype-batch-rewrite-test", context);
   llvm::GlobalVariable *batchRdi = createRegisterGlobal(batchModule, "RDI");
   llvm::GlobalVariable *batchRax = createRegisterGlobal(batchModule, "RAX");

@@ -736,6 +736,9 @@ readRecoveredParamList(const llvm::MDNode &node) {
     if (entry == nullptr) {
       return std::nullopt;
     }
+    if (entry->getNumOperands() != 2) {
+      return std::nullopt;
+    }
     std::optional<std::string> name = metadataField(*entry, "name");
     std::optional<uint64_t> slot = parseUint64Field(*entry, "slot");
     if (!name || name->empty() || !slot) {
