@@ -170,6 +170,45 @@ llvm::Function *createDirectCallEffectFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createCallerBeforeClobberingCalleeFunction(
+    llvm::Module &module, llvm::GlobalVariable *rbx) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *callerType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *caller =
+      llvm::Function::Create(callerType, llvm::GlobalValue::ExternalLinkage,
+                             "caller_before_clobbering_callee", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "callee_clobbers_rbx_after_caller", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  llvm::MDNode *rbxMetadata = registerAccessMetadata(context, "RBX");
+  llvm::LoadInst *entryRbx =
+      calleeBuilder.CreateLoad(rbx->getValueType(), rbx, "callee_entry_rbx");
+  entryRbx->setMetadata("notdec.register.access", rbxMetadata);
+  llvm::StoreInst *clobber = calleeBuilder.CreateStore(
+      llvm::ConstantInt::get(rbx->getValueType(), 0x4444), rbx);
+  clobber->setMetadata("notdec.register.access", rbxMetadata);
+  calleeBuilder.CreateRetVoid();
+
+  llvm::IRBuilder<> callerBuilder(callerEntry);
+  llvm::StoreInst *storeRbx = callerBuilder.CreateStore(
+      llvm::ConstantInt::get(rbx->getValueType(), 0x5555), rbx);
+  storeRbx->setMetadata("notdec.register.access", rbxMetadata);
+  callerBuilder.CreateCall(calleeType, callee);
+  llvm::LoadInst *loadRbx =
+      callerBuilder.CreateLoad(rbx->getValueType(), rbx,
+                               "rbx_after_late_clobbering_callee");
+  loadRbx->setMetadata("notdec.register.access", rbxMetadata);
+  callerBuilder.CreateRet(loadRbx);
+  return caller;
+}
+
 unsigned countRegisterLoads(const llvm::Function &function,
                             const llvm::GlobalVariable *global) {
   unsigned count = 0;
@@ -232,6 +271,8 @@ int main() {
   llvm::Function *callEffects = createCallEffectFunction(module, rbx, rax);
   llvm::Function *directCallEffects =
       createDirectCallEffectFunction(module, rbx);
+  llvm::Function *callerBeforeClobberingCallee =
+      createCallerBeforeClobberingCalleeFunction(module, rbx);
 
   notdec::bin2llvm::NativeRegisterSSAOptions options;
   options.EnableRewrite = true;
@@ -261,5 +302,7 @@ int main() {
                "RAX load after call was incorrectly propagated");
   ok &= expect(countRegisterLoads(*directCallEffects, rbx) == 0,
                "RBX load after direct preserving call was not propagated");
+  ok &= expect(countRegisterLoads(*callerBeforeClobberingCallee, rbx) == 1,
+               "RBX load after late direct clobbering callee was propagated");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

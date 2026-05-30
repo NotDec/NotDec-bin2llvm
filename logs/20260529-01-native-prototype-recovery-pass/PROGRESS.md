@@ -42,6 +42,9 @@
     - 记录：`04-callsite-effects/20260529-02-direct-callee-register-effects.md`
   - [x] 未解析 call 保守 fallback。
     - 当前实现：ABI `unaffected` 不阻断，其它未知 effect 保守阻断。
+  - [x] direct call 的 register effect 分析按 callee-first 顺序运行。
+    - 记录：`04-callsite-effects/20260529-03-direct-callee-analysis-order.md`
+    - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
   - [x] 添加 callsite clobber IR 小样例。
     - 文件：`tests/native_register_effects_test.cpp`
 

@@ -687,6 +687,49 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.Functions.push_back(function);
 }
 
+void visitDirectCalleesFirst(llvm::Function &function,
+                             std::set<llvm::Function *> &visiting,
+                             std::set<llvm::Function *> &visited,
+                             std::vector<llvm::Function *> &ordered) {
+  if (visited.count(&function) != 0) {
+    return;
+  }
+  if (!visiting.insert(&function).second) {
+    return;
+  }
+
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &inst : block) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      llvm::Function *callee =
+          call == nullptr ? nullptr : call->getCalledFunction();
+      if (callee == nullptr || callee->isDeclaration()) {
+        continue;
+      }
+      visitDirectCalleesFirst(*callee, visiting, visited, ordered);
+    }
+  }
+
+  visiting.erase(&function);
+  visited.insert(&function);
+  ordered.push_back(&function);
+}
+
+std::vector<llvm::Function *> directCalleeFirstOrder(llvm::Module &module) {
+  // This is a small substitute for a real call-effect fixpoint: non-recursive
+  // direct callees get their register effect metadata before their callers.
+  std::vector<llvm::Function *> ordered;
+  std::set<llvm::Function *> visiting;
+  std::set<llvm::Function *> visited;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    visitDirectCalleesFirst(function, visiting, visited, ordered);
+  }
+  return ordered;
+}
+
 } // namespace
 
 NativeRegisterSSASummary
@@ -700,12 +743,9 @@ runNativeRegisterSSA(llvm::Module &module,
   }
   AbiRegisterEffects abiEffects = collectAbiRegisterEffects(module);
 
-  for (llvm::Function &function : module) {
-    if (function.isDeclaration()) {
-      continue;
-    }
+  for (llvm::Function *function : directCalleeFirstOrder(module)) {
     NativeRegisterSSAFunctionSummary functionSummary;
-    FunctionPromoter promoter(function, units, abiEffects,
+    FunctionPromoter promoter(*function, units, abiEffects,
                               options.EnableRewrite, functionSummary);
     promoter.run();
     addFunctionSummary(summary, functionSummary);
