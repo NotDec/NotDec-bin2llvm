@@ -2851,6 +2851,32 @@ int main() {
                    "missing recovered prototype",
                "mismatched recovered metadata had unexpected ineligible reason");
 
+  llvm::Module abiModelMismatchModule(
+      "native-prototype-abi-model-mismatch-test", context);
+  attachTestAbi(abiModelMismatchModule);
+  llvm::Function *abiModelMismatchFunction =
+      createFunction(abiModelMismatchModule, "abi_model_mismatch");
+  abiModelMismatchFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__fastcall", {{"RDI", 0}}, {}));
+  notdec::bin2llvm::NativePrototypeRewriteEligibility
+      abiModelMismatchEligibility =
+          notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+              *abiModelMismatchFunction);
+  ok &= expect(!abiModelMismatchEligibility.Eligible,
+               "ABI model mismatch was incorrectly rewrite eligible");
+  ok &= expect(abiModelMismatchEligibility.Reason ==
+                   "recovered prototype ABI model mismatch",
+               "ABI model mismatch had unexpected ineligible reason");
+  notdec::bin2llvm::NativePrototypeRewriteResult abiModelMismatchRewrite =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+          *abiModelMismatchFunction);
+  ok &= expect(!abiModelMismatchRewrite.Rewritten,
+               "ABI model mismatch was incorrectly rewritten");
+  ok &= expect(abiModelMismatchRewrite.Reason ==
+                   "recovered prototype ABI model mismatch",
+               "ABI model mismatch rewrite had unexpected reason");
+
   llvm::Module mismatchedCountModule(
       "native-prototype-mismatched-recovered-count-test", context);
   llvm::Function *mismatchedCountFunction =

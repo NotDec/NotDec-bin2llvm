@@ -161,6 +161,9 @@
   - [x] 读回 recovered prototype metadata 时校验参数条目字段数。
     - 记录：`05-input-output-candidates/20260529-34-recovered-param-entry-field-count.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 签名重写 eligibility 校验 recovered prototype ABI model。
+    - 记录：`05-input-output-candidates/20260529-35-rewrite-eligibility-abi-model.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。

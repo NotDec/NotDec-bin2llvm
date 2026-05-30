@@ -1011,6 +1011,13 @@ getNativePrototypeRewriteEligibility(const llvm::Function &function) {
     result.Reason = "missing recovered prototype";
     return result;
   }
+  if (const llvm::Module *module = function.getParent()) {
+    std::optional<NativeAbiSpec> abi = readNativeAbiMetadata(*module);
+    if (abi && prototype->ModelName != abi->PrototypeName) {
+      result.Reason = "recovered prototype ABI model mismatch";
+      return result;
+    }
+  }
 
   std::optional<llvm::FunctionType *> recoveredType =
       buildNativeRecoveredPrototypeFunctionType(function.getContext(),
@@ -1666,6 +1673,10 @@ rewriteNativeRecoveredPrototype(llvm::Function &function) {
 
   NativePrototypeRewriteEligibility eligibility =
       getNativePrototypeRewriteEligibility(function);
+  if (!eligibility.Eligible) {
+    result.Reason = eligibility.Reason;
+    return result;
+  }
   if (eligibility.Eligible && !eligibility.NeedsRewrite) {
     result.Reason = eligibility.Reason;
     return result;
