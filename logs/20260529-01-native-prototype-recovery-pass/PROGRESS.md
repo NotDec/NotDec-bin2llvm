@@ -266,6 +266,9 @@
   - [x] CLI `.ll` 显式签名重写 smoke 检查输出不保留 trial metadata。
     - 记录：`06-pass-pipeline-and-verification/20260529-39-cli-rewrite-transient-metadata-smoke.md`
     - 文件：`tools/CMakeLists.txt`
+  - [x] CLI `.ll` 显式签名重写 smoke 覆盖 return-only 函数。
+    - 记录：`06-pass-pipeline-and-verification/20260529-40-cli-return-only-signature-rewrite-smoke.md`
+    - 文件：`tools/CMakeLists.txt`、`tests/ir/native-prototype/cli-signature-rewrite.ll`
 
 ## 记录规则
 
