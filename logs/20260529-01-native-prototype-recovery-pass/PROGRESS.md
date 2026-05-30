@@ -284,6 +284,9 @@
   - [x] CLI `.ll` 显式签名重写 smoke 覆盖多 input + 多返回函数。
     - 记录：`06-pass-pipeline-and-verification/20260529-45-cli-multi-input-multi-return-signature-rewrite-smoke.md`
     - 文件：`tools/CMakeLists.txt`、`tests/ir/native-prototype/cli-signature-rewrite.ll`
+  - [x] CLI `.ll` 显式签名重写 smoke 检查旧 return register store 被删除。
+    - 记录：`06-pass-pipeline-and-verification/20260529-46-cli-return-store-removal-smoke.md`
+    - 文件：`tools/CMakeLists.txt`
 
 ## 记录规则
 
