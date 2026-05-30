@@ -2965,6 +2965,31 @@ int main() {
                    "missing recovered prototype",
                "empty recovered prototype had unexpected ineligible reason");
 
+  llvm::Module extraOperandModule(
+      "native-prototype-extra-recovered-operand-test", context);
+  llvm::Function *extraOperandFunction =
+      createFunction(extraOperandModule, "extra_recovered_operand");
+  llvm::MDNode *baseRecoveredMetadata =
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {{"RDI", 0}}, {});
+  std::vector<llvm::Metadata *> extraOperandFields;
+  for (const llvm::MDOperand &operand : baseRecoveredMetadata->operands()) {
+    extraOperandFields.push_back(operand.get());
+  }
+  extraOperandFields.push_back(llvm::MDString::get(context, "extra=true"));
+  extraOperandFunction->setMetadata(
+      "notdec.prototype.recovered",
+      llvm::MDNode::get(context, extraOperandFields));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *extraOperandFunction),
+               "extra recovered prototype operand was ignored");
+  notdec::bin2llvm::NativePrototypeRewriteEligibility extraOperandEligibility =
+      notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+          *extraOperandFunction);
+  ok &= expect(!extraOperandEligibility.Eligible,
+               "extra recovered operand was incorrectly rewrite eligible");
+  ok &= expect(extraOperandEligibility.Reason == "missing recovered prototype",
+               "extra recovered operand had unexpected ineligible reason");
+
   llvm::Module batchModule("native-prototype-batch-rewrite-test", context);
   llvm::GlobalVariable *batchRdi = createRegisterGlobal(batchModule, "RDI");
   llvm::GlobalVariable *batchRax = createRegisterGlobal(batchModule, "RAX");

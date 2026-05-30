@@ -923,7 +923,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
 std::optional<NativeRecoveredPrototype>
 readNativeRecoveredPrototypeMetadata(const llvm::Function &function) {
   llvm::MDNode *node = function.getMetadata("notdec.prototype.recovered");
-  if (node == nullptr || node->getNumOperands() < 5) {
+  if (node == nullptr || node->getNumOperands() != 5) {
     return std::nullopt;
   }
 
