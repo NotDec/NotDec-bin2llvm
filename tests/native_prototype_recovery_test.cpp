@@ -2881,6 +2881,36 @@ int main() {
                     *mismatchedReturnCountFunction),
                "mismatched recovered prototype return count was read");
 
+  llvm::Module mismatchedSlotModule(
+      "native-prototype-mismatched-recovered-slot-test", context);
+  llvm::Function *unsortedInputSlotFunction =
+      createFunction(mismatchedSlotModule, "unsorted_recovered_input_slots");
+  unsortedInputSlotFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall",
+                                     {{"RSI", 1}, {"RDI", 0}}, {}));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *unsortedInputSlotFunction),
+               "unsorted recovered prototype input slots were read");
+  notdec::bin2llvm::NativePrototypeRewriteEligibility
+      unsortedInputSlotEligibility =
+          notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+              *unsortedInputSlotFunction);
+  ok &= expect(!unsortedInputSlotEligibility.Eligible,
+               "unsorted recovered input slots were incorrectly rewrite eligible");
+  ok &= expect(unsortedInputSlotEligibility.Reason ==
+                   "missing recovered prototype",
+               "unsorted recovered input slots had unexpected ineligible reason");
+  llvm::Function *duplicateReturnSlotFunction =
+      createFunction(mismatchedSlotModule, "duplicate_recovered_return_slots");
+  duplicateReturnSlotFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {},
+                                     {{"RAX", 0}, {"RDX", 0}}));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *duplicateReturnSlotFunction),
+               "duplicate recovered prototype return slots were read");
+
   llvm::Module batchModule("native-prototype-batch-rewrite-test", context);
   llvm::GlobalVariable *batchRdi = createRegisterGlobal(batchModule, "RDI");
   llvm::GlobalVariable *batchRax = createRegisterGlobal(batchModule, "RAX");
