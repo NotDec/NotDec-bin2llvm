@@ -2764,6 +2764,28 @@ int main() {
   ok &= expect(missingEligibility.Reason == "missing recovered prototype",
                "missing recovered prototype had unexpected ineligible reason");
 
+  llvm::Module noAbiModule("native-prototype-no-abi-stale-metadata-test",
+                           context);
+  llvm::Function *noAbiFunction = createFunction(noAbiModule, "no_abi_stale");
+  llvm::MDNode *stalePrototypeMetadata =
+      llvm::MDNode::get(context, llvm::MDString::get(context, "stale=true"));
+  noAbiFunction->setMetadata("notdec.prototype.input_candidates",
+                             stalePrototypeMetadata);
+  noAbiFunction->setMetadata("notdec.prototype.return_candidates",
+                             stalePrototypeMetadata);
+  noAbiFunction->setMetadata("notdec.prototype.recovered",
+                             stalePrototypeMetadata);
+  notdec::bin2llvm::runNativePrototypeRecovery(noAbiModule, options);
+  ok &= expect(noAbiFunction->getMetadata("notdec.prototype.input_candidates") ==
+                   nullptr,
+               "no-ABI module kept stale input candidate metadata");
+  ok &= expect(noAbiFunction->getMetadata("notdec.prototype.return_candidates") ==
+                   nullptr,
+               "no-ABI module kept stale return candidate metadata");
+  ok &= expect(noAbiFunction->getMetadata("notdec.prototype.recovered") ==
+                   nullptr,
+               "no-ABI module kept stale recovered prototype metadata");
+
   llvm::Module batchModule("native-prototype-batch-rewrite-test", context);
   llvm::GlobalVariable *batchRdi = createRegisterGlobal(batchModule, "RDI");
   llvm::GlobalVariable *batchRax = createRegisterGlobal(batchModule, "RAX");

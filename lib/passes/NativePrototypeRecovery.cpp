@@ -104,6 +104,12 @@ llvm::MDNode *recoveredPrototypeMetadata(
   return llvm::MDNode::get(context, fields);
 }
 
+void clearPrototypeRecoveryMetadata(llvm::Function &function) {
+  function.setMetadata("notdec.prototype.input_candidates", nullptr);
+  function.setMetadata("notdec.prototype.return_candidates", nullptr);
+  function.setMetadata("notdec.prototype.recovered", nullptr);
+}
+
 std::optional<std::string> returnValueKey(llvm::Value &value) {
   if (auto *constantInt = llvm::dyn_cast<llvm::ConstantInt>(&value)) {
     llvm::SmallString<32> text;
@@ -748,6 +754,11 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
   NativePrototypeRecoverySummary summary;
   std::optional<NativeAbiSpec> abi = readNativeAbiMetadata(module);
   if (!abi) {
+    for (llvm::Function &function : module) {
+      if (!function.isDeclaration()) {
+        clearPrototypeRecoveryMetadata(function);
+      }
+    }
     return summary;
   }
 

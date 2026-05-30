@@ -131,6 +131,9 @@
   - [x] return candidate 沿唯一前驱链回看 ABI output register store。
     - 记录：`05-input-output-candidates/20260529-26-return-candidate-linear-predecessor-chain.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 无 ABI 时清理 stale prototype recovery metadata。
+    - 记录：`05-input-output-candidates/20260529-27-clear-stale-prototype-metadata-without-abi.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。
