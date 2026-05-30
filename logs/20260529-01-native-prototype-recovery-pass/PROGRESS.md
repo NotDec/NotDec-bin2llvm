@@ -365,6 +365,9 @@
   - [x] callsite return 多后继无返回寄存器使用时允许 rewrite。
     - 记录：`06-pass-pipeline-and-verification/20260529-64-callsite-return-unused-multi-successor.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] signature rewrite summary 输出每个函数的重写结果和跳过原因。
+    - 记录：`06-pass-pipeline-and-verification/20260529-65-signature-rewrite-function-reasons.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

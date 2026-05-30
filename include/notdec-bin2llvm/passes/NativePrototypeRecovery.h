@@ -97,6 +97,14 @@ struct NativePrototypeRewriteResult {
   llvm::Function *Function = nullptr;
 };
 
+// Per-function rewrite result for diagnostics.  The function name is captured
+// before rewriting because a successful rewrite replaces the LLVM Function.
+struct NativePrototypeModuleRewriteFunctionSummary {
+  std::string FunctionName;
+  bool Rewritten = false;
+  std::string Reason;
+};
+
 // Module-level rewrite statistics.  Skip reasons make the conservative rewrite
 // boundary visible while callsite rewrite is still not implemented.
 struct NativePrototypeModuleRewriteSummary {
@@ -104,6 +112,7 @@ struct NativePrototypeModuleRewriteSummary {
   uint64_t FunctionsRewritten = 0;
   uint64_t FunctionsSkipped = 0;
   std::map<std::string, uint64_t> SkippedByReason;
+  std::vector<NativePrototypeModuleRewriteFunctionSummary> Functions;
 };
 
 struct NativePrototypeRecoveryFunctionSummary {
@@ -126,6 +135,8 @@ struct NativePrototypeRecoverySummary {
   uint64_t SignatureRewriteFunctionsRewritten = 0;
   uint64_t SignatureRewriteFunctionsSkipped = 0;
   std::map<std::string, uint64_t> SignatureRewriteSkippedByReason;
+  std::vector<NativePrototypeModuleRewriteFunctionSummary>
+      SignatureRewriteFunctions;
   std::vector<NativePrototypeRecoveryFunctionSummary> Functions;
 };
 

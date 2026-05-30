@@ -1508,6 +1508,20 @@ bool expect(bool condition, const std::string &message) {
   return false;
 }
 
+const notdec::bin2llvm::NativePrototypeModuleRewriteFunctionSummary *
+findRewriteFunctionSummary(
+    const std::vector<
+        notdec::bin2llvm::NativePrototypeModuleRewriteFunctionSummary>
+        &functions,
+    const std::string &name) {
+  for (const auto &function : functions) {
+    if (function.FunctionName == name) {
+      return &function;
+    }
+  }
+  return nullptr;
+}
+
 } // namespace
 
 int main() {
@@ -3993,6 +4007,28 @@ int main() {
   ok &= expect(optInSummary.SignatureRewriteSkippedByReason
                    ["missing recovered prototype"] == 1,
                "opt-in rewrite did not count missing-prototype skip reason");
+  ok &= expect(optInSummary.SignatureRewriteFunctions.size() == 3,
+               "opt-in rewrite did not keep per-function rewrite results");
+  const auto *optInRewrittenSummary = findRewriteFunctionSummary(
+      optInSummary.SignatureRewriteFunctions, "opt_in_input_rdi_return_rax");
+  ok &= expect(optInRewrittenSummary != nullptr &&
+                   optInRewrittenSummary->Rewritten &&
+                   optInRewrittenSummary->Reason == "rewritten",
+               "opt-in rewrite did not record rewritten function reason");
+  const auto *optInAlreadyTypedSummary = findRewriteFunctionSummary(
+      optInSummary.SignatureRewriteFunctions, "opt_in_input_rdi_already_typed");
+  ok &= expect(optInAlreadyTypedSummary != nullptr &&
+                   !optInAlreadyTypedSummary->Rewritten &&
+                   optInAlreadyTypedSummary->Reason == "already matches",
+               "opt-in rewrite did not record already-matches function reason");
+  const auto *optInMissingSummary = findRewriteFunctionSummary(
+      optInSummary.SignatureRewriteFunctions, "opt_in_missing_recovered");
+  ok &= expect(optInMissingSummary != nullptr &&
+                   !optInMissingSummary->Rewritten &&
+                   optInMissingSummary->Reason ==
+                       "missing recovered prototype",
+               "opt-in rewrite did not record missing-prototype function "
+               "reason");
   ok &= expect(optInModule.getFunction("opt_in_input_rdi_return_rax") !=
                        nullptr &&
                    functionTypeShape(

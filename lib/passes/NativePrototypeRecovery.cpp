@@ -1079,6 +1079,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
         rewriteSummary.FunctionsSkipped;
     summary.SignatureRewriteSkippedByReason =
         rewriteSummary.SkippedByReason;
+    summary.SignatureRewriteFunctions = rewriteSummary.Functions;
   }
 
   if (options.PrintSummary) {
@@ -1971,8 +1972,13 @@ rewriteNativeRecoveredPrototypes(llvm::Module &module) {
 
   for (llvm::Function *function : functions) {
     ++summary.FunctionsSeen;
+    NativePrototypeModuleRewriteFunctionSummary functionSummary;
+    functionSummary.FunctionName = function->getName().str();
     NativePrototypeRewriteResult result =
         rewriteNativeRecoveredPrototype(*function);
+    functionSummary.Rewritten = result.Rewritten;
+    functionSummary.Reason = result.Rewritten ? "rewritten" : result.Reason;
+    summary.Functions.push_back(std::move(functionSummary));
     if (result.Rewritten) {
       ++summary.FunctionsRewritten;
       continue;
@@ -2004,6 +2010,12 @@ void printNativePrototypeRecoverySummary(
   for (const auto &[reason, count] : summary.SignatureRewriteSkippedByReason) {
     os << "  signature rewrite skipped reason " << reason << ": " << count
        << '\n';
+  }
+  for (const NativePrototypeModuleRewriteFunctionSummary &function :
+       summary.SignatureRewriteFunctions) {
+    os << "  signature rewrite function " << function.FunctionName
+       << ": rewritten=" << (function.Rewritten ? 1 : 0)
+       << " reason=" << function.Reason << '\n';
   }
   for (const NativePrototypeRecoveryFunctionSummary &function :
        summary.Functions) {
