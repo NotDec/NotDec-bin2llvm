@@ -1152,6 +1152,40 @@ bool recoveredRegisterAt(const llvm::Function &function, uint64_t listIndex,
   return false;
 }
 
+llvm::MDNode *makeRecoveredPrototypeMetadata(
+    llvm::LLVMContext &context, llvm::StringRef model,
+    llvm::ArrayRef<std::pair<llvm::StringRef, uint64_t>> inputs,
+    llvm::ArrayRef<std::pair<llvm::StringRef, uint64_t>> returns) {
+  std::vector<llvm::Metadata *> inputEntries;
+  for (const auto &[name, slot] : inputs) {
+    llvm::Metadata *fields[] = {
+        llvm::MDString::get(context, ("name=" + name).str()),
+        llvm::MDString::get(context, "slot=" + std::to_string(slot)),
+    };
+    inputEntries.push_back(llvm::MDNode::get(context, fields));
+  }
+
+  std::vector<llvm::Metadata *> returnEntries;
+  for (const auto &[name, slot] : returns) {
+    llvm::Metadata *fields[] = {
+        llvm::MDString::get(context, ("name=" + name).str()),
+        llvm::MDString::get(context, "slot=" + std::to_string(slot)),
+    };
+    returnEntries.push_back(llvm::MDNode::get(context, fields));
+  }
+
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, ("model=" + model).str()),
+      llvm::MDString::get(context,
+                          "input_count=" + std::to_string(inputs.size())),
+      llvm::MDString::get(context,
+                          "return_count=" + std::to_string(returns.size())),
+      llvm::MDNode::get(context, inputEntries),
+      llvm::MDNode::get(context, returnEntries),
+  };
+  return llvm::MDNode::get(context, fields);
+}
+
 bool recoveredPrototypeParamAt(
     const std::vector<notdec::bin2llvm::NativeRecoveredPrototypeParam> &params,
     uint64_t index, llvm::StringRef name) {
@@ -2785,6 +2819,29 @@ int main() {
   ok &= expect(noAbiFunction->getMetadata("notdec.prototype.recovered") ==
                    nullptr,
                "no-ABI module kept stale recovered prototype metadata");
+
+  llvm::Module mismatchedMetadataModule(
+      "native-prototype-mismatched-recovered-metadata-test", context);
+  attachTestAbi(mismatchedMetadataModule);
+  llvm::Function *mismatchedMetadataFunction =
+      createFunction(mismatchedMetadataModule, "mismatched_recovered_metadata");
+  mismatchedMetadataFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {{"RDI", 0}}, {}));
+  notdec::bin2llvm::runNativePrototypeRecovery(mismatchedMetadataModule,
+                                               options);
+  ok &= expect(mismatchedMetadataFunction->getMetadata(
+                   "notdec.prototype.recovered") == nullptr,
+               "mismatched recovered prototype metadata was preserved");
+  notdec::bin2llvm::NativePrototypeRewriteEligibility
+      mismatchedMetadataEligibility =
+          notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+              *mismatchedMetadataFunction);
+  ok &= expect(!mismatchedMetadataEligibility.Eligible,
+               "mismatched recovered metadata was incorrectly rewrite eligible");
+  ok &= expect(mismatchedMetadataEligibility.Reason ==
+                   "missing recovered prototype",
+               "mismatched recovered metadata had unexpected ineligible reason");
 
   llvm::Module batchModule("native-prototype-batch-rewrite-test", context);
   llvm::GlobalVariable *batchRdi = createRegisterGlobal(batchModule, "RDI");
