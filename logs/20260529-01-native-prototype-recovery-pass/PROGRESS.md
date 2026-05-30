@@ -263,6 +263,9 @@
   - [x] CLI `.ll` 显式签名重写 smoke 检查 prototype recovery summary。
     - 记录：`06-pass-pipeline-and-verification/20260529-38-cli-signature-rewrite-summary-smoke.md`
     - 文件：`tools/CMakeLists.txt`
+  - [x] CLI `.ll` 显式签名重写 smoke 检查输出不保留 trial metadata。
+    - 记录：`06-pass-pipeline-and-verification/20260529-39-cli-rewrite-transient-metadata-smoke.md`
+    - 文件：`tools/CMakeLists.txt`
 
 ## 记录规则
 
