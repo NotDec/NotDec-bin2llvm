@@ -344,6 +344,9 @@
   - [x] callsite input 参数值查找支持线性唯一前驱链。
     - 记录：`06-pass-pipeline-and-verification/20260529-57-callsite-input-linear-predecessor-chain.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] return binding 支持同值多 return store。
+    - 记录：`06-pass-pipeline-and-verification/20260529-58-return-binding-equivalent-stores.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

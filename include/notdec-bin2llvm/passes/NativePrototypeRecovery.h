@@ -81,6 +81,7 @@ struct NativePrototypeInputBinding {
 struct NativePrototypeReturnBinding {
   NativeRecoveredPrototypeParam Param;
   llvm::StoreInst *ReturnStore = nullptr;
+  std::vector<llvm::StoreInst *> ReturnStores;
   llvm::Value *ReturnValue = nullptr;
 };
 

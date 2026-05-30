@@ -2029,13 +2029,42 @@ int main() {
                  "return binding used wrong slot");
     ok &= expect((*returnBindings)[0].ReturnStore == returnStore,
                  "return binding used wrong store");
+    ok &= expect((*returnBindings)[0].ReturnStores.size() == 1,
+                 "return binding used wrong store list size");
     ok &= expect((*returnBindings)[0].ReturnValue ==
                      returnStore->getValueOperand(),
                  "return binding used wrong value");
   }
+  std::optional<std::vector<notdec::bin2llvm::NativePrototypeReturnBinding>>
+      duplicateReturnBindings =
+          notdec::bin2llvm::getNativePrototypeReturnBindings(
+              *twoReturnFunction);
+  ok &= expect(duplicateReturnBindings.has_value(),
+               "equivalent duplicate return stores were not bound");
+  if (duplicateReturnBindings) {
+    ok &= expect(duplicateReturnBindings->size() == 1,
+                 "duplicate return stores had wrong binding count");
+    ok &= expect((*duplicateReturnBindings)[0].ReturnStores.size() == 2,
+                 "duplicate return stores had wrong store list size");
+  }
   ok &= expect(!notdec::bin2llvm::getNativePrototypeReturnBindings(
-                    *twoReturnFunction),
-               "duplicate return stores were incorrectly bound");
+                    *conflictingReturnFunction),
+               "conflicting return stores were incorrectly bound");
+  notdec::bin2llvm::NativePrototypeRewriteResult duplicateReturnRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+          *twoReturnFunction);
+  ok &= expect(duplicateReturnRewriteResult.Rewritten,
+               "equivalent duplicate return stores were not rewritten");
+  twoReturnFunction = duplicateReturnRewriteResult.Function;
+  ok &= expect(twoReturnFunction != nullptr &&
+                   functionTypeShape(*twoReturnFunction->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef<llvm::Type *>{}),
+               "rewritten duplicate-return function type was not i64()");
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after duplicate-return rewrite\n";
+    return EXIT_FAILURE;
+  }
   notdec::bin2llvm::NativePrototypeRewriteResult usedRewriteResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
           *usedReturnFunction);

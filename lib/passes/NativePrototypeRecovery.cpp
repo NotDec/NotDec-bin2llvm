@@ -177,9 +177,9 @@ std::optional<llvm::LoadInst *> uniqueExternalInputLoad(
   return result;
 }
 
-std::optional<llvm::StoreInst *> uniqueRegisterAccessStore(
+std::vector<llvm::StoreInst *> registerAccessStores(
     llvm::Function &function, llvm::StringRef registerName) {
-  llvm::StoreInst *result = nullptr;
+  std::vector<llvm::StoreInst *> stores;
   for (llvm::BasicBlock &block : function) {
     for (llvm::Instruction &instruction : block) {
       auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
@@ -194,16 +194,10 @@ std::optional<llvm::StoreInst *> uniqueRegisterAccessStore(
       if (!name || *name != registerName) {
         continue;
       }
-      if (result != nullptr) {
-        return std::nullopt;
-      }
-      result = store;
+      stores.push_back(store);
     }
   }
-  if (result == nullptr) {
-    return std::nullopt;
-  }
-  return result;
+  return stores;
 }
 
 bool isRegisterAccessLoad(llvm::Value *value) {
@@ -1111,16 +1105,38 @@ getNativePrototypeReturnBindings(llvm::Function &function) {
   std::vector<NativePrototypeReturnBinding> bindings;
   bindings.reserve(prototype->Returns.size());
   for (const NativeRecoveredPrototypeParam &param : prototype->Returns) {
-    std::optional<llvm::StoreInst *> store =
-        uniqueRegisterAccessStore(function, param.RegisterName);
-    if (!store) {
+    std::vector<llvm::StoreInst *> stores =
+        registerAccessStores(function, param.RegisterName);
+    if (stores.empty()) {
       return std::nullopt;
     }
 
     NativePrototypeReturnBinding binding;
     binding.Param = param;
-    binding.ReturnStore = *store;
-    binding.ReturnValue = (*store)->getValueOperand();
+    binding.ReturnStore = stores.front();
+    binding.ReturnStores = stores;
+    binding.ReturnValue = stores.front()->getValueOperand();
+    if (binding.ReturnValue == nullptr) {
+      return std::nullopt;
+    }
+    if (stores.size() == 1) {
+      bindings.push_back(std::move(binding));
+      continue;
+    }
+    std::optional<std::string> firstKey = returnValueKey(*binding.ReturnValue);
+    if (!firstKey) {
+      return std::nullopt;
+    }
+    for (llvm::StoreInst *store : stores) {
+      llvm::Value *value = store->getValueOperand();
+      if (value == nullptr || value->getType() != binding.ReturnValue->getType()) {
+        return std::nullopt;
+      }
+      std::optional<std::string> key = returnValueKey(*value);
+      if (!key || *key != *firstKey) {
+        return std::nullopt;
+      }
+    }
     bindings.push_back(std::move(binding));
   }
   return bindings;
@@ -1129,7 +1145,13 @@ getNativePrototypeReturnBindings(llvm::Function &function) {
 void eraseReturnBindingStores(
     llvm::ArrayRef<NativePrototypeReturnBinding> returnBindings) {
   for (const NativePrototypeReturnBinding &binding : returnBindings) {
-    if (binding.ReturnStore != nullptr) {
+    if (!binding.ReturnStores.empty()) {
+      for (llvm::StoreInst *store : binding.ReturnStores) {
+        if (store != nullptr) {
+          store->eraseFromParent();
+        }
+      }
+    } else if (binding.ReturnStore != nullptr) {
       binding.ReturnStore->eraseFromParent();
     }
   }
