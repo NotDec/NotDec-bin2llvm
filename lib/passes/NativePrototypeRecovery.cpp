@@ -254,8 +254,21 @@ struct NativeInputOnlyCallsiteRewrite {
   llvm::Value *Argument = nullptr;
 };
 
+// Multi-input form of Ghidra FuncCallSpecs::buildInputFromTrials(...): keep
+// the call and ABI-ordered argument values together so the old void call can be
+// replaced after every callsite has been checked.
+struct MultiInputCallsiteRewrite {
+  llvm::CallInst *Call = nullptr;
+  std::vector<llvm::Value *> Arguments;
+};
+
 struct InputOnlyCallsiteCollectionResult {
   std::vector<NativeInputOnlyCallsiteRewrite> Rewrites;
+  std::string FailureReason;
+};
+
+struct MultiInputCallsiteCollectionResult {
+  std::vector<MultiInputCallsiteRewrite> Rewrites;
   std::string FailureReason;
 };
 
@@ -286,13 +299,43 @@ collectInputOnlyDirectCallsiteRewrites(llvm::Function &function,
   return result;
 }
 
-void rewriteInputOnlyDirectCallsites(
+MultiInputCallsiteCollectionResult collectMultiInputDirectCallsiteRewrites(
+    llvm::Function &function,
+    llvm::ArrayRef<NativeRecoveredPrototypeParam> inputs,
+    llvm::FunctionType &recoveredType) {
+  MultiInputCallsiteCollectionResult result;
+  for (llvm::User *user : function.users()) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+    if (call == nullptr || call->getCalledFunction() != &function ||
+        call->arg_size() != 0 || !call->getType()->isVoidTy()) {
+      result.FailureReason = "function has uses";
+      return result;
+    }
+
+    MultiInputCallsiteRewrite rewrite;
+    rewrite.Call = call;
+    rewrite.Arguments.reserve(inputs.size());
+    for (uint64_t index = 0; index < inputs.size(); ++index) {
+      std::optional<llvm::Value *> argument = callsiteInputValueBeforeCall(
+          *call, inputs[index].RegisterName, recoveredType.getParamType(index));
+      if (!argument) {
+        result.FailureReason = "unsafe callsite input value";
+        return result;
+      }
+      rewrite.Arguments.push_back(*argument);
+    }
+    result.Rewrites.push_back(std::move(rewrite));
+  }
+  return result;
+}
+
+void rewriteMultiInputDirectCallsites(
     llvm::Function &rewritten,
-    llvm::ArrayRef<NativeInputOnlyCallsiteRewrite> callsites) {
-  for (const NativeInputOnlyCallsiteRewrite &callsite : callsites) {
+    llvm::ArrayRef<MultiInputCallsiteRewrite> callsites) {
+  for (const MultiInputCallsiteRewrite &callsite : callsites) {
     llvm::IRBuilder<> builder(callsite.Call);
     llvm::CallInst *newCall = builder.CreateCall(
-        rewritten.getFunctionType(), &rewritten, {callsite.Argument});
+        rewritten.getFunctionType(), &rewritten, callsite.Arguments);
     newCall->setCallingConv(callsite.Call->getCallingConv());
     callsite.Call->eraseFromParent();
   }
@@ -1116,7 +1159,7 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
     result.Reason = "missing recovered prototype";
     return result;
   }
-  if (prototype->Inputs.size() != 1 || !prototype->Returns.empty()) {
+  if (prototype->Inputs.empty() || !prototype->Returns.empty()) {
     result.Reason = "not input-only prototype";
     return result;
   }
@@ -1124,31 +1167,37 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
   std::optional<llvm::FunctionType *> recoveredType =
       buildNativeRecoveredPrototypeFunctionType(function.getContext(),
                                                *prototype);
-  if (!recoveredType || (*recoveredType)->getNumParams() != 1 ||
-      !(*recoveredType)->getReturnType()->isVoidTy() ||
-      !(*recoveredType)->getParamType(0)->isIntegerTy(64)) {
+  if (!recoveredType || (*recoveredType)->getNumParams() == 0 ||
+      !(*recoveredType)->getReturnType()->isVoidTy()) {
     result.Reason = "unsupported recovered prototype type";
     return result;
+  }
+  for (llvm::Type *paramType : (*recoveredType)->params()) {
+    if (!paramType->isIntegerTy(64)) {
+      result.Reason = "unsupported recovered prototype type";
+      return result;
+    }
   }
 
   std::optional<std::vector<NativePrototypeInputBinding>> inputBindings =
       getNativePrototypeInputBindings(function);
-  if (!inputBindings || inputBindings->size() != 1) {
+  if (!inputBindings || inputBindings->size() != prototype->Inputs.size()) {
     result.Reason = "missing input binding";
     return result;
   }
-  llvm::LoadInst *inputLoad = (*inputBindings)[0].ExternalInputLoad;
-  if (inputLoad == nullptr ||
-      inputLoad->getType() != (*recoveredType)->getParamType(0)) {
-    result.Reason = "input load type mismatch";
-    return result;
+  for (uint64_t index = 0; index < inputBindings->size(); ++index) {
+    llvm::LoadInst *inputLoad = (*inputBindings)[index].ExternalInputLoad;
+    if (inputLoad == nullptr ||
+        inputLoad->getType() != (*recoveredType)->getParamType(index)) {
+      result.Reason = "input load type mismatch";
+      return result;
+    }
   }
-  std::optional<std::vector<NativeInputOnlyCallsiteRewrite>> callsiteRewrites;
+  std::optional<std::vector<MultiInputCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
-    InputOnlyCallsiteCollectionResult callsiteCollection =
-        collectInputOnlyDirectCallsiteRewrites(
-        function, prototype->Inputs[0].RegisterName,
-        (*recoveredType)->getParamType(0));
+    MultiInputCallsiteCollectionResult callsiteCollection =
+        collectMultiInputDirectCallsiteRewrites(function, prototype->Inputs,
+                                                **recoveredType);
     if (!callsiteCollection.FailureReason.empty()) {
       result.Reason = callsiteCollection.FailureReason;
       return result;
@@ -1171,14 +1220,18 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
   rewritten->setCallingConv(function.getCallingConv());
   rewritten->splice(rewritten->end(), &function);
 
-  llvm::Argument *argument = &*rewritten->arg_begin();
-  argument->setName(inputLoad->getName());
-  inputLoad->replaceAllUsesWith(argument);
-  if (inputLoad->use_empty()) {
-    inputLoad->eraseFromParent();
+  auto argument = rewritten->arg_begin();
+  for (const NativePrototypeInputBinding &binding : *inputBindings) {
+    llvm::LoadInst *inputLoad = binding.ExternalInputLoad;
+    argument->setName(inputLoad->getName());
+    inputLoad->replaceAllUsesWith(&*argument);
+    if (inputLoad->use_empty()) {
+      inputLoad->eraseFromParent();
+    }
+    ++argument;
   }
   if (callsiteRewrites) {
-    rewriteInputOnlyDirectCallsites(*rewritten, *callsiteRewrites);
+    rewriteMultiInputDirectCallsites(*rewritten, *callsiteRewrites);
   }
 
   function.eraseFromParent();
@@ -1548,7 +1601,7 @@ rewriteNativeRecoveredPrototype(llvm::Function &function) {
   if (prototype->Inputs.empty() && prototype->Returns.size() == 1) {
     return rewriteNativeRecoveredPrototypeReturnOnly(function);
   }
-  if (prototype->Inputs.size() == 1 && prototype->Returns.empty()) {
+  if (!prototype->Inputs.empty() && prototype->Returns.empty()) {
     return rewriteNativeRecoveredPrototypeInputOnly(function);
   }
   if (prototype->Inputs.size() == 1 && prototype->Returns.size() == 1) {
