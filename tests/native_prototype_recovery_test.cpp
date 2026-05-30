@@ -2945,6 +2945,26 @@ int main() {
                     *emptyReturnNameFunction),
                "empty recovered prototype return name was read");
 
+  llvm::Module emptyPrototypeModule(
+      "native-prototype-empty-recovered-prototype-test", context);
+  llvm::Function *emptyPrototypeFunction =
+      createFunction(emptyPrototypeModule, "empty_recovered_prototype");
+  emptyPrototypeFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {}));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *emptyPrototypeFunction),
+               "empty recovered prototype was read");
+  notdec::bin2llvm::NativePrototypeRewriteEligibility
+      emptyPrototypeEligibility =
+          notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+              *emptyPrototypeFunction);
+  ok &= expect(!emptyPrototypeEligibility.Eligible,
+               "empty recovered prototype was incorrectly rewrite eligible");
+  ok &= expect(emptyPrototypeEligibility.Reason ==
+                   "missing recovered prototype",
+               "empty recovered prototype had unexpected ineligible reason");
+
   llvm::Module batchModule("native-prototype-batch-rewrite-test", context);
   llvm::GlobalVariable *batchRdi = createRegisterGlobal(batchModule, "RDI");
   llvm::GlobalVariable *batchRax = createRegisterGlobal(batchModule, "RAX");

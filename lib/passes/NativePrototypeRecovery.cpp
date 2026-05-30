@@ -954,6 +954,9 @@ readNativeRecoveredPrototypeMetadata(const llvm::Function &function) {
   if (*inputCount != inputs->size() || *returnCount != returns->size()) {
     return std::nullopt;
   }
+  if (inputs->empty() && returns->empty()) {
+    return std::nullopt;
+  }
 
   NativeRecoveredPrototype prototype;
   prototype.ModelName = *model;
