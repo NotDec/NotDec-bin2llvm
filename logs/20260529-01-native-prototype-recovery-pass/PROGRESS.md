@@ -353,6 +353,9 @@
   - [x] return binding 支持 PHI incoming 全等价的多 return store。
     - 记录：`06-pass-pipeline-and-verification/20260529-60-return-binding-phi-equivalent-stores.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] return candidate 支持 PHI incoming 全等价判断。
+    - 记录：`06-pass-pipeline-and-verification/20260529-61-return-candidate-phi-equivalence.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

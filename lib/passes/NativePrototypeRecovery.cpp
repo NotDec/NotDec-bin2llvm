@@ -699,11 +699,33 @@ std::vector<NativeParamTrial> returnTrialsBeforeInstruction(
     NativeParamTrial trial;
     trial.RegisterName = *name;
     trial.Slot = match->Slot;
-    trial.ValueKey = returnValueKey(*store->getValueOperand());
+    trial.Value = store->getValueOperand();
+    if (trial.Value != nullptr) {
+      trial.ValueKey = returnValueKey(*trial.Value);
+    }
     trial.Active = true;
     trials.push_back(std::move(trial));
   }
   return trials;
+}
+
+bool hasConflictingReturnTrialValue(
+    llvm::ArrayRef<NativeParamTrial> trials,
+    const std::map<uint64_t, NativeParamTrial> &firstTrialsBySlot,
+    uint64_t slot) {
+  auto first = firstTrialsBySlot.find(slot);
+  if (first == firstTrialsBySlot.end() || first->second.Value == nullptr) {
+    return false;
+  }
+  for (const NativeParamTrial &trial : trials) {
+    if (trial.Slot != slot || trial.Value == nullptr) {
+      continue;
+    }
+    if (!sameReturnStoreValue(*first->second.Value, *trial.Value)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 llvm::BasicBlock *uniquePredecessor(llvm::BasicBlock &block) {
@@ -900,9 +922,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     NativeParamActive returns;
     std::map<uint64_t, NativeParamTrial> returnTrialsBySlot;
     std::map<uint64_t, uint64_t> returnSlotCounts;
-    std::map<uint64_t, uint64_t> returnSlotKeyCounts;
-    std::map<uint64_t, std::string> returnSlotFirstKey;
-    std::set<uint64_t> returnSlotKeyConflicts;
+    std::vector<NativeParamTrial> returnTrials;
     uint64_t returnCount = 0;
     for (llvm::BasicBlock &block : function) {
       if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator())) {
@@ -910,15 +930,8 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
         for (NativeParamTrial &trial : returnTrialsBefore(*ret, model)) {
           uint64_t slot = trial.Slot;
           ++returnSlotCounts[slot];
-          if (trial.ValueKey) {
-            ++returnSlotKeyCounts[slot];
-            auto [iter, inserted] =
-                returnSlotFirstKey.try_emplace(slot, *trial.ValueKey);
-            if (!inserted && iter->second != *trial.ValueKey) {
-              returnSlotKeyConflicts.insert(slot);
-            }
-          }
-          returnTrialsBySlot.try_emplace(slot, std::move(trial));
+          returnTrialsBySlot.try_emplace(slot, trial);
+          returnTrials.push_back(std::move(trial));
         }
       }
     }
@@ -927,8 +940,8 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
       if (count != returnCount) {
         continue;
       }
-      if (returnSlotKeyCounts[slot] == returnCount &&
-          returnSlotKeyConflicts.find(slot) != returnSlotKeyConflicts.end()) {
+      if (hasConflictingReturnTrialValue(returnTrials, returnTrialsBySlot,
+                                         slot)) {
         continue;
       }
       addUniqueTrialBySlot(returns, returnSlots,

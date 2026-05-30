@@ -34,6 +34,9 @@ struct NativeParamTrial {
   // Optional simple value identity used by return recovery.  It is intentionally
   // small: unknown values are left unset so this first pass stays conservative.
   std::optional<std::string> ValueKey;
+  // In-memory SSA value identity for return recovery.  This is not serialized
+  // into metadata; it only lets one recovery run compare PHI/MULTIEQUAL values.
+  llvm::Value *Value = nullptr;
   bool Active = false;
 };
 

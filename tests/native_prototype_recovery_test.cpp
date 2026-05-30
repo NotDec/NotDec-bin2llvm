@@ -959,7 +959,8 @@ llvm::Function *createTwoReturnPhiEquivalentStoreFunction(
   builder.CreateBr(merged);
 
   builder.SetInsertPoint(merged);
-  llvm::PHINode *phi = builder.CreatePHI(global->getValueType(), 2);
+  llvm::PHINode *phi =
+      builder.CreatePHI(global->getValueType(), 2, "merged_value");
   phi->addIncoming(value, left);
   phi->addIncoming(value, right);
   llvm::StoreInst *phiStore = builder.CreateStore(phi, global);
@@ -1597,6 +1598,9 @@ int main() {
                                      "notdec.prototype.return_candidates",
                                      "RAX") == 1,
                "RAX return candidate was not deduplicated");
+  ok &= expect(metadataHasRegister(*phiReturnFunction,
+                                   "notdec.prototype.return_candidates", "RAX"),
+               "phi-equivalent RAX return was not marked as a candidate");
   ok &= expect(!metadataHasRegister(*partialReturnFunction,
                                     "notdec.prototype.return_candidates",
                                     "RAX"),
