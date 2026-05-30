@@ -287,6 +287,9 @@
   - [x] CLI `.ll` 显式签名重写 smoke 检查旧 return register store 被删除。
     - 记录：`06-pass-pipeline-and-verification/20260529-46-cli-return-store-removal-smoke.md`
     - 文件：`tools/CMakeLists.txt`
+  - [x] 将 CLI `.ll` 显式签名重写 smoke 从 CMake 长命令移到脚本。
+    - 记录：`06-pass-pipeline-and-verification/20260529-47-cli-signature-rewrite-smoke-script.md`
+    - 文件：`tools/CMakeLists.txt`、`scripts/native-llvm-cli-signature-rewrite-smoke.sh`
 
 ## 记录规则
 
