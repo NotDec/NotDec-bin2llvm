@@ -88,6 +88,9 @@ run_signature_rewrite_check() {
   require_contains "define { i64, i64 } @cli_return_rax_rdx()" "$out_ll"
   require_contains "define { i64, i64 } @cli_input_rdi_return_rax_rdx(i64 %" "$out_ll"
   require_contains "define { i64, i64 } @cli_input_rdi_rsi_return_rax_rdx(i64 %" "$out_ll"
+  require_contains "notdec.prototype.recovered" "$out_ll"
+  require_contains "input_count=2" "$out_ll"
+  require_contains "return_count=2" "$out_ll"
 
   require_not_contains "ptr @RAX" "$out_ll"
   require_not_contains "ptr @RDX" "$out_ll"

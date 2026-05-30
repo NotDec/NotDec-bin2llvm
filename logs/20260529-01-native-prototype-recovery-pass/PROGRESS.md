@@ -293,6 +293,9 @@
   - [x] CLI 显式签名重写 smoke 覆盖 `.bc` 输入路径。
     - 记录：`06-pass-pipeline-and-verification/20260529-48-cli-bc-signature-rewrite-smoke.md`
     - 文件：`scripts/native-llvm-cli-signature-rewrite-smoke.sh`
+  - [x] CLI 显式签名重写 smoke 检查 recovered prototype metadata 保留。
+    - 记录：`06-pass-pipeline-and-verification/20260529-49-cli-recovered-metadata-smoke.md`
+    - 文件：`scripts/native-llvm-cli-signature-rewrite-smoke.sh`
 
 ## 记录规则
 
