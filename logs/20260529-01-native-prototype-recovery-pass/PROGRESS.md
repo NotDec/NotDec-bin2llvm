@@ -140,6 +140,9 @@
   - [x] 无 ABI 时清理 stale prototype recovery metadata。
     - 记录：`05-input-output-candidates/20260529-27-clear-stale-prototype-metadata-without-abi.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 读回 recovered prototype metadata 时校验 count 字段。
+    - 记录：`05-input-output-candidates/20260529-28-recovered-metadata-count-validation.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
   - [x] 添加参数候选 IR 小样例。
     - 文件：`tests/native_prototype_recovery_test.cpp`
   - [x] 添加返回候选 IR 小样例。

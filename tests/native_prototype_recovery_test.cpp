@@ -1152,8 +1152,9 @@ bool recoveredRegisterAt(const llvm::Function &function, uint64_t listIndex,
   return false;
 }
 
-llvm::MDNode *makeRecoveredPrototypeMetadata(
-    llvm::LLVMContext &context, llvm::StringRef model,
+llvm::MDNode *makeRecoveredPrototypeMetadataWithCounts(
+    llvm::LLVMContext &context, llvm::StringRef model, uint64_t inputCount,
+    uint64_t returnCount,
     llvm::ArrayRef<std::pair<llvm::StringRef, uint64_t>> inputs,
     llvm::ArrayRef<std::pair<llvm::StringRef, uint64_t>> returns) {
   std::vector<llvm::Metadata *> inputEntries;
@@ -1176,14 +1177,21 @@ llvm::MDNode *makeRecoveredPrototypeMetadata(
 
   llvm::Metadata *fields[] = {
       llvm::MDString::get(context, ("model=" + model).str()),
+      llvm::MDString::get(context, "input_count=" + std::to_string(inputCount)),
       llvm::MDString::get(context,
-                          "input_count=" + std::to_string(inputs.size())),
-      llvm::MDString::get(context,
-                          "return_count=" + std::to_string(returns.size())),
+                          "return_count=" + std::to_string(returnCount)),
       llvm::MDNode::get(context, inputEntries),
       llvm::MDNode::get(context, returnEntries),
   };
   return llvm::MDNode::get(context, fields);
+}
+
+llvm::MDNode *makeRecoveredPrototypeMetadata(
+    llvm::LLVMContext &context, llvm::StringRef model,
+    llvm::ArrayRef<std::pair<llvm::StringRef, uint64_t>> inputs,
+    llvm::ArrayRef<std::pair<llvm::StringRef, uint64_t>> returns) {
+  return makeRecoveredPrototypeMetadataWithCounts(
+      context, model, inputs.size(), returns.size(), inputs, returns);
 }
 
 bool recoveredPrototypeParamAt(
@@ -2842,6 +2850,36 @@ int main() {
   ok &= expect(mismatchedMetadataEligibility.Reason ==
                    "missing recovered prototype",
                "mismatched recovered metadata had unexpected ineligible reason");
+
+  llvm::Module mismatchedCountModule(
+      "native-prototype-mismatched-recovered-count-test", context);
+  llvm::Function *mismatchedCountFunction =
+      createFunction(mismatchedCountModule, "mismatched_recovered_count");
+  mismatchedCountFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadataWithCounts(context, "__stdcall", 2, 0,
+                                               {{"RDI", 0}}, {}));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *mismatchedCountFunction),
+               "mismatched recovered prototype input count was read");
+  notdec::bin2llvm::NativePrototypeRewriteEligibility
+      mismatchedCountEligibility =
+          notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+              *mismatchedCountFunction);
+  ok &= expect(!mismatchedCountEligibility.Eligible,
+               "mismatched recovered count was incorrectly rewrite eligible");
+  ok &= expect(mismatchedCountEligibility.Reason ==
+                   "missing recovered prototype",
+               "mismatched recovered count had unexpected ineligible reason");
+  llvm::Function *mismatchedReturnCountFunction = createFunction(
+      mismatchedCountModule, "mismatched_recovered_return_count");
+  mismatchedReturnCountFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadataWithCounts(context, "__stdcall", 0, 2, {},
+                                               {{"RAX", 0}}));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *mismatchedReturnCountFunction),
+               "mismatched recovered prototype return count was read");
 
   llvm::Module batchModule("native-prototype-batch-rewrite-test", context);
   llvm::GlobalVariable *batchRdi = createRegisterGlobal(batchModule, "RDI");

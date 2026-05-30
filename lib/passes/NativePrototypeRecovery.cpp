@@ -926,6 +926,12 @@ readNativeRecoveredPrototypeMetadata(const llvm::Function &function) {
   if (!model) {
     return std::nullopt;
   }
+  std::optional<uint64_t> inputCount = parseUint64Field(*node, "input_count");
+  std::optional<uint64_t> returnCount =
+      parseUint64Field(*node, "return_count");
+  if (!inputCount || !returnCount) {
+    return std::nullopt;
+  }
 
   auto *inputsNode = llvm::dyn_cast_or_null<llvm::MDNode>(node->getOperand(3));
   auto *returnsNode = llvm::dyn_cast_or_null<llvm::MDNode>(node->getOperand(4));
@@ -938,6 +944,9 @@ readNativeRecoveredPrototypeMetadata(const llvm::Function &function) {
   std::optional<std::vector<NativeRecoveredPrototypeParam>> returns =
       readRecoveredParamList(*returnsNode);
   if (!inputs || !returns) {
+    return std::nullopt;
+  }
+  if (*inputCount != inputs->size() || *returnCount != returns->size()) {
     return std::nullopt;
   }
 
