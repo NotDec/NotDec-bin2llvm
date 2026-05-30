@@ -122,13 +122,38 @@ std::optional<std::string> returnValueKey(llvm::Value &value) {
   return std::nullopt;
 }
 
-bool sameReturnStoreValue(llvm::Value &first, llvm::Value &second) {
+bool sameReturnStoreValue(llvm::Value &first, llvm::Value &second,
+                          unsigned depth = 0) {
   if (&first == &second) {
     return true;
   }
   std::optional<std::string> firstKey = returnValueKey(first);
   std::optional<std::string> secondKey = returnValueKey(second);
-  return firstKey && secondKey && *firstKey == *secondKey;
+  if (firstKey && secondKey && *firstKey == *secondKey) {
+    return true;
+  }
+  if (depth >= 4) {
+    return false;
+  }
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&first)) {
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      if (incoming == nullptr ||
+          !sameReturnStoreValue(*incoming, second, depth + 1)) {
+        return false;
+      }
+    }
+    return phi->getNumIncomingValues() > 0;
+  }
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&second)) {
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      if (incoming == nullptr ||
+          !sameReturnStoreValue(first, *incoming, depth + 1)) {
+        return false;
+      }
+    }
+    return phi->getNumIncomingValues() > 0;
+  }
+  return false;
 }
 
 bool hasActiveExternalInputUse(llvm::Function &function,

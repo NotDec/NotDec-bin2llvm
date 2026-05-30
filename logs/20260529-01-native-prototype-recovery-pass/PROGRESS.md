@@ -350,6 +350,9 @@
   - [x] return binding 支持同一 LLVM Value 的多 return store。
     - 记录：`06-pass-pipeline-and-verification/20260529-59-return-binding-same-value-stores.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] return binding 支持 PHI incoming 全等价的多 return store。
+    - 记录：`06-pass-pipeline-and-verification/20260529-60-return-binding-phi-equivalent-stores.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

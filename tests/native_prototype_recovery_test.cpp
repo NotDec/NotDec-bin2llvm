@@ -921,6 +921,55 @@ llvm::Function *createTwoReturnSameValueStoreFunction(
   return function;
 }
 
+llvm::Function *createTwoReturnPhiEquivalentStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *direct =
+      llvm::BasicBlock::Create(context, "direct", function);
+  llvm::BasicBlock *split = llvm::BasicBlock::Create(context, "split", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *merged =
+      llvm::BasicBlock::Create(context, "merged", function);
+
+  llvm::Value *value = llvm::ConstantInt::get(global->getValueType(), 0x7777);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), direct, split);
+
+  builder.SetInsertPoint(direct);
+  llvm::StoreInst *directStore = builder.CreateStore(value, global);
+  directStore->setMetadata("notdec.register.access",
+                           registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(split);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+
+  builder.SetInsertPoint(left);
+  builder.CreateBr(merged);
+
+  builder.SetInsertPoint(right);
+  builder.CreateBr(merged);
+
+  builder.SetInsertPoint(merged);
+  llvm::PHINode *phi = builder.CreatePHI(global->getValueType(), 2);
+  phi->addIncoming(value, left);
+  phi->addIncoming(value, right);
+  llvm::StoreInst *phiStore = builder.CreateStore(phi, global);
+  phiStore->setMetadata("notdec.register.access",
+                        registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+
+  return function;
+}
+
 llvm::Function *createPartialReturnStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName) {
@@ -1405,6 +1454,10 @@ int main() {
       createTwoReturnSameValueStoreFunction(module,
                                             "return_rax_same_value_twice", rax,
                                             "RAX");
+  llvm::Function *phiReturnFunction =
+      createTwoReturnPhiEquivalentStoreFunction(module,
+                                                "return_rax_phi_equivalent",
+                                                rax, "RAX");
   llvm::Function *partialReturnFunction =
       createPartialReturnStoreFunction(module, "return_rax_partial", rax,
                                        "RAX");
@@ -1496,16 +1549,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 32, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 33, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 18,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 15,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 18,
+  ok &= expect(summary.ReturnCandidates == 19,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 22,
+  ok &= expect(summary.RewriteEligibleFunctions == 23,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 21,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 22,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -2100,6 +2153,18 @@ int main() {
     ok &= expect((*sameValueReturnBindings)[0].ReturnStores.size() == 2,
                  "same-value duplicate return stores had wrong store list size");
   }
+  std::optional<std::vector<notdec::bin2llvm::NativePrototypeReturnBinding>>
+      phiReturnBindings =
+          notdec::bin2llvm::getNativePrototypeReturnBindings(
+              *phiReturnFunction);
+  ok &= expect(phiReturnBindings.has_value(),
+               "phi-equivalent duplicate return stores were not bound");
+  if (phiReturnBindings) {
+    ok &= expect(phiReturnBindings->size() == 1,
+                 "phi-equivalent duplicate return stores had wrong binding count");
+    ok &= expect((*phiReturnBindings)[0].ReturnStores.size() == 2,
+                 "phi-equivalent duplicate return stores had wrong store list size");
+  }
   ok &= expect(!notdec::bin2llvm::getNativePrototypeReturnBindings(
                     *conflictingReturnFunction),
                "conflicting return stores were incorrectly bound");
@@ -2131,6 +2196,21 @@ int main() {
                "rewritten same-value duplicate-return function type was not i64()");
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after same-value return rewrite\n";
+    return EXIT_FAILURE;
+  }
+  notdec::bin2llvm::NativePrototypeRewriteResult phiReturnRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+          *phiReturnFunction);
+  ok &= expect(phiReturnRewriteResult.Rewritten,
+               "phi-equivalent duplicate return stores were not rewritten");
+  phiReturnFunction = phiReturnRewriteResult.Function;
+  ok &= expect(phiReturnFunction != nullptr &&
+                   functionTypeShape(*phiReturnFunction->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef<llvm::Type *>{}),
+               "rewritten phi-equivalent duplicate-return function type was not i64()");
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after phi-equivalent return rewrite\n";
     return EXIT_FAILURE;
   }
   notdec::bin2llvm::NativePrototypeRewriteResult usedRewriteResult =
