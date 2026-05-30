@@ -513,6 +513,45 @@ llvm::Function *createInputStoreReturnLoadCallerFunction(
   return function;
 }
 
+llvm::Function *createTwoInputStoreReturnLoadCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *firstInput, const std::string &firstRegisterName,
+    llvm::GlobalVariable *secondInput, const std::string &secondRegisterName,
+    llvm::GlobalVariable *output, const std::string &outputRegisterName,
+    llvm::CallInst **callOut, llvm::LoadInst **loadOut,
+    llvm::Value **firstArgumentOut, llvm::Value **secondArgumentOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *firstArgument =
+      llvm::ConstantInt::get(firstInput->getValueType(), 0x1357);
+  llvm::StoreInst *firstStore = builder.CreateStore(firstArgument, firstInput);
+  firstStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, firstRegisterName));
+  llvm::Value *secondArgument =
+      llvm::ConstantInt::get(secondInput->getValueType(), 0x2468);
+  llvm::StoreInst *secondStore =
+      builder.CreateStore(secondArgument, secondInput);
+  secondStore->setMetadata("notdec.register.access",
+                           registerAccessMetadata(context, secondRegisterName));
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            outputRegisterName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, outputRegisterName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *callOut = call;
+  *loadOut = load;
+  *firstArgumentOut = firstArgument;
+  *secondArgumentOut = secondArgument;
+  return function;
+}
+
 llvm::Function *createUnusedExternalInputFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName) {
@@ -654,6 +693,34 @@ llvm::Function *createInputReturnFunction(
                      registerAccessMetadata(context, outputRegisterName));
   builder.CreateRetVoid();
   *inputLoad = load;
+  *returnStore = store;
+  return function;
+}
+
+llvm::Function *createTwoInputReturnFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *first,
+    const std::string &firstRegisterName, llvm::GlobalVariable *second,
+    const std::string &secondRegisterName, llvm::GlobalVariable *output,
+    const std::string &outputRegisterName, llvm::LoadInst **firstInputLoad,
+    llvm::LoadInst **secondInputLoad, llvm::StoreInst **returnStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *firstLoad =
+      createExternalInputLoad(builder, first, firstRegisterName);
+  llvm::LoadInst *secondLoad =
+      createExternalInputLoad(builder, second, secondRegisterName);
+  llvm::Value *value = builder.CreateAdd(firstLoad, secondLoad);
+  llvm::StoreInst *store = builder.CreateStore(value, output);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, outputRegisterName));
+  builder.CreateRetVoid();
+  *firstInputLoad = firstLoad;
+  *secondInputLoad = secondLoad;
   *returnStore = store;
   return function;
 }
@@ -2098,6 +2165,126 @@ int main() {
   if (llvm::verifyModule(inputReturnCallsiteModule, &llvm::errs())) {
     std::cerr
         << "callsite module verification failed after input-return rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module multiInputReturnCallsiteModule(
+      "native-prototype-multi-input-return-callsite-rewrite-test", context);
+  llvm::GlobalVariable *multiInputReturnRdi =
+      createRegisterGlobal(multiInputReturnCallsiteModule, "RDI");
+  llvm::GlobalVariable *multiInputReturnRsi =
+      createRegisterGlobal(multiInputReturnCallsiteModule, "RSI");
+  llvm::GlobalVariable *multiInputReturnRax =
+      createRegisterGlobal(multiInputReturnCallsiteModule, "RAX");
+  attachTestAbi(multiInputReturnCallsiteModule);
+  llvm::LoadInst *multiInputReturnRdiLoad = nullptr;
+  llvm::LoadInst *multiInputReturnRsiLoad = nullptr;
+  llvm::StoreInst *multiInputReturnStore = nullptr;
+  llvm::Function *multiInputReturnFunction = createTwoInputReturnFunction(
+      multiInputReturnCallsiteModule, "callsite_input_rdi_rsi_return_rax",
+      multiInputReturnRdi, "RDI", multiInputReturnRsi, "RSI",
+      multiInputReturnRax, "RAX", &multiInputReturnRdiLoad,
+      &multiInputReturnRsiLoad, &multiInputReturnStore);
+  attachExternalInputs(*multiInputReturnFunction,
+                       {{"RDI", multiInputReturnRdi},
+                        {"RSI", multiInputReturnRsi}});
+  llvm::CallInst *oldMultiInputReturnCall = nullptr;
+  llvm::LoadInst *oldMultiInputReturnLoad = nullptr;
+  llvm::Value *firstMultiInputReturnArgument = nullptr;
+  llvm::Value *secondMultiInputReturnArgument = nullptr;
+  createTwoInputStoreReturnLoadCallerFunction(
+      multiInputReturnCallsiteModule,
+      "call_callsite_input_rdi_rsi_return_rax", multiInputReturnFunction,
+      multiInputReturnRdi, "RDI", multiInputReturnRsi, "RSI",
+      multiInputReturnRax, "RAX", &oldMultiInputReturnCall,
+      &oldMultiInputReturnLoad, &firstMultiInputReturnArgument,
+      &secondMultiInputReturnArgument);
+  notdec::bin2llvm::runNativePrototypeRecovery(multiInputReturnCallsiteModule,
+                                               options);
+  llvm::Instruction *multiInputReturnRdiUser =
+      multiInputReturnRdiLoad != nullptr && !multiInputReturnRdiLoad->user_empty()
+          ? llvm::dyn_cast<llvm::Instruction>(
+                *multiInputReturnRdiLoad->user_begin())
+          : nullptr;
+  llvm::Instruction *multiInputReturnRsiUser =
+      multiInputReturnRsiLoad != nullptr && !multiInputReturnRsiLoad->user_empty()
+          ? llvm::dyn_cast<llvm::Instruction>(
+                *multiInputReturnRsiLoad->user_begin())
+          : nullptr;
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      multiInputReturnRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputReturn(
+              *multiInputReturnFunction);
+  ok &= expect(multiInputReturnRewriteResult.Rewritten,
+               "multi-input return prototype with direct callsite was not rewritten");
+  multiInputReturnFunction = multiInputReturnRewriteResult.Function;
+  llvm::Type *multiInputReturnParams[] = {llvm::Type::getInt64Ty(context),
+                                          llvm::Type::getInt64Ty(context)};
+  ok &= expect(multiInputReturnFunction != nullptr &&
+                   functionTypeShape(
+                       *multiInputReturnFunction->getFunctionType(),
+                       llvm::Type::getInt64Ty(context),
+                       multiInputReturnParams),
+               "callsite rewritten multi-input return function type was not i64(i64, i64)");
+  llvm::CallInst *rewrittenMultiInputReturnCall = nullptr;
+  llvm::Function *multiInputReturnCaller =
+      multiInputReturnCallsiteModule.getFunction(
+          "call_callsite_input_rdi_rsi_return_rax");
+  if (multiInputReturnCaller != nullptr) {
+    for (llvm::BasicBlock &block : *multiInputReturnCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == multiInputReturnFunction) {
+          rewrittenMultiInputReturnCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenMultiInputReturnCall != nullptr,
+               "multi-input return direct callsite was not rewritten to new callee");
+  ok &= expect(rewrittenMultiInputReturnCall != nullptr &&
+                   rewrittenMultiInputReturnCall->arg_size() == 2,
+               "multi-input return direct callsite did not get two arguments");
+  ok &= expect(rewrittenMultiInputReturnCall != nullptr &&
+                   firstMultiInputReturnArgument ==
+                       rewrittenMultiInputReturnCall->getArgOperand(0) &&
+                   secondMultiInputReturnArgument ==
+                       rewrittenMultiInputReturnCall->getArgOperand(1),
+               "multi-input return direct callsite arguments were not ABI ordered");
+  ok &= expect(rewrittenMultiInputReturnCall != nullptr &&
+                   rewrittenMultiInputReturnCall->getType() ==
+                       llvm::Type::getInt64Ty(context),
+               "multi-input return direct callsite did not return i64");
+  ok &= expect(multiInputReturnFunction != nullptr &&
+                   multiInputReturnFunction->arg_size() == 2 &&
+                   multiInputReturnRdiUser != nullptr &&
+                   multiInputReturnRdiUser->getOperand(0) ==
+                       multiInputReturnFunction->getArg(0) &&
+                   multiInputReturnRsiUser != nullptr &&
+                   multiInputReturnRsiUser->getOperand(1) ==
+                       multiInputReturnFunction->getArg(1),
+               "multi-input return function did not replace both input loads");
+  bool sawOldMultiInputReturnLoad = false;
+  if (multiInputReturnCaller != nullptr) {
+    for (llvm::BasicBlock &block : *multiInputReturnCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+        if (load != nullptr &&
+            load->getMetadata("notdec.register.access") != nullptr) {
+          sawOldMultiInputReturnLoad = true;
+        }
+      }
+    }
+  }
+  ok &= expect(!sawOldMultiInputReturnLoad,
+               "multi-input return direct callsite kept old return register load");
+  ok &= expect(rewrittenMultiInputReturnCall != nullptr &&
+                   !rewrittenMultiInputReturnCall->use_empty(),
+               "multi-input return direct callsite result was not used");
+  if (llvm::verifyModule(multiInputReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "callsite module verification failed after multi-input "
+                 "return rewrite\n";
     return EXIT_FAILURE;
   }
   notdec::bin2llvm::NativePrototypeRewriteResult dispatchInputResult =

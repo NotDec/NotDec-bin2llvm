@@ -221,6 +221,9 @@
   - [x] 添加多 input、无 return direct callsite 的参数列表重写。
     - 记录：`06-pass-pipeline-and-verification/20260529-30-multi-input-direct-callsite-rewrite.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 添加多 input + 单 return direct callsite 的参数列表和返回 load 重写。
+    - 记录：`06-pass-pipeline-and-verification/20260529-31-multi-input-single-return-direct-callsite-rewrite.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
