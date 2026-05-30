@@ -429,6 +429,28 @@ llvm::Function *createReturnLoadMultiSuccessorCallerFunction(
   return function;
 }
 
+llvm::Function *createUnusedReturnMultiSuccessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+
+  builder.SetInsertPoint(left);
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(right);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createReturnLoadMultiPredecessorCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *output, const std::string &registerName,
@@ -2668,6 +2690,60 @@ int main() {
   if (llvm::verifyModule(linearReturnCallsiteModule, &llvm::errs())) {
     std::cerr << "linear callsite module verification failed after "
                  "return-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module unusedMultiSuccessorReturnCallsiteModule(
+      "native-prototype-return-unused-multi-successor-callsite-rewrite-test",
+      context);
+  llvm::GlobalVariable *unusedMultiSuccessorReturnCallsiteRax =
+      createRegisterGlobal(unusedMultiSuccessorReturnCallsiteModule, "RAX");
+  attachTestAbi(unusedMultiSuccessorReturnCallsiteModule);
+  llvm::StoreInst *unusedMultiSuccessorReturnCallsiteStore = nullptr;
+  llvm::Function *unusedMultiSuccessorReturnCallsiteFunction =
+      createReturnStoreFunction(unusedMultiSuccessorReturnCallsiteModule,
+                                "unused_multi_successor_callsite_return_rax",
+                                unusedMultiSuccessorReturnCallsiteRax, "RAX",
+                                &unusedMultiSuccessorReturnCallsiteStore);
+  createUnusedReturnMultiSuccessorCallerFunction(
+      unusedMultiSuccessorReturnCallsiteModule,
+      "call_unused_multi_successor_callsite_return_rax",
+      unusedMultiSuccessorReturnCallsiteFunction);
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      unusedMultiSuccessorReturnCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      unusedMultiSuccessorReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *unusedMultiSuccessorReturnCallsiteFunction);
+  ok &= expect(unusedMultiSuccessorReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype with unused multi-successor callsite was not rewritten");
+  unusedMultiSuccessorReturnCallsiteFunction =
+      unusedMultiSuccessorReturnCallsiteRewriteResult.Function;
+  llvm::CallInst *rewrittenUnusedMultiSuccessorReturnCallsiteCall = nullptr;
+  llvm::Function *unusedMultiSuccessorReturnCallsiteCaller =
+      unusedMultiSuccessorReturnCallsiteModule.getFunction(
+          "call_unused_multi_successor_callsite_return_rax");
+  if (unusedMultiSuccessorReturnCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *unusedMultiSuccessorReturnCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() ==
+                unusedMultiSuccessorReturnCallsiteFunction) {
+          rewrittenUnusedMultiSuccessorReturnCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenUnusedMultiSuccessorReturnCallsiteCall != nullptr,
+               "unused multi-successor return callsite was not rewritten to new callee");
+  ok &= expect(rewrittenUnusedMultiSuccessorReturnCallsiteCall != nullptr &&
+                   rewrittenUnusedMultiSuccessorReturnCallsiteCall->use_empty(),
+               "unused multi-successor return callsite result was unexpectedly used");
+  if (llvm::verifyModule(unusedMultiSuccessorReturnCallsiteModule,
+                         &llvm::errs())) {
+    std::cerr << "unused multi-successor return callsite module verification "
+                 "failed after return-only rewrite\n";
     return EXIT_FAILURE;
   }
 

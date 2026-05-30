@@ -444,6 +444,38 @@ ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
   return {};
 }
 
+bool blockHasNoReturnRegisterAccess(llvm::BasicBlock &block,
+                                    llvm::StringRef returnRegisterName) {
+  for (llvm::Instruction &instruction : block) {
+    llvm::MDNode *metadata =
+        instruction.getMetadata("notdec.register.access");
+    if (metadata == nullptr) {
+      continue;
+    }
+    std::optional<std::string> name = metadataField(*metadata, "name");
+    if (name && *name == returnRegisterName) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool allSuccessorsEndWithoutReturnRegisterAccess(
+    llvm::BasicBlock &block, llvm::StringRef returnRegisterName) {
+  uint64_t successorCount = 0;
+  for (llvm::BasicBlock *successor : llvm::successors(&block)) {
+    ++successorCount;
+    if (successor->getTerminator() == nullptr ||
+        successor->getTerminator()->getNumSuccessors() != 0) {
+      return false;
+    }
+    if (!blockHasNoReturnRegisterAccess(*successor, returnRegisterName)) {
+      return false;
+    }
+  }
+  return successorCount > 1;
+}
+
 ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
                                               llvm::StringRef returnRegisterName) {
   llvm::BasicBlock::iterator localIter(oldCall.getIterator());
@@ -459,6 +491,10 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
     llvm::BasicBlock *successor = nullptr;
     for (llvm::BasicBlock *candidate : llvm::successors(current)) {
       if (successor != nullptr) {
+        if (allSuccessorsEndWithoutReturnRegisterAccess(
+                *current, returnRegisterName)) {
+          return {};
+        }
         return {nullptr, true};
       }
       successor = candidate;

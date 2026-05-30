@@ -362,6 +362,9 @@
   - [x] callsite input 支持多前驱全等价参数值。
     - 记录：`06-pass-pipeline-and-verification/20260529-63-callsite-input-equivalent-predecessors.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] callsite return 多后继无返回寄存器使用时允许 rewrite。
+    - 记录：`06-pass-pipeline-and-verification/20260529-64-callsite-return-unused-multi-successor.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
