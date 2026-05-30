@@ -1604,6 +1604,13 @@ rewriteNativeRecoveredPrototype(llvm::Function &function) {
   NativePrototypeRewriteResult result;
   result.Function = &function;
 
+  NativePrototypeRewriteEligibility eligibility =
+      getNativePrototypeRewriteEligibility(function);
+  if (eligibility.Eligible && !eligibility.NeedsRewrite) {
+    result.Reason = eligibility.Reason;
+    return result;
+  }
+
   std::optional<NativeRecoveredPrototype> prototype =
       readNativeRecoveredPrototypeMetadata(function);
   if (!prototype) {

@@ -233,6 +233,9 @@
   - [x] 显式签名重写后清理临时 prototype recovery metadata。
     - 记录：`06-pass-pipeline-and-verification/20260529-34-clear-transient-prototype-metadata-after-rewrite.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 统一签名重写入口跳过已经匹配 recovered prototype 的函数。
+    - 记录：`06-pass-pipeline-and-verification/20260529-35-skip-already-matching-signature-rewrite.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

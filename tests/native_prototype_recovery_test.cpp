@@ -1754,6 +1754,12 @@ int main() {
                "matching input prototype incorrectly requested rewrite");
   ok &= expect(matchingEligibility.Reason == "already matches",
                "matching input prototype had unexpected eligibility reason");
+  notdec::bin2llvm::NativePrototypeRewriteResult matchingRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototype(*matchingInputFunction);
+  ok &= expect(!matchingRewriteResult.Rewritten,
+               "matching input prototype was rewritten");
+  ok &= expect(matchingRewriteResult.Reason == "already matches",
+               "matching input prototype rewrite had unexpected reason");
   ok &= expect(recoveredHasField(*returnFunction, "input_count=0"),
                "return-only recovered prototype input count was not written");
   ok &= expect(recoveredHasField(*returnFunction, "return_count=1"),
@@ -2733,6 +2739,12 @@ int main() {
       batchModule, "batch_input_rdi", batchRdi, "RDI", &batchInputLoad);
   attachExternalInputs(*batchInputFunction, {{"RDI", batchRdi}});
 
+  llvm::FunctionType *batchMatchingInputType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *batchMatchingInputFunction = createFunctionWithType(
+      batchModule, "batch_input_rdi_already_typed", batchMatchingInputType);
+  attachExternalInputs(*batchMatchingInputFunction, {{"RDI", batchRdi}});
+
   llvm::StoreInst *batchReturnStore = nullptr;
   createReturnStoreFunction(batchModule, "batch_return_rax", batchRax, "RAX",
                             &batchReturnStore);
@@ -2771,12 +2783,14 @@ int main() {
   notdec::bin2llvm::runNativePrototypeRecovery(batchModule, options);
   notdec::bin2llvm::NativePrototypeModuleRewriteSummary batchRewriteSummary =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypes(batchModule);
-  ok &= expect(batchRewriteSummary.FunctionsSeen == 10,
+  ok &= expect(batchRewriteSummary.FunctionsSeen == 11,
                "batch rewrite saw unexpected function count");
   ok &= expect(batchRewriteSummary.FunctionsRewritten == 3,
                "batch rewrite rewrote unexpected function count");
-  ok &= expect(batchRewriteSummary.FunctionsSkipped == 7,
+  ok &= expect(batchRewriteSummary.FunctionsSkipped == 8,
                "batch rewrite skipped unexpected function count");
+  ok &= expect(batchRewriteSummary.SkippedByReason["already matches"] == 1,
+               "batch rewrite did not count already-matches skip reason");
   ok &= expect(batchRewriteSummary.SkippedByReason["function has uses"] == 0,
                "batch rewrite did not count function-use skip reason");
   ok &= expect(
