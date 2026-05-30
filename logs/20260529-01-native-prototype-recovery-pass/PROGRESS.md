@@ -260,6 +260,9 @@
   - [x] 添加 `notdec-native-llvm` `.ll` 输入的显式签名重写 smoke。
     - 记录：`06-pass-pipeline-and-verification/20260529-37-cli-ll-signature-rewrite-smoke.md`
     - 文件：`tools/CMakeLists.txt`、`tests/ir/native-prototype/cli-signature-rewrite.ll`
+  - [x] CLI `.ll` 显式签名重写 smoke 检查 prototype recovery summary。
+    - 记录：`06-pass-pipeline-and-verification/20260529-38-cli-signature-rewrite-summary-smoke.md`
+    - 文件：`tools/CMakeLists.txt`
 
 ## 记录规则
 
