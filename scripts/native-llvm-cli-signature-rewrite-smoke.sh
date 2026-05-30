@@ -23,6 +23,8 @@ OUT_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite.bc"
 VERIFY_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite.opt.bc"
 RERUN_LL="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-rerun.ll"
 RERUN_SUMMARY_TXT="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-rerun-summary.txt"
+RERUN_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-rerun.bc"
+RERUN_VERIFY_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-rerun.opt.bc"
 FIXTURE_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-input.bc"
 OUT_LL_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc.ll"
 SUMMARY_TXT_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-summary.txt"
@@ -30,6 +32,8 @@ OUT_BC_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc.bc"
 VERIFY_BC_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc.opt.bc"
 RERUN_LL_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-rerun.ll"
 RERUN_SUMMARY_TXT_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-rerun-summary.txt"
+RERUN_BC_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-rerun.bc"
+RERUN_VERIFY_BC_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-rerun.opt.bc"
 
 require_executable() {
   if [[ ! -x "$1" ]]; then
@@ -115,6 +119,8 @@ run_rerun_check() {
   local input_ir="$1"
   local out_ll="$2"
   local summary_txt="$3"
+  local out_bc="$4"
+  local verify_bc="$5"
 
   "$NATIVE_LLVM" "$input_ir" \
     --no-instcombine-pass \
@@ -132,14 +138,19 @@ run_rerun_check() {
     "$summary_txt"
   require_not_contains "signature rewrite skipped reason missing recovered prototype" \
     "$summary_txt"
+
+  "$LLVM_BIN/llvm-as" "$out_ll" -o "$out_bc"
+  "$LLVM_BIN/opt" -passes=verify "$out_bc" -o "$verify_bc"
 }
 
 run_signature_rewrite_check "$FIXTURE_LL" "$OUT_LL" "$SUMMARY_TXT" \
   "$OUT_BC" "$VERIFY_BC"
-run_rerun_check "$OUT_LL" "$RERUN_LL" "$RERUN_SUMMARY_TXT"
+run_rerun_check "$OUT_LL" "$RERUN_LL" "$RERUN_SUMMARY_TXT" \
+  "$RERUN_BC" "$RERUN_VERIFY_BC"
 
 "$LLVM_BIN/llvm-as" "$FIXTURE_LL" -o "$FIXTURE_BC"
 run_signature_rewrite_check "$FIXTURE_BC" "$OUT_LL_FROM_BC" \
   "$SUMMARY_TXT_FROM_BC" "$OUT_BC_FROM_BC" "$VERIFY_BC_FROM_BC"
 run_rerun_check "$OUT_LL_FROM_BC" "$RERUN_LL_FROM_BC" \
-  "$RERUN_SUMMARY_TXT_FROM_BC"
+  "$RERUN_SUMMARY_TXT_FROM_BC" "$RERUN_BC_FROM_BC" \
+  "$RERUN_VERIFY_BC_FROM_BC"

@@ -302,6 +302,9 @@
   - [x] 类型不匹配时清理旧 recovered prototype metadata。
     - 记录：`06-pass-pipeline-and-verification/20260529-51-clear-mismatched-recovered-metadata.md`
     - 文件：`tests/native_prototype_recovery_test.cpp`
+  - [x] CLI 二次运行输出用 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260529-52-cli-rerun-output-verify.md`
+    - 文件：`scripts/native-llvm-cli-signature-rewrite-smoke.sh`
 
 ## 记录规则
 
