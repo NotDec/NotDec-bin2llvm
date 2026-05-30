@@ -1062,6 +1062,28 @@ uint64_t countMetadataRegister(const llvm::Function &function,
   return count;
 }
 
+bool hasRegisterStore(const llvm::Function &function, llvm::StringRef name) {
+  std::string expected = ("name=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &instruction : block) {
+      if (!llvm::isa<llvm::StoreInst>(&instruction)) {
+        continue;
+      }
+      llvm::MDNode *metadata = instruction.getMetadata("notdec.register.access");
+      if (metadata == nullptr) {
+        continue;
+      }
+      for (const llvm::MDOperand &operand : metadata->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (field != nullptr && field->getString() == expected) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 bool recoveredHasField(const llvm::Function &function, llvm::StringRef field) {
   llvm::MDNode *node = function.getMetadata("notdec.prototype.recovered");
   if (node == nullptr) {
@@ -1813,6 +1835,9 @@ int main() {
                                      llvm::Type::getInt64Ty(context),
                                      llvm::ArrayRef<llvm::Type *>{}),
                "callsite rewritten return function type was not i64()");
+  ok &= expect(returnCallsiteFunction != nullptr &&
+                   !hasRegisterStore(*returnCallsiteFunction, "RAX"),
+               "callsite rewritten return function kept old RAX store");
   llvm::CallInst *rewrittenReturnCallsiteCall = nullptr;
   llvm::Function *returnCallsiteCaller =
       returnCallsiteModule.getFunction("call_callsite_return_rax");
@@ -2099,6 +2124,7 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  llvm::Value *returnFunctionValue = returnStore->getValueOperand();
   notdec::bin2llvm::NativePrototypeRewriteResult rewriteResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
           *returnFunction);
@@ -2122,8 +2148,7 @@ int main() {
   ok &= expect(rewrittenRet != nullptr,
                "rewritten return-only function had no return instruction");
   ok &= expect(rewrittenRet != nullptr &&
-                   rewrittenRet->getReturnValue() ==
-                       returnStore->getValueOperand(),
+                   rewrittenRet->getReturnValue() == returnFunctionValue,
                "rewritten return-only function returned wrong value");
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after return-only rewrite\n";
@@ -2642,6 +2667,10 @@ int main() {
                    llvm::isa<llvm::StructType>(
                        multiInputTwoOutputFunction->getReturnType()),
                "multi-input multi-return function did not return struct");
+  ok &= expect(multiInputTwoOutputFunction != nullptr &&
+                   !hasRegisterStore(*multiInputTwoOutputFunction, "RAX") &&
+                   !hasRegisterStore(*multiInputTwoOutputFunction, "RDX"),
+               "multi-input multi-return function kept old return stores");
   ok &= expect(rewrittenMultiInputMultiReturnCall != nullptr,
                "multi-input multi-return callsite was not rewritten to new callee");
   ok &= expect(rewrittenMultiInputMultiReturnCall != nullptr &&

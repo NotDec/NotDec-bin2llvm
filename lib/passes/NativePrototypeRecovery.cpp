@@ -1018,6 +1018,15 @@ getNativePrototypeReturnBindings(llvm::Function &function) {
   return bindings;
 }
 
+void eraseReturnBindingStores(
+    llvm::ArrayRef<NativePrototypeReturnBinding> returnBindings) {
+  for (const NativePrototypeReturnBinding &binding : returnBindings) {
+    if (binding.ReturnStore != nullptr) {
+      binding.ReturnStore->eraseFromParent();
+    }
+  }
+}
+
 NativePrototypeRewriteResult
 rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
   NativePrototypeRewriteResult result;
@@ -1097,6 +1106,7 @@ rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
     builder.CreateRet(returnValue);
     ret->eraseFromParent();
   }
+  eraseReturnBindingStores(*returnBindings);
   if (callsiteRewrites) {
     rewriteReturnOnlyDirectCallsites(*rewritten, *callsiteRewrites,
                                      prototype->Returns[0].RegisterName);
@@ -1326,6 +1336,7 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
     builder.CreateRet(returnValue);
     ret->eraseFromParent();
   }
+  eraseReturnBindingStores(*returnBindings);
   if (callsiteRewrites) {
     rewriteInputReturnDirectCallsites(*rewritten, *callsiteRewrites,
                                       prototype->Returns[0].RegisterName);
@@ -1428,6 +1439,7 @@ rewriteNativeRecoveredPrototypeMultiReturn(llvm::Function &function) {
     builder.CreateRet(aggregate);
     ret->eraseFromParent();
   }
+  eraseReturnBindingStores(*returnBindings);
   if (callsiteRewrites) {
     rewriteMultiReturnDirectCallsites(*rewritten, *callsiteRewrites);
   }
@@ -1564,6 +1576,7 @@ rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
     builder.CreateRet(aggregate);
     ret->eraseFromParent();
   }
+  eraseReturnBindingStores(*returnBindings);
   if (callsiteRewrites) {
     rewriteInputMultiReturnDirectCallsites(*rewritten, *callsiteRewrites);
   }

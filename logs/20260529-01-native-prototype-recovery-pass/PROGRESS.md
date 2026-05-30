@@ -227,6 +227,9 @@
   - [x] 添加多 input + 多 return direct callsite 的参数列表和 struct result extract 重写。
     - 记录：`06-pass-pipeline-and-verification/20260529-32-multi-input-multi-return-direct-callsite-rewrite.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 显式签名重写后删除 callee 内旧 return register store。
+    - 记录：`06-pass-pipeline-and-verification/20260529-33-remove-return-register-stores-after-rewrite.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
