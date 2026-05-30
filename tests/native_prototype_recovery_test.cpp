@@ -2831,11 +2831,8 @@ int main() {
       clobberReturnCallsiteRewriteResult =
           notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
               *clobberReturnCallsiteFunction);
-  ok &= expect(!clobberReturnCallsiteRewriteResult.Rewritten,
-               "return-only prototype rewrite ignored callsite clobber");
-  ok &= expect(clobberReturnCallsiteRewriteResult.Reason ==
-                   "unsafe callsite return load",
-               "clobbered return callsite had wrong skip reason");
+  ok &= expect(clobberReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype rewrite rejected unused clobbered return");
   ok &= expect(!clobberReturnCallsiteLoad->use_empty(),
                "clobbered return load was unexpectedly replaced");
   if (llvm::verifyModule(clobberReturnCallsiteModule, &llvm::errs())) {

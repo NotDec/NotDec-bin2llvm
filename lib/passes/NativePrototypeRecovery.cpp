@@ -392,6 +392,7 @@ void rewriteMultiInputDirectCallsites(
 struct ReturnLoadSearchResult {
   llvm::LoadInst *Load = nullptr;
   bool Blocked = false;
+  bool Clobbered = false;
 };
 
 struct ReturnOnlyCallsiteCollectionResult {
@@ -450,10 +451,10 @@ ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
       continue;
     }
     if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter)) {
-      return {load, false};
+      return {load, false, false};
     }
     if (llvm::isa<llvm::StoreInst>(&*iter)) {
-      return {nullptr, true};
+      return {nullptr, false, true};
     }
   }
   return {};
@@ -469,25 +470,25 @@ ReturnLoadSearchResult findMixedSuccessorReturnLoad(
     ++successorCount;
     ReturnLoadSearchResult successorResult = findReturnLoadBeforeStoreInRange(
         successor->begin(), successor->end(), returnRegisterName);
-    if (successorResult.Blocked) {
-      return {nullptr, true};
+    if (successorResult.Blocked || successorResult.Clobbered) {
+      return {nullptr, true, false};
     }
     if (successorResult.Load != nullptr) {
       if (load != nullptr) {
-        return {nullptr, true};
+        return {nullptr, true, false};
       }
       load = successorResult.Load;
       continue;
     }
     if (successor->getTerminator() == nullptr ||
         successor->getTerminator()->getNumSuccessors() != 0) {
-      return {nullptr, true};
+      return {nullptr, true, false};
     }
   }
   if (successorCount <= 1) {
     return {};
   }
-  return {load, false};
+  return {load, false, false};
 }
 
 ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
@@ -495,7 +496,8 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
   llvm::BasicBlock::iterator localIter(oldCall.getIterator());
   ReturnLoadSearchResult localResult = findReturnLoadBeforeStoreInRange(
       ++localIter, oldCall.getParent()->end(), returnRegisterName);
-  if (localResult.Load != nullptr || localResult.Blocked) {
+  if (localResult.Load != nullptr || localResult.Blocked ||
+      localResult.Clobbered) {
     return localResult;
   }
 
@@ -516,22 +518,23 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
     llvm::BasicBlock *predecessor = nullptr;
     for (llvm::BasicBlock *candidate : llvm::predecessors(successor)) {
       if (predecessor != nullptr) {
-        return {nullptr, true};
+        return {nullptr, true, false};
       }
       predecessor = candidate;
     }
     if (predecessor != current) {
-      return {nullptr, true};
+      return {nullptr, true, false};
     }
 
     ReturnLoadSearchResult successorResult = findReturnLoadBeforeStoreInRange(
         successor->begin(), successor->end(), returnRegisterName);
-    if (successorResult.Load != nullptr || successorResult.Blocked) {
+    if (successorResult.Load != nullptr || successorResult.Blocked ||
+        successorResult.Clobbered) {
       return successorResult;
     }
     current = successor;
   }
-  return {nullptr, true};
+  return {nullptr, true, false};
 }
 
 void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,

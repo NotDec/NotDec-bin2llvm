@@ -374,6 +374,9 @@
   - [x] callsite return load 查找支持无 access metadata 的 register global 访问。
     - 记录：`06-pass-pipeline-and-verification/20260529-67-callsite-return-global-register-load.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] callsite 返回寄存器先被覆盖时按未使用返回值处理。
+    - 记录：`06-pass-pipeline-and-verification/20260529-68-callsite-return-clobber-unused.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
