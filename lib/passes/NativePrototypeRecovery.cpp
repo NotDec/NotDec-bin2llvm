@@ -644,20 +644,30 @@ llvm::BasicBlock *uniquePredecessor(llvm::BasicBlock &block) {
 
 std::vector<NativeParamTrial> returnTrialsBefore(
     llvm::ReturnInst &ret, const NativePrototypeModel &model) {
-  std::vector<NativeParamTrial> trials = returnTrialsBeforeInstruction(ret, model);
+  std::vector<NativeParamTrial> trials =
+      returnTrialsBeforeInstruction(ret, model);
   if (!trials.empty()) {
     return trials;
   }
 
-  llvm::BasicBlock *predecessor = uniquePredecessor(*ret.getParent());
-  if (predecessor == nullptr) {
-    return {};
+  std::set<llvm::BasicBlock *> visited;
+  llvm::BasicBlock *block = ret.getParent();
+  while (block != nullptr && visited.insert(block).second) {
+    llvm::BasicBlock *predecessor = uniquePredecessor(*block);
+    if (predecessor == nullptr) {
+      return {};
+    }
+    llvm::Instruction *terminator = predecessor->getTerminator();
+    if (terminator == nullptr) {
+      return {};
+    }
+    trials = returnTrialsBeforeInstruction(*terminator, model);
+    if (!trials.empty()) {
+      return trials;
+    }
+    block = predecessor;
   }
-  llvm::Instruction *terminator = predecessor->getTerminator();
-  if (terminator == nullptr) {
-    return {};
-  }
-  return returnTrialsBeforeInstruction(*terminator, model);
+  return {};
 }
 
 void addFunctionSummary(NativePrototypeRecoverySummary &total,

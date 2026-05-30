@@ -862,6 +862,35 @@ llvm::Function *createUniquePredecessorReturnStoreFunction(
   return function;
 }
 
+llvm::Function *createLinearPredecessorReturnStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *middle =
+      llvm::BasicBlock::Create(context, "middle", function);
+  llvm::BasicBlock *exit = llvm::BasicBlock::Create(context, "exit", function);
+
+  llvm::IRBuilder<> builder(entry);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x5555), global);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
+  builder.CreateBr(middle);
+
+  builder.SetInsertPoint(middle);
+  builder.CreateBr(exit);
+
+  builder.SetInsertPoint(exit);
+  builder.CreateRetVoid();
+
+  return function;
+}
+
 llvm::Function *createConflictingReturnStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName) {
@@ -1223,6 +1252,9 @@ int main() {
       createUniquePredecessorReturnStoreFunction(module,
                                                  "return_rax_unique_pred", rax,
                                                  "RAX");
+  llvm::Function *linearPredReturnFunction =
+      createLinearPredecessorReturnStoreFunction(
+          module, "return_rax_linear_pred", rax, "RAX");
   llvm::Function *conflictingReturnFunction =
       createConflictingReturnStoreFunction(module, "return_rax_conflict", rax,
                                            "RAX");
@@ -1296,16 +1328,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 29, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 30, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 17,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 14,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 15,
+  ok &= expect(summary.ReturnCandidates == 16,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 19,
+  ok &= expect(summary.RewriteEligibleFunctions == 20,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 18,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 19,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -1351,6 +1383,9 @@ int main() {
   ok &= expect(metadataHasRegister(*uniquePredReturnFunction,
                                    "notdec.prototype.return_candidates", "RAX"),
                "unique predecessor RAX return was not marked as a candidate");
+  ok &= expect(metadataHasRegister(*linearPredReturnFunction,
+                                   "notdec.prototype.return_candidates", "RAX"),
+               "linear predecessor RAX return was not marked as a candidate");
   ok &= expect(!metadataHasRegister(*conflictingReturnFunction,
                                     "notdec.prototype.return_candidates",
                                     "RAX"),
