@@ -2846,18 +2846,26 @@ int main() {
                             &optInInputReturnLoad, &optInInputReturnStore);
   attachExternalInputs(*optInModule.getFunction("opt_in_input_rdi_return_rax"),
                        {{"RDI", optInRdi}});
+  llvm::FunctionType *optInMatchingInputType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *optInMatchingInputFunction = createFunctionWithType(
+      optInModule, "opt_in_input_rdi_already_typed", optInMatchingInputType);
+  attachExternalInputs(*optInMatchingInputFunction, {{"RDI", optInRdi}});
   createFunction(optInModule, "opt_in_missing_recovered");
 
   notdec::bin2llvm::NativePrototypeRecoveryOptions rewriteOptions;
   rewriteOptions.RewriteSignatures = true;
   notdec::bin2llvm::NativePrototypeRecoverySummary optInSummary =
       notdec::bin2llvm::runNativePrototypeRecovery(optInModule, rewriteOptions);
-  ok &= expect(optInSummary.SignatureRewriteFunctionsSeen == 2,
+  ok &= expect(optInSummary.SignatureRewriteFunctionsSeen == 3,
                "opt-in rewrite saw unexpected function count");
   ok &= expect(optInSummary.SignatureRewriteFunctionsRewritten == 1,
                "opt-in rewrite rewrote unexpected function count");
-  ok &= expect(optInSummary.SignatureRewriteFunctionsSkipped == 1,
+  ok &= expect(optInSummary.SignatureRewriteFunctionsSkipped == 2,
                "opt-in rewrite skipped unexpected function count");
+  ok &= expect(optInSummary.SignatureRewriteSkippedByReason
+                   ["already matches"] == 1,
+               "opt-in rewrite did not count already-matches skip reason");
   ok &= expect(optInSummary.SignatureRewriteSkippedByReason
                    ["missing recovered prototype"] == 1,
                "opt-in rewrite did not count missing-prototype skip reason");

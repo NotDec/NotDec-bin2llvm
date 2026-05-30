@@ -236,6 +236,9 @@
   - [x] 统一签名重写入口跳过已经匹配 recovered prototype 的函数。
     - 记录：`06-pass-pipeline-and-verification/20260529-35-skip-already-matching-signature-rewrite.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] opt-in rewrite 统计已经匹配 recovered prototype 的 skip reason。
+    - 记录：`06-pass-pipeline-and-verification/20260529-36-opt-in-rewrite-already-matches-summary.md`
+    - 文件：`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
