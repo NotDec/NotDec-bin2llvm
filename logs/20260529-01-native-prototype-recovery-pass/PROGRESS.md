@@ -338,6 +338,9 @@
   - [x] Bench2 smoke 覆盖显式签名重写 assemble/verify。
     - 记录：`06-pass-pipeline-and-verification/20260529-55-bench2-signature-rewrite-verify.md`
     - 文件：`scripts/bench2-native-smoke.sh`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] module 级显式签名重写按 direct callee 优先处理。
+    - 记录：`06-pass-pipeline-and-verification/20260529-56-callee-first-signature-rewrite.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

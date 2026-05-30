@@ -3320,6 +3320,60 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  llvm::Module calleeFirstModule(
+      "native-prototype-callee-first-batch-rewrite-test", context);
+  llvm::GlobalVariable *calleeFirstRax =
+      createRegisterGlobal(calleeFirstModule, "RAX");
+  attachTestAbi(calleeFirstModule);
+  auto *voidFunctionType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *calleeFirstCaller = llvm::Function::Create(
+      voidFunctionType, llvm::GlobalValue::ExternalLinkage,
+      "callee_first_caller", calleeFirstModule);
+  llvm::StoreInst *calleeFirstCalleeStore = nullptr;
+  llvm::Function *calleeFirstCallee = createReturnStoreFunction(
+      calleeFirstModule, "callee_first_callee", calleeFirstRax, "RAX",
+      &calleeFirstCalleeStore);
+  llvm::BasicBlock *calleeFirstCallerEntry =
+      llvm::BasicBlock::Create(context, "entry", calleeFirstCaller);
+  llvm::IRBuilder<> calleeFirstBuilder(calleeFirstCallerEntry);
+  calleeFirstBuilder.CreateCall(calleeFirstCallee->getFunctionType(),
+                                calleeFirstCallee);
+  llvm::LoadInst *calleeFirstReturnLoad = calleeFirstBuilder.CreateLoad(
+      calleeFirstRax->getValueType(), calleeFirstRax, "RAX.return_value");
+  calleeFirstReturnLoad->setMetadata("notdec.register.access",
+                                     registerAccessMetadata(context, "RAX"));
+  llvm::StoreInst *calleeFirstCallerStore =
+      calleeFirstBuilder.CreateStore(calleeFirstReturnLoad, calleeFirstRax);
+  calleeFirstCallerStore->setMetadata("notdec.register.access",
+                                      registerAccessMetadata(context, "RAX"));
+  calleeFirstBuilder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativePrototypeRecovery(calleeFirstModule, options);
+  notdec::bin2llvm::NativePrototypeModuleRewriteSummary calleeFirstSummary =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypes(calleeFirstModule);
+  ok &= expect(calleeFirstSummary.FunctionsRewritten == 2,
+               "callee-first batch rewrite did not rewrite both functions");
+  ok &= expect(calleeFirstModule.getFunction("callee_first_callee") != nullptr &&
+                   functionTypeShape(
+                       *calleeFirstModule.getFunction("callee_first_callee")
+                            ->getFunctionType(),
+                       llvm::Type::getInt64Ty(context),
+                       llvm::ArrayRef<llvm::Type *>{}),
+               "callee-first callee function type was not i64()");
+  ok &= expect(calleeFirstModule.getFunction("callee_first_caller") != nullptr &&
+                   functionTypeShape(
+                       *calleeFirstModule.getFunction("callee_first_caller")
+                            ->getFunctionType(),
+                       llvm::Type::getInt64Ty(context),
+                       llvm::ArrayRef<llvm::Type *>{}),
+               "callee-first caller function type was not i64()");
+  if (llvm::verifyModule(calleeFirstModule, &llvm::errs())) {
+    std::cerr << "callee-first module verification failed after prototype "
+                 "rewrite\n";
+    return EXIT_FAILURE;
+  }
+
   llvm::Module optInModule("native-prototype-opt-in-rewrite-test", context);
   llvm::GlobalVariable *optInRdi = createRegisterGlobal(optInModule, "RDI");
   llvm::GlobalVariable *optInRax = createRegisterGlobal(optInModule, "RAX");

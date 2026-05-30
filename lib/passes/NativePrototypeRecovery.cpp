@@ -1119,6 +1119,44 @@ void clearTransientPrototypeRecoveryMetadata(llvm::Function &function) {
   function.setMetadata("notdec.prototype.return_candidates", nullptr);
 }
 
+void appendCalleeFirstFunction(llvm::Function &function,
+                               std::set<llvm::Function *> &visiting,
+                               std::set<llvm::Function *> &visited,
+                               std::vector<llvm::Function *> &ordered) {
+  if (!visited.insert(&function).second) {
+    return;
+  }
+  if (!visiting.insert(&function).second) {
+    return;
+  }
+
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+      llvm::Function *callee = call != nullptr ? call->getCalledFunction()
+                                               : nullptr;
+      if (callee == nullptr || callee == &function ||
+          callee->getParent() != function.getParent()) {
+        continue;
+      }
+      appendCalleeFirstFunction(*callee, visiting, visited, ordered);
+    }
+  }
+
+  visiting.erase(&function);
+  ordered.push_back(&function);
+}
+
+std::vector<llvm::Function *> calleeFirstFunctions(llvm::Module &module) {
+  std::vector<llvm::Function *> ordered;
+  std::set<llvm::Function *> visiting;
+  std::set<llvm::Function *> visited;
+  for (llvm::Function &function : module) {
+    appendCalleeFirstFunction(function, visiting, visited, ordered);
+  }
+  return ordered;
+}
+
 NativePrototypeRewriteResult
 rewriteNativeRecoveredPrototypeReturnOnly(llvm::Function &function) {
   NativePrototypeRewriteResult result;
@@ -1756,10 +1794,7 @@ NativePrototypeModuleRewriteSummary
 rewriteNativeRecoveredPrototypes(llvm::Module &module) {
   NativePrototypeModuleRewriteSummary summary;
 
-  std::vector<llvm::Function *> functions;
-  for (llvm::Function &function : module) {
-    functions.push_back(&function);
-  }
+  std::vector<llvm::Function *> functions = calleeFirstFunctions(module);
 
   for (llvm::Function *function : functions) {
     ++summary.FunctionsSeen;
