@@ -551,6 +551,7 @@ private:
 
   void attachExternalInputMetadata() {
     if (ExternalInputs.empty()) {
+      Function.setMetadata("notdec.register.external_inputs", nullptr);
       return;
     }
 
@@ -595,6 +596,8 @@ private:
 
   void attachRegisterEffectMetadata() {
     if (AbiEffects.Unaffected.empty() || ExternalInputValue.empty()) {
+      Function.setMetadata("notdec.register.preserves", nullptr);
+      Function.setMetadata("notdec.register.clobbers", nullptr);
       return;
     }
 
@@ -620,12 +623,10 @@ private:
       }
     }
 
-    if (llvm::MDNode *node = registerEffectMetadata(context, preserved)) {
-      Function.setMetadata("notdec.register.preserves", node);
-    }
-    if (llvm::MDNode *node = registerEffectMetadata(context, clobbered)) {
-      Function.setMetadata("notdec.register.clobbers", node);
-    }
+    Function.setMetadata("notdec.register.preserves",
+                         registerEffectMetadata(context, preserved));
+    Function.setMetadata("notdec.register.clobbers",
+                         registerEffectMetadata(context, clobbered));
   }
 
   bool isPreservedOnAllReturns(RegisterUnit &unit, llvm::Value *input) {

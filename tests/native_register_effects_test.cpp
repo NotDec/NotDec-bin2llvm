@@ -209,6 +209,25 @@ llvm::Function *createCallerBeforeClobberingCalleeFunction(
   return caller;
 }
 
+llvm::Function *createStaleMetadataFunction(llvm::Module &module,
+                                            llvm::GlobalVariable *rbx) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "stale_register_metadata", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateRetVoid();
+  attachRegisterMetadataToFunction(*function, "notdec.register.external_inputs",
+                                   rbx, "RBX");
+  attachRegisterMetadataToFunction(*function, "notdec.register.preserves", rbx,
+                                   "RBX");
+  attachRegisterMetadataToFunction(*function, "notdec.register.clobbers", rbx,
+                                   "RBX");
+  return function;
+}
+
 unsigned countRegisterLoads(const llvm::Function &function,
                             const llvm::GlobalVariable *global) {
   unsigned count = 0;
@@ -273,6 +292,7 @@ int main() {
       createDirectCallEffectFunction(module, rbx);
   llvm::Function *callerBeforeClobberingCallee =
       createCallerBeforeClobberingCalleeFunction(module, rbx);
+  llvm::Function *staleMetadata = createStaleMetadataFunction(module, rbx);
 
   notdec::bin2llvm::NativeRegisterSSAOptions options;
   options.EnableRewrite = true;
@@ -304,5 +324,14 @@ int main() {
                "RBX load after direct preserving call was not propagated");
   ok &= expect(countRegisterLoads(*callerBeforeClobberingCallee, rbx) == 1,
                "RBX load after late direct clobbering callee was propagated");
+  ok &= expect(staleMetadata->getMetadata("notdec.register.external_inputs") ==
+                   nullptr,
+               "stale external input metadata was not cleared");
+  ok &= expect(staleMetadata->getMetadata("notdec.register.preserves") ==
+                   nullptr,
+               "stale preserved metadata was not cleared");
+  ok &= expect(staleMetadata->getMetadata("notdec.register.clobbers") ==
+                   nullptr,
+               "stale clobber metadata was not cleared");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

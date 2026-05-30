@@ -30,6 +30,9 @@
     - 文件：`lib/passes/NativeRegisterSSA.cpp`
   - [x] 标注函数级 `notdec.register.clobbers`。
     - 记录：`03-function-register-effects/20260529-02-clobbered-unaffected-registers.md`
+  - [x] 清理本轮为空的 register effect metadata，避免 stale `external_inputs` / `preserves` / `clobbers`。
+    - 记录：`03-function-register-effects/20260529-03-clear-stale-register-effect-metadata.md`
+    - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
   - [x] 添加 preserved IR 小样例。
     - 文件：`tests/native_register_effects_test.cpp`
   - [x] 添加 clobber IR 小样例。
