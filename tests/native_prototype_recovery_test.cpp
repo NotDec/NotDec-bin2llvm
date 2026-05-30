@@ -752,6 +752,31 @@ llvm::Function *createReturnStoreFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createTemporaryReturnStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName, llvm::StoreInst **temporaryStore,
+    llvm::StoreInst **returnStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::StoreInst *temporary = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0xaaaa), global);
+  temporary->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, registerName));
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0xbbbb), global);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+  *temporaryStore = temporary;
+  *returnStore = store;
+  return function;
+}
+
 llvm::Function *createReturnRegisterLoadFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName, llvm::LoadInst **returnLoad = nullptr) {
@@ -1444,6 +1469,12 @@ int main() {
   llvm::Function *returnFunction =
       createReturnStoreFunction(module, "return_rax", rax, "RAX",
                                 &returnStore);
+  llvm::StoreInst *temporaryReturnStore = nullptr;
+  llvm::StoreInst *temporaryRealReturnStore = nullptr;
+  llvm::Function *temporaryReturnFunction =
+      createTemporaryReturnStoreFunction(module, "return_rax_after_temporary",
+                                         rax, "RAX", &temporaryReturnStore,
+                                         &temporaryRealReturnStore);
   llvm::Function *usedReturnFunction =
       createReturnStoreFunction(module, "return_rax_used", rax, "RAX");
   createCallerFunction(module, "call_return_rax_used", usedReturnFunction);
@@ -1550,16 +1581,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 33, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 34, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 18,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 15,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 19,
+  ok &= expect(summary.ReturnCandidates == 20,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 23,
+  ok &= expect(summary.RewriteEligibleFunctions == 24,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 22,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 23,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -2134,6 +2165,24 @@ int main() {
                  "return binding used wrong value");
   }
   std::optional<std::vector<notdec::bin2llvm::NativePrototypeReturnBinding>>
+      temporaryReturnBindings =
+          notdec::bin2llvm::getNativePrototypeReturnBindings(
+              *temporaryReturnFunction);
+  ok &= expect(temporaryReturnBindings.has_value(),
+               "temporary return store blocked return binding");
+  if (temporaryReturnBindings) {
+    ok &= expect(temporaryReturnBindings->size() == 1,
+                 "temporary return binding had wrong count");
+    ok &= expect((*temporaryReturnBindings)[0].ReturnStore ==
+                     temporaryRealReturnStore,
+                 "temporary return binding used wrong store");
+    ok &= expect((*temporaryReturnBindings)[0].ReturnStore !=
+                     temporaryReturnStore,
+                 "temporary return binding used temporary store");
+    ok &= expect((*temporaryReturnBindings)[0].ReturnStores.size() == 1,
+                 "temporary return binding included non-return store");
+  }
+  std::optional<std::vector<notdec::bin2llvm::NativePrototypeReturnBinding>>
       duplicateReturnBindings =
           notdec::bin2llvm::getNativePrototypeReturnBindings(
               *twoReturnFunction);
@@ -2215,6 +2264,21 @@ int main() {
                "rewritten phi-equivalent duplicate-return function type was not i64()");
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after phi-equivalent return rewrite\n";
+    return EXIT_FAILURE;
+  }
+  notdec::bin2llvm::NativePrototypeRewriteResult temporaryReturnRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+          *temporaryReturnFunction);
+  ok &= expect(temporaryReturnRewriteResult.Rewritten,
+               "temporary return store function was not rewritten");
+  temporaryReturnFunction = temporaryReturnRewriteResult.Function;
+  ok &= expect(temporaryReturnFunction != nullptr &&
+                   functionTypeShape(*temporaryReturnFunction->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef<llvm::Type *>{}),
+               "rewritten temporary-return function type was not i64()");
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after temporary return rewrite\n";
     return EXIT_FAILURE;
   }
   notdec::bin2llvm::NativePrototypeRewriteResult usedRewriteResult =

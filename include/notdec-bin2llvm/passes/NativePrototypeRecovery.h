@@ -37,6 +37,9 @@ struct NativeParamTrial {
   // In-memory SSA value identity for return recovery.  This is not serialized
   // into metadata; it only lets one recovery run compare PHI/MULTIEQUAL values.
   llvm::Value *Value = nullptr;
+  // Store that defined Value when the trial comes from an output register write.
+  // It is kept in memory so rewrite binding can delete only real return stores.
+  llvm::StoreInst *Store = nullptr;
   bool Active = false;
 };
 
