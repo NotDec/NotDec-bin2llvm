@@ -729,6 +729,7 @@ std::optional<uint64_t> parseUint64Field(const llvm::MDNode &node,
 std::optional<std::vector<NativeRecoveredPrototypeParam>>
 readRecoveredParamList(const llvm::MDNode &node) {
   std::vector<NativeRecoveredPrototypeParam> params;
+  std::set<std::string> seenNames;
   std::optional<uint64_t> previousSlot;
   for (const llvm::MDOperand &operand : node.operands()) {
     auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
@@ -738,6 +739,9 @@ readRecoveredParamList(const llvm::MDNode &node) {
     std::optional<std::string> name = metadataField(*entry, "name");
     std::optional<uint64_t> slot = parseUint64Field(*entry, "slot");
     if (!name || name->empty() || !slot) {
+      return std::nullopt;
+    }
+    if (!seenNames.insert(*name).second) {
       return std::nullopt;
     }
     if (previousSlot && *slot <= *previousSlot) {

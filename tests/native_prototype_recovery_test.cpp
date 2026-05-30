@@ -2990,6 +2990,36 @@ int main() {
   ok &= expect(extraOperandEligibility.Reason == "missing recovered prototype",
                "extra recovered operand had unexpected ineligible reason");
 
+  llvm::Module duplicateNameModule(
+      "native-prototype-duplicate-recovered-name-test", context);
+  llvm::Function *duplicateInputNameFunction =
+      createFunction(duplicateNameModule, "duplicate_recovered_input_name");
+  duplicateInputNameFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall",
+                                     {{"RDI", 0}, {"RDI", 1}}, {}));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *duplicateInputNameFunction),
+               "duplicate recovered prototype input names were read");
+  notdec::bin2llvm::NativePrototypeRewriteEligibility
+      duplicateInputNameEligibility =
+          notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+              *duplicateInputNameFunction);
+  ok &= expect(!duplicateInputNameEligibility.Eligible,
+               "duplicate recovered input names were incorrectly rewrite eligible");
+  ok &= expect(duplicateInputNameEligibility.Reason ==
+                   "missing recovered prototype",
+               "duplicate recovered input names had unexpected ineligible reason");
+  llvm::Function *duplicateReturnNameFunction =
+      createFunction(duplicateNameModule, "duplicate_recovered_return_name");
+  duplicateReturnNameFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {},
+                                     {{"RAX", 0}, {"RAX", 1}}));
+  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *duplicateReturnNameFunction),
+               "duplicate recovered prototype return names were read");
+
   llvm::Module batchModule("native-prototype-batch-rewrite-test", context);
   llvm::GlobalVariable *batchRdi = createRegisterGlobal(batchModule, "RDI");
   llvm::GlobalVariable *batchRax = createRegisterGlobal(batchModule, "RAX");
