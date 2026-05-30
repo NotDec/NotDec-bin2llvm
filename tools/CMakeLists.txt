@@ -140,4 +140,13 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
         "$<TARGET_FILE:notdec-native-llvm> /bin/ls -a 0x6aa0 -l 1024 -o ${PROJECT_BINARY_DIR}/notdec-native-llvm-smoke.ll && ${NOTDEC_LLVM_INSTALL_DIR}/bin/llvm-as ${PROJECT_BINARY_DIR}/notdec-native-llvm-smoke.ll -o ${PROJECT_BINARY_DIR}/notdec-native-llvm-smoke.bc && ${NOTDEC_LLVM_INSTALL_DIR}/bin/opt -passes=verify ${PROJECT_BINARY_DIR}/notdec-native-llvm-smoke.bc -o ${PROJECT_BINARY_DIR}/notdec-native-llvm-smoke.opt.bc"
     )
   endif ()
+
+  if (BUILD_TESTING)
+    add_test(
+      NAME notdec.native_llvm.cli_signature_rewrite_ll_smoke
+      COMMAND
+        /bin/bash -c
+        "$<TARGET_FILE:notdec-native-llvm> ${PROJECT_SOURCE_DIR}/tests/ir/native-prototype/cli-signature-rewrite.ll --no-instcombine-pass --no-register-ssa-pass --rewrite-prototype-signatures -o ${PROJECT_BINARY_DIR}/notdec-native-llvm-cli-signature-rewrite.ll && grep -Fq 'define void @cli_input_rdi(i64 %' ${PROJECT_BINARY_DIR}/notdec-native-llvm-cli-signature-rewrite.ll && ${NOTDEC_LLVM_INSTALL_DIR}/bin/llvm-as ${PROJECT_BINARY_DIR}/notdec-native-llvm-cli-signature-rewrite.ll -o ${PROJECT_BINARY_DIR}/notdec-native-llvm-cli-signature-rewrite.bc && ${NOTDEC_LLVM_INSTALL_DIR}/bin/opt -passes=verify ${PROJECT_BINARY_DIR}/notdec-native-llvm-cli-signature-rewrite.bc -o ${PROJECT_BINARY_DIR}/notdec-native-llvm-cli-signature-rewrite.opt.bc"
+    )
+  endif ()
 endif ()

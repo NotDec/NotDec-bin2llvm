@@ -239,6 +239,9 @@
   - [x] opt-in rewrite 统计已经匹配 recovered prototype 的 skip reason。
     - 记录：`06-pass-pipeline-and-verification/20260529-36-opt-in-rewrite-already-matches-summary.md`
     - 文件：`tests/native_prototype_recovery_test.cpp`
+  - [x] 添加 `notdec-native-llvm` `.ll` 输入的显式签名重写 smoke。
+    - 记录：`06-pass-pipeline-and-verification/20260529-37-cli-ll-signature-rewrite-smoke.md`
+    - 文件：`tools/CMakeLists.txt`、`tests/ir/native-prototype/cli-signature-rewrite.ll`
 
 ## 记录规则
 
