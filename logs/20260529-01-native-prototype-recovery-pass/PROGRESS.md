@@ -305,6 +305,9 @@
   - [x] CLI 二次运行输出用 LLVM 22 assemble/verify。
     - 记录：`06-pass-pipeline-and-verification/20260529-52-cli-rerun-output-verify.md`
     - 文件：`scripts/native-llvm-cli-signature-rewrite-smoke.sh`
+  - [x] Bench2 smoke 检查 prototype recovery summary 非零指标。
+    - 记录：`06-pass-pipeline-and-verification/20260529-53-bench2-prototype-summary-smoke.md`
+    - 文件：`scripts/bench2-native-smoke.sh`
 
 ## 记录规则
 

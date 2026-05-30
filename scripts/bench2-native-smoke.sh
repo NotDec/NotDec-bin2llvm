@@ -406,6 +406,28 @@ require_heritage_metric() {
   fi
 }
 
+parse_prototype_metric() {
+  local file="$1"
+  local label="$2"
+  sed -n "s/[[:space:]]*$label:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" |
+    head -n 1
+}
+
+require_positive_prototype_metric() {
+  local name="$1"
+  local value="$2"
+  local file="$3"
+  local label="$4"
+  if [[ -z "$value" ]]; then
+    echo "$name: missing prototype recovery metric $label in $file" >&2
+    exit 1
+  fi
+  if ((value == 0)); then
+    echo "$name: prototype recovery metric $label is zero in $file" >&2
+    exit 1
+  fi
+}
+
 check_ir_features() {
   local name="$1"
   local ll="$2"
@@ -514,7 +536,8 @@ for index in "${!TARGET_NAMES[@]}"; do
   "$DISCOVER" --xrefs-json "$target" >"$xrefs" 2>"$xrefs_stderr"
   check_xref_sources "$name" "$xrefs"
 
-  "$NATIVE_LLVM" "$target" --all-confirmed -o "$ll" \
+  "$NATIVE_LLVM" "$target" --all-confirmed --prototype-recovery-summary \
+    -o "$ll" \
     >"$native_stdout" 2>"$native_stderr"
   "$LLVM_AS" "$ll" -o "$bc" >"$llvm_as_stdout" 2>"$llvm_as_stderr"
   "$OPT" -passes=verify "$bc" -o "$opt_bc" >"$opt_stdout" 2>"$opt_stderr"
@@ -523,6 +546,21 @@ for index in "${!TARGET_NAMES[@]}"; do
     "unresolved_indirect_flows.indirect branch"
   check_ir_features "$name" "$ll" "$unresolved_indirect_branch"
   check_prototype_metadata "$name" "$ll"
+  prototype_functions="$(parse_prototype_metric "$native_stderr" "functions")"
+  prototype_external_inputs="$(parse_prototype_metric "$native_stderr" \
+    "external inputs")"
+  prototype_input_candidates="$(parse_prototype_metric "$native_stderr" \
+    "input candidates")"
+  prototype_return_candidates="$(parse_prototype_metric "$native_stderr" \
+    "return candidates")"
+  require_positive_prototype_metric "$name" "$prototype_functions" \
+    "$native_stderr" "functions"
+  require_positive_prototype_metric "$name" "$prototype_external_inputs" \
+    "$native_stderr" "external inputs"
+  require_positive_prototype_metric "$name" "$prototype_input_candidates" \
+    "$native_stderr" "input candidates"
+  require_positive_prototype_metric "$name" "$prototype_return_candidates" \
+    "$native_stderr" "return candidates"
 
   if [[ "$name" == "libuv" ]]; then
     single_ll="$OUT_DIR/$name.single-function.ll"
