@@ -10,6 +10,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Metadata.h"
@@ -426,11 +427,25 @@ ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
     llvm::BasicBlock::iterator iter, llvm::BasicBlock::iterator end,
     llvm::StringRef returnRegisterName) {
   for (; iter != end; ++iter) {
-    llvm::MDNode *metadata = iter->getMetadata("notdec.register.access");
-    if (metadata == nullptr) {
-      continue;
+    std::optional<std::string> name;
+    if (llvm::MDNode *metadata =
+            iter->getMetadata("notdec.register.access")) {
+      name = metadataField(*metadata, "name");
+    } else if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter)) {
+      if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+              load->getPointerOperand()->stripPointerCasts())) {
+        if (llvm::MDNode *metadata = global->getMetadata("notdec.register")) {
+          name = metadataField(*metadata, "name");
+        }
+      }
+    } else if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter)) {
+      if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+              store->getPointerOperand()->stripPointerCasts())) {
+        if (llvm::MDNode *metadata = global->getMetadata("notdec.register")) {
+          name = metadataField(*metadata, "name");
+        }
+      }
     }
-    std::optional<std::string> name = metadataField(*metadata, "name");
     if (!name || *name != returnRegisterName) {
       continue;
     }

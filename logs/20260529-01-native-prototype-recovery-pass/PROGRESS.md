@@ -371,6 +371,9 @@
   - [x] callsite return 支持直接多后继中单个后继读取返回寄存器的形状。
     - 记录：`06-pass-pipeline-and-verification/20260529-66-callsite-return-mixed-multi-successor.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] callsite return load 查找支持无 access metadata 的 register global 访问。
+    - 记录：`06-pass-pipeline-and-verification/20260529-67-callsite-return-global-register-load.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

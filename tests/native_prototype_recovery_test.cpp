@@ -154,6 +154,25 @@ llvm::Function *createReturnLoadCallerFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createUnmarkedReturnLoadCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  llvm::LoadInst *load =
+      builder.CreateLoad(output->getValueType(), output, "return_value");
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *loadOut = load;
+  return function;
+}
+
 llvm::Function *createTwoReturnLoadCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *firstOutput, const std::string &firstRegisterName,
@@ -2580,6 +2599,37 @@ int main() {
   if (llvm::verifyModule(returnCallsiteModule, &llvm::errs())) {
     std::cerr
         << "callsite module verification failed after return-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module unmarkedReturnCallsiteModule(
+      "native-prototype-return-unmarked-callsite-rewrite-test", context);
+  llvm::GlobalVariable *unmarkedReturnCallsiteRax =
+      createRegisterGlobal(unmarkedReturnCallsiteModule, "RAX");
+  attachTestAbi(unmarkedReturnCallsiteModule);
+  llvm::StoreInst *unmarkedReturnCallsiteStore = nullptr;
+  llvm::Function *unmarkedReturnCallsiteFunction = createReturnStoreFunction(
+      unmarkedReturnCallsiteModule, "unmarked_callsite_return_rax",
+      unmarkedReturnCallsiteRax, "RAX", &unmarkedReturnCallsiteStore);
+  llvm::LoadInst *unmarkedReturnCallsiteLoad = nullptr;
+  createUnmarkedReturnLoadCallerFunction(
+      unmarkedReturnCallsiteModule, "call_unmarked_callsite_return_rax",
+      unmarkedReturnCallsiteFunction, unmarkedReturnCallsiteRax,
+      &unmarkedReturnCallsiteLoad);
+  notdec::bin2llvm::runNativePrototypeRecovery(unmarkedReturnCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      unmarkedReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *unmarkedReturnCallsiteFunction);
+  ok &= expect(unmarkedReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype with unmarked return load was not "
+               "rewritten");
+  ok &= expect(unmarkedReturnCallsiteLoad->use_empty(),
+               "unmarked return register load was not replaced");
+  if (llvm::verifyModule(unmarkedReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "unmarked return callsite module verification failed after "
+                 "rewrite\n";
     return EXIT_FAILURE;
   }
 
