@@ -278,6 +278,9 @@
   - [x] CLI `.ll` 显式签名重写 smoke 覆盖 return-only 多返回函数。
     - 记录：`06-pass-pipeline-and-verification/20260529-43-cli-multi-return-signature-rewrite-smoke.md`
     - 文件：`tools/CMakeLists.txt`、`tests/ir/native-prototype/cli-signature-rewrite.ll`
+  - [x] CLI `.ll` 显式签名重写 smoke 覆盖 input + 多返回函数。
+    - 记录：`06-pass-pipeline-and-verification/20260529-44-cli-input-multi-return-signature-rewrite-smoke.md`
+    - 文件：`tools/CMakeLists.txt`、`tests/ir/native-prototype/cli-signature-rewrite.ll`
 
 ## 记录规则
 
