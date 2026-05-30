@@ -2934,6 +2934,26 @@ int main() {
                        llvm::Type::getInt64Ty(context),
                        llvm::ArrayRef(i64Param)),
                "opt-in input-return function type was not i64(i64)");
+  notdec::bin2llvm::NativePrototypeRecoverySummary optInRerunSummary =
+      notdec::bin2llvm::runNativePrototypeRecovery(optInModule, rewriteOptions);
+  ok &= expect(optInRerunSummary.SignatureRewriteFunctionsSeen == 3,
+               "opt-in rerun rewrite saw unexpected function count");
+  ok &= expect(optInRerunSummary.SignatureRewriteFunctionsRewritten == 0,
+               "opt-in rerun rewrote already matching functions");
+  ok &= expect(optInRerunSummary.SignatureRewriteFunctionsSkipped == 3,
+               "opt-in rerun skipped unexpected function count");
+  ok &= expect(optInRerunSummary.SignatureRewriteSkippedByReason
+                   ["already matches"] == 2,
+               "opt-in rerun did not preserve already-matches prototypes");
+  ok &= expect(optInRerunSummary.SignatureRewriteSkippedByReason
+                   ["missing recovered prototype"] == 1,
+               "opt-in rerun missing-prototype count changed");
+  ok &= expect(optInModule.getFunction("opt_in_input_rdi_return_rax") !=
+                       nullptr &&
+                   optInModule.getFunction("opt_in_input_rdi_return_rax")
+                           ->getMetadata("notdec.prototype.recovered") !=
+                       nullptr,
+               "opt-in rerun dropped recovered metadata from rewritten function");
   if (llvm::verifyModule(optInModule, &llvm::errs())) {
     std::cerr << "opt-in module verification failed after prototype rewrite\n";
     return EXIT_FAILURE;

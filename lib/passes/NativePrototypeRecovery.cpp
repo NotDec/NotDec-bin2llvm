@@ -770,6 +770,10 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
 
     NativePrototypeRecoveryFunctionSummary functionSummary;
     functionSummary.FunctionName = function.getName().str();
+    llvm::MDNode *previousRecoveredMetadata =
+        function.getMetadata("notdec.prototype.recovered");
+    std::optional<NativeRecoveredPrototype> previousRecovered =
+        readNativeRecoveredPrototypeMetadata(function);
 
     NativeParamActive active;
     std::set<uint64_t> inputSlots;
@@ -872,6 +876,17 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     if (llvm::MDNode *node =
             recoveredPrototypeMetadata(module.getContext(), recovered)) {
       function.setMetadata("notdec.prototype.recovered", node);
+    } else if (previousRecovered && previousRecoveredMetadata != nullptr &&
+               previousRecovered->ModelName == abi->PrototypeName) {
+      std::optional<llvm::FunctionType *> previousType =
+          buildNativeRecoveredPrototypeFunctionType(function.getContext(),
+                                                   *previousRecovered);
+      if (previousType && function.getFunctionType() == *previousType) {
+        function.setMetadata("notdec.prototype.recovered",
+                             previousRecoveredMetadata);
+      } else {
+        function.setMetadata("notdec.prototype.recovered", nullptr);
+      }
     } else {
       function.setMetadata("notdec.prototype.recovered", nullptr);
     }

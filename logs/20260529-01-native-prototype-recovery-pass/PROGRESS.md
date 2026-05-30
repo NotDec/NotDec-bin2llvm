@@ -296,6 +296,9 @@
   - [x] CLI 显式签名重写 smoke 检查 recovered prototype metadata 保留。
     - 记录：`06-pass-pipeline-and-verification/20260529-49-cli-recovered-metadata-smoke.md`
     - 文件：`scripts/native-llvm-cli-signature-rewrite-smoke.sh`
+  - [x] 二次运行 prototype recovery 时保留已匹配的 recovered prototype metadata。
+    - 记录：`06-pass-pipeline-and-verification/20260529-50-preserve-recovered-metadata-rerun.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`、`scripts/native-llvm-cli-signature-rewrite-smoke.sh`
 
 ## 记录规则
 
