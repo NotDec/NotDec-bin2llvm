@@ -3399,11 +3399,56 @@ int main() {
       "call_multi_predecessor_callsite_return_rax",
       multiPredecessorReturnCallsiteFunction, multiPredecessorReturnCallsiteRax,
       "RAX", &multiPredecessorReturnCallsiteLoad);
-  if (!expectReturnOnlyRewriteRejected(
-          multiPredecessorReturnCallsiteModule,
-          *multiPredecessorReturnCallsiteFunction,
-          multiPredecessorReturnCallsiteLoad,
-          "return-only prototype rewrite accepted multi-predecessor callsite")) {
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      multiPredecessorReturnCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      multiPredecessorReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *multiPredecessorReturnCallsiteFunction);
+  ok &= expect(multiPredecessorReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype rewrite rejected shared-successor return load");
+  multiPredecessorReturnCallsiteFunction =
+      multiPredecessorReturnCallsiteRewriteResult.Function;
+  llvm::CallInst *rewrittenMultiPredecessorReturnCallsiteCall = nullptr;
+  llvm::PHINode *multiPredecessorReturnPhi = nullptr;
+  llvm::Function *multiPredecessorReturnCallsiteCaller =
+      multiPredecessorReturnCallsiteModule.getFunction(
+          "call_multi_predecessor_callsite_return_rax");
+  if (multiPredecessorReturnCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *multiPredecessorReturnCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          if (call->getCalledFunction() ==
+              multiPredecessorReturnCallsiteFunction) {
+            rewrittenMultiPredecessorReturnCallsiteCall = call;
+          }
+        }
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction)) {
+          multiPredecessorReturnPhi = phi;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenMultiPredecessorReturnCallsiteCall != nullptr,
+               "shared-successor return callsite was not rewritten to new callee");
+  bool phiHasCallIncoming = false;
+  if (multiPredecessorReturnPhi != nullptr &&
+      rewrittenMultiPredecessorReturnCallsiteCall != nullptr) {
+    for (llvm::Value *incoming : multiPredecessorReturnPhi->incoming_values()) {
+      if (incoming == rewrittenMultiPredecessorReturnCallsiteCall) {
+        phiHasCallIncoming = true;
+      }
+    }
+  }
+  ok &= expect(multiPredecessorReturnPhi != nullptr &&
+                   multiPredecessorReturnPhi->getNumIncomingValues() == 2 &&
+                   phiHasCallIncoming,
+               "shared-successor return load was not replaced with call-result PHI");
+  ok &= expect(multiPredecessorReturnCallsiteLoad->use_empty(),
+               "shared-successor return load was not erased");
+  if (llvm::verifyModule(multiPredecessorReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "shared-successor return callsite module verification failed "
+                 "after rewrite\n";
     return EXIT_FAILURE;
   }
 

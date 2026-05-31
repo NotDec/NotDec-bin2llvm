@@ -533,9 +533,29 @@ void rewriteMultiInputDirectCallsites(
 
 struct ReturnLoadSearchResult {
   llvm::LoadInst *Load = nullptr;
+  llvm::BasicBlock *SharedSuccessor = nullptr;
+  llvm::BasicBlock *CallPredecessor = nullptr;
   bool Blocked = false;
   bool Clobbered = false;
 };
+
+ReturnLoadSearchResult foundReturnLoad(llvm::LoadInst *load) {
+  ReturnLoadSearchResult result;
+  result.Load = load;
+  return result;
+}
+
+ReturnLoadSearchResult blockedReturnLoadSearch() {
+  ReturnLoadSearchResult result;
+  result.Blocked = true;
+  return result;
+}
+
+ReturnLoadSearchResult clobberedReturnLoadSearch() {
+  ReturnLoadSearchResult result;
+  result.Clobbered = true;
+  return result;
+}
 
 struct ReturnOnlyCallsiteCollectionResult {
   std::vector<llvm::CallInst *> Callsites;
@@ -662,7 +682,7 @@ ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
   for (; iter != end; ++iter) {
     if (auto *call = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
       if (callClobbersRegister(*call, returnRegisterName)) {
-        return {nullptr, false, true};
+        return clobberedReturnLoadSearch();
       }
     }
     std::optional<std::string> name;
@@ -688,10 +708,10 @@ ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
       continue;
     }
     if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter)) {
-      return {load, false, false};
+      return foundReturnLoad(load);
     }
     if (llvm::isa<llvm::StoreInst>(&*iter)) {
-      return {nullptr, false, true};
+      return clobberedReturnLoadSearch();
     }
   }
   return {};
@@ -708,38 +728,38 @@ ReturnLoadSearchResult findMixedSuccessorReturnLoad(
     ReturnLoadSearchResult successorResult = findReturnLoadBeforeStoreInRange(
         successor->begin(), successor->end(), returnRegisterName);
     if (successorResult.Blocked || successorResult.Clobbered) {
-      return {nullptr, true, false};
+      return blockedReturnLoadSearch();
     }
     if (successorResult.Load != nullptr) {
       if (load != nullptr) {
-        return {nullptr, true, false};
+        return blockedReturnLoadSearch();
       }
       load = successorResult.Load;
       continue;
     }
     if (successor->getTerminator() == nullptr ||
         successor->getTerminator()->getNumSuccessors() != 0) {
-      return {nullptr, true, false};
+      return blockedReturnLoadSearch();
     }
   }
   if (successorCount <= 1) {
     return {};
   }
-  return {load, false, false};
+  return foundReturnLoad(load);
 }
 
 ReturnLoadSearchResult findSharedSuccessorUnusedReturn(
     llvm::BasicBlock &block, llvm::StringRef returnRegisterName,
     std::set<llvm::BasicBlock *> &activeBlocks) {
   if (!activeBlocks.insert(&block).second) {
-    return {nullptr, true, false};
+    return blockedReturnLoadSearch();
   }
 
   ReturnLoadSearchResult blockResult = findReturnLoadBeforeStoreInRange(
       block.begin(), block.end(), returnRegisterName);
   if (blockResult.Load != nullptr || blockResult.Blocked) {
     activeBlocks.erase(&block);
-    return {nullptr, true, false};
+    return blockedReturnLoadSearch();
   }
   if (blockResult.Clobbered) {
     activeBlocks.erase(&block);
@@ -749,7 +769,7 @@ ReturnLoadSearchResult findSharedSuccessorUnusedReturn(
   llvm::Instruction *terminator = block.getTerminator();
   if (terminator == nullptr) {
     activeBlocks.erase(&block);
-    return {nullptr, true, false};
+    return blockedReturnLoadSearch();
   }
 
   for (llvm::BasicBlock *successor : llvm::successors(&block)) {
@@ -758,7 +778,7 @@ ReturnLoadSearchResult findSharedSuccessorUnusedReturn(
                                         activeBlocks);
     if (successorResult.Blocked || successorResult.Load != nullptr) {
       activeBlocks.erase(&block);
-      return {nullptr, true, false};
+      return blockedReturnLoadSearch();
     }
   }
 
@@ -766,8 +786,10 @@ ReturnLoadSearchResult findSharedSuccessorUnusedReturn(
   return {};
 }
 
-ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
-                                              llvm::StringRef returnRegisterName) {
+ReturnLoadSearchResult
+findCallsiteReturnLoad(llvm::CallInst &oldCall,
+                       llvm::StringRef returnRegisterName,
+                       bool allowSharedSuccessorLoad = false) {
   llvm::BasicBlock::iterator localIter(oldCall.getIterator());
   ReturnLoadSearchResult localResult = findReturnLoadBeforeStoreInRange(
       ++localIter, oldCall.getParent()->end(), returnRegisterName);
@@ -803,21 +825,29 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
       predecessor = candidate;
     }
     if (!hasCurrentPredecessor) {
-      return {nullptr, true, false};
+      return blockedReturnLoadSearch();
     }
 
     ReturnLoadSearchResult successorResult = findReturnLoadBeforeStoreInRange(
         successor->begin(), successor->end(), returnRegisterName);
     if (hasMultiplePredecessors) {
-      if (successorResult.Load != nullptr || successorResult.Blocked) {
-        return {nullptr, true, false};
+      if (successorResult.Load != nullptr) {
+        if (!allowSharedSuccessorLoad) {
+          return blockedReturnLoadSearch();
+        }
+        successorResult.SharedSuccessor = successor;
+        successorResult.CallPredecessor = current;
+        return successorResult;
+      }
+      if (successorResult.Blocked) {
+        return blockedReturnLoadSearch();
       }
       if (!successorResult.Clobbered) {
         std::set<llvm::BasicBlock *> activeBlocks;
         ReturnLoadSearchResult unusedResult = findSharedSuccessorUnusedReturn(
             *successor, returnRegisterName, activeBlocks);
         if (unusedResult.Blocked || unusedResult.Load != nullptr) {
-          return {nullptr, true, false};
+          return blockedReturnLoadSearch();
         }
       }
       return {};
@@ -828,21 +858,64 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
     }
     current = successor;
   }
-  return {nullptr, true, false};
+  return blockedReturnLoadSearch();
 }
 
 void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,
-                               llvm::StringRef returnRegisterName) {
-  llvm::LoadInst *load =
-      findCallsiteReturnLoad(oldCall, returnRegisterName).Load;
+                               llvm::StringRef returnRegisterName,
+                               bool allowSharedSuccessorLoad = false) {
+  ReturnLoadSearchResult result =
+      findCallsiteReturnLoad(oldCall, returnRegisterName,
+                             allowSharedSuccessorLoad);
+  llvm::LoadInst *load = result.Load;
   if (load == nullptr) {
     return;
   }
-  if (load->getType() == newCall.getType()) {
-    load->replaceAllUsesWith(&newCall);
+  if (load->getType() != newCall.getType()) {
+    return;
+  }
+
+  if (result.SharedSuccessor != nullptr && result.CallPredecessor != nullptr) {
+    uint64_t predecessorCount = 0;
+    for (llvm::BasicBlock *predecessor :
+         llvm::predecessors(result.SharedSuccessor)) {
+      (void)predecessor;
+      ++predecessorCount;
+    }
+    llvm::IRBuilder<> builder(&*result.SharedSuccessor->getFirstInsertionPt());
+    llvm::PHINode *phi =
+        builder.CreatePHI(load->getType(), predecessorCount,
+                          returnRegisterName + ".return_phi");
+    for (llvm::BasicBlock *predecessor :
+         llvm::predecessors(result.SharedSuccessor)) {
+      if (predecessor == result.CallPredecessor) {
+        phi->addIncoming(&newCall, predecessor);
+        continue;
+      }
+      llvm::Instruction *terminator = predecessor->getTerminator();
+      if (terminator == nullptr) {
+        phi->eraseFromParent();
+        return;
+      }
+      llvm::IRBuilder<> predecessorBuilder(terminator);
+      llvm::LoadInst *incomingLoad = predecessorBuilder.CreateLoad(
+          load->getType(), load->getPointerOperand(),
+          (returnRegisterName + ".return_incoming").str());
+      if (llvm::MDNode *metadata = load->getMetadata("notdec.register.access")) {
+        incomingLoad->setMetadata("notdec.register.access", metadata);
+      }
+      phi->addIncoming(incomingLoad, predecessor);
+    }
+    load->replaceAllUsesWith(phi);
     if (load->use_empty()) {
       load->eraseFromParent();
     }
+    return;
+  }
+
+  load->replaceAllUsesWith(&newCall);
+  if (load->use_empty()) {
+    load->eraseFromParent();
   }
 }
 
@@ -862,9 +935,11 @@ void rewriteInputReturnDirectCallsites(
 
 bool callsiteHasMismatchedReturnLoad(llvm::CallInst &callsite,
                                      llvm::StringRef returnRegisterName,
-                                     llvm::Type *returnType) {
+                                     llvm::Type *returnType,
+                                     bool allowSharedSuccessorLoad = false) {
   ReturnLoadSearchResult result =
-      findCallsiteReturnLoad(callsite, returnRegisterName);
+      findCallsiteReturnLoad(callsite, returnRegisterName,
+                             allowSharedSuccessorLoad);
   return result.Blocked || (result.Load != nullptr &&
                             result.Load->getType() != returnType);
 }
@@ -881,7 +956,8 @@ collectReturnOnlyDirectCallsites(llvm::Function &function,
       result.FailureReason = "function has uses";
       return result;
     }
-    if (callsiteHasMismatchedReturnLoad(*call, returnRegisterName, returnType)) {
+    if (callsiteHasMismatchedReturnLoad(*call, returnRegisterName, returnType,
+                                        true)) {
       result.FailureReason = "unsafe callsite return load";
       return result;
     }
@@ -898,7 +974,7 @@ void rewriteReturnOnlyDirectCallsites(llvm::Function &rewritten,
     llvm::CallInst *newCall =
         builder.CreateCall(rewritten.getFunctionType(), &rewritten, {});
     newCall->setCallingConv(callsite->getCallingConv());
-    rewriteCallsiteReturnLoad(*callsite, *newCall, returnRegisterName);
+    rewriteCallsiteReturnLoad(*callsite, *newCall, returnRegisterName, true);
     callsite->eraseFromParent();
   }
 }

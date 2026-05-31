@@ -413,6 +413,9 @@
   - [x] CLI smoke 覆盖空 recovered prototype。
     - 记录：`06-pass-pipeline-and-verification/20260529-80-cli-empty-prototype-smoke.md`
     - 文件：`scripts/native-llvm-cli-signature-rewrite-smoke.sh`、`tests/ir/native-prototype/cli-signature-rewrite.ll`
+  - [x] return-only callsite 支持 shared successor 返回值 load 的 PHI 重写。
+    - 记录：`06-pass-pipeline-and-verification/20260529-81-callsite-return-shared-successor-phi.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
