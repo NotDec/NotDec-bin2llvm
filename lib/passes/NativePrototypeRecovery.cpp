@@ -314,6 +314,25 @@ std::optional<llvm::Value *> functionEntryValueForRegister(
   return *inputLoad;
 }
 
+std::optional<llvm::Value *> registerPhiValueAtBlockEntry(
+    llvm::BasicBlock &block, llvm::StringRef registerName, llvm::Type *paramType) {
+  llvm::Value *result = nullptr;
+  std::string prefix = (registerName + ".regssa").str();
+  for (llvm::PHINode &phi : block.phis()) {
+    if (!phi.getName().starts_with(prefix) || phi.getType() != paramType) {
+      continue;
+    }
+    if (result != nullptr) {
+      return std::nullopt;
+    }
+    result = &phi;
+  }
+  if (result == nullptr) {
+    return std::nullopt;
+  }
+  return result;
+}
+
 std::optional<llvm::Value *> equivalentInputValueFromPredecessors(
     llvm::BasicBlock &block, llvm::StringRef registerName,
     llvm::Type *paramType) {
@@ -393,6 +412,11 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
                                          paramType);
     if (predecessorValue) {
       return predecessorValue;
+    }
+    std::optional<llvm::Value *> predecessorPhi =
+        registerPhiValueAtBlockEntry(*predecessor, registerName, paramType);
+    if (predecessorPhi) {
+      return predecessorPhi;
     }
     sawInterveningCall |=
         hasCallInReverseRange(predecessor->rbegin(), predecessor->rend());

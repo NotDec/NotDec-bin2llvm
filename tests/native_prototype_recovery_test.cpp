@@ -2328,6 +2328,83 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  llvm::Module phiInputCallsiteModule(
+      "native-prototype-input-predecessor-phi-callsite-test", context);
+  llvm::GlobalVariable *phiInputRsi =
+      createRegisterGlobal(phiInputCallsiteModule, "RSI");
+  llvm::GlobalVariable *phiInputRdx =
+      createRegisterGlobal(phiInputCallsiteModule, "RDX");
+  llvm::LoadInst *phiInputRsiLoad = nullptr;
+  llvm::LoadInst *phiInputRdxLoad = nullptr;
+  llvm::Function *phiInputCallee = createTwoUsedExternalInputFunction(
+      phiInputCallsiteModule, "phi_callsite_input_rsi_rdx", phiInputRsi, "RSI",
+      phiInputRdx, "RDX", &phiInputRsiLoad, &phiInputRdxLoad);
+  phiInputCallee->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall",
+                                     {{"RSI", 1}, {"RDX", 2}}, {}));
+  llvm::Function *phiInputCaller =
+      createFunction(phiInputCallsiteModule, "call_phi_callsite_input_rsi_rdx");
+  llvm::BasicBlock &phiInputEntry = phiInputCaller->getEntryBlock();
+  phiInputEntry.getTerminator()->eraseFromParent();
+  llvm::BasicBlock *phiInputLeft =
+      llvm::BasicBlock::Create(context, "left", phiInputCaller);
+  llvm::BasicBlock *phiInputRight =
+      llvm::BasicBlock::Create(context, "right", phiInputCaller);
+  llvm::BasicBlock *phiInputMerge =
+      llvm::BasicBlock::Create(context, "merge", phiInputCaller);
+  llvm::BasicBlock *phiInputCallBlock =
+      llvm::BasicBlock::Create(context, "call", phiInputCaller);
+  llvm::IRBuilder<> phiInputBuilder(&phiInputEntry);
+  phiInputBuilder.CreateCondBr(llvm::ConstantInt::getTrue(context), phiInputLeft,
+                               phiInputRight);
+  phiInputBuilder.SetInsertPoint(phiInputLeft);
+  phiInputBuilder.CreateBr(phiInputMerge);
+  phiInputBuilder.SetInsertPoint(phiInputRight);
+  phiInputBuilder.CreateBr(phiInputMerge);
+  phiInputBuilder.SetInsertPoint(phiInputMerge);
+  llvm::PHINode *phiInputRdxValue =
+      phiInputBuilder.CreatePHI(llvm::Type::getInt64Ty(context), 2, "RDX.regssa");
+  phiInputRdxValue->addIncoming(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x1111),
+      phiInputLeft);
+  phiInputRdxValue->addIncoming(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x2222),
+      phiInputRight);
+  llvm::Value *phiInputRsiValue =
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x3333);
+  llvm::StoreInst *phiInputRsiStore =
+      phiInputBuilder.CreateStore(phiInputRsiValue, phiInputRsi);
+  phiInputRsiStore->setMetadata("notdec.register.access",
+                                registerAccessMetadata(context, "RSI"));
+  phiInputBuilder.CreateBr(phiInputCallBlock);
+  phiInputBuilder.SetInsertPoint(phiInputCallBlock);
+  phiInputBuilder.CreateCall(phiInputCallee->getFunctionType(), phiInputCallee);
+  phiInputBuilder.CreateRetVoid();
+  notdec::bin2llvm::NativePrototypeRewriteResult phiInputRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(*phiInputCallee);
+  ok &= expect(phiInputRewriteResult.Rewritten,
+               "multi-input prototype did not use predecessor register PHI");
+  phiInputCallee = phiInputRewriteResult.Function;
+  llvm::CallInst *phiInputCall = nullptr;
+  for (llvm::BasicBlock &block : *phiInputCaller) {
+    for (llvm::Instruction &instruction : block) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+      if (call != nullptr && call->getCalledFunction() == phiInputCallee) {
+        phiInputCall = call;
+      }
+    }
+  }
+  ok &= expect(phiInputCall != nullptr && phiInputCall->arg_size() == 2 &&
+                   phiInputCall->getArgOperand(0) == phiInputRsiValue &&
+                   phiInputCall->getArgOperand(1) == phiInputRdxValue,
+               "predecessor register PHI was not passed as callsite input");
+  if (llvm::verifyModule(phiInputCallsiteModule, &llvm::errs())) {
+    std::cerr << "predecessor PHI callsite module verification failed after "
+                 "multi-input rewrite\n";
+    return EXIT_FAILURE;
+  }
+
   llvm::Module predecessorCallsiteModule(
       "native-prototype-input-predecessor-callsite-rewrite-test", context);
   llvm::GlobalVariable *predecessorCallsiteRdi =
