@@ -230,6 +230,44 @@ llvm::Function *createTwoReturnLoadCallerFunction(
   return function;
 }
 
+llvm::Function *createSharedSuccessorOneReturnLoadCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, const std::string &registerName,
+    llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::BasicBlock *otherBlock =
+      llvm::BasicBlock::Create(context, "other_pred", function);
+  llvm::BasicBlock *useBlock =
+      llvm::BasicBlock::Create(context, "use_return", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), callBlock,
+                       otherBlock);
+
+  builder.SetInsertPoint(callBlock);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(otherBlock);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(useBlock);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            registerName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *loadOut = load;
+  return function;
+}
+
 llvm::Function *createInputStoreTwoReturnLoadCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *input, const std::string &inputRegisterName,
@@ -1823,6 +1861,13 @@ int main() {
   createTwoReturnLoadCallerFunction(
       module, "call_return_rdx_rax_used", twoOutputUsedReturnFunction, rax,
       "RAX", rdx, "RDX", &twoOutputUsedRaxLoad, &twoOutputUsedRdxLoad);
+  llvm::Function *twoOutputSharedReturnFunction =
+      createTwoOutputReturnStoreFunction(module, "return_rdx_rax_shared", rdx,
+                                         "RDX", rax, "RAX");
+  llvm::LoadInst *twoOutputSharedRaxLoad = nullptr;
+  createSharedSuccessorOneReturnLoadCallerFunction(
+      module, "call_return_rdx_rax_shared", twoOutputSharedReturnFunction, rax,
+      "RAX", &twoOutputSharedRaxLoad);
   llvm::Function *inputTwoOutputFunction =
       createInputTwoOutputReturnStoreFunction(
           module, "input_rdi_return_rdx_rax", rdi, "RDI", rdx, "RDX", rax,
@@ -1903,16 +1948,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 36, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 38, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 19,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 16,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 22,
+  ok &= expect(summary.ReturnCandidates == 24,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 36,
+  ok &= expect(summary.RewriteEligibleFunctions == 38,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 24,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 25,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -4211,6 +4256,58 @@ int main() {
                "used multi-return callsite did not extract both fields");
   ok &= expect(!sawOldMultiReturnLoad,
                "used multi-return callsite kept old return register load");
+
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      sharedMultiReturnRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+              *twoOutputSharedReturnFunction);
+  ok &= expect(sharedMultiReturnRewriteResult.Rewritten,
+               "multi-return shared-successor prototype was not rewritten");
+  twoOutputSharedReturnFunction = sharedMultiReturnRewriteResult.Function;
+  llvm::Function *twoOutputSharedCaller =
+      module.getFunction("call_return_rdx_rax_shared");
+  llvm::CallInst *rewrittenSharedMultiReturnCall = nullptr;
+  llvm::PHINode *sharedMultiReturnPhi = nullptr;
+  uint64_t sharedMultiReturnExtracts = 0;
+  if (twoOutputSharedCaller != nullptr) {
+    for (llvm::BasicBlock &block : *twoOutputSharedCaller) {
+      for (llvm::Instruction &instruction : block) {
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          if (call->getCalledFunction() == twoOutputSharedReturnFunction) {
+            rewrittenSharedMultiReturnCall = call;
+          }
+        }
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction)) {
+          sharedMultiReturnPhi = phi;
+        }
+        if (llvm::isa<llvm::ExtractValueInst>(&instruction)) {
+          ++sharedMultiReturnExtracts;
+        }
+      }
+    }
+  }
+  bool sharedMultiReturnPhiHasExtract = false;
+  if (sharedMultiReturnPhi != nullptr) {
+    for (llvm::Value *incoming : sharedMultiReturnPhi->incoming_values()) {
+      if (llvm::isa<llvm::ExtractValueInst>(incoming)) {
+        sharedMultiReturnPhiHasExtract = true;
+      }
+    }
+  }
+  ok &= expect(rewrittenSharedMultiReturnCall != nullptr,
+               "shared multi-return callsite was not rewritten to new callee");
+  ok &= expect(rewrittenSharedMultiReturnCall != nullptr &&
+                   llvm::isa<llvm::StructType>(
+                       rewrittenSharedMultiReturnCall->getType()),
+               "shared multi-return call did not return struct");
+  ok &= expect(sharedMultiReturnExtracts == 1,
+               "shared multi-return callsite did not extract exactly one used field");
+  ok &= expect(sharedMultiReturnPhi != nullptr &&
+                   sharedMultiReturnPhi->getNumIncomingValues() == 2 &&
+                   sharedMultiReturnPhiHasExtract,
+               "shared multi-return load was not replaced with extractvalue PHI");
+  ok &= expect(twoOutputSharedRaxLoad->use_empty(),
+               "shared multi-return callsite kept old return register load");
 
   notdec::bin2llvm::NativePrototypeRewriteResult inputMultiReturnRewriteResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototype(

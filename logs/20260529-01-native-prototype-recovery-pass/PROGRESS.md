@@ -419,6 +419,9 @@
   - [x] input+return callsite 支持 shared successor 返回值 load 的 PHI 重写。
     - 记录：`06-pass-pipeline-and-verification/20260529-82-input-return-shared-successor-phi.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] multi-return callsite 支持单分量 shared successor 返回值 load 的 PHI 重写。
+    - 记录：`06-pass-pipeline-and-verification/20260529-83-multi-return-shared-successor-phi.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

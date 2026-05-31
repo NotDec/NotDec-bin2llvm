@@ -567,6 +567,8 @@ struct MultiReturnCallsiteRewrite {
   // Kept ABI-slot aligned.  A null entry means the caller does not use that
   // return component before it is overwritten or before control leaves the path.
   std::vector<llvm::LoadInst *> ReturnLoads;
+  std::vector<ReturnLoadSearchResult> ReturnLoadResults;
+  std::vector<std::string> ReturnRegisterNames;
 };
 
 struct MultiReturnCallsiteCollectionResult {
@@ -861,6 +863,50 @@ findCallsiteReturnLoad(llvm::CallInst &oldCall,
   return blockedReturnLoadSearch();
 }
 
+bool replaceSharedSuccessorReturnLoad(llvm::LoadInst &load,
+                                      llvm::Value &callPathValue,
+                                      const ReturnLoadSearchResult &result,
+                                      llvm::StringRef returnRegisterName) {
+  if (result.SharedSuccessor == nullptr || result.CallPredecessor == nullptr) {
+    return false;
+  }
+  uint64_t predecessorCount = 0;
+  for (llvm::BasicBlock *predecessor :
+       llvm::predecessors(result.SharedSuccessor)) {
+    (void)predecessor;
+    ++predecessorCount;
+  }
+  llvm::IRBuilder<> builder(&*result.SharedSuccessor->getFirstInsertionPt());
+  llvm::PHINode *phi =
+      builder.CreatePHI(load.getType(), predecessorCount,
+                        returnRegisterName + ".return_phi");
+  for (llvm::BasicBlock *predecessor :
+       llvm::predecessors(result.SharedSuccessor)) {
+    if (predecessor == result.CallPredecessor) {
+      phi->addIncoming(&callPathValue, predecessor);
+      continue;
+    }
+    llvm::Instruction *terminator = predecessor->getTerminator();
+    if (terminator == nullptr) {
+      phi->eraseFromParent();
+      return false;
+    }
+    llvm::IRBuilder<> predecessorBuilder(terminator);
+    llvm::LoadInst *incomingLoad = predecessorBuilder.CreateLoad(
+        load.getType(), load.getPointerOperand(),
+        (returnRegisterName + ".return_incoming").str());
+    if (llvm::MDNode *metadata = load.getMetadata("notdec.register.access")) {
+      incomingLoad->setMetadata("notdec.register.access", metadata);
+    }
+    phi->addIncoming(incomingLoad, predecessor);
+  }
+  load.replaceAllUsesWith(phi);
+  if (load.use_empty()) {
+    load.eraseFromParent();
+  }
+  return true;
+}
+
 void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,
                                llvm::StringRef returnRegisterName,
                                bool allowSharedSuccessorLoad = false) {
@@ -876,40 +922,7 @@ void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,
   }
 
   if (result.SharedSuccessor != nullptr && result.CallPredecessor != nullptr) {
-    uint64_t predecessorCount = 0;
-    for (llvm::BasicBlock *predecessor :
-         llvm::predecessors(result.SharedSuccessor)) {
-      (void)predecessor;
-      ++predecessorCount;
-    }
-    llvm::IRBuilder<> builder(&*result.SharedSuccessor->getFirstInsertionPt());
-    llvm::PHINode *phi =
-        builder.CreatePHI(load->getType(), predecessorCount,
-                          returnRegisterName + ".return_phi");
-    for (llvm::BasicBlock *predecessor :
-         llvm::predecessors(result.SharedSuccessor)) {
-      if (predecessor == result.CallPredecessor) {
-        phi->addIncoming(&newCall, predecessor);
-        continue;
-      }
-      llvm::Instruction *terminator = predecessor->getTerminator();
-      if (terminator == nullptr) {
-        phi->eraseFromParent();
-        return;
-      }
-      llvm::IRBuilder<> predecessorBuilder(terminator);
-      llvm::LoadInst *incomingLoad = predecessorBuilder.CreateLoad(
-          load->getType(), load->getPointerOperand(),
-          (returnRegisterName + ".return_incoming").str());
-      if (llvm::MDNode *metadata = load->getMetadata("notdec.register.access")) {
-        incomingLoad->setMetadata("notdec.register.access", metadata);
-      }
-      phi->addIncoming(incomingLoad, predecessor);
-    }
-    load->replaceAllUsesWith(phi);
-    if (load->use_empty()) {
-      load->eraseFromParent();
-    }
+    replaceSharedSuccessorReturnLoad(*load, newCall, result, returnRegisterName);
     return;
   }
 
@@ -996,9 +1009,11 @@ MultiReturnCallsiteCollectionResult collectMultiReturnDirectCallsites(
     MultiReturnCallsiteRewrite rewrite;
     rewrite.Call = call;
     rewrite.ReturnLoads.reserve(returns.size());
+    rewrite.ReturnLoadResults.reserve(returns.size());
+    rewrite.ReturnRegisterNames.reserve(returns.size());
     for (uint64_t index = 0; index < returns.size(); ++index) {
       ReturnLoadSearchResult loadResult =
-          findCallsiteReturnLoad(*call, returns[index].RegisterName);
+          findCallsiteReturnLoad(*call, returns[index].RegisterName, true);
       if (loadResult.Blocked ||
           (loadResult.Load != nullptr &&
            loadResult.Load->getType() != returnType.getElementType(index))) {
@@ -1006,6 +1021,8 @@ MultiReturnCallsiteCollectionResult collectMultiReturnDirectCallsites(
         return result;
       }
       rewrite.ReturnLoads.push_back(loadResult.Load);
+      rewrite.ReturnLoadResults.push_back(loadResult);
+      rewrite.ReturnRegisterNames.push_back(returns[index].RegisterName);
     }
     result.Rewrites.push_back(std::move(rewrite));
   }
@@ -1027,6 +1044,17 @@ void rewriteMultiReturnDirectCallsites(
       }
       llvm::Value *field =
           builder.CreateExtractValue(newCall, {static_cast<unsigned>(index)});
+      if (index < callsite.ReturnLoadResults.size() &&
+          callsite.ReturnLoadResults[index].SharedSuccessor != nullptr) {
+        llvm::StringRef registerName =
+            index < callsite.ReturnRegisterNames.size()
+                ? llvm::StringRef(callsite.ReturnRegisterNames[index])
+                : llvm::StringRef();
+        replaceSharedSuccessorReturnLoad(*load, *field,
+                                         callsite.ReturnLoadResults[index],
+                                         registerName);
+        continue;
+      }
       load->replaceAllUsesWith(field);
       if (load->use_empty()) {
         load->eraseFromParent();
