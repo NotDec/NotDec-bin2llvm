@@ -4,6 +4,11 @@
 @RDX = external global i64, !notdec.register !18
 @SINK = external global i64
 
+define void @cli_empty_recovered() {
+entry:
+  ret void
+}
+
 define void @cli_input_rdi() !notdec.register.external_inputs !1 {
 entry:
   %RDI.external_input = load i64, ptr @RDI, align 8, !notdec.register.external_input !2

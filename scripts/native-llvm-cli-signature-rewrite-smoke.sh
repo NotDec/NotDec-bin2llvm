@@ -89,6 +89,7 @@ run_signature_rewrite_check() {
     2> "$summary_txt"
 
   require_contains "define void @cli_input_rdi(i64 %" "$out_ll"
+  require_contains "define void @cli_empty_recovered()" "$out_ll"
   require_contains "define i64 @cli_return_rax()" "$out_ll"
   require_contains "define i64 @cli_input_rdi_return_rax(i64 %" "$out_ll"
   require_contains "define i64 @cli_input_rdi_rsi_return_rax(i64 %" "$out_ll"
@@ -97,6 +98,8 @@ run_signature_rewrite_check() {
   require_contains "define { i64, i64 } @cli_input_rdi_return_rax_rdx(i64 %" "$out_ll"
   require_contains "define { i64, i64 } @cli_input_rdi_rsi_return_rax_rdx(i64 %" "$out_ll"
   require_contains "notdec.prototype.recovered" "$out_ll"
+  require_contains "input_count=0" "$out_ll"
+  require_contains "return_count=0" "$out_ll"
   require_contains "input_count=2" "$out_ll"
   require_contains "return_count=2" "$out_ll"
 
@@ -107,9 +110,11 @@ run_signature_rewrite_check() {
   require_not_contains "notdec.prototype.input_candidates" "$out_ll"
   require_not_contains "notdec.prototype.return_candidates" "$out_ll"
 
-  require_contains "signature rewrite seen functions: 7" "$summary_txt"
+  require_contains "signature rewrite seen functions: 8" "$summary_txt"
   require_contains "signature rewrite rewritten functions: 7" "$summary_txt"
-  require_contains "signature rewrite skipped functions: 0" "$summary_txt"
+  require_contains "signature rewrite skipped functions: 1" "$summary_txt"
+  require_contains "signature rewrite skipped reason already matches: 1" \
+    "$summary_txt"
 
   "$LLVM_BIN/llvm-as" "$out_ll" -o "$out_bc"
   "$LLVM_BIN/opt" -passes=verify "$out_bc" -o "$verify_bc"
@@ -131,10 +136,10 @@ run_rerun_check() {
     2> "$summary_txt"
 
   require_contains "notdec.prototype.recovered" "$out_ll"
-  require_contains "signature rewrite seen functions: 7" "$summary_txt"
+  require_contains "signature rewrite seen functions: 8" "$summary_txt"
   require_contains "signature rewrite rewritten functions: 0" "$summary_txt"
-  require_contains "signature rewrite skipped functions: 7" "$summary_txt"
-  require_contains "signature rewrite skipped reason already matches: 7" \
+  require_contains "signature rewrite skipped functions: 8" "$summary_txt"
+  require_contains "signature rewrite skipped reason already matches: 8" \
     "$summary_txt"
   require_not_contains "signature rewrite skipped reason missing recovered prototype" \
     "$summary_txt"
