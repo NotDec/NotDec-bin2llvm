@@ -401,6 +401,9 @@
   - [x] RegisterSSA 用 register global metadata 识别无 access metadata 的完整寄存器 load。
     - 记录：`06-pass-pipeline-and-verification/20260529-76-register-global-load-input.md`
     - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+  - [x] callsite input 缺少 store/entry value 时使用 register global load。
+    - 记录：`06-pass-pipeline-and-verification/20260529-77-callsite-input-register-global-load.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

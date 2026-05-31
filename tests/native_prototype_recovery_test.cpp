@@ -1995,10 +1995,8 @@ int main() {
   notdec::bin2llvm::NativePrototypeRewriteResult usedInputRewriteResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
           *usedBindableInputFunction);
-  ok &= expect(!usedInputRewriteResult.Rewritten,
-               "input-only prototype with uses was rewritten");
-  ok &= expect(usedInputRewriteResult.Reason == "unsafe callsite input value",
-               "input-only prototype with uses had unexpected rewrite reason");
+  ok &= expect(usedInputRewriteResult.Rewritten,
+               "input-only prototype with register global callsite load was not rewritten");
   llvm::Instruction *inputLoadUser =
       llvm::dyn_cast<llvm::Instruction>(*bindableInputLoad->user_begin());
   notdec::bin2llvm::NativePrototypeRewriteResult inputRewriteResult =
@@ -2682,13 +2680,70 @@ int main() {
       missingInputCallsiteRewriteResult =
           notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
               *missingInputCallsiteFunction);
-  ok &= expect(!missingInputCallsiteRewriteResult.Rewritten,
-               "input-only prototype rewrite ignored missing callsite argument");
-  ok &= expect(missingInputCallsiteRewriteResult.Reason ==
-                   "unsafe callsite input value",
-               "missing callsite input value had wrong skip reason");
+  ok &= expect(missingInputCallsiteRewriteResult.Rewritten,
+               "input-only prototype did not use register global callsite load");
+  missingInputCallsiteFunction = missingInputCallsiteRewriteResult.Function;
+  llvm::CallInst *missingInputCallsiteCall = nullptr;
+  llvm::Function *missingInputCallsiteCaller =
+      missingInputCallsiteModule.getFunction("call_missing_callsite_input_rdi");
+  if (missingInputCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *missingInputCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == missingInputCallsiteFunction) {
+          missingInputCallsiteCall = call;
+        }
+      }
+    }
+  }
+  auto *missingInputCallsiteArgLoad =
+      missingInputCallsiteCall != nullptr && missingInputCallsiteCall->arg_size() == 1
+          ? llvm::dyn_cast<llvm::LoadInst>(
+                missingInputCallsiteCall->getArgOperand(0))
+          : nullptr;
+  ok &= expect(missingInputCallsiteArgLoad != nullptr &&
+                   missingInputCallsiteArgLoad->getPointerOperand() ==
+                       missingInputCallsiteRdi,
+               "register global callsite load was not passed to callee");
   if (llvm::verifyModule(missingInputCallsiteModule, &llvm::errs())) {
     std::cerr << "missing input callsite module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module ambiguousInputCallsiteModule(
+      "native-prototype-input-ambiguous-register-global-test", context);
+  llvm::GlobalVariable *ambiguousInputCallsiteRdi =
+      createRegisterGlobal(ambiguousInputCallsiteModule, "RDI");
+  attachTestAbi(ambiguousInputCallsiteModule);
+  llvm::LoadInst *ambiguousInputCallsiteInputLoad = nullptr;
+  llvm::Function *ambiguousInputCallsiteFunction =
+      createUsedExternalInputFunction(ambiguousInputCallsiteModule,
+                                      "ambiguous_callsite_input_rdi",
+                                      ambiguousInputCallsiteRdi, "RDI",
+                                      &ambiguousInputCallsiteInputLoad);
+  attachExternalInputs(*ambiguousInputCallsiteFunction,
+                       {{"RDI", ambiguousInputCallsiteRdi}});
+  createCallerFunction(ambiguousInputCallsiteModule,
+                       "call_ambiguous_callsite_input_rdi",
+                       ambiguousInputCallsiteFunction);
+  notdec::bin2llvm::runNativePrototypeRecovery(ambiguousInputCallsiteModule,
+                                               options);
+  llvm::GlobalVariable *ambiguousInputCallsiteSecondRdi =
+      createRegisterGlobal(ambiguousInputCallsiteModule, "RDI_shadow");
+  ambiguousInputCallsiteSecondRdi->setMetadata(
+      "notdec.register", registerAccessMetadata(context, "RDI"));
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      ambiguousInputCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+              *ambiguousInputCallsiteFunction);
+  ok &= expect(!ambiguousInputCallsiteRewriteResult.Rewritten,
+               "ambiguous register global callsite input was rewritten");
+  ok &= expect(ambiguousInputCallsiteRewriteResult.Reason ==
+                   "unsafe callsite input value",
+               "ambiguous register global callsite input had wrong skip reason");
+  if (llvm::verifyModule(ambiguousInputCallsiteModule, &llvm::errs())) {
+    std::cerr << "ambiguous input callsite module verification failed\n";
     return EXIT_FAILURE;
   }
 
@@ -4515,9 +4570,9 @@ int main() {
       notdec::bin2llvm::rewriteNativeRecoveredPrototypes(batchModule);
   ok &= expect(batchRewriteSummary.FunctionsSeen == 11,
                "batch rewrite saw unexpected function count");
-  ok &= expect(batchRewriteSummary.FunctionsRewritten == 4,
+  ok &= expect(batchRewriteSummary.FunctionsRewritten == 6,
                "batch rewrite rewrote unexpected function count");
-  ok &= expect(batchRewriteSummary.FunctionsSkipped == 7,
+  ok &= expect(batchRewriteSummary.FunctionsSkipped == 5,
                "batch rewrite skipped unexpected function count");
   ok &= expect(batchRewriteSummary.SkippedByReason["already matches"] == 1,
                "batch rewrite did not count already-matches skip reason");
@@ -4530,7 +4585,7 @@ int main() {
       batchRewriteSummary.SkippedByReason["unsafe callsite return load"] == 0,
       "batch rewrite did not count unsafe-return-load skip reason");
   ok &= expect(
-      batchRewriteSummary.SkippedByReason["unsafe callsite input value"] == 2,
+      batchRewriteSummary.SkippedByReason["unsafe callsite input value"] == 0,
       "batch rewrite did not count unsafe-input-value skip reason");
   ok &= expect(batchModule.getFunction("batch_input_rdi") != nullptr &&
                    functionTypeShape(
@@ -4555,10 +4610,12 @@ int main() {
                        llvm::ArrayRef(i64Param)),
                "batch input-return function type was not i64(i64)");
   ok &= expect(batchModule.getFunction("batch_input_rdi_used") != nullptr &&
-                   batchModule.getFunction("batch_input_rdi_used")
-                       ->getFunctionType()
-                       ->getNumParams() == 0,
-               "batch function with caller was incorrectly rewritten");
+                   functionTypeShape(
+                       *batchModule.getFunction("batch_input_rdi_used")
+                            ->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef(i64Param)),
+               "batch function with register global callsite load was not rewritten");
   if (llvm::verifyModule(batchModule, &llvm::errs())) {
     std::cerr << "batch module verification failed after prototype rewrite\n";
     return EXIT_FAILURE;

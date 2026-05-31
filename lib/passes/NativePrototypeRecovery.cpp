@@ -333,6 +333,52 @@ std::optional<llvm::Value *> registerPhiValueAtBlockEntry(
   return result;
 }
 
+std::optional<llvm::GlobalVariable *> registerGlobalForName(
+    llvm::Module &module, llvm::StringRef registerName, llvm::Type *paramType) {
+  llvm::GlobalVariable *result = nullptr;
+  for (llvm::GlobalVariable &global : module.globals()) {
+    if (global.getValueType() != paramType) {
+      continue;
+    }
+    llvm::MDNode *metadata = global.getMetadata("notdec.register");
+    if (metadata == nullptr) {
+      continue;
+    }
+    std::optional<std::string> name = metadataField(*metadata, "name");
+    if (!name || *name != registerName) {
+      continue;
+    }
+    if (result != nullptr) {
+      return std::nullopt;
+    }
+    result = &global;
+  }
+  if (result == nullptr) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+std::optional<llvm::Value *> registerGlobalValueBeforeCall(
+    llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *paramType) {
+  std::optional<llvm::GlobalVariable *> global =
+      registerGlobalForName(*call.getModule(), registerName, paramType);
+  if (!global) {
+    return std::nullopt;
+  }
+
+  // Old callees loaded ABI input registers from globals at entry.  After
+  // signature rewrite, this load moves to the caller side for callsites where
+  // no SSA store/entry value is available.
+  llvm::IRBuilder<> builder(&call);
+  llvm::LoadInst *load =
+      builder.CreateLoad(paramType, *global, (registerName + ".callsite_input").str());
+  if (llvm::MDNode *metadata = (*global)->getMetadata("notdec.register")) {
+    load->setMetadata("notdec.register.access", metadata);
+  }
+  return load;
+}
+
 std::optional<llvm::Value *> equivalentInputValueFromPredecessors(
     llvm::BasicBlock &block, llvm::StringRef registerName,
     llvm::Type *paramType) {
@@ -389,10 +435,13 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
     }
     if (predecessor == nullptr) {
       if (!sawInterveningCall) {
-        return functionEntryValueForRegister(*call.getFunction(), registerName,
-                                             paramType);
+        if (std::optional<llvm::Value *> entryValue =
+                functionEntryValueForRegister(*call.getFunction(), registerName,
+                                              paramType)) {
+          return entryValue;
+        }
       }
-      return std::nullopt;
+      return registerGlobalValueBeforeCall(call, registerName, paramType);
     }
 
     bool reachesCurrent = false;
