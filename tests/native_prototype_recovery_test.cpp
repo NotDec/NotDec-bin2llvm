@@ -568,6 +568,36 @@ llvm::Function *createReturnLoadMultiPredecessorCallerFunction(
   return function;
 }
 
+llvm::Function *createUnusedReturnSharedSuccessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::BasicBlock *otherBlock =
+      llvm::BasicBlock::Create(context, "other_pred", function);
+  llvm::BasicBlock *doneBlock =
+      llvm::BasicBlock::Create(context, "done", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), callBlock,
+                       otherBlock);
+
+  builder.SetInsertPoint(callBlock);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateBr(doneBlock);
+
+  builder.SetInsertPoint(otherBlock);
+  builder.CreateBr(doneBlock);
+
+  builder.SetInsertPoint(doneBlock);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createReturnLoadLoopCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee) {
   llvm::LLVMContext &context = module.getContext();
@@ -3022,6 +3052,57 @@ int main() {
           *multiPredecessorReturnCallsiteFunction,
           multiPredecessorReturnCallsiteLoad,
           "return-only prototype rewrite accepted multi-predecessor callsite")) {
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module unusedSharedSuccessorReturnCallsiteModule(
+      "native-prototype-return-unused-shared-successor-callsite-test", context);
+  llvm::GlobalVariable *unusedSharedSuccessorReturnCallsiteRax =
+      createRegisterGlobal(unusedSharedSuccessorReturnCallsiteModule, "RAX");
+  attachTestAbi(unusedSharedSuccessorReturnCallsiteModule);
+  llvm::Function *unusedSharedSuccessorReturnCallsiteFunction =
+      createReturnStoreFunction(unusedSharedSuccessorReturnCallsiteModule,
+                                "unused_shared_successor_callsite_return_rax",
+                                unusedSharedSuccessorReturnCallsiteRax, "RAX");
+  createUnusedReturnSharedSuccessorCallerFunction(
+      unusedSharedSuccessorReturnCallsiteModule,
+      "call_unused_shared_successor_callsite_return_rax",
+      unusedSharedSuccessorReturnCallsiteFunction);
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      unusedSharedSuccessorReturnCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      unusedSharedSuccessorReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *unusedSharedSuccessorReturnCallsiteFunction);
+  ok &= expect(unusedSharedSuccessorReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype with unused shared successor callsite was not rewritten");
+  unusedSharedSuccessorReturnCallsiteFunction =
+      unusedSharedSuccessorReturnCallsiteRewriteResult.Function;
+  llvm::CallInst *rewrittenUnusedSharedSuccessorReturnCallsiteCall = nullptr;
+  llvm::Function *unusedSharedSuccessorReturnCallsiteCaller =
+      unusedSharedSuccessorReturnCallsiteModule.getFunction(
+          "call_unused_shared_successor_callsite_return_rax");
+  if (unusedSharedSuccessorReturnCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *unusedSharedSuccessorReturnCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() ==
+                unusedSharedSuccessorReturnCallsiteFunction) {
+          rewrittenUnusedSharedSuccessorReturnCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenUnusedSharedSuccessorReturnCallsiteCall != nullptr,
+               "unused shared successor return callsite was not rewritten to new callee");
+  ok &= expect(rewrittenUnusedSharedSuccessorReturnCallsiteCall != nullptr &&
+                   rewrittenUnusedSharedSuccessorReturnCallsiteCall->use_empty(),
+               "unused shared successor return callsite result was unexpectedly used");
+  if (llvm::verifyModule(unusedSharedSuccessorReturnCallsiteModule,
+                         &llvm::errs())) {
+    std::cerr << "unused shared successor return callsite module verification "
+                 "failed after rewrite\n";
     return EXIT_FAILURE;
   }
 

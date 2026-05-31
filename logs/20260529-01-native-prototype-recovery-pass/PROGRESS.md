@@ -383,6 +383,9 @@
   - [x] multi-return callsite 允许部分返回分量未使用或被中间 call 覆盖。
     - 记录：`06-pass-pipeline-and-verification/20260529-70-multi-return-unused-components.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] shared successor 未使用返回值时允许 callsite return rewrite。
+    - 记录：`06-pass-pipeline-and-verification/20260529-71-callsite-return-shared-successor-unused.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

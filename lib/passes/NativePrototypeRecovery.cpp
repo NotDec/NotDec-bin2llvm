@@ -611,18 +611,33 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
     }
 
     llvm::BasicBlock *predecessor = nullptr;
+    bool hasMultiplePredecessors = false;
+    bool hasCurrentPredecessor = false;
     for (llvm::BasicBlock *candidate : llvm::predecessors(successor)) {
       if (predecessor != nullptr) {
-        return {nullptr, true, false};
+        hasMultiplePredecessors = true;
+      }
+      if (candidate == current) {
+        hasCurrentPredecessor = true;
       }
       predecessor = candidate;
     }
-    if (predecessor != current) {
+    if (!hasCurrentPredecessor) {
       return {nullptr, true, false};
     }
 
     ReturnLoadSearchResult successorResult = findReturnLoadBeforeStoreInRange(
         successor->begin(), successor->end(), returnRegisterName);
+    if (hasMultiplePredecessors) {
+      if (successorResult.Load != nullptr || successorResult.Blocked) {
+        return {nullptr, true, false};
+      }
+      llvm::Instruction *terminator = successor->getTerminator();
+      if (terminator == nullptr || terminator->getNumSuccessors() != 0) {
+        return {nullptr, true, false};
+      }
+      return {};
+    }
     if (successorResult.Load != nullptr || successorResult.Blocked ||
         successorResult.Clobbered) {
       return successorResult;
