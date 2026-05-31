@@ -87,10 +87,6 @@ llvm::MDNode *recoveredParamListMetadata(
 
 llvm::MDNode *recoveredPrototypeMetadata(
     llvm::LLVMContext &context, const NativeRecoveredPrototype &prototype) {
-  if (prototype.Inputs.empty() && prototype.Returns.empty()) {
-    return nullptr;
-  }
-
   std::vector<llvm::Metadata *> fields = {
       llvm::MDString::get(context, "model=" + prototype.ModelName),
       llvm::MDString::get(context,
@@ -284,7 +280,7 @@ std::optional<llvm::Argument *> functionArgumentForRecoveredInput(
     llvm::Function &function, llvm::StringRef registerName, llvm::Type *paramType) {
   std::optional<NativeRecoveredPrototype> prototype =
       readNativeRecoveredPrototypeMetadata(function);
-  if (!prototype) {
+  if (!prototype || prototype->Inputs.empty()) {
     return std::nullopt;
   }
   std::optional<llvm::FunctionType *> recoveredType =
@@ -1364,11 +1360,13 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     recovered.ModelName = abi->PrototypeName;
     recovered.Inputs = recoveredParams(active);
     recovered.Returns = recoveredParams(returns);
-    if (llvm::MDNode *node =
-            recoveredPrototypeMetadata(module.getContext(), recovered)) {
-      function.setMetadata("notdec.prototype.recovered", node);
-    } else if (previousRecovered && previousRecoveredMetadata != nullptr &&
-               previousRecovered->ModelName == abi->PrototypeName) {
+    // A rerun after signature rewrite may not have register candidates anymore.
+    // Keep the old recovered prototype if it still matches the current type.
+    bool hasRecoveredCandidates =
+        !recovered.Inputs.empty() || !recovered.Returns.empty();
+    if (!hasRecoveredCandidates && previousRecovered &&
+        previousRecoveredMetadata != nullptr &&
+        previousRecovered->ModelName == abi->PrototypeName) {
       std::optional<llvm::FunctionType *> previousType =
           buildNativeRecoveredPrototypeFunctionType(function.getContext(),
                                                    *previousRecovered);
@@ -1376,10 +1374,14 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
         function.setMetadata("notdec.prototype.recovered",
                              previousRecoveredMetadata);
       } else {
-        function.setMetadata("notdec.prototype.recovered", nullptr);
+        function.setMetadata(
+            "notdec.prototype.recovered",
+            recoveredPrototypeMetadata(module.getContext(), recovered));
       }
     } else {
-      function.setMetadata("notdec.prototype.recovered", nullptr);
+      function.setMetadata(
+          "notdec.prototype.recovered",
+          recoveredPrototypeMetadata(module.getContext(), recovered));
     }
     NativePrototypeRewriteEligibility rewrite =
         getNativePrototypeRewriteEligibility(function);
@@ -1441,10 +1443,6 @@ readNativeRecoveredPrototypeMetadata(const llvm::Function &function) {
   if (*inputCount != inputs->size() || *returnCount != returns->size()) {
     return std::nullopt;
   }
-  if (inputs->empty() && returns->empty()) {
-    return std::nullopt;
-  }
-
   NativeRecoveredPrototype prototype;
   prototype.ModelName = *model;
   prototype.Inputs = std::move(*inputs);
@@ -1520,7 +1518,7 @@ std::optional<std::vector<NativePrototypeInputBinding>>
 getNativePrototypeInputBindings(llvm::Function &function) {
   std::optional<NativeRecoveredPrototype> prototype =
       readNativeRecoveredPrototypeMetadata(function);
-  if (!prototype) {
+  if (!prototype || prototype->Inputs.empty()) {
     return std::nullopt;
   }
 
@@ -1545,7 +1543,7 @@ std::optional<std::vector<NativePrototypeReturnBinding>>
 getNativePrototypeReturnBindings(llvm::Function &function) {
   std::optional<NativeRecoveredPrototype> prototype =
       readNativeRecoveredPrototypeMetadata(function);
-  if (!prototype) {
+  if (!prototype || prototype->Returns.empty()) {
     return std::nullopt;
   }
   llvm::Module *module = function.getParent();

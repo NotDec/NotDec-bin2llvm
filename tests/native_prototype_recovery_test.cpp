@@ -1866,7 +1866,7 @@ int main() {
                "unexpected input candidate count");
   ok &= expect(summary.ReturnCandidates == 22,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 25,
+  ok &= expect(summary.RewriteEligibleFunctions == 36,
                "unexpected rewrite eligible function count");
   ok &= expect(summary.SignatureRewriteNeededFunctions == 24,
                "unexpected signature rewrite needed function count");
@@ -3920,7 +3920,7 @@ int main() {
   ok &= expect(!dispatchMissingResult.Rewritten,
                "dispatch missing prototype was rewritten");
   ok &= expect(dispatchMissingResult.Reason ==
-                   "no recovered prototype candidates",
+                   "already matches",
                "dispatch missing prototype had unexpected reason");
 
   notdec::bin2llvm::NativePrototypeRewriteResult dispatchMultiReturnResult =
@@ -4209,20 +4209,26 @@ int main() {
   ok &= expect(!sawOldMultiInputMultiReturnLoad,
                "multi-input multi-return callsite kept old return register load");
 
-  ok &= expect(unusedInputFunction->getMetadata("notdec.prototype.recovered") ==
-                   nullptr,
-               "empty recovered prototype metadata was not cleared");
-  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
-                    *unusedInputFunction),
-               "empty recovered prototype metadata was incorrectly read");
+  std::optional<notdec::bin2llvm::NativeRecoveredPrototype>
+      emptyRecoveredPrototype =
+          notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+              *unusedInputFunction);
+  ok &= expect(emptyRecoveredPrototype.has_value(),
+               "empty recovered prototype metadata was not readable");
+  if (emptyRecoveredPrototype) {
+    ok &= expect(emptyRecoveredPrototype->Inputs.empty() &&
+                     emptyRecoveredPrototype->Returns.empty(),
+                 "empty recovered prototype had unexpected params");
+  }
   notdec::bin2llvm::NativePrototypeRewriteEligibility missingEligibility =
       notdec::bin2llvm::getNativePrototypeRewriteEligibility(
           *unusedInputFunction);
-  ok &= expect(!missingEligibility.Eligible,
-               "missing recovered prototype was incorrectly rewrite eligible");
-  ok &= expect(missingEligibility.Reason ==
-                   "no recovered prototype candidates",
-               "missing recovered prototype had unexpected ineligible reason");
+  ok &= expect(missingEligibility.Eligible,
+               "empty recovered prototype was not rewrite eligible");
+  ok &= expect(!missingEligibility.NeedsRewrite,
+               "empty recovered prototype incorrectly needed rewrite");
+  ok &= expect(missingEligibility.Reason == "already matches",
+               "empty recovered prototype had unexpected eligibility reason");
 
   llvm::Module noAbiModule("native-prototype-no-abi-stale-metadata-test",
                            context);
@@ -4257,17 +4263,18 @@ int main() {
   notdec::bin2llvm::runNativePrototypeRecovery(mismatchedMetadataModule,
                                                options);
   ok &= expect(mismatchedMetadataFunction->getMetadata(
-                   "notdec.prototype.recovered") == nullptr,
-               "mismatched recovered prototype metadata was preserved");
+                   "notdec.prototype.recovered") != nullptr,
+               "mismatched recovered prototype metadata was not replaced");
   notdec::bin2llvm::NativePrototypeRewriteEligibility
       mismatchedMetadataEligibility =
           notdec::bin2llvm::getNativePrototypeRewriteEligibility(
               *mismatchedMetadataFunction);
-  ok &= expect(!mismatchedMetadataEligibility.Eligible,
-               "mismatched recovered metadata was incorrectly rewrite eligible");
-  ok &= expect(mismatchedMetadataEligibility.Reason ==
-                   "no recovered prototype candidates",
-               "mismatched recovered metadata had unexpected ineligible reason");
+  ok &= expect(mismatchedMetadataEligibility.Eligible,
+               "replacement empty recovered metadata was not rewrite eligible");
+  ok &= expect(!mismatchedMetadataEligibility.NeedsRewrite,
+               "replacement empty recovered metadata incorrectly needed rewrite");
+  ok &= expect(mismatchedMetadataEligibility.Reason == "already matches",
+               "replacement empty recovered metadata had unexpected reason");
 
   llvm::Module abiModelMismatchModule(
       "native-prototype-abi-model-mismatch-test", context);
@@ -4396,17 +4403,17 @@ int main() {
   emptyPrototypeFunction->setMetadata(
       "notdec.prototype.recovered",
       makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {}));
-  ok &= expect(!notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
-                    *emptyPrototypeFunction),
-               "empty recovered prototype was read");
+  ok &= expect(notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                    *emptyPrototypeFunction)
+                   .has_value(),
+               "empty recovered prototype was not read");
   notdec::bin2llvm::NativePrototypeRewriteEligibility
       emptyPrototypeEligibility =
           notdec::bin2llvm::getNativePrototypeRewriteEligibility(
               *emptyPrototypeFunction);
-  ok &= expect(!emptyPrototypeEligibility.Eligible,
-               "empty recovered prototype was incorrectly rewrite eligible");
-  ok &= expect(emptyPrototypeEligibility.Reason ==
-                   "missing recovered prototype",
+  ok &= expect(emptyPrototypeEligibility.Eligible,
+               "empty recovered prototype was not rewrite eligible");
+  ok &= expect(emptyPrototypeEligibility.Reason == "already matches",
                "empty recovered prototype had unexpected ineligible reason");
 
   llvm::Module extraOperandModule(
@@ -4576,7 +4583,7 @@ int main() {
                "batch rewrite rewrote unexpected function count");
   ok &= expect(batchRewriteSummary.FunctionsSkipped == 5,
                "batch rewrite skipped unexpected function count");
-  ok &= expect(batchRewriteSummary.SkippedByReason["already matches"] == 1,
+  ok &= expect(batchRewriteSummary.SkippedByReason["already matches"] == 5,
                "batch rewrite did not count already-matches skip reason");
   ok &= expect(batchRewriteSummary.SkippedByReason["function has uses"] == 0,
                "batch rewrite did not count function-use skip reason");
@@ -4584,7 +4591,7 @@ int main() {
       batchRewriteSummary.SkippedByReason["missing recovered prototype"] == 0,
       "batch rewrite did not count missing-prototype skip reason");
   ok &= expect(batchRewriteSummary
-                   .SkippedByReason["no recovered prototype candidates"] == 4,
+                   .SkippedByReason["no recovered prototype candidates"] == 0,
                "batch rewrite did not count no-candidate skip reason");
   ok &= expect(
       batchRewriteSummary.SkippedByReason["unsafe callsite return load"] == 0,
@@ -4710,13 +4717,13 @@ int main() {
   ok &= expect(optInSummary.SignatureRewriteFunctionsSkipped == 2,
                "opt-in rewrite skipped unexpected function count");
   ok &= expect(optInSummary.SignatureRewriteSkippedByReason
-                   ["already matches"] == 1,
+                   ["already matches"] == 2,
                "opt-in rewrite did not count already-matches skip reason");
   ok &= expect(optInSummary.SignatureRewriteSkippedByReason
                    ["missing recovered prototype"] == 0,
                "opt-in rewrite did not count missing-prototype skip reason");
   ok &= expect(optInSummary.SignatureRewriteSkippedByReason
-                   ["no recovered prototype candidates"] == 1,
+                   ["no recovered prototype candidates"] == 0,
                "opt-in rewrite did not count no-candidate skip reason");
   ok &= expect(optInSummary.SignatureRewriteFunctions.size() == 3,
                "opt-in rewrite did not keep per-function rewrite results");
@@ -4736,9 +4743,8 @@ int main() {
       optInSummary.SignatureRewriteFunctions, "opt_in_missing_recovered");
   ok &= expect(optInMissingSummary != nullptr &&
                    !optInMissingSummary->Rewritten &&
-                   optInMissingSummary->Reason ==
-                       "no recovered prototype candidates",
-               "opt-in rewrite did not record no-candidate function reason");
+                   optInMissingSummary->Reason == "already matches",
+               "opt-in rewrite did not record empty-prototype function reason");
   ok &= expect(optInModule.getFunction("opt_in_input_rdi_return_rax") !=
                        nullptr &&
                    functionTypeShape(
@@ -4756,13 +4762,13 @@ int main() {
   ok &= expect(optInRerunSummary.SignatureRewriteFunctionsSkipped == 3,
                "opt-in rerun skipped unexpected function count");
   ok &= expect(optInRerunSummary.SignatureRewriteSkippedByReason
-                   ["already matches"] == 2,
+                   ["already matches"] == 3,
                "opt-in rerun did not preserve already-matches prototypes");
   ok &= expect(optInRerunSummary.SignatureRewriteSkippedByReason
                    ["missing recovered prototype"] == 0,
                "opt-in rerun missing-prototype count changed");
   ok &= expect(optInRerunSummary.SignatureRewriteSkippedByReason
-                   ["no recovered prototype candidates"] == 1,
+                   ["no recovered prototype candidates"] == 0,
                "opt-in rerun no-candidate count changed");
   ok &= expect(optInModule.getFunction("opt_in_input_rdi_return_rax") !=
                        nullptr &&
