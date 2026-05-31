@@ -3919,7 +3919,8 @@ int main() {
       notdec::bin2llvm::rewriteNativeRecoveredPrototype(*unusedInputFunction);
   ok &= expect(!dispatchMissingResult.Rewritten,
                "dispatch missing prototype was rewritten");
-  ok &= expect(dispatchMissingResult.Reason == "missing recovered prototype",
+  ok &= expect(dispatchMissingResult.Reason ==
+                   "no recovered prototype candidates",
                "dispatch missing prototype had unexpected reason");
 
   notdec::bin2llvm::NativePrototypeRewriteResult dispatchMultiReturnResult =
@@ -4219,7 +4220,8 @@ int main() {
           *unusedInputFunction);
   ok &= expect(!missingEligibility.Eligible,
                "missing recovered prototype was incorrectly rewrite eligible");
-  ok &= expect(missingEligibility.Reason == "missing recovered prototype",
+  ok &= expect(missingEligibility.Reason ==
+                   "no recovered prototype candidates",
                "missing recovered prototype had unexpected ineligible reason");
 
   llvm::Module noAbiModule("native-prototype-no-abi-stale-metadata-test",
@@ -4264,7 +4266,7 @@ int main() {
   ok &= expect(!mismatchedMetadataEligibility.Eligible,
                "mismatched recovered metadata was incorrectly rewrite eligible");
   ok &= expect(mismatchedMetadataEligibility.Reason ==
-                   "missing recovered prototype",
+                   "no recovered prototype candidates",
                "mismatched recovered metadata had unexpected ineligible reason");
 
   llvm::Module abiModelMismatchModule(
@@ -4579,8 +4581,11 @@ int main() {
   ok &= expect(batchRewriteSummary.SkippedByReason["function has uses"] == 0,
                "batch rewrite did not count function-use skip reason");
   ok &= expect(
-      batchRewriteSummary.SkippedByReason["missing recovered prototype"] == 4,
+      batchRewriteSummary.SkippedByReason["missing recovered prototype"] == 0,
       "batch rewrite did not count missing-prototype skip reason");
+  ok &= expect(batchRewriteSummary
+                   .SkippedByReason["no recovered prototype candidates"] == 4,
+               "batch rewrite did not count no-candidate skip reason");
   ok &= expect(
       batchRewriteSummary.SkippedByReason["unsafe callsite return load"] == 0,
       "batch rewrite did not count unsafe-return-load skip reason");
@@ -4708,8 +4713,11 @@ int main() {
                    ["already matches"] == 1,
                "opt-in rewrite did not count already-matches skip reason");
   ok &= expect(optInSummary.SignatureRewriteSkippedByReason
-                   ["missing recovered prototype"] == 1,
+                   ["missing recovered prototype"] == 0,
                "opt-in rewrite did not count missing-prototype skip reason");
+  ok &= expect(optInSummary.SignatureRewriteSkippedByReason
+                   ["no recovered prototype candidates"] == 1,
+               "opt-in rewrite did not count no-candidate skip reason");
   ok &= expect(optInSummary.SignatureRewriteFunctions.size() == 3,
                "opt-in rewrite did not keep per-function rewrite results");
   const auto *optInRewrittenSummary = findRewriteFunctionSummary(
@@ -4729,9 +4737,8 @@ int main() {
   ok &= expect(optInMissingSummary != nullptr &&
                    !optInMissingSummary->Rewritten &&
                    optInMissingSummary->Reason ==
-                       "missing recovered prototype",
-               "opt-in rewrite did not record missing-prototype function "
-               "reason");
+                       "no recovered prototype candidates",
+               "opt-in rewrite did not record no-candidate function reason");
   ok &= expect(optInModule.getFunction("opt_in_input_rdi_return_rax") !=
                        nullptr &&
                    functionTypeShape(
@@ -4752,8 +4759,11 @@ int main() {
                    ["already matches"] == 2,
                "opt-in rerun did not preserve already-matches prototypes");
   ok &= expect(optInRerunSummary.SignatureRewriteSkippedByReason
-                   ["missing recovered prototype"] == 1,
+                   ["missing recovered prototype"] == 0,
                "opt-in rerun missing-prototype count changed");
+  ok &= expect(optInRerunSummary.SignatureRewriteSkippedByReason
+                   ["no recovered prototype candidates"] == 1,
+               "opt-in rerun no-candidate count changed");
   ok &= expect(optInModule.getFunction("opt_in_input_rdi_return_rax") !=
                        nullptr &&
                    optInModule.getFunction("opt_in_input_rdi_return_rax")

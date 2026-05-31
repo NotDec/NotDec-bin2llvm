@@ -404,6 +404,9 @@
   - [x] callsite input 缺少 store/entry value 时使用 register global load。
     - 记录：`06-pass-pipeline-and-verification/20260529-77-callsite-input-register-global-load.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 将无 prototype candidate 的 rewrite skip reason 从 metadata 损坏类缺失中拆出。
+    - 记录：`06-pass-pipeline-and-verification/20260529-78-no-prototype-candidate-rewrite-reason.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

@@ -231,6 +231,12 @@ bool hasUnsafeReturnValueLoad(
   return false;
 }
 
+bool hasAnyPrototypeCandidateMetadata(const llvm::Function &function) {
+  return function.getMetadata("notdec.prototype.recovered") != nullptr ||
+         function.getMetadata("notdec.prototype.input_candidates") != nullptr ||
+         function.getMetadata("notdec.prototype.return_candidates") != nullptr;
+}
+
 std::optional<llvm::Value *> registerStoreValueInReverseRange(
     llvm::BasicBlock::reverse_iterator iter, llvm::BasicBlock::reverse_iterator end,
     llvm::StringRef registerName, llvm::Type *valueType) {
@@ -1482,7 +1488,9 @@ getNativePrototypeRewriteEligibility(const llvm::Function &function) {
   std::optional<NativeRecoveredPrototype> prototype =
       readNativeRecoveredPrototypeMetadata(function);
   if (!prototype) {
-    result.Reason = "missing recovered prototype";
+    result.Reason = hasAnyPrototypeCandidateMetadata(function)
+                        ? "missing recovered prototype"
+                        : "no recovered prototype candidates";
     return result;
   }
   if (const llvm::Module *module = function.getParent()) {
