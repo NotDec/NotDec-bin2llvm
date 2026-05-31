@@ -259,6 +259,14 @@ std::optional<llvm::Value *> registerStoreValueInReverseRange(
 bool hasCallInReverseRange(llvm::BasicBlock::reverse_iterator iter,
                            llvm::BasicBlock::reverse_iterator end) {
   for (; iter != end; ++iter) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&*iter);
+    if (call == nullptr) {
+      continue;
+    }
+    llvm::Function *callee = call->getCalledFunction();
+    if (callee != nullptr && callee->isIntrinsic()) {
+      continue;
+    }
     if (llvm::isa<llvm::CallInst>(&*iter)) {
       return true;
     }
@@ -368,14 +376,14 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
       return std::nullopt;
     }
 
-    llvm::BasicBlock *successor = nullptr;
+    bool reachesCurrent = false;
     for (llvm::BasicBlock *candidate : llvm::successors(predecessor)) {
-      if (successor != nullptr) {
-        return std::nullopt;
+      if (candidate == current) {
+        reachesCurrent = true;
+        break;
       }
-      successor = candidate;
     }
-    if (successor != current) {
+    if (!reachesCurrent) {
       return std::nullopt;
     }
 

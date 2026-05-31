@@ -389,6 +389,9 @@
   - [x] callsite input 在无显式 store 时复用 caller 入口寄存器值。
     - 记录：`06-pass-pipeline-and-verification/20260529-72-callsite-input-rewritten-caller-argument.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] callsite input 回看入口值时允许 intrinsic 和分支前驱。
+    - 记录：`06-pass-pipeline-and-verification/20260529-73-callsite-input-ignore-intrinsic-clobber.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

@@ -8,6 +8,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -2155,6 +2156,78 @@ int main() {
                "rewritten caller argument was not passed to direct callee");
   if (llvm::verifyModule(rewrittenCallerArgModule, &llvm::errs())) {
     std::cerr << "rewritten caller argument module verification failed after "
+                 "input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module intrinsicCallerArgModule(
+      "native-prototype-input-intrinsic-caller-argument-test", context);
+  llvm::GlobalVariable *intrinsicCallerArgRdi =
+      createRegisterGlobal(intrinsicCallerArgModule, "RDI");
+  attachTestAbi(intrinsicCallerArgModule);
+  llvm::LoadInst *intrinsicCallerArgInputLoad = nullptr;
+  llvm::Function *intrinsicCallerArgCallee = createUsedExternalInputFunction(
+      intrinsicCallerArgModule, "intrinsic_caller_arg_input_rdi",
+      intrinsicCallerArgRdi, "RDI", &intrinsicCallerArgInputLoad);
+  attachExternalInputs(*intrinsicCallerArgCallee,
+                       {{"RDI", intrinsicCallerArgRdi}});
+  auto *intrinsicCallerArgType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *intrinsicCallerArgCaller = llvm::Function::Create(
+      intrinsicCallerArgType, llvm::GlobalValue::ExternalLinkage,
+      "call_intrinsic_caller_arg_input_rdi", intrinsicCallerArgModule);
+  intrinsicCallerArgCaller->getArg(0)->setName("RDI.external_input");
+  llvm::BasicBlock *intrinsicCallerArgEntry =
+      llvm::BasicBlock::Create(context, "entry", intrinsicCallerArgCaller);
+  llvm::BasicBlock *intrinsicCallerArgCallBlock =
+      llvm::BasicBlock::Create(context, "call", intrinsicCallerArgCaller);
+  llvm::BasicBlock *intrinsicCallerArgExitBlock =
+      llvm::BasicBlock::Create(context, "exit", intrinsicCallerArgCaller);
+  llvm::IRBuilder<> intrinsicCallerArgBuilder(intrinsicCallerArgEntry);
+  llvm::FunctionCallee ctpop = llvm::Intrinsic::getOrInsertDeclaration(
+      &intrinsicCallerArgModule, llvm::Intrinsic::ctpop,
+      {llvm::Type::getInt64Ty(context)});
+  intrinsicCallerArgBuilder.CreateCall(
+      ctpop.getFunctionType(), ctpop.getCallee(),
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 7)});
+  intrinsicCallerArgBuilder.CreateCondBr(
+      llvm::ConstantInt::getTrue(context), intrinsicCallerArgCallBlock,
+      intrinsicCallerArgExitBlock);
+
+  intrinsicCallerArgBuilder.SetInsertPoint(intrinsicCallerArgCallBlock);
+  intrinsicCallerArgBuilder.CreateCall(intrinsicCallerArgCallee->getFunctionType(),
+                                       intrinsicCallerArgCallee);
+  intrinsicCallerArgBuilder.CreateRetVoid();
+
+  intrinsicCallerArgBuilder.SetInsertPoint(intrinsicCallerArgExitBlock);
+  intrinsicCallerArgBuilder.CreateRetVoid();
+  notdec::bin2llvm::runNativePrototypeRecovery(intrinsicCallerArgModule, options);
+  intrinsicCallerArgCaller->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {{"RDI", 0}}, {}));
+  notdec::bin2llvm::NativePrototypeRewriteResult intrinsicCallerArgResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+          *intrinsicCallerArgCallee);
+  ok &= expect(intrinsicCallerArgResult.Rewritten,
+               "input-only prototype treated intrinsic as callsite clobber");
+  intrinsicCallerArgCallee = intrinsicCallerArgResult.Function;
+  llvm::CallInst *intrinsicCallerArgCall = nullptr;
+  for (llvm::BasicBlock &block : *intrinsicCallerArgCaller) {
+    for (llvm::Instruction &instruction : block) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+      if (call != nullptr &&
+          call->getCalledFunction() == intrinsicCallerArgCallee) {
+        intrinsicCallerArgCall = call;
+      }
+    }
+  }
+  ok &= expect(intrinsicCallerArgCall != nullptr &&
+                   intrinsicCallerArgCall->arg_size() == 1 &&
+                   intrinsicCallerArgCall->getArgOperand(0) ==
+                       intrinsicCallerArgCaller->getArg(0),
+               "intrinsic-separated caller argument was not passed to callee");
+  if (llvm::verifyModule(intrinsicCallerArgModule, &llvm::errs())) {
+    std::cerr << "intrinsic caller argument module verification failed after "
                  "input-only rewrite\n";
     return EXIT_FAILURE;
   }
