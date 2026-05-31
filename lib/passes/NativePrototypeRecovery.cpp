@@ -677,6 +677,44 @@ ReturnLoadSearchResult findMixedSuccessorReturnLoad(
   return {load, false, false};
 }
 
+ReturnLoadSearchResult findSharedSuccessorUnusedReturn(
+    llvm::BasicBlock &block, llvm::StringRef returnRegisterName,
+    std::set<llvm::BasicBlock *> &activeBlocks) {
+  if (!activeBlocks.insert(&block).second) {
+    return {nullptr, true, false};
+  }
+
+  ReturnLoadSearchResult blockResult = findReturnLoadBeforeStoreInRange(
+      block.begin(), block.end(), returnRegisterName);
+  if (blockResult.Load != nullptr || blockResult.Blocked) {
+    activeBlocks.erase(&block);
+    return {nullptr, true, false};
+  }
+  if (blockResult.Clobbered) {
+    activeBlocks.erase(&block);
+    return {};
+  }
+
+  llvm::Instruction *terminator = block.getTerminator();
+  if (terminator == nullptr) {
+    activeBlocks.erase(&block);
+    return {nullptr, true, false};
+  }
+
+  for (llvm::BasicBlock *successor : llvm::successors(&block)) {
+    ReturnLoadSearchResult successorResult =
+        findSharedSuccessorUnusedReturn(*successor, returnRegisterName,
+                                        activeBlocks);
+    if (successorResult.Blocked || successorResult.Load != nullptr) {
+      activeBlocks.erase(&block);
+      return {nullptr, true, false};
+    }
+  }
+
+  activeBlocks.erase(&block);
+  return {};
+}
+
 ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
                                               llvm::StringRef returnRegisterName) {
   llvm::BasicBlock::iterator localIter(oldCall.getIterator());
@@ -723,9 +761,13 @@ ReturnLoadSearchResult findCallsiteReturnLoad(llvm::CallInst &oldCall,
       if (successorResult.Load != nullptr || successorResult.Blocked) {
         return {nullptr, true, false};
       }
-      llvm::Instruction *terminator = successor->getTerminator();
-      if (terminator == nullptr || terminator->getNumSuccessors() != 0) {
-        return {nullptr, true, false};
+      if (!successorResult.Clobbered) {
+        std::set<llvm::BasicBlock *> activeBlocks;
+        ReturnLoadSearchResult unusedResult = findSharedSuccessorUnusedReturn(
+            *successor, returnRegisterName, activeBlocks);
+        if (unusedResult.Blocked || unusedResult.Load != nullptr) {
+          return {nullptr, true, false};
+        }
       }
       return {};
     }

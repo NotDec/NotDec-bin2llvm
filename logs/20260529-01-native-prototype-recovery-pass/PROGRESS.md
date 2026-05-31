@@ -395,6 +395,9 @@
   - [x] callsite input 支持唯一前驱里的 register SSA PHI 值。
     - 记录：`06-pass-pipeline-and-verification/20260529-74-callsite-input-predecessor-register-phi.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] shared successor 路径先覆盖返回寄存器时允许 callsite return rewrite。
+    - 记录：`06-pass-pipeline-and-verification/20260529-75-callsite-return-shared-successor-clobber.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

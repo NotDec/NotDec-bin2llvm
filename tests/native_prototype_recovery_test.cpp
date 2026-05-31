@@ -599,6 +599,49 @@ llvm::Function *createUnusedReturnSharedSuccessorCallerFunction(
   return function;
 }
 
+llvm::Function *createClobberReturnSharedSuccessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, const std::string &registerName,
+    llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::BasicBlock *otherBlock =
+      llvm::BasicBlock::Create(context, "other_pred", function);
+  llvm::BasicBlock *useBlock =
+      llvm::BasicBlock::Create(context, "use_clobbered_return", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), callBlock,
+                       otherBlock);
+
+  builder.SetInsertPoint(callBlock);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(otherBlock);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(useBlock);
+  llvm::StoreInst *store =
+      builder.CreateStore(llvm::ConstantInt::get(output->getValueType(), 7),
+                          output);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            registerName + ".clobbered_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *loadOut = load;
+  return function;
+}
+
 llvm::Function *createReturnLoadLoopCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee) {
   llvm::LLVMContext &context = module.getContext();
@@ -3356,6 +3399,62 @@ int main() {
   if (llvm::verifyModule(unusedSharedSuccessorReturnCallsiteModule,
                          &llvm::errs())) {
     std::cerr << "unused shared successor return callsite module verification "
+                 "failed after rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module clobberSharedSuccessorReturnCallsiteModule(
+      "native-prototype-return-clobber-shared-successor-callsite-test", context);
+  llvm::GlobalVariable *clobberSharedSuccessorReturnCallsiteRax =
+      createRegisterGlobal(clobberSharedSuccessorReturnCallsiteModule, "RAX");
+  attachTestAbi(clobberSharedSuccessorReturnCallsiteModule);
+  llvm::Function *clobberSharedSuccessorReturnCallsiteFunction =
+      createReturnStoreFunction(clobberSharedSuccessorReturnCallsiteModule,
+                                "clobber_shared_successor_callsite_return_rax",
+                                clobberSharedSuccessorReturnCallsiteRax, "RAX");
+  llvm::LoadInst *clobberSharedSuccessorReturnCallsiteLoad = nullptr;
+  createClobberReturnSharedSuccessorCallerFunction(
+      clobberSharedSuccessorReturnCallsiteModule,
+      "call_clobber_shared_successor_callsite_return_rax",
+      clobberSharedSuccessorReturnCallsiteFunction,
+      clobberSharedSuccessorReturnCallsiteRax, "RAX",
+      &clobberSharedSuccessorReturnCallsiteLoad);
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      clobberSharedSuccessorReturnCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      clobberSharedSuccessorReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *clobberSharedSuccessorReturnCallsiteFunction);
+  ok &= expect(clobberSharedSuccessorReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype with clobbered shared successor callsite was not rewritten");
+  clobberSharedSuccessorReturnCallsiteFunction =
+      clobberSharedSuccessorReturnCallsiteRewriteResult.Function;
+  llvm::CallInst *rewrittenClobberSharedSuccessorReturnCallsiteCall = nullptr;
+  llvm::Function *clobberSharedSuccessorReturnCallsiteCaller =
+      clobberSharedSuccessorReturnCallsiteModule.getFunction(
+          "call_clobber_shared_successor_callsite_return_rax");
+  if (clobberSharedSuccessorReturnCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *clobberSharedSuccessorReturnCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() ==
+                clobberSharedSuccessorReturnCallsiteFunction) {
+          rewrittenClobberSharedSuccessorReturnCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenClobberSharedSuccessorReturnCallsiteCall != nullptr,
+               "clobbered shared successor return callsite was not rewritten to new callee");
+  ok &= expect(rewrittenClobberSharedSuccessorReturnCallsiteCall != nullptr &&
+                   rewrittenClobberSharedSuccessorReturnCallsiteCall->use_empty(),
+               "clobbered shared successor return callsite result was unexpectedly used");
+  ok &= expect(!clobberSharedSuccessorReturnCallsiteLoad->use_empty(),
+               "clobbered shared successor return load was unexpectedly replaced");
+  if (llvm::verifyModule(clobberSharedSuccessorReturnCallsiteModule,
+                         &llvm::errs())) {
+    std::cerr << "clobbered shared successor return callsite module verification "
                  "failed after rewrite\n";
     return EXIT_FAILURE;
   }
