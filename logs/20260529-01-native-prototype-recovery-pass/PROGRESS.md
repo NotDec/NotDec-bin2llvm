@@ -386,6 +386,9 @@
   - [x] shared successor 未使用返回值时允许 callsite return rewrite。
     - 记录：`06-pass-pipeline-and-verification/20260529-71-callsite-return-shared-successor-unused.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] callsite input 在无显式 store 时复用 caller 入口寄存器值。
+    - 记录：`06-pass-pipeline-and-verification/20260529-72-callsite-input-rewritten-caller-argument.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

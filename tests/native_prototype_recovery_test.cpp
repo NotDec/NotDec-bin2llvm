@@ -2055,6 +2055,110 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  llvm::Module callerEntryInputModule(
+      "native-prototype-input-caller-entry-value-test", context);
+  llvm::GlobalVariable *callerEntryInputRdi =
+      createRegisterGlobal(callerEntryInputModule, "RDI");
+  attachTestAbi(callerEntryInputModule);
+  llvm::LoadInst *callerEntryInputCalleeLoad = nullptr;
+  llvm::Function *callerEntryInputCallee = createUsedExternalInputFunction(
+      callerEntryInputModule, "caller_entry_input_rdi", callerEntryInputRdi,
+      "RDI", &callerEntryInputCalleeLoad);
+  attachExternalInputs(*callerEntryInputCallee, {{"RDI", callerEntryInputRdi}});
+  auto *callerEntryInputType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callerEntryInputCaller = llvm::Function::Create(
+      callerEntryInputType, llvm::GlobalValue::ExternalLinkage,
+      "call_caller_entry_input_rdi", callerEntryInputModule);
+  llvm::BasicBlock *callerEntryInputEntry =
+      llvm::BasicBlock::Create(context, "entry", callerEntryInputCaller);
+  llvm::IRBuilder<> callerEntryInputBuilder(callerEntryInputEntry);
+  llvm::LoadInst *callerEntryInputLoad =
+      createExternalInputLoad(callerEntryInputBuilder, callerEntryInputRdi, "RDI");
+  callerEntryInputBuilder.CreateCall(callerEntryInputCallee->getFunctionType(),
+                                     callerEntryInputCallee);
+  callerEntryInputBuilder.CreateRetVoid();
+  attachExternalInputs(*callerEntryInputCaller, {{"RDI", callerEntryInputRdi}});
+  notdec::bin2llvm::runNativePrototypeRecovery(callerEntryInputModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult callerEntryInputResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+          *callerEntryInputCallee);
+  ok &= expect(callerEntryInputResult.Rewritten,
+               "input-only prototype did not use caller entry input value");
+  callerEntryInputCallee = callerEntryInputResult.Function;
+  llvm::CallInst *callerEntryInputCall = nullptr;
+  for (llvm::BasicBlock &block : *callerEntryInputCaller) {
+    for (llvm::Instruction &instruction : block) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+      if (call != nullptr && call->getCalledFunction() == callerEntryInputCallee) {
+        callerEntryInputCall = call;
+      }
+    }
+  }
+  ok &= expect(callerEntryInputCall != nullptr &&
+                   callerEntryInputCall->arg_size() == 1 &&
+                   callerEntryInputCall->getArgOperand(0) == callerEntryInputLoad,
+               "caller entry input load was not passed to direct callee");
+  if (llvm::verifyModule(callerEntryInputModule, &llvm::errs())) {
+    std::cerr << "caller entry input module verification failed after "
+                 "input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module rewrittenCallerArgModule(
+      "native-prototype-input-rewritten-caller-argument-test", context);
+  llvm::GlobalVariable *rewrittenCallerArgRdi =
+      createRegisterGlobal(rewrittenCallerArgModule, "RDI");
+  attachTestAbi(rewrittenCallerArgModule);
+  llvm::LoadInst *rewrittenCallerArgInputLoad = nullptr;
+  llvm::Function *rewrittenCallerArgCallee = createUsedExternalInputFunction(
+      rewrittenCallerArgModule, "rewritten_caller_arg_input_rdi",
+      rewrittenCallerArgRdi, "RDI", &rewrittenCallerArgInputLoad);
+  attachExternalInputs(*rewrittenCallerArgCallee,
+                       {{"RDI", rewrittenCallerArgRdi}});
+  auto *rewrittenCallerArgType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *rewrittenCallerArgCaller = llvm::Function::Create(
+      rewrittenCallerArgType, llvm::GlobalValue::ExternalLinkage,
+      "call_rewritten_caller_arg_input_rdi", rewrittenCallerArgModule);
+  rewrittenCallerArgCaller->getArg(0)->setName("RDI.external_input");
+  llvm::BasicBlock *rewrittenCallerArgEntry =
+      llvm::BasicBlock::Create(context, "entry", rewrittenCallerArgCaller);
+  llvm::IRBuilder<> rewrittenCallerArgBuilder(rewrittenCallerArgEntry);
+  rewrittenCallerArgBuilder.CreateCall(rewrittenCallerArgCallee->getFunctionType(),
+                                       rewrittenCallerArgCallee);
+  rewrittenCallerArgBuilder.CreateRetVoid();
+  notdec::bin2llvm::runNativePrototypeRecovery(rewrittenCallerArgModule, options);
+  rewrittenCallerArgCaller->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {{"RDI", 0}}, {}));
+  notdec::bin2llvm::NativePrototypeRewriteResult rewrittenCallerArgResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+          *rewrittenCallerArgCallee);
+  ok &= expect(rewrittenCallerArgResult.Rewritten,
+               "input-only prototype did not use rewritten caller argument");
+  rewrittenCallerArgCallee = rewrittenCallerArgResult.Function;
+  llvm::CallInst *rewrittenCallerArgCall = nullptr;
+  for (llvm::BasicBlock &block : *rewrittenCallerArgCaller) {
+    for (llvm::Instruction &instruction : block) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+      if (call != nullptr &&
+          call->getCalledFunction() == rewrittenCallerArgCallee) {
+        rewrittenCallerArgCall = call;
+      }
+    }
+  }
+  ok &= expect(rewrittenCallerArgCall != nullptr &&
+                   rewrittenCallerArgCall->arg_size() == 1 &&
+                   rewrittenCallerArgCall->getArgOperand(0) ==
+                       rewrittenCallerArgCaller->getArg(0),
+               "rewritten caller argument was not passed to direct callee");
+  if (llvm::verifyModule(rewrittenCallerArgModule, &llvm::errs())) {
+    std::cerr << "rewritten caller argument module verification failed after "
+                 "input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
   llvm::Module multiInputCallsiteModule(
       "native-prototype-multi-input-callsite-rewrite-test", context);
   llvm::GlobalVariable *multiInputRdi =

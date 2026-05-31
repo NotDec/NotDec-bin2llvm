@@ -256,6 +256,56 @@ std::optional<llvm::Value *> registerStoreValueInReverseRange(
   return std::nullopt;
 }
 
+bool hasCallInReverseRange(llvm::BasicBlock::reverse_iterator iter,
+                           llvm::BasicBlock::reverse_iterator end) {
+  for (; iter != end; ++iter) {
+    if (llvm::isa<llvm::CallInst>(&*iter)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::optional<llvm::Argument *> functionArgumentForRecoveredInput(
+    llvm::Function &function, llvm::StringRef registerName, llvm::Type *paramType) {
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(function);
+  if (!prototype) {
+    return std::nullopt;
+  }
+  std::optional<llvm::FunctionType *> recoveredType =
+      buildNativeRecoveredPrototypeFunctionType(function.getContext(), *prototype);
+  if (!recoveredType || function.getFunctionType() != *recoveredType) {
+    return std::nullopt;
+  }
+
+  for (uint64_t index = 0; index < prototype->Inputs.size(); ++index) {
+    if (prototype->Inputs[index].RegisterName != registerName) {
+      continue;
+    }
+    if (index >= function.arg_size() ||
+        function.getFunctionType()->getParamType(index) != paramType) {
+      return std::nullopt;
+    }
+    return function.getArg(index);
+  }
+  return std::nullopt;
+}
+
+std::optional<llvm::Value *> functionEntryValueForRegister(
+    llvm::Function &function, llvm::StringRef registerName, llvm::Type *paramType) {
+  if (std::optional<llvm::Argument *> argument =
+          functionArgumentForRecoveredInput(function, registerName, paramType)) {
+    return *argument;
+  }
+  std::optional<llvm::LoadInst *> inputLoad =
+      uniqueExternalInputLoad(function, registerName);
+  if (!inputLoad || (*inputLoad)->getType() != paramType) {
+    return std::nullopt;
+  }
+  return *inputLoad;
+}
+
 std::optional<llvm::Value *> equivalentInputValueFromPredecessors(
     llvm::BasicBlock &block, llvm::StringRef registerName,
     llvm::Type *paramType) {
@@ -284,6 +334,9 @@ std::optional<llvm::Value *> equivalentInputValueFromPredecessors(
 
 std::optional<llvm::Value *> callsiteInputValueBeforeCall(
     llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *paramType) {
+  bool sawInterveningCall = hasCallInReverseRange(
+      llvm::BasicBlock::reverse_iterator(call.getIterator()),
+      call.getParent()->rend());
   std::optional<llvm::Value *> localValue = registerStoreValueInReverseRange(
       llvm::BasicBlock::reverse_iterator(call.getIterator()),
       call.getParent()->rend(), registerName, paramType);
@@ -308,6 +361,10 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
                                                  paramType);
     }
     if (predecessor == nullptr) {
+      if (!sawInterveningCall) {
+        return functionEntryValueForRegister(*call.getFunction(), registerName,
+                                             paramType);
+      }
       return std::nullopt;
     }
 
@@ -329,6 +386,8 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
     if (predecessorValue) {
       return predecessorValue;
     }
+    sawInterveningCall |=
+        hasCallInReverseRange(predecessor->rbegin(), predecessor->rend());
     current = predecessor;
   }
   return std::nullopt;
