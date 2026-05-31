@@ -928,7 +928,8 @@ void rewriteInputReturnDirectCallsites(
     llvm::CallInst *newCall = builder.CreateCall(
         rewritten.getFunctionType(), &rewritten, callsite.Arguments);
     newCall->setCallingConv(callsite.Call->getCallingConv());
-    rewriteCallsiteReturnLoad(*callsite.Call, *newCall, returnRegisterName);
+    rewriteCallsiteReturnLoad(*callsite.Call, *newCall, returnRegisterName,
+                              true);
     callsite.Call->eraseFromParent();
   }
 }
@@ -2003,7 +2004,7 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
     for (const MultiInputCallsiteRewrite &callsite : *callsiteRewrites) {
       if (callsiteHasMismatchedReturnLoad(
               *callsite.Call, prototype->Returns[0].RegisterName,
-              (*recoveredType)->getReturnType())) {
+              (*recoveredType)->getReturnType(), true)) {
         result.Reason = "unsafe callsite return load";
         return result;
       }

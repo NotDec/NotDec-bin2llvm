@@ -844,6 +844,50 @@ llvm::Function *createInputStoreReturnLoadCallerFunction(
   return function;
 }
 
+llvm::Function *createInputStoreSharedSuccessorReturnLoadCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *input, const std::string &inputRegisterName,
+    llvm::GlobalVariable *output, const std::string &outputRegisterName,
+    llvm::CallInst **callOut, llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::BasicBlock *otherBlock =
+      llvm::BasicBlock::Create(context, "other_pred", function);
+  llvm::BasicBlock *useBlock =
+      llvm::BasicBlock::Create(context, "use_return", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), callBlock,
+                       otherBlock);
+
+  builder.SetInsertPoint(callBlock);
+  llvm::Value *argument = llvm::ConstantInt::get(input->getValueType(), 0x5678);
+  llvm::StoreInst *store = builder.CreateStore(argument, input);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, inputRegisterName));
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(otherBlock);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(useBlock);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            outputRegisterName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, outputRegisterName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *callOut = call;
+  *loadOut = load;
+  return function;
+}
+
 llvm::Function *createTwoInputStoreReturnLoadCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *firstInput, const std::string &firstRegisterName,
@@ -3803,6 +3847,88 @@ int main() {
   if (llvm::verifyModule(inputReturnCallsiteModule, &llvm::errs())) {
     std::cerr
         << "callsite module verification failed after input-return rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module sharedInputReturnCallsiteModule(
+      "native-prototype-input-return-shared-successor-callsite-rewrite-test",
+      context);
+  llvm::GlobalVariable *sharedInputReturnCallsiteRdi =
+      createRegisterGlobal(sharedInputReturnCallsiteModule, "RDI");
+  llvm::GlobalVariable *sharedInputReturnCallsiteRax =
+      createRegisterGlobal(sharedInputReturnCallsiteModule, "RAX");
+  attachTestAbi(sharedInputReturnCallsiteModule);
+  llvm::LoadInst *sharedCallsiteInputReturnLoad = nullptr;
+  llvm::StoreInst *sharedCallsiteInputReturnStore = nullptr;
+  llvm::Function *sharedCallsiteInputReturnFunction = createInputReturnFunction(
+      sharedInputReturnCallsiteModule,
+      "shared_callsite_input_rdi_return_rax",
+      sharedInputReturnCallsiteRdi, "RDI", sharedInputReturnCallsiteRax, "RAX",
+      &sharedCallsiteInputReturnLoad, &sharedCallsiteInputReturnStore);
+  attachExternalInputs(*sharedCallsiteInputReturnFunction,
+                       {{"RDI", sharedInputReturnCallsiteRdi}});
+  llvm::CallInst *oldSharedInputReturnCallsiteCall = nullptr;
+  llvm::LoadInst *oldSharedInputReturnCallsiteLoad = nullptr;
+  createInputStoreSharedSuccessorReturnLoadCallerFunction(
+      sharedInputReturnCallsiteModule,
+      "call_shared_callsite_input_rdi_return_rax",
+      sharedCallsiteInputReturnFunction, sharedInputReturnCallsiteRdi, "RDI",
+      sharedInputReturnCallsiteRax, "RAX", &oldSharedInputReturnCallsiteCall,
+      &oldSharedInputReturnCallsiteLoad);
+  notdec::bin2llvm::runNativePrototypeRecovery(sharedInputReturnCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      sharedInputReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputReturn(
+              *sharedCallsiteInputReturnFunction);
+  ok &= expect(sharedInputReturnCallsiteRewriteResult.Rewritten,
+               "input-return prototype with shared-successor callsite was not rewritten");
+  sharedCallsiteInputReturnFunction =
+      sharedInputReturnCallsiteRewriteResult.Function;
+  llvm::CallInst *rewrittenSharedInputReturnCallsiteCall = nullptr;
+  llvm::PHINode *sharedInputReturnPhi = nullptr;
+  llvm::Function *sharedInputReturnCallsiteCaller =
+      sharedInputReturnCallsiteModule.getFunction(
+          "call_shared_callsite_input_rdi_return_rax");
+  if (sharedInputReturnCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *sharedInputReturnCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          if (call->getCalledFunction() == sharedCallsiteInputReturnFunction) {
+            rewrittenSharedInputReturnCallsiteCall = call;
+          }
+        }
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction)) {
+          sharedInputReturnPhi = phi;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenSharedInputReturnCallsiteCall != nullptr,
+               "shared input-return callsite was not rewritten to new callee");
+  ok &= expect(rewrittenSharedInputReturnCallsiteCall != nullptr &&
+                   rewrittenSharedInputReturnCallsiteCall->arg_size() == 1 &&
+                   llvm::isa<llvm::ConstantInt>(
+                       rewrittenSharedInputReturnCallsiteCall->getArgOperand(0)),
+               "shared input-return callsite did not preserve input argument");
+  bool sharedPhiHasCallIncoming = false;
+  if (sharedInputReturnPhi != nullptr &&
+      rewrittenSharedInputReturnCallsiteCall != nullptr) {
+    for (llvm::Value *incoming : sharedInputReturnPhi->incoming_values()) {
+      if (incoming == rewrittenSharedInputReturnCallsiteCall) {
+        sharedPhiHasCallIncoming = true;
+      }
+    }
+  }
+  ok &= expect(sharedInputReturnPhi != nullptr &&
+                   sharedInputReturnPhi->getNumIncomingValues() == 2 &&
+                   sharedPhiHasCallIncoming,
+               "shared input-return load was not replaced with call-result PHI");
+  ok &= expect(oldSharedInputReturnCallsiteLoad->use_empty(),
+               "shared input-return callsite kept old return register load");
+  if (llvm::verifyModule(sharedInputReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "shared input-return callsite module verification failed after "
+                 "rewrite\n";
     return EXIT_FAILURE;
   }
 
