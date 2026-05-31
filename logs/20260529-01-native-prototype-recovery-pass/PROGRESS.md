@@ -398,6 +398,9 @@
   - [x] shared successor 路径先覆盖返回寄存器时允许 callsite return rewrite。
     - 记录：`06-pass-pipeline-and-verification/20260529-75-callsite-return-shared-successor-clobber.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] RegisterSSA 用 register global metadata 识别无 access metadata 的完整寄存器 load。
+    - 记录：`06-pass-pipeline-and-verification/20260529-76-register-global-load-input.md`
+    - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
 
 ## 记录规则
 

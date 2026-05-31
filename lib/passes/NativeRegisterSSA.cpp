@@ -168,7 +168,8 @@ AccessInfo registerLoad(llvm::LoadInst &load,
   if (it == units.end()) {
     return {};
   }
-  if (load.getMetadata("notdec.register.access") == nullptr) {
+  if (load.getMetadata("notdec.register.access") == nullptr &&
+      global->getMetadata("notdec.register") == nullptr) {
     return {};
   }
   bool fullUnit = load.getType() == global->getValueType();

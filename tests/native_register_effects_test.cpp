@@ -228,6 +228,21 @@ llvm::Function *createStaleMetadataFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createUnmarkedRegisterLoadFunction(llvm::Module &module,
+                                                   llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "unmarked_register_load", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rdi->getValueType(), rdi, "unmarked_rdi");
+  builder.CreateRet(load);
+  return function;
+}
+
 unsigned countRegisterLoads(const llvm::Function &function,
                             const llvm::GlobalVariable *global) {
   unsigned count = 0;
@@ -282,6 +297,7 @@ int main() {
   llvm::Module module("native-register-effects-test", context);
   llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
   attachTestAbi(module);
   llvm::Function *preserved =
       createFunction(module, "preserved_rbx", rbx, true);
@@ -293,6 +309,8 @@ int main() {
   llvm::Function *callerBeforeClobberingCallee =
       createCallerBeforeClobberingCalleeFunction(module, rbx);
   llvm::Function *staleMetadata = createStaleMetadataFunction(module, rbx);
+  llvm::Function *unmarkedRegisterLoad =
+      createUnmarkedRegisterLoadFunction(module, rdi);
 
   notdec::bin2llvm::NativeRegisterSSAOptions options;
   options.EnableRewrite = true;
@@ -341,5 +359,10 @@ int main() {
   ok &= expect(staleMetadata->getMetadata("notdec.register.clobbers") ==
                    nullptr,
                "stale clobber metadata was not cleared");
+  ok &= expect(metadataHasRegister(*unmarkedRegisterLoad,
+                                   "notdec.register.external_inputs", "RDI"),
+               "unmarked RDI global load was not marked as external input");
+  ok &= expect(countRegisterLoads(*unmarkedRegisterLoad, rdi) == 1,
+               "unmarked RDI global load was not rewritten to one entry load");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
