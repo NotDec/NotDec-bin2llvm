@@ -434,6 +434,72 @@ llvm::Function *createTwoInputStoreTwoReturnLoadCallerFunction(
   return function;
 }
 
+llvm::Function *
+createTwoInputStoreSharedSuccessorTwoReturnLoadCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *firstInput, const std::string &firstInputName,
+    llvm::GlobalVariable *secondInput, const std::string &secondInputName,
+    llvm::GlobalVariable *firstOutput, const std::string &firstOutputName,
+    llvm::GlobalVariable *secondOutput, const std::string &secondOutputName,
+    llvm::CallInst **callOut, llvm::LoadInst **firstLoadOut,
+    llvm::LoadInst **secondLoadOut, llvm::Value **firstArgumentOut,
+    llvm::Value **secondArgumentOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::BasicBlock *otherBlock =
+      llvm::BasicBlock::Create(context, "other_pred", function);
+  llvm::BasicBlock *useBlock =
+      llvm::BasicBlock::Create(context, "use_return", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), callBlock,
+                       otherBlock);
+
+  builder.SetInsertPoint(callBlock);
+  llvm::Value *firstArgument =
+      llvm::ConstantInt::get(firstInput->getValueType(), 0x579b);
+  llvm::StoreInst *firstStore =
+      builder.CreateStore(firstArgument, firstInput);
+  firstStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, firstInputName));
+  llvm::Value *secondArgument =
+      llvm::ConstantInt::get(secondInput->getValueType(), 0x68ac);
+  llvm::StoreInst *secondStore =
+      builder.CreateStore(secondArgument, secondInput);
+  secondStore->setMetadata("notdec.register.access",
+                           registerAccessMetadata(context, secondInputName));
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(otherBlock);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(useBlock);
+  llvm::LoadInst *firstLoad =
+      builder.CreateLoad(firstOutput->getValueType(), firstOutput,
+                         firstOutputName + ".return_value");
+  firstLoad->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, firstOutputName));
+  llvm::LoadInst *secondLoad =
+      builder.CreateLoad(secondOutput->getValueType(), secondOutput,
+                         secondOutputName + ".return_value");
+  secondLoad->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, secondOutputName));
+  builder.CreateAdd(firstLoad, secondLoad);
+  builder.CreateRetVoid();
+  *callOut = call;
+  *firstLoadOut = firstLoad;
+  *secondLoadOut = secondLoad;
+  *firstArgumentOut = firstArgument;
+  *secondArgumentOut = secondArgument;
+  return function;
+}
+
 llvm::Function *createTwoInputStoreCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *firstInput, const std::string &firstRegisterName,
@@ -2042,6 +2108,25 @@ int main() {
       "RDX", &multiInputTwoOutputOldCall, &multiInputTwoOutputRaxLoad,
       &multiInputTwoOutputRdxLoad, &multiInputTwoOutputRdiArgument,
       &multiInputTwoOutputRsiArgument);
+  llvm::Function *multiInputTwoOutputSharedBothFunction =
+      createTwoInputTwoOutputReturnStoreFunction(
+          module, "input_rdi_rsi_return_rdx_rax_shared_both", rdi, "RDI", rsi,
+          "RSI", rdx, "RDX", rax, "RAX");
+  attachExternalInputs(*multiInputTwoOutputSharedBothFunction,
+                       {{"RDI", rdi}, {"RSI", rsi}});
+  llvm::CallInst *multiInputTwoOutputSharedBothOldCall = nullptr;
+  llvm::LoadInst *multiInputTwoOutputSharedBothRaxLoad = nullptr;
+  llvm::LoadInst *multiInputTwoOutputSharedBothRdxLoad = nullptr;
+  llvm::Value *multiInputTwoOutputSharedBothRdiArgument = nullptr;
+  llvm::Value *multiInputTwoOutputSharedBothRsiArgument = nullptr;
+  createTwoInputStoreSharedSuccessorTwoReturnLoadCallerFunction(
+      module, "call_input_rdi_rsi_return_rdx_rax_shared_both",
+      multiInputTwoOutputSharedBothFunction, rdi, "RDI", rsi, "RSI", rax,
+      "RAX", rdx, "RDX", &multiInputTwoOutputSharedBothOldCall,
+      &multiInputTwoOutputSharedBothRaxLoad,
+      &multiInputTwoOutputSharedBothRdxLoad,
+      &multiInputTwoOutputSharedBothRdiArgument,
+      &multiInputTwoOutputSharedBothRsiArgument);
   llvm::LoadInst *inputReturnLoad = nullptr;
   llvm::StoreInst *inputReturnStore = nullptr;
   llvm::Function *inputReturnFunction = createInputReturnFunction(
@@ -2080,16 +2165,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 44, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 21,
+  ok &= expect(summary.FunctionsSeen == 46, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 23,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 18,
+  ok &= expect(summary.InputCandidates == 20,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 30,
+  ok &= expect(summary.ReturnCandidates == 32,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 44,
+  ok &= expect(summary.RewriteEligibleFunctions == 46,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 28,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 29,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -4790,6 +4875,80 @@ int main() {
                "multi-input multi-return callsite did not extract both fields");
   ok &= expect(!sawOldMultiInputMultiReturnLoad,
                "multi-input multi-return callsite kept old return register load");
+
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      sharedBothMultiInputMultiReturnRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+              *multiInputTwoOutputSharedBothFunction);
+  ok &= expect(sharedBothMultiInputMultiReturnRewriteResult.Rewritten,
+               "dual shared multi-input multi-return prototype was not rewritten");
+  multiInputTwoOutputSharedBothFunction =
+      sharedBothMultiInputMultiReturnRewriteResult.Function;
+  llvm::Function *multiInputTwoOutputSharedBothCaller =
+      module.getFunction("call_input_rdi_rsi_return_rdx_rax_shared_both");
+  llvm::CallInst *rewrittenSharedBothMultiInputMultiReturnCall = nullptr;
+  uint64_t sharedBothMultiInputMultiReturnExtracts = 0;
+  uint64_t sharedBothMultiInputMultiReturnPhis = 0;
+  uint64_t sharedBothMultiInputMultiReturnPhiExtracts = 0;
+  bool sawOldSharedBothMultiInputRaxLoad = false;
+  bool sawOldSharedBothMultiInputRdxLoad = false;
+  if (multiInputTwoOutputSharedBothCaller != nullptr) {
+    for (llvm::BasicBlock &block : *multiInputTwoOutputSharedBothCaller) {
+      for (llvm::Instruction &instruction : block) {
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          if (call->getCalledFunction() ==
+              multiInputTwoOutputSharedBothFunction) {
+            rewrittenSharedBothMultiInputMultiReturnCall = call;
+          }
+        }
+        if (llvm::isa<llvm::ExtractValueInst>(&instruction)) {
+          ++sharedBothMultiInputMultiReturnExtracts;
+        }
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction)) {
+          ++sharedBothMultiInputMultiReturnPhis;
+          for (llvm::Value *incoming : phi->incoming_values()) {
+            if (llvm::isa<llvm::ExtractValueInst>(incoming)) {
+              ++sharedBothMultiInputMultiReturnPhiExtracts;
+            }
+          }
+        }
+        if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+          if (load->getName() == "RAX.return_value") {
+            sawOldSharedBothMultiInputRaxLoad = true;
+          }
+          if (load->getName() == "RDX.return_value") {
+            sawOldSharedBothMultiInputRdxLoad = true;
+          }
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenSharedBothMultiInputMultiReturnCall != nullptr,
+               "dual shared multi-input multi-return callsite was not rewritten to new callee");
+  ok &= expect(rewrittenSharedBothMultiInputMultiReturnCall != nullptr &&
+                   rewrittenSharedBothMultiInputMultiReturnCall->arg_size() == 2,
+               "dual shared multi-input multi-return callsite did not get two arguments");
+  ok &= expect(rewrittenSharedBothMultiInputMultiReturnCall != nullptr &&
+                   multiInputTwoOutputSharedBothRdiArgument ==
+                       rewrittenSharedBothMultiInputMultiReturnCall
+                           ->getArgOperand(0) &&
+                   multiInputTwoOutputSharedBothRsiArgument ==
+                       rewrittenSharedBothMultiInputMultiReturnCall
+                           ->getArgOperand(1),
+               "dual shared multi-input multi-return callsite arguments were not ABI ordered");
+  ok &= expect(rewrittenSharedBothMultiInputMultiReturnCall != nullptr &&
+                   llvm::isa<llvm::StructType>(
+                       rewrittenSharedBothMultiInputMultiReturnCall->getType()),
+               "dual shared multi-input multi-return direct call did not return struct");
+  ok &= expect(sharedBothMultiInputMultiReturnExtracts == 2,
+               "dual shared multi-input multi-return callsite did not extract both fields");
+  ok &= expect(sharedBothMultiInputMultiReturnPhis == 2 &&
+                   sharedBothMultiInputMultiReturnPhiExtracts == 2,
+               "dual shared multi-input multi-return loads were not replaced with extractvalue PHIs");
+  ok &= expect(!sawOldSharedBothMultiInputRaxLoad,
+               "dual shared multi-input multi-return callsite kept old RAX return register load");
+  ok &= expect(!sawOldSharedBothMultiInputRdxLoad,
+               "dual shared multi-input multi-return callsite kept old RDX return register load");
 
   std::optional<notdec::bin2llvm::NativeRecoveredPrototype>
       emptyRecoveredPrototype =
