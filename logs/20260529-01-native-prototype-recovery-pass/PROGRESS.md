@@ -428,6 +428,9 @@
   - [x] multi-return callsite 覆盖 shared successor 中双返回分量 load 的 PHI 重写。
     - 记录：`06-pass-pipeline-and-verification/20260529-85-multi-return-shared-successor-all-components.md`
     - 文件：`tests/native_prototype_recovery_test.cpp`
+  - [x] input+multi-return callsite 覆盖 shared successor 中双返回分量 load 的 PHI 重写。
+    - 记录：`06-pass-pipeline-and-verification/20260529-86-input-multi-return-shared-successor-all-components.md`
+    - 文件：`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
