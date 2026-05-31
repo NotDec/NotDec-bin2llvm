@@ -434,6 +434,61 @@ llvm::Function *createTwoInputStoreTwoReturnLoadCallerFunction(
   return function;
 }
 
+llvm::Function *createTwoInputStoreSharedSuccessorReturnLoadCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *firstInput, const std::string &firstRegisterName,
+    llvm::GlobalVariable *secondInput, const std::string &secondRegisterName,
+    llvm::GlobalVariable *output, const std::string &outputRegisterName,
+    llvm::CallInst **callOut, llvm::LoadInst **loadOut,
+    llvm::Value **firstArgumentOut, llvm::Value **secondArgumentOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::BasicBlock *otherBlock =
+      llvm::BasicBlock::Create(context, "other_pred", function);
+  llvm::BasicBlock *useBlock =
+      llvm::BasicBlock::Create(context, "use_return", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), callBlock,
+                       otherBlock);
+
+  builder.SetInsertPoint(callBlock);
+  llvm::Value *firstArgument =
+      llvm::ConstantInt::get(firstInput->getValueType(), 0x1358);
+  llvm::StoreInst *firstStore = builder.CreateStore(firstArgument, firstInput);
+  firstStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, firstRegisterName));
+  llvm::Value *secondArgument =
+      llvm::ConstantInt::get(secondInput->getValueType(), 0x2469);
+  llvm::StoreInst *secondStore =
+      builder.CreateStore(secondArgument, secondInput);
+  secondStore->setMetadata("notdec.register.access",
+                           registerAccessMetadata(context, secondRegisterName));
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(otherBlock);
+  builder.CreateBr(useBlock);
+
+  builder.SetInsertPoint(useBlock);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            outputRegisterName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, outputRegisterName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *callOut = call;
+  *loadOut = load;
+  *firstArgumentOut = firstArgument;
+  *secondArgumentOut = secondArgument;
+  return function;
+}
+
 llvm::Function *
 createTwoInputStoreSharedSuccessorTwoReturnLoadCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
@@ -4311,6 +4366,112 @@ int main() {
   if (llvm::verifyModule(multiInputReturnCallsiteModule, &llvm::errs())) {
     std::cerr << "callsite module verification failed after multi-input "
                  "return rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module sharedMultiInputReturnCallsiteModule(
+      "native-prototype-multi-input-return-shared-successor-callsite-rewrite-test",
+      context);
+  llvm::GlobalVariable *sharedMultiInputReturnRdi =
+      createRegisterGlobal(sharedMultiInputReturnCallsiteModule, "RDI");
+  llvm::GlobalVariable *sharedMultiInputReturnRsi =
+      createRegisterGlobal(sharedMultiInputReturnCallsiteModule, "RSI");
+  llvm::GlobalVariable *sharedMultiInputReturnRax =
+      createRegisterGlobal(sharedMultiInputReturnCallsiteModule, "RAX");
+  attachTestAbi(sharedMultiInputReturnCallsiteModule);
+  llvm::LoadInst *sharedMultiInputReturnRdiLoad = nullptr;
+  llvm::LoadInst *sharedMultiInputReturnRsiLoad = nullptr;
+  llvm::StoreInst *sharedMultiInputReturnStore = nullptr;
+  llvm::Function *sharedMultiInputReturnFunction =
+      createTwoInputReturnFunction(
+          sharedMultiInputReturnCallsiteModule,
+          "shared_callsite_input_rdi_rsi_return_rax",
+          sharedMultiInputReturnRdi, "RDI", sharedMultiInputReturnRsi, "RSI",
+          sharedMultiInputReturnRax, "RAX", &sharedMultiInputReturnRdiLoad,
+          &sharedMultiInputReturnRsiLoad, &sharedMultiInputReturnStore);
+  attachExternalInputs(*sharedMultiInputReturnFunction,
+                       {{"RDI", sharedMultiInputReturnRdi},
+                        {"RSI", sharedMultiInputReturnRsi}});
+  llvm::CallInst *oldSharedMultiInputReturnCall = nullptr;
+  llvm::LoadInst *oldSharedMultiInputReturnLoad = nullptr;
+  llvm::Value *firstSharedMultiInputReturnArgument = nullptr;
+  llvm::Value *secondSharedMultiInputReturnArgument = nullptr;
+  createTwoInputStoreSharedSuccessorReturnLoadCallerFunction(
+      sharedMultiInputReturnCallsiteModule,
+      "call_shared_callsite_input_rdi_rsi_return_rax",
+      sharedMultiInputReturnFunction, sharedMultiInputReturnRdi, "RDI",
+      sharedMultiInputReturnRsi, "RSI", sharedMultiInputReturnRax, "RAX",
+      &oldSharedMultiInputReturnCall, &oldSharedMultiInputReturnLoad,
+      &firstSharedMultiInputReturnArgument,
+      &secondSharedMultiInputReturnArgument);
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      sharedMultiInputReturnCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      sharedMultiInputReturnRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputReturn(
+              *sharedMultiInputReturnFunction);
+  ok &= expect(sharedMultiInputReturnRewriteResult.Rewritten,
+               "multi-input return prototype with shared-successor callsite was not rewritten");
+  sharedMultiInputReturnFunction =
+      sharedMultiInputReturnRewriteResult.Function;
+  llvm::CallInst *rewrittenSharedMultiInputReturnCall = nullptr;
+  llvm::PHINode *sharedMultiInputReturnPhi = nullptr;
+  bool sawOldSharedMultiInputReturnLoad = false;
+  llvm::Function *sharedMultiInputReturnCaller =
+      sharedMultiInputReturnCallsiteModule.getFunction(
+          "call_shared_callsite_input_rdi_rsi_return_rax");
+  if (sharedMultiInputReturnCaller != nullptr) {
+    for (llvm::BasicBlock &block : *sharedMultiInputReturnCaller) {
+      for (llvm::Instruction &instruction : block) {
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          if (call->getCalledFunction() == sharedMultiInputReturnFunction) {
+            rewrittenSharedMultiInputReturnCall = call;
+          }
+        }
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction)) {
+          sharedMultiInputReturnPhi = phi;
+        }
+        if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+          if (load->getName() == "RAX.return_value") {
+            sawOldSharedMultiInputReturnLoad = true;
+          }
+        }
+      }
+    }
+  }
+  bool sharedMultiInputPhiHasCallIncoming = false;
+  if (sharedMultiInputReturnPhi != nullptr &&
+      rewrittenSharedMultiInputReturnCall != nullptr) {
+    for (llvm::Value *incoming : sharedMultiInputReturnPhi->incoming_values()) {
+      if (incoming == rewrittenSharedMultiInputReturnCall) {
+        sharedMultiInputPhiHasCallIncoming = true;
+      }
+    }
+  }
+  ok &= expect(rewrittenSharedMultiInputReturnCall != nullptr,
+               "shared multi-input return callsite was not rewritten to new callee");
+  ok &= expect(rewrittenSharedMultiInputReturnCall != nullptr &&
+                   rewrittenSharedMultiInputReturnCall->arg_size() == 2,
+               "shared multi-input return callsite did not get two arguments");
+  ok &= expect(rewrittenSharedMultiInputReturnCall != nullptr &&
+                   firstSharedMultiInputReturnArgument ==
+                       rewrittenSharedMultiInputReturnCall->getArgOperand(0) &&
+                   secondSharedMultiInputReturnArgument ==
+                       rewrittenSharedMultiInputReturnCall->getArgOperand(1),
+               "shared multi-input return callsite arguments were not ABI ordered");
+  ok &= expect(rewrittenSharedMultiInputReturnCall != nullptr &&
+                   rewrittenSharedMultiInputReturnCall->getType() ==
+                       llvm::Type::getInt64Ty(context),
+               "shared multi-input return callsite did not return i64");
+  ok &= expect(sharedMultiInputReturnPhi != nullptr &&
+                   sharedMultiInputReturnPhi->getNumIncomingValues() == 2 &&
+                   sharedMultiInputPhiHasCallIncoming,
+               "shared multi-input return load was not replaced with call-result PHI");
+  ok &= expect(!sawOldSharedMultiInputReturnLoad,
+               "shared multi-input return callsite kept old return register load");
+  if (llvm::verifyModule(sharedMultiInputReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "shared multi-input return callsite module verification failed "
+                 "after rewrite\n";
     return EXIT_FAILURE;
   }
   notdec::bin2llvm::NativePrototypeRewriteResult dispatchInputResult =
