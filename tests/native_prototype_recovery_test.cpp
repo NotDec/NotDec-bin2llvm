@@ -1880,6 +1880,17 @@ int main() {
       module, "call_input_rdi_return_rdx_rax", inputTwoOutputFunction, rdi,
       "RDI", rax, "RAX", rdx, "RDX", &inputTwoOutputOldCall,
       &inputTwoOutputRaxLoad, &inputTwoOutputRdxLoad);
+  llvm::Function *inputTwoOutputSharedFunction =
+      createInputTwoOutputReturnStoreFunction(
+          module, "input_rdi_return_rdx_rax_shared", rdi, "RDI", rdx, "RDX",
+          rax, "RAX");
+  attachExternalInputs(*inputTwoOutputSharedFunction, {{"RDI", rdi}});
+  llvm::CallInst *inputTwoOutputSharedOldCall = nullptr;
+  llvm::LoadInst *inputTwoOutputSharedRaxLoad = nullptr;
+  createInputStoreSharedSuccessorReturnLoadCallerFunction(
+      module, "call_input_rdi_return_rdx_rax_shared",
+      inputTwoOutputSharedFunction, rdi, "RDI", rax, "RAX",
+      &inputTwoOutputSharedOldCall, &inputTwoOutputSharedRaxLoad);
   llvm::Function *unusedInputTwoOutputFunction =
       createInputTwoOutputReturnStoreFunction(
           module, "input_rdi_return_rdx_rax_unused", rdi, "RDI", rdx, "RDX",
@@ -1948,16 +1959,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 38, "unexpected function count");
-  ok &= expect(summary.ExternalInputsSeen == 19,
+  ok &= expect(summary.FunctionsSeen == 40, "unexpected function count");
+  ok &= expect(summary.ExternalInputsSeen == 20,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 16,
+  ok &= expect(summary.InputCandidates == 17,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 24,
+  ok &= expect(summary.ReturnCandidates == 26,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 38,
+  ok &= expect(summary.RewriteEligibleFunctions == 40,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 25,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 26,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -4362,6 +4373,61 @@ int main() {
                "input multi-return callsite did not extract both fields");
   ok &= expect(!sawOldInputMultiReturnLoad,
                "input multi-return callsite kept old return register load");
+
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      sharedInputMultiReturnRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+              *inputTwoOutputSharedFunction);
+  ok &= expect(sharedInputMultiReturnRewriteResult.Rewritten,
+               "shared input multi-return prototype was not rewritten");
+  inputTwoOutputSharedFunction = sharedInputMultiReturnRewriteResult.Function;
+  llvm::Function *inputTwoOutputSharedCaller =
+      module.getFunction("call_input_rdi_return_rdx_rax_shared");
+  llvm::CallInst *rewrittenSharedInputMultiReturnCall = nullptr;
+  llvm::PHINode *sharedInputMultiReturnPhi = nullptr;
+  uint64_t sharedInputMultiReturnExtracts = 0;
+  if (inputTwoOutputSharedCaller != nullptr) {
+    for (llvm::BasicBlock &block : *inputTwoOutputSharedCaller) {
+      for (llvm::Instruction &instruction : block) {
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          if (call->getCalledFunction() == inputTwoOutputSharedFunction) {
+            rewrittenSharedInputMultiReturnCall = call;
+          }
+        }
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction)) {
+          sharedInputMultiReturnPhi = phi;
+        }
+        if (llvm::isa<llvm::ExtractValueInst>(&instruction)) {
+          ++sharedInputMultiReturnExtracts;
+        }
+      }
+    }
+  }
+  bool sharedInputMultiReturnPhiHasExtract = false;
+  if (sharedInputMultiReturnPhi != nullptr) {
+    for (llvm::Value *incoming : sharedInputMultiReturnPhi->incoming_values()) {
+      if (llvm::isa<llvm::ExtractValueInst>(incoming)) {
+        sharedInputMultiReturnPhiHasExtract = true;
+      }
+    }
+  }
+  ok &= expect(rewrittenSharedInputMultiReturnCall != nullptr,
+               "shared input multi-return callsite was not rewritten to new callee");
+  ok &= expect(rewrittenSharedInputMultiReturnCall != nullptr &&
+                   rewrittenSharedInputMultiReturnCall->arg_size() == 1,
+               "shared input multi-return callsite did not get one argument");
+  ok &= expect(rewrittenSharedInputMultiReturnCall != nullptr &&
+                   llvm::isa<llvm::StructType>(
+                       rewrittenSharedInputMultiReturnCall->getType()),
+               "shared input multi-return direct call did not return struct");
+  ok &= expect(sharedInputMultiReturnExtracts == 1,
+               "shared input multi-return callsite did not extract exactly one used field");
+  ok &= expect(sharedInputMultiReturnPhi != nullptr &&
+                   sharedInputMultiReturnPhi->getNumIncomingValues() == 2 &&
+                   sharedInputMultiReturnPhiHasExtract,
+               "shared input multi-return load was not replaced with extractvalue PHI");
+  ok &= expect(inputTwoOutputSharedRaxLoad->use_empty(),
+               "shared input multi-return callsite kept old return register load");
 
   notdec::bin2llvm::NativePrototypeRewriteResult
       unusedInputMultiReturnRewriteResult =

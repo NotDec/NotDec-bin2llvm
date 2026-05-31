@@ -584,6 +584,8 @@ struct InputMultiReturnCallsiteRewrite {
   std::vector<llvm::Value *> Arguments;
   // Same slot order as the recovered returns; null entries are unused results.
   std::vector<llvm::LoadInst *> ReturnLoads;
+  std::vector<ReturnLoadSearchResult> ReturnLoadResults;
+  std::vector<std::string> ReturnRegisterNames;
 };
 
 struct InputMultiReturnCallsiteCollectionResult {
@@ -1093,9 +1095,11 @@ collectInputMultiReturnDirectCallsites(
       rewrite.Arguments.push_back(*argument);
     }
     rewrite.ReturnLoads.reserve(returns.size());
+    rewrite.ReturnLoadResults.reserve(returns.size());
+    rewrite.ReturnRegisterNames.reserve(returns.size());
     for (uint64_t index = 0; index < returns.size(); ++index) {
       ReturnLoadSearchResult loadResult =
-          findCallsiteReturnLoad(*call, returns[index].RegisterName);
+          findCallsiteReturnLoad(*call, returns[index].RegisterName, true);
       if (loadResult.Blocked ||
           (loadResult.Load != nullptr &&
            loadResult.Load->getType() != returnType.getElementType(index))) {
@@ -1103,6 +1107,8 @@ collectInputMultiReturnDirectCallsites(
         return result;
       }
       rewrite.ReturnLoads.push_back(loadResult.Load);
+      rewrite.ReturnLoadResults.push_back(loadResult);
+      rewrite.ReturnRegisterNames.push_back(returns[index].RegisterName);
     }
     result.Rewrites.push_back(std::move(rewrite));
   }
@@ -1124,6 +1130,17 @@ void rewriteInputMultiReturnDirectCallsites(
       }
       llvm::Value *field =
           builder.CreateExtractValue(newCall, {static_cast<unsigned>(index)});
+      if (index < callsite.ReturnLoadResults.size() &&
+          callsite.ReturnLoadResults[index].SharedSuccessor != nullptr) {
+        llvm::StringRef registerName =
+            index < callsite.ReturnRegisterNames.size()
+                ? llvm::StringRef(callsite.ReturnRegisterNames[index])
+                : llvm::StringRef();
+        replaceSharedSuccessorReturnLoad(*load, *field,
+                                         callsite.ReturnLoadResults[index],
+                                         registerName);
+        continue;
+      }
       load->replaceAllUsesWith(field);
       if (load->use_empty()) {
         load->eraseFromParent();
