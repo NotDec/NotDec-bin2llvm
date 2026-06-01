@@ -432,8 +432,12 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
       predecessor = candidate;
     }
     if (sawMultiplePredecessors) {
-      return equivalentInputValueFromPredecessors(*current, registerName,
-                                                 paramType);
+      if (std::optional<llvm::Value *> value =
+              equivalentInputValueFromPredecessors(*current, registerName,
+                                                   paramType)) {
+        return value;
+      }
+      return registerGlobalValueBeforeCall(call, registerName, paramType);
     }
     if (predecessor == nullptr) {
       if (!sawInterveningCall) {
@@ -473,7 +477,7 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
         hasCallInReverseRange(predecessor->rbegin(), predecessor->rend());
     current = predecessor;
   }
-  return std::nullopt;
+  return registerGlobalValueBeforeCall(call, registerName, paramType);
 }
 
 // Multi-input form of Ghidra FuncCallSpecs::buildInputFromTrials(...): keep

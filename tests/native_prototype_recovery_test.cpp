@@ -3009,11 +3009,35 @@ int main() {
       conflictingPredecessorCallsiteRewriteResult =
           notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
               *conflictingPredecessorCallsiteInputFunction);
-  ok &= expect(!conflictingPredecessorCallsiteRewriteResult.Rewritten,
-               "input-only prototype with conflicting predecessors was rewritten");
-  ok &= expect(conflictingPredecessorCallsiteRewriteResult.Reason ==
-                   "unsafe callsite input value",
-               "conflicting predecessor callsite had wrong skip reason");
+  ok &= expect(conflictingPredecessorCallsiteRewriteResult.Rewritten,
+               "input-only prototype with conflicting predecessors was not rewritten");
+  conflictingPredecessorCallsiteInputFunction =
+      conflictingPredecessorCallsiteRewriteResult.Function;
+  llvm::CallInst *conflictingPredecessorCallsiteCall = nullptr;
+  llvm::Function *conflictingPredecessorCallsiteCaller =
+      conflictingPredecessorCallsiteModule.getFunction(
+          "call_conflicting_predecessor_callsite_input_rdi");
+  if (conflictingPredecessorCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *conflictingPredecessorCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == conflictingPredecessorCallsiteInputFunction) {
+          conflictingPredecessorCallsiteCall = call;
+        }
+      }
+    }
+  }
+  auto *conflictingPredecessorCallsiteArgLoad =
+      conflictingPredecessorCallsiteCall != nullptr &&
+              conflictingPredecessorCallsiteCall->arg_size() == 1
+          ? llvm::dyn_cast<llvm::LoadInst>(
+                conflictingPredecessorCallsiteCall->getArgOperand(0))
+          : nullptr;
+  ok &= expect(conflictingPredecessorCallsiteArgLoad != nullptr &&
+                   conflictingPredecessorCallsiteArgLoad->getPointerOperand() ==
+                       conflictingPredecessorCallsiteRdi,
+               "conflicting predecessor callsite did not use register global load");
   if (llvm::verifyModule(conflictingPredecessorCallsiteModule, &llvm::errs())) {
     std::cerr << "conflicting predecessor callsite module verification failed\n";
     return EXIT_FAILURE;

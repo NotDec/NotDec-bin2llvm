@@ -470,6 +470,9 @@
   - [x] 扩展 Bench2 样本到 `lighttpd`，确认 IR 通过 LLVM 22 assemble/verify，并发现新的 `unsafe callsite input value` / `unsafe callsite return load` blocker。
     - 记录：`06-pass-pipeline-and-verification/20260601-98-lighttpd-expanded-bench2-audit.md`
     - 文件：Bench2 lighttpd 输出、`scripts/bench2-native-smoke.sh`
+  - [x] callsite input 多前驱值不唯一时 fallback 到当前 register global load，清零 lighttpd 的 `unsafe callsite input value`。
+    - 记录：`06-pass-pipeline-and-verification/20260601-99-callsite-input-ambiguous-current-register.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
