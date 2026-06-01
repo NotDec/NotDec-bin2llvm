@@ -554,6 +554,9 @@
   - [x] 收紧当前阶段目标：register 参数/返回值和 direct signature rewrite 视为阶段性收敛，后续不再无限扩大 audit，下一阶段转向参考 Ghidra 支持栈参数。
     - 记录：`GOAL.md`
     - 文件：`GOAL.md`
+  - [x] 创建 `07-stack-parameter-recovery` 阶段目录，记录栈参数恢复阶段范围。
+    - 记录：`07-stack-parameter-recovery/README.md`
+    - 文件：`07-stack-parameter-recovery/README.md`
 
 ## 记录规则
 
