@@ -506,6 +506,9 @@
   - [x] manifest prototype audit 支持 `--decode-seed-limit`，可对大目标分批跑完整 signature rewrite / LLVM 22 verify gate。
     - 记录：`06-pass-pipeline-and-verification/20260601-110-seed-limited-prototype-audit.md`
     - 文件：`scripts/bench2-native-prototype-audit.sh`
+  - [x] 对 PHP / Python / ICU / ffmpeg 大目标运行 seed-limited 100 函数 prototype gate，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-111-large-seed100-prototype-audit.md`
+    - 文件：Bench2 large-target seed-limited prototype 输出
 
 ## 记录规则
 
