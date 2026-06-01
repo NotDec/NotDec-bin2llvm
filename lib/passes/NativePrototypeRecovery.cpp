@@ -725,17 +725,63 @@ ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
   return {};
 }
 
+ReturnLoadSearchResult findSharedSuccessorUnusedReturn(
+    llvm::BasicBlock &block, llvm::StringRef returnRegisterName,
+    std::set<llvm::BasicBlock *> &visitedBlocks);
+
+bool hasUnvisitedPredecessor(llvm::BasicBlock &block,
+                             const std::set<llvm::BasicBlock *> &visited) {
+  for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
+    if (visited.count(predecessor) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+ReturnLoadSearchResult findDominatedSuccessorReturnLoad(
+    llvm::BasicBlock &block, llvm::StringRef returnRegisterName) {
+  std::vector<llvm::BasicBlock *> worklist = {&block};
+  std::set<llvm::BasicBlock *> visited;
+  while (!worklist.empty()) {
+    llvm::BasicBlock *current = worklist.back();
+    worklist.pop_back();
+    if (!visited.insert(current).second) {
+      continue;
+    }
+
+    ReturnLoadSearchResult blockResult = findReturnLoadBeforeStoreInRange(
+        current->begin(), current->end(), returnRegisterName);
+    if (blockResult.Load != nullptr || blockResult.Blocked ||
+        blockResult.Clobbered) {
+      return blockResult;
+    }
+
+    llvm::Instruction *terminator = current->getTerminator();
+    if (terminator == nullptr) {
+      return blockedReturnLoadSearch();
+    }
+    for (llvm::BasicBlock *successor : llvm::successors(current)) {
+      if (hasUnvisitedPredecessor(*successor, visited)) {
+        return blockedReturnLoadSearch();
+      }
+      worklist.push_back(successor);
+    }
+  }
+  return {};
+}
+
 ReturnLoadSearchResult findMixedSuccessorReturnLoad(
     llvm::BasicBlock &block, llvm::StringRef returnRegisterName) {
   llvm::LoadInst *load = nullptr;
   uint64_t successorCount = 0;
-  // A call result dominates each direct successor.  Keep this narrow: one
-  // successor may read the return register, the rest must end without touching it.
+  // A call result dominates each direct successor.  One successor may read the
+  // return register; all other reachable paths must prove the value is unused.
   for (llvm::BasicBlock *successor : llvm::successors(&block)) {
     ++successorCount;
     ReturnLoadSearchResult successorResult = findReturnLoadBeforeStoreInRange(
         successor->begin(), successor->end(), returnRegisterName);
-    if (successorResult.Blocked || successorResult.Clobbered) {
+    if (successorResult.Blocked) {
       return blockedReturnLoadSearch();
     }
     if (successorResult.Load != nullptr) {
@@ -745,8 +791,25 @@ ReturnLoadSearchResult findMixedSuccessorReturnLoad(
       load = successorResult.Load;
       continue;
     }
-    if (successor->getTerminator() == nullptr ||
-        successor->getTerminator()->getNumSuccessors() != 0) {
+    if (successorResult.Clobbered) {
+      continue;
+    }
+    ReturnLoadSearchResult nestedResult =
+        findDominatedSuccessorReturnLoad(*successor, returnRegisterName);
+    if (nestedResult.Load != nullptr) {
+      if (load != nullptr) {
+        return blockedReturnLoadSearch();
+      }
+      load = nestedResult.Load;
+      continue;
+    }
+    if (nestedResult.Clobbered) {
+      continue;
+    }
+    std::set<llvm::BasicBlock *> activeBlocks;
+    ReturnLoadSearchResult unusedResult = findSharedSuccessorUnusedReturn(
+        *successor, returnRegisterName, activeBlocks);
+    if (unusedResult.Blocked || unusedResult.Load != nullptr) {
       return blockedReturnLoadSearch();
     }
   }
@@ -758,39 +821,32 @@ ReturnLoadSearchResult findMixedSuccessorReturnLoad(
 
 ReturnLoadSearchResult findSharedSuccessorUnusedReturn(
     llvm::BasicBlock &block, llvm::StringRef returnRegisterName,
-    std::set<llvm::BasicBlock *> &activeBlocks) {
-  if (!activeBlocks.insert(&block).second) {
-    return blockedReturnLoadSearch();
-  }
+    std::set<llvm::BasicBlock *> &visitedBlocks) {
+  std::vector<llvm::BasicBlock *> worklist = {&block};
+  while (!worklist.empty()) {
+    llvm::BasicBlock *current = worklist.back();
+    worklist.pop_back();
+    if (!visitedBlocks.insert(current).second) {
+      continue;
+    }
 
-  ReturnLoadSearchResult blockResult = findReturnLoadBeforeStoreInRange(
-      block.begin(), block.end(), returnRegisterName);
-  if (blockResult.Load != nullptr || blockResult.Blocked) {
-    activeBlocks.erase(&block);
-    return blockedReturnLoadSearch();
-  }
-  if (blockResult.Clobbered) {
-    activeBlocks.erase(&block);
-    return {};
-  }
-
-  llvm::Instruction *terminator = block.getTerminator();
-  if (terminator == nullptr) {
-    activeBlocks.erase(&block);
-    return blockedReturnLoadSearch();
-  }
-
-  for (llvm::BasicBlock *successor : llvm::successors(&block)) {
-    ReturnLoadSearchResult successorResult =
-        findSharedSuccessorUnusedReturn(*successor, returnRegisterName,
-                                        activeBlocks);
-    if (successorResult.Blocked || successorResult.Load != nullptr) {
-      activeBlocks.erase(&block);
+    ReturnLoadSearchResult blockResult = findReturnLoadBeforeStoreInRange(
+        current->begin(), current->end(), returnRegisterName);
+    if (blockResult.Load != nullptr || blockResult.Blocked) {
       return blockedReturnLoadSearch();
     }
-  }
+    if (blockResult.Clobbered) {
+      continue;
+    }
 
-  activeBlocks.erase(&block);
+    llvm::Instruction *terminator = current->getTerminator();
+    if (terminator == nullptr) {
+      return blockedReturnLoadSearch();
+    }
+    for (llvm::BasicBlock *successor : llvm::successors(current)) {
+      worklist.push_back(successor);
+    }
+  }
   return {};
 }
 
@@ -866,7 +922,14 @@ findCallsiteReturnLoad(llvm::CallInst &oldCall,
     }
     current = successor;
   }
-  return blockedReturnLoadSearch();
+  std::set<llvm::BasicBlock *> activeBlocks;
+  ReturnLoadSearchResult unusedResult =
+      findSharedSuccessorUnusedReturn(*current, returnRegisterName,
+                                      activeBlocks);
+  if (unusedResult.Blocked || unusedResult.Load != nullptr) {
+    return blockedReturnLoadSearch();
+  }
+  return {};
 }
 
 bool replaceSharedSuccessorReturnLoad(llvm::LoadInst &load,

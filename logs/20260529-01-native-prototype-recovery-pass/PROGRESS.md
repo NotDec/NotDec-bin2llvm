@@ -473,6 +473,9 @@
   - [x] callsite input 多前驱值不唯一时 fallback 到当前 register global load，清零 lighttpd 的 `unsafe callsite input value`。
     - 记录：`06-pass-pipeline-and-verification/20260601-99-callsite-input-ambiguous-current-register.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] callsite return 在复杂后继 CFG 中查找 nested return load，并证明无 load 环/分支的返回值未使用，清零 lighttpd 的 `unsafe callsite return load`。
+    - 记录：`06-pass-pipeline-and-verification/20260601-100-callsite-return-unused-cfg.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

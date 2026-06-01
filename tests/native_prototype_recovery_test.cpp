@@ -714,6 +714,46 @@ llvm::Function *createReturnLoadMultiSuccessorCallerFunction(
   return function;
 }
 
+llvm::Function *createReturnLoadNestedSuccessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, const std::string &registerName,
+    llvm::LoadInst **loadOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *middle = llvm::BasicBlock::Create(context, "middle", function);
+  llvm::BasicBlock *skipBlock =
+      llvm::BasicBlock::Create(context, "skip_return", function);
+  llvm::BasicBlock *useBlock =
+      llvm::BasicBlock::Create(context, "use_return", function);
+  llvm::BasicBlock *doneBlock = llvm::BasicBlock::Create(context, "done", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), middle, doneBlock);
+
+  builder.SetInsertPoint(middle);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), useBlock, skipBlock);
+
+  builder.SetInsertPoint(useBlock);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            registerName + ".return_value");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(skipBlock);
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(doneBlock);
+  builder.CreateRetVoid();
+  *loadOut = load;
+  return function;
+}
+
 llvm::Function *createUnusedReturnMultiSuccessorCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee) {
   llvm::LLVMContext &context = module.getContext();
@@ -3717,26 +3757,6 @@ int main() {
     return EXIT_FAILURE;
   }
 
-  auto expectReturnOnlyRewriteRejected =
-      [&](llvm::Module &module, llvm::Function &function,
-          llvm::LoadInst *load, const char *message) {
-        notdec::bin2llvm::runNativePrototypeRecovery(module, options);
-        notdec::bin2llvm::NativePrototypeRewriteResult result =
-            notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(function);
-        ok &= expect(!result.Rewritten, message);
-        ok &= expect(result.Reason == "unsafe callsite return load",
-                     "unsafe return callsite had wrong skip reason");
-        if (load != nullptr) {
-          ok &= expect(!load->use_empty(),
-                       "unsafe callsite return load was unexpectedly replaced");
-        }
-        if (llvm::verifyModule(module, &llvm::errs())) {
-          std::cerr << "unsafe return callsite module verification failed\n";
-          return false;
-        }
-        return true;
-      };
-
   llvm::Module multiSuccessorReturnCallsiteModule(
       "native-prototype-return-multi-successor-callsite-test", context);
   llvm::GlobalVariable *multiSuccessorReturnCallsiteRax =
@@ -3766,6 +3786,38 @@ int main() {
   if (llvm::verifyModule(multiSuccessorReturnCallsiteModule, &llvm::errs())) {
     std::cerr << "mixed multi-successor return callsite module verification "
                  "failed after rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module nestedSuccessorReturnCallsiteModule(
+      "native-prototype-return-nested-successor-callsite-test", context);
+  llvm::GlobalVariable *nestedSuccessorReturnCallsiteRax =
+      createRegisterGlobal(nestedSuccessorReturnCallsiteModule, "RAX");
+  attachTestAbi(nestedSuccessorReturnCallsiteModule);
+  llvm::Function *nestedSuccessorReturnCallsiteFunction =
+      createReturnStoreFunction(nestedSuccessorReturnCallsiteModule,
+                                "nested_successor_callsite_return_rax",
+                                nestedSuccessorReturnCallsiteRax, "RAX");
+  llvm::LoadInst *nestedSuccessorReturnCallsiteLoad = nullptr;
+  createReturnLoadNestedSuccessorCallerFunction(
+      nestedSuccessorReturnCallsiteModule,
+      "call_nested_successor_callsite_return_rax",
+      nestedSuccessorReturnCallsiteFunction, nestedSuccessorReturnCallsiteRax,
+      "RAX", &nestedSuccessorReturnCallsiteLoad);
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      nestedSuccessorReturnCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      nestedSuccessorReturnCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *nestedSuccessorReturnCallsiteFunction);
+  ok &= expect(nestedSuccessorReturnCallsiteRewriteResult.Rewritten,
+               "return-only prototype rewrite rejected nested successor "
+               "return load");
+  ok &= expect(nestedSuccessorReturnCallsiteLoad->use_empty(),
+               "nested successor return load was not replaced");
+  if (llvm::verifyModule(nestedSuccessorReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "nested successor return callsite module verification failed "
+                 "after rewrite\n";
     return EXIT_FAILURE;
   }
 
@@ -3955,9 +4007,16 @@ int main() {
   createReturnLoadLoopCallerFunction(loopReturnCallsiteModule,
                                      "call_loop_callsite_return_rax",
                                      loopReturnCallsiteFunction);
-  if (!expectReturnOnlyRewriteRejected(
-          loopReturnCallsiteModule, *loopReturnCallsiteFunction, nullptr,
-          "return-only prototype rewrite accepted loop callsite")) {
+  notdec::bin2llvm::runNativePrototypeRecovery(loopReturnCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult loopReturnCallsiteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+          *loopReturnCallsiteFunction);
+  ok &= expect(loopReturnCallsiteResult.Rewritten,
+               "return-only prototype rewrite rejected unused loop callsite");
+  if (llvm::verifyModule(loopReturnCallsiteModule, &llvm::errs())) {
+    std::cerr << "unused loop return callsite module verification failed after "
+                 "rewrite\n";
     return EXIT_FAILURE;
   }
 
