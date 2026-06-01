@@ -223,6 +223,10 @@ bool hasUnsafeReturnValueLoad(
     if (isRegisterAccessLoad(binding.ReturnValue)) {
       return true;
     }
+    auto *trunc = llvm::dyn_cast_or_null<llvm::TruncInst>(binding.ReturnValue);
+    if (trunc != nullptr && isRegisterAccessLoad(trunc->getOperand(0))) {
+      return true;
+    }
   }
   return false;
 }
@@ -1399,6 +1403,31 @@ std::optional<uint64_t> parseUint64Field(const llvm::MDNode &node,
   }
 }
 
+llvm::Value *returnValueForStore(llvm::StoreInst &store) {
+  llvm::Value *value = store.getValueOperand();
+  if (value == nullptr || value->getType()->isIntegerTy(64)) {
+    return value;
+  }
+
+  llvm::MDNode *access = store.getMetadata("notdec.register.access");
+  if (access == nullptr) {
+    return value;
+  }
+  std::optional<uint64_t> size = parseUint64Field(*access, "size");
+  if (!size || *size != 8) {
+    return value;
+  }
+
+  auto *integerType = llvm::dyn_cast<llvm::IntegerType>(value->getType());
+  if (integerType == nullptr || integerType->getBitWidth() <= 64) {
+    return value;
+  }
+
+  llvm::IRBuilder<> builder(&store);
+  return builder.CreateTrunc(value, llvm::Type::getInt64Ty(store.getContext()),
+                             "notdec.return.slice");
+}
+
 std::optional<std::vector<NativeRecoveredPrototypeParam>>
 readRecoveredParamList(const llvm::MDNode &node) {
   std::vector<NativeRecoveredPrototypeParam> params;
@@ -1758,8 +1787,9 @@ getNativePrototypeReturnBindings(llvm::Function &function) {
     binding.Param = param;
     binding.ReturnStore = stores->front();
     binding.ReturnStores = *stores;
-    binding.ReturnValue = stores->front()->getValueOperand();
-    if (binding.ReturnValue == nullptr) {
+    llvm::Value *rawReturnValue = stores->front()->getValueOperand();
+    binding.ReturnValue = returnValueForStore(*stores->front());
+    if (rawReturnValue == nullptr || binding.ReturnValue == nullptr) {
       return std::nullopt;
     }
     if (stores->size() == 1) {
@@ -1768,10 +1798,10 @@ getNativePrototypeReturnBindings(llvm::Function &function) {
     }
     for (llvm::StoreInst *store : *stores) {
       llvm::Value *value = store->getValueOperand();
-      if (value == nullptr || value->getType() != binding.ReturnValue->getType()) {
+      if (value == nullptr || value->getType() != rawReturnValue->getType()) {
         return std::nullopt;
       }
-      if (!sameReturnStoreValue(*binding.ReturnValue, *value)) {
+      if (!sameReturnStoreValue(*rawReturnValue, *value)) {
         return std::nullopt;
       }
     }

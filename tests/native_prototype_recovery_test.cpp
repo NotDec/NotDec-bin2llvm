@@ -23,19 +23,26 @@
 namespace {
 
 llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
-                                           const std::string &name) {
+                                           const std::string &name,
+                                           llvm::Type *type) {
   llvm::LLVMContext &context = module.getContext();
-  auto *type = llvm::Type::getInt64Ty(context);
   auto *global = new llvm::GlobalVariable(
       module, type, false, llvm::GlobalValue::ExternalLinkage, nullptr, name);
+  uint64_t size = type->isIntegerTy() ? type->getIntegerBitWidth() / 8 : 8;
   llvm::Metadata *fields[] = {
       llvm::MDString::get(context, "space=register"),
       llvm::MDString::get(context, "offset=0"),
-      llvm::MDString::get(context, "size=8"),
+      llvm::MDString::get(context, "size=" + std::to_string(size)),
       llvm::MDString::get(context, "name=" + name),
   };
   global->setMetadata("notdec.register", llvm::MDNode::get(context, fields));
   return global;
+}
+
+llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
+                                           const std::string &name) {
+  return createRegisterGlobal(module, name,
+                              llvm::Type::getInt64Ty(module.getContext()));
 }
 
 notdec::bin2llvm::NativeAbiParamEntry inputRegister(const std::string &name) {
@@ -55,6 +62,20 @@ llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context,
       llvm::MDString::get(context, "space=register"),
       llvm::MDString::get(context, "offset=0"),
       llvm::MDString::get(context, "size=8"),
+      llvm::MDString::get(context, "name=" + name),
+  };
+  return llvm::MDNode::get(context, fields);
+}
+
+llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context,
+                                     const std::string &base, uint64_t offset,
+                                     uint64_t size,
+                                     const std::string &name) {
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "base=" + base),
+      llvm::MDString::get(context, "space=register"),
+      llvm::MDString::get(context, "offset=" + std::to_string(offset)),
+      llvm::MDString::get(context, "size=" + std::to_string(size)),
       llvm::MDString::get(context, "name=" + name),
   };
   return llvm::MDNode::get(context, fields);
@@ -87,6 +108,19 @@ void attachTestAbi(llvm::Module &module) {
   unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
   unaffected.Storage.Name = "RBX";
   abi.Effects.push_back(std::move(unaffected));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
+void attachVectorReturnTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+
+  notdec::bin2llvm::NativeAbiParamEntry xmm0 = inputRegister("XMM0_Qa");
+  abi.Outputs.push_back(std::move(xmm0));
+
+  notdec::bin2llvm::NativeAbiParamEntry rax = inputRegister("RAX");
+  abi.Outputs.push_back(std::move(rax));
 
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
@@ -1342,6 +1376,35 @@ llvm::Function *createReturnStoreFunction(llvm::Module &module,
   if (returnStore != nullptr) {
     *returnStore = store;
   }
+  return function;
+}
+
+llvm::Function *createWideVectorAndScalarReturnFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *wide,
+    llvm::GlobalVariable *scalar, llvm::StoreInst **wideReturnStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  llvm::Value *wideLoad = builder.CreateLoad(wide->getValueType(), wide);
+  llvm::Value *wideValue = builder.CreateAdd(
+      wideLoad, llvm::ConstantInt::get(wide->getValueType(), 1));
+  llvm::StoreInst *wideStore = builder.CreateStore(wideValue, wide);
+  wideStore->setMetadata(
+      "notdec.register.access",
+      registerAccessMetadata(context, "ZMM0", 4608, 8, "XMM0_Qa"));
+
+  llvm::StoreInst *scalarStore = builder.CreateStore(
+      llvm::ConstantInt::get(scalar->getValueType(), 0x1234), scalar);
+  scalarStore->setMetadata("notdec.register.access",
+                           registerAccessMetadata(context, "RAX"));
+  builder.CreateRetVoid();
+
+  *wideReturnStore = wideStore;
   return function;
 }
 
@@ -3328,6 +3391,66 @@ int main() {
   ok &= expect(!notdec::bin2llvm::getNativePrototypeReturnBindings(
                     *conflictingReturnFunction),
                "conflicting return stores were incorrectly bound");
+
+  llvm::Module vectorReturnModule("native-prototype-vector-return-slice-test",
+                                  context);
+  llvm::GlobalVariable *vectorReturnZmm =
+      createRegisterGlobal(vectorReturnModule, "ZMM0",
+                           llvm::IntegerType::get(context, 512));
+  llvm::GlobalVariable *vectorReturnRax =
+      createRegisterGlobal(vectorReturnModule, "RAX");
+  attachVectorReturnTestAbi(vectorReturnModule);
+  llvm::StoreInst *vectorReturnWideStore = nullptr;
+  llvm::Function *vectorReturnFunction =
+      createWideVectorAndScalarReturnFunction(
+          vectorReturnModule, "return_xmm0_lane_and_rax", vectorReturnZmm,
+          vectorReturnRax, &vectorReturnWideStore);
+  notdec::bin2llvm::runNativePrototypeRecovery(vectorReturnModule, options);
+  std::optional<std::vector<notdec::bin2llvm::NativePrototypeReturnBinding>>
+      vectorReturnBindings =
+          notdec::bin2llvm::getNativePrototypeReturnBindings(
+              *vectorReturnFunction);
+  ok &= expect(vectorReturnBindings.has_value(),
+               "wide vector return store was not bound");
+  if (vectorReturnBindings) {
+    ok &= expect(vectorReturnBindings->size() == 2,
+                 "wide vector return binding had wrong count");
+    ok &= expect((*vectorReturnBindings)[0].Param.RegisterName == "XMM0_Qa",
+                 "wide vector return binding used wrong first register");
+    ok &= expect((*vectorReturnBindings)[0].ReturnStore ==
+                     vectorReturnWideStore,
+                 "wide vector return binding used wrong store");
+    ok &= expect((*vectorReturnBindings)[0].ReturnValue != nullptr &&
+                     (*vectorReturnBindings)[0].ReturnValue->getType()
+                         ->isIntegerTy(64),
+                 "wide vector return binding was not sliced to i64");
+    ok &= expect(llvm::isa<llvm::TruncInst>(
+                     (*vectorReturnBindings)[0].ReturnValue),
+                 "wide vector return binding did not insert trunc");
+  }
+  notdec::bin2llvm::NativePrototypeRewriteResult vectorReturnRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+          *vectorReturnFunction);
+  ok &= expect(vectorReturnRewriteResult.Rewritten,
+               "wide vector multi-return prototype was not rewritten");
+  vectorReturnFunction = vectorReturnRewriteResult.Function;
+  auto *vectorReturnStruct =
+      vectorReturnFunction != nullptr
+          ? llvm::dyn_cast<llvm::StructType>(vectorReturnFunction->getReturnType())
+          : nullptr;
+  ok &= expect(vectorReturnStruct != nullptr &&
+                   vectorReturnStruct->getNumElements() == 2 &&
+                   vectorReturnStruct->getElementType(0)->isIntegerTy(64) &&
+                   vectorReturnStruct->getElementType(1)->isIntegerTy(64),
+               "wide vector rewritten return type was not {i64, i64}");
+  ok &= expect(vectorReturnFunction != nullptr &&
+                   !hasRegisterStore(*vectorReturnFunction, "XMM0_Qa"),
+               "wide vector rewritten function kept old XMM0_Qa store");
+  if (llvm::verifyModule(vectorReturnModule, &llvm::errs())) {
+    std::cerr << "wide vector return module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
   notdec::bin2llvm::NativePrototypeRewriteResult duplicateReturnRewriteResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
           *twoReturnFunction);

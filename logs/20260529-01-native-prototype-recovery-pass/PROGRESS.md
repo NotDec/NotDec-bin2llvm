@@ -485,6 +485,9 @@
   - [x] 添加 manifest 驱动的 prototype rewrite 扩展审计脚本，自动运行 all-confirmed / signature rewrite / LLVM 22 verify / skip reason gate。
     - 记录：`06-pass-pipeline-and-verification/20260601-103-manifest-prototype-audit-script.md`
     - 文件：`scripts/bench2-native-prototype-audit.sh`
+  - [x] return binding 按 access metadata 的 8 字节 storage 从宽 integer store 中切出 `i64` 返回值，清零 `redis:cli` 的 `return value type mismatch`。
+    - 记录：`06-pass-pipeline-and-verification/20260601-104-return-binding-storage-slice.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 
