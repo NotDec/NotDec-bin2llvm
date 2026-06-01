@@ -208,10 +208,38 @@ std::optional<llvm::LoadInst *> uniqueExternalInputLoad(
   return result;
 }
 
-bool isRegisterAccessLoad(llvm::Value *value) {
-  auto *load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
-  return load != nullptr &&
-         load->getMetadata("notdec.register.access") != nullptr;
+std::optional<std::string> registerAccessName(llvm::Instruction &instruction) {
+  llvm::MDNode *metadata = instruction.getMetadata("notdec.register.access");
+  if (metadata == nullptr) {
+    return std::nullopt;
+  }
+  return metadataField(*metadata, "name");
+}
+
+bool isDeclarationCallOutputLoad(llvm::LoadInst &load) {
+  std::optional<std::string> registerName = registerAccessName(load);
+  if (!registerName) {
+    return false;
+  }
+
+  for (auto iter = llvm::BasicBlock::reverse_iterator(load.getIterator()),
+            end = load.getParent()->rend();
+       iter != end; ++iter) {
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter)) {
+      if (registerAccessName(*store) == registerName) {
+        return false;
+      }
+      continue;
+    }
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&*iter);
+    if (call == nullptr) {
+      continue;
+    }
+    llvm::Function *callee = call->getCalledFunction();
+    return callee != nullptr && !callee->isIntrinsic() &&
+           callee->isDeclaration();
+  }
+  return false;
 }
 
 bool hasUnsafeReturnValueLoad(
@@ -220,11 +248,19 @@ bool hasUnsafeReturnValueLoad(
   // callsite's old return load.  Batch rewriting another callee may erase that
   // load later, so skip it until rewrite ordering tracks that dependency.
   for (const NativePrototypeReturnBinding &binding : returnBindings) {
-    if (isRegisterAccessLoad(binding.ReturnValue)) {
+    auto *load = llvm::dyn_cast_or_null<llvm::LoadInst>(binding.ReturnValue);
+    if (load != nullptr && load->getMetadata("notdec.register.access") != nullptr &&
+        !isDeclarationCallOutputLoad(*load)) {
       return true;
     }
     auto *trunc = llvm::dyn_cast_or_null<llvm::TruncInst>(binding.ReturnValue);
-    if (trunc != nullptr && isRegisterAccessLoad(trunc->getOperand(0))) {
+    auto *truncLoad = trunc != nullptr
+                          ? llvm::dyn_cast_or_null<llvm::LoadInst>(
+                                trunc->getOperand(0))
+                          : nullptr;
+    if (truncLoad != nullptr &&
+        truncLoad->getMetadata("notdec.register.access") != nullptr &&
+        !isDeclarationCallOutputLoad(*truncLoad)) {
       return true;
     }
   }
@@ -1540,6 +1576,77 @@ llvm::Value *returnValueForStore(llvm::StoreInst &store) {
                              "notdec.return.slice");
 }
 
+std::optional<std::vector<llvm::LoadInst *>>
+returnPointDeclarationCallOutputLoads(llvm::Function &function,
+                                      llvm::StringRef registerName) {
+  std::vector<llvm::LoadInst *> loads;
+  std::set<llvm::LoadInst *> seenLoads;
+  uint64_t returnCount = 0;
+  for (llvm::BasicBlock &block : function) {
+    auto *ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
+    if (ret == nullptr) {
+      continue;
+    }
+    ++returnCount;
+
+    llvm::LoadInst *loadForReturn = nullptr;
+    for (auto iter = llvm::BasicBlock::reverse_iterator(ret->getIterator()),
+              end = block.rend();
+         iter != end; ++iter) {
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter)) {
+        if (registerAccessName(*store) == registerName) {
+          return std::nullopt;
+        }
+        continue;
+      }
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter);
+      if (load == nullptr || registerAccessName(*load) != registerName) {
+        continue;
+      }
+      if (!isDeclarationCallOutputLoad(*load)) {
+        return std::nullopt;
+      }
+      loadForReturn = load;
+      break;
+    }
+    if (loadForReturn == nullptr) {
+      return std::nullopt;
+    }
+    if (seenLoads.insert(loadForReturn).second) {
+      loads.push_back(loadForReturn);
+    }
+  }
+  if (returnCount == 0 || loads.empty()) {
+    return std::nullopt;
+  }
+  return loads;
+}
+
+void applyDeclarationCallOutputAliases(
+    std::vector<NativePrototypeReturnBinding> &bindings) {
+  std::map<std::string, llvm::LoadInst *> callOutputsByRegister;
+  for (const NativePrototypeReturnBinding &binding : bindings) {
+    auto *load = llvm::dyn_cast_or_null<llvm::LoadInst>(binding.ReturnValue);
+    if (load == nullptr || !isDeclarationCallOutputLoad(*load)) {
+      continue;
+    }
+    std::optional<std::string> registerName = registerAccessName(*load);
+    if (!registerName) {
+      continue;
+    }
+    callOutputsByRegister[*registerName] = load;
+  }
+
+  for (NativePrototypeReturnBinding &binding : bindings) {
+    auto found = callOutputsByRegister.find(binding.Param.RegisterName);
+    if (found == callOutputsByRegister.end()) {
+      continue;
+    }
+    binding.ReturnValue = found->second;
+    binding.EraseReturnStores = false;
+  }
+}
+
 std::optional<std::vector<NativeRecoveredPrototypeParam>>
 readRecoveredParamList(const llvm::MDNode &node) {
   std::vector<NativeRecoveredPrototypeParam> params;
@@ -1891,6 +1998,16 @@ getNativePrototypeReturnBindings(llvm::Function &function) {
   for (const NativeRecoveredPrototypeParam &param : prototype->Returns) {
     std::optional<std::vector<llvm::StoreInst *>> stores =
         returnPointStores(function, model, param.RegisterName);
+    std::optional<std::vector<llvm::LoadInst *>> callOutputLoads =
+        returnPointDeclarationCallOutputLoads(function, param.RegisterName);
+    if (callOutputLoads) {
+      NativePrototypeReturnBinding binding;
+      binding.Param = param;
+      binding.ReturnValue = callOutputLoads->front();
+      binding.EraseReturnStores = false;
+      bindings.push_back(std::move(binding));
+      continue;
+    }
     if (!stores || stores->empty()) {
       return std::nullopt;
     }
@@ -1919,12 +2036,16 @@ getNativePrototypeReturnBindings(llvm::Function &function) {
     }
     bindings.push_back(std::move(binding));
   }
+  applyDeclarationCallOutputAliases(bindings);
   return bindings;
 }
 
 void eraseReturnBindingStores(
     llvm::ArrayRef<NativePrototypeReturnBinding> returnBindings) {
   for (const NativePrototypeReturnBinding &binding : returnBindings) {
+    if (!binding.EraseReturnStores) {
+      continue;
+    }
     if (!binding.ReturnStores.empty()) {
       for (llvm::StoreInst *store : binding.ReturnStores) {
         if (store != nullptr) {

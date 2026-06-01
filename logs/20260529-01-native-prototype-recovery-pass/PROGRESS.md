@@ -512,6 +512,9 @@
   - [x] return binding 解析函数内 register COPY，把 Python seed200 的 `PyStatus_Exit` 从 `unsafe return value load` 推进到签名重写成功。
     - 记录：`06-pass-pipeline-and-verification/20260601-112-return-binding-register-copy.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] return binding 识别 declaration call output，把 ffmpeg codec seed200 的 `av_packet_alloc` 从 `unsafe return value load` 推进到签名重写成功；四个大目标 seed200 gate 只剩合理 skip reason。
+    - 记录：`06-pass-pipeline-and-verification/20260601-113-return-binding-declaration-call-output.md`
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

@@ -89,6 +89,7 @@ struct NativePrototypeReturnBinding {
   llvm::StoreInst *ReturnStore = nullptr;
   std::vector<llvm::StoreInst *> ReturnStores;
   llvm::Value *ReturnValue = nullptr;
+  bool EraseReturnStores = true;
 };
 
 struct NativePrototypeRewriteResult {

@@ -1562,6 +1562,39 @@ llvm::Function *createInputRegisterCopyReturnFunction(
   return function;
 }
 
+llvm::Function *createDeclarationCallOutputReturnFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *firstOutput, const std::string &firstRegisterName,
+    llvm::GlobalVariable *secondOutput, const std::string &secondRegisterName,
+    llvm::LoadInst **callOutputLoad, llvm::StoreInst **staleFirstStore,
+    llvm::StoreInst **secondReturnStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::StoreInst *staleStore = builder.CreateStore(
+      llvm::ConstantInt::get(firstOutput->getValueType(), 0), firstOutput);
+  staleStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, firstRegisterName));
+  builder.CreateCall(callee->getFunctionType(), callee);
+  llvm::LoadInst *load = builder.CreateLoad(firstOutput->getValueType(),
+                                            firstOutput,
+                                            firstRegisterName + ".call_output");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, firstRegisterName));
+  llvm::StoreInst *store = builder.CreateStore(load, secondOutput);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, secondRegisterName));
+  builder.CreateRetVoid();
+  *callOutputLoad = load;
+  *staleFirstStore = staleStore;
+  *secondReturnStore = store;
+  return function;
+}
+
 llvm::Function *createTwoInputReturnFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *first,
     const std::string &firstRegisterName, llvm::GlobalVariable *second,
@@ -4401,6 +4434,71 @@ int main() {
                "input-register-copy-return unexpectedly erased temporary load");
   if (llvm::verifyModule(inputRegisterCopyReturnModule, &llvm::errs())) {
     std::cerr << "module verification failed after input-register-copy-return rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallOutputReturnModule(
+      "native-prototype-declaration-call-output-return-test", context);
+  llvm::GlobalVariable *declarationCallOutputRax =
+      createRegisterGlobal(declarationCallOutputReturnModule, "RAX");
+  llvm::GlobalVariable *declarationCallOutputRdx =
+      createRegisterGlobal(declarationCallOutputReturnModule, "RDX");
+  attachTestAbi(declarationCallOutputReturnModule);
+  auto *declarationCallOutputCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallOutputCallee = llvm::Function::Create(
+      declarationCallOutputCalleeType, llvm::GlobalValue::ExternalLinkage,
+      "declaration_call_output_callee", declarationCallOutputReturnModule);
+  llvm::LoadInst *declarationCallOutputLoad = nullptr;
+  llvm::StoreInst *declarationCallOutputStaleStore = nullptr;
+  llvm::StoreInst *declarationCallOutputSecondStore = nullptr;
+  llvm::Function *declarationCallOutputReturnFunction =
+      createDeclarationCallOutputReturnFunction(
+          declarationCallOutputReturnModule,
+          "declaration_call_output_return_rax_rdx",
+          declarationCallOutputCallee, declarationCallOutputRax, "RAX",
+          declarationCallOutputRdx, "RDX", &declarationCallOutputLoad,
+          &declarationCallOutputStaleStore,
+          &declarationCallOutputSecondStore);
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallOutputReturnModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      declarationCallOutputRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+              *declarationCallOutputReturnFunction);
+  ok &= expect(declarationCallOutputRewriteResult.Rewritten,
+               "declaration call output multi-return prototype was not rewritten");
+  declarationCallOutputReturnFunction =
+      declarationCallOutputRewriteResult.Function;
+  uint64_t declarationCallOutputReturnUses = 0;
+  bool sawDeclarationCallOutputStaleStore = false;
+  bool sawDeclarationCallOutputSecondStore = false;
+  if (declarationCallOutputReturnFunction != nullptr) {
+    for (llvm::BasicBlock &block : *declarationCallOutputReturnFunction) {
+      for (llvm::Instruction &instruction : block) {
+        if (&instruction == declarationCallOutputStaleStore) {
+          sawDeclarationCallOutputStaleStore = true;
+        }
+        if (&instruction == declarationCallOutputSecondStore) {
+          sawDeclarationCallOutputSecondStore = true;
+        }
+        auto *insert = llvm::dyn_cast<llvm::InsertValueInst>(&instruction);
+        if (insert != nullptr &&
+            insert->getInsertedValueOperand() == declarationCallOutputLoad) {
+          ++declarationCallOutputReturnUses;
+        }
+      }
+    }
+  }
+  ok &= expect(declarationCallOutputReturnUses == 2,
+               "declaration call output was not used for both return pieces");
+  ok &= expect(sawDeclarationCallOutputStaleStore,
+               "declaration call output rewrite erased stale call setup store");
+  ok &= expect(!sawDeclarationCallOutputSecondStore,
+               "declaration call output rewrite kept copied return store");
+  if (llvm::verifyModule(declarationCallOutputReturnModule, &llvm::errs())) {
+    std::cerr << "declaration call output return module verification failed "
+                 "after rewrite\n";
     return EXIT_FAILURE;
   }
 
