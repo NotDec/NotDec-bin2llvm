@@ -479,6 +479,9 @@
   - [x] 扩展 Bench2 样本到 `lighttpd-angel` 和 `tmux`，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
     - 记录：`06-pass-pipeline-and-verification/20260601-101-lighttpd-angel-tmux-expanded-audit.md`
     - 文件：Bench2 lighttpd-angel / tmux 输出
+  - [x] 扩展 Bench2 样本到 OpenSSH `ssh` / `sshd`，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-102-openssh-expanded-audit.md`
+    - 文件：Bench2 ssh / sshd 输出
 
 ## 记录规则
 
