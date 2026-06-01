@@ -8,6 +8,7 @@ OUT_DIR="${OUT_DIR:-/tmp/notdec-bin2llvm-bench2-prototype-audit}"
 LLVM_BIN="${LLVM_BIN:-/sn640/NotDec/llvm-22.1.0.obj/bin}"
 TARGETS=()
 ALLOWED_SKIP_REASONS=("already matches" "declaration")
+DECODE_SEED_LIMIT=""
 
 usage() {
   cat <<'EOF'
@@ -15,6 +16,7 @@ usage: bench2-native-prototype-audit.sh --target PROJECT:ROLE [--target PROJECT:
                                       [--build-dir DIR] [--bench2-root DIR]
                                       [--manifest FILE] [--out-dir DIR]
                                       [--llvm-bin DIR]
+                                      [--decode-seed-limit COUNT]
                                       [--allow-skip-reason REASON]
 
 Runs the native prototype recovery audit for selected Bench2 manifest targets.
@@ -46,6 +48,10 @@ while [[ $# -gt 0 ]]; do
     ;;
   --llvm-bin)
     LLVM_BIN="$2"
+    shift 2
+    ;;
+  --decode-seed-limit)
+    DECODE_SEED_LIMIT="$2"
     shift 2
     ;;
   --allow-skip-reason)
@@ -175,8 +181,13 @@ mkdir -p "$OUT_DIR"
 echo "out_dir=$OUT_DIR"
 
 METRICS="$OUT_DIR/metrics.tsv"
-printf 'target\tproject\trole\trootfs_path\tdiscover_seconds\tall_confirmed_seconds\tsignature_rewrite_seconds\tconfirmed_functions\tbasic_blocks\tinstructions\tunresolved_indirect_call\tunresolved_indirect_branch\tprototype_functions\tprototype_external_inputs\tprototype_input_candidates\tprototype_return_candidates\tsignature_rewrite_needed\tsignature_rewrite_seen\tsignature_rewrite_rewritten\tsignature_rewrite_skipped\n' \
+printf 'target\tproject\trole\trootfs_path\tdecode_seed_limit\tdiscover_seconds\tall_confirmed_seconds\tsignature_rewrite_seconds\tconfirmed_functions\tbasic_blocks\tinstructions\tunresolved_indirect_call\tunresolved_indirect_branch\tprototype_functions\tprototype_external_inputs\tprototype_input_candidates\tprototype_return_candidates\tsignature_rewrite_needed\tsignature_rewrite_seen\tsignature_rewrite_rewritten\tsignature_rewrite_skipped\n' \
   >"$METRICS"
+
+native_llvm_args=()
+if [[ -n "$DECODE_SEED_LIMIT" ]]; then
+  native_llvm_args+=(--decode-seed-limit "$DECODE_SEED_LIMIT")
+fi
 
 for target in "${TARGETS[@]}"; do
   row="$(manifest_row "$target")" || {
@@ -209,15 +220,16 @@ for target in "${TARGETS[@]}"; do
   discover_seconds="$(( $(date +%s) - started_at ))"
 
   started_at="$(date +%s)"
-  "$NATIVE_LLVM" "$binary" --all-confirmed --prototype-recovery-summary \
+  "$NATIVE_LLVM" "$binary" --all-confirmed "${native_llvm_args[@]}" \
+    --prototype-recovery-summary \
     -o "$ll" >"$native_stdout" 2>"$native_stderr"
   all_confirmed_seconds="$(( $(date +%s) - started_at ))"
   "$LLVM_AS" "$ll" -o "$bc" 2>"$llvm_as_stderr"
   "$OPT" -passes=verify "$bc" -o "$opt_bc" 2>"$opt_stderr"
 
   started_at="$(date +%s)"
-  "$NATIVE_LLVM" "$binary" --all-confirmed --prototype-recovery-summary \
-    --rewrite-prototype-signatures -o "$rewrite_ll" \
+  "$NATIVE_LLVM" "$binary" --all-confirmed "${native_llvm_args[@]}" \
+    --prototype-recovery-summary --rewrite-prototype-signatures -o "$rewrite_ll" \
     >"$rewrite_stdout" 2>"$rewrite_stderr"
   signature_rewrite_seconds="$(( $(date +%s) - started_at ))"
   "$LLVM_AS" "$rewrite_ll" -o "$rewrite_bc" 2>"$rewrite_llvm_as_stderr"
@@ -243,8 +255,9 @@ for target in "${TARGETS[@]}"; do
   require_metric "$target" "$signature_rewrite_needed" "signature rewrite needed functions" "$rewrite_stderr"
   require_metric "$target" "$signature_rewrite_rewritten" "signature rewrite rewritten functions" "$rewrite_stderr"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$target" "$project" "$role" "$rootfs_path" \
+    "${DECODE_SEED_LIMIT:-all}" \
     "$discover_seconds" "$all_confirmed_seconds" "$signature_rewrite_seconds" \
     "$confirmed_functions" "$basic_blocks" "$instructions" \
     "$unresolved_indirect_call" "$unresolved_indirect_branch" \

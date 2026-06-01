@@ -503,6 +503,9 @@
   - [x] 审计大 executable / runtime library 的 all-confirmed scale 边界，确认 vim / php / python / ffmpeg format 等目标仍主要受 lift 吞吐限制。
     - 记录：`06-pass-pipeline-and-verification/20260601-109-large-executable-scale-audit.md`
     - 文件：Bench2 executable / runtime library scale 输出
+  - [x] manifest prototype audit 支持 `--decode-seed-limit`，可对大目标分批跑完整 signature rewrite / LLVM 22 verify gate。
+    - 记录：`06-pass-pipeline-and-verification/20260601-110-seed-limited-prototype-audit.md`
+    - 文件：`scripts/bench2-native-prototype-audit.sh`
 
 ## 记录规则
 
