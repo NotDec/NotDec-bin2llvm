@@ -491,6 +491,9 @@
   - [x] 扩展 Bench2 样本到 `redis:benchmark` 和 `wrk:executable`，确认 signature rewrite 只剩合理 skip reason；记录 `redis:server-symlink` 的 all-confirmed 性能边界。
     - 记录：`06-pass-pipeline-and-verification/20260601-105-redis-benchmark-wrk-expanded-audit.md`
     - 文件：Bench2 redis-benchmark / wrk / redis-server-symlink 输出
+  - [x] 添加 all-confirmed scale audit 脚本，确认 `redis:server-symlink` 耗时主要来自 lift / IR 生成，和 seed 数基本线性。
+    - 记录：`06-pass-pipeline-and-verification/20260601-106-all-confirmed-scale-audit.md`
+    - 文件：`scripts/bench2-native-scale-audit.sh`
 
 ## 记录规则
 
