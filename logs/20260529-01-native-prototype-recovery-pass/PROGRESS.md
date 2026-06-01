@@ -443,6 +443,9 @@
   - [x] 调整后续推进规则：先识别 Bench2/Ghidra 对应的大块任务，再切小步实现；明确任务粒度和第 6 阶段停止标准。
     - 记录：`GOAL.md`
     - 文件：`GOAL.md`
+  - [x] 审计 Bench2 signature rewrite skip reason，确认非合理 blocker 已清零，并识别下一批大块任务。
+    - 记录：`06-pass-pipeline-and-verification/20260601-90-bench2-signature-rewrite-skip-audit.md`
+    - 文件：Bench2 smoke 输出、`GOAL.md`
 
 ## 记录规则
 
