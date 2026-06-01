@@ -455,6 +455,9 @@
   - [x] 审计 Bench2 multi-return callsite 使用情况，确认当前真实 `{ i64, i64 }` callsite 没有消费返回分量。
     - 记录：`06-pass-pipeline-and-verification/20260601-93-bench2-multi-return-callsite-usage-audit.md`
     - 文件：Bench2 signature rewrite 输出
+  - [x] 审计 Bench2 `declaration` skip 和外部 call effect 边界，确认 declaration 都是合理 skip，不是本地函数漏改。
+    - 记录：`06-pass-pipeline-and-verification/20260601-94-bench2-declaration-call-effect-audit.md`
+    - 文件：Bench2 signature rewrite 输出、`lib/passes/NativePrototypeRecovery.cpp`、`lib/passes/NativeRegisterSSA.cpp`
 
 ## 记录规则
 
