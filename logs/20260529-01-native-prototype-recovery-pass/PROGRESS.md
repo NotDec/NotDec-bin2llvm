@@ -515,6 +515,42 @@
   - [x] return binding 识别 declaration call output，把 ffmpeg codec seed200 的 `av_packet_alloc` 从 `unsafe return value load` 推进到签名重写成功；四个大目标 seed200 gate 只剩合理 skip reason。
     - 记录：`06-pass-pipeline-and-verification/20260601-113-return-binding-declaration-call-output.md`
     - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 对 PHP / Python / ICU common / ffmpeg codec 大目标运行 seed-limited 300 函数 prototype gate，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-114-large-seed300-prototype-audit.md`
+    - 文件：Bench2 large-target seed-limited prototype 输出
+  - [x] 对 Python shared / ICU i18n / ffmpeg filter 大目标补跑 seed-limited 300 函数 prototype gate，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-115-large-extra-seed300-prototype-audit.md`
+    - 文件：Bench2 large-target seed-limited prototype 输出
+  - [x] 对 vim / ffmpeg format / redis server / wolfssl 多类型目标运行 seed-limited 300 函数 prototype gate，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-116-diverse-seed300-prototype-audit.md`
+    - 文件：Bench2 diverse-target seed-limited prototype 输出
+  - [x] 对 Python debug interpreter / debug shared library 运行 seed-limited 300 函数 prototype gate，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-117-python-debug-seed300-prototype-audit.md`
+    - 文件：Bench2 python-debug seed-limited prototype 输出
+  - [x] 对 Python interpreter / ffmpeg codec / redis server / wolfssl 关键压力目标运行 seed-limited 500 函数 prototype gate，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-118-key-seed500-prototype-audit.md`
+    - 文件：Bench2 key-target seed-limited prototype 输出
+  - [x] 汇总 Bench2 manifest 32 个目标的 prototype gate 覆盖，确认每个目标至少有 full gate 或 seed-limited gate 证据，当前最新覆盖没有非合理 skip reason。
+    - 记录：`06-pass-pipeline-and-verification/20260601-119-manifest-prototype-coverage-audit.md`
+    - 文件：Bench2 manifest、阶段 95 / 100-118 审计记录
+  - [x] 抽查 seed500 大目标 rewritten 函数和 callsite 语义，确认样本中 recovered metadata、函数签名、参数顺序和返回值使用一致。
+    - 记录：`06-pass-pipeline-and-verification/20260601-120-seed-limited-rewritten-semantics-audit.md`
+    - 文件：Bench2 key-target seed500 signature rewrite 输出
+  - [x] 审计现有 Bench2 signature rewrite 输出里的多返回 callsite 消费覆盖，确认已有第 0 分量真实消费样本，但暂无第 1 分量消费样本。
+    - 记录：`06-pass-pipeline-and-verification/20260601-121-multireturn-second-component-coverage-audit.md`
+    - 文件：Bench2 prototype audit signature rewrite 输出
+  - [x] 对 Python interpreter / ffmpeg codec / redis server / wolfssl 关键压力目标运行 seed-limited 700 函数 prototype gate，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-122-key-seed700-prototype-audit.md`
+    - 文件：Bench2 key-target seed700 prototype 输出
+  - [x] 抽查 seed700 相比 seed500 新增 rewritten 函数，确认样本中 summary、函数签名和多返回 callsite 形状一致。
+    - 记录：`06-pass-pipeline-and-verification/20260601-123-seed700-new-rewritten-semantics-audit.md`
+    - 文件：Bench2 key-target seed500 / seed700 signature rewrite 输出
+  - [x] 审计 seed700 skipped 函数质量，确认 `already matches` 全部是空 recovered prototype，`declaration` 样本都是声明或 intrinsic。
+    - 记录：`06-pass-pipeline-and-verification/20260601-124-seed700-skip-quality-audit.md`
+    - 文件：Bench2 key-target seed700 signature rewrite 输出
+  - [x] 对 Python interpreter / ffmpeg codec 历史 blocker 来源目标运行 seed-limited 1000 函数 prototype gate，确认旧 return binding blocker 未复现，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-125-blocker-seed1000-prototype-audit.md`
+    - 文件：Bench2 blocker-source seed1000 prototype 输出
 
 ## 记录规则
 
