@@ -500,6 +500,9 @@
   - [x] 扩展 Bench2 样本到 `ffmpeg:executable` 和 `libicu:data-library`，确认 signature rewrite 只剩合理 skip reason；记录 ICU common / i18n 大库的 scale 边界。
     - 记录：`06-pass-pipeline-and-verification/20260601-108-ffmpeg-executable-icu-audit.md`
     - 文件：Bench2 ffmpeg executable / ICU 输出
+  - [x] 审计大 executable / runtime library 的 all-confirmed scale 边界，确认 vim / php / python / ffmpeg format 等目标仍主要受 lift 吞吐限制。
+    - 记录：`06-pass-pipeline-and-verification/20260601-109-large-executable-scale-audit.md`
+    - 文件：Bench2 executable / runtime library scale 输出
 
 ## 记录规则
 
