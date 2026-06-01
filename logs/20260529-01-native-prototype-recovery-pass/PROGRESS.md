@@ -440,6 +440,9 @@
   - [x] 多 input+multi-return callsite 覆盖 shared successor 中部分返回分量使用。
     - 记录：`06-pass-pipeline-and-verification/20260529-89-multi-input-multi-return-shared-successor-partial.md`
     - 文件：`tests/native_prototype_recovery_test.cpp`
+  - [x] 调整后续推进规则：先识别 Bench2/Ghidra 对应的大块任务，再切小步实现；明确任务粒度和第 6 阶段停止标准。
+    - 记录：`GOAL.md`
+    - 文件：`GOAL.md`
 
 ## 记录规则
 

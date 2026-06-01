@@ -77,6 +77,63 @@ Ghidra output prototype recovery
 5. 实现完成后，把改动文件、函数、验证命令、结果和风险回写到同一个规划文件。
 6. 同步更新本目录的 `PROGRESS.md`。
 
+如果当前工作只是 Bench2 数据集测试、skip reason 归类、真实函数抽查、收敛判断或目标文档调整，而不是复刻新的 Ghidra 模块/数据结构，可以不新建功能复刻 plan。但仍要把结论和进度记到 `PROGRESS.md` 或对应审计日志里。
+
+## 大块任务识别规则
+
+后续每轮不要直接从一个单独 CFG 变体开始。先看 Bench2 当前 skip reason 和真实函数样本，再按 Ghidra 数据结构和 Bench2 blocker 识别 2-5 个候选大块任务。
+
+大块任务是能推进主线能力的一类问题，通常满足至少一条：
+
+- 对应 Ghidra 一个明确数据结构或算法，例如 `FuncCallSpecs`、`ParamActive`、`ParamTrial`、`FuncProto`、call effect、return output map。
+- 能减少 Bench2 中一类真实 blocker，例如 `unsafe callsite input value`、`unsafe callsite return load`、`function has uses`。
+- 能替换当前分散 helper，让 pass 更接近稳定结构，例如统一 register current-value 查询、统一 callsite rewrite plan。
+- 能提高语义正确性，而不只是让 LLVM verifier 通过。
+- 能把一类 skip reason 拆细、统计清楚，帮助判断后续是否继续做。
+
+每轮 plan 或审计日志里应先写：
+
+- 候选大块任务；
+- Ghidra 对应源码文件和关键函数；
+- native 当前缺口；
+- 影响哪些 Bench2 skip reason 或真实样本；
+- 做完后怎么判断收敛；
+- 本轮为什么选这一块。
+
+只有大块任务确定后，才从里面切可验证的小步。小步服务于大块任务，不能自己变成主线。
+
+## 实现粒度和提交规则
+
+每次任务和 commit 不应默认以“一个极小 CFG 变体”为粒度。同一类语义问题应合并成一个小阶段处理，同类问题尽量多修几个再合并提交。
+
+推荐粒度：
+
+- 新增或修改一个明确能力，例如 callsite input 当前值查询、return load 查找、multi-return binding、call effect 判断。
+- 解决或拆清一类 skip reason。
+- 覆盖同一策略下 2-4 个代表性 CFG 形状，包含正例和负例。
+- 对 Bench2 一个真实 blocker 做定位、实现、验证，并记录剩余 blocker 分类。
+
+不推荐单独作为一次任务：
+
+- 一个 shared successor / multi-return / input 数量排列组合。
+- 一个已有逻辑理论上已经支持的测试变体。
+- 一个只增加断言但不改变能力、不减少真实 blocker 的测试。
+- 一个没有 Bench2 blocker、也没有明确语义风险的小 CFG 形状。
+
+如果确实要做很小的回归测试，必须说明它属于哪个大块任务，以及为什么不和同类测试合并。
+
+## 阶段停止标准
+
+当前 native prototype recovery 不以“覆盖所有可能 CFG 形状”为停止标准，而以 Bench2 和语义风险收敛为标准。
+
+第 6 阶段阶段性完成需要满足：
+
+1. Bench2 selected 目标稳定完成，生成 `.ll` / `.bc`，并通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+2. signature rewrite 的 skip reason 已分类，至少包括 `declaration`、`already matches`、`missing recovered prototype`、`unsafe callsite input value`、`unsafe callsite return load`、`function has uses`。
+3. 非合理 skip reason 有处理结论：能安全实现的按一类问题实现；暂不做的写明原因，例如 indirect call、栈参数、复杂 alias、已有函数指针 use。
+4. 对 vsftpd、libuv、memcached 的 rewritten 函数做真实样本抽查，确认参数顺序、返回值和 callsite 替换语义合理。
+5. 后续不再追逐零散 CFG 组合。只有 Bench2 暴露新 blocker，或已有能力存在明确回归风险时，才继续补小测试。
+
 ## 阶段划分
 
 ### 1. `01-cspec-abi-model`
