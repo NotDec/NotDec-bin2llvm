@@ -488,6 +488,9 @@
   - [x] return binding 按 access metadata 的 8 字节 storage 从宽 integer store 中切出 `i64` 返回值，清零 `redis:cli` 的 `return value type mismatch`。
     - 记录：`06-pass-pipeline-and-verification/20260601-104-return-binding-storage-slice.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 扩展 Bench2 样本到 `redis:benchmark` 和 `wrk:executable`，确认 signature rewrite 只剩合理 skip reason；记录 `redis:server-symlink` 的 all-confirmed 性能边界。
+    - 记录：`06-pass-pipeline-and-verification/20260601-105-redis-benchmark-wrk-expanded-audit.md`
+    - 文件：Bench2 redis-benchmark / wrk / redis-server-symlink 输出
 
 ## 记录规则
 
