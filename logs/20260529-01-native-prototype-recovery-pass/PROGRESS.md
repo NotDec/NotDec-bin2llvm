@@ -458,6 +458,9 @@
   - [x] 审计 Bench2 `declaration` skip 和外部 call effect 边界，确认 declaration 都是合理 skip，不是本地函数漏改。
     - 记录：`06-pass-pipeline-and-verification/20260601-94-bench2-declaration-call-effect-audit.md`
     - 文件：Bench2 signature rewrite 输出、`lib/passes/NativePrototypeRecovery.cpp`、`lib/passes/NativeRegisterSSA.cpp`
+  - [x] 对照 `GOAL.md` 第 6 阶段停止标准做收敛审计，确认 direct signature rewrite 在当前 Bench2 样本上没有明确 blocker。
+    - 记录：`06-pass-pipeline-and-verification/20260601-95-stage6-convergence-audit.md`
+    - 文件：Bench2 smoke 输出、`GOAL.md`
 
 ## 记录规则
 
