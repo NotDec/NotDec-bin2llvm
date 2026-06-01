@@ -125,6 +125,22 @@ void attachVectorReturnTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachInputRaxReturnTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+  abi.Inputs.push_back(inputRegister("RDI"));
+
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.Align = 8;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "RAX";
+  abi.Outputs.push_back(std::move(output));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 llvm::Function *createFunction(llvm::Module &module, const std::string &name) {
   llvm::LLVMContext &context = module.getContext();
   auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
@@ -1500,6 +1516,48 @@ llvm::Function *createInputForwardReturnFunction(
                      registerAccessMetadata(context, outputRegisterName));
   builder.CreateRetVoid();
   *inputLoad = load;
+  *returnStore = store;
+  return function;
+}
+
+llvm::Function *createInputRegisterCopyReturnFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *input,
+    const std::string &inputRegisterName, llvm::GlobalVariable *temporary,
+    const std::string &temporaryRegisterName, llvm::GlobalVariable *output,
+    const std::string &outputRegisterName, llvm::LoadInst **inputLoad,
+    llvm::LoadInst **temporaryLoad, llvm::StoreInst **returnStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *load =
+      createExternalInputLoad(builder, input, inputRegisterName);
+  llvm::BasicBlock *copyBlock =
+      llvm::BasicBlock::Create(context, "copy", function);
+  builder.CreateBr(copyBlock);
+  builder.SetInsertPoint(copyBlock);
+  llvm::StoreInst *temporaryStore = builder.CreateStore(load, temporary);
+  temporaryStore->setMetadata("notdec.register.access",
+                              registerAccessMetadata(context,
+                                                     temporaryRegisterName));
+  llvm::BasicBlock *returnBlock =
+      llvm::BasicBlock::Create(context, "return", function);
+  builder.CreateBr(returnBlock);
+  builder.SetInsertPoint(returnBlock);
+  llvm::LoadInst *copied =
+      builder.CreateLoad(temporary->getValueType(), temporary,
+                         temporaryRegisterName + ".copy");
+  copied->setMetadata("notdec.register.access",
+                      registerAccessMetadata(context, temporaryRegisterName));
+  llvm::StoreInst *store = builder.CreateStore(copied, output);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, outputRegisterName));
+  builder.CreateRetVoid();
+  *inputLoad = load;
+  *temporaryLoad = copied;
   *returnStore = store;
   return function;
 }
@@ -4283,6 +4341,66 @@ int main() {
                "rewritten input-forward-return kept old input load");
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after input-forward-return rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module inputRegisterCopyReturnModule(
+      "native-prototype-input-register-copy-return-test", context);
+  llvm::GlobalVariable *inputRegisterCopyRdi =
+      createRegisterGlobal(inputRegisterCopyReturnModule, "RDI");
+  llvm::GlobalVariable *inputRegisterCopyRdx =
+      createRegisterGlobal(inputRegisterCopyReturnModule, "RDX");
+  llvm::GlobalVariable *inputRegisterCopyRax =
+      createRegisterGlobal(inputRegisterCopyReturnModule, "RAX");
+  attachInputRaxReturnTestAbi(inputRegisterCopyReturnModule);
+  llvm::LoadInst *inputRegisterCopyReturnLoad = nullptr;
+  llvm::LoadInst *inputRegisterCopyTemporaryLoad = nullptr;
+  llvm::StoreInst *inputRegisterCopyReturnStore = nullptr;
+  llvm::Function *inputRegisterCopyReturnFunction =
+      createInputRegisterCopyReturnFunction(
+          inputRegisterCopyReturnModule, "input_rdi_copy_rdx_return_rax",
+          inputRegisterCopyRdi, "RDI", inputRegisterCopyRdx, "RDX",
+          inputRegisterCopyRax, "RAX", &inputRegisterCopyReturnLoad,
+          &inputRegisterCopyTemporaryLoad, &inputRegisterCopyReturnStore);
+  attachExternalInputs(*inputRegisterCopyReturnFunction,
+                       {{"RDI", inputRegisterCopyRdi}});
+  notdec::bin2llvm::runNativePrototypeRecovery(inputRegisterCopyReturnModule,
+                                               options);
+  ok &= expect(inputRegisterCopyReturnStore != nullptr,
+               "input-register-copy-return test did not create return store");
+  notdec::bin2llvm::NativePrototypeRewriteResult inputRegisterCopyRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputReturn(
+          *inputRegisterCopyReturnFunction);
+  ok &= expect(inputRegisterCopyRewriteResult.Rewritten,
+               "input-register-copy-return prototype was not rewritten");
+  inputRegisterCopyReturnFunction = inputRegisterCopyRewriteResult.Function;
+  llvm::ReturnInst *rewrittenInputRegisterCopyRet = nullptr;
+  bool sawInputRegisterCopyTemporaryLoad = false;
+  if (inputRegisterCopyReturnFunction != nullptr) {
+    for (llvm::BasicBlock &block : *inputRegisterCopyReturnFunction) {
+      if (auto *ret =
+              llvm::dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator())) {
+        rewrittenInputRegisterCopyRet = ret;
+      }
+      for (llvm::Instruction &instruction : block) {
+        if (&instruction == inputRegisterCopyTemporaryLoad) {
+          sawInputRegisterCopyTemporaryLoad = true;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenInputRegisterCopyRet != nullptr,
+               "rewritten input-register-copy-return function had no return");
+  ok &= expect(inputRegisterCopyReturnFunction != nullptr &&
+                   rewrittenInputRegisterCopyRet != nullptr &&
+                   !inputRegisterCopyReturnFunction->arg_empty() &&
+                   rewrittenInputRegisterCopyRet->getReturnValue() ==
+                       &*inputRegisterCopyReturnFunction->arg_begin(),
+               "rewritten input-register-copy-return did not return new argument");
+  ok &= expect(sawInputRegisterCopyTemporaryLoad,
+               "input-register-copy-return unexpectedly erased temporary load");
+  if (llvm::verifyModule(inputRegisterCopyReturnModule, &llvm::errs())) {
+    std::cerr << "module verification failed after input-register-copy-return rewrite\n";
     return EXIT_FAILURE;
   }
 

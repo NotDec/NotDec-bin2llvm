@@ -509,6 +509,9 @@
   - [x] 对 PHP / Python / ICU / ffmpeg 大目标运行 seed-limited 100 函数 prototype gate，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
     - 记录：`06-pass-pipeline-and-verification/20260601-111-large-seed100-prototype-audit.md`
     - 文件：Bench2 large-target seed-limited prototype 输出
+  - [x] return binding 解析函数内 register COPY，把 Python seed200 的 `PyStatus_Exit` 从 `unsafe return value load` 推进到签名重写成功。
+    - 记录：`06-pass-pipeline-and-verification/20260601-112-return-binding-register-copy.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
 
 ## 记录规则
 

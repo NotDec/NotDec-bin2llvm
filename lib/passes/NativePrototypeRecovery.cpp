@@ -262,6 +262,112 @@ std::optional<llvm::Value *> registerStoreValueInReverseRange(
   return std::nullopt;
 }
 
+struct RegisterValueLookup {
+  bool Unsafe = false;
+  llvm::Value *Value = nullptr;
+};
+
+// Resolves a register-global load back to the current register value when the
+// path is local to this function and no non-intrinsic call can clobber it.
+RegisterValueLookup registerValueInReverseRange(
+    llvm::BasicBlock::reverse_iterator iter,
+    llvm::BasicBlock::reverse_iterator end, llvm::StringRef registerName,
+    llvm::Type *valueType) {
+  for (; iter != end; ++iter) {
+    if (auto *call = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee == nullptr || !callee->isIntrinsic()) {
+        return RegisterValueLookup{true, nullptr};
+      }
+      continue;
+    }
+
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter);
+    if (store == nullptr) {
+      continue;
+    }
+    llvm::MDNode *storeMetadata =
+        store->getMetadata("notdec.register.access");
+    if (storeMetadata == nullptr ||
+        metadataField(*storeMetadata, "name") != registerName) {
+      continue;
+    }
+    llvm::Value *value = store->getValueOperand();
+    if (value == nullptr || value->getType() != valueType) {
+      return RegisterValueLookup{true, nullptr};
+    }
+    return RegisterValueLookup{false, value};
+  }
+  return RegisterValueLookup{};
+}
+
+RegisterValueLookup registerValueAtBlockEntry(
+    llvm::BasicBlock &block, llvm::StringRef registerName, llvm::Type *valueType,
+    std::set<llvm::BasicBlock *> &visited) {
+  if (!visited.insert(&block).second) {
+    return RegisterValueLookup{};
+  }
+
+  llvm::Value *result = nullptr;
+  for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
+    RegisterValueLookup local = registerValueInReverseRange(
+        predecessor->rbegin(), predecessor->rend(), registerName, valueType);
+    if (local.Unsafe) {
+      return local;
+    }
+
+    llvm::Value *value = local.Value;
+    if (value == nullptr) {
+      RegisterValueLookup incoming = registerValueAtBlockEntry(
+          *predecessor, registerName, valueType, visited);
+      if (incoming.Unsafe) {
+        return incoming;
+      }
+      value = incoming.Value;
+    }
+    if (value == nullptr) {
+      continue;
+    }
+    if (result == nullptr) {
+      result = value;
+      continue;
+    }
+    if (!sameReturnStoreValue(*result, *value)) {
+      return RegisterValueLookup{true, nullptr};
+    }
+  }
+  return RegisterValueLookup{false, result};
+}
+
+std::optional<llvm::Value *> registerStoreValueBeforeLoad(llvm::LoadInst &load) {
+  llvm::MDNode *metadata = load.getMetadata("notdec.register.access");
+  if (metadata == nullptr) {
+    return std::nullopt;
+  }
+  std::optional<std::string> registerName = metadataField(*metadata, "name");
+  if (!registerName) {
+    return std::nullopt;
+  }
+
+  RegisterValueLookup local = registerValueInReverseRange(
+      llvm::BasicBlock::reverse_iterator(load.getIterator()),
+      load.getParent()->rend(), *registerName, load.getType());
+  if (local.Unsafe) {
+    return std::nullopt;
+  }
+  if (local.Value != nullptr) {
+    return local.Value;
+  }
+
+  std::set<llvm::BasicBlock *> visited;
+  RegisterValueLookup incoming = registerValueAtBlockEntry(
+      *load.getParent(), *registerName, load.getType(), visited);
+  if (incoming.Unsafe || incoming.Value == nullptr) {
+    return std::nullopt;
+  }
+  return incoming.Value;
+}
+
 bool hasCallInReverseRange(llvm::BasicBlock::reverse_iterator iter,
                            llvm::BasicBlock::reverse_iterator end) {
   for (; iter != end; ++iter) {
@@ -1405,6 +1511,12 @@ std::optional<uint64_t> parseUint64Field(const llvm::MDNode &node,
 
 llvm::Value *returnValueForStore(llvm::StoreInst &store) {
   llvm::Value *value = store.getValueOperand();
+  if (auto *load = llvm::dyn_cast_or_null<llvm::LoadInst>(value)) {
+    if (std::optional<llvm::Value *> storedValue =
+            registerStoreValueBeforeLoad(*load)) {
+      value = *storedValue;
+    }
+  }
   if (value == nullptr || value->getType()->isIntegerTy(64)) {
     return value;
   }
