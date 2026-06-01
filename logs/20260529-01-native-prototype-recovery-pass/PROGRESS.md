@@ -497,6 +497,9 @@
   - [x] 扩展 Bench2 样本到 PHP extensions 和 ffmpeg util / swresample / swscale，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
     - 记录：`06-pass-pipeline-and-verification/20260601-107-php-ffmpeg-expanded-audit.md`
     - 文件：Bench2 php-extension / ffmpeg library 输出
+  - [x] 扩展 Bench2 样本到 `ffmpeg:executable` 和 `libicu:data-library`，确认 signature rewrite 只剩合理 skip reason；记录 ICU common / i18n 大库的 scale 边界。
+    - 记录：`06-pass-pipeline-and-verification/20260601-108-ffmpeg-executable-icu-audit.md`
+    - 文件：Bench2 ffmpeg executable / ICU 输出
 
 ## 记录规则
 
