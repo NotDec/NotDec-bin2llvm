@@ -15,11 +15,13 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <exception>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -42,6 +44,9 @@ std::optional<std::string> metadataField(const llvm::MDNode &node,
   return std::nullopt;
 }
 
+std::optional<uint64_t> parseUint64Field(const llvm::MDNode &node,
+                                         llvm::StringRef key);
+
 llvm::MDNode *inputCandidateMetadata(llvm::LLVMContext &context,
                                      const NativeParamActive &active) {
   if (active.Trials.empty()) {
@@ -50,10 +55,24 @@ llvm::MDNode *inputCandidateMetadata(llvm::LLVMContext &context,
 
   std::vector<llvm::Metadata *> entries;
   for (const NativeParamTrial &trial : active.Trials) {
-    std::vector<llvm::Metadata *> fields = {
-        llvm::MDString::get(context, "name=" + trial.RegisterName),
-        llvm::MDString::get(context, "slot=" + std::to_string(trial.Slot)),
-    };
+    std::vector<llvm::Metadata *> fields;
+    if (trial.StorageKind == "stack") {
+      fields = {
+          llvm::MDString::get(context, "storage=stack"),
+          llvm::MDString::get(context, "space=" + trial.StackSpace),
+          llvm::MDString::get(context,
+                              "offset=" + std::to_string(trial.StackOffset)),
+          llvm::MDString::get(context, "size=" + std::to_string(trial.Size)),
+          llvm::MDString::get(context, "slot=" + std::to_string(trial.Slot)),
+      };
+    } else {
+      fields = {
+          llvm::MDString::get(context, "storage=register"),
+          llvm::MDString::get(context, "name=" + trial.RegisterName),
+          llvm::MDString::get(context, "size=" + std::to_string(trial.Size)),
+          llvm::MDString::get(context, "slot=" + std::to_string(trial.Slot)),
+      };
+    }
     entries.push_back(llvm::MDNode::get(context, fields));
   }
   return llvm::MDNode::get(context, entries);
@@ -65,6 +84,10 @@ std::vector<NativeRecoveredPrototypeParam> recoveredParams(
   for (const NativeParamTrial &trial : active.Trials) {
     NativeRecoveredPrototypeParam param;
     param.RegisterName = trial.RegisterName;
+    param.StorageKind = trial.StorageKind;
+    param.StackSpace = trial.StackSpace;
+    param.StackOffset = trial.StackOffset;
+    param.Size = trial.Size;
     param.Slot = trial.Slot;
     params.push_back(std::move(param));
   }
@@ -76,10 +99,24 @@ llvm::MDNode *recoveredParamListMetadata(
     const std::vector<NativeRecoveredPrototypeParam> &params) {
   std::vector<llvm::Metadata *> entries;
   for (const NativeRecoveredPrototypeParam &param : params) {
-    std::vector<llvm::Metadata *> fields = {
-        llvm::MDString::get(context, "name=" + param.RegisterName),
-        llvm::MDString::get(context, "slot=" + std::to_string(param.Slot)),
-    };
+    std::vector<llvm::Metadata *> fields;
+    if (param.StorageKind == "stack") {
+      fields = {
+          llvm::MDString::get(context, "storage=stack"),
+          llvm::MDString::get(context, "space=" + param.StackSpace),
+          llvm::MDString::get(context,
+                              "offset=" + std::to_string(param.StackOffset)),
+          llvm::MDString::get(context, "size=" + std::to_string(param.Size)),
+          llvm::MDString::get(context, "slot=" + std::to_string(param.Slot)),
+      };
+    } else {
+      fields = {
+          llvm::MDString::get(context, "storage=register"),
+          llvm::MDString::get(context, "name=" + param.RegisterName),
+          llvm::MDString::get(context, "size=" + std::to_string(param.Size)),
+          llvm::MDString::get(context, "slot=" + std::to_string(param.Slot)),
+      };
+    }
     entries.push_back(llvm::MDNode::get(context, fields));
   }
   return llvm::MDNode::get(context, entries);
@@ -177,6 +214,91 @@ bool hasActiveExternalInputUse(llvm::Function &function,
     }
   }
   return !sawExternalInputLoad;
+}
+
+bool hasActiveUse(const llvm::Instruction &instruction) {
+  return !instruction.use_empty();
+}
+
+std::optional<llvm::AllocaInst *> functionStackAlloca(llvm::Function &function) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
+      if (alloca == nullptr || !alloca->hasName() ||
+          !alloca->getName().starts_with("notdec_stack")) {
+        continue;
+      }
+      return alloca;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<int64_t> constantByteOffsetFromBase(llvm::Value *pointer,
+                                                  llvm::Value *base,
+                                                  const llvm::DataLayout &layout) {
+  auto *gep = llvm::dyn_cast_or_null<llvm::GEPOperator>(pointer);
+  if (gep == nullptr || gep->getPointerOperand()->stripPointerCasts() != base) {
+    return std::nullopt;
+  }
+
+  llvm::APInt offset(64, 0, true);
+  if (!gep->accumulateConstantOffset(layout, offset)) {
+    return std::nullopt;
+  }
+  return offset.getSExtValue();
+}
+
+std::vector<NativeParamTrial> stackInputTrials(llvm::Function &function,
+                                               const NativePrototypeModel &model) {
+  std::vector<NativeParamTrial> trials;
+  std::optional<llvm::AllocaInst *> stackBase = functionStackAlloca(function);
+  const llvm::Module *module = function.getParent();
+  if (!stackBase || module == nullptr) {
+    return trials;
+  }
+
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (load == nullptr || !hasActiveUse(*load)) {
+        continue;
+      }
+      llvm::MDNode *metadata = load->getMetadata("notdec.stack.input");
+      if (metadata == nullptr) {
+        continue;
+      }
+      // Stack candidates come from HeritageToLLVM metadata, not from pointer
+      // arithmetic alone.  The GEP/base check keeps the metadata tied to the
+      // current function's stack object.
+      std::optional<std::string> space = metadataField(*metadata, "space");
+      std::optional<uint64_t> offset = parseUint64Field(*metadata, "offset");
+      std::optional<uint64_t> size = parseUint64Field(*metadata, "size");
+      if (!space || !offset || !size ||
+          *size > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+        continue;
+      }
+      if (!constantByteOffsetFromBase(load->getPointerOperand(), *stackBase,
+                                      module->getDataLayout())) {
+        continue;
+      }
+      std::optional<NativeStorageMatch> match =
+          model.findInputStack(*space, *offset, static_cast<uint32_t>(*size));
+      if (!match) {
+        continue;
+      }
+
+      NativeParamTrial trial;
+      trial.StorageKind = "stack";
+      trial.StackSpace = *space;
+      trial.StackOffset = *offset;
+      trial.Size = static_cast<uint32_t>(*size);
+      trial.Slot = match->Slot;
+      trial.Active = true;
+      trials.push_back(std::move(trial));
+    }
+  }
+  return trials;
 }
 
 std::optional<llvm::LoadInst *> uniqueExternalInputLoad(
@@ -1651,29 +1773,69 @@ std::optional<std::vector<NativeRecoveredPrototypeParam>>
 readRecoveredParamList(const llvm::MDNode &node) {
   std::vector<NativeRecoveredPrototypeParam> params;
   std::set<std::string> seenNames;
+  std::set<std::string> seenStorage;
   std::optional<uint64_t> previousSlot;
   for (const llvm::MDOperand &operand : node.operands()) {
     auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
     if (entry == nullptr) {
       return std::nullopt;
     }
-    if (entry->getNumOperands() != 2) {
-      return std::nullopt;
-    }
-    std::optional<std::string> name = metadataField(*entry, "name");
     std::optional<uint64_t> slot = parseUint64Field(*entry, "slot");
-    if (!name || name->empty() || !slot) {
+    if (!slot) {
       return std::nullopt;
     }
-    if (!seenNames.insert(*name).second) {
+    std::string storage = metadataField(*entry, "storage").value_or("register");
+    NativeRecoveredPrototypeParam param;
+    param.StorageKind = storage;
+    param.Slot = *slot;
+    if (storage == "register") {
+      if (entry->getNumOperands() != 2 && entry->getNumOperands() != 4) {
+        return std::nullopt;
+      }
+      std::optional<std::string> name = metadataField(*entry, "name");
+      if (!name || name->empty()) {
+        return std::nullopt;
+      }
+      if (entry->getNumOperands() == 4 &&
+          metadataField(*entry, "storage") != "register") {
+        return std::nullopt;
+      }
+      if (!seenNames.insert(*name).second) {
+        return std::nullopt;
+      }
+      param.RegisterName = *name;
+      if (std::optional<uint64_t> size = parseUint64Field(*entry, "size")) {
+        if (*size == 0 ||
+            *size > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+          return std::nullopt;
+        }
+        param.Size = static_cast<uint32_t>(*size);
+      }
+    } else if (storage == "stack") {
+      if (entry->getNumOperands() != 5) {
+        return std::nullopt;
+      }
+      std::optional<std::string> space = metadataField(*entry, "space");
+      std::optional<uint64_t> offset = parseUint64Field(*entry, "offset");
+      std::optional<uint64_t> size = parseUint64Field(*entry, "size");
+      if (!space || space->empty() || !offset || !size || *size == 0 ||
+          *size > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+        return std::nullopt;
+      }
+      std::string key = *space + ":" + std::to_string(*offset) + ":" +
+                        std::to_string(*size);
+      if (!seenStorage.insert(key).second) {
+        return std::nullopt;
+      }
+      param.StackSpace = *space;
+      param.StackOffset = *offset;
+      param.Size = static_cast<uint32_t>(*size);
+    } else {
       return std::nullopt;
     }
     if (previousSlot && *slot <= *previousSlot) {
       return std::nullopt;
     }
-    NativeRecoveredPrototypeParam param;
-    param.RegisterName = *name;
-    param.Slot = *slot;
     params.push_back(std::move(param));
     previousSlot = *slot;
   }
@@ -1742,10 +1904,14 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
 
         NativeParamTrial trial;
         trial.RegisterName = *name;
+        trial.Size = 8;
         trial.Slot = match->Slot;
         trial.Active = true;
         active.Trials.push_back(std::move(trial));
       }
+    }
+    for (NativeParamTrial &trial : stackInputTrials(function, model)) {
+      addUniqueTrialBySlot(active, inputSlots, std::move(trial));
     }
     sortTrialsBySlot(active);
 
@@ -1893,11 +2059,18 @@ std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
   llvm::Type *registerType = llvm::Type::getInt64Ty(context);
   paramTypes.reserve(prototype.Inputs.size());
   for (const NativeRecoveredPrototypeParam &param : prototype.Inputs) {
-    (void)param;
+    if (param.StorageKind != "register") {
+      return std::nullopt;
+    }
     paramTypes.push_back(registerType);
   }
 
   llvm::Type *returnType = llvm::Type::getVoidTy(context);
+  for (const NativeRecoveredPrototypeParam &param : prototype.Returns) {
+    if (param.StorageKind != "register") {
+      return std::nullopt;
+    }
+  }
   if (prototype.Returns.size() == 1) {
     returnType = registerType;
   } else if (prototype.Returns.size() > 1) {

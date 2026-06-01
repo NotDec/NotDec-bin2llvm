@@ -24,12 +24,18 @@ struct NativePrototypeRecoveryOptions {
   bool RewriteSignatures = false;
 };
 
-// Native copy of Ghidra ParamTrial for the first input-recovery step.  It only
-// models register inputs for now, but keeps ABI slot and active state so later
-// work can add no-use, joining, and return candidates without changing the
-// metadata shape.
+// Native copy of Ghidra ParamTrial for the first input-recovery step.  It keeps
+// ABI slot and active state so later work can add no-use, joining, and richer
+// storage rules without changing the metadata shape again.
 struct NativeParamTrial {
+  // StorageKind keeps stack trials separate from register trials while sharing
+  // the same ParamActive ordering path.  The first stack version records only
+  // the concrete ABI stack slot; rewrite still accepts register storage only.
   std::string RegisterName;
+  std::string StorageKind = "register";
+  std::string StackSpace;
+  uint64_t StackOffset = 0;
+  uint32_t Size = 8;
   uint64_t Slot = 0;
   // Optional simple value identity used by return recovery.  It is intentionally
   // small: unknown values are left unset so this first pass stays conservative.
@@ -53,7 +59,13 @@ struct NativeParamActive {
 // not rewrite LLVM function types yet; it records the ordered storage chosen
 // from input/output trials so the later signature rewrite has one stable source.
 struct NativeRecoveredPrototypeParam {
+  // This mirrors NativeParamTrial's storage identity in serialized recovered
+  // metadata.  Old metadata without StorageKind is still read as register.
   std::string RegisterName;
+  std::string StorageKind = "register";
+  std::string StackSpace;
+  uint64_t StackOffset = 0;
+  uint32_t Size = 8;
   uint64_t Slot = 0;
 };
 

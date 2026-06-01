@@ -558,6 +558,18 @@
     - 记录：`07-stack-parameter-recovery/README.md`
     - 文件：`07-stack-parameter-recovery/README.md`
 
+- [ ] 阶段 7: `07-stack-parameter-recovery`
+  - [x] 编写第一小步规划：参考 Ghidra `ParamEntry` / `ParamTrial` / `ParamActive`，恢复第一版 stack input candidates。
+    - 记录：`07-stack-parameter-recovery/20260601-01-stack-input-candidates.md`
+  - [x] `HeritageToLLVM` 为 address-tied stack input load 标注 `notdec.stack.input`，并把正 offset address-tied input 纳入 `notdec_stack`。
+    - 文件：`lib/HeritageToLLVM.cpp`
+  - [x] `NativePrototypeRecovery` 支持 stack input trial、stack recovered metadata 读写，并让现有 signature rewrite 对非 register storage 保守跳过。
+    - 文件：`include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`、`lib/passes/NativePrototypeRecovery.cpp`
+  - [x] 添加 stack input candidate / unused stack input / stack 不进入 rewrite 的单元测试。
+    - 文件：`tests/native_prototype_recovery_test.cpp`
+  - [x] 生产代码改动后跑固定 Bench2 回归 gate，确认 `vsftpd:executable`、`libuv:shared-library`、`memcached:executable` 的 all-confirmed / signature-rewrite 通过 LLVM 22 assemble/verify，skip reason 只剩 `already matches` / `declaration`。
+    - 输出：`/tmp/notdec-bin2llvm-stack-param-regression-gate`
+
 ## 记录规则
 
 1. 每做一小块，先在对应阶段目录创建规划 markdown。

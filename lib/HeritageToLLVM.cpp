@@ -498,7 +498,9 @@ private:
         continue;
       }
       int64_t offset = signedOffset(varnode.Offset);
-      if (offset >= 0) {
+      // Positive stack offsets are normally incoming stack arguments.  Keep the
+      // first version narrow: only address-tied input varnodes are modeled.
+      if (offset >= 0 && !(varnode.IsInput && varnode.IsAddressTied)) {
         continue;
       }
       int64_t end = offset + static_cast<int64_t>(varnode.Size);
@@ -1443,6 +1445,17 @@ private:
     auto *load =
         builder.CreateLoad(intType(varnode.Size), pointer, varnode.Id + ".mem");
     load->setAlignment(llvm::Align(1));
+    if (varnode.Space == "stack") {
+      // Prototype recovery uses this as the native ParamTrial storage identity.
+      std::vector<llvm::Metadata *> fields = {
+          llvm::MDString::get(Context, "space=stack"),
+          llvm::MDString::get(Context,
+                              "offset=" + std::to_string(varnode.Offset)),
+          llvm::MDString::get(Context,
+                              "size=" + std::to_string(varnode.Size)),
+      };
+      load->setMetadata("notdec.stack.input", llvm::MDNode::get(Context, fields));
+    }
     return load;
   }
 

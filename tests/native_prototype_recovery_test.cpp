@@ -16,6 +16,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,6 +56,18 @@ notdec::bin2llvm::NativeAbiParamEntry inputRegister(const std::string &name) {
   return entry;
 }
 
+notdec::bin2llvm::NativeAbiParamEntry inputStack(uint64_t offset,
+                                                uint32_t size) {
+  notdec::bin2llvm::NativeAbiParamEntry entry;
+  entry.MinSize = 1;
+  entry.MaxSize = size;
+  entry.Align = 8;
+  entry.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Stack;
+  entry.Storage.Space = "stack";
+  entry.Storage.Offset = offset;
+  return entry;
+}
+
 llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context,
                                      const std::string &name) {
   llvm::Metadata *fields[] = {
@@ -86,6 +99,8 @@ void attachTestAbi(llvm::Module &module) {
   abi.PrototypeName = "__stdcall";
   abi.Inputs.push_back(inputRegister("RDI"));
   abi.Inputs.push_back(inputRegister("RSI"));
+  abi.Inputs.push_back(inputStack(8, 8));
+  abi.Inputs.push_back(inputStack(16, 8));
 
   notdec::bin2llvm::NativeAbiParamEntry output;
   output.MinSize = 1;
@@ -1331,6 +1346,46 @@ llvm::Function *createUsedExternalInputFunction(
   return function;
 }
 
+llvm::MDNode *stackInputMetadata(llvm::LLVMContext &context, uint64_t offset,
+                                 uint32_t size) {
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "space=stack"),
+      llvm::MDString::get(context, "offset=" + std::to_string(offset)),
+      llvm::MDString::get(context, "size=" + std::to_string(size)),
+  };
+  return llvm::MDNode::get(context, fields);
+}
+
+llvm::Function *createStackInputFunction(llvm::Module &module,
+                                         const std::string &name,
+                                         uint64_t offset, bool used) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *byteType = llvm::Type::getInt8Ty(context);
+  auto *arrayType = llvm::ArrayType::get(byteType, 32);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(arrayType, nullptr, "notdec_stack");
+  llvm::Value *pointer = builder.CreateInBoundsGEP(
+      byteType, stack,
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), offset),
+      "stack_arg.stack");
+  llvm::LoadInst *load =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), pointer,
+                         "stack_arg.mem");
+  load->setMetadata("notdec.stack.input",
+                    stackInputMetadata(context, offset, 8));
+  if (used) {
+    builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 1));
+  }
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createTwoUsedExternalInputFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *first,
     const std::string &firstRegisterName, llvm::GlobalVariable *second,
@@ -2004,6 +2059,30 @@ bool metadataRegisterAt(const llvm::Function &function, llvm::StringRef kind,
   return false;
 }
 
+bool metadataStackAt(const llvm::Function &function, llvm::StringRef kind,
+                     uint64_t index, uint64_t offset) {
+  llvm::MDNode *node = function.getMetadata(kind);
+  if (node == nullptr || index >= node->getNumOperands()) {
+    return false;
+  }
+  auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(node->getOperand(index));
+  if (entry == nullptr) {
+    return false;
+  }
+
+  bool hasStorage = false;
+  bool hasOffset = false;
+  for (const llvm::MDOperand &fieldOperand : entry->operands()) {
+    auto *field = llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+    if (field == nullptr) {
+      continue;
+    }
+    hasStorage |= field->getString() == "storage=stack";
+    hasOffset |= field->getString() == "offset=" + std::to_string(offset);
+  }
+  return hasStorage && hasOffset;
+}
+
 uint64_t countMetadataRegister(const llvm::Function &function,
                                llvm::StringRef kind, llvm::StringRef name) {
   llvm::MDNode *node = function.getMetadata(kind);
@@ -2086,6 +2165,34 @@ bool recoveredRegisterAt(const llvm::Function &function, uint64_t listIndex,
     }
   }
   return false;
+}
+
+bool recoveredStackAt(const llvm::Function &function, uint64_t listIndex,
+                      uint64_t paramIndex, uint64_t offset) {
+  llvm::MDNode *node = function.getMetadata("notdec.prototype.recovered");
+  if (node == nullptr || listIndex >= node->getNumOperands()) {
+    return false;
+  }
+  auto *list = llvm::dyn_cast_or_null<llvm::MDNode>(node->getOperand(listIndex));
+  if (list == nullptr || paramIndex >= list->getNumOperands()) {
+    return false;
+  }
+  auto *param = llvm::dyn_cast_or_null<llvm::MDNode>(list->getOperand(paramIndex));
+  if (param == nullptr) {
+    return false;
+  }
+
+  bool hasStorage = false;
+  bool hasOffset = false;
+  for (const llvm::MDOperand &fieldOperand : param->operands()) {
+    auto *field = llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+    if (field == nullptr) {
+      continue;
+    }
+    hasStorage |= field->getString() == "storage=stack";
+    hasOffset |= field->getString() == "offset=" + std::to_string(offset);
+  }
+  return hasStorage && hasOffset;
 }
 
 llvm::MDNode *makeRecoveredPrototypeMetadataWithCounts(
@@ -2223,6 +2330,11 @@ int main() {
   llvm::Function *unusedInputFunction =
       createUnusedExternalInputFunction(module, "unused_rdi", rdi, "RDI");
   attachExternalInputs(*unusedInputFunction, {{"RDI", rdi}});
+
+  llvm::Function *stackInputFunction =
+      createStackInputFunction(module, "input_stack_8", 8, true);
+  llvm::Function *unusedStackInputFunction =
+      createStackInputFunction(module, "unused_stack_8", 8, false);
 
   llvm::Function *savedRegisterFunction = createFunction(module, "saved_rbx");
   attachExternalInputs(*savedRegisterFunction, {{"RBX", rbx}});
@@ -2414,14 +2526,14 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 46, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 48, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 23,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 20,
+  ok &= expect(summary.InputCandidates == 21,
                "unexpected input candidate count");
   ok &= expect(summary.ReturnCandidates == 32,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 46,
+  ok &= expect(summary.RewriteEligibleFunctions == 47,
                "unexpected rewrite eligible function count");
   ok &= expect(summary.SignatureRewriteNeededFunctions == 29,
                "unexpected signature rewrite needed function count");
@@ -2449,6 +2561,12 @@ int main() {
   ok &= expect(!metadataHasRegister(*unusedInputFunction,
                                     "notdec.prototype.input_candidates", "RDI"),
                "unused RDI was incorrectly marked as an input candidate");
+  ok &= expect(metadataStackAt(*stackInputFunction,
+                               "notdec.prototype.input_candidates", 0, 8),
+               "stack offset 8 was not marked as an input candidate");
+  ok &= expect(!metadataStackAt(*unusedStackInputFunction,
+                                "notdec.prototype.input_candidates", 0, 8),
+               "unused stack offset 8 was incorrectly marked as an input candidate");
   ok &= expect(!metadataHasRegister(*savedRegisterFunction,
                                     "notdec.prototype.input_candidates", "RBX"),
                "RBX was incorrectly marked as an input candidate");
@@ -2495,6 +2613,32 @@ int main() {
                "recovered prototype return count was not written");
   ok &= expect(recoveredRegisterAt(*inputFunction, 3, 0, "RDI"),
                "recovered prototype input register was not written");
+  ok &= expect(recoveredStackAt(*stackInputFunction, 3, 0, 8),
+               "recovered prototype stack input was not written");
+  std::optional<notdec::bin2llvm::NativeRecoveredPrototype> stackPrototype =
+      notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(*stackInputFunction);
+  ok &= expect(stackPrototype.has_value(),
+               "recovered stack input prototype was not readable");
+  if (stackPrototype) {
+    ok &= expect(stackPrototype->Inputs.size() == 1,
+                 "recovered stack input prototype input count was not read");
+    ok &= expect(stackPrototype->Inputs[0].StorageKind == "stack",
+                 "recovered stack input kind was not read");
+    ok &= expect(stackPrototype->Inputs[0].StackSpace == "stack",
+                 "recovered stack input space was not read");
+    ok &= expect(stackPrototype->Inputs[0].StackOffset == 8,
+                 "recovered stack input offset was not read");
+    ok &= expect(!notdec::bin2llvm::buildNativeRecoveredPrototypeFunctionType(
+                     context, *stackPrototype),
+                 "stack input prototype unexpectedly built a rewrite type");
+    notdec::bin2llvm::NativePrototypeRewriteEligibility stackEligibility =
+        notdec::bin2llvm::getNativePrototypeRewriteEligibility(
+            *stackInputFunction);
+    ok &= expect(!stackEligibility.Eligible,
+                 "stack input prototype was incorrectly rewrite eligible");
+    ok &= expect(stackEligibility.Reason == "unsupported recovered prototype type",
+                 "stack input prototype had unexpected rewrite reason");
+  }
   std::optional<notdec::bin2llvm::NativeRecoveredPrototype> inputPrototype =
       notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(*inputFunction);
   ok &= expect(inputPrototype.has_value(),
