@@ -464,6 +464,9 @@
   - [x] 对 Bench2 空 recovered prototype 做原因分类，确认 `already matches` 主要集中在 preserved/frame-only、stub、wrapper/thunk 等合理形状。
     - 记录：`06-pass-pipeline-and-verification/20260601-96-empty-prototype-reason-classification.md`
     - 文件：Bench2 signature rewrite 输出
+  - [x] 对照 `GOAL.md` 做全目标完成度审计，确认第 6 阶段阶段性完成，但长期 native prototype recovery 目标仍不能标完成。
+    - 记录：`06-pass-pipeline-and-verification/20260601-97-goal-completion-audit.md`
+    - 文件：`GOAL.md`、`PROGRESS.md`、Bench2 smoke 输出、当前源码和测试
 
 ## 记录规则
 
