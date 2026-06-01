@@ -494,6 +494,9 @@
   - [x] 添加 all-confirmed scale audit 脚本，确认 `redis:server-symlink` 耗时主要来自 lift / IR 生成，和 seed 数基本线性。
     - 记录：`06-pass-pipeline-and-verification/20260601-106-all-confirmed-scale-audit.md`
     - 文件：`scripts/bench2-native-scale-audit.sh`
+  - [x] 扩展 Bench2 样本到 PHP extensions 和 ffmpeg util / swresample / swscale，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-107-php-ffmpeg-expanded-audit.md`
+    - 文件：Bench2 php-extension / ffmpeg library 输出
 
 ## 记录规则
 
