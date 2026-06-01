@@ -467,6 +467,9 @@
   - [x] 对照 `GOAL.md` 做全目标完成度审计，确认第 6 阶段阶段性完成，但长期 native prototype recovery 目标仍不能标完成。
     - 记录：`06-pass-pipeline-and-verification/20260601-97-goal-completion-audit.md`
     - 文件：`GOAL.md`、`PROGRESS.md`、Bench2 smoke 输出、当前源码和测试
+  - [x] 扩展 Bench2 样本到 `lighttpd`，确认 IR 通过 LLVM 22 assemble/verify，并发现新的 `unsafe callsite input value` / `unsafe callsite return load` blocker。
+    - 记录：`06-pass-pipeline-and-verification/20260601-98-lighttpd-expanded-bench2-audit.md`
+    - 文件：Bench2 lighttpd 输出、`scripts/bench2-native-smoke.sh`
 
 ## 记录规则
 
