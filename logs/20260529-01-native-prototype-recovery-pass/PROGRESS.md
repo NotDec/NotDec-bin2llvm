@@ -452,6 +452,9 @@
   - [x] 审计 Bench2 `already matches` / 空 prototype 质量，确认剩余 `already matches` 都是零 input/return candidate，不是 signature rewrite 漏处理。
     - 记录：`06-pass-pipeline-and-verification/20260601-92-bench2-empty-prototype-quality-audit.md`
     - 文件：Bench2 signature rewrite 输出
+  - [x] 审计 Bench2 multi-return callsite 使用情况，确认当前真实 `{ i64, i64 }` callsite 没有消费返回分量。
+    - 记录：`06-pass-pipeline-and-verification/20260601-93-bench2-multi-return-callsite-usage-audit.md`
+    - 文件：Bench2 signature rewrite 输出
 
 ## 记录规则
 
