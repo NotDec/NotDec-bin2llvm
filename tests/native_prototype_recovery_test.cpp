@@ -4474,6 +4474,129 @@ int main() {
                  "after rewrite\n";
     return EXIT_FAILURE;
   }
+
+  llvm::Module partialSharedMultiInputMultiReturnModule(
+      "native-prototype-multi-input-multi-return-partial-shared-successor-test",
+      context);
+  llvm::GlobalVariable *partialSharedMultiInputMultiReturnRdi =
+      createRegisterGlobal(partialSharedMultiInputMultiReturnModule, "RDI");
+  llvm::GlobalVariable *partialSharedMultiInputMultiReturnRsi =
+      createRegisterGlobal(partialSharedMultiInputMultiReturnModule, "RSI");
+  llvm::GlobalVariable *partialSharedMultiInputMultiReturnRax =
+      createRegisterGlobal(partialSharedMultiInputMultiReturnModule, "RAX");
+  llvm::GlobalVariable *partialSharedMultiInputMultiReturnRdx =
+      createRegisterGlobal(partialSharedMultiInputMultiReturnModule, "RDX");
+  attachTestAbi(partialSharedMultiInputMultiReturnModule);
+  llvm::Function *partialSharedMultiInputMultiReturnFunction =
+      createTwoInputTwoOutputReturnStoreFunction(
+          partialSharedMultiInputMultiReturnModule,
+          "input_rdi_rsi_return_rdx_rax_partial_shared",
+          partialSharedMultiInputMultiReturnRdi, "RDI",
+          partialSharedMultiInputMultiReturnRsi, "RSI",
+          partialSharedMultiInputMultiReturnRdx, "RDX",
+          partialSharedMultiInputMultiReturnRax, "RAX");
+  attachExternalInputs(*partialSharedMultiInputMultiReturnFunction,
+                       {{"RDI", partialSharedMultiInputMultiReturnRdi},
+                        {"RSI", partialSharedMultiInputMultiReturnRsi}});
+  llvm::CallInst *partialSharedMultiInputMultiReturnOldCall = nullptr;
+  llvm::LoadInst *partialSharedMultiInputMultiReturnOldLoad = nullptr;
+  llvm::Value *partialSharedMultiInputMultiReturnFirstArgument = nullptr;
+  llvm::Value *partialSharedMultiInputMultiReturnSecondArgument = nullptr;
+  createTwoInputStoreSharedSuccessorReturnLoadCallerFunction(
+      partialSharedMultiInputMultiReturnModule,
+      "call_input_rdi_rsi_return_rdx_rax_partial_shared",
+      partialSharedMultiInputMultiReturnFunction,
+      partialSharedMultiInputMultiReturnRdi, "RDI",
+      partialSharedMultiInputMultiReturnRsi, "RSI",
+      partialSharedMultiInputMultiReturnRax, "RAX",
+      &partialSharedMultiInputMultiReturnOldCall,
+      &partialSharedMultiInputMultiReturnOldLoad,
+      &partialSharedMultiInputMultiReturnFirstArgument,
+      &partialSharedMultiInputMultiReturnSecondArgument);
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      partialSharedMultiInputMultiReturnModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      partialSharedMultiInputMultiReturnRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+              *partialSharedMultiInputMultiReturnFunction);
+  ok &= expect(partialSharedMultiInputMultiReturnRewriteResult.Rewritten,
+               "partial shared multi-input multi-return prototype was not rewritten");
+  partialSharedMultiInputMultiReturnFunction =
+      partialSharedMultiInputMultiReturnRewriteResult.Function;
+  llvm::Function *partialSharedMultiInputMultiReturnCaller =
+      partialSharedMultiInputMultiReturnModule.getFunction(
+          "call_input_rdi_rsi_return_rdx_rax_partial_shared");
+  llvm::CallInst *rewrittenPartialSharedMultiInputMultiReturnCall = nullptr;
+  uint64_t partialSharedMultiInputMultiReturnExtracts = 0;
+  uint64_t partialSharedMultiInputMultiReturnPhis = 0;
+  uint64_t partialSharedMultiInputMultiReturnPhiExtracts = 0;
+  bool sawOldPartialSharedMultiInputRaxLoad = false;
+  bool sawOldPartialSharedMultiInputRdxLoad = false;
+  if (partialSharedMultiInputMultiReturnCaller != nullptr) {
+    for (llvm::BasicBlock &block : *partialSharedMultiInputMultiReturnCaller) {
+      for (llvm::Instruction &instruction : block) {
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          if (call->getCalledFunction() ==
+              partialSharedMultiInputMultiReturnFunction) {
+            rewrittenPartialSharedMultiInputMultiReturnCall = call;
+          }
+        }
+        if (llvm::isa<llvm::ExtractValueInst>(&instruction)) {
+          ++partialSharedMultiInputMultiReturnExtracts;
+        }
+        if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction)) {
+          ++partialSharedMultiInputMultiReturnPhis;
+          for (llvm::Value *incoming : phi->incoming_values()) {
+            if (llvm::isa<llvm::ExtractValueInst>(incoming)) {
+              ++partialSharedMultiInputMultiReturnPhiExtracts;
+            }
+          }
+        }
+        if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+          if (load->getName() == "RAX.return_value") {
+            sawOldPartialSharedMultiInputRaxLoad = true;
+          }
+          if (load->getName() == "RDX.return_value") {
+            sawOldPartialSharedMultiInputRdxLoad = true;
+          }
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenPartialSharedMultiInputMultiReturnCall != nullptr,
+               "partial shared multi-input multi-return callsite was not rewritten");
+  ok &= expect(rewrittenPartialSharedMultiInputMultiReturnCall != nullptr &&
+                   rewrittenPartialSharedMultiInputMultiReturnCall->arg_size() ==
+                       2,
+               "partial shared multi-input multi-return callsite did not get two arguments");
+  ok &= expect(rewrittenPartialSharedMultiInputMultiReturnCall != nullptr &&
+                   partialSharedMultiInputMultiReturnFirstArgument ==
+                       rewrittenPartialSharedMultiInputMultiReturnCall
+                           ->getArgOperand(0) &&
+                   partialSharedMultiInputMultiReturnSecondArgument ==
+                       rewrittenPartialSharedMultiInputMultiReturnCall
+                           ->getArgOperand(1),
+               "partial shared multi-input multi-return arguments were not ABI ordered");
+  ok &= expect(rewrittenPartialSharedMultiInputMultiReturnCall != nullptr &&
+                   llvm::isa<llvm::StructType>(
+                       rewrittenPartialSharedMultiInputMultiReturnCall->getType()),
+               "partial shared multi-input multi-return call did not return struct");
+  ok &= expect(partialSharedMultiInputMultiReturnExtracts == 1,
+               "partial shared multi-input multi-return callsite extracted an unused field");
+  ok &= expect(partialSharedMultiInputMultiReturnPhis == 1 &&
+                   partialSharedMultiInputMultiReturnPhiExtracts == 1,
+               "partial shared multi-input multi-return load was not replaced with extractvalue PHI");
+  ok &= expect(!sawOldPartialSharedMultiInputRaxLoad,
+               "partial shared multi-input multi-return kept old RAX load");
+  ok &= expect(!sawOldPartialSharedMultiInputRdxLoad,
+               "partial shared multi-input multi-return unexpectedly loaded unused RDX");
+  if (llvm::verifyModule(partialSharedMultiInputMultiReturnModule,
+                         &llvm::errs())) {
+    std::cerr << "partial shared multi-input multi-return module verification "
+                 "failed after rewrite\n";
+    return EXIT_FAILURE;
+  }
+
   notdec::bin2llvm::NativePrototypeRewriteResult dispatchInputResult =
       notdec::bin2llvm::rewriteNativeRecoveredPrototype(*dispatchInputFunction);
   ok &= expect(dispatchInputResult.Rewritten,
