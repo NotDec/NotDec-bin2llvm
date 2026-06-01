@@ -476,6 +476,9 @@
   - [x] callsite return 在复杂后继 CFG 中查找 nested return load，并证明无 load 环/分支的返回值未使用，清零 lighttpd 的 `unsafe callsite return load`。
     - 记录：`06-pass-pipeline-and-verification/20260601-100-callsite-return-unused-cfg.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+  - [x] 扩展 Bench2 样本到 `lighttpd-angel` 和 `tmux`，确认 signature rewrite 只剩合理 skip reason，并通过 LLVM 22 assemble/verify。
+    - 记录：`06-pass-pipeline-and-verification/20260601-101-lighttpd-angel-tmux-expanded-audit.md`
+    - 文件：Bench2 lighttpd-angel / tmux 输出
 
 ## 记录规则
 
