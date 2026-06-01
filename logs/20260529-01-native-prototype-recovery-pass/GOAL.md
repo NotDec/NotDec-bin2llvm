@@ -14,7 +14,14 @@
 
 核心任务是逐步复刻 Ghidra prototype recovery 相关的数据结构和数据流判断，最终在 native 链路里形成一个可独立运行的参数和返回值恢复 Pass。
 
-第一阶段不直接改 LLVM 函数签名。先把 ABI、函数寄存器效果、参数候选、返回候选用 metadata 标清楚。metadata 稳定后，再考虑把函数签名和 callsite 重写接上。
+当前 register 参数、register 返回值、direct callsite signature rewrite 已经在现有 Bench2 真实样例上阶段性收敛。后续不再把扩大 audit 覆盖面当作主线，也不追求把所有大目标全量跑完才继续。
+
+当前阶段目标改为两件事：
+
+1. 继续用已经选定的真实样例做回归验证和少量抽查，防止已有 register 参数/返回值能力退化。
+2. 参考 Ghidra 对 stack 参数的处理，规划并实现 native 侧第一版栈上传参恢复。
+
+早期路线是先把 ABI、函数寄存器效果、参数候选、返回候选用 metadata 标清楚，再接函数签名和 callsite 重写。这个路线目前已经走到 signature rewrite 阶段，后续新增能力仍按同样方式推进：先 metadata 和候选判断稳定，再考虑 rewrite。
 
 ## 和当前 Register SSA 的关系
 
@@ -62,7 +69,7 @@ Ghidra output prototype recovery
 - `external_input` 不能直接等于参数。保存恢复用的 `RBX/RBP/R12-R15` 也可能是 external input，必须先用 preserved 分析过滤。
 - 当前 call barrier 太保守，后续要按 ABI 和 callee metadata 细分，否则会挡住 ABI preserved register 的传播。
 - 返回值不从 LLVM 函数返回类型推断，第一版从 return block 前的 ABI output register SSA 值推断。
-- 栈参数暂时不靠当前 SSA pass 解决。当前底座主要覆盖 register 参数和 register 返回值。
+- 栈参数是下一阶段重点。当前底座主要覆盖 register 参数和 register 返回值；后续需要参考 Ghidra 对 stack varnode / `ParamEntry` / `ParamTrial` 的处理，把栈上 input storage 纳入候选参数。
 
 如果实现过程中发现 `NativeRegisterSSA` 缺少 Ghidra heritage 已经提供的信息，比如 call effect、return 前寄存器值、入口 input 的精确来源、PHI 合流或部分寄存器处理，就优先参考 Ghidra heritage 的做法补齐 SSA 底座。后续 prototype recovery 的其他部分也按这个原则调整：先找 Ghidra 对应数据结构和关键函数，再在 native 侧做最小可验证复刻。
 
@@ -78,6 +85,20 @@ Ghidra output prototype recovery
 6. 同步更新本目录的 `PROGRESS.md`。
 
 如果当前工作只是 Bench2 数据集测试、skip reason 归类、真实函数抽查、收敛判断或目标文档调整，而不是复刻新的 Ghidra 模块/数据结构，可以不新建功能复刻 plan。但仍要把结论和进度记到 `PROGRESS.md` 或对应审计日志里。
+
+数据集 audit 不是主线实现任务。后续 audit 只做两类：
+
+- 改了生产代码后，跑固定真实样例回归。
+- 引入 1-2 批新真实样例确认没有新 blocker。
+
+如果连续 1-2 轮新增真实样例都只剩 `already matches` / `declaration`，并且 LLVM 22 assemble/verify 通过，就停止继续扩大 audit，转回实现任务或阶段总结。
+
+audit 的做法以自动 gate 为主：
+
+1. 跑真实样例生成 all-confirmed 和 signature-rewrite IR。
+2. 用 LLVM 22 `llvm-as` 和 `opt -passes=verify` 验证。
+3. 检查 signature rewrite summary，确认非合理 skip reason 没有出现。
+4. 只抽查少量代表函数的 IR 转换前后语义，例如参数顺序、返回值、callsite 参数和 `extractvalue`。不要求每轮手工看大量 IR。
 
 ## 大块任务识别规则
 
@@ -126,13 +147,22 @@ Ghidra output prototype recovery
 
 当前 native prototype recovery 不以“覆盖所有可能 CFG 形状”为停止标准，而以 Bench2 和语义风险收敛为标准。
 
-第 6 阶段阶段性完成需要满足：
+第 6 阶段 register 参数/返回值和 direct signature rewrite 可以视为阶段性完成，需要满足：
 
-1. Bench2 selected 目标稳定完成，生成 `.ll` / `.bc`，并通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+1. 已选真实目标稳定完成，生成 `.ll` / `.bc`，并通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
 2. signature rewrite 的 skip reason 已分类，至少包括 `declaration`、`already matches`、`missing recovered prototype`、`unsafe callsite input value`、`unsafe callsite return load`、`function has uses`。
 3. 非合理 skip reason 有处理结论：能安全实现的按一类问题实现；暂不做的写明原因，例如 indirect call、栈参数、复杂 alias、已有函数指针 use。
-4. 对 vsftpd、libuv、memcached 的 rewritten 函数做真实样本抽查，确认参数顺序、返回值和 callsite 替换语义合理。
-5. 后续不再追逐零散 CFG 组合。只有 Bench2 暴露新 blocker，或已有能力存在明确回归风险时，才继续补小测试。
+4. 对真实 rewritten 函数做少量抽查，确认参数顺序、返回值和 callsite 替换语义合理。
+5. 后续不再追逐零散 CFG 组合，也不无限扩大 audit。只有生产代码改动、Bench2 暴露新 blocker，或已有能力存在明确回归风险时，才继续补测试。
+
+当前已经跑过的真实样例可以作为本阶段主要覆盖范围。大目标 seed-limited 的结论足够支持阶段性收敛，不要求继续把每个大目标全量跑完。
+
+下一阶段停止标准改为围绕栈参数：
+
+1. 写清楚 Ghidra stack parameter recovery 相关源码文件和关键函数。
+2. 明确 native 侧第一版只支持哪些 x86-64 SysV stack 参数形状。
+3. 用 1-2 个 IR 小样例和少量真实样例验证 stack 参数候选 metadata。
+4. 没有真实 blocker 时，不扩大到复杂 alias、varargs、动态栈调整和完整类型恢复。
 
 ## 阶段划分
 
@@ -282,6 +312,30 @@ Ghidra output prototype recovery
 - 不能把寄存器 global load/store 优化成无法追踪的形态。
 - pass 前后 `NativeRegisterSSA` 的 external input / replaced load 数量不能出现异常下降。
 - 如果直接放在 `NativeRegisterSSA` 前风险偏大，就先放在 prototype recovery 的模式识别前，只对已经 SSA 化后的函数做 canonicalization。
+
+### 7. `07-stack-parameter-recovery`
+
+参考 Ghidra stack 参数恢复，给 native 侧加入第一版栈上传参候选。
+
+主要数据结构：
+
+- `NativeStackParamTrial`
+- `NativeStackParamStorage`
+- `NativeStackParamCandidate`
+
+拟放源码：
+
+- `include/notdec-bin2llvm/passes/NativePrototypeRecovery.h`
+- `lib/passes/NativePrototypeRecovery.cpp`
+- 如果逻辑变大，再拆到 `include/notdec-bin2llvm/passes/NativeStackParameters.h`
+- 如果逻辑变大，再拆到 `lib/passes/NativeStackParameters.cpp`
+
+目标：
+
+- 先研究 Ghidra `ParamEntry` / `ParamList` / `ParamTrial` 如何表示 stack storage。
+- 只支持当前测试能证明的 x86-64 SysV 简单形状。
+- 第一版先写 metadata，不急着做 signature rewrite。
+- 明确不做复杂 alias、varargs、动态栈调整、栈对象类型恢复。
 
 ## 测试和验证
 

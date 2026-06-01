@@ -551,6 +551,9 @@
   - [x] 对 Python interpreter / ffmpeg codec 历史 blocker 来源目标运行 seed-limited 1000 函数 prototype gate，确认旧 return binding blocker 未复现，并通过 LLVM 22 assemble/verify。
     - 记录：`06-pass-pipeline-and-verification/20260601-125-blocker-seed1000-prototype-audit.md`
     - 文件：Bench2 blocker-source seed1000 prototype 输出
+  - [x] 收紧当前阶段目标：register 参数/返回值和 direct signature rewrite 视为阶段性收敛，后续不再无限扩大 audit，下一阶段转向参考 Ghidra 支持栈参数。
+    - 记录：`GOAL.md`
+    - 文件：`GOAL.md`
 
 ## 记录规则
 
