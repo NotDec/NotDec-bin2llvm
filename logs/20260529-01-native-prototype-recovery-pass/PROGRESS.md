@@ -449,6 +449,9 @@
   - [x] 抽查 Bench2 rewritten 函数语义，确认样本中签名、metadata、callsite 参数和返回值一致。
     - 记录：`06-pass-pipeline-and-verification/20260601-91-bench2-rewritten-function-semantic-audit.md`
     - 文件：Bench2 signature rewrite 输出
+  - [x] 审计 Bench2 `already matches` / 空 prototype 质量，确认剩余 `already matches` 都是零 input/return candidate，不是 signature rewrite 漏处理。
+    - 记录：`06-pass-pipeline-and-verification/20260601-92-bench2-empty-prototype-quality-audit.md`
+    - 文件：Bench2 signature rewrite 输出
 
 ## 记录规则
 
