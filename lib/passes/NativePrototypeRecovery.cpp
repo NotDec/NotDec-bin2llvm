@@ -548,6 +548,7 @@ bool hasUnsafeReturnValueLoad(
   for (const NativePrototypeReturnBinding &binding : returnBindings) {
     auto *load = llvm::dyn_cast_or_null<llvm::LoadInst>(binding.ReturnValue);
     if (load != nullptr && load->getMetadata("notdec.register.access") != nullptr &&
+        load->getMetadata("notdec.register.external_input") == nullptr &&
         !isDeclarationCallOutputLoad(*load)) {
       return true;
     }
@@ -558,6 +559,7 @@ bool hasUnsafeReturnValueLoad(
                           : nullptr;
     if (truncLoad != nullptr &&
         truncLoad->getMetadata("notdec.register.access") != nullptr &&
+        truncLoad->getMetadata("notdec.register.external_input") == nullptr &&
         !isDeclarationCallOutputLoad(*truncLoad)) {
       return true;
     }

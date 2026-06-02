@@ -2645,6 +2645,8 @@ int main() {
                                        rdi, "RDI", rax, "RAX",
                                        &inputForwardReturnLoad,
                                        &inputForwardReturnStore);
+  inputForwardReturnLoad->setMetadata("notdec.register.access",
+                                      registerAccessMetadata(context, "RDI"));
   attachExternalInputs(*inputForwardReturnFunction, {{"RDI", rdi}});
   llvm::LoadInst *dispatchInputLoad = nullptr;
   llvm::Function *dispatchInputFunction = createUsedExternalInputFunction(

@@ -334,6 +334,22 @@ llvm::Function *createOverwrittenStoreFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createUnmarkedRegisterStoreLoadFunction(
+    llvm::Module &module, llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "unmarked_register_store_load", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateStore(llvm::ConstantInt::get(rax->getValueType(), 5), rax);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rax->getValueType(), rax, "unmarked_rax");
+  builder.CreateRet(load);
+  return function;
+}
+
 llvm::Function *createCallBetweenStoresFunction(llvm::Module &module,
                                                 llvm::GlobalVariable *rax) {
   llvm::LLVMContext &context = module.getContext();
@@ -623,6 +639,23 @@ unsigned countRegisterLoads(const llvm::Function &function,
   return count;
 }
 
+bool hasRegisterAccessLoad(const llvm::Function &function,
+                           const llvm::GlobalVariable *global) {
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+      if (load == nullptr ||
+          load->getPointerOperand()->stripPointerCasts() != global) {
+        continue;
+      }
+      if (load->getMetadata("notdec.register.access") != nullptr) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 unsigned countRegisterStores(const llvm::Function &function,
                              const llvm::GlobalVariable *global) {
   unsigned count = 0;
@@ -699,6 +732,8 @@ int main() {
   llvm::Function *staleMetadata = createStaleMetadataFunction(module, rbx);
   llvm::Function *unmarkedRegisterLoad =
       createUnmarkedRegisterLoadFunction(module, rdi);
+  llvm::Function *unmarkedRegisterStoreLoad =
+      createUnmarkedRegisterStoreLoadFunction(module, rax);
   llvm::Function *overwrittenStore =
       createOverwrittenStoreFunction(module, rax);
   llvm::Function *callBetweenStores =
@@ -783,6 +818,10 @@ int main() {
                "unmarked RDI global load was not marked as external input");
   ok &= expect(countRegisterLoads(*unmarkedRegisterLoad, rdi) == 1,
                "unmarked RDI global load was not rewritten to one entry load");
+  ok &= expect(!hasRegisterAccessLoad(*unmarkedRegisterLoad, rdi),
+               "external input RDI load unexpectedly got access metadata");
+  ok &= expect(countRegisterLoads(*unmarkedRegisterStoreLoad, rax) == 0,
+               "unmarked RAX store/load was not propagated");
   ok &= expect(countRegisterStores(*overwrittenStore, rax) == 1,
                "overwritten RAX store was not removed");
   ok &= expect(countRegisterStores(*callBetweenStores, rax) == 2,

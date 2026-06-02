@@ -165,6 +165,18 @@ std::map<llvm::GlobalVariable *, RegisterUnit> collectRegisterUnits(
   return units;
 }
 
+llvm::MDNode *fullRegisterAccessMetadata(llvm::LLVMContext &context,
+                                         const RegisterUnit &unit) {
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "base=" + unit.Name),
+      llvm::MDString::get(context, "space=register"),
+      llvm::MDString::get(context, "offset=" + std::to_string(unit.Offset)),
+      llvm::MDString::get(context, "size=" + std::to_string(unit.Size)),
+      llvm::MDString::get(context, "name=" + unit.Name),
+  };
+  return llvm::MDNode::get(context, fields);
+}
+
 AbiRegisterEffects collectAbiRegisterEffects(llvm::Module &module) {
   AbiRegisterEffects effects;
   llvm::NamedMDNode *abiMetadata = module.getNamedMetadata("notdec.abi");
@@ -234,6 +246,11 @@ AccessInfo registerLoad(llvm::LoadInst &load,
     return {};
   }
   RegisterUnit &unit = it->second;
+  if (accessMetadata == nullptr &&
+      load.getMetadata("notdec.register.external_input") == nullptr) {
+    accessMetadata = fullRegisterAccessMetadata(load.getContext(), unit);
+    load.setMetadata("notdec.register.access", accessMetadata);
+  }
   uint32_t offset = unit.Offset;
   uint32_t size = unit.Size;
   std::string name = unit.Name;
@@ -262,10 +279,15 @@ AccessInfo registerStore(
     return {};
   }
   llvm::MDNode *accessMetadata = store.getMetadata("notdec.register.access");
-  if (accessMetadata == nullptr) {
+  if (accessMetadata == nullptr &&
+      global->getMetadata("notdec.register") == nullptr) {
     return {};
   }
   RegisterUnit &unit = it->second;
+  if (accessMetadata == nullptr) {
+    accessMetadata = fullRegisterAccessMetadata(store.getContext(), unit);
+    store.setMetadata("notdec.register.access", accessMetadata);
+  }
   uint32_t offset = parseU32(mdField(accessMetadata, "offset"));
   uint32_t size = parseU32(mdField(accessMetadata, "size"));
   std::string name = unit.Name;

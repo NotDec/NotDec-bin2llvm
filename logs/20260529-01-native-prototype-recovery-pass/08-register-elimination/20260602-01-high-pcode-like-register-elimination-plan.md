@@ -2173,3 +2173,126 @@ load i64 from all register globals, no md    56      9
 
 - 更完整方案是让前面的 pass 不丢掉普通 register global load 的 access metadata。
 - 当前补法更窄，只服务已经有严格形状约束的 declaration call output rewrite。
+
+## 阶段 A/D 小步：补齐无 metadata 的 direct register global access
+
+背景：
+
+- 上一轮 declaration call output cleanup 后，固定三目标里仍有 9 个 `load i64, ptr @REG` 没有任何 `notdec.register.access` metadata。
+- 这些 load 实际仍是 register global 流量，但 residue audit 看不到，后续 SSA / cleanup 也只能靠零散 fallback 处理。
+- 这类访问不能简单忽略，否则“寄存器残留数量”会被低估。
+
+本轮规则：
+
+- `NativeRegisterSSA` 遇到 direct register global load/store，如果 instruction 没有 `notdec.register.access`，但 global 有 `notdec.register`，按 full-unit access 处理。
+- 普通 load/store 会补一个 full-unit `notdec.register.access` metadata。
+- synthetic external input load 不补 `notdec.register.access`，只保留 `notdec.register.external_input`，避免 residue audit 把 external input 双计成普通 access。
+- prototype rewrite 的 unsafe return load 检查忽略 external input load。输入直接转返回是合法绑定，不应因为 load 同时可能被识别为 register access 而跳过。
+
+实现中踩过的问题：
+
+- 初版给所有 load 都补 `notdec.register.access`，包括 `*.external_input`。
+- 这让 `vsftpd` 里 `notdec_native_151b0` / `notdec_native_151d0` 的 input-forward-return 从 rewritten 退成 `unsafe return value load`。
+- 最终修正为：external input load 不补 access metadata；并且 `hasUnsafeReturnValueLoad()` 显式忽略 external input。
+
+改动文件和函数：
+
+- `lib/passes/NativeRegisterSSA.cpp:168`
+  - 新增 `fullRegisterAccessMetadata()`，从 `RegisterUnit` 生成 full-unit access metadata。
+- `lib/passes/NativeRegisterSSA.cpp:232`
+  - `registerLoad()` 支持无 instruction access metadata 的 direct register global load；普通 load 补 metadata，external input load 不补。
+- `lib/passes/NativeRegisterSSA.cpp:269`
+  - `registerStore()` 支持无 instruction access metadata 的 direct register global store，并补 full-unit metadata。
+- `lib/passes/NativePrototypeRecovery.cpp:543`
+  - `hasUnsafeReturnValueLoad()` 忽略带 `notdec.register.external_input` 的 load / trunc(load)。
+- `tests/native_register_effects_test.cpp:337`
+  - 新增 `createUnmarkedRegisterStoreLoadFunction()`，覆盖无 metadata store/load 仍能进入 SSA。
+- `tests/native_register_effects_test.cpp:642`
+  - 新增 `hasRegisterAccessLoad()` 测试 helper。
+- `tests/native_register_effects_test.cpp:735`
+  - 接入无 metadata store/load 测试函数。
+- `tests/native_register_effects_test.cpp:821`
+  - 断言 external input load 不被补 access metadata，保持审计口径。
+- `tests/native_register_effects_test.cpp:823`
+  - 断言无 metadata RAX store/load 被 SSA 消除。
+- `tests/native_prototype_recovery_test.cpp:2648`
+  - 给 input-forward-return 的 external input load 加 access metadata，确认 prototype rewrite 不再误判 unsafe return value load。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test native_prototype_recovery_test -j2
+./build/bin/native_register_effects_test
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-full-register-access-md-clean-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-full-register-access-md-clean-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-full-register-access-md-clean-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-full-register-access-md-clean.tsv
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 42s | 41s |
+| `libuv:shared-library` | 107s | 106s |
+| `memcached:executable` | 57s | 57s |
+
+残留统计变化：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  before  after
+gpr       load         access           full     full         13      22
+gpr       load         external_input   full     full         3190    3190
+vector    load         access           full     full         0       1
+vector    load         external_input   full     full         70      70
+```
+
+这里 `gpr load access` 上升不是回退，而是之前 9 个无 metadata direct global load 现在被纳入审计。无 metadata register global load 已清零：
+
+```text
+pattern                                      before  after
+load i64 from register globals, no md        9       0
+```
+
+剩余可见的普通 GPR access load 主要是复杂 CFG / frame restore / callee-saved 场景：
+
+```text
+notdec_native_9c38 R14/R14
+notdec_native_9c38 RBP/RBP
+uv_timer_stop RSP/RSP, R8/R8, R9/R9, RCX/RCX
+notdec_native_126d0 RBX/EBX, RBP/RBP
+notdec_native_12b70 RBX/EBX
+notdec_native_12c00 RBX/RBX, RBP/RBP
+```
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 没直接减少 metadata access 数，但修正审计盲区，后续 cleanup 不再漏看 direct global access。 |
+| 理解成本 | 3 | `registerLoad/registerStore` 多了 metadata fallback，并要理解 external input 不双计。 |
+| 维护成本 | 3 | 后续如果有统一 storage access parser，应把这个 fallback 收进统一接口。 |
+
+有没有更好的方案：
+
+- 最好是在 P-Code lowering 阶段保证所有 register global access 都带准确 access metadata。
+- 本轮是在 SSA pass 入口补齐 full-unit fallback，范围只限 direct register global，避免猜复杂 pointer alias。
