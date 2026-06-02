@@ -603,3 +603,101 @@ ctest --test-dir build --output-on-failure
 
 - flags store 下降 `1447`，耗时没有明显退化。
 - 本轮清理后仍有 `2366` 个 flags store，其中很多来自原始函数中出现过 flags load 的函数，后续需要真正的 flags SSA 或 producer/consumer 局部化，不能靠“未读 store”规则继续硬删。
+
+## 阶段 A 局部清理补充：函数内未读 RIP store
+
+上一轮后 `other store access full` 主要是 `RIP`：
+
+```bash
+awk -F '\t' '$3=="other" && $4=="store" {c[$7]++} END {for (k in c) print c[k], k}' \
+  /tmp/notdec-bin2llvm-register-residue-unread-flags-gate/register-residue-details.tsv | sort -nr
+```
+
+结果是 `245 RIP`。继续看函数级读写：
+
+```bash
+awk -F '\t' '$7=="RIP" {if ($4=="load") l[$1 "\t" $2]=1; if ($4=="store") s[$1 "\t" $2]++} END {for (k in s) {total+=s[k]; funcs++; if (!(k in l)) {nol+=s[k]; nolf++}} print funcs, total, nolf, nol}' \
+  /tmp/notdec-bin2llvm-register-residue-unread-flags-gate/register-residue-details.tsv
+```
+
+结果是 `227` 个函数有 RIP store，总数 `245`；这些函数都没有 RIP load。RIP store 是 lifted instruction pointer 状态残留，不是当前 ABI 参数/返回值，也不参与现有 prototype recovery。这里做一个很窄的清理：函数原始 IR 没有 RIP load 时，删除该函数内 RIP store。有 RIP load 的函数不动。
+
+不做：
+
+- 不把规则泛化到普通 GPR。
+- 不删除 `FS_OFFSET` 这类 segment base load。
+- 不修改控制流或 branch target。
+
+改动文件和函数：
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:26`
+  - `NativeRegisterSSAFunctionSummary` 新增 `UnreadRipStoresRemoved`。
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:42`
+  - `NativeRegisterSSASummary` 新增 `UnreadRipStoresRemoved`。
+- `lib/passes/NativeRegisterSSA.cpp:57`
+  - 新增 `isInstructionPointerName()`，目前只识别 `RIP`。
+- `lib/passes/NativeRegisterSSA.cpp:265`
+  - `FunctionPromoter::run()` 在 `removeUnreadFlagStores()` 后调用 `removeUnreadRipStores()`。
+- `lib/passes/NativeRegisterSSA.cpp:432`
+  - 新增 `removeUnreadRipStores()`。
+  - 如果原始函数读过 RIP，直接返回。
+  - 否则删除函数内所有 RIP store，并更新 `UnreadRipStoresRemoved`。
+- `lib/passes/NativeRegisterSSA.cpp:843`
+  - `addFunctionSummary()` 聚合 `UnreadRipStoresRemoved`。
+- `lib/passes/NativeRegisterSSA.cpp:933`
+  - `printNativeRegisterSSASummary()` 打印 unread RIP store 删除数量。
+- `tests/native_register_effects_test.cpp:388`
+  - 新增 `createUnreadRipStoresFunction()`，覆盖没有 RIP load 时删除 store。
+- `tests/native_register_effects_test.cpp:405`
+  - 新增 `createReadRipStoresFunction()`，覆盖有 RIP load 时不能删。
+- `tests/native_register_effects_test.cpp:557`
+  - 新增 `UnreadRipStoresRemoved` 断言。
+- `tests/native_register_effects_test.cpp:594`
+  - 新增 unread/read RIP store 数量断言。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+ctest --test-dir build -R 'notdec.native_register_effects.preserved' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-unread-rip-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-unread-rip-gate/*.signature-rewrite.ll
+ctest --test-dir build --output-on-failure
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 107s | 108s |
+| `memcached:executable` | 58s | 57s |
+
+残留对比：
+
+| kind | 上一轮 | 本轮 |
+| --- | ---: | ---: |
+| `other store access full` | 245 | 0 |
+| `flags store access full` | 2366 | 2366 |
+| `gpr store access full` | 3601 | 3601 |
+| `gpr store access partial` | 14 | 14 |
+| `vector store access partial` | 71 | 71 |
+
+判断：
+
+- RIP store 清理移除了 `245` 个明显未读状态，耗时没有明显退化。
+- 下一步主要残留仍是 GPR full store/load、flags store，以及少量 partial/vector。

@@ -23,6 +23,7 @@ struct NativeRegisterSSAFunctionSummary {
   uint64_t LoadsReplaced = 0;
   uint64_t DeadStoresRemoved = 0;
   uint64_t UnreadFlagStoresRemoved = 0;
+  uint64_t UnreadRipStoresRemoved = 0;
   uint64_t PhisCreated = 0;
   uint64_t PhisSimplified = 0;
   uint64_t ExternalInputs = 0;
@@ -38,6 +39,7 @@ struct NativeRegisterSSASummary {
   uint64_t LoadsReplaced = 0;
   uint64_t DeadStoresRemoved = 0;
   uint64_t UnreadFlagStoresRemoved = 0;
+  uint64_t UnreadRipStoresRemoved = 0;
   uint64_t PhisCreated = 0;
   uint64_t PhisSimplified = 0;
   uint64_t ExternalInputs = 0;

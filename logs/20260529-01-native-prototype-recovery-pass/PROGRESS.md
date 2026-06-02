@@ -589,6 +589,9 @@
   - [x] 清理函数内原始 IR 没有 flags load 的 flags store，避免把明显未读的 flags 写入继续保留成 register global 残留。
     - 文件：`include/notdec-bin2llvm/passes/NativeRegisterSSA.h`、`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-register-residue-unread-flags-gate`
+  - [x] 清理函数内原始 IR 没有 RIP load 的 RIP store，去掉 lifted instruction pointer 状态残留。
+    - 文件：`include/notdec-bin2llvm/passes/NativeRegisterSSA.h`、`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-unread-rip-gate`
 
 ## 记录规则
 

@@ -385,6 +385,42 @@ llvm::Function *createReadFlagStoresFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createUnreadRipStoresFunction(llvm::Module &module,
+                                              llvm::GlobalVariable *rip) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "unread_rip_stores", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RIP", "RIP", 648, 8);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(rip->getValueType(), 0x400123), rip);
+  store->setMetadata("notdec.register.access", metadata);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createReadRipStoresFunction(llvm::Module &module,
+                                            llvm::GlobalVariable *rip) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "read_rip_stores", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RIP", "RIP", 648, 8);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(rip->getValueType(), 0x400456), rip);
+  store->setMetadata("notdec.register.access", metadata);
+  llvm::LoadInst *load = builder.CreateLoad(rip->getValueType(), rip);
+  load->setMetadata("notdec.register.access", metadata);
+  builder.CreateRet(load);
+  return function;
+}
+
 unsigned countRegisterLoads(const llvm::Function &function,
                             const llvm::GlobalVariable *global) {
   unsigned count = 0;
@@ -458,6 +494,7 @@ int main() {
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
   llvm::GlobalVariable *cf = createRegisterGlobal(module, "CF", 512, 1);
+  llvm::GlobalVariable *rip = createRegisterGlobal(module, "RIP", 648, 8);
   attachTestAbi(module);
   llvm::Function *preserved =
       createFunction(module, "preserved_rbx", rbx, true);
@@ -480,6 +517,8 @@ int main() {
   llvm::Function *partialOnly = createPartialStoresOnlyFunction(module, rax);
   llvm::Function *unreadFlags = createUnreadFlagStoresFunction(module, cf);
   llvm::Function *readFlags = createReadFlagStoresFunction(module, cf);
+  llvm::Function *unreadRip = createUnreadRipStoresFunction(module, rip);
+  llvm::Function *readRip = createReadRipStoresFunction(module, rip);
 
   notdec::bin2llvm::NativeRegisterSSAOptions options;
   options.EnableRewrite = true;
@@ -515,6 +554,8 @@ int main() {
                "register SSA did not remove the expected overwritten store");
   ok &= expect(summary.UnreadFlagStoresRemoved == 1,
                "register SSA did not remove unread flag stores");
+  ok &= expect(summary.UnreadRipStoresRemoved == 1,
+               "register SSA did not remove unread RIP stores");
   ok &= expect(countRegisterLoads(*callEffects, rbx) == 0,
                "RBX load after call was not propagated");
   ok &= expect(countRegisterLoads(*callEffects, rax) == 1,
@@ -549,5 +590,9 @@ int main() {
                "unread CF stores were not removed");
   ok &= expect(countRegisterStores(*readFlags, cf) == 1,
                "read CF store was removed");
+  ok &= expect(countRegisterStores(*unreadRip, rip) == 0,
+               "unread RIP store was not removed");
+  ok &= expect(countRegisterStores(*readRip, rip) == 1,
+               "read RIP store was removed");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

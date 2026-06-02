@@ -54,6 +54,10 @@ bool isFlagRegisterName(llvm::StringRef name) {
          name == "OF";
 }
 
+bool isInstructionPointerName(llvm::StringRef name) {
+  return name == "RIP";
+}
+
 std::optional<std::string> mdField(const llvm::MDNode *node,
                                    llvm::StringRef key) {
   if (node == nullptr) {
@@ -258,6 +262,7 @@ public:
       rewriteLoads();
       removeLocalDeadStores();
       removeUnreadFlagStores();
+      removeUnreadRipStores();
       attachRegisterEffectMetadata();
       eraseDeadPhis();
     } else {
@@ -421,6 +426,42 @@ private:
     }
     for (llvm::GlobalVariable *global : removedFlags) {
       StoredFullUnits.erase(global);
+    }
+  }
+
+  void removeUnreadRipStores() {
+    bool hasRipLoad = false;
+    for (llvm::GlobalVariable *global : LoadedUnits) {
+      auto it = Units.find(global);
+      if (it != Units.end() && isInstructionPointerName(it->second.Name)) {
+        hasRipLoad = true;
+        break;
+      }
+    }
+    if (hasRipLoad) {
+      return;
+    }
+
+    std::vector<llvm::StoreInst *> deadStores;
+    for (llvm::BasicBlock &block : Function) {
+      for (llvm::Instruction &inst : block) {
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+        if (store == nullptr) {
+          continue;
+        }
+        AccessInfo access = registerStore(*store, Units);
+        if (access.Unit != nullptr &&
+            isInstructionPointerName(access.Unit->Name)) {
+          deadStores.push_back(store);
+        }
+      }
+    }
+
+    for (llvm::StoreInst *store : deadStores) {
+      if (store->use_empty()) {
+        store->eraseFromParent();
+        ++Summary.UnreadRipStoresRemoved;
+      }
     }
   }
 
@@ -799,6 +840,7 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.LoadsReplaced += function.LoadsReplaced;
   total.DeadStoresRemoved += function.DeadStoresRemoved;
   total.UnreadFlagStoresRemoved += function.UnreadFlagStoresRemoved;
+  total.UnreadRipStoresRemoved += function.UnreadRipStoresRemoved;
   total.PhisCreated += function.PhisCreated;
   total.PhisSimplified += function.PhisSimplified;
   total.ExternalInputs += function.ExternalInputs;
@@ -887,6 +929,8 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
   os << "  loads replaced: " << summary.LoadsReplaced << '\n';
   os << "  dead stores removed: " << summary.DeadStoresRemoved << '\n';
   os << "  unread flag stores removed: " << summary.UnreadFlagStoresRemoved
+     << '\n';
+  os << "  unread RIP stores removed: " << summary.UnreadRipStoresRemoved
      << '\n';
   os << "  phis created: " << summary.PhisCreated << '\n';
   os << "  phis simplified: " << summary.PhisSimplified << '\n';
