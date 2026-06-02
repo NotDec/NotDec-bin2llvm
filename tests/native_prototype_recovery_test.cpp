@@ -4165,10 +4165,14 @@ int main() {
                "register global callsite load was not passed to callee");
   ok &= expect(missingInputCallsiteArgLoad != nullptr &&
                    metadataHasField(*missingInputCallsiteArgLoad,
-                                    "notdec.register.access", "base=RDI") &&
-                   metadataHasField(*missingInputCallsiteArgLoad,
-                                    "notdec.register.access", "name=RDI"),
-               "register global callsite load had incomplete access metadata");
+                                    "notdec.register.external_input",
+                                    "name=RDI") &&
+                   missingInputCallsiteArgLoad->getMetadata(
+                       "notdec.register.access") == nullptr &&
+                   metadataHasRegister(*missingInputCallsiteCaller,
+                                       "notdec.register.external_inputs",
+                                       "RDI"),
+               "entry callsite fallback load was not marked as caller external input");
   if (llvm::verifyModule(missingInputCallsiteModule, &llvm::errs())) {
     std::cerr << "missing input callsite module verification failed\n";
     return EXIT_FAILURE;

@@ -3604,3 +3604,118 @@ memcached  notdec_native_17ab0 EDI  caller_saved_gpr  ordinary     none
 - 多数剩余 GPR partial store 的 `function_effects=none`，当前 metadata 不足以证明它们是返回边界不可观察的 killed/clobbered store。
 - `memcached notdec_native_6740 BL` 虽然有 `clobbers,external_inputs`，但它位于普通路径且后面有 call/merge，不能用 return-path dead store 条件删。
 - 下一步如果要继续减少这些 partial store，应该进入阶段 B 的 storage range SSA，或者先补 call/effect metadata 的准确性；不应再扩大 post-rewrite cleanup。
+
+## 阶段 C 小步：入口 fallback callsite load 标成 caller external input
+
+背景：
+
+- direct callsite rewrite 找不到本地 store、PHI 或 caller entry value 时，会在 caller 侧生成 `RDI.callsite_input = load @RDI`。
+- 如果这条 fallback load 所在 callsite 沿唯一前驱链回到函数入口，且中间没有非 intrinsic call，那么它语义上就是 caller 的 entry register input。
+- 旧逻辑把这种 load 标成普通 `notdec.register.access`，会留在 register access residue 里；这不利于区分真实未消除寄存器流量和函数入口输入。
+
+本轮范围：
+
+- 只处理“回到 caller 入口、且中间无非 intrinsic call”的 fallback load。
+- 多前驱冲突、call 后 fallback、找不到唯一 register global 等情况仍保持旧逻辑。
+- 不把它替换成函数参数；只把 metadata 从普通 access 改成 external input，并同步 caller 的 `notdec.register.external_inputs`。
+
+实现：
+
+- `lib/passes/NativePrototypeRecovery.cpp:884`
+  - 新增 `registerExternalInputMetadata()`，为 caller fallback load 生成 `notdec.register.external_input` metadata。
+- `lib/passes/NativePrototypeRecovery.cpp:894`
+  - 新增 `functionExternalInputsHasRegister()`，避免重复写同一个 external input entry。
+- `lib/passes/NativePrototypeRecovery.cpp:916`
+  - 新增 `ensureFunctionExternalInputMetadata()`，把 fallback input 同步到 caller 函数 metadata。
+- `lib/passes/NativePrototypeRecovery.cpp:959`
+  - `registerGlobalValueBeforeCall()` 增加 `isCallerEntryValue` 参数；入口 fallback 时挂 `external_input`，其它 fallback 仍挂普通 access。
+- `lib/passes/NativePrototypeRecovery.cpp:1043`
+  - `callsiteInputValueBeforeCall()` 在唯一链回到入口且无 intervening call 时，使用 entry fallback 模式。
+- `tests/native_prototype_recovery_test.cpp:4166`
+  - missing callsite input fallback 用例改为断言生成 load 带 `notdec.register.external_input name=RDI`，不再带 `notdec.register.access`，且 caller metadata 包含 `RDI`。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-entry-fallback-input-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-entry-fallback-input-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-entry-fallback-input-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-entry-fallback-input.tsv
+git diff --check
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 107s | 107s |
+| `memcached:executable` | 57s | 57s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         21
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3191
+gpr       store        access           full     full         no         3332
+gpr       store        access           partial  full         no         4
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         no         1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-gpr-return-cleanup-gate` 相比：
+
+- `gpr load access full/full`：22 -> 21。
+- `gpr load external_input full/full`：3190 -> 3191。
+
+抽查：
+
+```text
+notdec_native_8480  %RDI.callsite_input = load i64, ptr @RDI, !notdec.register.external_input
+```
+
+该函数的 `notdec.register.external_inputs` 也同步包含 `RDI`。
+
+判断：
+
+- 这一步没有消除输入值本身，但把“caller entry register input”从普通 access residue 中移出，减少了一个误导性的 access load。
+- 后续如果要进一步消除这类 entry input，需要阶段 C 的统一 current-value 查询和函数签名 rewrite，而不是把 fallback load 当死代码删除。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | access load 少 1，主要是分类和语义标注更准确。 |
+| 理解成本 | 3 | 新增 metadata helper，逻辑仍局限在 callsite input fallback。 |
+| 维护成本 | 3 | 后续统一 current-value 查询落地后，应把这个入口 fallback 判断收进去。 |
+
+有没有更好的方案：
+
+- 更完整方案是让 caller 也参与 signature rewrite，把 entry fallback input 变成 caller 参数。
+- 本轮只改 metadata，是因为当前 caller 未必已经被 rewrite；直接升成参数会扩大调用链改动范围。

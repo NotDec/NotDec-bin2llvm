@@ -881,6 +881,59 @@ std::optional<llvm::GlobalVariable *> registerGlobalForName(
   return result;
 }
 
+llvm::MDNode *registerExternalInputMetadata(llvm::GlobalVariable &global,
+                                            llvm::StringRef registerName) {
+  llvm::LLVMContext &context = global.getContext();
+  llvm::Metadata *metadata[] = {
+      llvm::MDString::get(context, ("name=" + registerName).str()),
+      llvm::ValueAsMetadata::get(&global),
+  };
+  return llvm::MDNode::get(context, metadata);
+}
+
+bool functionExternalInputsHasRegister(const llvm::Function &function,
+                                       llvm::StringRef registerName) {
+  llvm::MDNode *node = function.getMetadata("notdec.register.external_inputs");
+  if (node == nullptr) {
+    return false;
+  }
+  std::string expected = ("name=" + registerName).str();
+  for (const llvm::MDOperand &operand : node->operands()) {
+    auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (entry == nullptr) {
+      continue;
+    }
+    for (const llvm::MDOperand &fieldOperand : entry->operands()) {
+      auto *field = llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+      if (field != nullptr && field->getString() == expected) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void ensureFunctionExternalInputMetadata(llvm::Function &function,
+                                         llvm::StringRef registerName,
+                                         llvm::GlobalVariable &global) {
+  if (functionExternalInputsHasRegister(function, registerName)) {
+    return;
+  }
+
+  std::vector<llvm::Metadata *> entries;
+  if (llvm::MDNode *old =
+          function.getMetadata("notdec.register.external_inputs")) {
+    for (const llvm::MDOperand &operand : old->operands()) {
+      if (operand.get() != nullptr) {
+        entries.push_back(operand.get());
+      }
+    }
+  }
+  entries.push_back(registerExternalInputMetadata(global, registerName));
+  function.setMetadata("notdec.register.external_inputs",
+                       llvm::MDNode::get(function.getContext(), entries));
+}
+
 llvm::MDNode *registerGlobalAccessMetadata(llvm::GlobalVariable &global) {
   llvm::MDNode *metadata = global.getMetadata("notdec.register");
   if (metadata == nullptr) {
@@ -904,7 +957,8 @@ llvm::MDNode *registerGlobalAccessMetadata(llvm::GlobalVariable &global) {
 }
 
 std::optional<llvm::Value *> registerGlobalValueBeforeCall(
-    llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *paramType) {
+    llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *paramType,
+    bool isCallerEntryValue = false) {
   std::optional<llvm::GlobalVariable *> global =
       registerGlobalForName(*call.getModule(), registerName, paramType);
   if (!global) {
@@ -917,7 +971,12 @@ std::optional<llvm::Value *> registerGlobalValueBeforeCall(
   llvm::IRBuilder<> builder(&call);
   llvm::LoadInst *load =
       builder.CreateLoad(paramType, *global, (registerName + ".callsite_input").str());
-  if (llvm::MDNode *metadata = registerGlobalAccessMetadata(**global)) {
+  if (isCallerEntryValue) {
+    load->setMetadata("notdec.register.external_input",
+                      registerExternalInputMetadata(**global, registerName));
+    ensureFunctionExternalInputMetadata(*call.getFunction(), registerName,
+                                        **global);
+  } else if (llvm::MDNode *metadata = registerGlobalAccessMetadata(**global)) {
     load->setMetadata("notdec.register.access", metadata);
   }
   return load;
@@ -988,6 +1047,8 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
                                               paramType)) {
           return entryValue;
         }
+        return registerGlobalValueBeforeCall(call, registerName, paramType,
+                                             true);
       }
       return registerGlobalValueBeforeCall(call, registerName, paramType);
     }
