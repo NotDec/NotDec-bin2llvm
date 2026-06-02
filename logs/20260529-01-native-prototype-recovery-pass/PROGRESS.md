@@ -570,6 +570,14 @@
   - [x] 生产代码改动后跑固定 Bench2 回归 gate，确认 `vsftpd:executable`、`libuv:shared-library`、`memcached:executable` 的 all-confirmed / signature-rewrite 通过 LLVM 22 assemble/verify，skip reason 只剩 `already matches` / `declaration`。
     - 输出：`/tmp/notdec-bin2llvm-stack-param-regression-gate`
 
+- [ ] 阶段 8: `08-register-elimination`
+  - [x] 编写 HighPCode-like register elimination 总体规划，明确 Ghidra heritage / subflow / prototype recovery 对应实现和 native 缺口。
+    - 记录：`08-register-elimination/20260602-01-high-pcode-like-register-elimination-plan.md`
+  - [x] 实现阶段 A 残留寄存器审计脚本，统计 `.ll` 中 `notdec.register.access` / `notdec.register.external_input` 的 full/partial、load/store 和寄存器类别。
+    - 文件：`scripts/native-register-residue-audit.py`
+  - [x] 添加审计脚本单测并注册到 CTest。
+    - 文件：`tests/native_register_residue_audit_test.py`、`CMakeLists.txt`
+
 ## 记录规则
 
 1. 每做一小块，先在对应阶段目录创建规划 markdown。

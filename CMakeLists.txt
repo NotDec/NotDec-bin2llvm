@@ -13,6 +13,13 @@ if (BUILD_TESTING)
       python3
       "${PROJECT_SOURCE_DIR}/tests/bench2_native_discovery_debug_check_test.py"
   )
+
+  add_test(
+    NAME notdec.native_register_residue_audit.unit
+    COMMAND
+      python3
+      "${PROJECT_SOURCE_DIR}/tests/native_register_residue_audit_test.py"
+  )
 endif ()
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")

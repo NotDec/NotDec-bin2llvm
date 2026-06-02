@@ -265,3 +265,59 @@ vector/lane：
 - 如果 flags 占主要残留，先做同 block flags SSA。
 
 这个顺序能避免按直觉大改 SSA，也符合当前 Bench2 真实项目优先的目标。
+
+# 实现记录
+
+## 阶段 A：残留寄存器审计脚本
+
+本轮先实现审计工具，不改 lowering、SSA 或 prototype rewrite 语义。
+
+改动文件和函数：
+
+- `scripts/native-register-residue-audit.py:1`
+  - 新增 `.ll` 文本审计脚本。
+  - `parse_metadata()` 读取 LLVM metadata 节点里的 `key=value` 字段。
+  - `parse_globals()` 读取带 `!notdec.register` 的 register global，得到 backing unit 的 name、space、offset、size。
+  - `parse_accesses()` 只统计 `!notdec.register.access` 和 `!notdec.register.external_input`，不把 register global 声明误算成访问。
+  - `summarize()` 按 `category/access_kind/metadata_kind/shape` 汇总，其中 `shape` 区分 full 和 partial。
+  - `write_details()` 输出逐条访问，方便定位残留位置和函数。
+- `tests/native_register_residue_audit_test.py:1`
+  - 新增 Python 单测，构造一个最小 `.ll`，覆盖 full external input、full store、partial load、flags store。
+- `CMakeLists.txt:13`
+  - 把新增 Python 单测注册成 `notdec.native_register_residue_audit.unit`。
+
+验证：
+
+```bash
+python3 tests/native_register_residue_audit_test.py
+python3 scripts/native-register-residue-audit.py tests/ir/native-prototype/cli-signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details tests/ir/native-prototype/cli-signature-rewrite.ll | head -20
+cmake -S . -B build
+ctest --test-dir build -R 'native_register_residue|bench2_native_discovery' --output-on-failure
+```
+
+结果：
+
+- Python 单测通过。
+- `tests/ir/native-prototype/cli-signature-rewrite.ll` 汇总结果：
+
+```text
+category	access_kind	metadata_kind	shape	count
+gpr	load	external_input	full	7
+gpr	store	access	full	9
+```
+
+- 重新配置 CMake 后，目标 CTest 2/2 通过：
+  - `notdec.bench2_native_discovery_debug_oracle_unit`
+  - `notdec.native_register_residue_audit.unit`
+
+性能判断：
+
+- 这是文本审计脚本，不在 native 生成和 pass pipeline 中运行，不影响当前 IR 生成性能。
+- 后续在 Bench2 gate 里调用时，只线性扫描 `.ll` 文本，成本应远小于 lifting 和 LLVM verify。
+
+限制：
+
+- 当前只解析文本 `.ll`，不直接读 `.bc`。
+- full/partial 判断依赖 register global 的 `!notdec.register` metadata 和 access metadata 的 `base/offset/size` 字段。
+- 目前只做统计，不给出“该先修哪一类”的自动决策；下一步应在固定 Bench2 rewrite 输出上跑这个脚本，再按真实残留选择阶段 B 或阶段 D。
