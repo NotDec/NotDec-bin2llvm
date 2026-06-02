@@ -953,7 +953,7 @@ private:
       return resolveValue(cached->second);
     }
     if (ResolvingEntry.count(key) != 0) {
-      return nullptr;
+      return ensurePhi(block, unit);
     }
     ResolvingEntry.insert(key);
 
@@ -967,12 +967,12 @@ private:
     }
 
     std::vector<llvm::BasicBlock *> preds(predIt, predEnd);
-    if (preds.size() == 1) {
-      llvm::Value *value = readBlockExit(*preds.front(), unit);
-      value = resolveValue(value);
-      EntryValue.emplace(key, value);
-      ResolvingEntry.erase(key);
-      return value;
+    for (llvm::BasicBlock *pred : preds) {
+      if (blockHasClobberingCall(*pred, unit) &&
+          localValueBefore(*pred, unit, pred->getTerminator()) == nullptr) {
+        ResolvingEntry.erase(key);
+        return nullptr;
+      }
     }
 
     std::vector<std::pair<llvm::BasicBlock *, llvm::Value *>> incomingValues;
@@ -986,7 +986,17 @@ private:
       incomingValues.push_back({pred, incoming});
     }
 
-    llvm::PHINode *phi = ensurePhi(block, unit);
+    auto pendingPhi = PendingPhi.find(key);
+    if (preds.size() == 1 && pendingPhi == PendingPhi.end()) {
+      llvm::Value *value = incomingValues.front().second;
+      EntryValue.emplace(key, value);
+      ResolvingEntry.erase(key);
+      return value;
+    }
+
+    llvm::PHINode *phi =
+        pendingPhi != PendingPhi.end() ? pendingPhi->second
+                                       : ensurePhi(block, unit);
     EntryValue.emplace(key, phi);
     for (const auto &[pred, incoming] : incomingValues) {
       phi->addIncoming(incoming, pred);

@@ -3814,3 +3814,108 @@ vector    load         external_input   full     full         no         1
 
 - 更完整方案是做寄存器级 def-use/liveness，而不是在路径扫描里补条件。
 - 当前 residue 还没到需要引入完整 liveness 的程度；本次先保留简单路径判断，避免扩大实现面。
+
+## 2026-06-02 实现记录：循环入口寄存器值补 PHI
+
+背景：
+
+- 最新 residue 里还有少量 `gpr load access full/full`，其中 `uv_timer_stop` 里有多处循环/回边附近的普通寄存器 load。
+- `NativeRegisterSSA::readBlockEntry` 在递归解析同一 block/register 时直接返回 `nullptr`，导致循环携带的寄存器值无法建 PHI，后续只能保留 global load。
+- 这一步对应阶段 B/C 的跨 block PHI 和 current-value 查询改进。仍然不处理 RSP/RBP、callee-saved return-path 的保留语义。
+
+改动：
+
+- [NativeRegisterSSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSSA.cpp:949)
+  - `readBlockEntry` 遇到同一个 block/register 正在解析时，返回 `ensurePhi(block, unit)`，允许循环回边引用待填 PHI。
+  - 多 predecessor 入口先检查 predecessor 是否有 clobbering call 且没有后续本地定义；这种 incoming 仍然按 unknown 处理，不建 PHI。
+  - 收集全部 incoming 后，如果不是循环场景且只有一个 predecessor，仍直接复用 incoming value，不额外建 PHI。
+- [native_register_effects_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_effects_test.cpp:484)
+  - 新增 `createLoopCarriedRegisterValueFunction`，构造 entry 写 RAX、loop 读 RAX、loop 回写 RAX 的循环场景。
+- [native_register_effects_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_effects_test.cpp:880)
+  - 验证循环携带的 RAX load 被 PHI 替换，函数内不再残留 RAX access load。
+
+实现中的调整：
+
+- 第一版提前创建 PHI，`libuv` 生成阶段暴露了空 PHI：
+
+```text
+PHINode should have one entry for each predecessor of its parent basic block!
+  %R14.regssa32 = phi i64
+module verification failed after register SSA pass
+```
+
+- 最终实现改成先筛掉确定 unknown 的 predecessor，再收集 incoming，只有递归真的需要 pending PHI 或多 predecessor 成功时才使用 PHI。这样避免失败路径留下半成品 PHI。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-loop-phi-gate2 \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-loop-phi-gate2/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 106s | 107s |
+| `memcached:executable` | 57s | 58s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         14
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3194
+gpr       store        access           full     full         no         3311
+gpr       store        access           partial  full         no         4
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         no         1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-overwrite-dead-store-gate` 相比：
+
+- `gpr load access full/full`：21 -> 14，少 7 个。
+- `gpr load external_input full/full`：3191 -> 3194，多 3 个。这是循环入口值被显式建成 entry input/PHI 后的结果。
+- `gpr store access full/full` 保持 3311。
+
+判断：
+
+- 这一步修的是 SSA current-value 的真实缺口，不是单纯 cleanup。
+- 它能消除一部分循环/跨块 full GPR load residue，同时保持 call clobber unknown 的保守边界。
+- 对固定 gate 没有明显性能退化，`libuv` signature rewrite 从 106s 变 107s，仍在同量级。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 5 | 删除 7 个真实 full GPR load residue，并补齐循环 PHI 能力。 |
+| 理解成本 | 4 | `readBlockEntry` 的递归解析比原来复杂，主要风险是 pending PHI 的生命周期。 |
+| 维护成本 | 4 | 后续统一 current-value 查询时，这里应保留为核心逻辑或抽到统一模块。 |
+
+有没有更好的方案：
+
+- 更完整方案是把 `readBlockEntry/readBlockExit/localValueBefore` 抽成独立 current-value resolver，并给 pending PHI 建明确状态机。
+- 本轮先在现有 on-demand SSA 里补循环 PHI，是因为真实 Bench2 residue 已经直接暴露这个缺口，改动范围较小。

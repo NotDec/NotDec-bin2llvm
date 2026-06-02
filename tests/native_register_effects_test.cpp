@@ -481,6 +481,39 @@ llvm::Function *createPartialLoadFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createLoopCarriedRegisterValueFunction(
+    llvm::Module &module, llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "loop_carried_register_value", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *loop = llvm::BasicBlock::Create(context, "loop", function);
+  llvm::BasicBlock *exit = llvm::BasicBlock::Create(context, "exit", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RAX");
+
+  llvm::StoreInst *initial = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 1), rax);
+  initial->setMetadata("notdec.register.access", metadata);
+  builder.CreateBr(loop);
+
+  builder.SetInsertPoint(loop);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rax->getValueType(), rax, "loop_rax");
+  load->setMetadata("notdec.register.access", metadata);
+  llvm::Value *next =
+      builder.CreateAdd(load, llvm::ConstantInt::get(rax->getValueType(), 1));
+  llvm::StoreInst *store = builder.CreateStore(next, rax);
+  store->setMetadata("notdec.register.access", metadata);
+  builder.CreateCondBr(llvm::ConstantInt::getFalse(context), loop, exit);
+
+  builder.SetInsertPoint(exit);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createUnreadFlagStoresFunction(llvm::Module &module,
                                                llvm::GlobalVariable *cf) {
   llvm::LLVMContext &context = module.getContext();
@@ -746,6 +779,8 @@ int main() {
   llvm::Function *partialMetadataStorage =
       createPartialMetadataStorageValueFunction(module, rax);
   llvm::Function *partialLoad = createPartialLoadFunction(module, rax);
+  llvm::Function *loopCarriedRegisterValue =
+      createLoopCarriedRegisterValueFunction(module, rax);
   llvm::Function *unreadFlags = createUnreadFlagStoresFunction(module, cf);
   llvm::Function *readFlags = createReadFlagStoresFunction(module, cf);
   llvm::Function *readOneFlag =
@@ -842,6 +877,8 @@ int main() {
                "partial metadata backing RAX load was not propagated");
   ok &= expect(countRegisterLoads(*partialLoad, rax) == 0,
                "partial RAX load was not replaced with an SSA extract");
+  ok &= expect(countRegisterLoads(*loopCarriedRegisterValue, rax) == 0,
+               "loop-carried RAX load was not replaced with a PHI");
   ok &= expect(countRegisterStores(*unreadFlags, cf) == 0,
                "unread CF stores were not removed");
   ok &= expect(countRegisterStores(*readFlags, cf) == 0,
