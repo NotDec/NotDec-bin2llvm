@@ -127,6 +127,21 @@ void attachTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachPreservedInputTestAbi(llvm::Module &module,
+                                 const std::string &registerName) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+  abi.Inputs.push_back(inputRegister(registerName));
+
+  notdec::bin2llvm::NativeAbiEffect unaffected;
+  unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
+  unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  unaffected.Storage.Name = registerName;
+  abi.Effects.push_back(std::move(unaffected));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 void attachVectorReturnTestAbi(llvm::Module &module) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__stdcall";
@@ -2933,9 +2948,101 @@ int main() {
                    llvm::isa<llvm::ConstantInt>(
                        rewrittenCallsiteCall->getArgOperand(0)),
                "direct callsite argument did not use register store value");
+  ok &= expect(callsiteCaller != nullptr &&
+                   !hasRegisterStore(*callsiteCaller, "RDI"),
+               "clobbered direct callsite input kept old register store");
   if (llvm::verifyModule(callsiteModule, &llvm::errs())) {
     std::cerr
         << "callsite module verification failed after input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module preservedCallsiteModule(
+      "native-prototype-preserved-input-callsite-rewrite-test", context);
+  llvm::GlobalVariable *preservedCallsiteRbx =
+      createRegisterGlobal(preservedCallsiteModule, "RBX");
+  attachPreservedInputTestAbi(preservedCallsiteModule, "RBX");
+  llvm::LoadInst *preservedCallsiteInputLoad = nullptr;
+  llvm::Function *preservedCallsiteInputFunction =
+      createUsedExternalInputFunction(preservedCallsiteModule,
+                                      "callsite_input_rbx",
+                                      preservedCallsiteRbx, "RBX",
+                                      &preservedCallsiteInputLoad);
+  attachExternalInputs(*preservedCallsiteInputFunction,
+                       {{"RBX", preservedCallsiteRbx}});
+  llvm::CallInst *oldPreservedCallsiteCall = nullptr;
+  createInputStoreCallerFunction(preservedCallsiteModule,
+                                 "call_callsite_input_rbx",
+                                 preservedCallsiteInputFunction,
+                                 preservedCallsiteRbx, "RBX",
+                                 &oldPreservedCallsiteCall);
+  notdec::bin2llvm::runNativePrototypeRecovery(preservedCallsiteModule,
+                                               options);
+  preservedCallsiteInputFunction->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {{"RBX", 0}}, {}));
+  notdec::bin2llvm::NativePrototypeRewriteResult preservedCallsiteRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+          *preservedCallsiteInputFunction);
+  ok &= expect(preservedCallsiteRewriteResult.Rewritten,
+               "preserved input prototype with direct callsite was not rewritten");
+  preservedCallsiteInputFunction = preservedCallsiteRewriteResult.Function;
+  llvm::Function *preservedCallsiteCaller =
+      preservedCallsiteModule.getFunction("call_callsite_input_rbx");
+  ok &= expect(preservedCallsiteCaller != nullptr &&
+                   hasRegisterStore(*preservedCallsiteCaller, "RBX"),
+               "preserved direct callsite input lost caller-visible register store");
+  if (llvm::verifyModule(preservedCallsiteModule, &llvm::errs())) {
+    std::cerr << "preserved callsite module verification failed after "
+                 "input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module returnCandidateCallsiteModule(
+      "native-prototype-return-candidate-input-callsite-rewrite-test", context);
+  llvm::GlobalVariable *returnCandidateCallsiteRdi =
+      createRegisterGlobal(returnCandidateCallsiteModule, "RDI");
+  attachTestAbi(returnCandidateCallsiteModule);
+  llvm::LoadInst *returnCandidateCallsiteInputLoad = nullptr;
+  llvm::Function *returnCandidateCallsiteInputFunction =
+      createUsedExternalInputFunction(returnCandidateCallsiteModule,
+                                      "callsite_input_rdi_with_return_candidate",
+                                      returnCandidateCallsiteRdi, "RDI",
+                                      &returnCandidateCallsiteInputLoad);
+  attachExternalInputs(*returnCandidateCallsiteInputFunction,
+                       {{"RDI", returnCandidateCallsiteRdi}});
+  llvm::CallInst *oldReturnCandidateCallsiteCall = nullptr;
+  createInputStoreCallerFunction(returnCandidateCallsiteModule,
+                                 "call_callsite_input_rdi_with_return_candidate",
+                                 returnCandidateCallsiteInputFunction,
+                                 returnCandidateCallsiteRdi, "RDI",
+                                 &oldReturnCandidateCallsiteCall);
+  notdec::bin2llvm::runNativePrototypeRecovery(returnCandidateCallsiteModule,
+                                               options);
+  llvm::Function *returnCandidateCaller =
+      returnCandidateCallsiteModule.getFunction(
+          "call_callsite_input_rdi_with_return_candidate");
+  if (returnCandidateCaller != nullptr) {
+    llvm::MDNode *returnCandidatePrototype =
+        makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {{"RAX", 0}});
+    returnCandidateCaller->setMetadata(
+        "notdec.prototype.return_candidates",
+        llvm::dyn_cast<llvm::MDNode>(returnCandidatePrototype->getOperand(4)));
+  }
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      returnCandidateCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+              *returnCandidateCallsiteInputFunction);
+  ok &= expect(returnCandidateCallsiteRewriteResult.Rewritten,
+               "return-candidate caller input prototype was not rewritten");
+  returnCandidateCaller = returnCandidateCallsiteModule.getFunction(
+      "call_callsite_input_rdi_with_return_candidate");
+  ok &= expect(returnCandidateCaller != nullptr &&
+                   hasRegisterStore(*returnCandidateCaller, "RDI"),
+               "return-candidate caller lost callsite input store");
+  if (llvm::verifyModule(returnCandidateCallsiteModule, &llvm::errs())) {
+    std::cerr << "return-candidate callsite module verification failed after "
+                 "input-only rewrite\n";
     return EXIT_FAILURE;
   }
 

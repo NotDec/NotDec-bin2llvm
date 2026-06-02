@@ -1931,3 +1931,142 @@ vector    store        access         partial  full         71
 
 - 更完整方案是把外部函数原型恢复接到 ABI 和符号信息上，直接生成正确 declaration 类型。
 - 本轮只根据现有 ABI output register 和局部 IR 形状做保守替换，不猜参数和非 `i64` 返回。
+
+## 阶段 D 小步：删除安全的 callsite 输入寄存器 store
+
+背景：
+
+- signature rewrite 已经能把 `call void @callee()` 改成 `call void @callee(i64 arg)`。
+- 但 caller 里很多调用前 ABI input store 仍保留，例如 `store i64 1, ptr @RDI` 后马上 `call @callee(i64 1)`。
+- 这类 store 已经不再用于给 callee 传参；如果调用会 clobber 该寄存器，且 caller 自己没有返回候选依赖，就可以删除。
+
+本轮只做窄规则：
+
+- 只处理同一个 basic block 内，call 前最近的同名 register store。
+- 中间遇到同 register load、非 intrinsic call，认为不安全。
+- 只有 store value 正好是 rewrite 后 call argument 时才删除。
+- 只有 callee effect 表示该输入寄存器会被 clobber 时才删除；ABI unaffected / preserved 的寄存器不删。
+- caller 函数如果还有 `notdec.prototype.return_candidates`，不删。原因是 prototype rewrite batch 仍会用这些 store 推导 caller 自己的返回绑定。
+
+实现中踩过的问题：
+
+- 初版只按 callee clobber 判断，固定三目标里 `memcached` 的 `notdec_native_19910` 从 rewritten 退成 `missing return binding`。
+- 原因是 caller 自己还有 return candidate；删除一个调用前 store 后影响了后续返回绑定搜索。
+- 最终把规则收窄为 caller 没有 return candidates 才删，固定 gate 恢复通过。
+
+改动文件和函数：
+
+- `lib/passes/NativePrototypeRecovery.cpp:549`
+  - 增加 `callClobbersRegister()` 前置声明，供 callsite rewrite 收集阶段使用。
+- `lib/passes/NativePrototypeRecovery.cpp:576`
+  - 新增 `localCallsiteInputStoreBeforeCall()`，只查同 block、call 前、无同 register load / 普通 call 屏障的输入 store。
+- `lib/passes/NativePrototypeRecovery.cpp:962`
+  - `MultiInputCallsiteRewrite` 增加 `InputStores`，和 ABI 参数顺序对齐保存可删除 store。
+- `lib/passes/NativePrototypeRecovery.cpp:975`
+  - `collectMultiInputDirectCallsiteRewrites()` 在确定 argument 后记录安全 input store。
+- `lib/passes/NativePrototypeRecovery.cpp:1016`
+  - 新增 `eraseCallsiteInputStores()`，去重删除已经确认安全的 store。
+- `lib/passes/NativePrototypeRecovery.cpp:1025`
+  - `rewriteMultiInputDirectCallsites()` 在替换 call 后删除安全 input store。
+- `lib/passes/NativePrototypeRecovery.cpp:1655`
+  - `InputMultiReturnCallsiteRewrite` 同样记录 `InputStores`。
+- `lib/passes/NativePrototypeRecovery.cpp:1639`
+  - `collectInputMultiReturnDirectCallsites()` 复用同样规则记录安全 input store。
+- `lib/passes/NativePrototypeRecovery.cpp:1689`
+  - `rewriteInputMultiReturnDirectCallsites()` 在替换 call 后删除安全 input store。
+- `tests/native_prototype_recovery_test.cpp:130`
+  - 新增 `attachPreservedInputTestAbi()`，构造“输入寄存器同时是 ABI unaffected”的测试 ABI。
+- `tests/native_prototype_recovery_test.cpp:2951`
+  - 断言 clobbered `RDI` direct callsite rewrite 后删除旧 input store。
+- `tests/native_prototype_recovery_test.cpp:2960`
+  - 新增 preserved `RBX` 负例，确认 caller-visible register store 不被删除。
+- `tests/native_prototype_recovery_test.cpp:3001`
+  - 新增 caller 带 return candidate 的负例，确认不破坏后续 return binding。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-callsite-input-store-safe-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-callsite-input-store-safe-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-callsite-input-store-safe-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-callsite-input-store-safe.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 40s | 41s |
+| `libuv:shared-library` | 106s | 106s |
+| `memcached:executable` | 57s | 58s |
+
+残留统计变化：
+
+```text
+category  access_kind  metadata_kind  shape  value_shape  before  after
+gpr       store        access         full   full         3601    3578
+```
+
+完整本轮残留：
+
+```text
+category  access_kind  metadata_kind  shape    value_shape  count
+gpr       load         access         full     full         13
+gpr       load         access         partial  full         3
+gpr       load         external_input full     full         3190
+gpr       store        access         full     full         3578
+gpr       store        access         partial  full         11
+other     load         access         full     full         8
+other     load         external_input full     full         49
+other     store        access         partial  full         1
+vector    load         external_input full     full         70
+vector    store        access         partial  full         71
+```
+
+剩余 GPR store access 按 `base/name` 前几项：
+
+```text
+1132 RSP/RSP
+742 RBP/RBP
+270 RAX/RAX
+240 RDI/RDI
+199 RBX/RBX
+183 RSI/RSI
+167 R12/R12
+146 RCX/RCX
+135 RDX/RDX
+```
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 固定三目标 GPR full store 下降 23 个，收益小但直接对应 prototype 后 cleanup。 |
+| 理解成本 | 4 | callsite rewrite 多带一个 store 来源列表，并要理解 return candidate 的保护条件。 |
+| 维护成本 | 4 | 后续统一 current-value / call effect resolver 后，应把这个规则并入统一 callsite cleanup。 |
+
+有没有更好的方案：
+
+- 更完整方案是让 prototype rewrite 分阶段：先完成所有函数自身 input/return binding，再做 caller-side input store cleanup。
+- 当前 batch rewrite 还会用 caller 的 return candidates，因此本轮用 `return_candidates == nullptr` 做保守保护。

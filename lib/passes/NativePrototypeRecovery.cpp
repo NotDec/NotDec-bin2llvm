@@ -546,6 +546,8 @@ bool hasAnyPrototypeCandidateMetadata(const llvm::Function &function) {
          function.getMetadata("notdec.prototype.return_candidates") != nullptr;
 }
 
+bool callClobbersRegister(llvm::CallBase &call, llvm::StringRef registerName);
+
 std::optional<llvm::Value *> registerStoreValueInReverseRange(
     llvm::BasicBlock::reverse_iterator iter, llvm::BasicBlock::reverse_iterator end,
     llvm::StringRef registerName, llvm::Type *valueType) {
@@ -569,6 +571,39 @@ std::optional<llvm::Value *> registerStoreValueInReverseRange(
     return value;
   }
   return std::nullopt;
+}
+
+llvm::StoreInst *localCallsiteInputStoreBeforeCall(
+    llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *valueType) {
+  for (auto iter = llvm::BasicBlock::reverse_iterator(call.getIterator()),
+            end = call.getParent()->rend();
+       iter != end; ++iter) {
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter)) {
+      llvm::MDNode *metadata = load->getMetadata("notdec.register.access");
+      if (metadata != nullptr && metadataField(*metadata, "name") == registerName) {
+        return nullptr;
+      }
+      continue;
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter)) {
+      llvm::MDNode *metadata = store->getMetadata("notdec.register.access");
+      if (metadata == nullptr || metadataField(*metadata, "name") != registerName) {
+        continue;
+      }
+      llvm::Value *value = store->getValueOperand();
+      if (value == nullptr || value->getType() != valueType) {
+        return nullptr;
+      }
+      return store;
+    }
+    if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
+      llvm::Function *callee = previousCall->getCalledFunction();
+      if (callee == nullptr || !callee->isIntrinsic()) {
+        return nullptr;
+      }
+    }
+  }
+  return nullptr;
 }
 
 struct RegisterValueLookup {
@@ -927,6 +962,9 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
 struct MultiInputCallsiteRewrite {
   llvm::CallInst *Call = nullptr;
   std::vector<llvm::Value *> Arguments;
+  // Same ABI order as Arguments.  Null means the argument did not come from a
+  // local store that is safe to erase after the call is rewritten.
+  std::vector<llvm::StoreInst *> InputStores;
 };
 
 struct MultiInputCallsiteCollectionResult {
@@ -950,6 +988,7 @@ MultiInputCallsiteCollectionResult collectMultiInputDirectCallsiteRewrites(
     MultiInputCallsiteRewrite rewrite;
     rewrite.Call = call;
     rewrite.Arguments.reserve(inputs.size());
+    rewrite.InputStores.reserve(inputs.size());
     for (uint64_t index = 0; index < inputs.size(); ++index) {
       std::optional<llvm::Value *> argument = callsiteInputValueBeforeCall(
           *call, inputs[index].RegisterName, recoveredType.getParamType(index));
@@ -958,10 +997,29 @@ MultiInputCallsiteCollectionResult collectMultiInputDirectCallsiteRewrites(
         return result;
       }
       rewrite.Arguments.push_back(*argument);
+      llvm::StoreInst *inputStore = localCallsiteInputStoreBeforeCall(
+          *call, inputs[index].RegisterName, recoveredType.getParamType(index));
+      if (inputStore != nullptr && inputStore->getValueOperand() == *argument &&
+          call->getFunction()->getMetadata("notdec.prototype.return_candidates") ==
+              nullptr &&
+          callClobbersRegister(*call, inputs[index].RegisterName)) {
+        rewrite.InputStores.push_back(inputStore);
+      } else {
+        rewrite.InputStores.push_back(nullptr);
+      }
     }
     result.Rewrites.push_back(std::move(rewrite));
   }
   return result;
+}
+
+void eraseCallsiteInputStores(llvm::ArrayRef<llvm::StoreInst *> inputStores) {
+  std::set<llvm::StoreInst *> erased;
+  for (llvm::StoreInst *store : inputStores) {
+    if (store != nullptr && erased.insert(store).second) {
+      store->eraseFromParent();
+    }
+  }
 }
 
 void rewriteMultiInputDirectCallsites(
@@ -972,6 +1030,7 @@ void rewriteMultiInputDirectCallsites(
     llvm::CallInst *newCall = builder.CreateCall(
         rewritten.getFunctionType(), &rewritten, callsite.Arguments);
     newCall->setCallingConv(callsite.Call->getCallingConv());
+    eraseCallsiteInputStores(callsite.InputStores);
     callsite.Call->eraseFromParent();
   }
 }
@@ -1027,6 +1086,9 @@ struct MultiReturnCallsiteCollectionResult {
 struct InputMultiReturnCallsiteRewrite {
   llvm::CallInst *Call = nullptr;
   std::vector<llvm::Value *> Arguments;
+  // Same ABI order as Arguments.  Null means the argument store is still needed
+  // as caller-visible register state.
+  std::vector<llvm::StoreInst *> InputStores;
   // Same slot order as the recovered returns; null entries are unused results.
   std::vector<llvm::LoadInst *> ReturnLoads;
   std::vector<ReturnLoadSearchResult> ReturnLoadResults;
@@ -1593,6 +1655,7 @@ collectInputMultiReturnDirectCallsites(
     InputMultiReturnCallsiteRewrite rewrite;
     rewrite.Call = call;
     rewrite.Arguments.reserve(inputs.size());
+    rewrite.InputStores.reserve(inputs.size());
     for (uint64_t index = 0; index < inputs.size(); ++index) {
       std::optional<llvm::Value *> argument = callsiteInputValueBeforeCall(
           *call, inputs[index].RegisterName, recoveredType.getParamType(index));
@@ -1601,6 +1664,16 @@ collectInputMultiReturnDirectCallsites(
         return result;
       }
       rewrite.Arguments.push_back(*argument);
+      llvm::StoreInst *inputStore = localCallsiteInputStoreBeforeCall(
+          *call, inputs[index].RegisterName, recoveredType.getParamType(index));
+      if (inputStore != nullptr && inputStore->getValueOperand() == *argument &&
+          call->getFunction()->getMetadata("notdec.prototype.return_candidates") ==
+              nullptr &&
+          callClobbersRegister(*call, inputs[index].RegisterName)) {
+        rewrite.InputStores.push_back(inputStore);
+      } else {
+        rewrite.InputStores.push_back(nullptr);
+      }
     }
     rewrite.ReturnLoads.reserve(returns.size());
     rewrite.ReturnLoadResults.reserve(returns.size());
@@ -1631,6 +1704,7 @@ void rewriteInputMultiReturnDirectCallsites(
     llvm::CallInst *newCall = builder.CreateCall(
         rewritten.getFunctionType(), &rewritten, callsite.Arguments);
     newCall->setCallingConv(callsite.Call->getCallingConv());
+    eraseCallsiteInputStores(callsite.InputStores);
     for (uint64_t index = 0; index < callsite.ReturnLoads.size(); ++index) {
       llvm::LoadInst *load = callsite.ReturnLoads[index];
       if (load == nullptr) {
