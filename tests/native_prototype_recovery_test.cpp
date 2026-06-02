@@ -1667,7 +1667,8 @@ llvm::Function *createWideVectorAndScalarReturnFunction(
 
 llvm::Function *createKilledVectorScratchStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *wide,
-    const std::string &accessName, bool keepLoad) {
+    const std::string &accessName, bool keepLoad,
+    llvm::Function *calleeAfterStore = nullptr) {
   llvm::LLVMContext &context = module.getContext();
   auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *function =
@@ -1687,6 +1688,9 @@ llvm::Function *createKilledVectorScratchStoreFunction(
   }
   llvm::StoreInst *store = builder.CreateStore(value, wide);
   store->setMetadata("notdec.register.access", access);
+  if (calleeAfterStore != nullptr) {
+    builder.CreateCall(calleeAfterStore->getFunctionType(), calleeAfterStore);
+  }
   builder.CreateRetVoid();
   return function;
 }
@@ -7220,6 +7224,12 @@ int main() {
       createKilledVectorScratchStoreFunction(killedVectorScratchModule,
                                              "live_killed_vector_scratch",
                                              killedVectorZmm, "XMM0_Qb", true);
+  llvm::Function *scratchCallCallee =
+      createFunction(killedVectorScratchModule, "scratch_call_callee");
+  llvm::Function *callArgumentKilledVectorScratch =
+      createKilledVectorScratchStoreFunction(
+          killedVectorScratchModule, "call_argument_killed_vector_scratch",
+          killedVectorZmm, "XMM0_Qb", false, scratchCallCallee);
   notdec::bin2llvm::runNativePrototypeRecovery(killedVectorScratchModule,
                                                rewriteOptions);
   ok &= expect(!hasRegisterStore(*deadKilledVectorScratch, "XMM0_Qb"),
@@ -7228,6 +7238,8 @@ int main() {
                "live killed-by-call vector scratch store was removed");
   ok &= expect(hasRegisterLoad(*liveKilledVectorScratch, "XMM0_Qb"),
                "live killed-by-call vector scratch load was removed");
+  ok &= expect(hasRegisterStore(*callArgumentKilledVectorScratch, "XMM0_Qb"),
+               "killed-by-call vector store before call was removed");
   if (llvm::verifyModule(killedVectorScratchModule, &llvm::errs())) {
     std::cerr << "killed vector scratch module verification failed after "
                  "prototype rewrite\n";

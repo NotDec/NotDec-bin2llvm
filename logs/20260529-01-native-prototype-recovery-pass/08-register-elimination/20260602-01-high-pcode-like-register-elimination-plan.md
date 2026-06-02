@@ -2885,6 +2885,7 @@ vector    store        access           partial  full         no         71
 - 只处理 ABI metadata 明确写出的 `killedbycall` register。
 - 只删当前函数已经是 recovered prototype 类型的函数里的 store。
 - 如果函数里还有同 register / lane register load，则保留 store。
+- 只删 store 后同一 basic block 直接到 `ret`，且中间没有普通 call 的 store。
 - `XMM0` 可以匹配 `XMM0_Qa` / `XMM0_Qb`，但不从 `XMM0` 推到 `ZMM0`，也不推到 `XMM1`。
 - 不改 `NativeRegisterSSA`，不提前删 return candidate。
 
@@ -2897,17 +2898,19 @@ vector    store        access           partial  full         no         71
 - `lib/passes/NativePrototypeRecovery.cpp:1221`
   - 新增 `functionHasRegisterAccessLoad()`，函数内有同 register load 时保守不清理。
 - `lib/passes/NativePrototypeRecovery.cpp:1238`
-  - 新增 `killedByCallRegisterNames()`，从 ABI effect 收集明确的 killed-by-call register 名。
+  - 新增 `storeIsDeadAtReturn()`，要求 store 后到本 block 的 `ret` 前没有普通 call，避免删除后续 call 的参数准备。
 - `lib/passes/NativePrototypeRecovery.cpp:1251`
+  - 新增 `killedByCallRegisterNames()`，从 ABI effect 收集明确的 killed-by-call register 名。
+- `lib/passes/NativePrototypeRecovery.cpp:1264`
   - 新增 `eraseDeadKilledByCallRegisterStores()`，删除 rewrite 后无读的 killed-by-call register stores，并递归清理死 RMW 计算和 external input load。
 - `lib/passes/NativePrototypeRecovery.cpp:2592`
   - `runNativePrototypeRecovery()` 在 `rewriteNativeRecoveredPrototypes()` 和 `rewriteDeclarationCallOutputs()` 之后调用 cleanup。
 - `tests/native_prototype_recovery_test.cpp:174`
   - 新增 `attachKilledVectorScratchTestAbi()`，构造 `XMM0` killed-by-call ABI。
 - `tests/native_prototype_recovery_test.cpp:1668`
-  - 新增 `createKilledVectorScratchStoreFunction()`，构造 dead/live 两种 vector scratch store。
+  - 新增 `createKilledVectorScratchStoreFunction()`，构造 dead/live/call 后继三种 vector scratch store。
 - `tests/native_prototype_recovery_test.cpp:7209`
-  - 断言 dead `XMM0_Qb` store 被删除，有同名 load 的 `XMM0_Qb` store 保留。
+  - 断言 dead `XMM0_Qb` store 被删除，有同名 load 的 `XMM0_Qb` store 保留，store 后还有 call 的 `XMM0_Qb` store 也保留。
 
 验证：
 
@@ -2920,15 +2923,15 @@ cmake --build build --target notdec-native-llvm -j2
 ctest --test-dir build --output-on-failure
 scripts/bench2-native-prototype-audit.sh \
   --build-dir build \
-  --out-dir /tmp/notdec-bin2llvm-killed-scratch-gate \
+  --out-dir /tmp/notdec-bin2llvm-killed-scratch-ret-gate \
   --target vsftpd:executable \
   --target libuv:shared-library \
   --target memcached:executable
 python3 scripts/native-register-residue-audit.py \
-  /tmp/notdec-bin2llvm-killed-scratch-gate/*.signature-rewrite.ll
+  /tmp/notdec-bin2llvm-killed-scratch-ret-gate/*.signature-rewrite.ll
 python3 scripts/native-register-residue-audit.py --details \
-  /tmp/notdec-bin2llvm-killed-scratch-gate/*.signature-rewrite.ll \
-  > /tmp/notdec-reg-details-killed-scratch.tsv
+  /tmp/notdec-bin2llvm-killed-scratch-ret-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-killed-scratch-ret.tsv
 ```
 
 结果：
@@ -2943,8 +2946,8 @@ python3 scripts/native-register-residue-audit.py --details \
 
 | target | all-confirmed | signature-rewrite |
 | --- | ---: | ---: |
-| `vsftpd:executable` | 41s | 41s |
-| `libuv:shared-library` | 106s | 106s |
+| `vsftpd:executable` | 41s | 42s |
+| `libuv:shared-library` | 106s | 107s |
 | `memcached:executable` | 57s | 57s |
 
 residue 变化：
@@ -2967,6 +2970,7 @@ vector    store        access           partial  full         no         71     
 判断：
 
 - 这一步直接消掉了大部分 `XMM0` scratch vector RMW 残留。
+- 收紧到 return 前 store 后，fixed gate residue 和过宽版本相同，说明被删除的 store 都不是 call 前参数准备。
 - 仍剩下的 vector 残留主要是 `XMM1`、`XMM2`、`XMM3` 等 ABI metadata 当前没有明确 `killedbycall` 的寄存器，或者函数内存在对应 load。
 - 下一步如果要继续消 vector，需要先补 ABI effect 导出范围，或者在 cleanup 里引入更明确的 ABI alias 表；不能靠猜测把 `XMM1+` 都当 killed-by-call。
 

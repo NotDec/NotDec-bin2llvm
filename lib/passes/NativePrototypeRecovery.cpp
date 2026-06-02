@@ -1235,6 +1235,19 @@ bool functionHasRegisterAccessLoad(llvm::Function &function,
   return false;
 }
 
+bool storeIsDeadAtReturn(llvm::StoreInst &store) {
+  for (llvm::Instruction *instruction = store.getNextNode();
+       instruction != nullptr; instruction = instruction->getNextNode()) {
+    if (llvm::isa<llvm::ReturnInst>(instruction)) {
+      return true;
+    }
+    if (llvm::isa<llvm::CallBase>(instruction)) {
+      return false;
+    }
+  }
+  return false;
+}
+
 std::set<std::string> killedByCallRegisterNames(const NativeAbiSpec &abi) {
   std::set<std::string> names;
   for (const NativeAbiEffect &effect : abi.Effects) {
@@ -1278,7 +1291,8 @@ void eraseDeadKilledByCallRegisterStores(llvm::Module &module,
           }
           llvm::MDNode *access = store->getMetadata("notdec.register.access");
           if (access != nullptr &&
-              accessMatchesEffectRegister(*access, registerName)) {
+              accessMatchesEffectRegister(*access, registerName) &&
+              storeIsDeadAtReturn(*store)) {
             deadStores.push_back(store);
           }
         }
