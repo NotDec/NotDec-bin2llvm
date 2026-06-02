@@ -1021,13 +1021,12 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
   return registerGlobalValueBeforeCall(call, registerName, paramType);
 }
 
-std::optional<llvm::Value *> localStackInputValueBeforeCall(
-    llvm::CallInst &call, llvm::StringRef space, uint64_t offset, uint32_t size,
+std::optional<llvm::LoadInst *> stackInputLoadInReverseRange(
+    llvm::BasicBlock::reverse_iterator iter, llvm::BasicBlock::reverse_iterator end,
+    llvm::StringRef space, uint64_t offset, uint32_t size,
     llvm::Type *paramType) {
   llvm::LoadInst *result = nullptr;
-  for (auto iter = llvm::BasicBlock::reverse_iterator(call.getIterator()),
-            end = call.getParent()->rend();
-       iter != end; ++iter) {
+  for (; iter != end; ++iter) {
     if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
       llvm::Function *callee = previousCall->getCalledFunction();
       if (callee == nullptr || !callee->isIntrinsic()) {
@@ -1055,6 +1054,53 @@ std::optional<llvm::Value *> localStackInputValueBeforeCall(
   return result;
 }
 
+std::optional<llvm::Value *> localStackInputValueBeforeCall(
+    llvm::CallInst &call, llvm::StringRef space, uint64_t offset, uint32_t size,
+    llvm::Type *paramType) {
+  return stackInputLoadInReverseRange(
+      llvm::BasicBlock::reverse_iterator(call.getIterator()),
+      call.getParent()->rend(), space, offset, size, paramType);
+}
+
+std::optional<llvm::Value *> stackInputValueBeforeCall(
+    llvm::CallInst &call, llvm::StringRef space, uint64_t offset, uint32_t size,
+    llvm::Type *paramType) {
+  if (std::optional<llvm::Value *> local =
+          localStackInputValueBeforeCall(call, space, offset, size, paramType)) {
+    return local;
+  }
+  if (hasCallInReverseRange(llvm::BasicBlock::reverse_iterator(call.getIterator()),
+                            call.getParent()->rend())) {
+    return std::nullopt;
+  }
+
+  std::set<llvm::BasicBlock *> visited;
+  llvm::BasicBlock *current = call.getParent();
+  while (visited.insert(current).second) {
+    llvm::BasicBlock *predecessor = nullptr;
+    for (llvm::BasicBlock *candidate : llvm::predecessors(current)) {
+      if (predecessor != nullptr) {
+        return std::nullopt;
+      }
+      predecessor = candidate;
+    }
+    if (predecessor == nullptr) {
+      return std::nullopt;
+    }
+    std::optional<llvm::LoadInst *> load = stackInputLoadInReverseRange(
+        predecessor->rbegin(), predecessor->rend(), space, offset, size,
+        paramType);
+    if (load) {
+      return *load;
+    }
+    if (hasCallInReverseRange(predecessor->rbegin(), predecessor->rend())) {
+      return std::nullopt;
+    }
+    current = predecessor;
+  }
+  return std::nullopt;
+}
+
 std::optional<llvm::Value *> callsiteInputValueBeforeCall(
     llvm::CallInst &call, const NativeRecoveredPrototypeParam &input,
     llvm::Type *paramType) {
@@ -1062,9 +1108,8 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
     return callsiteInputValueBeforeCall(call, input.RegisterName, paramType);
   }
   if (input.StorageKind == "stack") {
-    return localStackInputValueBeforeCall(call, input.StackSpace,
-                                         input.StackOffset, input.Size,
-                                         paramType);
+    return stackInputValueBeforeCall(call, input.StackSpace, input.StackOffset,
+                                     input.Size, paramType);
   }
   return std::nullopt;
 }

@@ -2662,3 +2662,121 @@ vector    store        access           partial  full         71
 
 - 更完整方案仍然是阶段 C，把 register/stack/current value 查询集中成独立模块。
 - 本轮只消掉一处明确重复和保守跳过，不提前处理复杂 stack CFG。
+
+## 阶段 C/E 小步：stack input callsite 的唯一前驱查询
+
+背景：
+
+- 前两轮已经让三条 direct callsite rewrite 路径支持简单 stack input。
+- 但 caller 侧 stack input 只支持和 call 在同一 basic block 内。
+- 很多简单 CFG 会在前一个 block 里准备参数，然后跳到 call block。这个场景不需要完整 stack alias，也不需要跨多前驱合并。
+
+本轮范围：
+
+- stack input callsite 查询从“同一 basic block”扩到“唯一 predecessor 链”。
+- 每个 block 内仍只接受唯一匹配的 `notdec.stack.input` load。
+- 遇到多 predecessor、普通 call、循环、类型不匹配、多个匹配 load，都返回 `unsafe callsite input value`。
+- register input 查询不变。
+
+不做：
+
+- 不在多 predecessor 上比较 stack input 是否等价。
+- 不跨普通 call 追栈值。
+- 不从 GEP 或栈指针表达式猜参数。
+- 不删除 caller 侧 stack load。
+
+改动文件和函数：
+
+- `lib/passes/NativePrototypeRecovery.cpp:1024`
+  - 新增 `stackInputLoadInReverseRange()`，在一段反向指令范围内找唯一匹配 stack input load，并把非 intrinsic call 当成屏障。
+- `lib/passes/NativePrototypeRecovery.cpp:1057`
+  - `localStackInputValueBeforeCall()` 改为复用 `stackInputLoadInReverseRange()`。
+- `lib/passes/NativePrototypeRecovery.cpp:1065`
+  - 新增 `stackInputValueBeforeCall()`，沿唯一 predecessor 链查找 stack input load；多 predecessor、普通 call、循环都保守失败。
+- `lib/passes/NativePrototypeRecovery.cpp:1110`
+  - stack input 的 `callsiteInputValueBeforeCall()` 改为调用 `stackInputValueBeforeCall()`。
+- `tests/native_prototype_recovery_test.cpp:1441`
+  - 新增 `createStackInputUniquePredecessorCallerFunction()`，构造 stack input 在前驱 block、call 在后继 block 的正例。
+- `tests/native_prototype_recovery_test.cpp:1476`
+  - 新增 `createStackInputAmbiguousPredecessorCallerFunction()`，构造两个 predecessor 都有 stack input 的保守跳过反例。
+- `tests/native_prototype_recovery_test.cpp:3259`
+  - 断言唯一前驱 stack input callsite 能 rewrite，参数来自前驱 block 的 stack input load。
+- `tests/native_prototype_recovery_test.cpp:3311`
+  - 断言多前驱 stack input callsite 不 rewrite，skip reason 为 `unsafe callsite input value`。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-stack-input-pred-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-stack-input-pred-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-stack-input-pred-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-stack-input-pred.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 105s | 106s |
+| `memcached:executable` | 56s | 57s |
+
+signature rewrite 统计：
+
+```text
+target      needed  rewritten
+vsftpd      137     137
+libuv       336     336
+memcached   187     187
+```
+
+残留统计与上一轮相同：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  count
+gpr       load         access           full     full         22
+gpr       load         access           partial  full         3
+gpr       load         external_input   full     full         3190
+gpr       store        access           full     full         3583
+gpr       store        access           partial  full         11
+other     load         access           full     full         8
+other     load         external_input   full     full         49
+other     store        access           partial  full         1
+vector    load         access           full     full         1
+vector    load         external_input   full     full         70
+vector    store        access           partial  full         71
+```
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 覆盖了简单跨 block stack input callsite；固定三目标没有命中新场景，所以 residue 不变。 |
+| 理解成本 | 3 | stack input 查询多了一层唯一前驱回溯，但失败条件清楚。 |
+| 维护成本 | 3 | 后续应把 register/stack value-before-call 查询收进阶段 C 的统一接口，避免继续分散。 |
+
+有没有更好的方案：
+
+- 更完整方案是统一 current-value 查询，并支持 PHI / 多前驱等价判断。
+- 本轮只处理唯一前驱链，是为了在不引入 stack alias 和 PHI 复杂度的情况下先覆盖简单 CFG。

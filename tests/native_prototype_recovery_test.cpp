@@ -1438,6 +1438,83 @@ llvm::Function *createStackInputCallerFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createStackInputUniquePredecessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    uint64_t offset, llvm::LoadInst **inputLoad, llvm::CallInst **callOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *byteType = llvm::Type::getInt8Ty(context);
+  auto *arrayType = llvm::ArrayType::get(byteType, 32);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(arrayType, nullptr, "notdec_stack");
+  llvm::Value *pointer = builder.CreateInBoundsGEP(
+      byteType, stack,
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), offset),
+      "stack_arg.stack");
+  llvm::LoadInst *load =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), pointer,
+                         "stack_arg.mem");
+  load->setMetadata("notdec.stack.input",
+                    stackInputMetadata(context, offset, 8));
+  builder.CreateBr(callBlock);
+
+  builder.SetInsertPoint(callBlock);
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+  *inputLoad = load;
+  *callOut = call;
+  return function;
+}
+
+llvm::Function *createStackInputAmbiguousPredecessorCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    uint64_t offset) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+
+  auto createStackLoad = [&](llvm::BasicBlock *block) {
+    builder.SetInsertPoint(block);
+    auto *byteType = llvm::Type::getInt8Ty(context);
+    auto *arrayType = llvm::ArrayType::get(byteType, 32);
+    llvm::AllocaInst *stack =
+        builder.CreateAlloca(arrayType, nullptr, "notdec_stack");
+    llvm::Value *pointer = builder.CreateInBoundsGEP(
+        byteType, stack,
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), offset),
+        "stack_arg.stack");
+    llvm::LoadInst *load =
+        builder.CreateLoad(llvm::Type::getInt64Ty(context), pointer,
+                           "stack_arg.mem");
+    load->setMetadata("notdec.stack.input",
+                      stackInputMetadata(context, offset, 8));
+    builder.CreateBr(callBlock);
+  };
+  createStackLoad(left);
+  createStackLoad(right);
+
+  builder.SetInsertPoint(callBlock);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createStackInputReturnLoadCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     uint64_t stackOffset, llvm::GlobalVariable *firstOutput,
@@ -3176,6 +3253,86 @@ int main() {
   if (llvm::verifyModule(stackCallsiteModule, &llvm::errs())) {
     std::cerr
         << "stack callsite module verification failed after input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module stackPredecessorCallsiteModule(
+      "native-prototype-stack-input-predecessor-callsite-rewrite-test",
+      context);
+  attachTestAbi(stackPredecessorCallsiteModule);
+  llvm::LoadInst *stackPredecessorInputLoad = nullptr;
+  llvm::Function *stackPredecessorInputFunction =
+      createStackInputFunction(stackPredecessorCallsiteModule,
+                               "predecessor_callsite_input_stack_8", 8, true,
+                               &stackPredecessorInputLoad);
+  llvm::LoadInst *stackPredecessorCallerInputLoad = nullptr;
+  llvm::CallInst *oldStackPredecessorCall = nullptr;
+  createStackInputUniquePredecessorCallerFunction(
+      stackPredecessorCallsiteModule, "call_predecessor_callsite_input_stack_8",
+      stackPredecessorInputFunction, 8, &stackPredecessorCallerInputLoad,
+      &oldStackPredecessorCall);
+  notdec::bin2llvm::runNativePrototypeRecovery(stackPredecessorCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      stackPredecessorRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+              *stackPredecessorInputFunction);
+  ok &= expect(stackPredecessorRewriteResult.Rewritten,
+               "stack input-only prototype with predecessor callsite was not rewritten");
+  stackPredecessorInputFunction = stackPredecessorRewriteResult.Function;
+  llvm::CallInst *rewrittenStackPredecessorCall = nullptr;
+  llvm::Function *stackPredecessorCaller =
+      stackPredecessorCallsiteModule.getFunction(
+          "call_predecessor_callsite_input_stack_8");
+  if (stackPredecessorCaller != nullptr) {
+    for (llvm::BasicBlock &block : *stackPredecessorCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == stackPredecessorInputFunction) {
+          rewrittenStackPredecessorCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenStackPredecessorCall != nullptr,
+               "stack predecessor callsite was not rewritten to new callee");
+  ok &= expect(rewrittenStackPredecessorCall != nullptr &&
+                   rewrittenStackPredecessorCall->arg_size() == 1 &&
+                   rewrittenStackPredecessorCall->getArgOperand(0) ==
+                       stackPredecessorCallerInputLoad,
+               "stack predecessor callsite did not use stack input load");
+  if (llvm::verifyModule(stackPredecessorCallsiteModule, &llvm::errs())) {
+    std::cerr << "stack predecessor callsite module verification failed after "
+                 "input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module stackAmbiguousCallsiteModule(
+      "native-prototype-stack-input-ambiguous-callsite-test", context);
+  attachTestAbi(stackAmbiguousCallsiteModule);
+  llvm::LoadInst *stackAmbiguousInputLoad = nullptr;
+  llvm::Function *stackAmbiguousInputFunction =
+      createStackInputFunction(stackAmbiguousCallsiteModule,
+                               "ambiguous_callsite_input_stack_8", 8, true,
+                               &stackAmbiguousInputLoad);
+  createStackInputAmbiguousPredecessorCallerFunction(
+      stackAmbiguousCallsiteModule, "call_ambiguous_callsite_input_stack_8",
+      stackAmbiguousInputFunction, 8);
+  notdec::bin2llvm::runNativePrototypeRecovery(stackAmbiguousCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      stackAmbiguousRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+              *stackAmbiguousInputFunction);
+  ok &= expect(!stackAmbiguousRewriteResult.Rewritten,
+               "stack input-only prototype with ambiguous predecessors was rewritten");
+  ok &= expect(stackAmbiguousRewriteResult.Reason ==
+                   "unsafe callsite input value",
+               "stack ambiguous predecessor callsite had wrong skip reason");
+  if (llvm::verifyModule(stackAmbiguousCallsiteModule, &llvm::errs())) {
+    std::cerr << "stack ambiguous callsite module verification failed after "
+                 "input-only rewrite\n";
     return EXIT_FAILURE;
   }
 
