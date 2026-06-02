@@ -56,6 +56,7 @@ using BlockRegKey = std::pair<llvm::BasicBlock *, llvm::GlobalVariable *>;
 struct AbiRegisterEffects {
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
+  std::string StackPointerRegister;
 };
 
 struct FlagBlockLiveness {
@@ -172,6 +173,10 @@ AbiRegisterEffects collectAbiRegisterEffects(llvm::Module &module) {
   }
 
   for (llvm::MDNode *abiNode : abiMetadata->operands()) {
+    if (std::optional<std::string> stackPointer =
+            mdField(abiNode, "stackpointer.register")) {
+      effects.StackPointerRegister = *stackPointer;
+    }
     for (const llvm::MDOperand &operand : abiNode->operands()) {
       auto *effectList = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
       if (effectList == nullptr) {
@@ -896,6 +901,10 @@ private:
 
   bool callClobbersRegister(const llvm::Instruction &inst,
                             const RegisterUnit &unit) const {
+    if (!AbiEffects.StackPointerRegister.empty() &&
+        unit.Name == AbiEffects.StackPointerRegister) {
+      return false;
+    }
     auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
     llvm::Function *callee =
         call == nullptr ? nullptr : call->getCalledFunction();

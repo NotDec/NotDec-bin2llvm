@@ -1677,3 +1677,120 @@ vector    store        access         partial  full         71
 
 - 更大的收益仍在 prototype rewrite 后 cleanup、callsite 当前值查询、RSP/RBP/call effect 建模。
 - 本轮没有碰这些语义风险高的部分，只清理已被证明无用户的 load。
+
+## 阶段 C/D 小步：按 ABI stack pointer 处理 call 边界
+
+背景：
+
+- 固定三目标里剩余 GPR access load 主要来自 `RSP/RBP`、声明调用后的 `RAX`，以及少量 callsite fallback。
+- 其中 `RSP` load 有一类很常见：调用前已经 store 了当前 `RSP`，调用返回后只是为了下一次压返回地址又 load `@RSP`。
+- 普通函数调用返回后，ABI stack pointer 应回到调用点的栈位置。这个事实来自 ABI 的 `stackpointer.register`，不是普通 callee-saved 寄存器规则。
+
+本轮只做窄规则：
+
+- 从 `notdec.abi` metadata 读取 `stackpointer.register`。
+- `NativeRegisterSSA` 判断 call clobber 时，如果当前 register unit 是 ABI stack pointer，就认为普通 call 返回后不 clobber 该寄存器。
+- 不把 `RSP` 加进 `unaffected`，避免把它当普通 preserved register 输出到 `notdec.register.preserves`。
+- 不放宽 `RAX/RDI/RBX/RBP` 等其它寄存器。
+
+改动文件和函数：
+
+- `lib/passes/NativeRegisterSSA.cpp:56`
+  - `AbiRegisterEffects` 增加 `StackPointerRegister` 字段，单独记录 ABI stack pointer。
+- `lib/passes/NativeRegisterSSA.cpp:175`
+  - `collectAbiRegisterEffects()` 从 ABI metadata 读取 `stackpointer.register`。
+- `lib/passes/NativeRegisterSSA.cpp:902`
+  - `FunctionPromoter::callClobbersRegister()` 对 ABI stack pointer 返回 `false`，允许跨 call 使用调用前的 RSP SSA value。
+- `tests/native_register_effects_test.cpp:68`
+  - 测试 ABI 显式设置 `RSP` 为 stack pointer。
+- `tests/native_register_effects_test.cpp:146`
+  - 新增 `createStackPointerCallEffectFunction()`，覆盖外部 call 后读取 `RSP` 的传播。
+- `tests/native_register_effects_test.cpp:691`
+  - 将该样例加入主测试。
+- `tests/native_register_effects_test.cpp:764`
+  - 断言 call 后 `RSP` load 被消除；原有 `RAX` call 后 load 保留断言继续覆盖普通 killed-by-call register 不被误传播。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+./build/bin/native_register_effects_test
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-stack-pointer-call-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-stack-pointer-call-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 40s |
+| `libuv:shared-library` | 105s | 106s |
+| `memcached:executable` | 57s | 58s |
+
+残留统计变化：
+
+```text
+category  access_kind  metadata_kind  shape  value_shape  before  after
+gpr       load         access         full   full         39      19
+```
+
+其中 GPR full access load 按 register 变化：
+
+```text
+before: RSP=22 RAX=13 RBP=5 RBX=4 RDI=1 RCX=1 R9=1 R8=1
+after:  RSP=2  RAX=13 RBP=5 RBX=4 RDI=1 RCX=1 R9=1 R8=1
+```
+
+完整本轮残留：
+
+```text
+category  access_kind  metadata_kind  shape    value_shape  count
+gpr       load         access         full     full         19
+gpr       load         access         partial  full         9
+gpr       load         external_input full     full         3190
+gpr       store        access         full     full         3601
+gpr       store        access         partial  full         11
+other     load         access         full     full         8
+other     load         external_input full     full         49
+other     store        access         partial  full         1
+vector    load         external_input full     full         70
+vector    store        access         partial  full         71
+```
+
+抽查：
+
+- `notdec_native_12790` 中两次调用 `notdec_native_126d0` 前的 stack pointer 已由同 block 的 `%3` 继续传播，第二次压返回地址不再读取 `@RSP`。
+- 剩余 2 个 `RSP` access load 都在 `uv_timer_stop`，还有其它 `R9/R8/RCX` register access load 混在复杂 CFG 中，本轮不继续扩大规则。
+- `notdec_native_8480` 的 `%RDI.callsite_input` 不能安全替换成 entry input，因为该函数 metadata 只有 `RSP/RBP` external input，没有 `RDI`。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 固定三目标 GPR full access load 从 39 降到 19，主要解决 RSP call 边界噪声。 |
+| 理解成本 | 3 | 增加一个 ABI stack pointer 特例，但它来自现有 ABI metadata，范围清楚。 |
+| 维护成本 | 3 | 后续 call effect resolver 独立后，应把这个规则迁移到统一 resolver。 |
+
+有没有更好的方案：
+
+- 更完整的方案是独立 call effect resolver，统一处理 ABI、direct callee metadata、recovered prototype 和 stack pointer。
+- 本轮先把 ABI stack pointer 从普通 killed-by-call 里拿出来，是一个小而可验证的步骤。

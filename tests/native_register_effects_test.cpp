@@ -65,6 +65,8 @@ llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
 void attachTestAbi(llvm::Module &module) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__stdcall";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
   notdec::bin2llvm::NativeAbiEffect unaffected;
   unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
   unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
@@ -138,6 +140,32 @@ llvm::Function *createCallEffectFunction(llvm::Module &module,
       builder.CreateLoad(rax->getValueType(), rax, "rax_after_call");
   loadRax->setMetadata("notdec.register.access", raxMetadata);
   builder.CreateRet(builder.CreateAdd(loadRbx, loadRax));
+  return function;
+}
+
+llvm::Function *createStackPointerCallEffectFunction(
+    llvm::Module &module, llvm::GlobalVariable *rsp) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "stack_pointer_call", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      funcType, llvm::GlobalValue::ExternalLinkage,
+      "stack_pointer_call_effect", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RSP", "RSP", 32, 8);
+
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(rsp->getValueType(), 0x1000), rsp);
+  store->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rsp->getValueType(), rsp, "rsp_after_call");
+  load->setMetadata("notdec.register.access", metadata);
+  builder.CreateRet(load);
   return function;
 }
 
@@ -649,6 +677,7 @@ int main() {
   llvm::Module module("native-register-effects-test", context);
   llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP", 32, 8);
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
   llvm::GlobalVariable *cf = createRegisterGlobal(module, "CF", 512, 1);
   llvm::GlobalVariable *of = createRegisterGlobal(module, "OF", 523, 1);
@@ -659,6 +688,8 @@ int main() {
   llvm::Function *clobbered =
       createFunction(module, "clobbered_rbx", rbx, false);
   llvm::Function *callEffects = createCallEffectFunction(module, rbx, rax);
+  llvm::Function *stackPointerCallEffects =
+      createStackPointerCallEffectFunction(module, rsp);
   llvm::Function *repeatedLoadAfterCall =
       createRepeatedLoadAfterCallFunction(module, rax);
   llvm::Function *directCallEffects =
@@ -730,6 +761,8 @@ int main() {
                "RBX load after call was not propagated");
   ok &= expect(countRegisterLoads(*callEffects, rax) == 1,
                "RAX load after call was incorrectly propagated");
+  ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
+               "RSP load after call was not propagated");
   ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 1,
                "repeated RAX load after call was not reused");
   ok &= expect(countRegisterLoads(*directCallEffects, rbx) == 0,
