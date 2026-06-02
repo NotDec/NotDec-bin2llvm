@@ -4386,3 +4386,70 @@ stack_pointer            1132
 | 实现效果 | 2 | 不减少 residue，但把 202 个 callsite input store 从噪声里分出来。 |
 | 理解成本 | 1 | 同块向后看 call，规则直接。 |
 | 维护成本 | 2 | 只看同一 basic block，保守；跨 block callsite setup 以后需要更强 CFG 查询。 |
+
+## 2026-06-02 实现记录：residue 详情输出 callsite target
+
+背景：
+
+- `callsite_input_store` 已经能分出来，但还不知道它们主要指向内部函数、外部声明还是间接调用。
+- 这会影响下一步实现：internal direct call 通常应该靠 recovered prototype rewrite 清；declaration call 需要单独的 declaration input rewrite；indirect call 要保守。
+
+改动：
+
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:29)
+  - 增加 `DEFINE_RE` / `DECLARE_RE` / `CALLED_FUNCTION_RE`。
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:196)
+  - 新增 `parse_declared_functions`，区分 module 内声明和定义。
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:302)
+  - 新增 `nearby_call_after` 和 `nearby_call_kind`，为同块后续 call 标出 callee 名和 `declaration` / `internal` / `indirect`。
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:536)
+  - `--details` 增加 `nearby_call`、`nearby_call_kind` 两列。
+- [native_register_residue_audit_test.py](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_residue_audit_test.py:136)
+  - 连续 call 和栈调整样例补充 `nearby_call` / `nearby_call_kind` 断言。
+- [native_register_residue_audit_test.py](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_residue_audit_test.py:176)
+  - 新增 internal callee 样例，确认定义过的 callee 被标为 `internal`。
+
+验证：
+
+```bash
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R native_register_residue --output-on-failure
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-wide-partial-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- 手动 Python 测试通过。
+- `notdec.native_register_residue_audit.unit` 通过。
+- 复用上一轮 gate 产物后，202 个 `gpr store callsite_input_store` 的 call target 分布：
+
+```text
+declaration 177
+internal     25
+```
+
+Top target：
+
+```text
+declaration  __assert_fail                 70
+declaration  perror                        16
+declaration  fwrite                         8
+declaration  fcntl64                        7
+declaration  __errno_location               6
+internal     notdec_native_132f0            6
+```
+
+判断：
+
+- 这一步不改变 IR，也不影响性能。
+- 但它说明下一步更该优先做 declaration input rewrite，而不是继续只盯 internal direct callsite rewrite。
+- declaration input rewrite 不能简单把所有 call 前 register store 都变成参数；需要按 ABI input slot、callee 所有 callsite 一致性、现有 declaration type、以及是否已有非空参数来保守处理。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 没减少 residue，但把 177 个 declaration callsite input store 明确暴露出来。 |
+| 理解成本 | 1 | 只是在详情行上附加同块后续 call 信息。 |
+| 维护成本 | 2 | 同块判断仍保守；跨 block setup 和 invoke 以后要另补。 |

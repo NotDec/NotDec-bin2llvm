@@ -140,6 +140,8 @@ declare void @second()
     assert len(accesses) == 1
     assert accesses[0].local_context == "before_call"
     assert accesses[0].residue_reason == "callsite_input_store"
+    assert accesses[0].nearby_call == "second"
+    assert accesses[0].nearby_call_kind == "declaration"
 
 
 def test_callsite_input_store_can_have_stack_adjustment_before_call() -> None:
@@ -171,6 +173,37 @@ declare void @callee()
     assert accesses[0].name == "RDI"
     assert accesses[0].local_context == "before_call_path"
     assert accesses[0].residue_reason == "callsite_input_store"
+    assert accesses[0].nearby_call == "callee"
+    assert accesses[0].nearby_call_kind == "declaration"
+
+
+def test_nearby_call_kind_marks_defined_callee_as_internal() -> None:
+    module = load_audit_module()
+    ir = """
+@RDI = external global i64, !notdec.register !0
+
+define void @sample_internal_call() {
+entry:
+  store i64 1, ptr @RDI, align 8, !notdec.register.access !1
+  call void @callee()
+  ret void
+}
+
+define void @callee() {
+entry:
+  ret void
+}
+
+!0 = !{!"space=register", !"offset=56", !"size=8", !"name=RDI"}
+!1 = !{!"base=RDI", !"space=register", !"offset=56", !"size=8", !"name=RDI"}
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "sample.ll"
+        path.write_text(ir, encoding="utf-8")
+        accesses = module.parse_accesses(path)
+
+    assert accesses[0].nearby_call == "callee"
+    assert accesses[0].nearby_call_kind == "internal"
 
 
 if __name__ == "__main__":
@@ -178,3 +211,4 @@ if __name__ == "__main__":
     test_register_access_details_include_residue_reason()
     test_callsite_input_store_wins_over_after_call_context()
     test_callsite_input_store_can_have_stack_adjustment_before_call()
+    test_nearby_call_kind_marks_defined_callee_as_internal()

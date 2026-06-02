@@ -26,6 +26,9 @@ FIELD_RE = re.compile(r'!"([^"=]+)=([^"]*)"')
 LOAD_RE = re.compile(r"(?:^|=\s*)load\s+([^,]+),")
 STORE_RE = re.compile(r"^store\s+([^,]+),")
 LABEL_RE = re.compile(r"^[-a-zA-Z$._0-9]+:\s*(?:;.*)?$")
+DEFINE_RE = re.compile(r"^define\b.*@([-a-zA-Z$._0-9]+)\(")
+DECLARE_RE = re.compile(r"^declare\b.*@([-a-zA-Z$._0-9]+)\(")
+CALLED_FUNCTION_RE = re.compile(r"\bcall\b.*@([-a-zA-Z$._0-9]+)\(")
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,8 @@ class RegisterAccess:
     local_context: str
     function_effects: str
     residue_reason: str
+    nearby_call: str
+    nearby_call_kind: str
     base: str
     name: str
     space: str
@@ -192,6 +197,19 @@ def parse_function_effects(
     return effects_by_function
 
 
+def parse_declared_functions(lines: list[str]) -> set[str]:
+    declarations: set[str] = set()
+    definitions: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        if match := DECLARE_RE.match(stripped):
+            declarations.add(match.group(1))
+            continue
+        if match := DEFINE_RE.match(stripped):
+            definitions.add(match.group(1))
+    return declarations - definitions
+
+
 def current_block(line: str, previous: str) -> str:
     stripped = line.strip()
     if stripped.startswith("define "):
@@ -289,6 +307,31 @@ def reaches_call_in_block(lines: list[str], index: int) -> bool:
         if is_ret_instruction(stripped):
             return False
     return False
+
+
+def nearby_call_after(lines: list[str], index: int) -> str:
+    for cursor in range(index + 1, len(lines)):
+        stripped = lines[cursor].strip()
+        if stripped == "" or stripped.startswith(";"):
+            continue
+        if is_block_boundary(stripped) or is_ret_instruction(stripped):
+            return ""
+        if not is_call_instruction(stripped):
+            continue
+        if match := CALLED_FUNCTION_RE.search(stripped):
+            return match.group(1)
+        return "<indirect>"
+    return ""
+
+
+def nearby_call_kind(call_name: str, declarations: set[str]) -> str:
+    if call_name == "":
+        return "none"
+    if call_name == "<indirect>":
+        return "indirect"
+    if call_name in declarations:
+        return "declaration"
+    return "internal"
 
 
 def storage_role(name: str) -> str:
@@ -400,6 +443,7 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
     globals_by_symbol = parse_globals(text, metadata)
     globals_by_name = {global_.name: global_ for global_ in globals_by_symbol.values()}
     effects_by_function = parse_function_effects(lines, metadata)
+    declarations = parse_declared_functions(lines)
 
     accesses: list[RegisterAccess] = []
     function = "<module>"
@@ -447,6 +491,7 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
             access_name or base,
             base,
         )
+        nearby_call_name = nearby_call_after(lines, index)
         accesses.append(
             RegisterAccess(
                 file=str(path),
@@ -469,6 +514,9 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
                     effects,
                     is_full,
                 ),
+                nearby_call=nearby_call_name,
+                nearby_call_kind=nearby_call_kind(nearby_call_name,
+                                                  declarations),
                 base=base,
                 name=access_name,
                 space=space,
@@ -513,7 +561,8 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
         "file", "line", "function", "block", "category", "storage_role",
         "local_context", "function_effects", "residue_reason", "access_kind",
         "metadata_kind", "shape", "value_shape", "base", "name", "space",
-        "offset", "size", "value_size", "synthetic", "instruction",
+        "offset", "size", "value_size", "synthetic", "nearby_call",
+        "nearby_call_kind", "instruction",
     ])
     for access in accesses:
         writer.writerow([
@@ -539,6 +588,8 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
             access.size,
             "" if access.value_size is None else access.value_size,
             "yes" if access.synthetic else "no",
+            access.nearby_call,
+            access.nearby_call_kind,
             access.instruction,
         ])
 
