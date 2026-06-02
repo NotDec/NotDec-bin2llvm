@@ -31,7 +31,7 @@ def test_register_access_summary_classifies_full_and_partial() -> None:
 @RAX = external global i64, !notdec.register !0
 @ZF = external global i8, !notdec.register !5
 
-define void @sample() {
+define void @sample() !notdec.register.clobbers !8 !notdec.register.external_inputs !9 {
 entry:
   %in = load i64, ptr @RAX, align 8, !notdec.register.external_input !4
   %al = load i8, ptr @RAX, align 1, !notdec.register.access !2
@@ -50,6 +50,10 @@ entry:
 !5 = !{!"space=register", !"offset=16", !"size=1", !"name=ZF"}
 !6 = !{!"base=ZF", !"space=register", !"offset=16", !"size=1", !"name=ZF"}
 !7 = !{!"partial_storage_ssa"}
+!8 = !{!10}
+!9 = !{!11}
+!10 = !{!"name=RAX", ptr @RAX}
+!11 = !{!"name=ZF", ptr @ZF}
 """
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "sample.ll"
@@ -67,7 +71,9 @@ entry:
     assert accesses[0].block == "entry"
     assert accesses[0].storage_role == "caller_saved_gpr"
     assert accesses[0].local_context == "entry_external_input"
+    assert accesses[0].function_effects == "clobbers"
     assert accesses[2].local_context == "before_call"
+    assert accesses[-1].function_effects == "external_inputs"
     assert accesses[-2].local_context == "return_path"
     assert accesses[-1].local_context == "before_ret"
 

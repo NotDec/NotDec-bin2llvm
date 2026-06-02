@@ -16,6 +16,9 @@ from typing import Iterable
 
 METADATA_RE = re.compile(r"^!(\d+)\s*=\s*!\{(.*)\}\s*$")
 MD_REF_RE = re.compile(r"!notdec\.register\.(access|external_input)\s+!(\d+)")
+FUNCTION_EFFECT_RE = re.compile(
+    r"!notdec\.register\.(clobbers|preserves|external_inputs)\s+!(\d+)"
+)
 SYNTHETIC_RE = re.compile(r"!notdec\.register\.synthetic\s+!\d+")
 GLOBAL_RE = re.compile(r"^(@[-a-zA-Z$._0-9]+)\s*=.*!notdec\.register\s+!(\d+)")
 PTR_GLOBAL_RE = re.compile(r"ptr\s+(@[-a-zA-Z$._0-9]+)")
@@ -46,6 +49,7 @@ class RegisterAccess:
     category: str
     storage_role: str
     local_context: str
+    function_effects: str
     base: str
     name: str
     space: str
@@ -139,6 +143,51 @@ def current_function(line: str, previous: str) -> str:
         return previous
     end = stripped.find("(", at)
     return stripped[at + 1:end] if end > at else previous
+
+
+def parse_function_effects(
+    lines: list[str], metadata: dict[str, dict[str, str]]
+) -> dict[str, dict[str, set[str]]]:
+    raw_metadata_lines: dict[str, str] = {}
+    for line in lines:
+        match = METADATA_RE.match(line.strip())
+        if match:
+            raw_metadata_lines[match.group(1)] = line.strip()
+
+    def names_from_node(node_id: str) -> set[str]:
+        names: set[str] = set()
+        seen: set[str] = set()
+
+        def visit(current: str) -> None:
+            if current in seen:
+                return
+            seen.add(current)
+            fields = metadata.get(current, {})
+            name = fields.get("name")
+            if name:
+                names.add(name)
+            line = raw_metadata_lines.get(current, "")
+            match = METADATA_RE.match(line)
+            if match is None:
+                return
+            for child in re.findall(r"!([0-9]+)", match.group(2)):
+                visit(child)
+
+        visit(node_id)
+        return names
+
+    effects_by_function: dict[str, dict[str, set[str]]] = {}
+    function = "<module>"
+    for line in lines:
+        previous = function
+        function = current_function(line, function)
+        if function == previous or not line.strip().startswith("define "):
+            continue
+        effects = {"clobbers": set(), "preserves": set(), "external_inputs": set()}
+        for kind, node_id in FUNCTION_EFFECT_RE.findall(line):
+            effects[kind].update(names_from_node(node_id))
+        effects_by_function[function] = effects
+    return effects_by_function
 
 
 def current_block(line: str, previous: str) -> str:
@@ -262,12 +311,34 @@ def local_context(
     return "ordinary"
 
 
+def name_matches_effect(access_name: str, effect_name: str) -> bool:
+    return access_name == effect_name or access_name.startswith(effect_name + "_")
+
+
+def function_effects_for_access(
+    effects: dict[str, set[str]],
+    access_name: str,
+    access_base: str,
+) -> str:
+    matched: list[str] = []
+    for kind in ("clobbers", "preserves", "external_inputs"):
+        names = effects.get(kind, set())
+        if any(
+            name_matches_effect(access_name, name) or
+            name_matches_effect(access_base, name)
+            for name in names
+        ):
+            matched.append(kind)
+    return ",".join(matched) if matched else "none"
+
+
 def parse_accesses(path: Path) -> list[RegisterAccess]:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
     metadata = parse_metadata(text)
     globals_by_symbol = parse_globals(text, metadata)
     globals_by_name = {global_.name: global_ for global_ in globals_by_symbol.values()}
+    effects_by_function = parse_function_effects(lines, metadata)
 
     accesses: list[RegisterAccess] = []
     function = "<module>"
@@ -317,6 +388,11 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
                 category=classify_register(access_name or base),
                 storage_role=storage_role(access_name or base),
                 local_context=local_context(lines, index, block, metadata_kind),
+                function_effects=function_effects_for_access(
+                    effects_by_function.get(function, {}),
+                    access_name or base,
+                    base,
+                ),
                 base=base,
                 name=access_name,
                 space=space,
@@ -359,9 +435,9 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
     writer = csv.writer(output, delimiter="\t", lineterminator="\n")
     writer.writerow([
         "file", "line", "function", "block", "category", "storage_role",
-        "local_context", "access_kind", "metadata_kind", "shape", "value_shape",
-        "base", "name", "space", "offset", "size", "value_size", "synthetic",
-        "instruction",
+        "local_context", "function_effects", "access_kind", "metadata_kind",
+        "shape", "value_shape", "base", "name", "space", "offset", "size",
+        "value_size", "synthetic", "instruction",
     ])
     for access in accesses:
         writer.writerow([
@@ -372,6 +448,7 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
             access.category,
             access.storage_role,
             access.local_context,
+            access.function_effects,
             access.access_kind,
             access.metadata_kind,
             "full" if access.is_full else "partial",

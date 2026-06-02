@@ -3538,3 +3538,69 @@ memcached  notdec_native_17ab0   EDI
 
 - 更完整方案还是阶段 C 的统一 storage liveness/current-value 查询。
 - 这次先按单条 killed-by-call store 清理，是因为它能减少明确不可观察的 caller-saved residue，同时避开 callee-saved 和 stack pointer 语义风险。
+
+## 阶段 A 小步：残留审计显示函数 effect metadata
+
+背景：
+
+- GPR return-path cleanup 后，剩余 caller-saved store 里有不少看起来也在 return path 上。
+- 但 fixed gate 里 ABI `killedbycall` 只覆盖 `RAX/RDX/XMM0` 等少数寄存器，不能把所有 caller-saved 都按名字假设成可删。
+- 需要直接看到当前函数 metadata 对某个 storage 的说法：它是 `clobbers`、`preserves`、`external_inputs`，还是根本没有 effect 记录。
+
+本轮范围：
+
+- 只增强 `native-register-residue-audit.py --details`。
+- summary 输出保持不变。
+- 不改 pass，不改 IR 生成。
+
+实现：
+
+- `scripts/native-register-residue-audit.py:18`
+  - 新增 `FUNCTION_EFFECT_RE`，匹配函数定义行上的 `notdec.register.clobbers/preserves/external_inputs`。
+- `scripts/native-register-residue-audit.py:49`
+  - `RegisterAccess` 增加 `function_effects` 字段。
+- `scripts/native-register-residue-audit.py:145`
+  - 新增 `parse_function_effects()`，递归解析函数 effect metadata node 里的 `name=`。
+- `scripts/native-register-residue-audit.py:311`
+  - 新增 `function_effects_for_access()`，按 access name/base 匹配当前函数 effect。
+- `scripts/native-register-residue-audit.py:335`
+  - `parse_accesses()` 给每条 access 记录 effect 分类。
+- `scripts/native-register-residue-audit.py:435`
+  - `write_details()` 增加 `function_effects` 列。
+- `tests/native_register_residue_audit_test.py:34`
+  - 测试 IR 增加 `notdec.register.clobbers` 和 `notdec.register.external_inputs`。
+- `tests/native_register_residue_audit_test.py:74`
+  - 增加 `function_effects` 断言。
+
+验证：
+
+```bash
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R native_register_residue --output-on-failure
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-gpr-return-cleanup-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-gpr-return-cleanup-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-effects.tsv
+git diff --check
+```
+
+结果：
+
+- `native_register_residue_audit_test.py` 通过。
+- `notdec.native_register_residue_audit.unit` 通过。
+- summary 不变。
+- 剩余 4 个 GPR partial store 的 effect 情况：
+
+```text
+libuv      uv_ip6_addr         SI   caller_saved_gpr  return_path  none
+libuv      uv_read_start       CL   caller_saved_gpr  ordinary     none
+memcached  notdec_native_6740  BL   callee_saved_gpr  ordinary     clobbers,external_inputs
+memcached  notdec_native_17ab0 EDI  caller_saved_gpr  ordinary     none
+```
+
+判断：
+
+- 多数剩余 GPR partial store 的 `function_effects=none`，当前 metadata 不足以证明它们是返回边界不可观察的 killed/clobbered store。
+- `memcached notdec_native_6740 BL` 虽然有 `clobbers,external_inputs`，但它位于普通路径且后面有 call/merge，不能用 return-path dead store 条件删。
+- 下一步如果要继续减少这些 partial store，应该进入阶段 B 的 storage range SSA，或者先补 call/effect metadata 的准确性；不应再扩大 post-rewrite cleanup。
