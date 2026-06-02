@@ -1475,3 +1475,105 @@ vector    store        access         partial  full         71
 
 - 固定三目标里剩下的 GPR partial metadata load/store 都是 `value_shape=full`。
 - 下一步不应再把这些当成“直接 partial IR access 未进 SSA”，而应继续处理 partial metadata/full backing value 的 prototype cleanup、callsite 当前值和 return/input 绑定。
+
+## 阶段 D 小步：共享 return successor 的多前驱返回候选
+
+当前 `returnTrialsBefore()` 只处理两类形态：
+
+- return 指令前同 block 内有 ABI output register store。
+- return block 沿唯一前驱链能回看到 ABI output register store。
+
+这会漏掉一种常见 CFG：多个 predecessor 先各自写同一个返回寄存器，然后汇入同一个 shared successor，shared successor 里只有 `ret`。这种形态如果每条前驱都写了同一个 ABI output slot，且值等价，就可以作为返回候选；如果任一前驱缺 store 或值冲突，则仍要保守跳过。
+
+本轮只补这个窄规则，不做任意 CFG value query：
+
+- return block 自身没有 return trial 时才尝试。
+- 只处理 predecessor 数量大于等于 2 的 shared successor。
+- 以第一条 predecessor 的 return trial 为基准。
+- 每个其它 predecessor 必须能在 terminator 前找到同 slot return trial。
+- 所有 store value 必须通过 `sameReturnStoreValue()` 判定等价。
+- 不处理缺 store、跨 call、不同 slot、值不等价的情况。
+
+改动文件和函数：
+
+- `lib/passes/NativePrototypeRecovery.cpp:1571`
+  - 新增 `matchingReturnTrialForSlot()`，从一组 return trial 中按 ABI slot 查找候选。
+- `lib/passes/NativePrototypeRecovery.cpp:1600`
+  - 新增 `returnTrialsFromAllPredecessors()`，对 shared successor 的所有 predecessor 做保守合并。
+- `lib/passes/NativePrototypeRecovery.cpp:1663`
+  - `returnTrialsBefore()` 在唯一前驱链回看前，先尝试多前驱 shared successor 返回候选。
+- `tests/native_prototype_recovery_test.cpp:1934`
+  - 新增 `createSharedSuccessorReturnStoreFunction()`，构造同值、冲突值、缺 store 三种 shared successor 样例。
+- `tests/native_prototype_recovery_test.cpp:2453`
+  - 将三种样例加入主测试模块。
+- `tests/native_prototype_recovery_test.cpp:2612`
+  - 更新 summary 计数。
+- `tests/native_prototype_recovery_test.cpp:2686`
+  - 断言同值 shared predecessor 会标 `RAX` return candidate，冲突值和缺 store 不会标。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-shared-return-pred-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-shared-return-pred-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 40s | 41s |
+| `libuv:shared-library` | 106s | 106s |
+| `memcached:executable` | 57s | 57s |
+
+残留统计：
+
+```text
+category  access_kind  metadata_kind  shape    value_shape  count
+gpr       load         access         full     full         39
+gpr       load         access         partial  full         9
+gpr       load         external_input full     full         3191
+gpr       store        access         full     full         3601
+gpr       store        access         partial  full         11
+other     load         access         full     full         8
+other     load         external_input full     full         50
+other     store        access         partial  full         1
+vector    load         external_input full     full         70
+vector    store        access         partial  full         71
+```
+
+抽查：
+
+- `uv_translate_sys_error` 仍保持 `void`，因为两条路径的 `RAX` value 不等价，本轮规则正确跳过。
+- 固定三目标 residue 没有下降，但 shared successor 返回候选这个 CFG 形态已经有正反例覆盖。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 修了真实 CFG 漏恢复形态，但固定三目标没有 residue 下降。 |
+| 理解成本 | 4 | 多了一个 all-predecessor 合并路径，但条件集中且保守。 |
+| 维护成本 | 4 | 后续统一 current-value 查询时，这段逻辑应迁移到共享查询接口。 |
+
+有没有更好的方案：
+
+- 长期应实现统一 `valueBefore(ret, storage)`，让 return recovery、callsite rewrite、cleanup 共用一套 CFG SSA 查询。
+- 本轮只补 all-predecessor shared successor，是为了避免在没有统一接口前扩大 CFG 推理范围。

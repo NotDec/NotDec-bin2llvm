@@ -1931,6 +1931,45 @@ llvm::Function *createConflictingReturnStoreFunction(
   return function;
 }
 
+llvm::Function *createSharedSuccessorReturnStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName, bool sameValue, bool missingRightStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *exit = llvm::BasicBlock::Create(context, "exit", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x7777), global);
+  leftStore->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, registerName));
+  builder.CreateBr(exit);
+
+  builder.SetInsertPoint(right);
+  if (!missingRightStore) {
+    uint64_t value = sameValue ? 0x7777 : 0x8888;
+    llvm::StoreInst *rightStore = builder.CreateStore(
+        llvm::ConstantInt::get(global->getValueType(), value), global);
+    rightStore->setMetadata("notdec.register.access",
+                            registerAccessMetadata(context, registerName));
+  }
+  builder.CreateBr(exit);
+
+  builder.SetInsertPoint(exit);
+  builder.CreateRetVoid();
+
+  return function;
+}
+
 llvm::Function *createTwoOutputReturnStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *first,
     const std::string &firstRegisterName, llvm::GlobalVariable *second,
@@ -2411,6 +2450,15 @@ int main() {
   llvm::Function *conflictingReturnFunction =
       createConflictingReturnStoreFunction(module, "return_rax_conflict", rax,
                                            "RAX");
+  llvm::Function *sharedPredReturnFunction =
+      createSharedSuccessorReturnStoreFunction(
+          module, "return_rax_shared_pred", rax, "RAX", true, false);
+  llvm::Function *sharedPredConflictReturnFunction =
+      createSharedSuccessorReturnStoreFunction(
+          module, "return_rax_shared_pred_conflict", rax, "RAX", false, false);
+  llvm::Function *sharedPredMissingReturnFunction =
+      createSharedSuccessorReturnStoreFunction(
+          module, "return_rax_shared_pred_missing", rax, "RAX", true, true);
   llvm::Function *twoOutputReturnFunction =
       createTwoOutputReturnStoreFunction(module, "return_rdx_rax_order", rdx,
                                          "RDX", rax, "RAX");
@@ -2561,16 +2609,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 49, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 52, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 23,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 21,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 33,
+  ok &= expect(summary.ReturnCandidates == 34,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 48,
+  ok &= expect(summary.RewriteEligibleFunctions == 51,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 30,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 31,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -2635,6 +2683,17 @@ int main() {
                                     "notdec.prototype.return_candidates",
                                     "RAX"),
                "conflicting RAX return was incorrectly marked as a candidate");
+  ok &= expect(metadataHasRegister(*sharedPredReturnFunction,
+                                   "notdec.prototype.return_candidates", "RAX"),
+               "shared predecessor RAX return was not marked as a candidate");
+  ok &= expect(!metadataHasRegister(*sharedPredConflictReturnFunction,
+                                    "notdec.prototype.return_candidates",
+                                    "RAX"),
+               "conflicting shared predecessor RAX return was marked");
+  ok &= expect(!metadataHasRegister(*sharedPredMissingReturnFunction,
+                                    "notdec.prototype.return_candidates",
+                                    "RAX"),
+               "missing shared predecessor RAX return was marked");
   ok &= expect(metadataRegisterAt(*twoOutputReturnFunction,
                                   "notdec.prototype.return_candidates", 0,
                                   "RAX"),

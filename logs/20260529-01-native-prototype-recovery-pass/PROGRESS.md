@@ -618,6 +618,9 @@
     - 输出：`/tmp/notdec-bin2llvm-partial-storage-ssa-gate`
   - [x] 扩展 residue audit 输出 `value_shape`，区分 metadata partial 和 IR value 是否已经是完整 backing。
     - 文件：`scripts/native-register-residue-audit.py`、`tests/native_register_residue_audit_test.py`
+  - [x] 支持 shared return successor 的 all-predecessor 返回候选：所有前驱都写同一 ABI output 且值等价时才恢复，冲突或缺 store 保守跳过。
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-shared-return-pred-gate`
 
 ## 记录规则
 

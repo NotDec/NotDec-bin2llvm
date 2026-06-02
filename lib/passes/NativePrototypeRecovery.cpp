@@ -1568,6 +1568,16 @@ std::vector<NativeParamTrial> returnTrialsBeforeInstruction(
   return trials;
 }
 
+std::optional<NativeParamTrial> matchingReturnTrialForSlot(
+    llvm::ArrayRef<NativeParamTrial> trials, uint64_t slot) {
+  for (const NativeParamTrial &trial : trials) {
+    if (trial.Slot == slot) {
+      return trial;
+    }
+  }
+  return std::nullopt;
+}
+
 bool hasConflictingReturnTrialValue(
     llvm::ArrayRef<NativeParamTrial> trials,
     const std::map<uint64_t, NativeParamTrial> &firstTrialsBySlot,
@@ -1587,6 +1597,58 @@ bool hasConflictingReturnTrialValue(
   return false;
 }
 
+std::vector<NativeParamTrial> returnTrialsFromAllPredecessors(
+    llvm::BasicBlock &block, const NativePrototypeModel &model) {
+  std::vector<llvm::BasicBlock *> predecessors;
+  for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
+    predecessors.push_back(predecessor);
+  }
+  if (predecessors.size() < 2) {
+    return {};
+  }
+
+  std::vector<NativeParamTrial> firstTrials =
+      returnTrialsBeforeInstruction(*predecessors.front()->getTerminator(),
+                                    model);
+  if (firstTrials.empty()) {
+    return {};
+  }
+
+  std::vector<NativeParamTrial> result;
+  for (const NativeParamTrial &firstTrial : firstTrials) {
+    bool allPredecessorsMatch = true;
+    std::vector<llvm::StoreInst *> stores;
+    if (firstTrial.Store != nullptr) {
+      stores.push_back(firstTrial.Store);
+    }
+
+    for (llvm::BasicBlock *predecessor :
+         llvm::ArrayRef<llvm::BasicBlock *>(predecessors).drop_front()) {
+      std::vector<NativeParamTrial> trials =
+          returnTrialsBeforeInstruction(*predecessor->getTerminator(), model);
+      std::optional<NativeParamTrial> matching =
+          matchingReturnTrialForSlot(trials, firstTrial.Slot);
+      if (!matching || firstTrial.Value == nullptr ||
+          matching->Value == nullptr ||
+          !sameReturnStoreValue(*firstTrial.Value, *matching->Value)) {
+        allPredecessorsMatch = false;
+        break;
+      }
+      if (matching->Store != nullptr) {
+        stores.push_back(matching->Store);
+      }
+    }
+
+    if (!allPredecessorsMatch) {
+      continue;
+    }
+    NativeParamTrial trial = firstTrial;
+    trial.Store = stores.empty() ? nullptr : stores.front();
+    result.push_back(std::move(trial));
+  }
+  return result;
+}
+
 llvm::BasicBlock *uniquePredecessor(llvm::BasicBlock &block) {
   llvm::BasicBlock *result = nullptr;
   for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
@@ -1602,6 +1664,11 @@ std::vector<NativeParamTrial> returnTrialsBefore(
     llvm::ReturnInst &ret, const NativePrototypeModel &model) {
   std::vector<NativeParamTrial> trials =
       returnTrialsBeforeInstruction(ret, model);
+  if (!trials.empty()) {
+    return trials;
+  }
+
+  trials = returnTrialsFromAllPredecessors(*ret.getParent(), model);
   if (!trials.empty()) {
     return trials;
   }
