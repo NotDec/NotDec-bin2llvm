@@ -1232,3 +1232,103 @@ python3 scripts/native-register-residue-audit.py \
 
 - 长期应把这类逻辑放入统一的 `valueBefore(inst, storage)` 查询模块。
 - 本轮先内联在 `NativeRegisterSSA`，因为当前目标只是消除明显重复 load，代码面小且风险低。
+
+## 阶段 D 小步：partial metadata 的完整 backing store 参与返回候选
+
+固定三目标里还有一些 `store i64 ..., @RAX`，但 `notdec.register.access` 标的是 `AL` / `EAX`。其中一类不是普通 partial write，而是 lowering 已经生成完整 backing storage value，只是 metadata 仍保留原始 access name。
+
+典型例子：
+
+- `uv_is_closing` 最后 `store i64 %4, ptr @RAX`，metadata 是 `base=RAX,name=AL,size=1`。
+- 这实际已经有完整 `RAX` backing value，可以作为返回候选。
+- 旧逻辑只用 metadata `name` 匹配 ABI output，所以 `AL` / `EAX` 匹配不到 ABI 的 `RAX`，导致函数保持 `void`，返回 store 残留。
+
+本轮只放宽这个窄条件：
+
+- 如果 metadata `name` 不能匹配 ABI output，但 `base` 能匹配。
+- store 的 value type 是完整 `i64`。
+- store 目标 global 也是 `i64`，且 global 的 `notdec.register name` 等于 metadata `base`。
+- 满足这些条件时，按 `base` 作为返回 register。
+
+真正只在部分路径写返回的旧负例仍保持不候选。
+
+改动文件和函数：
+
+- `lib/passes/NativePrototypeRecovery.cpp:1518`
+  - `returnTrialsBeforeInstruction()` 在 metadata `name` 匹配失败时，尝试用 `base` 匹配 ABI output。
+  - fallback 只接受完整 `i64` backing store，并校验 store 目标 global 的 register name 等于 metadata `base`。
+- `tests/native_prototype_recovery_test.cpp:1832`
+  - 新增 `createFullStoragePartialMetadataReturnStoreFunction()`，覆盖 `base=RAX,name=AL` 但 store value 是完整 `i64` 的返回样例。
+- `tests/native_prototype_recovery_test.cpp:2401`
+  - 将新样例加入主测试模块。
+- `tests/native_prototype_recovery_test.cpp:2564`
+  - 更新 summary 计数。
+- `tests/native_prototype_recovery_test.cpp:2625`
+  - 断言完整 backing store 的 partial metadata 返回能标成 `RAX` return candidate。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+ctest --test-dir build -R 'notdec.native_prototype_recovery.input_candidates' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+ctest --test-dir build --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-partial-return-base-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-partial-return-base-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 107s | 105s |
+| `memcached:executable` | 57s | 57s |
+
+残留对比：
+
+| kind | 上一轮 | 本轮 |
+| --- | ---: | ---: |
+| `gpr store access partial` | 14 | 11 |
+| `gpr store access full` | 3601 | 3601 |
+| `gpr load access full` | 39 | 39 |
+| `gpr load access partial` | 9 | 9 |
+| `flags` | 0 | 0 |
+
+抽查：
+
+- `uv_is_closing` 从 `void` 变成 `i64 @uv_is_closing(i64 ...)`。
+- `uv_os_getenv` 从 partial `AL` return store 残留推进到 `i64` 返回。
+- `uv_translate_sys_error` 仍保持保守，因为存在多路径/冲突形态，不能靠本轮规则证明。
+
+判断：
+
+- 这不是把 partial write 全部当 full write，只处理 lowering 已经给出完整 backing value 的返回 store。
+- 固定三目标 partial GPR store 残留下降 `3`，耗时没有明显退化。
+- 后续真正 partial write 仍需要 storage range SSA 或更精确的 read-modify-write 语义。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 只下降 3 个 partial store，但修正了真实返回签名漏恢复。 |
+| 理解成本 | 4 | 增加了 `name` fallback 到 `base` 的窄条件，需要理解 metadata name/base 区别。 |
+| 维护成本 | 4 | 条件较保守，后续 range SSA 完成后可能可替换为统一 storage 匹配。 |
+
+有没有更好的方案：
+
+- 长期应让 ABI storage 匹配支持 range/base，而不是在 return trial 里补局部 fallback。
+- 本轮先修返回候选漏标，因为它会直接影响 signature rewrite 和返回语义。

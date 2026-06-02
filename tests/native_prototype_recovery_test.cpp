@@ -1829,6 +1829,23 @@ llvm::Function *createPartialReturnStoreFunction(
   return function;
 }
 
+llvm::Function *createFullStoragePartialMetadataReturnStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x44), global);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RAX", 0, 1, "AL"));
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createUniquePredecessorReturnStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName) {
@@ -2381,6 +2398,9 @@ int main() {
   llvm::Function *partialReturnFunction =
       createPartialReturnStoreFunction(module, "return_rax_partial", rax,
                                        "RAX");
+  llvm::Function *fullStoragePartialMetadataReturnFunction =
+      createFullStoragePartialMetadataReturnStoreFunction(
+          module, "return_rax_full_storage_partial_metadata", rax);
   llvm::Function *uniquePredReturnFunction =
       createUniquePredecessorReturnStoreFunction(module,
                                                  "return_rax_unique_pred", rax,
@@ -2541,16 +2561,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 48, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 49, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 23,
                "unexpected external input count");
   ok &= expect(summary.InputCandidates == 21,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 32,
+  ok &= expect(summary.ReturnCandidates == 33,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 47,
+  ok &= expect(summary.RewriteEligibleFunctions == 48,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 29,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 30,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -2602,6 +2622,9 @@ int main() {
                                     "notdec.prototype.return_candidates",
                                     "RAX"),
                "partial RAX return was incorrectly marked as a candidate");
+  ok &= expect(metadataHasRegister(*fullStoragePartialMetadataReturnFunction,
+                                   "notdec.prototype.return_candidates", "RAX"),
+               "full storage RAX return with partial metadata was not marked");
   ok &= expect(metadataHasRegister(*uniquePredReturnFunction,
                                    "notdec.prototype.return_candidates", "RAX"),
                "unique predecessor RAX return was not marked as a candidate");

@@ -610,6 +610,9 @@
   - [x] 复用同一 call barrier 后的重复 register load，减少 call output 之后的重复 GPR load 残留。
     - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-register-residue-repeated-load-gate`
+  - [x] 让 partial metadata 但完整 backing storage 的返回 store 按 metadata base 进入返回候选，修正部分返回签名漏恢复。
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-partial-return-base-gate`
 
 ## 记录规则
 

@@ -1524,10 +1524,28 @@ std::vector<NativeParamTrial> returnTrialsBeforeInstruction(
       continue;
     }
     std::optional<std::string> name = metadataField(*access, "name");
-    if (!name) {
+    std::optional<std::string> base = metadataField(*access, "base");
+    std::optional<std::string> outputName = name;
+    std::optional<NativeStorageMatch> match;
+    if (outputName) {
+      match = model.findOutputRegister(*outputName);
+    }
+    if (!match && base && store->getValueOperand() != nullptr &&
+        store->getValueOperand()->getType()->isIntegerTy(64)) {
+      auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+          store->getPointerOperand()->stripPointerCasts());
+      if (global != nullptr && global->getValueType()->isIntegerTy(64)) {
+        llvm::MDNode *globalMetadata = global->getMetadata("notdec.register");
+        if (globalMetadata != nullptr &&
+            metadataField(*globalMetadata, "name") == *base) {
+          outputName = base;
+          match = model.findOutputRegister(*outputName);
+        }
+      }
+    }
+    if (!outputName) {
       continue;
     }
-    std::optional<NativeStorageMatch> match = model.findOutputRegister(*name);
     if (!match) {
       continue;
     }
@@ -1536,7 +1554,7 @@ std::vector<NativeParamTrial> returnTrialsBeforeInstruction(
     }
 
     NativeParamTrial trial;
-    trial.RegisterName = *name;
+    trial.RegisterName = *outputName;
     trial.Slot = match->Slot;
     trial.Store = store;
     trial.Value = store->getValueOperand();
