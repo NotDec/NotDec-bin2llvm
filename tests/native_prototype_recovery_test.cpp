@@ -127,6 +127,16 @@ void attachTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachThreeInputTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+  abi.Inputs.push_back(inputRegister("RDI"));
+  abi.Inputs.push_back(inputRegister("RSI"));
+  abi.Inputs.push_back(inputRegister("RDX"));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 void attachPreservedInputTestAbi(llvm::Module &module,
                                  const std::string &registerName) {
   notdec::bin2llvm::NativeAbiSpec abi;
@@ -701,6 +711,41 @@ llvm::Function *createTwoInputStoreCallerFunction(
   *callOut = call;
   *firstArgumentOut = firstArgument;
   *secondArgumentOut = secondArgument;
+  return function;
+}
+
+llvm::Function *createThreeInputStoreCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *firstInput, const std::string &firstRegisterName,
+    llvm::GlobalVariable *secondInput, const std::string &secondRegisterName,
+    llvm::GlobalVariable *thirdInput, const std::string &thirdRegisterName,
+    llvm::CallInst **callOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *firstArgument =
+      llvm::ConstantInt::get(firstInput->getValueType(), 0x1111);
+  llvm::StoreInst *firstStore = builder.CreateStore(firstArgument, firstInput);
+  firstStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, firstRegisterName));
+  llvm::Value *secondArgument =
+      llvm::ConstantInt::get(secondInput->getValueType(), 0x2222);
+  llvm::StoreInst *secondStore =
+      builder.CreateStore(secondArgument, secondInput);
+  secondStore->setMetadata("notdec.register.access",
+                           registerAccessMetadata(context, secondRegisterName));
+  llvm::Value *thirdArgument =
+      llvm::ConstantInt::get(thirdInput->getValueType(), 0x3333);
+  llvm::StoreInst *thirdStore = builder.CreateStore(thirdArgument, thirdInput);
+  thirdStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, thirdRegisterName));
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+  *callOut = call;
   return function;
 }
 
@@ -5644,6 +5689,103 @@ int main() {
                "declaration call input rewrite kept old register store");
   if (llvm::verifyModule(declarationCallInputRewriteModule, &llvm::errs())) {
     std::cerr << "declaration call input rewrite module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputPrefixModule(
+      "native-prototype-declaration-call-input-prefix-test", context);
+  llvm::GlobalVariable *declarationCallInputPrefixRdi =
+      createRegisterGlobal(declarationCallInputPrefixModule, "RDI");
+  llvm::GlobalVariable *declarationCallInputPrefixRsi =
+      createRegisterGlobal(declarationCallInputPrefixModule, "RSI");
+  llvm::GlobalVariable *declarationCallInputPrefixRdx =
+      createRegisterGlobal(declarationCallInputPrefixModule, "RDX");
+  attachThreeInputTestAbi(declarationCallInputPrefixModule);
+  auto *declarationCallInputPrefixCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputPrefixCallee =
+      llvm::Function::Create(declarationCallInputPrefixCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_prefix_callee",
+                             declarationCallInputPrefixModule);
+  llvm::CallInst *declarationCallInputPrefixFirstCall = nullptr;
+  createThreeInputStoreCallerFunction(
+      declarationCallInputPrefixModule,
+      "declaration_call_input_prefix_first",
+      declarationCallInputPrefixCallee, declarationCallInputPrefixRdi, "RDI",
+      declarationCallInputPrefixRsi, "RSI", declarationCallInputPrefixRdx,
+      "RDX", &declarationCallInputPrefixFirstCall);
+  llvm::Value *declarationCallInputPrefixSecondRdiArgument = nullptr;
+  llvm::Value *declarationCallInputPrefixSecondRsiArgument = nullptr;
+  llvm::CallInst *declarationCallInputPrefixSecondCall = nullptr;
+  createTwoInputStoreCallerFunction(
+      declarationCallInputPrefixModule,
+      "declaration_call_input_prefix_second",
+      declarationCallInputPrefixCallee, declarationCallInputPrefixRdi, "RDI",
+      declarationCallInputPrefixRsi, "RSI",
+      &declarationCallInputPrefixSecondCall,
+      &declarationCallInputPrefixSecondRdiArgument,
+      &declarationCallInputPrefixSecondRsiArgument);
+  notdec::bin2llvm::NativePrototypeRecoveryOptions prefixInputOptions;
+  prefixInputOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputPrefixModule, prefixInputOptions);
+  llvm::Function *prefixCalleeAfterRewrite =
+      declarationCallInputPrefixModule.getFunction(
+          "declaration_call_input_prefix_callee");
+  ok &= expect(prefixCalleeAfterRewrite != nullptr &&
+                   functionTypeShape(
+                       *prefixCalleeAfterRewrite->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef<llvm::Type *>{i64Param, i64Param}),
+               "declaration input prefix rewrite did not keep common prefix");
+  llvm::Function *declarationCallInputPrefixFirst =
+      declarationCallInputPrefixModule.getFunction(
+          "declaration_call_input_prefix_first");
+  llvm::Function *declarationCallInputPrefixSecond =
+      declarationCallInputPrefixModule.getFunction(
+          "declaration_call_input_prefix_second");
+  llvm::CallInst *declarationCallInputPrefixNewFirstCall = nullptr;
+  if (declarationCallInputPrefixFirst != nullptr) {
+    for (llvm::BasicBlock &block : *declarationCallInputPrefixFirst) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == prefixCalleeAfterRewrite) {
+          declarationCallInputPrefixNewFirstCall = call;
+        }
+      }
+    }
+  }
+  llvm::CallInst *declarationCallInputPrefixNewSecondCall = nullptr;
+  if (declarationCallInputPrefixSecond != nullptr) {
+    for (llvm::BasicBlock &block : *declarationCallInputPrefixSecond) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == prefixCalleeAfterRewrite) {
+          declarationCallInputPrefixNewSecondCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(declarationCallInputPrefixNewFirstCall != nullptr &&
+                   declarationCallInputPrefixNewFirstCall->arg_size() == 2,
+               "declaration input prefix rewrite did not update first call");
+  ok &= expect(declarationCallInputPrefixNewSecondCall != nullptr &&
+                   declarationCallInputPrefixNewSecondCall->arg_size() == 2,
+               "declaration input prefix rewrite did not update second call");
+  ok &= expect(declarationCallInputPrefixFirst != nullptr &&
+                   !hasRegisterStore(*declarationCallInputPrefixFirst, "RDI") &&
+                   !hasRegisterStore(*declarationCallInputPrefixFirst, "RSI") &&
+                   hasRegisterStore(*declarationCallInputPrefixFirst, "RDX"),
+               "declaration input prefix rewrite removed non-common input");
+  ok &= expect(declarationCallInputPrefixSecond != nullptr &&
+                   !hasRegisterStore(*declarationCallInputPrefixSecond, "RDI") &&
+                   !hasRegisterStore(*declarationCallInputPrefixSecond, "RSI"),
+               "declaration input prefix rewrite kept common input stores");
+  if (llvm::verifyModule(declarationCallInputPrefixModule, &llvm::errs())) {
+    std::cerr << "declaration call input prefix module verification failed\n";
     return EXIT_FAILURE;
   }
 

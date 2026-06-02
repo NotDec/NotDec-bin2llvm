@@ -588,6 +588,8 @@ llvm::StoreInst *localCallsiteInputStoreBeforeCall(
 
 void eraseCallsiteInputStores(llvm::ArrayRef<llvm::StoreInst *> inputStores);
 
+bool callClobbersRegister(llvm::CallBase &call, llvm::StringRef registerName);
+
 struct DeclarationCallInputRewrite {
   llvm::CallInst *Call = nullptr;
   std::vector<NativeRecoveredPrototypeParam> Inputs;
@@ -660,21 +662,32 @@ std::vector<NativeRecoveredPrototypeParam> declarationInputParamsBeforeCall(
   return params;
 }
 
-bool declarationInputParamsMatch(
-    llvm::ArrayRef<NativeRecoveredPrototypeParam> left,
-    llvm::ArrayRef<NativeRecoveredPrototypeParam> right) {
-  if (left.size() != right.size()) {
-    return false;
+bool sameDeclarationInputParam(const NativeRecoveredPrototypeParam &left,
+                               const NativeRecoveredPrototypeParam &right) {
+  return left.StorageKind == right.StorageKind &&
+         left.RegisterName == right.RegisterName && left.Size == right.Size &&
+         left.Slot == right.Slot;
+}
+
+std::vector<NativeRecoveredPrototypeParam> commonDeclarationInputPrefix(
+    llvm::ArrayRef<std::vector<NativeRecoveredPrototypeParam>> inputSets) {
+  std::vector<NativeRecoveredPrototypeParam> result;
+  if (inputSets.empty()) {
+    return result;
   }
-  for (uint64_t index = 0; index < left.size(); ++index) {
-    if (left[index].StorageKind != right[index].StorageKind ||
-        left[index].RegisterName != right[index].RegisterName ||
-        left[index].Size != right[index].Size ||
-        left[index].Slot != right[index].Slot) {
-      return false;
+  result = inputSets.front();
+  for (const std::vector<NativeRecoveredPrototypeParam> &inputs : inputSets) {
+    uint64_t shared = 0;
+    while (shared < result.size() && shared < inputs.size() &&
+           sameDeclarationInputParam(result[shared], inputs[shared])) {
+      ++shared;
+    }
+    result.resize(shared);
+    if (result.empty()) {
+      return result;
     }
   }
-  return true;
+  return result;
 }
 
 std::optional<DeclarationCallInputRewrite> declarationCallInputRewriteForCall(
@@ -693,7 +706,9 @@ std::optional<DeclarationCallInputRewrite> declarationCallInputRewriteForCall(
     }
     llvm::StoreInst *inputStore =
         localCallsiteInputStoreBeforeCall(call, input.RegisterName, paramType);
-    if (inputStore != nullptr && inputStore->getValueOperand() != *argument) {
+    if (inputStore != nullptr &&
+        (inputStore->getValueOperand() != *argument ||
+         !callClobbersRegister(call, input.RegisterName))) {
       inputStore = nullptr;
     }
     rewrite.Arguments.push_back(*argument);
@@ -706,12 +721,14 @@ DeclarationCallInputRewrites collectDeclarationCallInputRewrites(
     llvm::Module &module, const NativePrototypeModel &model) {
   DeclarationCallInputRewrites rewrites;
   for (llvm::Function &callee : module) {
-    if (!callee.isDeclaration() || callee.arg_size() != 0 ||
+    if (!callee.isDeclaration() || callee.isIntrinsic() ||
+        callee.arg_size() != 0 ||
         !callee.getReturnType()->isVoidTy()) {
       continue;
     }
 
-    std::optional<std::vector<NativeRecoveredPrototypeParam>> expectedInputs;
+    std::vector<std::pair<llvm::CallInst *, std::vector<NativeRecoveredPrototypeParam>>>
+        callInputSets;
     std::vector<DeclarationCallInputRewrite> callRewrites;
     bool safe = true;
     for (llvm::User *user : callee.users()) {
@@ -728,22 +745,33 @@ DeclarationCallInputRewrites collectDeclarationCallInputRewrites(
         safe = false;
         break;
       }
-      if (!expectedInputs) {
-        expectedInputs = inputs;
-      } else if (!declarationInputParamsMatch(*expectedInputs, inputs)) {
-        safe = false;
-        break;
-      }
+      callInputSets.push_back({call, std::move(inputs)});
+    }
+    if (!safe || callInputSets.empty()) {
+      continue;
+    }
 
+    std::vector<std::vector<NativeRecoveredPrototypeParam>> inputSets;
+    inputSets.reserve(callInputSets.size());
+    for (const auto &[call, inputs] : callInputSets) {
+      inputSets.push_back(inputs);
+    }
+    std::vector<NativeRecoveredPrototypeParam> commonInputs =
+        commonDeclarationInputPrefix(inputSets);
+    if (commonInputs.empty()) {
+      continue;
+    }
+
+    for (auto &[call, inputs] : callInputSets) {
       std::optional<DeclarationCallInputRewrite> rewrite =
-          declarationCallInputRewriteForCall(*call, inputs);
+          declarationCallInputRewriteForCall(*call, commonInputs);
       if (!rewrite) {
         safe = false;
         break;
       }
       callRewrites.push_back(std::move(*rewrite));
     }
-    if (safe && expectedInputs && !callRewrites.empty()) {
+    if (safe && !callRewrites.empty()) {
       rewrites[&callee] = std::move(callRewrites);
     }
   }
