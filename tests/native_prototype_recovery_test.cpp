@@ -5586,6 +5586,108 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  llvm::Module declarationCallInputRewriteModule(
+      "native-prototype-declaration-call-input-rewrite-test", context);
+  llvm::GlobalVariable *declarationCallInputRewriteRdi =
+      createRegisterGlobal(declarationCallInputRewriteModule, "RDI");
+  attachTestAbi(declarationCallInputRewriteModule);
+  auto *declarationCallInputRewriteCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputRewriteCallee =
+      llvm::Function::Create(declarationCallInputRewriteCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_rewrite_callee",
+                             declarationCallInputRewriteModule);
+  llvm::CallInst *declarationCallInputOldCall = nullptr;
+  createInputStoreCallerFunction(
+      declarationCallInputRewriteModule,
+      "declaration_call_input_rewrite_user",
+      declarationCallInputRewriteCallee, declarationCallInputRewriteRdi, "RDI",
+      &declarationCallInputOldCall);
+  notdec::bin2llvm::NativePrototypeRecoveryOptions declarationInputOptions;
+  declarationInputOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputRewriteModule, declarationInputOptions);
+  llvm::Function *rewrittenDeclarationInputCallee =
+      declarationCallInputRewriteModule.getFunction(
+          "declaration_call_input_rewrite_callee");
+  ok &= expect(rewrittenDeclarationInputCallee != nullptr &&
+                   functionTypeShape(
+                       *rewrittenDeclarationInputCallee->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef<llvm::Type *>{i64Param}),
+               "declaration call input callee was not rewritten to void(i64)");
+  llvm::Function *declarationCallInputRewriteUser =
+      declarationCallInputRewriteModule.getFunction(
+          "declaration_call_input_rewrite_user");
+  llvm::CallInst *declarationCallInputNewCall = nullptr;
+  if (declarationCallInputRewriteUser != nullptr) {
+    for (llvm::BasicBlock &block : *declarationCallInputRewriteUser) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == rewrittenDeclarationInputCallee) {
+          declarationCallInputNewCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(declarationCallInputNewCall != nullptr &&
+                   declarationCallInputNewCall->arg_size() == 1,
+               "declaration call input rewrite did not add one call argument");
+  ok &= expect(declarationCallInputNewCall != nullptr &&
+                   llvm::isa<llvm::ConstantInt>(
+                       declarationCallInputNewCall->getArgOperand(0)),
+               "declaration call input rewrite did not use register store value");
+  ok &= expect(declarationCallInputRewriteUser != nullptr &&
+                   !hasRegisterStore(*declarationCallInputRewriteUser, "RDI"),
+               "declaration call input rewrite kept old register store");
+  if (llvm::verifyModule(declarationCallInputRewriteModule, &llvm::errs())) {
+    std::cerr << "declaration call input rewrite module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputMismatchModule(
+      "native-prototype-declaration-call-input-mismatch-test", context);
+  llvm::GlobalVariable *declarationCallInputMismatchRdi =
+      createRegisterGlobal(declarationCallInputMismatchModule, "RDI");
+  llvm::GlobalVariable *declarationCallInputMismatchRsi =
+      createRegisterGlobal(declarationCallInputMismatchModule, "RSI");
+  attachTestAbi(declarationCallInputMismatchModule);
+  auto *declarationCallInputMismatchCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputMismatchCallee =
+      llvm::Function::Create(declarationCallInputMismatchCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_mismatch_callee",
+                             declarationCallInputMismatchModule);
+  llvm::CallInst *declarationCallInputMismatchFirstCall = nullptr;
+  createInputStoreCallerFunction(
+      declarationCallInputMismatchModule,
+      "declaration_call_input_mismatch_first",
+      declarationCallInputMismatchCallee, declarationCallInputMismatchRdi,
+      "RDI", &declarationCallInputMismatchFirstCall);
+  llvm::CallInst *declarationCallInputMismatchSecondCall = nullptr;
+  createInputStoreCallerFunction(
+      declarationCallInputMismatchModule,
+      "declaration_call_input_mismatch_second",
+      declarationCallInputMismatchCallee, declarationCallInputMismatchRsi,
+      "RSI", &declarationCallInputMismatchSecondCall);
+  notdec::bin2llvm::NativePrototypeRecoveryOptions mismatchInputOptions;
+  mismatchInputOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputMismatchModule, mismatchInputOptions);
+  llvm::Function *mismatchCalleeAfterRewrite =
+      declarationCallInputMismatchModule.getFunction(
+          "declaration_call_input_mismatch_callee");
+  ok &= expect(mismatchCalleeAfterRewrite != nullptr &&
+                   mismatchCalleeAfterRewrite->arg_size() == 0,
+               "declaration input rewrite crossed mismatched callsite inputs");
+  if (llvm::verifyModule(declarationCallInputMismatchModule, &llvm::errs())) {
+    std::cerr << "declaration call input mismatch module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
   llvm::Module inputReturnCallsiteModule(
       "native-prototype-input-return-callsite-rewrite-test", context);
   llvm::GlobalVariable *inputReturnCallsiteRdi =

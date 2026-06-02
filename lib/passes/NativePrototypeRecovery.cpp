@@ -579,6 +579,209 @@ void rewriteDeclarationCallOutputs(llvm::Module &module,
   }
 }
 
+std::optional<llvm::Value *> callsiteInputValueBeforeCall(
+    llvm::CallInst &call, const NativeRecoveredPrototypeParam &input,
+    llvm::Type *paramType);
+
+llvm::StoreInst *localCallsiteInputStoreBeforeCall(
+    llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *valueType);
+
+void eraseCallsiteInputStores(llvm::ArrayRef<llvm::StoreInst *> inputStores);
+
+struct DeclarationCallInputRewrite {
+  llvm::CallInst *Call = nullptr;
+  std::vector<NativeRecoveredPrototypeParam> Inputs;
+  std::vector<llvm::Value *> Arguments;
+  std::vector<llvm::StoreInst *> InputStores;
+};
+
+using DeclarationCallInputRewrites =
+    std::map<llvm::Function *, std::vector<DeclarationCallInputRewrite>>;
+
+std::optional<NativeRecoveredPrototypeParam> declarationInputParamForStore(
+    llvm::StoreInst &store, const NativePrototypeModel &model) {
+  llvm::MDNode *metadata = store.getMetadata("notdec.register.access");
+  if (metadata == nullptr) {
+    return std::nullopt;
+  }
+  std::optional<std::string> registerName = metadataField(*metadata, "name");
+  if (!registerName) {
+    return std::nullopt;
+  }
+  std::optional<NativeStorageMatch> match =
+      model.findInputRegister(*registerName);
+  if (!match) {
+    return std::nullopt;
+  }
+  auto *integer = llvm::dyn_cast<llvm::IntegerType>(
+      store.getValueOperand()->getType());
+  if (integer == nullptr || integer->getBitWidth() != 64) {
+    return std::nullopt;
+  }
+
+  NativeRecoveredPrototypeParam param;
+  param.RegisterName = *registerName;
+  param.StorageKind = "register";
+  param.Size = 8;
+  param.Slot = match->Slot;
+  return param;
+}
+
+std::vector<NativeRecoveredPrototypeParam> declarationInputParamsBeforeCall(
+    llvm::CallInst &call, const NativePrototypeModel &model) {
+  std::map<uint64_t, NativeRecoveredPrototypeParam> paramsBySlot;
+  for (auto iter = llvm::BasicBlock::reverse_iterator(call.getIterator()),
+            end = call.getParent()->rend();
+       iter != end; ++iter) {
+    if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
+      llvm::Function *callee = previousCall->getCalledFunction();
+      if (callee == nullptr || !callee->isIntrinsic()) {
+        break;
+      }
+      continue;
+    }
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter);
+    if (store == nullptr) {
+      continue;
+    }
+    std::optional<NativeRecoveredPrototypeParam> param =
+        declarationInputParamForStore(*store, model);
+    if (!param) {
+      continue;
+    }
+    paramsBySlot.try_emplace(param->Slot, *param);
+  }
+
+  std::vector<NativeRecoveredPrototypeParam> params;
+  params.reserve(paramsBySlot.size());
+  for (auto &[slot, param] : paramsBySlot) {
+    params.push_back(std::move(param));
+  }
+  return params;
+}
+
+bool declarationInputParamsMatch(
+    llvm::ArrayRef<NativeRecoveredPrototypeParam> left,
+    llvm::ArrayRef<NativeRecoveredPrototypeParam> right) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  for (uint64_t index = 0; index < left.size(); ++index) {
+    if (left[index].StorageKind != right[index].StorageKind ||
+        left[index].RegisterName != right[index].RegisterName ||
+        left[index].Size != right[index].Size ||
+        left[index].Slot != right[index].Slot) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<DeclarationCallInputRewrite> declarationCallInputRewriteForCall(
+    llvm::CallInst &call, llvm::ArrayRef<NativeRecoveredPrototypeParam> inputs) {
+  DeclarationCallInputRewrite rewrite;
+  rewrite.Call = &call;
+  rewrite.Inputs.assign(inputs.begin(), inputs.end());
+  rewrite.Arguments.reserve(inputs.size());
+  rewrite.InputStores.reserve(inputs.size());
+  for (const NativeRecoveredPrototypeParam &input : inputs) {
+    llvm::Type *paramType = llvm::Type::getInt64Ty(call.getContext());
+    std::optional<llvm::Value *> argument =
+        callsiteInputValueBeforeCall(call, input, paramType);
+    if (!argument) {
+      return std::nullopt;
+    }
+    llvm::StoreInst *inputStore =
+        localCallsiteInputStoreBeforeCall(call, input.RegisterName, paramType);
+    if (inputStore != nullptr && inputStore->getValueOperand() != *argument) {
+      inputStore = nullptr;
+    }
+    rewrite.Arguments.push_back(*argument);
+    rewrite.InputStores.push_back(inputStore);
+  }
+  return rewrite;
+}
+
+DeclarationCallInputRewrites collectDeclarationCallInputRewrites(
+    llvm::Module &module, const NativePrototypeModel &model) {
+  DeclarationCallInputRewrites rewrites;
+  for (llvm::Function &callee : module) {
+    if (!callee.isDeclaration() || callee.arg_size() != 0 ||
+        !callee.getReturnType()->isVoidTy()) {
+      continue;
+    }
+
+    std::optional<std::vector<NativeRecoveredPrototypeParam>> expectedInputs;
+    std::vector<DeclarationCallInputRewrite> callRewrites;
+    bool safe = true;
+    for (llvm::User *user : callee.users()) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+      if (call == nullptr || call->getCalledFunction() != &callee ||
+          call->arg_size() != 0 || !call->getType()->isVoidTy()) {
+        safe = false;
+        break;
+      }
+
+      std::vector<NativeRecoveredPrototypeParam> inputs =
+          declarationInputParamsBeforeCall(*call, model);
+      if (inputs.empty()) {
+        safe = false;
+        break;
+      }
+      if (!expectedInputs) {
+        expectedInputs = inputs;
+      } else if (!declarationInputParamsMatch(*expectedInputs, inputs)) {
+        safe = false;
+        break;
+      }
+
+      std::optional<DeclarationCallInputRewrite> rewrite =
+          declarationCallInputRewriteForCall(*call, inputs);
+      if (!rewrite) {
+        safe = false;
+        break;
+      }
+      callRewrites.push_back(std::move(*rewrite));
+    }
+    if (safe && expectedInputs && !callRewrites.empty()) {
+      rewrites[&callee] = std::move(callRewrites);
+    }
+  }
+  return rewrites;
+}
+
+void rewriteDeclarationCallInputs(llvm::Module &module,
+                                  const NativePrototypeModel &model) {
+  DeclarationCallInputRewrites rewrites =
+      collectDeclarationCallInputRewrites(module, model);
+  for (auto &[callee, callRewrites] : rewrites) {
+    const std::vector<NativeRecoveredPrototypeParam> &inputs =
+        callRewrites.front().Inputs;
+    std::string originalName = callee->getName().str();
+    callee->setName(originalName + ".old");
+
+    std::vector<llvm::Type *> paramTypes(inputs.size(),
+                                         llvm::Type::getInt64Ty(module.getContext()));
+    auto *newType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(module.getContext()), paramTypes, false);
+    llvm::Function *rewritten =
+        llvm::Function::Create(newType, callee->getLinkage(), originalName,
+                               module);
+    rewritten->copyMetadata(callee, 0);
+    rewritten->setCallingConv(callee->getCallingConv());
+
+    for (const DeclarationCallInputRewrite &rewrite : callRewrites) {
+      llvm::IRBuilder<> builder(rewrite.Call);
+      llvm::CallInst *newCall = builder.CreateCall(
+          rewritten->getFunctionType(), rewritten, rewrite.Arguments);
+      newCall->setCallingConv(rewrite.Call->getCallingConv());
+      eraseCallsiteInputStores(rewrite.InputStores);
+      rewrite.Call->eraseFromParent();
+    }
+    callee->eraseFromParent();
+  }
+}
+
 bool hasUnsafeReturnValueLoad(
     llvm::ArrayRef<NativePrototypeReturnBinding> returnBindings) {
   // A return value that is still a register load can also be a direct
@@ -2897,6 +3100,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     NativePrototypeModuleRewriteSummary rewriteSummary =
         rewriteNativeRecoveredPrototypes(module);
     rewriteDeclarationCallOutputs(module, model);
+    rewriteDeclarationCallInputs(module, model);
     eraseDeadKilledByCallRegisterStores(module, *abi);
     eraseDeadNonReturnVectorStores(module);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;

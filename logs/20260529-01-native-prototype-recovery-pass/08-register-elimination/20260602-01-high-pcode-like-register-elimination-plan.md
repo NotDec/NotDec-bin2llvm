@@ -4453,3 +4453,104 @@ internal     notdec_native_132f0            6
 | 实现效果 | 2 | 没减少 residue，但把 177 个 declaration callsite input store 明确暴露出来。 |
 | 理解成本 | 1 | 只是在详情行上附加同块后续 call 信息。 |
 | 维护成本 | 2 | 同块判断仍保守；跨 block setup 和 invoke 以后要另补。 |
+
+## 2026-06-02 实现记录：declaration call 的简单寄存器输入 rewrite
+
+背景：
+
+- 上一轮审计显示，固定三目标里 202 个 `gpr store callsite_input_store` 中有 177 个指向 declaration。
+- internal direct callsite 在 recovered prototype rewrite 成功时已经能删除本地 input store；declaration 侧之前只有 output rewrite，没有 input rewrite。
+- 本轮只做保守子集：void declaration、所有 use 都是 void call、所有 callsite 的 ABI register input 集合一致，且参数值能用现有 `callsiteInputValueBeforeCall` 解析。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:591)
+  - 新增 `DeclarationCallInputRewrite`，记录 declaration call、ABI 输入、实参值和可删除的本地 input store。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:601)
+  - 新增 `declarationInputParamForStore`，只接受 ABI input register、i64 store，按 ABI slot 生成 recovered param。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:630)
+  - 新增 `declarationInputParamsBeforeCall`，从 call 前同块向后回看 register store，遇到非 intrinsic call 停止。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:705)
+  - 新增 `collectDeclarationCallInputRewrites`，要求 declaration 的所有 callsite 都是 `void()` 形态，并且输入寄存器集合完全一致。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:753)
+  - 新增 `rewriteDeclarationCallInputs`，把 declaration 改成 `void(i64...)`，重写所有 call，并删除能唯一绑定的本地 input store。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3099)
+  - signature rewrite pipeline 中，在 declaration output rewrite 后执行 declaration input rewrite。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:5589)
+  - 新增成功样例：`void()` declaration 前有 `RDI` store，rewrite 后 callee 类型为 `void(i64)`，call 带一个参数，旧 `RDI` store 被删除。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:5650)
+  - 新增 blocked 样例：同一 declaration 的两个 callsite 分别准备 `RDI` 和 `RSI`，输入集合不一致时不 rewrite。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-decl-input-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-decl-input-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 42s |
+| `libuv:shared-library` | 106s | 106s |
+| `memcached:executable` | 58s | 58s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         14
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3187
+gpr       store        access           full     full         no         3263
+gpr       store        access           partial  full         yes        5
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-wide-partial-gate` 相比：
+
+- `gpr store access full/full`：3308 -> 3263，少 45。
+- `gpr store callsite_input_store`：202 -> 157，少 45。
+- declaration callsite input store：177 -> 132，少 45。
+- internal callsite input store 仍为 25。
+
+判断：
+
+- 这一步减少了真实 register store residue，且只处理所有 callsite 输入形态一致的 declaration。
+- 剩余最多的 declaration target 仍是 `__assert_fail`，主要因为多参数/调用点形态不一致，不能靠这版简单规则硬改。
+- 固定三目标耗时与上一轮同量级，`libuv` signature rewrite 从 108s 回到 106s。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 固定三目标少 45 个 GPR store，直接推进 prototype 后 register cleanup。 |
+| 理解成本 | 3 | declaration input rewrite 是新路径，但复用了现有 callsite value resolver 和 store 删除逻辑。 |
+| 维护成本 | 3 | 规则保守；后续要扩展到多形态 declaration、已有参数、非 void 返回时需要继续加安全条件。 |
+
+有没有更好的方案：
+
+- 更完整方案是引入统一 current-value / call effect resolver，并从 ABI prototype 模型直接推 declaration 输入输出。
+- 本轮先做所有 callsite 一致的 void declaration，是因为收益明确且误改风险低。
