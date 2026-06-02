@@ -2070,3 +2070,106 @@ vector    store        access         partial  full         71
 
 - 更完整方案是让 prototype rewrite 分阶段：先完成所有函数自身 input/return binding，再做 caller-side input store cleanup。
 - 当前 batch rewrite 还会用 caller 的 return candidates，因此本轮用 `return_candidates == nullptr` 做保守保护。
+
+## 阶段 D 小步：声明调用返回 load 支持无 access metadata
+
+背景：
+
+- 前一轮已经能把 `call void @external(); load @RAX` 改成 `call i64 @external()`，但要求 load 自己带 `notdec.register.access`。
+- Bench2 里仍有一些声明调用后的 `load i64, ptr @RAX`，load 没有 access metadata，但 `@RAX` global 仍有 `notdec.register` metadata。
+- 这些 load 不会被 `native-register-residue-audit.py` 的 `access` 统计覆盖，但仍是实际寄存器 global 流量。
+
+本轮只放宽声明调用 output load 识别：
+
+- load/store 自己有 `notdec.register.access` 时，仍按原 metadata 的 `base` 判断。
+- load/store 没有 access metadata 时，只在 pointer 是带 `notdec.register` metadata 的 register global 时，用 global 的 `name` 当 base。
+- 仍要求同一 basic block 内，load 前最近的非 intrinsic call 是 declaration，且中间没有同 base store。
+- 仍只处理 ABI output register 和 `i64` 返回，不推断其他类型。
+
+改动文件和函数：
+
+- `lib/passes/NativePrototypeRecovery.cpp:351`
+  - 新增 `registerStorageBase()`，统一从 instruction access metadata 或 register global metadata 取 base。
+- `lib/passes/NativePrototypeRecovery.cpp:376`
+  - `isDeclarationCallOutputLoad()` 改用 `registerStorageBase()`，允许无 access metadata 的 register global load。
+- `lib/passes/NativePrototypeRecovery.cpp:402`
+  - `declarationCallOutputSource()` 同样改用 `registerStorageBase()`，保证同 base store 仍能阻断。
+- `lib/passes/NativePrototypeRecovery.cpp:431`
+  - `canRewriteDeclarationCallOutputLoad()` 改用 `registerStorageBase()` 查询 ABI output register。
+- `tests/native_prototype_recovery_test.cpp:4923`
+  - 在 declaration call output rewrite 测试里清掉 load 的 `notdec.register.access`，确认只靠 `@RAX` global metadata 也能 rewrite。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-decl-output-global-load-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-decl-output-global-load-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-decl-output-global-load-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-decl-output-global-load.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 106s | 106s |
+| `memcached:executable` | 57s | 56s |
+
+`native-register-residue-audit.py` 统计不变，因为它只统计带 access/external_input metadata 的访问：
+
+```text
+category  access_kind  metadata_kind  shape    value_shape  count
+gpr       load         access         full     full         13
+gpr       load         access         partial  full         3
+gpr       load         external_input full     full         3190
+gpr       store        access         full     full         3578
+gpr       store        access         partial  full         11
+other     load         access         full     full         8
+other     load         external_input full     full         49
+other     store        access         partial full         1
+vector    load         external_input full     full         70
+vector    store        access         partial  full         71
+```
+
+但无 metadata 的 register global load 明显下降：
+
+```text
+pattern                                      before  after
+%EAX = load i64, ptr @RAX, align 4          33      1
+load i64 from all register globals, no md    56      9
+```
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 不改变 metadata 审计数字，但固定三目标里无 metadata `@RAX` 返回 load 基本清掉。 |
+| 理解成本 | 2 | 只是把“register base”查询从 instruction metadata 放宽到 register global metadata。 |
+| 维护成本 | 2 | 规则仍集中在 declaration call output rewrite，后续统一 storage 查询时可直接迁走。 |
+
+有没有更好的方案：
+
+- 更完整方案是让前面的 pass 不丢掉普通 register global load 的 access metadata。
+- 当前补法更窄，只服务已经有严格形状约束的 declaration call output rewrite。

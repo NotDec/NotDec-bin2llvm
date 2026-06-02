@@ -4920,6 +4920,8 @@ int main() {
       "declaration_call_output_rewrite_user",
       declarationCallOutputRewriteCallee, declarationCallOutputRewriteRax,
       "RAX", &declarationCallOutputRewriteLoad);
+  declarationCallOutputRewriteLoad->setMetadata("notdec.register.access",
+                                                nullptr);
   notdec::bin2llvm::NativePrototypeRecoveryOptions declarationRewriteOptions;
   declarationRewriteOptions.RewriteSignatures = true;
   notdec::bin2llvm::runNativePrototypeRecovery(

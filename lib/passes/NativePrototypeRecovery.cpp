@@ -348,8 +348,33 @@ std::optional<std::string> registerAccessBase(llvm::Instruction &instruction) {
   return metadataField(*metadata, "base");
 }
 
+std::optional<std::string> registerStorageBase(llvm::Instruction &instruction) {
+  if (std::optional<std::string> base = registerAccessBase(instruction)) {
+    return base;
+  }
+
+  llvm::Value *pointer = nullptr;
+  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+    pointer = load->getPointerOperand();
+  } else if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+    pointer = store->getPointerOperand();
+  }
+  auto *global = pointer == nullptr
+                     ? nullptr
+                     : llvm::dyn_cast<llvm::GlobalVariable>(
+                           pointer->stripPointerCasts());
+  if (global == nullptr) {
+    return std::nullopt;
+  }
+  llvm::MDNode *metadata = global->getMetadata("notdec.register");
+  if (metadata == nullptr) {
+    return std::nullopt;
+  }
+  return metadataField(*metadata, "name");
+}
+
 bool isDeclarationCallOutputLoad(llvm::LoadInst &load) {
-  std::optional<std::string> registerBase = registerAccessBase(load);
+  std::optional<std::string> registerBase = registerStorageBase(load);
   if (!registerBase) {
     return false;
   }
@@ -358,7 +383,7 @@ bool isDeclarationCallOutputLoad(llvm::LoadInst &load) {
             end = load.getParent()->rend();
        iter != end; ++iter) {
     if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter)) {
-      if (registerAccessBase(*store) == registerBase) {
+      if (registerStorageBase(*store) == registerBase) {
         return false;
       }
       continue;
@@ -375,7 +400,7 @@ bool isDeclarationCallOutputLoad(llvm::LoadInst &load) {
 }
 
 llvm::CallInst *declarationCallOutputSource(llvm::LoadInst &load) {
-  std::optional<std::string> registerBase = registerAccessBase(load);
+  std::optional<std::string> registerBase = registerStorageBase(load);
   if (!registerBase) {
     return nullptr;
   }
@@ -384,7 +409,7 @@ llvm::CallInst *declarationCallOutputSource(llvm::LoadInst &load) {
             end = load.getParent()->rend();
        iter != end; ++iter) {
     if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter)) {
-      if (registerAccessBase(*store) == registerBase) {
+      if (registerStorageBase(*store) == registerBase) {
         return nullptr;
       }
       continue;
@@ -408,7 +433,7 @@ bool canRewriteDeclarationCallOutputLoad(llvm::LoadInst &load,
   if (load.getType() != llvm::Type::getInt64Ty(load.getContext())) {
     return false;
   }
-  std::optional<std::string> base = registerAccessBase(load);
+  std::optional<std::string> base = registerStorageBase(load);
   if (!base || !model.findOutputRegister(*base)) {
     return false;
   }
