@@ -3919,3 +3919,96 @@ vector    load         external_input   full     full         no         1
 
 - 更完整方案是把 `readBlockEntry/readBlockExit/localValueBefore` 抽成独立 current-value resolver，并给 pending PHI 建明确状态机。
 - 本轮先在现有 on-demand SSA 里补循环 PHI，是因为真实 Bench2 residue 已经直接暴露这个缺口，改动范围较小。
+
+## 2026-06-02 实现记录：Register SSA 前清理不可达块
+
+背景：
+
+- 固定三目标 signature rewrite IR 里还有 201 个 `No predecessors!` block。
+- 这些 block 会被 `NativeRegisterSSA` 当成额外函数入口，制造不必要的 external input，也会干扰 PHI/current-value 判断。
+- 这属于测试集上的明显 CFG 噪声；清理它比继续在 SSA 查询里为无前驱块补特殊情况更直接。
+
+改动：
+
+- [NativeRegisterSSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSSA.cpp:1314)
+  - 在 `runNativeRegisterSSA` 收集 register unit / ABI effect 后、逐函数 SSA 前，对每个非 declaration 函数调用 LLVM `EliminateUnreachableBlocks`。
+  - 这样后续 `readBlockEntry` 不再把无前驱死块当成真实入口。
+- [native_register_effects_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_effects_test.cpp:517)
+  - 新增 `createUnreachableRegisterLoadFunction`，构造一个 dead block，里面有 RAX access load。
+- [native_register_effects_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_effects_test.cpp:905)
+  - 验证 Register SSA 后函数只剩 entry block，dead block 里的 RAX load 被删除。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-unreachable-cleanup-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-unreachable-cleanup-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 43s |
+| `libuv:shared-library` | 106s | 107s |
+| `memcached:executable` | 58s | 57s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         14
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3188
+gpr       store        access           full     full         no         3308
+gpr       store        access           partial  full         no         4
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         no         1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-loop-phi-gate2` 相比：
+
+- `No predecessors!` block：201 -> 0。
+- `gpr load external_input full/full`：3194 -> 3188，少 6 个。
+- `gpr store access full/full`：3311 -> 3308，少 3 个。
+- `gpr load access full/full` 保持 14。这一步清的是 CFG 噪声，不是普通 load 替换。
+
+判断：
+
+- 这一步减少了 SSA 和 prototype recovery 面对的假入口，后续 current-value 查询会更干净。
+- 对固定 gate 没有明显性能退化，`vsftpd` signature rewrite 有 2 秒波动，`libuv` 和 `memcached` 与上一轮同量级。
+- 剩余普通 GPR load 仍主要是真实 call barrier / caller-saved 当前值问题，不能靠不可达块清理解决。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 清掉 201 个不可达块和少量 register residue 噪声，但不直接减少普通 GPR load。 |
+| 理解成本 | 1 | 使用 LLVM 标准 CFG 清理，位置在 Register SSA 入口，逻辑简单。 |
+| 维护成本 | 1 | 后续仍可保留，除非 native lifting 本身不再生成不可达块。 |
+
+有没有更好的方案：
+
+- 更根本方案是修 native CFG 生成，避免把不可达地址块放进函数。
+- 当前先在 SSA 前清理，是因为它能马上消除假入口对 register SSA/prototype recovery 的影响，且语义风险低。

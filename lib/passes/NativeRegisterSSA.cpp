@@ -14,6 +14,7 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 
 #include <algorithm>
@@ -1309,6 +1310,12 @@ runNativeRegisterSSA(llvm::Module &module,
     return summary;
   }
   AbiRegisterEffects abiEffects = collectAbiRegisterEffects(module);
+
+  for (llvm::Function &function : module) {
+    if (!function.isDeclaration()) {
+      llvm::EliminateUnreachableBlocks(function);
+    }
+  }
 
   for (llvm::Function *function : directCalleeFirstOrder(module)) {
     NativeRegisterSSAFunctionSummary functionSummary;

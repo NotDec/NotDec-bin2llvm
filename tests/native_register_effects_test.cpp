@@ -514,6 +514,27 @@ llvm::Function *createLoopCarriedRegisterValueFunction(
   return function;
 }
 
+llvm::Function *createUnreachableRegisterLoadFunction(
+    llvm::Module &module, llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "unreachable_register_load", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *dead = llvm::BasicBlock::Create(context, "dead", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RAX");
+
+  builder.CreateRetVoid();
+  builder.SetInsertPoint(dead);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rax->getValueType(), rax, "dead_rax");
+  load->setMetadata("notdec.register.access", metadata);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createUnreadFlagStoresFunction(llvm::Module &module,
                                                llvm::GlobalVariable *cf) {
   llvm::LLVMContext &context = module.getContext();
@@ -781,6 +802,8 @@ int main() {
   llvm::Function *partialLoad = createPartialLoadFunction(module, rax);
   llvm::Function *loopCarriedRegisterValue =
       createLoopCarriedRegisterValueFunction(module, rax);
+  llvm::Function *unreachableRegisterLoad =
+      createUnreachableRegisterLoadFunction(module, rax);
   llvm::Function *unreadFlags = createUnreadFlagStoresFunction(module, cf);
   llvm::Function *readFlags = createReadFlagStoresFunction(module, cf);
   llvm::Function *readOneFlag =
@@ -879,6 +902,9 @@ int main() {
                "partial RAX load was not replaced with an SSA extract");
   ok &= expect(countRegisterLoads(*loopCarriedRegisterValue, rax) == 0,
                "loop-carried RAX load was not replaced with a PHI");
+  ok &= expect(unreachableRegisterLoad->size() == 1 &&
+                   countRegisterLoads(*unreachableRegisterLoad, rax) == 0,
+               "unreachable register load block was not removed");
   ok &= expect(countRegisterStores(*unreadFlags, cf) == 0,
                "unread CF stores were not removed");
   ok &= expect(countRegisterStores(*readFlags, cf) == 0,
