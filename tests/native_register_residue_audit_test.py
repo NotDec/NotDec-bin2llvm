@@ -38,6 +38,7 @@ entry:
   store i64 %in, ptr @RAX, align 8, !notdec.register.access !1
   call void @callee()
   store i64 %in, ptr @RAX, align 8, !notdec.register.access !2, !notdec.register.synthetic !7
+  store i64 %in, ptr @RAX, align 8, !notdec.register.access !1
   store i8 1, ptr @ZF, align 1, !notdec.register.access !6
   ret void
 }
@@ -58,7 +59,7 @@ entry:
     counts = module.summarize(accesses)
     assert counts[("gpr", "load", "external_input", "full", "full", "no")] == 1
     assert counts[("gpr", "load", "access", "partial", "partial", "no")] == 1
-    assert counts[("gpr", "store", "access", "full", "full", "no")] == 1
+    assert counts[("gpr", "store", "access", "full", "full", "no")] == 2
     assert counts[("gpr", "store", "access", "partial", "full", "yes")] == 1
     assert counts[("flags", "store", "access", "full", "full", "no")] == 1
 
@@ -67,6 +68,7 @@ entry:
     assert accesses[0].storage_role == "caller_saved_gpr"
     assert accesses[0].local_context == "entry_external_input"
     assert accesses[2].local_context == "before_call"
+    assert accesses[-2].local_context == "return_path"
     assert accesses[-1].local_context == "before_ret"
 
 

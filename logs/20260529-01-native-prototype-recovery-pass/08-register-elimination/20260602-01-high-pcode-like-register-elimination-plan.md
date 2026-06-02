@@ -3332,3 +3332,89 @@ vector    load         external_input   full     full         no         1
 
 - 更完整方案是直接构建统一 storage liveness/current-value 查询。
 - 本轮先补审计，是因为当前 GPR residue 里 `RSP/RBP` 和 callee-saved 占大头，先看清来源比继续扩大 cleanup 条件更稳。
+
+## 阶段 A 小步：残留审计区分 return path
+
+背景：
+
+- 上一步 `local_context` 只能把紧贴 `ret` 的访问标成 `before_ret`。
+- 实际 epilogue 常见形态是连续恢复 `RBX/R12/RBP/RSP`，只有最后一条紧贴 `ret`，前面的恢复 store 会被归到 `ordinary`。
+- 这会夸大“普通 GPR store”数量，不利于判断下一步应该做 partial SSA 还是处理保存恢复残留。
+
+本轮范围：
+
+- 只增强 `--details` 的位置分类。
+- 同一 basic block 内，如果某条访问之后没有 call，最后到达 ret，则标成 `return_path`。
+- 不跨 block 推断，不改 summary，不改 IR 生成和 pass 语义。
+
+实现：
+
+- `scripts/native-register-residue-audit.py:215`
+  - 新增 `reaches_return_in_block_without_call()`，判断同一 block 内后续是否无 call 到 ret。
+- `scripts/native-register-residue-audit.py:257`
+  - `local_context()` 增加 `return_path` 分类，优先级低于 `before_call` 和 `before_ret`。
+- `tests/native_register_residue_audit_test.py:41`
+  - 测试 IR 增加一条 ret path 上的 full store。
+- `tests/native_register_residue_audit_test.py:62`
+  - 更新 full store 数量断言。
+- `tests/native_register_residue_audit_test.py:71`
+  - 增加 `return_path` 断言。
+
+验证：
+
+```bash
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R native_register_residue --output-on-failure
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-vector-rmw-cleanup-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-return-path.tsv
+awk -F '\t' 'NR>1 {count[$6"\t"$7"\t"$8"\t"$9]++} END {for (k in count) print count[k]"\t"k}' \
+  /tmp/notdec-reg-details-return-path.tsv | sort -nr | head -30
+git diff --check
+```
+
+结果：
+
+- `native_register_residue_audit_test.py` 通过。
+- `notdec.native_register_residue_audit.unit` 通过。
+- `git diff --check` 通过。
+- fixed gate 前 30 类变为：
+
+```text
+1633  callee_saved_gpr  entry_external_input  load   external_input
+855   stack_pointer     entry_external_input  load   external_input
+692   frame_pointer     entry_external_input  load   external_input
+603   frame_pointer     return_path           store  access
+534   stack_pointer     return_path           store  access
+511   caller_saved_gpr  ordinary              store  access
+439   callee_saved_gpr  return_path           store  access
+302   stack_pointer     before_ret            store  access
+296   stack_pointer     ordinary              store  access
+236   caller_saved_gpr  return_path           store  access
+140   callee_saved_gpr  before_ret            store  access
+120   frame_pointer     ordinary              store  access
+97    caller_saved_gpr  before_ret            store  access
+63    callee_saved_gpr  ordinary              store  access
+49    other             entry_external_input  load   external_input
+28    caller_saved_gpr  after_call            store  access
+18    frame_pointer     before_ret            store  access
+10    caller_saved_gpr  entry_external_input  load   external_input
+8     other             ordinary              load   access
+4     frame_pointer     return_path           load   access
+4     callee_saved_gpr  ordinary              load   access
+3     frame_pointer     ordinary              load   access
+3     caller_saved_gpr  ordinary              load   access
+2     stack_pointer     ordinary              load   access
+2     caller_saved_gpr  after_call            load   access
+2     callee_saved_gpr  return_path           load   access
+1     vector            return_path           load   access
+1     vector            entry_external_input  load   external_input
+1     stack_pointer     return_path           load   access
+1     other             ordinary              store  access
+```
+
+判断：
+
+- 大量原本看起来是 `ordinary store` 的 `RBP/RSP/callee-saved`，实际是在 return path 上恢复寄存器和栈状态。
+- 下一步不应盲删这些 store。callee-saved preserve 语义需要由函数 metadata、call effect 和 caller 侧 current-value 查询共同承接。
+- 当前更合理的后续方向是：先做“callee-saved / stack pointer return-path residue”归类和语义判断，再决定是否做 post-rewrite cleanup。

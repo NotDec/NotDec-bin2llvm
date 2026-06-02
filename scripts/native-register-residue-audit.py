@@ -212,6 +212,20 @@ def next_instruction(lines: list[str], index: int) -> str:
     return ""
 
 
+def reaches_return_in_block_without_call(lines: list[str], index: int) -> bool:
+    for cursor in range(index + 1, len(lines)):
+        stripped = lines[cursor].strip()
+        if stripped == "" or stripped.startswith(";"):
+            continue
+        if is_block_boundary(stripped):
+            return False
+        if is_call_instruction(stripped):
+            return False
+        if is_ret_instruction(stripped):
+            return True
+    return False
+
+
 def storage_role(name: str) -> str:
     upper = name.upper()
     if upper in {"RSP", "ESP", "SP"}:
@@ -243,6 +257,8 @@ def local_context(
         return "before_call"
     if is_ret_instruction(following):
         return "before_ret"
+    if reaches_return_in_block_without_call(lines, index):
+        return "return_path"
     return "ordinary"
 
 
