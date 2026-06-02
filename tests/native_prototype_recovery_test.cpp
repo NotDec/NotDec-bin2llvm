@@ -1405,6 +1405,39 @@ llvm::Function *createStackInputFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createStackInputCallerFunction(llvm::Module &module,
+                                               const std::string &name,
+                                               llvm::Function *callee,
+                                               uint64_t offset,
+                                               llvm::LoadInst **inputLoad,
+                                               llvm::CallInst **callOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *byteType = llvm::Type::getInt8Ty(context);
+  auto *arrayType = llvm::ArrayType::get(byteType, 32);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(arrayType, nullptr, "notdec_stack");
+  llvm::Value *pointer = builder.CreateInBoundsGEP(
+      byteType, stack,
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), offset),
+      "stack_arg.stack");
+  llvm::LoadInst *load =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), pointer,
+                         "stack_arg.mem");
+  load->setMetadata("notdec.stack.input",
+                    stackInputMetadata(context, offset, 8));
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+  *inputLoad = load;
+  *callOut = call;
+  return function;
+}
+
 llvm::Function *createTwoUsedExternalInputFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *first,
     const std::string &firstRegisterName, llvm::GlobalVariable *second,
@@ -3002,6 +3035,54 @@ int main() {
   if (llvm::verifyModule(callsiteModule, &llvm::errs())) {
     std::cerr
         << "callsite module verification failed after input-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module stackCallsiteModule(
+      "native-prototype-stack-input-callsite-rewrite-test", context);
+  attachTestAbi(stackCallsiteModule);
+  llvm::LoadInst *stackCallsiteInputLoad = nullptr;
+  llvm::Function *stackCallsiteInputFunction =
+      createStackInputFunction(stackCallsiteModule, "callsite_input_stack_8",
+                               8, true, &stackCallsiteInputLoad);
+  llvm::LoadInst *stackCallerInputLoad = nullptr;
+  llvm::CallInst *oldStackCallsiteCall = nullptr;
+  createStackInputCallerFunction(stackCallsiteModule,
+                                 "call_callsite_input_stack_8",
+                                 stackCallsiteInputFunction, 8,
+                                 &stackCallerInputLoad,
+                                 &oldStackCallsiteCall);
+  notdec::bin2llvm::runNativePrototypeRecovery(stackCallsiteModule, options);
+  notdec::bin2llvm::NativePrototypeRewriteResult stackCallsiteRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+          *stackCallsiteInputFunction);
+  ok &= expect(stackCallsiteRewriteResult.Rewritten,
+               "stack input-only prototype with direct callsite was not rewritten");
+  stackCallsiteInputFunction = stackCallsiteRewriteResult.Function;
+  llvm::CallInst *rewrittenStackCallsiteCall = nullptr;
+  llvm::Function *stackCallsiteCaller =
+      stackCallsiteModule.getFunction("call_callsite_input_stack_8");
+  if (stackCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *stackCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == stackCallsiteInputFunction) {
+          rewrittenStackCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenStackCallsiteCall != nullptr,
+               "stack direct callsite was not rewritten to new callee");
+  ok &= expect(rewrittenStackCallsiteCall != nullptr &&
+                   rewrittenStackCallsiteCall->arg_size() == 1 &&
+                   rewrittenStackCallsiteCall->getArgOperand(0) ==
+                       stackCallerInputLoad,
+               "stack direct callsite argument did not use stack input load");
+  if (llvm::verifyModule(stackCallsiteModule, &llvm::errs())) {
+    std::cerr
+        << "stack callsite module verification failed after input-only rewrite\n";
     return EXIT_FAILURE;
   }
 

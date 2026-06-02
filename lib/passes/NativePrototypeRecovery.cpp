@@ -332,6 +332,15 @@ std::optional<llvm::LoadInst *> uniqueExternalInputLoad(
   return result;
 }
 
+bool stackInputMetadataMatches(llvm::MDNode &metadata, llvm::StringRef space,
+                               uint64_t offset, uint32_t size) {
+  std::optional<std::string> loadSpace = metadataField(metadata, "space");
+  std::optional<uint64_t> loadOffset = parseUint64Field(metadata, "offset");
+  std::optional<uint64_t> loadSize = parseUint64Field(metadata, "size");
+  return loadSpace && *loadSpace == space && loadOffset &&
+         *loadOffset == offset && loadSize && *loadSize == size;
+}
+
 std::optional<llvm::LoadInst *> uniqueStackInputLoad(
     llvm::Function &function, llvm::StringRef space, uint64_t offset,
     uint32_t size) {
@@ -346,11 +355,7 @@ std::optional<llvm::LoadInst *> uniqueStackInputLoad(
       if (metadata == nullptr) {
         continue;
       }
-      std::optional<std::string> loadSpace = metadataField(*metadata, "space");
-      std::optional<uint64_t> loadOffset = parseUint64Field(*metadata, "offset");
-      std::optional<uint64_t> loadSize = parseUint64Field(*metadata, "size");
-      if (!loadSpace || *loadSpace != space || !loadOffset ||
-          *loadOffset != offset || !loadSize || *loadSize != size) {
+      if (!stackInputMetadataMatches(*metadata, space, offset, size)) {
         continue;
       }
       if (result != nullptr) {
@@ -1016,6 +1021,54 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
   return registerGlobalValueBeforeCall(call, registerName, paramType);
 }
 
+std::optional<llvm::Value *> localStackInputValueBeforeCall(
+    llvm::CallInst &call, llvm::StringRef space, uint64_t offset, uint32_t size,
+    llvm::Type *paramType) {
+  llvm::LoadInst *result = nullptr;
+  for (auto iter = llvm::BasicBlock::reverse_iterator(call.getIterator()),
+            end = call.getParent()->rend();
+       iter != end; ++iter) {
+    if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
+      llvm::Function *callee = previousCall->getCalledFunction();
+      if (callee == nullptr || !callee->isIntrinsic()) {
+        return std::nullopt;
+      }
+      continue;
+    }
+    auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter);
+    if (load == nullptr) {
+      continue;
+    }
+    llvm::MDNode *metadata = load->getMetadata("notdec.stack.input");
+    if (metadata == nullptr ||
+        !stackInputMetadataMatches(*metadata, space, offset, size)) {
+      continue;
+    }
+    if (load->getType() != paramType || result != nullptr) {
+      return std::nullopt;
+    }
+    result = load;
+  }
+  if (result == nullptr) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+std::optional<llvm::Value *> callsiteInputValueBeforeCall(
+    llvm::CallInst &call, const NativeRecoveredPrototypeParam &input,
+    llvm::Type *paramType) {
+  if (input.StorageKind == "register") {
+    return callsiteInputValueBeforeCall(call, input.RegisterName, paramType);
+  }
+  if (input.StorageKind == "stack") {
+    return localStackInputValueBeforeCall(call, input.StackSpace,
+                                         input.StackOffset, input.Size,
+                                         paramType);
+  }
+  return std::nullopt;
+}
+
 // Multi-input form of Ghidra FuncCallSpecs::buildInputFromTrials(...): keep
 // the call and ABI-ordered argument values together so the old void call can be
 // replaced after every callsite has been checked.
@@ -1051,22 +1104,25 @@ MultiInputCallsiteCollectionResult collectMultiInputDirectCallsiteRewrites(
     rewrite.InputStores.reserve(inputs.size());
     for (uint64_t index = 0; index < inputs.size(); ++index) {
       std::optional<llvm::Value *> argument = callsiteInputValueBeforeCall(
-          *call, inputs[index].RegisterName, recoveredType.getParamType(index));
+          *call, inputs[index], recoveredType.getParamType(index));
       if (!argument) {
         result.FailureReason = "unsafe callsite input value";
         return result;
       }
       rewrite.Arguments.push_back(*argument);
-      llvm::StoreInst *inputStore = localCallsiteInputStoreBeforeCall(
-          *call, inputs[index].RegisterName, recoveredType.getParamType(index));
-      if (inputStore != nullptr && inputStore->getValueOperand() == *argument &&
-          call->getFunction()->getMetadata("notdec.prototype.return_candidates") ==
-              nullptr &&
-          callClobbersRegister(*call, inputs[index].RegisterName)) {
-        rewrite.InputStores.push_back(inputStore);
-      } else {
-        rewrite.InputStores.push_back(nullptr);
+      llvm::StoreInst *inputStore = nullptr;
+      if (inputs[index].StorageKind == "register") {
+        inputStore = localCallsiteInputStoreBeforeCall(
+            *call, inputs[index].RegisterName, recoveredType.getParamType(index));
+        if (inputStore != nullptr &&
+            (inputStore->getValueOperand() != *argument ||
+             call->getFunction()->getMetadata(
+                 "notdec.prototype.return_candidates") != nullptr ||
+             !callClobbersRegister(*call, inputs[index].RegisterName))) {
+          inputStore = nullptr;
+        }
       }
+      rewrite.InputStores.push_back(inputStore);
     }
     result.Rewrites.push_back(std::move(rewrite));
   }
@@ -2850,10 +2906,6 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
   }
   std::optional<std::vector<MultiInputCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
-    if (hasStackInputBinding(*inputBindings)) {
-      result.Reason = "unsupported stack callsite input";
-      return result;
-    }
     MultiInputCallsiteCollectionResult callsiteCollection =
         collectMultiInputDirectCallsiteRewrites(function, prototype->Inputs,
                                                 **recoveredType);
@@ -2971,10 +3023,6 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
   }
   std::optional<std::vector<MultiInputCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
-    if (hasStackInputBinding(*inputBindings)) {
-      result.Reason = "unsupported stack callsite input";
-      return result;
-    }
     MultiInputCallsiteCollectionResult callsiteCollection =
         collectMultiInputDirectCallsiteRewrites(function, prototype->Inputs,
                                                 **recoveredType);
