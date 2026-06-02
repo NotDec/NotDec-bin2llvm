@@ -604,6 +604,9 @@
   - [x] 将 unread flags store cleanup 的读集合改为 rewrite 后当前 IR 中仍存在的 flag load，避免已被 SSA 替换的旧 load 继续保护 store。
     - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-register-residue-post-rewrite-flag-liveness-gate`
+  - [x] 将 unread flags cleanup 改成 CFG 级 liveness，并清理删除 store 后暴露出的死 flag external input 链；固定三目标 flags 残留清零。
+    - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-flag-liveness-dce-gate`
 
 ## 记录规则
 

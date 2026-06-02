@@ -1037,3 +1037,109 @@ ctest --test-dir build --output-on-failure
 
 - flags store 又下降 `649`，耗时没有明显退化。
 - 剩下的 `OF` store 与当前 IR 中仍存在的 `OF.external_input` load 同 flag，不能继续用未读规则删除。下一步要处理它们，需要真正的 flags SSA 或更准确的外部输入消除。
+
+## 阶段 D 小步：按 CFG liveness 清理剩余 OF store 和死 external input
+
+上一轮还剩 16 个 `OF` store 和 15 个 `OF.external_input` load。抽查后发现两类形态：
+
+- `OF.external_input` 只经过 `and ..., 1` 后写回 `@OF`。
+- `OF.external_input` 参与了已经无 use 的中间 flag 计算，最后 `@OF` 被常量 `0` 覆盖。
+
+之前按“函数里是否还有同 flag load”判断太粗。只要函数入口还有 `OF.external_input`，所有 `OF` store 都会被保护，即使 store 之后没有任何 load 能读到它。
+
+本轮改成基本块级 liveness：
+
+- 为每个基本块计算 flag `LiveIn` / `LiveOut`。
+- 反向扫描指令，store 只有在后面可能有同 flag load 读到时才保留。
+- 普通 call 按当前 ABI / callee effect 作为 clobber barrier，call 前的 store 不能被 call 后的 load 证明为 live。
+- 删除 store 后，递归清理只依赖 flag external input 的死计算链，并同步移除 `notdec.register.external_inputs` 里的 stale 项。
+
+改动文件和函数：
+
+- `lib/passes/NativeRegisterSSA.cpp:59`
+  - 新增 `FlagBlockLiveness`，保存每个基本块的 flag live-in / live-out。
+- `lib/passes/NativeRegisterSSA.cpp:425`
+  - `removeUnreadFlagStores()` 改为 CFG 反向 liveness，不再只看全函数 read set。
+  - 删除 dead store 后调用 `RecursivelyDeleteTriviallyDeadInstructions()`，并通过回调清理 external input 记录。
+- `lib/passes/NativeRegisterSSA.cpp:503`
+  - 新增 `flagLiveBeforeBlock()`，计算单个 basic block 入口前的 live flags。
+- `lib/passes/NativeRegisterSSA.cpp:531`
+  - 新增 `eraseClobberedFlagsFromLiveSet()`，让 call clobber 语义参与 flag liveness。
+- `lib/passes/NativeRegisterSSA.cpp:541`
+  - 新增 `hasRemainingStorageStore()`，避免删除部分 store 后留下错误的 clobber 记录。
+- `lib/passes/NativeRegisterSSA.cpp:558`
+  - 新增 `forgetExternalInputValue()`，删除死 external input load 时同步更新 metadata 来源集合。
+- `lib/passes/NativeRegisterSSA.cpp:569`
+  - 新增 `removeDeadFlagExternalInputUsers()` / `valueDependsOnFlagExternalInput()`，清掉 store 删除后暴露出的死 flag external input 链。
+- `tests/native_register_effects_test.cpp:431`
+  - 新增 `createFlagRestoreOnlyFunction()`，覆盖 `OF.external_input -> and -> store @OF`。
+- `tests/native_register_effects_test.cpp:452`
+  - 新增 `createDeadFlagInputBeforeConstantStoreFunction()`，覆盖 `OF.external_input` 只参与死中间计算、最后 `store 0 @OF`。
+- `tests/native_register_effects_test.cpp:649`
+  - 更新 `UnreadFlagStoresRemoved` 断言为 `6`。
+- `tests/native_register_effects_test.cpp:693`
+  - 增加 dead OF restore / constant-store 形态的 load、store、external input metadata 断言。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+ctest --test-dir build -R 'notdec.native_register_effects.preserved' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+ctest --test-dir build --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-flag-liveness-dce-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-flag-liveness-dce-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-register-residue-flag-liveness-dce-gate/*.signature-rewrite.ll | \
+  awk -F '\t' '$3=="flags" {print}'
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 40s |
+| `libuv:shared-library` | 105s | 106s |
+| `memcached:executable` | 57s | 57s |
+
+残留对比：
+
+| kind | 上一轮 | 本轮 |
+| --- | ---: | ---: |
+| `flags load external_input full` | 15 | 0 |
+| `flags store access full` | 16 | 0 |
+| `gpr store access full` | 3601 | 3601 |
+| `gpr load access partial` | 18 | 17 |
+| `vector store access partial` | 71 | 71 |
+
+判断：
+
+- 固定三目标上 flags 残留已经清零，耗时没有明显退化。
+- 这仍然不是完整 flags SSA；它只删除没有后继读者的 flag store 和随之暴露的死 external input 链。
+- 后续更大的收益在 GPR full store / external input、栈相关寄存器流量、callsite 当前值查询和 partial storage SSA。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 8 | 固定三目标 flags 残留从 `store 16 / input 15` 变成 `0`。 |
+| 理解成本 | 6 | 增加了一个局部 liveness 算法，但只限 flags，代码边界清楚。 |
+| 维护成本 | 5 | 仍依赖 metadata 和 ABI call effect；后续做完整 flags SSA 时可能需要替换这段保守 cleanup。 |
+
+有没有更好的方案：
+
+- 长期更好的方案是完整 flags SSA，让 flag producer / consumer 直接变成 SSA value。
+- 本轮没有直接做完整 flags SSA，是因为当前明显残留是未读 store 和死输入链，先用小步 cleanup 可以稳定清零这批残留。

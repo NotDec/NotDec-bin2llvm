@@ -428,6 +428,49 @@ llvm::Function *createReadOneFlagStoreOtherFlagFunction(
   return function;
 }
 
+llvm::Function *createFlagRestoreOnlyFunction(llvm::Module &module,
+                                              llvm::GlobalVariable *of) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "flag_restore_only", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "OF", "OF", 523, 1);
+  llvm::LoadInst *entryOf =
+      builder.CreateLoad(of->getValueType(), of, "entry_of");
+  entryOf->setMetadata("notdec.register.access", metadata);
+  llvm::Value *masked =
+      builder.CreateAnd(entryOf, llvm::ConstantInt::get(of->getValueType(), 1));
+  llvm::StoreInst *restore = builder.CreateStore(masked, of);
+  restore->setMetadata("notdec.register.access", metadata);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createDeadFlagInputBeforeConstantStoreFunction(
+    llvm::Module &module, llvm::GlobalVariable *of) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "dead_flag_input_before_constant_store", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "OF", "OF", 523, 1);
+  llvm::LoadInst *entryOf =
+      builder.CreateLoad(of->getValueType(), of, "entry_of");
+  entryOf->setMetadata("notdec.register.access", metadata);
+  (void)builder.CreateAnd(entryOf,
+                          llvm::ConstantInt::get(of->getValueType(), 1));
+  llvm::StoreInst *clear =
+      builder.CreateStore(llvm::ConstantInt::get(of->getValueType(), 0), of);
+  clear->setMetadata("notdec.register.access", metadata);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createUnreadRipStoresFunction(llvm::Module &module,
                                               llvm::GlobalVariable *rip) {
   llvm::LLVMContext &context = module.getContext();
@@ -565,6 +608,9 @@ int main() {
   llvm::Function *readFlags = createReadFlagStoresFunction(module, cf);
   llvm::Function *readOneFlag =
       createReadOneFlagStoreOtherFlagFunction(module, cf, of);
+  llvm::Function *flagRestoreOnly = createFlagRestoreOnlyFunction(module, of);
+  llvm::Function *deadFlagInputBeforeConstantStore =
+      createDeadFlagInputBeforeConstantStoreFunction(module, of);
   llvm::Function *unreadRip = createUnreadRipStoresFunction(module, rip);
   llvm::Function *readRip = createReadRipStoresFunction(module, rip);
 
@@ -600,7 +646,7 @@ int main() {
                "register effect summary had unexpected clobber count");
   ok &= expect(summary.DeadStoresRemoved >= 1,
                "register SSA did not remove the expected overwritten store");
-  ok &= expect(summary.UnreadFlagStoresRemoved == 4,
+  ok &= expect(summary.UnreadFlagStoresRemoved == 6,
                "register SSA did not remove unread flag stores");
   ok &= expect(summary.UnreadRipStoresRemoved == 1,
                "register SSA did not remove unread RIP stores");
@@ -644,6 +690,20 @@ int main() {
                "resolved CF store was not removed when another flag was unread");
   ok &= expect(countRegisterStores(*readOneFlag, of) == 0,
                "unread OF store was not removed when CF was read");
+  ok &= expect(countRegisterLoads(*flagRestoreOnly, of) == 0,
+               "dead OF restore input was not removed");
+  ok &= expect(countRegisterStores(*flagRestoreOnly, of) == 0,
+               "dead OF restore store was not removed");
+  ok &= expect(flagRestoreOnly->getMetadata("notdec.register.external_inputs") ==
+                   nullptr,
+               "dead OF restore left stale external input metadata");
+  ok &= expect(countRegisterLoads(*deadFlagInputBeforeConstantStore, of) == 0,
+               "dead OF input before constant store was not removed");
+  ok &= expect(countRegisterStores(*deadFlagInputBeforeConstantStore, of) == 0,
+               "dead OF constant store was not removed");
+  ok &= expect(deadFlagInputBeforeConstantStore->getMetadata(
+                   "notdec.register.external_inputs") == nullptr,
+               "dead OF constant store left stale external input metadata");
   ok &= expect(countRegisterStores(*unreadRip, rip) == 0,
                "unread RIP store was not removed");
   ok &= expect(countRegisterStores(*readRip, rip) == 1,

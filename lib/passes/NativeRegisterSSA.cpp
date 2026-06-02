@@ -12,6 +12,7 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 #include <algorithm>
 #include <map>
@@ -53,6 +54,11 @@ using BlockRegKey = std::pair<llvm::BasicBlock *, llvm::GlobalVariable *>;
 struct AbiRegisterEffects {
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
+};
+
+struct FlagBlockLiveness {
+  std::set<llvm::GlobalVariable *> LiveIn;
+  std::set<llvm::GlobalVariable *> LiveOut;
 };
 
 bool isFlagRegisterName(llvm::StringRef name) {
@@ -417,21 +423,122 @@ private:
   }
 
   void removeUnreadFlagStores() {
-    std::set<llvm::GlobalVariable *> readFlags;
-    for (llvm::BasicBlock &block : Function) {
-      for (llvm::Instruction &inst : block) {
-        auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
-        if (load == nullptr) {
-          continue;
+    std::map<llvm::BasicBlock *, FlagBlockLiveness> blockLiveness;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (llvm::BasicBlock &block : llvm::reverse(Function)) {
+        std::set<llvm::GlobalVariable *> liveOut;
+        for (llvm::BasicBlock *successor : llvm::successors(&block)) {
+          const auto &successorLiveIn = blockLiveness[successor].LiveIn;
+          liveOut.insert(successorLiveIn.begin(), successorLiveIn.end());
         }
-        AccessInfo access = registerLoad(*load, Units);
-        if (access.Unit != nullptr && isFlagRegisterName(access.Unit->Name)) {
-          readFlags.insert(access.Unit->Global);
+
+        std::set<llvm::GlobalVariable *> liveIn =
+            flagLiveBeforeBlock(block, liveOut);
+        FlagBlockLiveness &liveness = blockLiveness[&block];
+        if (liveness.LiveOut != liveOut || liveness.LiveIn != liveIn) {
+          liveness.LiveOut = std::move(liveOut);
+          liveness.LiveIn = std::move(liveIn);
+          changed = true;
         }
       }
     }
 
     std::vector<llvm::StoreInst *> deadStores;
+    for (llvm::BasicBlock &block : Function) {
+      std::set<llvm::GlobalVariable *> live =
+          blockLiveness[&block].LiveOut;
+      for (llvm::Instruction &inst : llvm::reverse(block)) {
+        if (isRegisterClobberCall(inst)) {
+          eraseClobberedFlagsFromLiveSet(inst, live);
+          continue;
+        }
+        if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+          AccessInfo access = registerLoad(*load, Units);
+          if (access.Unit != nullptr && isFlagRegisterName(access.Unit->Name)) {
+            live.insert(access.Unit->Global);
+          }
+          continue;
+        }
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+        if (store == nullptr) {
+          continue;
+        }
+        AccessInfo access = registerStore(*store, Units);
+        if (access.Unit == nullptr || !isFlagRegisterName(access.Unit->Name)) {
+          continue;
+        }
+        if (live.count(access.Unit->Global) == 0) {
+          deadStores.push_back(store);
+        } else {
+          live.erase(access.Unit->Global);
+        }
+      }
+    }
+
+    std::set<llvm::GlobalVariable *> touchedFlags;
+    for (llvm::StoreInst *store : deadStores) {
+      AccessInfo access = registerStore(*store, Units);
+      if (access.Unit != nullptr) {
+        touchedFlags.insert(access.Unit->Global);
+      }
+      llvm::Value *storedValue = store->getValueOperand();
+      if (store->use_empty()) {
+        store->eraseFromParent();
+        llvm::RecursivelyDeleteTriviallyDeadInstructions(
+            storedValue, nullptr, nullptr,
+            [this](llvm::Value *value) { forgetExternalInputValue(value); });
+        ++Summary.UnreadFlagStoresRemoved;
+      }
+    }
+    removeDeadFlagExternalInputUsers();
+    for (llvm::GlobalVariable *global : touchedFlags) {
+      if (!hasRemainingStorageStore(*global)) {
+        StoredFullUnits.erase(global);
+      }
+    }
+  }
+
+  std::set<llvm::GlobalVariable *> flagLiveBeforeBlock(
+      llvm::BasicBlock &block,
+      const std::set<llvm::GlobalVariable *> &liveOut) {
+    std::set<llvm::GlobalVariable *> live = liveOut;
+    for (llvm::Instruction &inst : llvm::reverse(block)) {
+      if (isRegisterClobberCall(inst)) {
+        eraseClobberedFlagsFromLiveSet(inst, live);
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        AccessInfo access = registerLoad(*load, Units);
+        if (access.Unit != nullptr && isFlagRegisterName(access.Unit->Name)) {
+          live.insert(access.Unit->Global);
+        }
+        continue;
+      }
+      auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+      if (store == nullptr) {
+        continue;
+      }
+      AccessInfo access = registerStore(*store, Units);
+      if (access.Unit != nullptr && isFlagRegisterName(access.Unit->Name)) {
+        live.erase(access.Unit->Global);
+      }
+    }
+    return live;
+  }
+
+  void eraseClobberedFlagsFromLiveSet(
+      const llvm::Instruction &inst,
+      std::set<llvm::GlobalVariable *> &live) const {
+    for (auto &[global, unit] : Units) {
+      if (isFlagRegisterName(unit.Name) && callClobbersRegister(inst, unit)) {
+        live.erase(global);
+      }
+    }
+  }
+
+  bool hasRemainingStorageStore(llvm::GlobalVariable &global) {
     for (llvm::BasicBlock &block : Function) {
       for (llvm::Instruction &inst : block) {
         auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
@@ -439,27 +546,70 @@ private:
           continue;
         }
         AccessInfo access = registerStore(*store, Units);
-        if (access.Unit != nullptr && isFlagRegisterName(access.Unit->Name) &&
-            readFlags.count(access.Unit->Global) == 0) {
-          deadStores.push_back(store);
+        if (access.Unit != nullptr && access.Unit->Global == &global &&
+            access.IsStorageValue) {
+          return true;
         }
       }
     }
+    return false;
+  }
 
-    std::set<llvm::GlobalVariable *> removedFlags;
-    for (llvm::StoreInst *store : deadStores) {
-      AccessInfo access = registerStore(*store, Units);
-      if (access.Unit != nullptr) {
-        removedFlags.insert(access.Unit->Global);
-      }
-      if (store->use_empty()) {
-        store->eraseFromParent();
-        ++Summary.UnreadFlagStoresRemoved;
+  void forgetExternalInputValue(llvm::Value *value) {
+    for (auto it = ExternalInputValue.begin(); it != ExternalInputValue.end();) {
+      if (it->second == value) {
+        ExternalInputs.erase(it->first);
+        it = ExternalInputValue.erase(it);
+      } else {
+        ++it;
       }
     }
-    for (llvm::GlobalVariable *global : removedFlags) {
-      StoredFullUnits.erase(global);
+  }
+
+  void removeDeadFlagExternalInputUsers() {
+    std::vector<llvm::Instruction *> deadUsers;
+    for (llvm::BasicBlock &block : Function) {
+      for (llvm::Instruction &inst : block) {
+        if (inst.use_empty() && valueDependsOnFlagExternalInput(inst)) {
+          deadUsers.push_back(&inst);
+        }
+      }
     }
+    for (llvm::Instruction *inst : deadUsers) {
+      if (inst->getParent() != nullptr && inst->use_empty()) {
+        llvm::RecursivelyDeleteTriviallyDeadInstructions(
+            inst, nullptr, nullptr,
+            [this](llvm::Value *value) { forgetExternalInputValue(value); });
+      }
+    }
+  }
+
+  bool valueDependsOnFlagExternalInput(llvm::Value &value) {
+    std::set<llvm::Value *> seen;
+    return valueDependsOnFlagExternalInput(value, seen);
+  }
+
+  bool valueDependsOnFlagExternalInput(llvm::Value &value,
+                                       std::set<llvm::Value *> &seen) {
+    if (!seen.insert(&value).second) {
+      return false;
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&value)) {
+      if (load->getMetadata("notdec.register.external_input") != nullptr) {
+        AccessInfo access = registerLoad(*load, Units);
+        return access.Unit != nullptr && isFlagRegisterName(access.Unit->Name);
+      }
+    }
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(&value);
+    if (inst == nullptr) {
+      return false;
+    }
+    for (llvm::Value *operand : inst->operands()) {
+      if (valueDependsOnFlagExternalInput(*operand, seen)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   void removeUnreadRipStores() {
