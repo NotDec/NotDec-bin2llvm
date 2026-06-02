@@ -1290,19 +1290,90 @@ bool accessMatchesRecoveredReturn(const llvm::MDNode &access,
   return false;
 }
 
-bool functionHasRegisterAccessLoadForAccess(llvm::Function &function,
-                                            const llvm::MDNode &access) {
+bool instructionReadsRegisterAccess(llvm::Instruction &instruction,
+                                    const llvm::MDNode &access) {
+  auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+  if (load == nullptr) {
+    return false;
+  }
+  llvm::MDNode *loadAccess = load->getMetadata("notdec.register.access");
+  if (loadAccess == nullptr) {
+    return false;
+  }
   if (std::optional<std::string> name = metadataField(access, "name")) {
-    if (functionHasRegisterAccessLoad(function, *name)) {
+    if (accessMatchesEffectRegister(*loadAccess, *name)) {
       return true;
     }
   }
   if (std::optional<std::string> base = metadataField(access, "base")) {
-    if (functionHasRegisterAccessLoad(function, *base)) {
+    if (accessMatchesEffectRegister(*loadAccess, *base)) {
       return true;
     }
   }
   return false;
+}
+
+bool reachesReturnWithoutCallOrAccessLoad(llvm::Instruction *instruction,
+                                          const llvm::MDNode &access,
+                                          std::set<llvm::BasicBlock *> &seen) {
+  while (instruction != nullptr) {
+    if (llvm::isa<llvm::ReturnInst>(instruction)) {
+      return true;
+    }
+    if (llvm::isa<llvm::CallBase>(instruction) ||
+        instructionReadsRegisterAccess(*instruction, access)) {
+      return false;
+    }
+    instruction = instruction->getNextNode();
+  }
+  return false;
+}
+
+bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
+    llvm::BasicBlock &block, const llvm::MDNode &access,
+    std::set<llvm::BasicBlock *> &seen) {
+  llvm::Instruction *terminator = block.getTerminator();
+  if (terminator == nullptr) {
+    return false;
+  }
+  if (llvm::isa<llvm::ReturnInst>(terminator)) {
+    return true;
+  }
+  if (llvm::isa<llvm::CallBase>(terminator)) {
+    return false;
+  }
+
+  bool sawSuccessor = false;
+  for (llvm::BasicBlock *successor : llvm::successors(&block)) {
+    sawSuccessor = true;
+    if (!seen.insert(successor).second) {
+      return false;
+    }
+    if (!reachesReturnWithoutCallOrAccessLoad(
+            successor->empty() ? nullptr : &successor->front(), access, seen)) {
+      return false;
+    }
+  }
+  return sawSuccessor;
+}
+
+bool storeIsDeadOnAllReturnPaths(llvm::StoreInst &store,
+                                 const llvm::MDNode &access) {
+  std::set<llvm::BasicBlock *> seen;
+  seen.insert(store.getParent());
+  llvm::Instruction *next = store.getNextNode();
+  while (next != nullptr) {
+    if (llvm::isa<llvm::ReturnInst>(next)) {
+      return true;
+    }
+    if (llvm::isa<llvm::CallBase>(next) ||
+        instructionReadsRegisterAccess(*next, access)) {
+      return false;
+    }
+    next = next->getNextNode();
+  }
+  return allSuccessorsReachReturnWithoutCallOrAccessLoad(*store.getParent(),
+                                                         access, seen);
 }
 
 std::set<std::string> killedByCallRegisterNames(const NativeAbiSpec &abi) {
@@ -1386,13 +1457,13 @@ void eraseDeadNonReturnVectorStores(llvm::Module &module) {
     for (llvm::BasicBlock &block : function) {
       for (llvm::Instruction &instruction : block) {
         auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
-        if (store == nullptr || !storeIsDeadAtReturn(*store)) {
+        if (store == nullptr) {
           continue;
         }
         llvm::MDNode *access = store->getMetadata("notdec.register.access");
         if (access == nullptr || !accessIsVectorPartialStore(*access, *store) ||
             accessMatchesRecoveredReturn(*access, *prototype) ||
-            functionHasRegisterAccessLoadForAccess(function, *access)) {
+            !storeIsDeadOnAllReturnPaths(*store, *access)) {
           continue;
         }
         deadStores.push_back(store);

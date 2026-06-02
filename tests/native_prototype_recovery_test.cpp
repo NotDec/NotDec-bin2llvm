@@ -1679,7 +1679,8 @@ llvm::Function *createKilledVectorScratchStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *wide,
     const std::string &accessName, bool keepLoad,
     llvm::Function *calleeAfterStore = nullptr,
-    const std::string &baseName = "ZMM0") {
+    const std::string &baseName = "ZMM0",
+    bool loadAfterStore = false) {
   llvm::LLVMContext &context = module.getContext();
   auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *function =
@@ -1699,6 +1700,11 @@ llvm::Function *createKilledVectorScratchStoreFunction(
   }
   llvm::StoreInst *store = builder.CreateStore(value, wide);
   store->setMetadata("notdec.register.access", access);
+  if (loadAfterStore) {
+    llvm::LoadInst *load = builder.CreateLoad(wide->getValueType(), wide);
+    load->setMetadata("notdec.register.access", access);
+    (void)builder.CreateAdd(load, value);
+  }
   if (calleeAfterStore != nullptr) {
     builder.CreateCall(calleeAfterStore->getFunctionType(), calleeAfterStore);
   }
@@ -7233,8 +7239,9 @@ int main() {
                                              killedVectorZmm, "XMM0_Qb", false);
   llvm::Function *liveKilledVectorScratch =
       createKilledVectorScratchStoreFunction(killedVectorScratchModule,
-                                             "live_killed_vector_scratch",
-                                             killedVectorZmm, "XMM0_Qb", true);
+                                             "loaded_after_vector_scratch",
+                                             killedVectorZmm, "XMM0_Qb", false,
+                                             nullptr, "ZMM0", true);
   llvm::Function *scratchCallCallee =
       createFunction(killedVectorScratchModule, "scratch_call_callee");
   llvm::Function *callArgumentKilledVectorScratch =
@@ -7250,9 +7257,9 @@ int main() {
   ok &= expect(!hasRegisterStore(*deadKilledVectorScratch, "XMM0_Qb"),
                "dead killed-by-call vector scratch store was not removed");
   ok &= expect(hasRegisterStore(*liveKilledVectorScratch, "XMM0_Qb"),
-               "live killed-by-call vector scratch store was removed");
+               "vector scratch store with later load was removed");
   ok &= expect(hasRegisterLoad(*liveKilledVectorScratch, "XMM0_Qb"),
-               "live killed-by-call vector scratch load was removed");
+               "later vector scratch load was removed");
   ok &= expect(hasRegisterStore(*callArgumentKilledVectorScratch, "XMM0_Qb"),
                "killed-by-call vector store before call was removed");
   ok &= expect(!hasRegisterStore(*deadNonReturnVectorScratch, "XMM1"),

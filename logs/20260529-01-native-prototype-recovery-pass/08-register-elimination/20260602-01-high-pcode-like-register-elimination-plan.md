@@ -3098,3 +3098,110 @@ vector    store        access           partial  full         no         3
 
 - 更完整方案仍然是统一 storage current-value 查询和 ABI effect alias resolver。
 - 本轮选择 cleanup，是因为它能先消掉明确无用的 vector scratch，不需要提前处理完整 vector/lane SSA。
+
+## 阶段 D 小步：跨 block 清理死 vector RMW store
+
+背景：
+
+- 上一步后 fixed gate 只剩 3 个 `vector store access partial/full`。
+- 它们都在 `libuv` 的 `uv_fs_futime`、`uv_fs_lutime`、`uv_fs_utime` 里，形态是用 `ZMM0/ZMM1` external input 拼出一个 `XMM0_Qb` partial backing store，然后所有后续路径直接 return。
+- 这不是 ABI vector lane input 没进签名的问题。x86-64 cspec 里 vector float input 是 `XMM0_Qa/XMM1_Qa`，残留 store 是 `XMM0_Qb`，不能把它误恢复成参数。
+- 真正问题是上一步 cleanup 只看同一 block 的 `store -> ret`，没覆盖 `store -> branch -> ret`。
+
+实现：
+
+- `lib/passes/NativePrototypeRecovery.cpp:1293`
+  - 新增 `instructionReadsRegisterAccess()`，判断 store 之后是否有同一 access name/base 的 register load。
+- `lib/passes/NativePrototypeRecovery.cpp:1316`
+  - 新增 `reachesReturnWithoutCallOrAccessLoad()`，扫描一段指令，遇到 return 视为安全，遇到 call 或同 storage load 视为不安全。
+- `lib/passes/NativePrototypeRecovery.cpp:1332`
+  - 新增 `allSuccessorsReachReturnWithoutCallOrAccessLoad()`，处理 store 所在 block 后继都是 return path 的简单 CFG。
+- `lib/passes/NativePrototypeRecovery.cpp:1360`
+  - 新增 `storeIsDeadOnAllReturnPaths()`，把同 block 和简单后继 block 的死 store 判断合并。
+- `lib/passes/NativePrototypeRecovery.cpp:1440`
+  - `eraseDeadNonReturnVectorStores()` 改用 `storeIsDeadOnAllReturnPaths()`，不再因为 store 的 value 依赖旧 vector external input 就保留死写。
+- `tests/native_prototype_recovery_test.cpp:1678`
+  - `createKilledVectorScratchStoreFunction()` 增加 `loadAfterStore` 参数，用来构造真正可观察的后续 load。
+- `tests/native_prototype_recovery_test.cpp:7240`
+  - 原来的 live 用例从“store 前读旧值”改成“store 后读同一 vector access”。前者只是 RMW 构造过程，store 后如果没有读/call/return 绑定，仍然是死写。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-vector-rmw-cleanup-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-vector-rmw-cleanup-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-vector-rmw-cleanup-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-vector-rmw-cleanup.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 42s | 41s |
+| `libuv:shared-library` | 107s | 107s |
+| `memcached:executable` | 57s | 58s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         22
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3190
+gpr       store        access           full     full         no         3381
+gpr       store        access           partial  full         no         9
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         no         1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一步相比：
+
+- `vector store access partial/full`：3 -> 0。
+- `vector load external_input full/full`：7 -> 1。
+- 剩余 vector residue 只剩：
+  - `notdec_native_9e70` 的 `ZMM0` external input。
+  - `uv_timer_stop` 的 `ZMM0` full access load。
+
+判断：
+
+- 这一步把 fixed gate 上最后 3 个 vector partial store 清掉了。
+- 清理条件仍然围绕“store 后是否可观察”：后续路径有 call、同 storage load、recovered return 时都不删。
+- 当前 CFG 判断只处理简单后继路径；遇到环或复杂 successor 会保守不删。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 7 | fixed gate 上 vector partial store 清零，vector external input 从 7 降到 1。 |
+| 理解成本 | 4 | 比同 block cleanup 多了简单 CFG 扫描，但仍集中在 post-rewrite cleanup。 |
+| 维护成本 | 4 | 后续如果要覆盖更复杂 CFG，应复用统一 liveness/current-value 查询，避免这个 helper 继续长大。 |
+
+有没有更好的方案：
+
+- 更完整方案是阶段 C 的统一 current-value/liveness 查询。
+- 本轮先补简单后继 CFG，是因为 fixed gate 剩余 case 很明确，且不需要引入 vector 参数恢复的语义风险。
