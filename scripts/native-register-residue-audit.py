@@ -18,6 +18,8 @@ MD_REF_RE = re.compile(r"!notdec\.register\.(access|external_input)\s+!(\d+)")
 GLOBAL_RE = re.compile(r"^(@[-a-zA-Z$._0-9]+)\s*=.*!notdec\.register\s+!(\d+)")
 PTR_GLOBAL_RE = re.compile(r"ptr\s+(@[-a-zA-Z$._0-9]+)")
 FIELD_RE = re.compile(r'!"([^"=]+)=([^"]*)"')
+LOAD_RE = re.compile(r"(?:^|=\s*)load\s+([^,]+),")
+STORE_RE = re.compile(r"^store\s+([^,]+),")
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class RegisterAccess:
     space: str
     offset: int
     size: int
+    value_size: int | None
     unit_offset: int | None
     unit_size: int | None
 
@@ -52,6 +55,14 @@ class RegisterAccess:
             and self.unit_size is not None
             and self.offset == self.unit_offset
             and self.size == self.unit_size
+        )
+
+    @property
+    def value_is_full(self) -> bool:
+        return (
+            self.value_size is not None
+            and self.unit_size is not None
+            and self.value_size == self.unit_size
         )
 
 
@@ -131,6 +142,23 @@ def instruction_kind(line: str) -> str:
     return "other"
 
 
+def value_size(line: str) -> int | None:
+    stripped = line.strip()
+    match = LOAD_RE.search(stripped)
+    if match is None:
+        match = STORE_RE.search(stripped)
+    if match is None:
+        return None
+    value_type = match.group(1).strip().split()[0]
+    int_match = re.fullmatch(r"i([0-9]+)", value_type)
+    if int_match is None:
+        return None
+    bits = int(int_match.group(1))
+    if bits % 8 != 0:
+        return None
+    return bits // 8
+
+
 def parse_accesses(path: Path) -> list[RegisterAccess]:
     text = path.read_text(encoding="utf-8")
     metadata = parse_metadata(text)
@@ -184,6 +212,7 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
                 space=space,
                 offset=offset,
                 size=size,
+                value_size=value_size(line),
                 unit_offset=unit.offset if unit is not None else None,
                 unit_size=unit.size if unit is not None else None,
             )
@@ -191,18 +220,25 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
     return accesses
 
 
-def summarize(accesses: Iterable[RegisterAccess]) -> dict[tuple[str, str, str, str], int]:
-    counts: dict[tuple[str, str, str, str], int] = {}
+def summarize(accesses: Iterable[RegisterAccess]) -> dict[tuple[str, str, str, str, str], int]:
+    counts: dict[tuple[str, str, str, str, str], int] = {}
     for access in accesses:
         shape = "full" if access.is_full else "partial"
-        key = (access.category, access.access_kind, access.metadata_kind, shape)
+        value_shape = "full" if access.value_is_full else "partial"
+        if access.value_size is None:
+            value_shape = "unknown"
+        key = (access.category, access.access_kind, access.metadata_kind,
+               shape, value_shape)
         counts[key] = counts.get(key, 0) + 1
     return counts
 
 
 def write_summary(accesses: list[RegisterAccess], output) -> None:
     writer = csv.writer(output, delimiter="\t", lineterminator="\n")
-    writer.writerow(["category", "access_kind", "metadata_kind", "shape", "count"])
+    writer.writerow([
+        "category", "access_kind", "metadata_kind", "shape", "value_shape",
+        "count",
+    ])
     for key, count in sorted(summarize(accesses).items()):
         writer.writerow([*key, count])
 
@@ -211,7 +247,8 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
     writer = csv.writer(output, delimiter="\t", lineterminator="\n")
     writer.writerow([
         "file", "function", "category", "access_kind", "metadata_kind",
-        "shape", "base", "name", "space", "offset", "size", "instruction",
+        "shape", "value_shape", "base", "name", "space", "offset", "size",
+        "value_size", "instruction",
     ])
     for access in accesses:
         writer.writerow([
@@ -221,11 +258,15 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
             access.access_kind,
             access.metadata_kind,
             "full" if access.is_full else "partial",
+            "full" if access.value_is_full else (
+                "unknown" if access.value_size is None else "partial"
+            ),
             access.base,
             access.name,
             access.space,
             access.offset,
             access.size,
+            "" if access.value_size is None else access.value_size,
             access.instruction,
         ])
 

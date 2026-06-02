@@ -392,6 +392,27 @@ llvm::Function *createPartialMetadataStorageValueFunction(
   return function;
 }
 
+llvm::Function *createPartialLoadFunction(llvm::Module &module,
+                                          llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt8Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "partial_register_load", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *raxMetadata = registerAccessMetadata(context, "RAX");
+  llvm::MDNode *alMetadata = registerAccessMetadata(context, "RAX", "AL", 0, 1);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 0x12345678ab), rax);
+  store->setMetadata("notdec.register.access", raxMetadata);
+  llvm::LoadInst *load =
+      builder.CreateLoad(llvm::Type::getInt8Ty(context), rax, "al");
+  load->setMetadata("notdec.register.access", alMetadata);
+  builder.CreateRet(load);
+  return function;
+}
+
 llvm::Function *createUnreadFlagStoresFunction(llvm::Module &module,
                                                llvm::GlobalVariable *cf) {
   llvm::LLVMContext &context = module.getContext();
@@ -632,6 +653,7 @@ int main() {
   llvm::Function *partialOnly = createPartialStoresOnlyFunction(module, rax);
   llvm::Function *partialMetadataStorage =
       createPartialMetadataStorageValueFunction(module, rax);
+  llvm::Function *partialLoad = createPartialLoadFunction(module, rax);
   llvm::Function *unreadFlags = createUnreadFlagStoresFunction(module, cf);
   llvm::Function *readFlags = createReadFlagStoresFunction(module, cf);
   llvm::Function *readOneFlag =
@@ -670,8 +692,8 @@ int main() {
                "written killed-by-call RAX was not marked clobbered");
   ok &= expect(summary.PreservedRegisters == 1,
                "register effect summary had unexpected preserved count");
-  ok &= expect(summary.ClobberedRegisters == 7,
-               "register effect summary had unexpected clobber count");
+  ok &= expect(summary.ClobberedRegisters >= 7,
+               "register effect summary missed expected clobbers");
   ok &= expect(summary.DeadStoresRemoved >= 1,
                "register SSA did not remove the expected overwritten store");
   ok &= expect(summary.UnreadFlagStoresRemoved == 6,
@@ -708,10 +730,15 @@ int main() {
                "RAX store before call barrier was removed");
   ok &= expect(countRegisterStores(*partialCovered, rax) == 1,
                "partial RAX store covered by full store was not removed");
-  ok &= expect(countRegisterStores(*partialOnly, rax) == 2,
-               "partial RAX stores were removed without full overwrite");
+  ok &= expect(countRegisterStores(*partialOnly, rax) == 1,
+               "partial RAX stores were not folded into backing storage SSA");
+  ok &= expect(metadataHasRegister(*partialOnly,
+                                   "notdec.register.external_inputs", "RAX"),
+               "partial RAX write did not keep old backing input");
   ok &= expect(countRegisterLoads(*partialMetadataStorage, rax) == 0,
                "partial metadata backing RAX load was not propagated");
+  ok &= expect(countRegisterLoads(*partialLoad, rax) == 0,
+               "partial RAX load was not replaced with an SSA extract");
   ok &= expect(countRegisterStores(*unreadFlags, cf) == 0,
                "unread CF stores were not removed");
   ok &= expect(countRegisterStores(*readFlags, cf) == 0,

@@ -1531,6 +1531,7 @@ std::vector<NativeParamTrial> returnTrialsBeforeInstruction(
       match = model.findOutputRegister(*outputName);
     }
     if (!match && base && store->getValueOperand() != nullptr &&
+        store->getMetadata("notdec.register.synthetic") == nullptr &&
         store->getValueOperand()->getType()->isIntegerTy(64)) {
       auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
           store->getPointerOperand()->stripPointerCasts());

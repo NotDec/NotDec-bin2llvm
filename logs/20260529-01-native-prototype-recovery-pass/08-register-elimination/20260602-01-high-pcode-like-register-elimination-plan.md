@@ -1332,3 +1332,146 @@ python3 scripts/native-register-residue-audit.py \
 
 - 长期应让 ABI storage 匹配支持 range/base，而不是在 return trial 里补局部 fallback。
 - 本轮先修返回候选漏标，因为它会直接影响 signature rewrite 和返回语义。
+
+## 阶段 B 小步：整数 partial IR access 进入 backing SSA
+
+前面几轮已经确认，Bench2 固定三目标里的很多 `partial` 残留不是 `i8/i32` 直接访问 register global，而是 `store i64 ..., @RAX` 这种完整 backing value，只是 metadata 仍保留 `AL/EAX`。但 `NativeRegisterSSA` 对真正 IR 类型就是 partial 的访问仍缺少处理。
+
+本轮补第一版整数 partial IR access：
+
+- partial load：先读当前完整 backing value，再按 metadata range 做 shift/trunc。
+- partial store：先读当前完整 backing value，按 metadata range 清位、写入新片段，再生成完整 backing store。
+- 如果 partial store 需要旧高位且本地没有定义，会生成 base register external input，这是保留未写部分所需的语义。
+- flags、RIP、vector lane 不纳入本轮。
+
+改动文件和函数：
+
+- `lib/passes/NativeRegisterSSA.cpp:73`
+  - 新增 `bitWidth()`、`bitOffset()`、`isIntegerUnit()`、`canPromotePartialAccess()`，集中判断哪些 partial access 可以进入本轮整数 backing SSA。
+- `lib/passes/NativeRegisterSSA.cpp:327`
+  - `FunctionPromoter::run()` 在 full load rewrite 前先执行 `rewritePartialStores()`，把直接 partial store 扩成完整 backing store。
+- `lib/passes/NativeRegisterSSA.cpp:343`
+  - `scanBlock()` 把可提升 partial load 加入 rewrite 列表。
+- `lib/passes/NativeRegisterSSA.cpp:375`
+  - `rewriteLoads()` 对 partial load 使用 `extractPartialValue()`，替换为 SSA extract，不再保留原始 register load。
+- `lib/passes/NativeRegisterSSA.cpp:412`
+  - 新增 `rewritePartialStores()`，对 `i8/i16/i32` 等 partial store 做 read-modify-write，并用 `notdec.register.synthetic` 标记由 SSA 合成出的完整 backing store。
+- `lib/passes/NativeRegisterSSA.cpp:451`
+  - `removeLocalDeadStores()` 删除死 store 后递归清理暴露出的 dead external input 链，避免 partial store 被 full store 覆盖后留下假输入。
+- `lib/passes/NativeRegisterSSA.cpp:695`
+  - 新增 `resizeInteger()`、`extractPartialValue()`、`replacePartialValue()`、`markSyntheticPartialStore()`。
+- `lib/passes/NativeRegisterSSA.cpp:813`
+  - `localValueBefore()` 遇到前序 partial store 时即时合成当前 backing value，支持连续 partial store。
+- `lib/passes/NativePrototypeRecovery.cpp:1533`
+  - `returnTrialsBeforeInstruction()` 跳过 `notdec.register.synthetic` store，避免把 SSA 合成出的 partial backing store 误当成完整返回候选。
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:52`
+  - 更新 pass 注释，说明当前已处理整数 partial access，flags/vector 仍保守。
+- `tests/native_register_effects_test.cpp:395`
+  - 新增 `createPartialLoadFunction()`，覆盖 `i8` partial load 被 SSA extract 替换。
+- `tests/native_register_effects_test.cpp:733`
+  - 更新 partial store 测试预期：连续 `AL` store 会折叠成一个完整 backing store，并保留旧 backing external input。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test native_prototype_recovery_test -j2
+./build/bin/native_register_effects_test
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+ctest --test-dir build --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-partial-storage-ssa-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 40s |
+| `libuv:shared-library` | 106s | 105s |
+| `memcached:executable` | 57s | 58s |
+
+判断：
+
+- 耗时没有明显退化。
+- 本轮能消除真实 `i8/i16/i32` partial IR access。
+- 固定三目标 residue 数字没有下降，是因为这些目标剩余 partial metadata 行的 IR value 都已经是完整 backing value；它们不是本轮新增能力要处理的直接 partial IR access。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 补上真正 partial IR access 的 SSA 基础，但固定三目标主要剩的是 partial metadata/full value。 |
+| 理解成本 | 5 | 引入 extract/replace-range 和 synthetic store，需要理解 metadata range 与 IR value type 的区别。 |
+| 维护成本 | 4 | 仍复用现有 backing global SSA，后续统一 storage range SSA 时可以迁移这些 helper。 |
+
+有没有更好的方案：
+
+- 长期应把 SSA key 从 `GlobalVariable*` 扩展到明确 storage range，并把 current-value 查询独立出来。
+- 本轮先在现有 backing global SSA 上做 partial extract/replace，是能验证语义的小步。
+
+## 阶段 A 审计补充：区分 metadata shape 和 IR value shape
+
+残留审计原来只有 `shape` 一列，表示 metadata range 是否覆盖完整 register backing。这个口径容易误导：`store i64 ..., @RAX` 配 `name=AL,size=1` 会被统计成 `partial`，但 IR 本身已经是完整 backing value。
+
+本轮给审计脚本新增 `value_shape`：
+
+- `shape`：metadata range 相对 register backing 是 full 还是 partial。
+- `value_shape`：load/store 的 IR value type 是否等于 register backing size。
+
+改动文件和函数：
+
+- `scripts/native-register-residue-audit.py:35`
+  - `RegisterAccess` 新增 `value_size` 和 `value_is_full`。
+- `scripts/native-register-residue-audit.py:145`
+  - 新增 `value_size()`，从 `load` / `store` 指令解析整数 value type。
+- `scripts/native-register-residue-audit.py:223`
+  - `summarize()` 的 key 增加 `value_shape`。
+- `scripts/native-register-residue-audit.py:236`
+  - summary 输出列增加 `value_shape`。
+- `scripts/native-register-residue-audit.py:246`
+  - details 输出列增加 `value_shape` / `value_size`。
+- `tests/native_register_residue_audit_test.py:56`
+  - 更新脚本单测，断言 full/partial metadata 和 full/partial value shape。
+
+验证：
+
+```bash
+python3 tests/native_register_residue_audit_test.py
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-partial-storage-ssa-gate/*.signature-rewrite.ll
+```
+
+固定三目标新审计结果：
+
+```text
+category  access_kind  metadata_kind  shape    value_shape  count
+gpr       load         access         full     full         39
+gpr       load         access         partial  full         9
+gpr       load         external_input full     full         3191
+gpr       store        access         full     full         3601
+gpr       store        access         partial  full         11
+other     load         access         full     full         8
+other     load         external_input full     full         50
+other     store        access         partial  full         1
+vector    load         external_input full     full         70
+vector    store        access         partial  full         71
+```
+
+判断：
+
+- 固定三目标里剩下的 GPR partial metadata load/store 都是 `value_shape=full`。
+- 下一步不应再把这些当成“直接 partial IR access 未进 SSA”，而应继续处理 partial metadata/full backing value 的 prototype cleanup、callsite 当前值和 return/input 绑定。

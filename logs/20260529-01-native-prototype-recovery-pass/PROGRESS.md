@@ -613,6 +613,11 @@
   - [x] 让 partial metadata 但完整 backing storage 的返回 store 按 metadata base 进入返回候选，修正部分返回签名漏恢复。
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-register-residue-partial-return-base-gate`
+  - [x] 让整数 partial IR access 进入 backing SSA：partial load 用 extract 替换，partial store 用 read-modify-write 合成完整 backing store。
+    - 文件：`include/notdec-bin2llvm/passes/NativeRegisterSSA.h`、`lib/passes/NativeRegisterSSA.cpp`、`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_register_effects_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-partial-storage-ssa-gate`
+  - [x] 扩展 residue audit 输出 `value_shape`，区分 metadata partial 和 IR value 是否已经是完整 backing。
+    - 文件：`scripts/native-register-residue-audit.py`、`tests/native_register_residue_audit_test.py`
 
 ## 记录规则
 

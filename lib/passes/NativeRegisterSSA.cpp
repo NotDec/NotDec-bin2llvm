@@ -2,8 +2,10 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -69,6 +71,34 @@ bool isFlagRegisterName(llvm::StringRef name) {
 
 bool isInstructionPointerName(llvm::StringRef name) {
   return name == "RIP";
+}
+
+uint32_t bitWidth(uint32_t byteSize) {
+  return byteSize * 8;
+}
+
+std::optional<uint32_t> bitOffset(const AccessInfo &access) {
+  if (access.Unit == nullptr || access.Offset < access.Unit->Offset ||
+      access.Size == 0 ||
+      access.Offset + access.Size > access.Unit->Offset + access.Unit->Size) {
+    return std::nullopt;
+  }
+  return bitWidth(access.Offset - access.Unit->Offset);
+}
+
+bool isIntegerUnit(const AccessInfo &access) {
+  if (access.Unit == nullptr || access.Unit->Global == nullptr) {
+    return false;
+  }
+  return llvm::isa<llvm::IntegerType>(access.Unit->Global->getValueType());
+}
+
+bool canPromotePartialAccess(const AccessInfo &access) {
+  return access.Unit != nullptr && access.IsRegisterAccess &&
+         !access.IsFullUnit && isIntegerUnit(access) &&
+         !isFlagRegisterName(access.Unit->Name) &&
+         !isInstructionPointerName(access.Unit->Name) &&
+         bitOffset(access).has_value();
 }
 
 std::optional<std::string> mdField(const llvm::MDNode *node,
@@ -295,6 +325,7 @@ public:
     }
 
     if (EnableRewrite) {
+      rewritePartialStores();
       rewriteLoads();
       removeLocalDeadStores();
       removeUnreadFlagStores();
@@ -316,7 +347,7 @@ private:
         if (access.Unit != nullptr) {
           ++Summary.LoadsSeen;
           LoadedUnits.insert(access.Unit->Global);
-          if (access.IsStorageValue) {
+          if (access.IsStorageValue || canPromotePartialAccess(access)) {
             Loads.push_back(load);
           }
         }
@@ -344,13 +375,17 @@ private:
   void rewriteLoads() {
     for (llvm::LoadInst *load : Loads) {
       AccessInfo access = registerLoad(*load, Units);
-      if (access.Unit == nullptr || !access.IsStorageValue) {
+      if (access.Unit == nullptr ||
+          (!access.IsStorageValue && !canPromotePartialAccess(access))) {
         continue;
       }
 
       llvm::Value *value = readRegister(*load->getParent(), *access.Unit, load);
       if (value == nullptr || value == load) {
         continue;
+      }
+      if (!access.IsStorageValue) {
+        value = extractPartialValue(access, value, load);
       }
       Replacement[load] = value;
       load->replaceAllUsesWith(value);
@@ -366,10 +401,50 @@ private:
   void collectExternalInputsOnly() {
     for (llvm::LoadInst *load : Loads) {
       AccessInfo access = registerLoad(*load, Units);
-      if (access.Unit == nullptr || !access.IsStorageValue) {
+      if (access.Unit == nullptr ||
+          (!access.IsStorageValue && !canPromotePartialAccess(access))) {
         continue;
       }
       (void)readRegister(*load->getParent(), *access.Unit, load);
+    }
+  }
+
+  void rewritePartialStores() {
+    std::vector<llvm::StoreInst *> stores;
+    for (llvm::BasicBlock &block : Function) {
+      for (llvm::Instruction &inst : block) {
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+        if (store == nullptr) {
+          continue;
+        }
+        AccessInfo access = registerStore(*store, Units);
+        if (canPromotePartialAccess(access)) {
+          stores.push_back(store);
+        }
+      }
+    }
+
+    for (llvm::StoreInst *store : stores) {
+      AccessInfo access = registerStore(*store, Units);
+      if (!canPromotePartialAccess(access) || access.IsStorageValue) {
+        continue;
+      }
+      llvm::Value *oldValue =
+          readRegister(*store->getParent(), *access.Unit, store);
+      if (oldValue == nullptr) {
+        continue;
+      }
+      llvm::Value *newValue =
+          replacePartialValue(access, oldValue, store->getValueOperand(), store);
+      llvm::IRBuilder<> builder(store);
+      llvm::StoreInst *newStore = builder.CreateStore(newValue,
+                                                      access.Unit->Global);
+      newStore->setMetadata("notdec.register.access",
+                            store->getMetadata("notdec.register.access"));
+      markSyntheticPartialStore(*newStore);
+      StoredFullUnits.insert(access.Unit->Global);
+      Replacement[store] = newStore;
+      store->eraseFromParent();
     }
   }
 
@@ -416,7 +491,12 @@ private:
                                                    deadStores.end());
     for (llvm::Instruction *inst : uniqueDeadStores) {
       if (inst->use_empty()) {
+        auto *store = llvm::cast<llvm::StoreInst>(inst);
+        llvm::Value *storedValue = store->getValueOperand();
         inst->eraseFromParent();
+        llvm::RecursivelyDeleteTriviallyDeadInstructions(
+            storedValue, nullptr, nullptr,
+            [this](llvm::Value *value) { forgetExternalInputValue(value); });
         ++Summary.DeadStoresRemoved;
       }
     }
@@ -612,6 +692,76 @@ private:
     return false;
   }
 
+  llvm::Value *resizeInteger(llvm::IRBuilder<> &builder, llvm::Value *value,
+                             llvm::IntegerType *targetType) {
+    auto *valueType = llvm::dyn_cast<llvm::IntegerType>(value->getType());
+    if (valueType == nullptr || valueType == targetType) {
+      return value;
+    }
+    if (valueType->getBitWidth() < targetType->getBitWidth()) {
+      return builder.CreateZExt(value, targetType);
+    }
+    return builder.CreateTrunc(value, targetType);
+  }
+
+  llvm::Value *extractPartialValue(const AccessInfo &access,
+                                   llvm::Value *baseValue,
+                                   llvm::Instruction *before) {
+    std::optional<uint32_t> shift = bitOffset(access);
+    if (!shift) {
+      return baseValue;
+    }
+    llvm::IRBuilder<> builder(before);
+    auto *baseType = llvm::cast<llvm::IntegerType>(baseValue->getType());
+    llvm::Value *shifted = baseValue;
+    if (*shift != 0) {
+      shifted = builder.CreateLShr(
+          baseValue, llvm::ConstantInt::get(baseType, *shift));
+    }
+    auto *targetType = llvm::IntegerType::get(Function.getContext(),
+                                             bitWidth(access.Size));
+    if (baseType == targetType) {
+      return shifted;
+    }
+    return builder.CreateTrunc(shifted, targetType);
+  }
+
+  llvm::Value *replacePartialValue(const AccessInfo &access,
+                                   llvm::Value *oldValue,
+                                   llvm::Value *partialValue,
+                                   llvm::Instruction *before) {
+    std::optional<uint32_t> shift = bitOffset(access);
+    if (!shift) {
+      return oldValue;
+    }
+    llvm::IRBuilder<> builder(before);
+    auto *baseType = llvm::cast<llvm::IntegerType>(oldValue->getType());
+    llvm::Value *resized = resizeInteger(builder, partialValue, baseType);
+    unsigned baseBits = baseType->getBitWidth();
+    unsigned accessBits = bitWidth(access.Size);
+    llvm::APInt mask = llvm::APInt::getLowBitsSet(baseBits, accessBits)
+                           .shl(*shift);
+    llvm::Value *cleared =
+        builder.CreateAnd(oldValue, llvm::ConstantInt::get(baseType, ~mask));
+    llvm::Value *shifted = resized;
+    if (*shift != 0) {
+      shifted =
+          builder.CreateShl(resized, llvm::ConstantInt::get(baseType, *shift));
+    }
+    llvm::Value *masked =
+        builder.CreateAnd(shifted, llvm::ConstantInt::get(baseType, mask));
+    return builder.CreateOr(cleared, masked);
+  }
+
+  void markSyntheticPartialStore(llvm::StoreInst &store) {
+    llvm::LLVMContext &context = Function.getContext();
+    llvm::Metadata *fields[] = {
+        llvm::MDString::get(context, "partial_storage_ssa"),
+    };
+    store.setMetadata("notdec.register.synthetic",
+                      llvm::MDNode::get(context, fields));
+  }
+
   void removeUnreadRipStores() {
     bool hasRipLoad = false;
     for (llvm::GlobalVariable *global : LoadedUnits) {
@@ -691,6 +841,14 @@ private:
       AccessInfo access = registerStore(*store, Units);
       if (access.Unit == &unit && access.IsStorageValue) {
         return resolveValue(store->getValueOperand());
+      }
+      if (access.Unit == &unit && canPromotePartialAccess(access)) {
+        llvm::Value *oldValue = readRegister(block, unit, store);
+        if (oldValue == nullptr) {
+          return nullptr;
+        }
+        return replacePartialValue(access, oldValue, store->getValueOperand(),
+                                   before);
       }
     }
     return nullptr;

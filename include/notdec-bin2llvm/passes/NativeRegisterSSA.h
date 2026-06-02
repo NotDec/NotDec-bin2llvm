@@ -49,9 +49,9 @@ struct NativeRegisterSSASummary {
   std::vector<NativeRegisterSSAFunctionSummary> Functions;
 };
 
-// This pass only promotes full-width register globals tagged by RegisterStorage.
-// Partial register aliases stay as memory operations until alias semantics are
-// modeled explicitly.
+// This pass promotes RegisterStorage-backed globals into SSA values. Integer
+// partial accesses are rewritten through the full backing value, while flags
+// and vector lanes stay conservative.
 NativeRegisterSSASummary
 runNativeRegisterSSA(llvm::Module &module,
                      const NativeRegisterSSAOptions &options = {});

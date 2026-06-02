@@ -53,10 +53,10 @@ entry:
         accesses = module.parse_accesses(path)
 
     counts = module.summarize(accesses)
-    assert counts[("gpr", "load", "external_input", "full")] == 1
-    assert counts[("gpr", "load", "access", "partial")] == 1
-    assert counts[("gpr", "store", "access", "full")] == 1
-    assert counts[("flags", "store", "access", "full")] == 1
+    assert counts[("gpr", "load", "external_input", "full", "full")] == 1
+    assert counts[("gpr", "load", "access", "partial", "partial")] == 1
+    assert counts[("gpr", "store", "access", "full", "full")] == 1
+    assert counts[("flags", "store", "access", "full", "full")] == 1
 
 
 if __name__ == "__main__":
