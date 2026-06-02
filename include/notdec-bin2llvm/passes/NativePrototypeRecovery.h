@@ -91,6 +91,7 @@ struct NativePrototypeRewriteEligibility {
 struct NativePrototypeInputBinding {
   NativeRecoveredPrototypeParam Param;
   llvm::LoadInst *ExternalInputLoad = nullptr;
+  llvm::LoadInst *StackInputLoad = nullptr;
 };
 
 // Read-only bridge from recovered return storage to the register store that

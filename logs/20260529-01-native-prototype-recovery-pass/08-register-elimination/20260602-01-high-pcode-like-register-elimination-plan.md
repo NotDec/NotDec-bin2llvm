@@ -2296,3 +2296,132 @@ notdec_native_12c00 RBX/RBX, RBP/RBP
 
 - 最好是在 P-Code lowering 阶段保证所有 register global access 都带准确 access metadata。
 - 本轮是在 SSA pass 入口补齐 full-unit fallback，范围只限 direct register global，避免猜复杂 pointer alias。
+
+## 阶段 E 小步：stack input 的 callee 侧 signature rewrite
+
+背景：
+
+- stack input candidate 已能通过 `notdec.stack.input` metadata 恢复到 `notdec.prototype.recovered`。
+- 但之前 `buildNativeRecoveredPrototypeFunctionType()` 遇到 `storage=stack` 会直接返回 unsupported，导致 stack input 只能记录，不能进入函数签名。
+- 阶段 E 的完整目标还包括 direct callsite 从调用点 stack storage 取值。本轮先做 callee 侧最小实现，不猜 caller 栈。
+
+本轮范围：
+
+- 只支持 size 为 8 的 stack input，统一生成 `i64` 参数。
+- `getNativePrototypeInputBindings()` 支持把 recovered stack input 绑定到唯一的 `notdec.stack.input` load。
+- input-only、input-return、input-multi-return rewrite 都可用同一套 input binding 替换 callee 内部 load。
+- 如果函数有调用者且输入里有 stack input，先返回 `unsupported stack callsite input`，不做 callsite rewrite。
+
+不做：
+
+- 不从任意 GEP 或栈指针表达式猜 stack 参数，只使用已有 `notdec.stack.input` metadata。
+- 不实现 caller 侧 stack argument value 查询。
+- 不处理非 8 字节 stack input、varargs、动态栈调整、复杂 alias。
+
+改动文件和函数：
+
+- `include/notdec-bin2llvm/passes/NativePrototypeRecovery.h:91`
+  - `NativePrototypeInputBinding` 增加 `StackInputLoad`，让 register input 和 stack input 共用绑定结构。
+- `lib/passes/NativePrototypeRecovery.cpp:335`
+  - 新增 `uniqueStackInputLoad()`，按 `space/offset/size` 找唯一 `notdec.stack.input` load。
+- `lib/passes/NativePrototypeRecovery.cpp:2450`
+  - `buildNativeRecoveredPrototypeFunctionType()` 接受 8 字节 stack input，生成 `i64` 参数；return 仍只支持 register。
+- `lib/passes/NativePrototypeRecovery.cpp:2524`
+  - `getNativePrototypeInputBindings()` 支持 register external input 和 stack input 两种绑定。
+- `lib/passes/NativePrototypeRecovery.cpp:2560`
+  - 新增 `inputBindingLoad()`，rewrite 时统一取 input load。
+- `lib/passes/NativePrototypeRecovery.cpp:2567`
+  - 新增 `hasStackInputBinding()`，callsite rewrite 遇到 stack input 时保守跳过。
+- `lib/passes/NativePrototypeRecovery.cpp:2847`
+  - `rewriteNativeRecoveredPrototypeInputOnly()` 用统一 input binding 替换 load；有调用者且含 stack input 时跳过。
+- `lib/passes/NativePrototypeRecovery.cpp:2943`
+  - `rewriteNativeRecoveredPrototypeInputReturn()` 同样支持 stack input binding，并保守跳过 stack callsite。
+- `lib/passes/NativePrototypeRecovery.cpp:3196`
+  - `rewriteNativeRecoveredPrototypeInputMultiReturn()` 同样支持 stack input binding，并保守跳过 stack callsite。
+- `tests/native_prototype_recovery_test.cpp:1374`
+  - `createStackInputFunction()` 增加可选输出 `StackInputLoad`。
+- `tests/native_prototype_recovery_test.cpp:2688`
+  - stack input 现在可 rewrite，summary 期望从 51/31 调整为 52/32。
+- `tests/native_prototype_recovery_test.cpp:2782`
+  - 断言 stack input recovered prototype 能构建 `void(i64)`，且 rewrite eligibility 为 true。
+- `tests/native_prototype_recovery_test.cpp:2859`
+  - 断言 stack input binding 指向正确的 `notdec.stack.input` load。
+- `tests/native_prototype_recovery_test.cpp:2928`
+  - 断言 stack input-only rewrite 后函数类型为 `void(i64)`，原 stack load use 被新参数替换。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-stack-input-callee-final-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-stack-input-callee-final-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-stack-input-callee-final-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-stack-input-callee-final.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 107s | 107s |
+| `memcached:executable` | 57s | 57s |
+
+signature rewrite 统计：
+
+```text
+target      needed  rewritten  unsupported stack callsite input
+vsftpd      137     137        0
+libuv       336     336        0
+memcached   187     187        0
+```
+
+残留统计与上一轮相同：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  count
+gpr       load         access           full     full         22
+gpr       load         access           partial  full         3
+gpr       load         external_input   full     full         3190
+gpr       store        access           full     full         3583
+gpr       store        access           partial  full         11
+other     load         access           full     full         8
+other     load         external_input   full     full         49
+other     store        access           partial  full         1
+vector    load         access           full     full         1
+vector    load         external_input   full     full         70
+vector    store        access           partial  full         71
+```
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 阶段 E 从“只能记录 stack input”推进到“callee 内部能变成 LLVM 参数”；固定三目标暂未出现新增 residue 下降。 |
+| 理解成本 | 3 | input binding 从单一 register load 扩展成 register/stack 两类，但 rewrite 入口仍集中。 |
+| 维护成本 | 3 | 后续 caller-side stack value 查询实现后，需要替换当前 `unsupported stack callsite input` 保护。 |
+
+有没有更好的方案：
+
+- 完整方案是同时实现 direct callsite stack argument 查询和 rewrite。
+- 本轮先把 callee 侧 load-to-argument 打通，避免在 caller 栈语义不明确时猜值。

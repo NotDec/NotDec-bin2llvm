@@ -332,6 +332,39 @@ std::optional<llvm::LoadInst *> uniqueExternalInputLoad(
   return result;
 }
 
+std::optional<llvm::LoadInst *> uniqueStackInputLoad(
+    llvm::Function &function, llvm::StringRef space, uint64_t offset,
+    uint32_t size) {
+  llvm::LoadInst *result = nullptr;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (load == nullptr) {
+        continue;
+      }
+      llvm::MDNode *metadata = load->getMetadata("notdec.stack.input");
+      if (metadata == nullptr) {
+        continue;
+      }
+      std::optional<std::string> loadSpace = metadataField(*metadata, "space");
+      std::optional<uint64_t> loadOffset = parseUint64Field(*metadata, "offset");
+      std::optional<uint64_t> loadSize = parseUint64Field(*metadata, "size");
+      if (!loadSpace || *loadSpace != space || !loadOffset ||
+          *loadOffset != offset || !loadSize || *loadSize != size) {
+        continue;
+      }
+      if (result != nullptr) {
+        return std::nullopt;
+      }
+      result = load;
+    }
+  }
+  if (result == nullptr) {
+    return std::nullopt;
+  }
+  return result;
+}
+
 std::optional<std::string> registerAccessName(llvm::Instruction &instruction) {
   llvm::MDNode *metadata = instruction.getMetadata("notdec.register.access");
   if (metadata == nullptr) {
@@ -2420,7 +2453,10 @@ std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
   llvm::Type *registerType = llvm::Type::getInt64Ty(context);
   paramTypes.reserve(prototype.Inputs.size());
   for (const NativeRecoveredPrototypeParam &param : prototype.Inputs) {
-    if (param.StorageKind != "register") {
+    if (param.StorageKind != "register" && param.StorageKind != "stack") {
+      return std::nullopt;
+    }
+    if (param.Size != 8) {
       return std::nullopt;
     }
     paramTypes.push_back(registerType);
@@ -2496,18 +2532,47 @@ getNativePrototypeInputBindings(llvm::Function &function) {
   std::vector<NativePrototypeInputBinding> bindings;
   bindings.reserve(prototype->Inputs.size());
   for (const NativeRecoveredPrototypeParam &param : prototype->Inputs) {
-    std::optional<llvm::LoadInst *> load =
-        uniqueExternalInputLoad(function, param.RegisterName);
-    if (!load) {
-      return std::nullopt;
-    }
-
     NativePrototypeInputBinding binding;
     binding.Param = param;
-    binding.ExternalInputLoad = *load;
+    if (param.StorageKind == "register") {
+      std::optional<llvm::LoadInst *> load =
+          uniqueExternalInputLoad(function, param.RegisterName);
+      if (!load) {
+        return std::nullopt;
+      }
+      binding.ExternalInputLoad = *load;
+    } else if (param.StorageKind == "stack") {
+      std::optional<llvm::LoadInst *> load =
+          uniqueStackInputLoad(function, param.StackSpace, param.StackOffset,
+                               param.Size);
+      if (!load) {
+        return std::nullopt;
+      }
+      binding.StackInputLoad = *load;
+    } else {
+      return std::nullopt;
+    }
     bindings.push_back(std::move(binding));
   }
   return bindings;
+}
+
+llvm::LoadInst *inputBindingLoad(const NativePrototypeInputBinding &binding) {
+  if (binding.ExternalInputLoad != nullptr) {
+    return binding.ExternalInputLoad;
+  }
+  return binding.StackInputLoad;
+}
+
+bool hasStackInputBinding(
+    llvm::ArrayRef<NativePrototypeInputBinding> inputBindings) {
+  for (const NativePrototypeInputBinding &binding : inputBindings) {
+    if (binding.StackInputLoad != nullptr ||
+        binding.Param.StorageKind == "stack") {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::optional<std::vector<NativePrototypeReturnBinding>>
@@ -2776,7 +2841,7 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
     return result;
   }
   for (uint64_t index = 0; index < inputBindings->size(); ++index) {
-    llvm::LoadInst *inputLoad = (*inputBindings)[index].ExternalInputLoad;
+    llvm::LoadInst *inputLoad = inputBindingLoad((*inputBindings)[index]);
     if (inputLoad == nullptr ||
         inputLoad->getType() != (*recoveredType)->getParamType(index)) {
       result.Reason = "input load type mismatch";
@@ -2785,6 +2850,10 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
   }
   std::optional<std::vector<MultiInputCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
+    if (hasStackInputBinding(*inputBindings)) {
+      result.Reason = "unsupported stack callsite input";
+      return result;
+    }
     MultiInputCallsiteCollectionResult callsiteCollection =
         collectMultiInputDirectCallsiteRewrites(function, prototype->Inputs,
                                                 **recoveredType);
@@ -2813,7 +2882,7 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
 
   auto argument = rewritten->arg_begin();
   for (const NativePrototypeInputBinding &binding : *inputBindings) {
-    llvm::LoadInst *inputLoad = binding.ExternalInputLoad;
+    llvm::LoadInst *inputLoad = inputBindingLoad(binding);
     argument->setName(inputLoad->getName());
     inputLoad->replaceAllUsesWith(&*argument);
     if (inputLoad->use_empty()) {
@@ -2876,7 +2945,7 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
     return result;
   }
   for (uint64_t index = 0; index < inputBindings->size(); ++index) {
-    llvm::LoadInst *inputLoad = (*inputBindings)[index].ExternalInputLoad;
+    llvm::LoadInst *inputLoad = inputBindingLoad((*inputBindings)[index]);
     if (inputLoad == nullptr ||
         inputLoad->getType() != (*recoveredType)->getParamType(index)) {
       result.Reason = "input load type mismatch";
@@ -2902,6 +2971,10 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
   }
   std::optional<std::vector<MultiInputCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
+    if (hasStackInputBinding(*inputBindings)) {
+      result.Reason = "unsupported stack callsite input";
+      return result;
+    }
     MultiInputCallsiteCollectionResult callsiteCollection =
         collectMultiInputDirectCallsiteRewrites(function, prototype->Inputs,
                                                 **recoveredType);
@@ -2938,7 +3011,7 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
 
   auto argument = rewritten->arg_begin();
   for (const NativePrototypeInputBinding &binding : *inputBindings) {
-    llvm::LoadInst *inputLoad = binding.ExternalInputLoad;
+    llvm::LoadInst *inputLoad = inputBindingLoad(binding);
     argument->setName(inputLoad->getName());
     if (returnValue == inputLoad) {
       returnValue = &*argument;
@@ -3127,7 +3200,7 @@ rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
     return result;
   }
   for (uint64_t index = 0; index < inputBindings->size(); ++index) {
-    llvm::LoadInst *inputLoad = (*inputBindings)[index].ExternalInputLoad;
+    llvm::LoadInst *inputLoad = inputBindingLoad((*inputBindings)[index]);
     if (inputLoad == nullptr ||
         inputLoad->getType() != (*recoveredType)->getParamType(index)) {
       result.Reason = "input load type mismatch";
@@ -3156,6 +3229,10 @@ rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
 
   std::optional<std::vector<InputMultiReturnCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
+    if (hasStackInputBinding(*inputBindings)) {
+      result.Reason = "unsupported stack callsite input";
+      return result;
+    }
     InputMultiReturnCallsiteCollectionResult callsiteCollection =
         collectInputMultiReturnDirectCallsites(
             function, prototype->Inputs, **recoveredType, prototype->Returns,
@@ -3185,7 +3262,7 @@ rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
 
   auto argument = rewritten->arg_begin();
   for (const NativePrototypeInputBinding &binding : *inputBindings) {
-    llvm::LoadInst *inputLoad = binding.ExternalInputLoad;
+    llvm::LoadInst *inputLoad = inputBindingLoad(binding);
     argument->setName(inputLoad->getName());
     for (NativePrototypeReturnBinding &returnBinding : *returnBindings) {
       if (returnBinding.ReturnValue == inputLoad) {

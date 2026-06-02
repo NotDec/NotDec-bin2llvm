@@ -1373,7 +1373,8 @@ llvm::MDNode *stackInputMetadata(llvm::LLVMContext &context, uint64_t offset,
 
 llvm::Function *createStackInputFunction(llvm::Module &module,
                                          const std::string &name,
-                                         uint64_t offset, bool used) {
+                                         uint64_t offset, bool used,
+                                         llvm::LoadInst **inputLoad = nullptr) {
   llvm::LLVMContext &context = module.getContext();
   auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *function =
@@ -1394,6 +1395,9 @@ llvm::Function *createStackInputFunction(llvm::Module &module,
                          "stack_arg.mem");
   load->setMetadata("notdec.stack.input",
                     stackInputMetadata(context, offset, 8));
+  if (inputLoad != nullptr) {
+    *inputLoad = load;
+  }
   if (used) {
     builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 1));
   }
@@ -2463,8 +2467,10 @@ int main() {
       createUnusedExternalInputFunction(module, "unused_rdi", rdi, "RDI");
   attachExternalInputs(*unusedInputFunction, {{"RDI", rdi}});
 
+  llvm::LoadInst *stackInputLoad = nullptr;
   llvm::Function *stackInputFunction =
-      createStackInputFunction(module, "input_stack_8", 8, true);
+      createStackInputFunction(module, "input_stack_8", 8, true,
+                               &stackInputLoad);
   llvm::Function *unusedStackInputFunction =
       createStackInputFunction(module, "unused_stack_8", 8, false);
 
@@ -2679,9 +2685,9 @@ int main() {
                "unexpected input candidate count");
   ok &= expect(summary.ReturnCandidates == 34,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 51,
+  ok &= expect(summary.RewriteEligibleFunctions == 52,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 31,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 32,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -2788,16 +2794,21 @@ int main() {
                  "recovered stack input space was not read");
     ok &= expect(stackPrototype->Inputs[0].StackOffset == 8,
                  "recovered stack input offset was not read");
-    ok &= expect(!notdec::bin2llvm::buildNativeRecoveredPrototypeFunctionType(
-                     context, *stackPrototype),
-                 "stack input prototype unexpectedly built a rewrite type");
+    std::optional<llvm::FunctionType *> stackType =
+        notdec::bin2llvm::buildNativeRecoveredPrototypeFunctionType(
+            context, *stackPrototype);
+    llvm::Type *stackI64 = llvm::Type::getInt64Ty(context);
+    ok &= expect(stackType && functionTypeShape(**stackType,
+                                                llvm::Type::getVoidTy(context),
+                                                llvm::ArrayRef(stackI64)),
+                 "stack input prototype did not build void(i64)");
     notdec::bin2llvm::NativePrototypeRewriteEligibility stackEligibility =
         notdec::bin2llvm::getNativePrototypeRewriteEligibility(
             *stackInputFunction);
-    ok &= expect(!stackEligibility.Eligible,
-                 "stack input prototype was incorrectly rewrite eligible");
-    ok &= expect(stackEligibility.Reason == "unsupported recovered prototype type",
-                 "stack input prototype had unexpected rewrite reason");
+    ok &= expect(stackEligibility.Eligible,
+                 "stack input prototype was not rewrite eligible");
+    ok &= expect(stackEligibility.NeedsRewrite,
+                 "stack input prototype did not request rewrite");
   }
   std::optional<notdec::bin2llvm::NativeRecoveredPrototype> inputPrototype =
       notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(*inputFunction);
@@ -2844,6 +2855,20 @@ int main() {
                  "bindable input binding used wrong slot");
     ok &= expect((*inputBindings)[0].ExternalInputLoad == bindableInputLoad,
                  "bindable input binding used wrong load");
+  }
+  std::optional<std::vector<notdec::bin2llvm::NativePrototypeInputBinding>>
+      stackInputBindings =
+          notdec::bin2llvm::getNativePrototypeInputBindings(
+              *stackInputFunction);
+  ok &= expect(stackInputBindings.has_value(),
+               "stack input prototype had no input bindings");
+  if (stackInputBindings) {
+    ok &= expect(stackInputBindings->size() == 1,
+                 "stack input prototype had unexpected binding count");
+    ok &= expect((*stackInputBindings)[0].Param.StorageKind == "stack",
+                 "stack input binding used wrong storage kind");
+    ok &= expect((*stackInputBindings)[0].StackInputLoad == stackInputLoad,
+                 "stack input binding used wrong load");
   }
   ok &= expect(!notdec::bin2llvm::getNativePrototypeInputBindings(
                     *inputFunction),
@@ -2900,6 +2925,27 @@ int main() {
                    bindableInputFunction->getMetadata(
                        "notdec.prototype.recovered") != nullptr,
                "rewritten input-only function lost recovered prototype metadata");
+  llvm::Instruction *stackInputLoadUser =
+      stackInputLoad != nullptr && !stackInputLoad->use_empty()
+          ? llvm::dyn_cast<llvm::Instruction>(*stackInputLoad->user_begin())
+          : nullptr;
+  notdec::bin2llvm::NativePrototypeRewriteResult stackInputRewriteResult =
+      notdec::bin2llvm::rewriteNativeRecoveredPrototypeInputOnly(
+          *stackInputFunction);
+  ok &= expect(stackInputRewriteResult.Rewritten,
+               "stack input-only prototype was not rewritten");
+  stackInputFunction = stackInputRewriteResult.Function;
+  ok &= expect(stackInputFunction != nullptr &&
+                   functionTypeShape(*stackInputFunction->getFunctionType(),
+                                     llvm::Type::getVoidTy(context),
+                                     llvm::ArrayRef(i64Param)),
+               "rewritten stack input-only function type was not void(i64)");
+  ok &= expect(stackInputFunction != nullptr &&
+                   !stackInputFunction->arg_empty() &&
+                   stackInputLoadUser != nullptr &&
+                   stackInputLoadUser->getOperand(0) ==
+                       &*stackInputFunction->arg_begin(),
+               "rewritten stack input-only function did not use new argument");
 
   llvm::Module callsiteModule("native-prototype-input-callsite-rewrite-test",
                               context);
