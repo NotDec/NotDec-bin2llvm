@@ -674,11 +674,18 @@ private:
         passedBarrier = true;
         continue;
       }
-      auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
-      if (store == nullptr) {
+      if (passedBarrier) {
         continue;
       }
-      if (passedBarrier) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        AccessInfo access = registerLoad(*load, Units);
+        if (access.Unit == &unit && access.IsStorageValue) {
+          return resolveValue(load);
+        }
+        continue;
+      }
+      auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+      if (store == nullptr) {
         continue;
       }
       AccessInfo access = registerStore(*store, Units);

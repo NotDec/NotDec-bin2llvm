@@ -1143,3 +1143,92 @@ python3 scripts/native-register-residue-audit.py --details \
 
 - 长期更好的方案是完整 flags SSA，让 flag producer / consumer 直接变成 SSA value。
 - 本轮没有直接做完整 flags SSA，是因为当前明显残留是未读 store 和死输入链，先用小步 cleanup 可以稳定清零这批残留。
+
+## 阶段 C 小步：复用同一 call barrier 后的重复 register load
+
+固定三目标 flags 残留清零后，剩余 register load 里有一批形态很明确：
+
+- call 之后读取某个 killed-by-call register。
+- 第一次 load 不能被替换，因为 call 确实阻断了 call 前 reaching value。
+- 同一个 call barrier 后再次读取同一个 backing register 时，应该复用第一次 load 的 SSA value，而不是继续从全局 register load。
+
+典型例子是 `uv_mutex_trylock`：`pthread_mutex_trylock()` 后连续读取 `RAX/EAX` 做不同比较。第一条 `RAX` load 是 call output 的保守表示；后续同 register load 可以安全复用它。
+
+本轮只做这个窄规则：
+
+- `localValueBefore()` 继续不穿过 clobbering call。
+- 如果在同一个 barrier 之后已经有同 register 的 storage-value load，就把它作为当前值。
+- 不把 declaration call 强行解释成返回值，不改 ABI，不改 partial metadata。
+
+改动文件和函数：
+
+- `lib/passes/NativeRegisterSSA.cpp:663`
+  - `localValueBefore()` 在查找 store 前先识别同 register 的前序 load。
+  - 一旦遇到 clobbering call，仍停止使用 call 之前的 load/store。
+- `tests/native_register_effects_test.cpp:144`
+  - 新增 `createRepeatedLoadAfterCallFunction()`，覆盖 call 后同 register 连续 load。
+- `tests/native_register_effects_test.cpp:617`
+  - 将新样例加入主测试模块。
+- `tests/native_register_effects_test.cpp:685`
+  - 断言 call 后重复 `RAX` load 从 2 条降到 1 条。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+ctest --test-dir build -R 'notdec.native_register_effects.preserved' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+ctest --test-dir build --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-repeated-load-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-repeated-load-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 40s | 40s |
+| `libuv:shared-library` | 105s | 107s |
+| `memcached:executable` | 56s | 56s |
+
+残留对比：
+
+| kind | 上一轮 | 本轮 |
+| --- | ---: | ---: |
+| `gpr load access full` | 53 | 39 |
+| `gpr load access partial` | 17 | 9 |
+| `gpr store access full` | 3601 | 3601 |
+| `gpr store access partial` | 14 | 14 |
+| `flags` | 0 | 0 |
+
+判断：
+
+- 这个改动减少了 call 后重复 register load，没有让 value 穿过 call barrier。
+- 耗时没有明显退化。
+- 下一步还要处理 store 残留、external input 和真正 partial storage SSA。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 5 | GPR access load 明显下降，但 store 主体还没动。 |
+| 理解成本 | 3 | 只在现有 `localValueBefore()` 增加一个前序 load 复用分支。 |
+| 维护成本 | 3 | 规则依赖现有 call barrier 逻辑，后续统一 current-value 查询时可以直接迁移。 |
+
+有没有更好的方案：
+
+- 长期应把这类逻辑放入统一的 `valueBefore(inst, storage)` 查询模块。
+- 本轮先内联在 `NativeRegisterSSA`，因为当前目标只是消除明显重复 load，代码面小且风险低。

@@ -141,6 +141,32 @@ llvm::Function *createCallEffectFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createRepeatedLoadAfterCallFunction(llvm::Module &module,
+                                                    llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "repeated_load_after_call_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "repeated_load_after_call", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RAX");
+
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *first =
+      builder.CreateLoad(rax->getValueType(), rax, "rax_after_call_first");
+  first->setMetadata("notdec.register.access", metadata);
+  llvm::LoadInst *second =
+      builder.CreateLoad(rax->getValueType(), rax, "rax_after_call_second");
+  second->setMetadata("notdec.register.access", metadata);
+  builder.CreateRet(builder.CreateAdd(first, second));
+  return function;
+}
+
 void attachRegisterMetadataToFunction(llvm::Function &function,
                                       llvm::StringRef kind,
                                       llvm::GlobalVariable *global,
@@ -588,6 +614,8 @@ int main() {
   llvm::Function *clobbered =
       createFunction(module, "clobbered_rbx", rbx, false);
   llvm::Function *callEffects = createCallEffectFunction(module, rbx, rax);
+  llvm::Function *repeatedLoadAfterCall =
+      createRepeatedLoadAfterCallFunction(module, rax);
   llvm::Function *directCallEffects =
       createDirectCallEffectFunction(module, rbx);
   llvm::Function *callerBeforeClobberingCallee =
@@ -654,6 +682,8 @@ int main() {
                "RBX load after call was not propagated");
   ok &= expect(countRegisterLoads(*callEffects, rax) == 1,
                "RAX load after call was incorrectly propagated");
+  ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 1,
+               "repeated RAX load after call was not reused");
   ok &= expect(countRegisterLoads(*directCallEffects, rbx) == 0,
                "RBX load after direct preserving call was not propagated");
   ok &= expect(countRegisterLoads(*callerBeforeClobberingCallee, rbx) == 1,

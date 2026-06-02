@@ -607,6 +607,9 @@
   - [x] 将 unread flags cleanup 改成 CFG 级 liveness，并清理删除 store 后暴露出的死 flag external input 链；固定三目标 flags 残留清零。
     - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-register-residue-flag-liveness-dce-gate`
+  - [x] 复用同一 call barrier 后的重复 register load，减少 call output 之后的重复 GPR load 残留。
+    - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-repeated-load-gate`
 
 ## 记录规则
 
