@@ -331,6 +331,7 @@ public:
       removeUnreadFlagStores();
       removeUnreadRipStores();
       attachRegisterEffectMetadata();
+      removeDeadExternalInputs();
       eraseDeadPhis();
     } else {
       collectExternalInputsOnly();
@@ -643,6 +644,20 @@ private:
       } else {
         ++it;
       }
+    }
+  }
+
+  void removeDeadExternalInputs() {
+    std::vector<llvm::LoadInst *> deadLoads;
+    for (auto &[global, value] : ExternalInputValue) {
+      auto *load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
+      if (load != nullptr && load->use_empty()) {
+        deadLoads.push_back(load);
+      }
+    }
+    for (llvm::LoadInst *load : deadLoads) {
+      forgetExternalInputValue(load);
+      load->eraseFromParent();
     }
   }
 

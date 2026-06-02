@@ -1577,3 +1577,103 @@ vector    store        access         partial  full         71
 
 - 长期应实现统一 `valueBefore(ret, storage)`，让 return recovery、callsite rewrite、cleanup 共用一套 CFG SSA 查询。
 - 本轮只补 all-predecessor shared successor，是为了避免在没有统一接口前扩大 CFG 推理范围。
+
+## 阶段 D 小步：清理无用户的 external input load
+
+背景：
+
+- partial store SSA 会在需要旧 backing value 时创建 entry external input load。
+- 后续如果这个 partial store 又被完整 store 覆盖，死代码删除会把依赖链删掉，但 `ExternalInputValue` / `ExternalInputs` 里仍可能保留已经没有用户的 entry load。
+- 这类 load 不代表真实 ABI 输入，继续保留会让 residue 统计偏高，也会给 prototype recovery 留下噪声。
+
+本轮只做很窄的清理：
+
+- 只删除 `NativeRegisterSSA` 自己创建的 `notdec.register.external_input` load。
+- 只在 load `use_empty()` 时删除。
+- 放在 `attachRegisterEffectMetadata()` 之后执行，避免影响 preserved/clobbered 判断。之前试过放到 effect metadata 之前，会让 clobbered RBX 测试失败，因为 effect 推导仍需要 entry input 对比。
+- 不处理仍有用户的 external input，不推断 RSP/RBP/call effect 语义。
+
+改动文件和函数：
+
+- `lib/passes/NativeRegisterSSA.cpp:333`
+  - `FunctionPromoter::run()` 在 `attachRegisterEffectMetadata()` 后调用 `removeDeadExternalInputs()`。
+- `lib/passes/NativeRegisterSSA.cpp:650`
+  - 新增 `FunctionPromoter::removeDeadExternalInputs()`，扫描 `ExternalInputValue`，删除无用户 external input load，并通过 `forgetExternalInputValue()` 同步函数级 external input 集合。
+- `tests/native_register_effects_test.cpp:355`
+  - 新增 `createDeadPartialInputFunction()`，构造 partial store 先引入旧 backing input、随后 full store 覆盖、再 full load 被 SSA 替换的场景。
+- `tests/native_register_effects_test.cpp:677`
+  - 将 `dead_partial_register_input` 样例加入主测试。
+- `tests/native_register_effects_test.cpp:759`
+  - 断言该样例中 RAX load 被清空，且 `notdec.register.external_inputs` metadata 不再残留。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test native_prototype_recovery_test -j2
+./build/bin/native_register_effects_test
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-dead-external-input-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-dead-external-input-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 106s | 105s |
+| `memcached:executable` | 56s | 57s |
+
+残留统计变化：
+
+```text
+category  access_kind  metadata_kind  shape    value_shape  before  after
+gpr       load         external_input full     full         3191    3190
+other     load         external_input full     full         50      49
+```
+
+完整本轮残留：
+
+```text
+category  access_kind  metadata_kind  shape    value_shape  count
+gpr       load         access         full     full         39
+gpr       load         access         partial  full         9
+gpr       load         external_input full     full         3190
+gpr       store        access         full     full         3601
+gpr       store        access         partial  full         11
+other     load         access         full     full         8
+other     load         external_input full     full         49
+other     store        access         partial  full         1
+vector    load         external_input full     full         70
+vector    store        access         partial  full         71
+```
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 固定三目标只少了 2 个 external input residue，但去掉了明确无用的噪声。 |
+| 理解成本 | 2 | 只新增一个小清理函数，顺序约束需要记住：必须在 effect metadata 之后。 |
+| 维护成本 | 2 | 后续如果统一 dead-code cleanup，可以把这段合进去。 |
+
+有没有更好的方案：
+
+- 更大的收益仍在 prototype rewrite 后 cleanup、callsite 当前值查询、RSP/RBP/call effect 建模。
+- 本轮没有碰这些语义风险高的部分，只清理已被证明无用户的 load。

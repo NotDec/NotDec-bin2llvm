@@ -352,6 +352,30 @@ llvm::Function *createPartialStoreCoveredByFullStoreFunction(
   return function;
 }
 
+llvm::Function *createDeadPartialInputFunction(llvm::Module &module,
+                                               llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "dead_partial_register_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *alMetadata = registerAccessMetadata(context, "RAX", "AL", 0, 1);
+  llvm::MDNode *raxMetadata = registerAccessMetadata(context, "RAX");
+  llvm::StoreInst *partial = builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 9), rax);
+  partial->setMetadata("notdec.register.access", alMetadata);
+  llvm::StoreInst *full = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 10), rax);
+  full->setMetadata("notdec.register.access", raxMetadata);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rax->getValueType(), rax, "after_full_store");
+  load->setMetadata("notdec.register.access", raxMetadata);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createPartialStoresOnlyFunction(llvm::Module &module,
                                                 llvm::GlobalVariable *rax) {
   llvm::LLVMContext &context = module.getContext();
@@ -650,6 +674,8 @@ int main() {
       createCallBetweenStoresFunction(module, rax);
   llvm::Function *partialCovered =
       createPartialStoreCoveredByFullStoreFunction(module, rax);
+  llvm::Function *deadPartialInput =
+      createDeadPartialInputFunction(module, rax);
   llvm::Function *partialOnly = createPartialStoresOnlyFunction(module, rax);
   llvm::Function *partialMetadataStorage =
       createPartialMetadataStorageValueFunction(module, rax);
@@ -730,6 +756,11 @@ int main() {
                "RAX store before call barrier was removed");
   ok &= expect(countRegisterStores(*partialCovered, rax) == 1,
                "partial RAX store covered by full store was not removed");
+  ok &= expect(countRegisterLoads(*deadPartialInput, rax) == 0,
+               "dead partial input left an unused RAX load");
+  ok &= expect(deadPartialInput->getMetadata("notdec.register.external_inputs") ==
+                   nullptr,
+               "dead partial input left stale external input metadata");
   ok &= expect(countRegisterStores(*partialOnly, rax) == 1,
                "partial RAX stores were not folded into backing storage SSA");
   ok &= expect(metadataHasRegister(*partialOnly,
