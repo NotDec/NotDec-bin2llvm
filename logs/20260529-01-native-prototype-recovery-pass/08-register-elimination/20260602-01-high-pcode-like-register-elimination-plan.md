@@ -3205,3 +3205,130 @@ vector    load         external_input   full     full         no         1
 
 - 更完整方案是阶段 C 的统一 current-value/liveness 查询。
 - 本轮先补简单后继 CFG，是因为 fixed gate 剩余 case 很明确，且不需要引入 vector 参数恢复的语义风险。
+
+## 阶段 A 小步：残留审计补充位置和 storage role
+
+背景：
+
+- vector partial store 清完后，fixed gate 剩余大头转到 GPR。
+- 直接看 summary 只能知道 GPR load/store 很多，不能区分 `RSP/RBP` 栈建模、callee-saved 保存恢复、call 附近真实寄存器传值和普通 partial access。
+- 在没有这个分类前，继续改 SSA 容易把 stack pointer / frame pointer 残留误当成普通 GPR 消除问题。
+
+本轮范围：
+
+- 只增强 residue audit 的 `--details` 输出。
+- 不改 IR 生成，不改寄存器 SSA，不改 prototype rewrite。
+- summary 输出保持原有列，便于继续和前几轮数据对比。
+
+实现：
+
+- `scripts/native-register-residue-audit.py:25`
+  - 新增 `LABEL_RE`，识别 LLVM IR basic block label。
+- `scripts/native-register-residue-audit.py:38`
+  - `RegisterAccess` 新增 `line`、`block`、`storage_role`、`local_context` 字段。
+- `scripts/native-register-residue-audit.py:144`
+  - 新增 `current_block()`，记录每条访问所在 block。
+- `scripts/native-register-residue-audit.py:179`
+  - 新增 `is_call_instruction()`、`is_ret_instruction()`、`previous_instruction()`、`next_instruction()` 等小 helper，用来判断访问是否紧贴 call/ret。
+- `scripts/native-register-residue-audit.py:215`
+  - 新增 `storage_role()`，把寄存器粗分成 `stack_pointer`、`frame_pointer`、`callee_saved_gpr`、`caller_saved_gpr`、`flags`、`vector`、`other`。
+- `scripts/native-register-residue-audit.py:230`
+  - 新增 `local_context()`，把访问粗分成 `entry_external_input`、`before_call`、`after_call`、`before_ret`、`ordinary`。
+- `scripts/native-register-residue-audit.py:249`
+  - `parse_accesses()` 记录行号、block、storage role 和 local context。
+- `scripts/native-register-residue-audit.py:342`
+  - `write_details()` 输出新增列：`line`、`block`、`storage_role`、`local_context`。
+- `tests/native_register_residue_audit_test.py:36`
+  - 测试 IR 增加一个 call，让位置分类能覆盖 `before_call`。
+- `tests/native_register_residue_audit_test.py:65`
+  - 增加 `line`、`block`、`storage_role`、`local_context` 断言。
+
+验证：
+
+```bash
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R native_register_residue --output-on-failure
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-vector-rmw-cleanup-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-vector-rmw-cleanup-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-context.tsv
+awk -F '\t' 'NR>1 {count[$6"\t"$7"\t"$8"\t"$9]++} END {for (k in count) print count[k]"\t"k}' \
+  /tmp/notdec-reg-details-context.tsv | sort -nr | head -30
+```
+
+结果：
+
+- `native_register_residue_audit_test.py` 通过。
+- `notdec.native_register_residue_audit.unit` 通过。
+- summary 统计不变：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         22
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3190
+gpr       store        access           full     full         no         3381
+gpr       store        access           partial  full         no         9
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         no         1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+新增分类里 fixed gate 前 30 类如下：
+
+```text
+1633  callee_saved_gpr  entry_external_input  load   external_input
+855   stack_pointer     entry_external_input  load   external_input
+830   stack_pointer     ordinary              store  access
+747   caller_saved_gpr  ordinary              store  access
+723   frame_pointer     ordinary              store  access
+692   frame_pointer     entry_external_input  load   external_input
+502   callee_saved_gpr  ordinary              store  access
+302   stack_pointer     before_ret            store  access
+140   callee_saved_gpr  before_ret            store  access
+97    caller_saved_gpr  before_ret            store  access
+49    other             entry_external_input  load   external_input
+28    caller_saved_gpr  after_call            store  access
+18    frame_pointer     before_ret            store  access
+10    caller_saved_gpr  entry_external_input  load   external_input
+8     other             ordinary              load   access
+7     frame_pointer     ordinary              load   access
+6     callee_saved_gpr  ordinary              load   access
+4     caller_saved_gpr  ordinary              load   access
+3     stack_pointer     ordinary              load   access
+2     caller_saved_gpr  after_call            load   access
+1     vector            ordinary              load   access
+1     vector            entry_external_input  load   external_input
+1     other             ordinary              store  access
+1     frame_pointer     before_call           store  access
+1     frame_pointer     after_call            load   access
+1     caller_saved_gpr  before_call           store  access
+1     caller_saved_gpr  before_call           load   access
+1     callee_saved_gpr  after_call            store  access
+1     callee_saved_gpr  after_call            load   access
+```
+
+判断：
+
+- 当前 fixed gate 最大残留不是 partial access，而是：
+  - callee-saved GPR entry external input；
+  - `RSP/RBP` 的 entry load、ordinary store、ret 前 store；
+  - callee-saved 保存恢复 store。
+- 这说明下一步如果只追 GPR partial SSA，收益很小；更应该先拆清 stack pointer/frame pointer 建模残留和 callee-saved save/restore 是否能在 prototype rewrite 后清理。
+- 剩余 3 个 `gpr load access partial/full` 仍是 call-after-load case，不应盲删。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 没减少 IR 残留，但把下一步方向从“猜 partial SSA”变成了可量化分类。 |
+| 理解成本 | 2 | 只是审计脚本新增几列，summary 不变。 |
+| 维护成本 | 2 | 分类是粗粒度辅助判断，不参与 pass 语义；后续不应把它当证明条件。 |
+
+有没有更好的方案：
+
+- 更完整方案是直接构建统一 storage liveness/current-value 查询。
+- 本轮先补审计，是因为当前 GPR residue 里 `RSP/RBP` 和 callee-saved 占大头，先看清来源比继续扩大 cleanup 条件更稳。

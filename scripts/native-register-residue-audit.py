@@ -22,6 +22,7 @@ PTR_GLOBAL_RE = re.compile(r"ptr\s+(@[-a-zA-Z$._0-9]+)")
 FIELD_RE = re.compile(r'!"([^"=]+)=([^"]*)"')
 LOAD_RE = re.compile(r"(?:^|=\s*)load\s+([^,]+),")
 STORE_RE = re.compile(r"^store\s+([^,]+),")
+LABEL_RE = re.compile(r"^[-a-zA-Z$._0-9]+:\s*(?:;.*)?$")
 
 
 @dataclass(frozen=True)
@@ -36,11 +37,15 @@ class RegisterGlobal:
 @dataclass(frozen=True)
 class RegisterAccess:
     file: str
+    line: int
     function: str
+    block: str
     instruction: str
     metadata_kind: str
     access_kind: str
     category: str
+    storage_role: str
+    local_context: str
     base: str
     name: str
     space: str
@@ -136,6 +141,15 @@ def current_function(line: str, previous: str) -> str:
     return stripped[at + 1:end] if end > at else previous
 
 
+def current_block(line: str, previous: str) -> str:
+    stripped = line.strip()
+    if stripped.startswith("define "):
+        return "entry"
+    if LABEL_RE.match(stripped):
+        return stripped.split(":", 1)[0]
+    return previous
+
+
 def instruction_kind(line: str) -> str:
     stripped = line.strip()
     if re.search(r"(^|=\s*)load\b", stripped):
@@ -162,16 +176,89 @@ def value_size(line: str) -> int | None:
     return bits // 8
 
 
+def is_call_instruction(line: str) -> bool:
+    stripped = line.strip()
+    return bool(re.search(r"(^|=\s*)call\b", stripped))
+
+
+def is_ret_instruction(line: str) -> bool:
+    return line.strip().startswith("ret ")
+
+
+def is_block_boundary(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("define ") or stripped == "}" or bool(LABEL_RE.match(stripped))
+
+
+def previous_instruction(lines: list[str], index: int) -> str:
+    for cursor in range(index - 1, -1, -1):
+        stripped = lines[cursor].strip()
+        if stripped == "" or stripped.startswith(";"):
+            continue
+        if is_block_boundary(stripped):
+            return ""
+        return stripped
+    return ""
+
+
+def next_instruction(lines: list[str], index: int) -> str:
+    for cursor in range(index + 1, len(lines)):
+        stripped = lines[cursor].strip()
+        if stripped == "" or stripped.startswith(";"):
+            continue
+        if is_block_boundary(stripped):
+            return ""
+        return stripped
+    return ""
+
+
+def storage_role(name: str) -> str:
+    upper = name.upper()
+    if upper in {"RSP", "ESP", "SP"}:
+        return "stack_pointer"
+    if upper in {"RBP", "EBP", "BP"}:
+        return "frame_pointer"
+    if upper in {"RBX", "EBX", "BX", "BL", "BH", "R12", "R12D", "R12W", "R12B",
+                 "R13", "R13D", "R13W", "R13B", "R14", "R14D", "R14W", "R14B",
+                 "R15", "R15D", "R15W", "R15B"}:
+        return "callee_saved_gpr"
+    if classify_register(name) == "gpr":
+        return "caller_saved_gpr"
+    return classify_register(name)
+
+
+def local_context(
+    lines: list[str],
+    index: int,
+    block: str,
+    metadata_kind: str,
+) -> str:
+    if block == "entry" and metadata_kind == "external_input":
+        return "entry_external_input"
+    previous = previous_instruction(lines, index)
+    following = next_instruction(lines, index)
+    if is_call_instruction(previous):
+        return "after_call"
+    if is_call_instruction(following):
+        return "before_call"
+    if is_ret_instruction(following):
+        return "before_ret"
+    return "ordinary"
+
+
 def parse_accesses(path: Path) -> list[RegisterAccess]:
     text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
     metadata = parse_metadata(text)
     globals_by_symbol = parse_globals(text, metadata)
     globals_by_name = {global_.name: global_ for global_ in globals_by_symbol.values()}
 
     accesses: list[RegisterAccess] = []
     function = "<module>"
-    for line in text.splitlines():
+    block = "<module>"
+    for index, line in enumerate(lines):
         function = current_function(line, function)
+        block = current_block(line, block)
         if "!notdec.register" not in line:
             continue
         md_match = MD_REF_RE.search(line)
@@ -205,11 +292,15 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
         accesses.append(
             RegisterAccess(
                 file=str(path),
+                line=index + 1,
                 function=function,
+                block=block,
                 instruction=line.strip(),
                 metadata_kind=metadata_kind,
                 access_kind=instruction_kind(line),
                 category=classify_register(access_name or base),
+                storage_role=storage_role(access_name or base),
+                local_context=local_context(lines, index, block, metadata_kind),
                 base=base,
                 name=access_name,
                 space=space,
@@ -251,15 +342,20 @@ def write_summary(accesses: list[RegisterAccess], output) -> None:
 def write_details(accesses: list[RegisterAccess], output) -> None:
     writer = csv.writer(output, delimiter="\t", lineterminator="\n")
     writer.writerow([
-        "file", "function", "category", "access_kind", "metadata_kind",
-        "shape", "value_shape", "base", "name", "space", "offset", "size",
-        "value_size", "synthetic", "instruction",
+        "file", "line", "function", "block", "category", "storage_role",
+        "local_context", "access_kind", "metadata_kind", "shape", "value_shape",
+        "base", "name", "space", "offset", "size", "value_size", "synthetic",
+        "instruction",
     ])
     for access in accesses:
         writer.writerow([
             access.file,
+            access.line,
             access.function,
+            access.block,
             access.category,
+            access.storage_role,
+            access.local_context,
             access.access_kind,
             access.metadata_kind,
             "full" if access.is_full else "partial",

@@ -36,6 +36,7 @@ entry:
   %in = load i64, ptr @RAX, align 8, !notdec.register.external_input !4
   %al = load i8, ptr @RAX, align 1, !notdec.register.access !2
   store i64 %in, ptr @RAX, align 8, !notdec.register.access !1
+  call void @callee()
   store i64 %in, ptr @RAX, align 8, !notdec.register.access !2, !notdec.register.synthetic !7
   store i8 1, ptr @ZF, align 1, !notdec.register.access !6
   ret void
@@ -60,6 +61,13 @@ entry:
     assert counts[("gpr", "store", "access", "full", "full", "no")] == 1
     assert counts[("gpr", "store", "access", "partial", "full", "yes")] == 1
     assert counts[("flags", "store", "access", "full", "full", "no")] == 1
+
+    assert accesses[0].line > 0
+    assert accesses[0].block == "entry"
+    assert accesses[0].storage_role == "caller_saved_gpr"
+    assert accesses[0].local_context == "entry_external_input"
+    assert accesses[2].local_context == "before_call"
+    assert accesses[-1].local_context == "before_ret"
 
 
 if __name__ == "__main__":
