@@ -799,3 +799,76 @@ ctest --test-dir build --output-on-failure
 
 - 固定三目标 residue 没有下降，但 pass 的 full/partial 判断口径已经和 metadata/audit 对齐。
 - 后续真正做 extract/replace-range SSA 时，可以复用 `AccessInfo::Offset/Size/IsFullUnit/IsStorageValue`，不需要再先修分类。
+
+## 阶段 C 小修：callsite fallback load 补完整 access metadata
+
+阶段 B 修正后，固定三目标还剩一个明显的误判 partial：
+
+```text
+notdec_native_8480 gpr load access partial  RDI  %RDI.callsite_input = load i64, ptr @RDI ...
+```
+
+这个不是实际 partial access。来源是 `NativePrototypeRecovery` 在 direct callsite rewrite 时，如果找不到明确的 SSA input value，会在 caller 侧插入一个 register global fallback load。旧代码把 global 的 `notdec.register` metadata 直接挂到 load 的 `notdec.register.access` 上。global metadata 没有 `base=` 字段，residue audit 只能把 base 解析成空字符串，于是把一个 full `RDI` load 误判成 partial。
+
+本轮修正这个 metadata 生成：
+
+- 从 global 的 `notdec.register` 读取 `name/space/offset/size`。
+- 重新生成完整 `notdec.register.access` metadata。
+- 明确补上 `base=<name>` 和 `name=<name>`。
+
+改动文件和函数：
+
+- `lib/passes/NativePrototypeRecovery.cpp:632`
+  - 新增 `registerGlobalAccessMetadata()`，把 register global metadata 转成完整 access metadata。
+- `lib/passes/NativePrototypeRecovery.cpp:668`
+  - `registerGlobalValueBeforeCall()` 不再直接复用 `notdec.register`，改为挂新生成的 `notdec.register.access`。
+- `tests/native_prototype_recovery_test.cpp:2131`
+  - 新增 `metadataHasField()`。
+- `tests/native_prototype_recovery_test.cpp:3448`
+  - 在 missing callsite input fallback 用例中断言生成的 load metadata 包含 `base=RDI` 和 `name=RDI`。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+ctest --test-dir build -R 'notdec.native_prototype_recovery.input_candidates' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-callsite-access-metadata-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-callsite-access-metadata-gate/*.signature-rewrite.ll
+ctest --test-dir build --output-on-failure
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 40s | 41s |
+| `libuv:shared-library` | 106s | 106s |
+| `memcached:executable` | 58s | 57s |
+
+残留对比：
+
+| kind | 上一轮 | 本轮 |
+| --- | ---: | ---: |
+| `gpr load access full` | 53 | 54 |
+| `gpr load access partial` | 19 | 18 |
+| `gpr store access partial` | 14 | 14 |
+| `gpr store access full` | 3601 | 3601 |
+
+判断：
+
+- 这一步没有改变语义，只修正 metadata 口径。
+- 固定三目标中一个误判 partial 被正确归类为 full。

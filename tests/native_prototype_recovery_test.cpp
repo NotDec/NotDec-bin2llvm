@@ -2128,6 +2128,21 @@ bool hasRegisterStore(const llvm::Function &function, llvm::StringRef name) {
   return false;
 }
 
+bool metadataHasField(const llvm::Instruction &instruction,
+                      llvm::StringRef metadataName, llvm::StringRef field) {
+  llvm::MDNode *metadata = instruction.getMetadata(metadataName);
+  if (metadata == nullptr) {
+    return false;
+  }
+  for (const llvm::MDOperand &operand : metadata->operands()) {
+    auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+    if (text != nullptr && text->getString() == field) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool recoveredHasField(const llvm::Function &function, llvm::StringRef field) {
   llvm::MDNode *node = function.getMetadata("notdec.prototype.recovered");
   if (node == nullptr) {
@@ -3429,6 +3444,12 @@ int main() {
                    missingInputCallsiteArgLoad->getPointerOperand() ==
                        missingInputCallsiteRdi,
                "register global callsite load was not passed to callee");
+  ok &= expect(missingInputCallsiteArgLoad != nullptr &&
+                   metadataHasField(*missingInputCallsiteArgLoad,
+                                    "notdec.register.access", "base=RDI") &&
+                   metadataHasField(*missingInputCallsiteArgLoad,
+                                    "notdec.register.access", "name=RDI"),
+               "register global callsite load had incomplete access metadata");
   if (llvm::verifyModule(missingInputCallsiteModule, &llvm::errs())) {
     std::cerr << "missing input callsite module verification failed\n";
     return EXIT_FAILURE;

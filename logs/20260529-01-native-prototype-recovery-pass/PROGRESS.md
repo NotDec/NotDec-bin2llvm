@@ -595,6 +595,9 @@
   - [x] 修正 `NativeRegisterSSA` 对 partial/full 的判断，改为按 `notdec.register.access` metadata range 判断，同时保留 backing storage value 是否可参与现有 SSA 的条件。
     - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-register-residue-partial-metadata-gate`
+  - [x] 修正 direct callsite input fallback load 的 register access metadata，避免把 full `RDI` fallback load 误判成 partial。
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-callsite-access-metadata-gate`
 
 ## 记录规则
 

@@ -629,6 +629,28 @@ std::optional<llvm::GlobalVariable *> registerGlobalForName(
   return result;
 }
 
+llvm::MDNode *registerGlobalAccessMetadata(llvm::GlobalVariable &global) {
+  llvm::MDNode *metadata = global.getMetadata("notdec.register");
+  if (metadata == nullptr) {
+    return nullptr;
+  }
+  llvm::LLVMContext &context = global.getContext();
+  std::string name = metadataField(*metadata, "name").value_or(
+      global.getName().str());
+  std::string space =
+      metadataField(*metadata, "space").value_or("register");
+  std::string offset = metadataField(*metadata, "offset").value_or("0");
+  std::string size = metadataField(*metadata, "size").value_or("0");
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "base=" + name),
+      llvm::MDString::get(context, "space=" + space),
+      llvm::MDString::get(context, "offset=" + offset),
+      llvm::MDString::get(context, "size=" + size),
+      llvm::MDString::get(context, "name=" + name),
+  };
+  return llvm::MDNode::get(context, fields);
+}
+
 std::optional<llvm::Value *> registerGlobalValueBeforeCall(
     llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *paramType) {
   std::optional<llvm::GlobalVariable *> global =
@@ -643,7 +665,7 @@ std::optional<llvm::Value *> registerGlobalValueBeforeCall(
   llvm::IRBuilder<> builder(&call);
   llvm::LoadInst *load =
       builder.CreateLoad(paramType, *global, (registerName + ".callsite_input").str());
-  if (llvm::MDNode *metadata = (*global)->getMetadata("notdec.register")) {
+  if (llvm::MDNode *metadata = registerGlobalAccessMetadata(**global)) {
     load->setMetadata("notdec.register.access", metadata);
   }
   return load;
