@@ -3719,3 +3719,98 @@ notdec_native_8480  %RDI.callsite_input = load i64, ptr @RDI, !notdec.register.e
 
 - 更完整方案是让 caller 也参与 signature rewrite，把 entry fallback input 变成 caller 参数。
 - 本轮只改 metadata，是因为当前 caller 未必已经被 rewrite；直接升成参数会扩大调用链改动范围。
+
+## 2026-06-02 实现记录：覆盖 store 也作为前序 dead store 的结束点
+
+背景：
+
+- 上一轮 cleanup 只把“从 store 到所有 return 路径没有 call、没有同寄存器 load”的 store 当作 dead。
+- 这会漏掉一种简单情况：同一个寄存器后面先被另一个 store 覆盖，前一个 store 已经不可能被读到。
+- 本次只处理 killed-by-call scratch store 的这个漏删点，不处理 RSP/RBP、callee-saved return-path store，也不改变 prototype 恢复规则。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1347)
+  - 新增 `instructionWritesRegisterAccess`，按 `notdec.register.access` 的 `name/base` 判断后续 store 是否覆盖同一寄存器访问。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1370)
+  - `reachesReturnWithoutCallOrAccessLoad` 遇到同寄存器后续 store 时返回 true，表示当前 store 在这条路径上已被覆盖。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1417)
+  - `storeIsDeadOnAllReturnPaths` 的同块扫描也加入同样判断；遇到 call 或同寄存器 load 仍然保守停止。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1729)
+  - `createKilledGprScratchStoreFunction` 增加 `overwriteAfterStore` 测试开关。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:7340)
+  - 新增 `overwritten_gpr_scratch` 用例，确认被覆盖的 killed-by-call GPR store 会被清掉。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-overwrite-dead-store-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-overwrite-dead-store-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 40s |
+| `libuv:shared-library` | 106s | 106s |
+| `memcached:executable` | 57s | 58s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         21
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3191
+gpr       store        access           full     full         no         3311
+gpr       store        access           partial  full         no         4
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         no         1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-entry-fallback-input-gate` 相比：
+
+- `gpr store access full/full`：3332 -> 3311，少 21 个。
+- 主要变化是 `caller_saved_gpr ordinary clobbers store access full/full`：151 -> 130。
+- `gpr load access` 没变，说明这一步只删覆盖后的死 store，没有扩大到读取语义。
+
+判断：
+
+- 这一步是局部 cleanup，能删除确定被同寄存器后续 store 覆盖的 killed-by-call 残留。
+- 对性能没有明显负面影响，固定 gate 耗时和上一轮同量级。
+- 还没解决 stack/frame/callee-saved residue，也没解决 caller entry input 参数化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 删除 21 个真实 GPR store residue，但范围只限已证明死的覆盖 store。 |
+| 理解成本 | 2 | 只是补齐 dead-store 路径判断，和已有 load/call 停止逻辑并列。 |
+| 维护成本 | 2 | 后续如果引入统一 current-value 查询，这段仍可作为简单 cleanup 保留。 |
+
+有没有更好的方案：
+
+- 更完整方案是做寄存器级 def-use/liveness，而不是在路径扫描里补条件。
+- 当前 residue 还没到需要引入完整 liveness 的程度；本次先保留简单路径判断，避免扩大实现面。

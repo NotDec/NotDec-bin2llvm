@@ -1344,11 +1344,37 @@ bool instructionReadsRegisterAccess(llvm::Instruction &instruction,
   return false;
 }
 
+bool instructionWritesRegisterAccess(llvm::Instruction &instruction,
+                                     const llvm::MDNode &access) {
+  auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+  if (store == nullptr) {
+    return false;
+  }
+  llvm::MDNode *storeAccess = store->getMetadata("notdec.register.access");
+  if (storeAccess == nullptr) {
+    return false;
+  }
+  if (std::optional<std::string> name = metadataField(access, "name")) {
+    if (accessMatchesEffectRegister(*storeAccess, *name)) {
+      return true;
+    }
+  }
+  if (std::optional<std::string> base = metadataField(access, "base")) {
+    if (accessMatchesEffectRegister(*storeAccess, *base)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool reachesReturnWithoutCallOrAccessLoad(llvm::Instruction *instruction,
                                           const llvm::MDNode &access,
                                           std::set<llvm::BasicBlock *> &seen) {
   while (instruction != nullptr) {
     if (llvm::isa<llvm::ReturnInst>(instruction)) {
+      return true;
+    }
+    if (instructionWritesRegisterAccess(*instruction, access)) {
       return true;
     }
     if (llvm::isa<llvm::CallBase>(instruction) ||
@@ -1395,6 +1421,9 @@ bool storeIsDeadOnAllReturnPaths(llvm::StoreInst &store,
   llvm::Instruction *next = store.getNextNode();
   while (next != nullptr) {
     if (llvm::isa<llvm::ReturnInst>(next)) {
+      return true;
+    }
+    if (instructionWritesRegisterAccess(*next, access)) {
       return true;
     }
     if (llvm::isa<llvm::CallBase>(next) ||
