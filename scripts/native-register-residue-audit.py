@@ -50,6 +50,7 @@ class RegisterAccess:
     storage_role: str
     local_context: str
     function_effects: str
+    residue_reason: str
     base: str
     name: str
     space: str
@@ -332,6 +333,46 @@ def function_effects_for_access(
     return ",".join(matched) if matched else "none"
 
 
+def residue_reason_for_access(
+    access_kind: str,
+    metadata_kind: str,
+    category: str,
+    storage_role: str,
+    local_context: str,
+    function_effects: str,
+    is_full: bool,
+) -> str:
+    # Keep these labels factual.  They are used to pick the next pass change,
+    # not to prove an access can be removed.
+    if metadata_kind == "external_input":
+        if local_context == "entry_external_input":
+            return "entry_external_input"
+        return "fallback_external_input"
+    if not is_full:
+        return "partial_access"
+    if storage_role in {"stack_pointer", "frame_pointer"}:
+        return storage_role
+    if storage_role == "callee_saved_gpr":
+        if local_context in {"before_ret", "return_path"}:
+            return "callee_saved_return_path"
+        return "callee_saved_gpr"
+    if access_kind == "load" and local_context == "after_call":
+        if "clobbers" in function_effects.split(","):
+            return "after_call_clobbered"
+        if "preserves" in function_effects.split(","):
+            return "after_call_preserved"
+        return "after_call_unknown_effect"
+    if access_kind == "store" and local_context == "before_call":
+        return "callsite_input_store"
+    if access_kind == "load" and local_context == "before_ret":
+        return "return_value_load"
+    if category == "flags":
+        return "flags"
+    if category == "vector":
+        return "vector"
+    return local_context
+
+
 def parse_accesses(path: Path) -> list[RegisterAccess]:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -376,6 +417,16 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
                 size = unit.size
 
         access_name = name or base
+        is_full = (
+            unit is not None
+            and offset == unit.offset
+            and size == unit.size
+        )
+        effects = function_effects_for_access(
+            effects_by_function.get(function, {}),
+            access_name or base,
+            base,
+        )
         accesses.append(
             RegisterAccess(
                 file=str(path),
@@ -388,10 +439,15 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
                 category=classify_register(access_name or base),
                 storage_role=storage_role(access_name or base),
                 local_context=local_context(lines, index, block, metadata_kind),
-                function_effects=function_effects_for_access(
-                    effects_by_function.get(function, {}),
-                    access_name or base,
-                    base,
+                function_effects=effects,
+                residue_reason=residue_reason_for_access(
+                    instruction_kind(line),
+                    metadata_kind,
+                    classify_register(access_name or base),
+                    storage_role(access_name or base),
+                    local_context(lines, index, block, metadata_kind),
+                    effects,
+                    is_full,
                 ),
                 base=base,
                 name=access_name,
@@ -435,9 +491,9 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
     writer = csv.writer(output, delimiter="\t", lineterminator="\n")
     writer.writerow([
         "file", "line", "function", "block", "category", "storage_role",
-        "local_context", "function_effects", "access_kind", "metadata_kind",
-        "shape", "value_shape", "base", "name", "space", "offset", "size",
-        "value_size", "synthetic", "instruction",
+        "local_context", "function_effects", "residue_reason", "access_kind",
+        "metadata_kind", "shape", "value_shape", "base", "name", "space",
+        "offset", "size", "value_size", "synthetic", "instruction",
     ])
     for access in accesses:
         writer.writerow([
@@ -449,6 +505,7 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
             access.storage_role,
             access.local_context,
             access.function_effects,
+            access.residue_reason,
             access.access_kind,
             access.metadata_kind,
             "full" if access.is_full else "partial",

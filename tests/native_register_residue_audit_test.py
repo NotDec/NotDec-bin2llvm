@@ -71,12 +71,44 @@ entry:
     assert accesses[0].block == "entry"
     assert accesses[0].storage_role == "caller_saved_gpr"
     assert accesses[0].local_context == "entry_external_input"
+    assert accesses[0].residue_reason == "entry_external_input"
     assert accesses[0].function_effects == "clobbers"
     assert accesses[2].local_context == "before_call"
+    assert accesses[2].residue_reason == "callsite_input_store"
+    assert accesses[1].residue_reason == "partial_access"
     assert accesses[-1].function_effects == "external_inputs"
     assert accesses[-2].local_context == "return_path"
     assert accesses[-1].local_context == "before_ret"
+    assert accesses[-1].residue_reason == "flags"
+
+
+def test_register_access_details_include_residue_reason() -> None:
+    module = load_audit_module()
+    ir = """
+@RBX = external global i64, !notdec.register !0
+
+define i64 @sample_callee_saved() !notdec.register.preserves !2 {
+entry:
+  %saved = load i64, ptr @RBX, align 8, !notdec.register.access !1
+  ret i64 %saved
+}
+
+!0 = !{!"space=register", !"offset=24", !"size=8", !"name=RBX"}
+!1 = !{!"base=RBX", !"space=register", !"offset=24", !"size=8", !"name=RBX"}
+!2 = !{!3}
+!3 = !{!"name=RBX", ptr @RBX}
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "sample.ll"
+        path.write_text(ir, encoding="utf-8")
+        accesses = module.parse_accesses(path)
+
+    assert len(accesses) == 1
+    assert accesses[0].storage_role == "callee_saved_gpr"
+    assert accesses[0].local_context == "before_ret"
+    assert accesses[0].residue_reason == "callee_saved_return_path"
 
 
 if __name__ == "__main__":
     test_register_access_summary_classifies_full_and_partial()
+    test_register_access_details_include_residue_reason()

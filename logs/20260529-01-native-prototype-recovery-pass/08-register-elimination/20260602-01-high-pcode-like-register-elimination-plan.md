@@ -4111,3 +4111,67 @@ vector    load         external_input   full     full         no         1
 
 - 更完整方案是把 register 和 stack 的 callsite current-value 查询抽成同一个 resolver。
 - 本轮先补 stack 的同值 predecessor，是因为已有 stack rewrite 测试框架，改动小且不扩大语义风险。
+
+## 2026-06-02 实现记录：residue 详情增加保守原因分类
+
+背景：
+
+- 固定三目标 gate 剩余 `gpr load access` 数量已经很小，但里面混有 partial、frame pointer、callee-saved、after-call 等不同情况。
+- 这些残留不能一概删除。下一步要继续做 SSA/current-value/cleanup，需要先把“为什么还剩下”分清楚。
+
+改动：
+
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:41)
+  - `RegisterAccess` 增加 `residue_reason` 字段。
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:336)
+  - 新增 `residue_reason_for_access`，按已有事实给详情行分类：`partial_access`、`frame_pointer`、`callee_saved_return_path`、`after_call_clobbered`、`callsite_input_store` 等。
+  - 这些标签只用于审计和选下一步改动，不表示对应 access 可以安全删除。
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:491)
+  - `--details` 输出增加 `residue_reason` 列。
+- [native_register_residue_audit_test.py](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_residue_audit_test.py:70)
+  - 补充 entry external input、partial access、callsite input store、flags 的原因断言。
+- [native_register_residue_audit_test.py](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_residue_audit_test.py:85)
+  - 新增 callee-saved return-path 样例，确认 `RBX` return 前 load 被标为 `callee_saved_return_path`。
+
+验证：
+
+```bash
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R native_register_residue --output-on-failure
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-stack-equivalent-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- 手动 Python 测试通过。
+- `notdec.native_register_residue_audit.unit` 通过。
+- 复用上一轮 `/tmp/notdec-bin2llvm-stack-equivalent-gate` 产物查看详情，固定三目标剩余 `gpr load access` 原因分布：
+
+```text
+after_call_clobbered   1
+callee_saved_gpr       2
+callee_saved_return_path 1
+frame_pointer          6
+ordinary               3
+partial_access         3
+return_path            1
+```
+
+判断：
+
+- 这一步不改变 pass 行为，也不改变 IR 生成性能。
+- 当前固定三目标里，下一步最明确的实现方向仍是 partial SSA；frame/callee-saved/after-call 需要更完整 current-value 和 call effect 证明，不能直接清。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 不减少 residue，但让剩余原因可直接统计。 |
+| 理解成本 | 1 | 只在审计脚本增加一列，标签来自已有上下文。 |
+| 维护成本 | 1 | 后续如果新增分类，只改脚本和对应测试。 |
+
+有没有更好的方案：
+
+- 更强方案是直接在 pass 里输出 skip reason metadata。
+- 当前先改审计脚本更轻量，不会影响 IR，也适合继续观察 Bench2 残留。
