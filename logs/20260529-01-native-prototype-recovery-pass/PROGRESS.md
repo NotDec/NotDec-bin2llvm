@@ -592,6 +592,9 @@
   - [x] 清理函数内原始 IR 没有 RIP load 的 RIP store，去掉 lifted instruction pointer 状态残留。
     - 文件：`include/notdec-bin2llvm/passes/NativeRegisterSSA.h`、`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-register-residue-unread-rip-gate`
+  - [x] 修正 `NativeRegisterSSA` 对 partial/full 的判断，改为按 `notdec.register.access` metadata range 判断，同时保留 backing storage value 是否可参与现有 SSA 的条件。
+    - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-partial-metadata-gate`
 
 ## 记录规则
 

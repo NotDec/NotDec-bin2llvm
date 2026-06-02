@@ -30,15 +30,22 @@ namespace {
 struct RegisterUnit {
   llvm::GlobalVariable *Global = nullptr;
   std::string Name;
+  uint32_t Offset = 0;
   uint32_t Size = 0;
 };
 
 // AccessInfo separates "this is a register access" from "this is safe to
-// promote". Partial accesses stay in memory form for now.
+// replace with the backing storage value". Metadata gives the architectural
+// access range, while the IR type tells whether this instruction carries the
+// full backing value used by RegisterStorage.
 struct AccessInfo {
   RegisterUnit *Unit = nullptr;
   bool IsRegisterAccess = false;
   bool IsFullUnit = false;
+  bool IsStorageValue = false;
+  uint32_t Offset = 0;
+  uint32_t Size = 0;
+  std::string Name;
 };
 
 using BlockRegKey = std::pair<llvm::BasicBlock *, llvm::GlobalVariable *>;
@@ -114,6 +121,7 @@ std::map<llvm::GlobalVariable *, RegisterUnit> collectRegisterUnits(
     RegisterUnit unit;
     unit.Global = &global;
     unit.Name = unitName(global);
+    unit.Offset = parseU32(mdField(node, "offset"));
     unit.Size = parseU32(mdField(node, "size"));
     units.emplace(&global, std::move(unit));
   }
@@ -179,12 +187,25 @@ AccessInfo registerLoad(llvm::LoadInst &load,
   if (it == units.end()) {
     return {};
   }
-  if (load.getMetadata("notdec.register.access") == nullptr &&
+  llvm::MDNode *accessMetadata = load.getMetadata("notdec.register.access");
+  if (accessMetadata == nullptr &&
       global->getMetadata("notdec.register") == nullptr) {
     return {};
   }
-  bool fullUnit = load.getType() == global->getValueType();
-  return AccessInfo{&it->second, true, fullUnit};
+  RegisterUnit &unit = it->second;
+  uint32_t offset = unit.Offset;
+  uint32_t size = unit.Size;
+  std::string name = unit.Name;
+  if (accessMetadata != nullptr) {
+    offset = parseU32(mdField(accessMetadata, "offset"));
+    size = parseU32(mdField(accessMetadata, "size"));
+    if (auto metadataName = mdField(accessMetadata, "name")) {
+      name = *metadataName;
+    }
+  }
+  bool fullUnit = offset == unit.Offset && size == unit.Size;
+  bool storageValue = load.getType() == global->getValueType();
+  return AccessInfo{&unit, true, fullUnit, storageValue, offset, size, name};
 }
 
 AccessInfo registerStore(
@@ -199,11 +220,20 @@ AccessInfo registerStore(
   if (it == units.end()) {
     return {};
   }
-  if (store.getMetadata("notdec.register.access") == nullptr) {
+  llvm::MDNode *accessMetadata = store.getMetadata("notdec.register.access");
+  if (accessMetadata == nullptr) {
     return {};
   }
-  bool fullUnit = store.getValueOperand()->getType() == global->getValueType();
-  return AccessInfo{&it->second, true, fullUnit};
+  RegisterUnit &unit = it->second;
+  uint32_t offset = parseU32(mdField(accessMetadata, "offset"));
+  uint32_t size = parseU32(mdField(accessMetadata, "size"));
+  std::string name = unit.Name;
+  if (auto metadataName = mdField(accessMetadata, "name")) {
+    name = *metadataName;
+  }
+  bool fullUnit = offset == unit.Offset && size == unit.Size;
+  bool storageValue = store.getValueOperand()->getType() == global->getValueType();
+  return AccessInfo{&unit, true, fullUnit, storageValue, offset, size, name};
 }
 
 bool isRegisterClobberCall(const llvm::Instruction &inst) {
@@ -280,7 +310,7 @@ private:
         if (access.Unit != nullptr) {
           ++Summary.LoadsSeen;
           LoadedUnits.insert(access.Unit->Global);
-          if (access.IsFullUnit) {
+          if (access.IsStorageValue) {
             Loads.push_back(load);
           }
         }
@@ -291,7 +321,7 @@ private:
         AccessInfo access = registerStore(*store, Units);
         if (access.Unit != nullptr) {
           ++Summary.StoresSeen;
-          if (access.IsFullUnit) {
+          if (access.IsStorageValue) {
             StoredFullUnits.insert(access.Unit->Global);
           }
         }
@@ -308,7 +338,7 @@ private:
   void rewriteLoads() {
     for (llvm::LoadInst *load : Loads) {
       AccessInfo access = registerLoad(*load, Units);
-      if (access.Unit == nullptr || !access.IsFullUnit) {
+      if (access.Unit == nullptr || !access.IsStorageValue) {
         continue;
       }
 
@@ -330,7 +360,7 @@ private:
   void collectExternalInputsOnly() {
     for (llvm::LoadInst *load : Loads) {
       AccessInfo access = registerLoad(*load, Units);
-      if (access.Unit == nullptr || !access.IsFullUnit) {
+      if (access.Unit == nullptr || !access.IsStorageValue) {
         continue;
       }
       (void)readRegister(*load->getParent(), *access.Unit, load);
@@ -368,7 +398,7 @@ private:
         }
         std::vector<llvm::StoreInst *> &stores =
             pendingStores[access.Unit->Global];
-        if (access.IsFullUnit) {
+        if (access.IsStorageValue) {
           deadStores.insert(deadStores.end(), stores.begin(), stores.end());
           stores.clear();
         }
@@ -499,7 +529,7 @@ private:
         continue;
       }
       AccessInfo access = registerStore(*store, Units);
-      if (access.Unit == &unit && access.IsFullUnit) {
+      if (access.Unit == &unit && access.IsStorageValue) {
         return resolveValue(store->getValueOperand());
       }
     }

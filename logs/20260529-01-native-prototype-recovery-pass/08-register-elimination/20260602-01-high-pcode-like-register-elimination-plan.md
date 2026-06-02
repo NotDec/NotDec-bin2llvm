@@ -701,3 +701,101 @@ ctest --test-dir build --output-on-failure
 
 - RIP store 清理移除了 `245` 个明显未读状态，耗时没有明显退化。
 - 下一步主要残留仍是 GPR full store/load、flags store，以及少量 partial/vector。
+
+## 阶段 B 基础修正：按 metadata 判断 partial/full
+
+RegisterStorage 的 partial access 形态和 `NativeRegisterSSA` 原来的判断不一致：
+
+- partial read 会先从 backing global 读完整值，例如 `load i64, ptr @RAX`，再在后续 IR 里截取。
+- partial write 会先组合出新的完整 backing value，再 `store i64, ptr @RAX`。
+- 但 `notdec.register.access` metadata 会标出真实架构访问范围，例如 `name=EAX,size=4` 或 `name=AL,size=1`。
+
+原来的 `NativeRegisterSSA` 只按 LLVM load/store 的类型判断 full-unit。这样会把 `load i64 @RAX` + metadata `EAX` 误当作 full `RAX` 访问。这个判断和 residue audit 的口径不一致，也会挡住后续真正的 storage range SSA。
+
+本轮修正 `AccessInfo`：
+
+- `IsFullUnit`：按 metadata 的 `offset/size` 和 backing global 的 `offset/size` 判断。
+- `IsStorageValue`：按 LLVM IR 类型判断这条 load/store 是否携带 backing full value。
+- 现有 SSA 读写仍只替换 `IsStorageValue` 的访问，因为 RegisterStorage 已经把 partial write 合成为 backing full value。
+
+这一步不是完整 partial bit-range SSA。它还不处理 IR 类型本身就是 `i8/i32` 的 partial load/store，也不做 extract/replace-range。它只是先修正分类，让后续阶段 B 能站在正确的 range 语义上。
+
+改动文件和函数：
+
+- `lib/passes/NativeRegisterSSA.cpp:30`
+  - `RegisterUnit` 新增 `Offset`。
+- `lib/passes/NativeRegisterSSA.cpp:37`
+  - `AccessInfo` 新增 `IsStorageValue`、`Offset`、`Size`、`Name`。
+- `lib/passes/NativeRegisterSSA.cpp:113`
+  - `collectRegisterUnits()` 记录 backing global 的 offset。
+- `lib/passes/NativeRegisterSSA.cpp:179`
+  - `registerLoad()` 从 `notdec.register.access` metadata 读取 access offset/size/name。
+  - `IsFullUnit` 改为按 metadata range 判断。
+  - `IsStorageValue` 记录 load type 是否等于 backing global type。
+- `lib/passes/NativeRegisterSSA.cpp:211`
+  - `registerStore()` 从 metadata 读取 access offset/size/name。
+  - `IsFullUnit` 改为按 metadata range 判断。
+  - `IsStorageValue` 记录 store value type 是否等于 backing global type。
+- `lib/passes/NativeRegisterSSA.cpp:309`
+  - `scanBlock()` 用 `IsStorageValue` 判断 load 是否可进入现有 SSA rewrite。
+- `lib/passes/NativeRegisterSSA.cpp:321`
+  - `scanBlock()` 用 `IsStorageValue` 判断 store 是否写入 backing full value。
+- `lib/passes/NativeRegisterSSA.cpp:338`
+  - `rewriteLoads()` 用 `IsStorageValue` 作为替换条件。
+- `lib/passes/NativeRegisterSSA.cpp:360`
+  - `collectExternalInputsOnly()` 用 `IsStorageValue` 作为读取条件。
+- `lib/passes/NativeRegisterSSA.cpp:398`
+  - `removeLocalDeadStores()` 用 `IsStorageValue` 判断后续 store 是否完整覆盖 pending store。
+- `lib/passes/NativeRegisterSSA.cpp:529`
+  - `localValueBefore()` 用 `IsStorageValue` 判断 store 是否能作为当前 backing full value。
+- `tests/native_register_effects_test.cpp:349`
+  - 新增 `createPartialMetadataStorageValueFunction()`，构造 `i64 load/store @RAX` 但 metadata 为 `EAX` 的生产形态。
+- `tests/native_register_effects_test.cpp:612`
+  - 新增断言，确认这类 backing value load 能被 SSA 替换。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+ctest --test-dir build -R 'notdec.native_register_effects.preserved' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-partial-metadata-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-partial-metadata-gate/*.signature-rewrite.ll
+ctest --test-dir build --output-on-failure
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 105s | 106s |
+| `memcached:executable` | 57s | 56s |
+
+残留对比：
+
+| kind | 上一轮 | 本轮 |
+| --- | ---: | ---: |
+| `gpr load access partial` | 19 | 19 |
+| `gpr store access partial` | 14 | 14 |
+| `gpr store access full` | 3601 | 3601 |
+| `flags store access full` | 2366 | 2366 |
+| `vector store access partial` | 71 | 71 |
+
+判断：
+
+- 固定三目标 residue 没有下降，但 pass 的 full/partial 判断口径已经和 metadata/audit 对齐。
+- 后续真正做 extract/replace-range SSA 时，可以复用 `AccessInfo::Offset/Size/IsFullUnit/IsStorageValue`，不需要再先修分类。
