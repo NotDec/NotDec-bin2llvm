@@ -4273,3 +4273,47 @@ vector    load         external_input   full     full         no         1
 
 - 更完整方案是继续做统一 current-value resolver，解决调用后 partial load 的 reaching value。
 - 本轮只修 metadata partial 和 IR type 不一致的问题，风险小，也直接对应真实 residue。
+
+## 2026-06-02 实现记录：residue 审计补齐 x86-64 低 8 位 GPR 分类
+
+背景：
+
+- 继续看 `/tmp/notdec-bin2llvm-wide-partial-gate` 的 residue 时，发现 `SIL` 被审计脚本归到了 `other`。
+- 这不是 pass 语义问题，但会误导后续判断：`SIL/DIL/SPL/BPL` 都是 x86-64 GPR 的低 8 位别名，应算作 GPR partial access。
+
+改动：
+
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:119)
+  - `classify_register` 的 GPR 集合补充 `SIL`、`DIL`、`SPL`、`BPL`。
+- [native_register_residue_audit_test.py](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_residue_audit_test.py:31)
+  - 样例 IR 增加 `@RSI` 和 `SIL` partial synthetic store。
+- [native_register_residue_audit_test.py](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_residue_audit_test.py:65)
+  - 断言 `gpr store access partial/full synthetic` 数量从 1 改成 2，确认 `SIL` 被归入 GPR。
+
+验证：
+
+```bash
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R native_register_residue --output-on-failure
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-wide-partial-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- 手动 Python 测试通过。
+- `notdec.native_register_residue_audit.unit` 通过。
+- 复用上一轮 gate 产物后，`other store access partial/full` 从 1 变成 0，`gpr store access partial/full synthetic` 从 4 变成 5。
+
+判断：
+
+- 这一步只修审计分类，不改变 IR，也不影响性能。
+- 修完后，后续看 `other` 残留时不会被 x86 GPR 别名污染。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 1 | 不减少真实 residue，只让统计更准。 |
+| 理解成本 | 1 | 补齐 x86-64 常见 GPR 低 8 位别名。 |
+| 维护成本 | 1 | 如果后续发现更多别名，继续补测试和集合即可。 |

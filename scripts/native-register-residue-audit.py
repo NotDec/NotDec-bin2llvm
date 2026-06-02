@@ -125,6 +125,7 @@ def classify_register(name: str) -> str:
         "EAX", "EBX", "ECX", "EDX", "ESI", "EDI", "ESP", "EBP",
         "AX", "BX", "CX", "DX", "SI", "DI", "SP", "BP",
         "AL", "AH", "BL", "BH", "CL", "CH", "DL", "DH",
+        "SIL", "DIL", "SPL", "BPL",
     }
     if upper in flags:
         return "flags"

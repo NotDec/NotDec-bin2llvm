@@ -29,6 +29,7 @@ def test_register_access_summary_classifies_full_and_partial() -> None:
     module = load_audit_module()
     ir = """
 @RAX = external global i64, !notdec.register !0
+@RSI = external global i64, !notdec.register !12
 @ZF = external global i8, !notdec.register !5
 
 define void @sample() !notdec.register.clobbers !8 !notdec.register.external_inputs !9 {
@@ -38,6 +39,7 @@ entry:
   store i64 %in, ptr @RAX, align 8, !notdec.register.access !1
   call void @callee()
   store i64 %in, ptr @RAX, align 8, !notdec.register.access !2, !notdec.register.synthetic !7
+  store i64 %in, ptr @RSI, align 8, !notdec.register.access !13, !notdec.register.synthetic !7
   store i64 %in, ptr @RAX, align 8, !notdec.register.access !1
   store i8 1, ptr @ZF, align 1, !notdec.register.access !6
   ret void
@@ -54,6 +56,8 @@ entry:
 !9 = !{!11}
 !10 = !{!"name=RAX", ptr @RAX}
 !11 = !{!"name=ZF", ptr @ZF}
+!12 = !{!"space=register", !"offset=48", !"size=8", !"name=RSI"}
+!13 = !{!"base=RSI", !"space=register", !"offset=48", !"size=1", !"name=SIL"}
 """
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "sample.ll"
@@ -64,7 +68,7 @@ entry:
     assert counts[("gpr", "load", "external_input", "full", "full", "no")] == 1
     assert counts[("gpr", "load", "access", "partial", "partial", "no")] == 1
     assert counts[("gpr", "store", "access", "full", "full", "no")] == 2
-    assert counts[("gpr", "store", "access", "partial", "full", "yes")] == 1
+    assert counts[("gpr", "store", "access", "partial", "full", "yes")] == 2
     assert counts[("flags", "store", "access", "full", "full", "no")] == 1
 
     assert accesses[0].line > 0
