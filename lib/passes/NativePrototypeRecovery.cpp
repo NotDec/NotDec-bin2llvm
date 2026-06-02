@@ -1124,6 +1124,63 @@ std::optional<llvm::Value *> localStackInputValueBeforeCall(
       call.getParent()->rend(), space, offset, size, paramType);
 }
 
+std::optional<llvm::Value *> stackInputValueAtBlockExit(
+    llvm::BasicBlock &block, llvm::StringRef space, uint64_t offset,
+    uint32_t size, llvm::Type *paramType,
+    std::set<llvm::BasicBlock *> &visited) {
+  std::optional<llvm::LoadInst *> local = stackInputLoadInReverseRange(
+      block.rbegin(), block.rend(), space, offset, size, paramType);
+  if (local) {
+    return *local;
+  }
+  if (hasCallInReverseRange(block.rbegin(), block.rend())) {
+    return std::nullopt;
+  }
+  if (!visited.insert(&block).second) {
+    return std::nullopt;
+  }
+
+  llvm::BasicBlock *predecessor = nullptr;
+  for (llvm::BasicBlock *candidate : llvm::predecessors(&block)) {
+    if (predecessor != nullptr) {
+      return std::nullopt;
+    }
+    predecessor = candidate;
+  }
+  if (predecessor == nullptr) {
+    return std::nullopt;
+  }
+  return stackInputValueAtBlockExit(*predecessor, space, offset, size,
+                                    paramType, visited);
+}
+
+std::optional<llvm::Value *> equivalentStackInputValueFromPredecessors(
+    llvm::BasicBlock &block, llvm::StringRef space, uint64_t offset,
+    uint32_t size, llvm::Type *paramType) {
+  llvm::Value *result = nullptr;
+  uint64_t predecessorCount = 0;
+  for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
+    ++predecessorCount;
+    std::set<llvm::BasicBlock *> visited;
+    std::optional<llvm::Value *> value = stackInputValueAtBlockExit(
+        *predecessor, space, offset, size, paramType, visited);
+    if (!value) {
+      return std::nullopt;
+    }
+    if (result == nullptr) {
+      result = *value;
+      continue;
+    }
+    if (result != *value) {
+      return std::nullopt;
+    }
+  }
+  if (predecessorCount < 2) {
+    return std::nullopt;
+  }
+  return result;
+}
+
 std::optional<llvm::Value *> stackInputValueBeforeCall(
     llvm::CallInst &call, llvm::StringRef space, uint64_t offset, uint32_t size,
     llvm::Type *paramType) {
@@ -1142,6 +1199,10 @@ std::optional<llvm::Value *> stackInputValueBeforeCall(
     llvm::BasicBlock *predecessor = nullptr;
     for (llvm::BasicBlock *candidate : llvm::predecessors(current)) {
       if (predecessor != nullptr) {
+        if (current == call.getParent()) {
+          return equivalentStackInputValueFromPredecessors(
+              *current, space, offset, size, paramType);
+        }
         return std::nullopt;
       }
       predecessor = candidate;

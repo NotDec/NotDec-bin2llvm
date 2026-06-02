@@ -4012,3 +4012,102 @@ vector    load         external_input   full     full         no         1
 
 - 更根本方案是修 native CFG 生成，避免把不可达地址块放进函数。
 - 当前先在 SSA 前清理，是因为它能马上消除假入口对 register SSA/prototype recovery 的影响，且语义风险低。
+
+## 2026-06-02 实现记录：stack input callsite 支持等价多 predecessor
+
+背景：
+
+- 阶段 E 的 stack 参数 rewrite 已经支持 callee 签名、简单 direct callsite、单 predecessor callsite。
+- 但 stack callsite 遇到多个 predecessor 时一律跳过；register 侧已经有“多个 predecessor 给出同一个值则可 rewrite”的保守逻辑。
+- 本次补齐 stack input 的同类能力：只有所有 predecessor 都能回看到同一个 stack input value 时才 rewrite，值不同或路径不清楚仍跳过。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1127)
+  - 新增 `stackInputValueAtBlockExit`，从 block 末尾向前查找 `notdec.stack.input` load；遇到非 intrinsic call 或多 predecessor 继续保守失败。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1157)
+  - 新增 `equivalentStackInputValueFromPredecessors`，要求所有 predecessor 找到同一个 `Value*`，否则返回 unknown。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1184)
+  - `stackInputValueBeforeCall` 在 call block 自身有多个 predecessor 时尝试等价值查询；不是 call block 的多 predecessor 仍保守跳过。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1555)
+  - 新增 `createStackInputEquivalentPredecessorCallerFunction`，构造一个 shared stack input load，经左右两个 predecessor 到同一个 call block。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:3460)
+  - 新增测试，确认 stack input-only callee 在等价多 predecessor callsite 下能 rewrite，且 call argument 使用 shared stack input load。
+  - 原有 ambiguous predecessor 测试保持不变，继续验证不同 predecessor 各自 load 时不会 rewrite。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-stack-equivalent-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-stack-equivalent-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 40s | 41s |
+| `libuv:shared-library` | 106s | 106s |
+| `memcached:executable` | 57s | 57s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         14
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3188
+gpr       store        access           full     full         no         3308
+gpr       store        access           partial  full         no         4
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         no         1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-unreachable-cleanup-gate` 相比：
+
+- signature rewrite 数量不变：
+  - `vsftpd` 137/236
+  - `libuv` 336/571
+  - `memcached` 191/315
+- register residue 不变。
+- 固定三目标没有命中这个 stack 等价 predecessor 场景；本轮是阶段 E 能力补齐，不是 residue 数量下降。
+
+判断：
+
+- 这一步补齐了 stack input callsite rewrite 的一个保守缺口。
+- 真实 Bench2 固定三目标未命中，所以收益体现在单测覆盖和后续样例能力，不体现在当前 residue。
+- 逻辑仍保守：路径上有非 intrinsic call、多 predecessor 继续回溯、或不同 predecessor 给出不同 stack load 时都不 rewrite。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 固定 Bench2 未命中，但补齐了阶段 E 的一个明确缺口。 |
+| 理解成本 | 3 | 新增两个 stack current-value helper，和 register 等价值查询思路一致。 |
+| 维护成本 | 3 | 后续统一 current-value resolver 时，应把 register/stack 两套等价查询合并。 |
+
+有没有更好的方案：
+
+- 更完整方案是把 register 和 stack 的 callsite current-value 查询抽成同一个 resolver。
+- 本轮先补 stack 的同值 predecessor，是因为已有 stack rewrite 测试框架，改动小且不扩大语义风险。
