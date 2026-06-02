@@ -577,6 +577,12 @@
     - 文件：`scripts/native-register-residue-audit.py`
   - [x] 添加审计脚本单测并注册到 CTest。
     - 文件：`tests/native_register_residue_audit_test.py`、`CMakeLists.txt`
+  - [x] 对固定 Bench2 三目标跑 signature-rewrite 残留审计，确认当前主要残留是 flags store、GPR full store 和 RSP/RBP/preserved register 流量，partial GPR 不是最大项。
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-fixed-gate`
+  - [x] 在 `NativeRegisterSSA` 增加保守同 block dead register store cleanup，删除被后续同 register full store 覆盖且中间无 load/call/terminator 的旧 store。
+    - 文件：`include/notdec-bin2llvm/passes/NativeRegisterSSA.h`、`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+  - [x] 生产代码改动后跑固定 Bench2 回归 gate，确认 `vsftpd:executable`、`libuv:shared-library`、`memcached:executable` 的 all-confirmed / signature-rewrite 通过 LLVM 22 assemble/verify，skip reason 只剩 `already matches` / `declaration`，并记录残留下降。
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-dead-store-gate`
 
 ## 记录规则
 

@@ -243,6 +243,51 @@ llvm::Function *createUnmarkedRegisterLoadFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createOverwrittenStoreFunction(llvm::Module &module,
+                                               llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "overwritten_register_store", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RAX");
+  llvm::StoreInst *first = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 1), rax);
+  first->setMetadata("notdec.register.access", metadata);
+  llvm::StoreInst *second = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 2), rax);
+  second->setMetadata("notdec.register.access", metadata);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createCallBetweenStoresFunction(llvm::Module &module,
+                                                llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "dead_store_barrier_call", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "call_between_register_stores", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RAX");
+  llvm::StoreInst *first = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 3), rax);
+  first->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  llvm::StoreInst *second = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 4), rax);
+  second->setMetadata("notdec.register.access", metadata);
+  builder.CreateRetVoid();
+  return function;
+}
+
 unsigned countRegisterLoads(const llvm::Function &function,
                             const llvm::GlobalVariable *global) {
   unsigned count = 0;
@@ -253,6 +298,23 @@ unsigned countRegisterLoads(const llvm::Function &function,
         continue;
       }
       if (load->getPointerOperand()->stripPointerCasts() == global) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
+unsigned countRegisterStores(const llvm::Function &function,
+                             const llvm::GlobalVariable *global) {
+  unsigned count = 0;
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+      if (store == nullptr) {
+        continue;
+      }
+      if (store->getPointerOperand()->stripPointerCasts() == global) {
         ++count;
       }
     }
@@ -311,6 +373,10 @@ int main() {
   llvm::Function *staleMetadata = createStaleMetadataFunction(module, rbx);
   llvm::Function *unmarkedRegisterLoad =
       createUnmarkedRegisterLoadFunction(module, rdi);
+  llvm::Function *overwrittenStore =
+      createOverwrittenStoreFunction(module, rax);
+  llvm::Function *callBetweenStores =
+      createCallBetweenStoresFunction(module, rax);
 
   notdec::bin2llvm::NativeRegisterSSAOptions options;
   options.EnableRewrite = true;
@@ -340,8 +406,10 @@ int main() {
                "written killed-by-call RAX was not marked clobbered");
   ok &= expect(summary.PreservedRegisters == 1,
                "register effect summary had unexpected preserved count");
-  ok &= expect(summary.ClobberedRegisters == 3,
+  ok &= expect(summary.ClobberedRegisters == 5,
                "register effect summary had unexpected clobber count");
+  ok &= expect(summary.DeadStoresRemoved >= 1,
+               "register SSA did not remove the expected overwritten store");
   ok &= expect(countRegisterLoads(*callEffects, rbx) == 0,
                "RBX load after call was not propagated");
   ok &= expect(countRegisterLoads(*callEffects, rax) == 1,
@@ -364,5 +432,9 @@ int main() {
                "unmarked RDI global load was not marked as external input");
   ok &= expect(countRegisterLoads(*unmarkedRegisterLoad, rdi) == 1,
                "unmarked RDI global load was not rewritten to one entry load");
+  ok &= expect(countRegisterStores(*overwrittenStore, rax) == 1,
+               "overwritten RAX store was not removed");
+  ok &= expect(countRegisterStores(*callBetweenStores, rax) == 2,
+               "RAX store before call barrier was removed");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

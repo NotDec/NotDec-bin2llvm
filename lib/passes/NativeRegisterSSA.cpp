@@ -249,6 +249,7 @@ public:
 
     if (EnableRewrite) {
       rewriteLoads();
+      removeLocalDeadStores();
       attachRegisterEffectMetadata();
       eraseDeadPhis();
     } else {
@@ -319,6 +320,52 @@ private:
         continue;
       }
       (void)readRegister(*load->getParent(), *access.Unit, load);
+    }
+  }
+
+  void removeLocalDeadStores() {
+    std::vector<llvm::Instruction *> deadStores;
+    for (llvm::BasicBlock &block : Function) {
+      std::map<llvm::GlobalVariable *, llvm::StoreInst *> lastStore;
+      for (llvm::Instruction &inst : block) {
+        if (inst.isTerminator()) {
+          lastStore.clear();
+          continue;
+        }
+        if (isRegisterClobberCall(inst)) {
+          lastStore.clear();
+          continue;
+        }
+        if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+          AccessInfo access = registerLoad(*load, Units);
+          if (access.Unit != nullptr && access.IsFullUnit) {
+            lastStore.erase(access.Unit->Global);
+          }
+          continue;
+        }
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+        if (store == nullptr) {
+          continue;
+        }
+        AccessInfo access = registerStore(*store, Units);
+        if (access.Unit == nullptr || !access.IsFullUnit) {
+          continue;
+        }
+        auto existing = lastStore.find(access.Unit->Global);
+        if (existing != lastStore.end()) {
+          deadStores.push_back(existing->second);
+        }
+        lastStore[access.Unit->Global] = store;
+      }
+    }
+
+    std::set<llvm::Instruction *> uniqueDeadStores(deadStores.begin(),
+                                                   deadStores.end());
+    for (llvm::Instruction *inst : uniqueDeadStores) {
+      if (inst->use_empty()) {
+        inst->eraseFromParent();
+        ++Summary.DeadStoresRemoved;
+      }
     }
   }
 
@@ -694,6 +741,7 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.LoadsSeen += function.LoadsSeen;
   total.StoresSeen += function.StoresSeen;
   total.LoadsReplaced += function.LoadsReplaced;
+  total.DeadStoresRemoved += function.DeadStoresRemoved;
   total.PhisCreated += function.PhisCreated;
   total.PhisSimplified += function.PhisSimplified;
   total.ExternalInputs += function.ExternalInputs;
@@ -780,6 +828,7 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
   os << "  loads: " << summary.LoadsSeen << '\n';
   os << "  stores: " << summary.StoresSeen << '\n';
   os << "  loads replaced: " << summary.LoadsReplaced << '\n';
+  os << "  dead stores removed: " << summary.DeadStoresRemoved << '\n';
   os << "  phis created: " << summary.PhisCreated << '\n';
   os << "  phis simplified: " << summary.PhisSimplified << '\n';
   os << "  external inputs: " << summary.ExternalInputs << '\n';
@@ -790,6 +839,7 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
     os << "  function " << function.FunctionName << ": loads="
        << function.LoadsSeen << " stores=" << function.StoresSeen
        << " replaced=" << function.LoadsReplaced
+       << " dead_stores_removed=" << function.DeadStoresRemoved
        << " phis=" << function.PhisCreated
        << " simplified=" << function.PhisSimplified
        << " external_inputs=" << function.ExternalInputs

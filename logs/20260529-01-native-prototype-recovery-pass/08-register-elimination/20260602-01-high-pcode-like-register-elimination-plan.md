@@ -321,3 +321,110 @@ gpr	store	access	full	9
 - 当前只解析文本 `.ll`，不直接读 `.bc`。
 - full/partial 判断依赖 register global 的 `!notdec.register` metadata 和 access metadata 的 `base/offset/size` 字段。
 - 目前只做统计，不给出“该先修哪一类”的自动决策；下一步应在固定 Bench2 rewrite 输出上跑这个脚本，再按真实残留选择阶段 B 或阶段 D。
+
+## 固定 Bench2 残留审计和本地 dead store cleanup
+
+先用阶段 A 脚本跑固定三目标 signature-rewrite 输出：
+
+```bash
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-fixed-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-fixed-gate/*.signature-rewrite.ll
+```
+
+结果显示 partial GPR 不是当前最大残留：
+
+```text
+category	access_kind	metadata_kind	shape	count
+flags	load	external_input	full	15
+flags	store	access	full	4740
+gpr	load	access	full	53
+gpr	load	access	partial	19
+gpr	load	external_input	full	3186
+gpr	store	access	full	5790
+gpr	store	access	partial	31
+other	load	access	full	8
+other	load	external_input	full	50
+other	store	access	full	245
+other	store	access	partial	1
+vector	load	external_input	full	70
+vector	store	access	partial	72
+```
+
+按 base 看，主要是 `RSP` store、flags store、`RBP` store/external input 和 preserved register external input。基于这个结果，本轮没有直接做 storage range SSA，而是先做一个很保守的本地 dead register store cleanup：同一 basic block 内，full-unit register store 如果被后续同 register full store 覆盖，且中间没有同 register load、普通 call 或 terminator，就删除前一个 store。
+
+改动文件和函数：
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:24`
+  - `NativeRegisterSSAFunctionSummary` 和 `NativeRegisterSSASummary` 新增 `DeadStoresRemoved` 计数。
+- `lib/passes/NativeRegisterSSA.cpp:252`
+  - `FunctionPromoter::run()` 在 `rewriteLoads()` 后调用 `removeLocalDeadStores()`。
+- `lib/passes/NativeRegisterSSA.cpp:326`
+  - 新增 `removeLocalDeadStores()`。
+  - 只处理 full-unit register store。
+  - 遇到同 register full load 时清掉该 register 的 pending store。
+  - 遇到普通 call 或 terminator 时清掉全部 pending store，避免跨 call 或跨 block 删除。
+  - partial access 暂不参与，后续交给 storage range SSA。
+- `lib/passes/NativeRegisterSSA.cpp:744`
+  - summary 聚合 `DeadStoresRemoved`。
+- `lib/passes/NativeRegisterSSA.cpp:831`
+  - summary 打印 `dead stores removed`。
+- `tests/native_register_effects_test.cpp:244`
+  - 新增 `createOverwrittenStoreFunction()`，覆盖同 block 后 store 覆盖前 store 的正例。
+- `tests/native_register_effects_test.cpp:266`
+  - 新增 `createCallBetweenStoresFunction()`，覆盖普通 call barrier，不允许删除 call 前 store。
+- `tests/native_register_effects_test.cpp:308`
+  - 新增 `countRegisterStores()`。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+ctest --test-dir build -R 'notdec.native_register_effects.preserved' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-dead-store-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-dead-store-gate/*.signature-rewrite.ll
+ctest --test-dir build --output-on-failure
+```
+
+结果：
+
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过，skip reason 仍只剩 `already matches` / `declaration`。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 40s |
+| `libuv:shared-library` | 105s | 105s |
+| `memcached:executable` | 57s | 57s |
+
+残留对比：
+
+| kind | cleanup 前 | cleanup 后 |
+| --- | ---: | ---: |
+| `flags store access full` | 4740 | 3813 |
+| `gpr store access full` | 5790 | 3601 |
+| `gpr store access partial` | 31 | 14 |
+| `vector store access partial` | 72 | 71 |
+
+按 base 看，`RSP` store 从 3141 降到 1132。这个说明当前大量残留是局部覆写，不需要等完整 storage range SSA 才能减少。
+
+注意：
+
+- `libuv` 的 `prototype_return_candidates` / rewritten 数从 157/338 变成 155/337，skip reason gate 仍通过。判断是被删除的 store 本来被后续同 block store 覆盖，旧 return candidate 是更弱的候选；cleanup 让候选更保守。后续如果要确认具体函数，可继续用 residue details 和 prototype summary 定位。
+- 这个 cleanup 不是 flags SSA，也不是 partial access SSA。它只是删除同 block 内确定被覆盖的 full store。
+- 不跨 call、不跨 block、不处理 partial access，避免用局部清理替代真正的 storage SSA。
