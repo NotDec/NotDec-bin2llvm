@@ -1438,6 +1438,50 @@ llvm::Function *createStackInputCallerFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createStackInputReturnLoadCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    uint64_t stackOffset, llvm::GlobalVariable *firstOutput,
+    const std::string &firstOutputName, llvm::GlobalVariable *secondOutput,
+    const std::string &secondOutputName, llvm::LoadInst **inputLoad,
+    llvm::CallInst **callOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *byteType = llvm::Type::getInt8Ty(context);
+  auto *arrayType = llvm::ArrayType::get(byteType, 32);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(arrayType, nullptr, "notdec_stack");
+  llvm::Value *pointer = builder.CreateInBoundsGEP(
+      byteType, stack,
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), stackOffset),
+      "stack_arg.stack");
+  llvm::LoadInst *stackLoad =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), pointer,
+                         "stack_arg.mem");
+  stackLoad->setMetadata("notdec.stack.input",
+                         stackInputMetadata(context, stackOffset, 8));
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  llvm::LoadInst *firstLoad =
+      builder.CreateLoad(firstOutput->getValueType(), firstOutput,
+                         firstOutputName + ".return_value");
+  firstLoad->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, firstOutputName));
+  llvm::LoadInst *secondLoad =
+      builder.CreateLoad(secondOutput->getValueType(), secondOutput,
+                         secondOutputName + ".return_value");
+  secondLoad->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, secondOutputName));
+  builder.CreateAdd(firstLoad, secondLoad);
+  builder.CreateRetVoid();
+  *inputLoad = stackLoad;
+  *callOut = call;
+  return function;
+}
+
 llvm::Function *createTwoUsedExternalInputFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *first,
     const std::string &firstRegisterName, llvm::GlobalVariable *second,
@@ -2101,6 +2145,46 @@ llvm::Function *createInputTwoOutputReturnStoreFunction(
   return function;
 }
 
+llvm::Function *createStackInputTwoOutputReturnStoreFunction(
+    llvm::Module &module, const std::string &name, uint64_t stackOffset,
+    llvm::GlobalVariable *first, const std::string &firstRegisterName,
+    llvm::GlobalVariable *second, const std::string &secondRegisterName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *byteType = llvm::Type::getInt8Ty(context);
+  auto *arrayType = llvm::ArrayType::get(byteType, 32);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(arrayType, nullptr, "notdec_stack");
+  llvm::Value *pointer = builder.CreateInBoundsGEP(
+      byteType, stack,
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), stackOffset),
+      "stack_arg.stack");
+  llvm::LoadInst *load =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), pointer,
+                         "stack_arg.mem");
+  load->setMetadata("notdec.stack.input",
+                    stackInputMetadata(context, stackOffset, 8));
+
+  llvm::StoreInst *firstStore = builder.CreateStore(
+      builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 1)),
+      first);
+  firstStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, firstRegisterName));
+
+  llvm::StoreInst *secondStore = builder.CreateStore(
+      builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 2)),
+      second);
+  secondStore->setMetadata("notdec.register.access",
+                           registerAccessMetadata(context, secondRegisterName));
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createTwoInputTwoOutputReturnStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *firstInput,
     const std::string &firstInputName, llvm::GlobalVariable *secondInput,
@@ -2598,6 +2682,15 @@ int main() {
       module, "call_input_rdi_return_rdx_rax", inputTwoOutputFunction, rdi,
       "RDI", rax, "RAX", rdx, "RDX", &inputTwoOutputOldCall,
       &inputTwoOutputRaxLoad, &inputTwoOutputRdxLoad);
+  llvm::Function *stackInputTwoOutputFunction =
+      createStackInputTwoOutputReturnStoreFunction(
+          module, "input_stack_return_rdx_rax", 8, rdx, "RDX", rax, "RAX");
+  llvm::LoadInst *stackInputTwoOutputInputLoad = nullptr;
+  llvm::CallInst *stackInputTwoOutputOldCall = nullptr;
+  createStackInputReturnLoadCallerFunction(
+      module, "call_input_stack_return_rdx_rax", stackInputTwoOutputFunction, 8,
+      rax, "RAX", rdx, "RDX", &stackInputTwoOutputInputLoad,
+      &stackInputTwoOutputOldCall);
   llvm::Function *inputTwoOutputSharedFunction =
       createInputTwoOutputReturnStoreFunction(
           module, "input_rdi_return_rdx_rax_shared", rdi, "RDI", rdx, "RDX",
@@ -2711,16 +2804,16 @@ int main() {
   }
 
   bool ok = true;
-  ok &= expect(summary.FunctionsSeen == 52, "unexpected function count");
+  ok &= expect(summary.FunctionsSeen == 54, "unexpected function count");
   ok &= expect(summary.ExternalInputsSeen == 23,
                "unexpected external input count");
-  ok &= expect(summary.InputCandidates == 21,
+  ok &= expect(summary.InputCandidates == 22,
                "unexpected input candidate count");
-  ok &= expect(summary.ReturnCandidates == 34,
+  ok &= expect(summary.ReturnCandidates == 36,
                "unexpected return candidate count");
-  ok &= expect(summary.RewriteEligibleFunctions == 52,
+  ok &= expect(summary.RewriteEligibleFunctions == 54,
                "unexpected rewrite eligible function count");
-  ok &= expect(summary.SignatureRewriteNeededFunctions == 32,
+  ok &= expect(summary.SignatureRewriteNeededFunctions == 33,
                "unexpected signature rewrite needed function count");
   ok &= expect(summary.SignatureRewriteFunctionsSeen == 0,
                "default recovery unexpectedly ran signature rewrite");
@@ -5979,6 +6072,63 @@ int main() {
                "input multi-return callsite did not extract both fields");
   ok &= expect(!sawOldInputMultiReturnLoad,
                "input multi-return callsite kept old return register load");
+
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      stackInputMultiReturnRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototype(
+              *stackInputTwoOutputFunction);
+  ok &= expect(stackInputMultiReturnRewriteResult.Rewritten,
+               "stack input multi-return prototype was not rewritten");
+  stackInputTwoOutputFunction = stackInputMultiReturnRewriteResult.Function;
+  llvm::Function *stackInputTwoOutputCaller =
+      module.getFunction("call_input_stack_return_rdx_rax");
+  llvm::CallInst *rewrittenStackInputMultiReturnCall = nullptr;
+  uint64_t stackInputMultiReturnExtracts = 0;
+  bool sawOldStackInputMultiReturnLoad = false;
+  if (stackInputTwoOutputCaller != nullptr) {
+    for (llvm::BasicBlock &block : *stackInputTwoOutputCaller) {
+      for (llvm::Instruction &instruction : block) {
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          if (call->getCalledFunction() == stackInputTwoOutputFunction) {
+            rewrittenStackInputMultiReturnCall = call;
+          }
+        }
+        if (llvm::isa<llvm::ExtractValueInst>(&instruction)) {
+          ++stackInputMultiReturnExtracts;
+        }
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+        if (load != nullptr &&
+            load->getMetadata("notdec.register.access") != nullptr) {
+          sawOldStackInputMultiReturnLoad = true;
+        }
+      }
+    }
+  }
+  ok &= expect(stackInputTwoOutputFunction != nullptr &&
+                   functionTypeShape(
+                       *stackInputTwoOutputFunction->getFunctionType(),
+                       stackInputTwoOutputFunction->getReturnType(),
+                       llvm::ArrayRef(i64Param)),
+               "stack input multi-return function type did not keep one i64 input");
+  ok &= expect(stackInputTwoOutputFunction != nullptr &&
+                   llvm::isa<llvm::StructType>(
+                       stackInputTwoOutputFunction->getReturnType()),
+               "stack input multi-return function did not return struct");
+  ok &= expect(rewrittenStackInputMultiReturnCall != nullptr,
+               "stack input multi-return callsite was not rewritten to new callee");
+  ok &= expect(rewrittenStackInputMultiReturnCall != nullptr &&
+                   rewrittenStackInputMultiReturnCall->arg_size() == 1 &&
+                   rewrittenStackInputMultiReturnCall->getArgOperand(0) ==
+                       stackInputTwoOutputInputLoad,
+               "stack input multi-return callsite did not use stack input argument");
+  ok &= expect(rewrittenStackInputMultiReturnCall != nullptr &&
+                   llvm::isa<llvm::StructType>(
+                       rewrittenStackInputMultiReturnCall->getType()),
+               "stack input multi-return direct call did not return struct");
+  ok &= expect(stackInputMultiReturnExtracts == 2,
+               "stack input multi-return callsite did not extract both fields");
+  ok &= expect(!sawOldStackInputMultiReturnLoad,
+               "stack input multi-return callsite kept old return register load");
 
   notdec::bin2llvm::NativePrototypeRewriteResult
       sharedInputMultiReturnRewriteResult =

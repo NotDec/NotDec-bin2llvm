@@ -1774,22 +1774,25 @@ collectInputMultiReturnDirectCallsites(
     rewrite.InputStores.reserve(inputs.size());
     for (uint64_t index = 0; index < inputs.size(); ++index) {
       std::optional<llvm::Value *> argument = callsiteInputValueBeforeCall(
-          *call, inputs[index].RegisterName, recoveredType.getParamType(index));
+          *call, inputs[index], recoveredType.getParamType(index));
       if (!argument) {
         result.FailureReason = "unsafe callsite input value";
         return result;
       }
       rewrite.Arguments.push_back(*argument);
-      llvm::StoreInst *inputStore = localCallsiteInputStoreBeforeCall(
-          *call, inputs[index].RegisterName, recoveredType.getParamType(index));
-      if (inputStore != nullptr && inputStore->getValueOperand() == *argument &&
-          call->getFunction()->getMetadata("notdec.prototype.return_candidates") ==
-              nullptr &&
-          callClobbersRegister(*call, inputs[index].RegisterName)) {
-        rewrite.InputStores.push_back(inputStore);
-      } else {
-        rewrite.InputStores.push_back(nullptr);
+      llvm::StoreInst *inputStore = nullptr;
+      if (inputs[index].StorageKind == "register") {
+        inputStore = localCallsiteInputStoreBeforeCall(
+            *call, inputs[index].RegisterName, recoveredType.getParamType(index));
+        if (inputStore != nullptr &&
+            (inputStore->getValueOperand() != *argument ||
+             call->getFunction()->getMetadata(
+                 "notdec.prototype.return_candidates") != nullptr ||
+             !callClobbersRegister(*call, inputs[index].RegisterName))) {
+          inputStore = nullptr;
+        }
       }
+      rewrite.InputStores.push_back(inputStore);
     }
     rewrite.ReturnLoads.reserve(returns.size());
     rewrite.ReturnLoadResults.reserve(returns.size());
@@ -3277,10 +3280,6 @@ rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
 
   std::optional<std::vector<InputMultiReturnCallsiteRewrite>> callsiteRewrites;
   if (!function.use_empty()) {
-    if (hasStackInputBinding(*inputBindings)) {
-      result.Reason = "unsupported stack callsite input";
-      return result;
-    }
     InputMultiReturnCallsiteCollectionResult callsiteCollection =
         collectInputMultiReturnDirectCallsites(
             function, prototype->Inputs, **recoveredType, prototype->Returns,

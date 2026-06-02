@@ -2545,3 +2545,120 @@ vector    store        access           partial  full         71
 
 - 更完整的做法是阶段 C 的统一 current-value 查询，stack/register 都走同一套 CFG 查询。
 - 本轮先用 metadata 限定一个窄 case，是为了避免在 stack alias 还没建模时猜值。
+
+## 阶段 E 小步：stack input 的 input-multi-return callsite rewrite
+
+背景：
+
+- 上一轮只让 input-only 和 input-return 两条 direct callsite 路径支持简单 stack input。
+- input-multi-return 仍然在有 stack input 且存在 caller 时返回 `unsupported stack callsite input`。
+- 这条路径的 input 查询逻辑和前两条路径重复，适合直接复用上轮新增的 storage-kind 分派查询。
+
+本轮范围：
+
+- `input + multi-return` 的 direct callsite 支持简单 stack input。
+- stack input 仍只接受调用点前同一 basic block 内唯一匹配的 `notdec.stack.input` load。
+- register input 仍保持原来的 store 查询和可删除 input store 逻辑。
+- return load 处理不变，仍沿用已有 multi-return 的 `extractvalue` / shared successor PHI 逻辑。
+
+不做：
+
+- 不跨 basic block 追 stack 值。
+- 不从 GEP 或栈指针表达式猜参数。
+- 不删除 caller 侧 stack load。
+- 不扩大 return load 搜索范围。
+
+改动文件和函数：
+
+- `lib/passes/NativePrototypeRecovery.cpp:1775`
+  - `collectInputMultiReturnDirectCallsites()` 改为调用按 `NativeRecoveredPrototypeParam::StorageKind` 分派的 `callsiteInputValueBeforeCall()`。
+  - 只有 register input 才查询和删除 caller 侧 input store；stack input 的 `InputStores` 保持空。
+- `lib/passes/NativePrototypeRecovery.cpp:3281`
+  - `rewriteNativeRecoveredPrototypeInputMultiReturn()` 移除 stack input 的统一跳过，交给 callsite input 查询判断是否安全。
+- `tests/native_prototype_recovery_test.cpp:1441`
+  - 新增 `createStackInputReturnLoadCallerFunction()`，构造 caller 侧 stack input load、direct call 和两个 return register load。
+- `tests/native_prototype_recovery_test.cpp:2149`
+  - 新增 `createStackInputTwoOutputReturnStoreFunction()`，构造 stack input + 两个 register return 的 callee。
+- `tests/native_prototype_recovery_test.cpp:2685`
+  - 增加 stack input multi-return 的 callee/caller 样例。
+- `tests/native_prototype_recovery_test.cpp:2807`
+  - summary 期望随新增样例调整：函数数 `52 -> 54`，input candidate `21 -> 22`，return candidate `34 -> 36`，rewrite eligible `52 -> 54`，signature rewrite needed `32 -> 33`。
+- `tests/native_prototype_recovery_test.cpp:6076`
+  - 断言 stack input multi-return 能 rewrite，调用点参数来自 caller 侧 stack input load，返回值变为 struct，旧 return register load 被替换。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-stack-input-multireturn-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-stack-input-multireturn-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-stack-input-multireturn-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-stack-input-multireturn.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 40s |
+| `libuv:shared-library` | 105s | 106s |
+| `memcached:executable` | 57s | 57s |
+
+signature rewrite 统计：
+
+```text
+target      needed  rewritten
+vsftpd      137     137
+libuv       336     336
+memcached   187     187
+```
+
+残留统计与上一轮相同：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  count
+gpr       load         access           full     full         22
+gpr       load         access           partial  full         3
+gpr       load         external_input   full     full         3190
+gpr       store        access           full     full         3583
+gpr       store        access           partial  full         11
+other     load         access           full     full         8
+other     load         external_input   full     full         49
+other     store        access           partial  full         1
+vector    load         access           full     full         1
+vector    load         external_input   full     full         70
+vector    store        access           partial  full         71
+```
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 把 stack input direct callsite 支持补到 input-multi-return 路径；固定三目标未命中新场景，所以 residue 不变。 |
+| 理解成本 | 2 | 主要是删除一处重复 register-only 查询，复用已有 storage-kind 查询入口。 |
+| 维护成本 | 3 | 后续如果做统一 current-value 查询，需要把这三条 direct callsite 路径继续合并，避免逻辑再分叉。 |
+
+有没有更好的方案：
+
+- 更完整方案仍然是阶段 C，把 register/stack/current value 查询集中成独立模块。
+- 本轮只消掉一处明确重复和保守跳过，不提前处理复杂 stack CFG。
