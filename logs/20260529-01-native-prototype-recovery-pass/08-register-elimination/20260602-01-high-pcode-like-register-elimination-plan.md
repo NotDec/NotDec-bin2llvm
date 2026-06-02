@@ -2869,3 +2869,116 @@ vector    store        access           partial  full         no         71
 
 - 可以直接做 vector liveness cleanup，但当前还没证明这些 store 是否都是 dead。
 - 先加审计维度更稳，后续再按 range/liveness 做窄 cleanup。
+
+## 阶段 D 小步：rewrite 后清理 killedbycall scratch store
+
+背景：
+
+- 上一轮确认固定三目标里的 vector partial store 不是 `notdec.register.synthetic`。
+- 这些 store 多数是 caller-saved register 的 scratch 写，例如 `XMM0_Qb` 写到 `ZMM0` backing value。
+- `NativeRegisterSSA` 在 prototype recovery 之前运行，不能在 SSA 阶段删这类 store，否则可能破坏 return recovery。
+- 更合适的位置是 signature rewrite 后：此时 return store 已经被绑定和删除，剩下的 ABI `killedbycall` store 如果函数内没人读，就只是 scratch register traffic。
+
+本轮范围：
+
+- 只在 `RewriteSignatures` 流程后清理。
+- 只处理 ABI metadata 明确写出的 `killedbycall` register。
+- 只删当前函数已经是 recovered prototype 类型的函数里的 store。
+- 如果函数里还有同 register / lane register load，则保留 store。
+- `XMM0` 可以匹配 `XMM0_Qa` / `XMM0_Qb`，但不从 `XMM0` 推到 `ZMM0`，也不推到 `XMM1`。
+- 不改 `NativeRegisterSSA`，不提前删 return candidate。
+
+改动文件和函数：
+
+- `lib/passes/NativePrototypeRecovery.cpp:1200`
+  - 新增 `registerNameMatchesEffect()`，支持 `XMM0` 匹配 `XMM0_*` lane 名。
+- `lib/passes/NativePrototypeRecovery.cpp:1206`
+  - 新增 `accessMatchesEffectRegister()`，按 access metadata 的 `name` / `base` 判断是否命中 ABI effect register。
+- `lib/passes/NativePrototypeRecovery.cpp:1221`
+  - 新增 `functionHasRegisterAccessLoad()`，函数内有同 register load 时保守不清理。
+- `lib/passes/NativePrototypeRecovery.cpp:1238`
+  - 新增 `killedByCallRegisterNames()`，从 ABI effect 收集明确的 killed-by-call register 名。
+- `lib/passes/NativePrototypeRecovery.cpp:1251`
+  - 新增 `eraseDeadKilledByCallRegisterStores()`，删除 rewrite 后无读的 killed-by-call register stores，并递归清理死 RMW 计算和 external input load。
+- `lib/passes/NativePrototypeRecovery.cpp:2592`
+  - `runNativePrototypeRecovery()` 在 `rewriteNativeRecoveredPrototypes()` 和 `rewriteDeclarationCallOutputs()` 之后调用 cleanup。
+- `tests/native_prototype_recovery_test.cpp:174`
+  - 新增 `attachKilledVectorScratchTestAbi()`，构造 `XMM0` killed-by-call ABI。
+- `tests/native_prototype_recovery_test.cpp:1668`
+  - 新增 `createKilledVectorScratchStoreFunction()`，构造 dead/live 两种 vector scratch store。
+- `tests/native_prototype_recovery_test.cpp:7209`
+  - 断言 dead `XMM0_Qb` store 被删除，有同名 load 的 `XMM0_Qb` store 保留。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-killed-scratch-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-killed-scratch-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-killed-scratch-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-killed-scratch.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 106s | 106s |
+| `memcached:executable` | 57s | 57s |
+
+residue 变化：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  before  after
+gpr       load         access           full     full         no         22      22
+gpr       load         access           partial  full         no         3       3
+gpr       load         external_input   full     full         no         3190    3190
+gpr       store        access           full     full         no         3583    3179
+gpr       store        access           partial  full         no         11      4
+other     load         access           full     full         no         8       8
+other     load         external_input   full     full         no         49      49
+other     store        access           partial  full         no         1       1
+vector    load         access           full     full         no         1       1
+vector    load         external_input   full     full         no         70      15
+vector    store        access           partial  full         no         71      14
+```
+
+判断：
+
+- 这一步直接消掉了大部分 `XMM0` scratch vector RMW 残留。
+- 仍剩下的 vector 残留主要是 `XMM1`、`XMM2`、`XMM3` 等 ABI metadata 当前没有明确 `killedbycall` 的寄存器，或者函数内存在对应 load。
+- 下一步如果要继续消 vector，需要先补 ABI effect 导出范围，或者在 cleanup 里引入更明确的 ABI alias 表；不能靠猜测把 `XMM1+` 都当 killed-by-call。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 7 | fixed gate 上 vector external input 从 70 降到 15，vector partial store 从 71 降到 14，GPR store 也下降一批。 |
+| 理解成本 | 3 | 新增的是 rewrite 后 cleanup，条件较窄，但读代码时要知道它故意不在 SSA 阶段运行。 |
+| 维护成本 | 3 | 依赖 ABI effect metadata 的准确性；后续 ABI 导出更完整时，这个 cleanup 会自然覆盖更多寄存器。 |
+
+有没有更好的方案：
+
+- 更完整方案是把 ABI effect alias 做成统一 resolver，供 SSA、prototype recovery 和 cleanup 共用。
+- 本轮先做 rewrite 后窄清理，是为了避免提前影响 return recovery，同时先解决 fixed gate 上明显的 vector residue。

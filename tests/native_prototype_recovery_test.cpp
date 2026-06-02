@@ -171,6 +171,19 @@ void attachInputRaxReturnTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachKilledVectorScratchTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = "XMM0";
+  abi.Effects.push_back(std::move(killed));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 llvm::Function *createFunction(llvm::Module &module, const std::string &name) {
   llvm::LLVMContext &context = module.getContext();
   auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
@@ -1649,6 +1662,32 @@ llvm::Function *createWideVectorAndScalarReturnFunction(
   builder.CreateRetVoid();
 
   *wideReturnStore = wideStore;
+  return function;
+}
+
+llvm::Function *createKilledVectorScratchStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *wide,
+    const std::string &accessName, bool keepLoad) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *access =
+      registerAccessMetadata(context, "ZMM0", 4616, 8, accessName);
+
+  llvm::Value *value =
+      llvm::ConstantInt::get(wide->getValueType(), llvm::APInt(512, 0x1234));
+  if (keepLoad) {
+    llvm::LoadInst *load = builder.CreateLoad(wide->getValueType(), wide);
+    load->setMetadata("notdec.register.access", access);
+    value = builder.CreateAdd(load, value);
+  }
+  llvm::StoreInst *store = builder.CreateStore(value, wide);
+  store->setMetadata("notdec.register.access", access);
+  builder.CreateRetVoid();
   return function;
 }
 
@@ -7164,6 +7203,34 @@ int main() {
                "opt-in rerun dropped recovered metadata from rewritten function");
   if (llvm::verifyModule(optInModule, &llvm::errs())) {
     std::cerr << "opt-in module verification failed after prototype rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module killedVectorScratchModule(
+      "native-prototype-killed-vector-scratch-test", context);
+  llvm::GlobalVariable *killedVectorZmm =
+      createRegisterGlobal(killedVectorScratchModule, "ZMM0",
+                           llvm::IntegerType::get(context, 512));
+  attachKilledVectorScratchTestAbi(killedVectorScratchModule);
+  llvm::Function *deadKilledVectorScratch =
+      createKilledVectorScratchStoreFunction(killedVectorScratchModule,
+                                             "dead_killed_vector_scratch",
+                                             killedVectorZmm, "XMM0_Qb", false);
+  llvm::Function *liveKilledVectorScratch =
+      createKilledVectorScratchStoreFunction(killedVectorScratchModule,
+                                             "live_killed_vector_scratch",
+                                             killedVectorZmm, "XMM0_Qb", true);
+  notdec::bin2llvm::runNativePrototypeRecovery(killedVectorScratchModule,
+                                               rewriteOptions);
+  ok &= expect(!hasRegisterStore(*deadKilledVectorScratch, "XMM0_Qb"),
+               "dead killed-by-call vector scratch store was not removed");
+  ok &= expect(hasRegisterStore(*liveKilledVectorScratch, "XMM0_Qb"),
+               "live killed-by-call vector scratch store was removed");
+  ok &= expect(hasRegisterLoad(*liveKilledVectorScratch, "XMM0_Qb"),
+               "live killed-by-call vector scratch load was removed");
+  if (llvm::verifyModule(killedVectorScratchModule, &llvm::errs())) {
+    std::cerr << "killed vector scratch module verification failed after "
+                 "prototype rewrite\n";
     return EXIT_FAILURE;
   }
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;

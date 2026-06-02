@@ -18,6 +18,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -1193,6 +1194,104 @@ void rewriteMultiInputDirectCallsites(
     newCall->setCallingConv(callsite.Call->getCallingConv());
     eraseCallsiteInputStores(callsite.InputStores);
     callsite.Call->eraseFromParent();
+  }
+}
+
+bool registerNameMatchesEffect(llvm::StringRef accessName,
+                               llvm::StringRef effectName) {
+  std::string lanePrefix = (effectName + "_").str();
+  return accessName == effectName || accessName.starts_with(lanePrefix);
+}
+
+bool accessMatchesEffectRegister(const llvm::MDNode &access,
+                                 llvm::StringRef effectName) {
+  if (std::optional<std::string> name = metadataField(access, "name")) {
+    if (registerNameMatchesEffect(*name, effectName)) {
+      return true;
+    }
+  }
+  if (std::optional<std::string> base = metadataField(access, "base")) {
+    if (registerNameMatchesEffect(*base, effectName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool functionHasRegisterAccessLoad(llvm::Function &function,
+                                   llvm::StringRef effectName) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (load == nullptr) {
+        continue;
+      }
+      llvm::MDNode *access = load->getMetadata("notdec.register.access");
+      if (access != nullptr && accessMatchesEffectRegister(*access, effectName)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::set<std::string> killedByCallRegisterNames(const NativeAbiSpec &abi) {
+  std::set<std::string> names;
+  for (const NativeAbiEffect &effect : abi.Effects) {
+    if (effect.Kind != NativeAbiEffectKind::KilledByCall ||
+        effect.Storage.Kind != NativeAbiStorageKind::Register ||
+        effect.Storage.Name.empty()) {
+      continue;
+    }
+    names.insert(effect.Storage.Name);
+  }
+  return names;
+}
+
+void eraseDeadKilledByCallRegisterStores(llvm::Module &module,
+                                         const NativeAbiSpec &abi) {
+  std::set<std::string> killedRegisters = killedByCallRegisterNames(abi);
+  if (killedRegisters.empty()) {
+    return;
+  }
+
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+
+    std::vector<llvm::StoreInst *> deadStores;
+    for (const std::string &registerName : killedRegisters) {
+      if (functionHasRegisterAccessLoad(function, registerName)) {
+        continue;
+      }
+      for (llvm::BasicBlock &block : function) {
+        for (llvm::Instruction &instruction : block) {
+          auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+          if (store == nullptr) {
+            continue;
+          }
+          llvm::MDNode *access = store->getMetadata("notdec.register.access");
+          if (access != nullptr &&
+              accessMatchesEffectRegister(*access, registerName)) {
+            deadStores.push_back(store);
+          }
+        }
+      }
+    }
+
+    std::set<llvm::StoreInst *> uniqueStores(deadStores.begin(),
+                                            deadStores.end());
+    for (llvm::StoreInst *store : uniqueStores) {
+      llvm::Value *storedValue = store->getValueOperand();
+      store->eraseFromParent();
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
+    }
   }
 }
 
@@ -2494,6 +2593,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     NativePrototypeModuleRewriteSummary rewriteSummary =
         rewriteNativeRecoveredPrototypes(module);
     rewriteDeclarationCallOutputs(module, model);
+    eraseDeadKilledByCallRegisterStores(module, *abi);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
     summary.SignatureRewriteFunctionsRewritten =
         rewriteSummary.FunctionsRewritten;
