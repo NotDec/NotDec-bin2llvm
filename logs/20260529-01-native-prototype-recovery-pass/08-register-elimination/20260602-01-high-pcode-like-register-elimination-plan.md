@@ -3418,3 +3418,123 @@ git diff --check
 - 大量原本看起来是 `ordinary store` 的 `RBP/RSP/callee-saved`，实际是在 return path 上恢复寄存器和栈状态。
 - 下一步不应盲删这些 store。callee-saved preserve 语义需要由函数 metadata、call effect 和 caller 侧 current-value 查询共同承接。
 - 当前更合理的后续方向是：先做“callee-saved / stack pointer return-path residue”归类和语义判断，再决定是否做 post-rewrite cleanup。
+
+## 阶段 D 小步：按 store 后续路径清理 killed-by-call GPR 死写
+
+背景：
+
+- 现有 `eraseDeadKilledByCallRegisterStores()` 只删同一 block 内紧贴 return 的 killed-by-call register store。
+- 它还有一个过粗条件：如果函数里任何地方有同寄存器 load，就整类 store 都不删。
+- fixed gate 里仍有一些 caller-saved GPR return-path store，store 后没有 call/load，返回 ABI 也不要求保留；这些可以用已有 path liveness 条件清掉。
+
+本轮范围：
+
+- 只处理 ABI `killedbycall` register。
+- 按单条 store 判断后续所有路径是否到 return，且中间没有 call 或同 storage load。
+- 如果 store 对应 recovered return register，不删。
+- 不处理 `RSP/RBP`，不处理 ABI unaffected / callee-saved restore，不处理跨复杂 CFG 的推断。
+
+实现：
+
+- `lib/passes/NativePrototypeRecovery.cpp:1221`
+  - 删除本轮改动后不再使用的 `functionHasRegisterAccessLoad()` 和 `storeIsDeadAtReturn()`。
+- `lib/passes/NativePrototypeRecovery.cpp:1362`
+  - `eraseDeadKilledByCallRegisterStores()` 改成逐条 store 使用 `storeIsDeadOnAllReturnPaths()` 判断。
+  - 增加 `accessMatchesRecoveredReturn()` 保护，避免删除已经恢复成返回值语义的寄存器写。
+- `tests/native_prototype_recovery_test.cpp:187`
+  - 新增 `attachKilledGprScratchTestAbi()`，构造 killed-by-call GPR ABI。
+- `tests/native_prototype_recovery_test.cpp:1729`
+  - 新增 `createKilledGprScratchStoreFunction()`，构造 store 前有 load、store 后有/无 load 两种用例。
+- `tests/native_prototype_recovery_test.cpp:7318`
+  - 增加 GPR killed-by-call cleanup 测试：
+    - store 前有同寄存器 load，但 store 后无 load/call，期望删除；
+    - store 后还有同寄存器 load，期望保留。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-gpr-return-cleanup-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-gpr-return-cleanup-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-gpr-return-cleanup-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-gpr-return-cleanup.tsv
+git diff --check
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 105s | 107s |
+| `memcached:executable` | 57s | 58s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         22
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3190
+gpr       store        access           full     full         no         3332
+gpr       store        access           partial  full         no         4
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         no         1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-vector-rmw-cleanup-gate` 相比：
+
+- `gpr store access full/full`：3381 -> 3332。
+- `gpr store access partial/full`：9 -> 4。
+- 其它大类不变。
+
+剩余 4 个 GPR partial store：
+
+```text
+libuv      uv_ip6_addr           SI
+libuv      uv_read_start         CL
+memcached  notdec_native_6740    BL
+memcached  notdec_native_17ab0   EDI
+```
+
+判断：
+
+- 这一步只删除 store 后不可观察的 killed-by-call GPR 写，没有碰 `RSP/RBP/callee-saved` return-path restore。
+- fixed gate 没有明显性能退化，耗时和上一轮同口径基本持平。
+- 剩余 GPR 大头仍然是 stack/frame/callee-saved 状态。要继续大幅下降，需要先让 preserve/call effect/current-value 语义承接这些保存恢复，而不是简单扩大死写删除条件。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 5 | 清掉 49 个 GPR full store 和 5 个 GPR partial store，范围小但确定。 |
+| 理解成本 | 3 | 复用已有 `storeIsDeadOnAllReturnPaths()`，逻辑比原来更细，但没有新增 CFG 算法。 |
+| 维护成本 | 3 | 依赖 ABI killed-by-call metadata 和 access metadata；条件集中，后续可被统一 liveness 查询替代。 |
+
+有没有更好的方案：
+
+- 更完整方案还是阶段 C 的统一 storage liveness/current-value 查询。
+- 这次先按单条 killed-by-call store 清理，是因为它能减少明确不可观察的 caller-saved residue，同时避开 callee-saved 和 stack pointer 语义风险。

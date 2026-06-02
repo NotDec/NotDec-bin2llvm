@@ -184,6 +184,20 @@ void attachKilledVectorScratchTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachKilledGprScratchTestAbi(llvm::Module &module,
+                                   const std::string &registerName) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = registerName;
+  abi.Effects.push_back(std::move(killed));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 void attachVectorXmm1ReturnTestAbi(llvm::Module &module) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__stdcall";
@@ -1707,6 +1721,37 @@ llvm::Function *createKilledVectorScratchStoreFunction(
   }
   if (calleeAfterStore != nullptr) {
     builder.CreateCall(calleeAfterStore->getFunctionType(), calleeAfterStore);
+  }
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createKilledGprScratchStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName, bool loadBeforeStore,
+    bool loadAfterStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *access = registerAccessMetadata(context, registerName);
+
+  llvm::Value *value =
+      llvm::ConstantInt::get(global->getValueType(), 0x12345678);
+  if (loadBeforeStore) {
+    llvm::LoadInst *load = builder.CreateLoad(global->getValueType(), global);
+    load->setMetadata("notdec.register.access", access);
+    value = builder.CreateAdd(load, value);
+  }
+  llvm::StoreInst *store = builder.CreateStore(value, global);
+  store->setMetadata("notdec.register.access", access);
+  if (loadAfterStore) {
+    llvm::LoadInst *load = builder.CreateLoad(global->getValueType(), global);
+    load->setMetadata("notdec.register.access", access);
+    (void)builder.CreateAdd(load, value);
   }
   builder.CreateRetVoid();
   return function;
@@ -7266,6 +7311,33 @@ int main() {
                "dead non-return vector scratch store was not removed");
   if (llvm::verifyModule(killedVectorScratchModule, &llvm::errs())) {
     std::cerr << "killed vector scratch module verification failed after "
+                 "prototype rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module killedGprScratchModule(
+      "native-prototype-killed-gpr-scratch-test", context);
+  llvm::GlobalVariable *killedGprRdi =
+      createRegisterGlobal(killedGprScratchModule, "RDI");
+  attachKilledGprScratchTestAbi(killedGprScratchModule, "RDI");
+  llvm::Function *deadKilledGprScratch =
+      createKilledGprScratchStoreFunction(killedGprScratchModule,
+                                          "dead_killed_gpr_scratch",
+                                          killedGprRdi, "RDI", true, false);
+  llvm::Function *liveKilledGprScratch =
+      createKilledGprScratchStoreFunction(killedGprScratchModule,
+                                          "loaded_after_gpr_scratch",
+                                          killedGprRdi, "RDI", false, true);
+  notdec::bin2llvm::runNativePrototypeRecovery(killedGprScratchModule,
+                                               rewriteOptions);
+  ok &= expect(!hasRegisterStore(*deadKilledGprScratch, "RDI"),
+               "dead killed-by-call GPR scratch store was not removed");
+  ok &= expect(hasRegisterStore(*liveKilledGprScratch, "RDI"),
+               "GPR scratch store with later load was removed");
+  ok &= expect(hasRegisterLoad(*liveKilledGprScratch, "RDI"),
+               "later GPR scratch load was removed");
+  if (llvm::verifyModule(killedGprScratchModule, &llvm::errs())) {
+    std::cerr << "killed GPR scratch module verification failed after "
                  "prototype rewrite\n";
     return EXIT_FAILURE;
   }

@@ -1218,36 +1218,6 @@ bool accessMatchesEffectRegister(const llvm::MDNode &access,
   return false;
 }
 
-bool functionHasRegisterAccessLoad(llvm::Function &function,
-                                   llvm::StringRef effectName) {
-  for (llvm::BasicBlock &block : function) {
-    for (llvm::Instruction &instruction : block) {
-      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
-      if (load == nullptr) {
-        continue;
-      }
-      llvm::MDNode *access = load->getMetadata("notdec.register.access");
-      if (access != nullptr && accessMatchesEffectRegister(*access, effectName)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-bool storeIsDeadAtReturn(llvm::StoreInst &store) {
-  for (llvm::Instruction *instruction = store.getNextNode();
-       instruction != nullptr; instruction = instruction->getNextNode()) {
-    if (llvm::isa<llvm::ReturnInst>(instruction)) {
-      return true;
-    }
-    if (llvm::isa<llvm::CallBase>(instruction)) {
-      return false;
-    }
-  }
-  return false;
-}
-
 bool isVectorRegisterName(llvm::StringRef name) {
   return name.starts_with("XMM") || name.starts_with("YMM") ||
          name.starts_with("ZMM");
@@ -1408,9 +1378,8 @@ void eraseDeadKilledByCallRegisterStores(llvm::Module &module,
 
     std::vector<llvm::StoreInst *> deadStores;
     for (const std::string &registerName : killedRegisters) {
-      if (functionHasRegisterAccessLoad(function, registerName)) {
-        continue;
-      }
+      std::optional<NativeRecoveredPrototype> prototype =
+          readNativeRecoveredPrototypeMetadata(function);
       for (llvm::BasicBlock &block : function) {
         for (llvm::Instruction &instruction : block) {
           auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
@@ -1420,7 +1389,8 @@ void eraseDeadKilledByCallRegisterStores(llvm::Module &module,
           llvm::MDNode *access = store->getMetadata("notdec.register.access");
           if (access != nullptr &&
               accessMatchesEffectRegister(*access, registerName) &&
-              storeIsDeadAtReturn(*store)) {
+              (!prototype || !accessMatchesRecoveredReturn(*access, *prototype)) &&
+              storeIsDeadOnAllReturnPaths(*store, *access)) {
             deadStores.push_back(store);
           }
         }
