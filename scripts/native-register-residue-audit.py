@@ -277,6 +277,20 @@ def reaches_return_in_block_without_call(lines: list[str], index: int) -> bool:
     return False
 
 
+def reaches_call_in_block(lines: list[str], index: int) -> bool:
+    for cursor in range(index + 1, len(lines)):
+        stripped = lines[cursor].strip()
+        if stripped == "" or stripped.startswith(";"):
+            continue
+        if is_block_boundary(stripped):
+            return False
+        if is_call_instruction(stripped):
+            return True
+        if is_ret_instruction(stripped):
+            return False
+    return False
+
+
 def storage_role(name: str) -> str:
     upper = name.upper()
     if upper in {"RSP", "ESP", "SP"}:
@@ -302,10 +316,12 @@ def local_context(
         return "entry_external_input"
     previous = previous_instruction(lines, index)
     following = next_instruction(lines, index)
-    if is_call_instruction(previous):
-        return "after_call"
     if is_call_instruction(following):
         return "before_call"
+    if reaches_call_in_block(lines, index):
+        return "before_call_path"
+    if is_call_instruction(previous):
+        return "after_call"
     if is_ret_instruction(following):
         return "before_ret"
     if reaches_return_in_block_without_call(lines, index):
@@ -363,7 +379,10 @@ def residue_reason_for_access(
         if "preserves" in function_effects.split(","):
             return "after_call_preserved"
         return "after_call_unknown_effect"
-    if access_kind == "store" and local_context == "before_call":
+    if access_kind == "store" and local_context in {
+        "before_call",
+        "before_call_path",
+    }:
         return "callsite_input_store"
     if access_kind == "load" and local_context == "before_ret":
         return "return_value_load"

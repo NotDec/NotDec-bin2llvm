@@ -4317,3 +4317,72 @@ python3 scripts/native-register-residue-audit.py \
 | 实现效果 | 1 | 不减少真实 residue，只让统计更准。 |
 | 理解成本 | 1 | 补齐 x86-64 常见 GPR 低 8 位别名。 |
 | 维护成本 | 1 | 如果后续发现更多别名，继续补测试和集合即可。 |
+
+## 2026-06-02 实现记录：residue 审计识别同块 callsite 参数准备
+
+背景：
+
+- 继续看 GPR store residue 时，发现很多 `after_call` 实际是“一个 call 之后，马上准备下一个 call 的寄存器参数”。
+- 旧审计只看相邻上一条/下一条有效指令。真实 IR 里参数 store 和 call 之间通常还有 RSP 调整、返回地址 store，所以这些 callsite input store 被误归到 `after_call` 或 `ordinary`。
+- 这会误导后续 cleanup 方向。下一步要清理 prototype 后 callsite input store，必须先把这类残留统计出来。
+
+改动：
+
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:279)
+  - 新增 `reaches_call_in_block`，判断当前 access 后面同一 basic block 是否会遇到 call。
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:316)
+  - `local_context` 增加 `before_call_path`。
+  - `before_call` / `before_call_path` 都优先于 `after_call`，避免连续 call 之间的参数准备被误标。
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:380)
+  - `residue_reason_for_access` 把 `before_call_path` 的 store 也归为 `callsite_input_store`。
+- [native_register_residue_audit_test.py](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_residue_audit_test.py:120)
+  - 新增连续 call 样例，确认 call 后、下一条就是 call 前参数 store 时，归到 `callsite_input_store`。
+- [native_register_residue_audit_test.py](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_residue_audit_test.py:147)
+  - 新增参数 store 和 call 中间隔着 RSP store 的样例，确认归到 `before_call_path` / `callsite_input_store`。
+
+验证：
+
+```bash
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R native_register_residue --output-on-failure
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-wide-partial-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- 手动 Python 测试通过。
+- `notdec.native_register_residue_audit.unit` 通过。
+- 复用上一轮 gate 产物后，GPR store residue 的原因分布变成：
+
+```text
+after_call                 14
+before_ret                 96
+callee_saved_gpr           63
+callee_saved_return_path  579
+callsite_input_store      202
+frame_pointer             742
+ordinary                  246
+partial_access              5
+return_path               234
+stack_pointer            1132
+```
+
+对比旧分类：
+
+- `after_call`：28 -> 14。
+- `ordinary`：434 -> 246。
+- 新增明确的 `callsite_input_store`：202。
+
+判断：
+
+- 这一步仍是审计改动，不改变 IR，也不影响性能。
+- 但它让下一步更清楚：prototype 后 register cleanup 的主要候选不是泛泛的 ordinary store，而是这些 callsite input store。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 不减少 residue，但把 202 个 callsite input store 从噪声里分出来。 |
+| 理解成本 | 1 | 同块向后看 call，规则直接。 |
+| 维护成本 | 2 | 只看同一 basic block，保守；跨 block callsite setup 以后需要更强 CFG 查询。 |

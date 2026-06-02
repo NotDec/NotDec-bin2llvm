@@ -113,6 +113,68 @@ entry:
     assert accesses[0].residue_reason == "callee_saved_return_path"
 
 
+def test_callsite_input_store_wins_over_after_call_context() -> None:
+    module = load_audit_module()
+    ir = """
+@RDI = external global i64, !notdec.register !0
+
+define void @sample_consecutive_calls() {
+entry:
+  call void @first()
+  store i64 1, ptr @RDI, align 8, !notdec.register.access !1
+  call void @second()
+  ret void
+}
+
+declare void @first()
+declare void @second()
+
+!0 = !{!"space=register", !"offset=56", !"size=8", !"name=RDI"}
+!1 = !{!"base=RDI", !"space=register", !"offset=56", !"size=8", !"name=RDI"}
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "sample.ll"
+        path.write_text(ir, encoding="utf-8")
+        accesses = module.parse_accesses(path)
+
+    assert len(accesses) == 1
+    assert accesses[0].local_context == "before_call"
+    assert accesses[0].residue_reason == "callsite_input_store"
+
+
+def test_callsite_input_store_can_have_stack_adjustment_before_call() -> None:
+    module = load_audit_module()
+    ir = """
+@RDI = external global i64, !notdec.register !0
+@RSP = external global i64, !notdec.register !2
+
+define void @sample_callsite_setup() {
+entry:
+  store i64 1, ptr @RDI, align 8, !notdec.register.access !1
+  store i64 1024, ptr @RSP, align 8, !notdec.register.access !3
+  call void @callee()
+  ret void
+}
+
+declare void @callee()
+
+!0 = !{!"space=register", !"offset=56", !"size=8", !"name=RDI"}
+!1 = !{!"base=RDI", !"space=register", !"offset=56", !"size=8", !"name=RDI"}
+!2 = !{!"space=register", !"offset=32", !"size=8", !"name=RSP"}
+!3 = !{!"base=RSP", !"space=register", !"offset=32", !"size=8", !"name=RSP"}
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "sample.ll"
+        path.write_text(ir, encoding="utf-8")
+        accesses = module.parse_accesses(path)
+
+    assert accesses[0].name == "RDI"
+    assert accesses[0].local_context == "before_call_path"
+    assert accesses[0].residue_reason == "callsite_input_store"
+
+
 if __name__ == "__main__":
     test_register_access_summary_classifies_full_and_partial()
     test_register_access_details_include_residue_reason()
+    test_callsite_input_store_wins_over_after_call_context()
+    test_callsite_input_store_can_have_stack_adjustment_before_call()
