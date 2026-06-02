@@ -1650,6 +1650,30 @@ llvm::Function *createDeclarationCallOutputReturnFunction(
   return function;
 }
 
+llvm::Function *createDeclarationCallOutputCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, const std::string &registerName,
+    llvm::LoadInst **outputLoad) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  llvm::LoadInst *load = builder.CreateLoad(output->getValueType(), output,
+                                            registerName + ".call_output");
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  llvm::StoreInst *store = builder.CreateStore(load, output);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, registerName));
+  builder.CreateRetVoid();
+  *outputLoad = load;
+  return function;
+}
+
 llvm::Function *createTwoInputReturnFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *first,
     const std::string &firstRegisterName, llvm::GlobalVariable *second,
@@ -2167,6 +2191,28 @@ bool hasRegisterStore(const llvm::Function &function, llvm::StringRef name) {
   for (const llvm::BasicBlock &block : function) {
     for (const llvm::Instruction &instruction : block) {
       if (!llvm::isa<llvm::StoreInst>(&instruction)) {
+        continue;
+      }
+      llvm::MDNode *metadata = instruction.getMetadata("notdec.register.access");
+      if (metadata == nullptr) {
+        continue;
+      }
+      for (const llvm::MDOperand &operand : metadata->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (field != nullptr && field->getString() == expected) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool hasRegisterLoad(const llvm::Function &function, llvm::StringRef name) {
+  std::string expected = ("name=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &instruction : block) {
+      if (!llvm::isa<llvm::LoadInst>(&instruction)) {
         continue;
       }
       llvm::MDNode *metadata = instruction.getMetadata("notdec.register.access");
@@ -4746,6 +4792,107 @@ int main() {
   if (llvm::verifyModule(declarationCallOutputReturnModule, &llvm::errs())) {
     std::cerr << "declaration call output return module verification failed "
                  "after rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallOutputRewriteModule(
+      "native-prototype-declaration-call-output-rewrite-test", context);
+  llvm::GlobalVariable *declarationCallOutputRewriteRax =
+      createRegisterGlobal(declarationCallOutputRewriteModule, "RAX");
+  attachTestAbi(declarationCallOutputRewriteModule);
+  auto *declarationCallOutputRewriteCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallOutputRewriteCallee =
+      llvm::Function::Create(declarationCallOutputRewriteCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_output_rewrite_callee",
+                             declarationCallOutputRewriteModule);
+  llvm::LoadInst *declarationCallOutputRewriteLoad = nullptr;
+  createDeclarationCallOutputCallerFunction(
+      declarationCallOutputRewriteModule,
+      "declaration_call_output_rewrite_user",
+      declarationCallOutputRewriteCallee, declarationCallOutputRewriteRax,
+      "RAX", &declarationCallOutputRewriteLoad);
+  notdec::bin2llvm::NativePrototypeRecoveryOptions declarationRewriteOptions;
+  declarationRewriteOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallOutputRewriteModule, declarationRewriteOptions);
+  llvm::Function *rewrittenDeclarationCallee =
+      declarationCallOutputRewriteModule.getFunction(
+          "declaration_call_output_rewrite_callee");
+  ok &= expect(rewrittenDeclarationCallee != nullptr &&
+                   functionTypeShape(*rewrittenDeclarationCallee
+                                          ->getFunctionType(),
+                                      llvm::Type::getInt64Ty(context),
+                                      llvm::ArrayRef<llvm::Type *>{}),
+               "declaration call output callee was not rewritten to i64()");
+  llvm::Function *declarationCallOutputRewriteUser =
+      declarationCallOutputRewriteModule.getFunction(
+          "declaration_call_output_rewrite_user");
+  ok &= expect(declarationCallOutputRewriteUser != nullptr &&
+                   !hasRegisterLoad(*declarationCallOutputRewriteUser, "RAX"),
+               "declaration call output load was not replaced with call result");
+  if (llvm::verifyModule(declarationCallOutputRewriteModule, &llvm::errs())) {
+    std::cerr << "declaration call output rewrite module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallOutputBlockedModule(
+      "native-prototype-declaration-call-output-blocked-test", context);
+  llvm::GlobalVariable *declarationCallOutputBlockedRax =
+      createRegisterGlobal(declarationCallOutputBlockedModule, "RAX");
+  attachTestAbi(declarationCallOutputBlockedModule);
+  auto *declarationCallOutputBlockedCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallOutputBlockedCallee =
+      llvm::Function::Create(declarationCallOutputBlockedCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_output_blocked_callee",
+                             declarationCallOutputBlockedModule);
+  auto *declarationCallOutputBlockedUserType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallOutputBlockedUser = llvm::Function::Create(
+      declarationCallOutputBlockedUserType, llvm::GlobalValue::ExternalLinkage,
+      "declaration_call_output_blocked_user",
+      declarationCallOutputBlockedModule);
+  llvm::BasicBlock *declarationCallOutputBlockedEntry =
+      llvm::BasicBlock::Create(context, "entry",
+                               declarationCallOutputBlockedUser);
+  {
+    llvm::IRBuilder<> builder(declarationCallOutputBlockedEntry);
+    builder.CreateCall(declarationCallOutputBlockedCallee->getFunctionType(),
+                       declarationCallOutputBlockedCallee);
+    llvm::StoreInst *blockedStore = builder.CreateStore(
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 42),
+        declarationCallOutputBlockedRax);
+    blockedStore->setMetadata("notdec.register.access",
+                              registerAccessMetadata(context, "RAX"));
+    llvm::LoadInst *blockedLoad = builder.CreateLoad(
+        declarationCallOutputBlockedRax->getValueType(),
+        declarationCallOutputBlockedRax, "EAX.after_rax_store");
+    blockedLoad->setMetadata("notdec.register.access",
+                             registerAccessMetadata(context, "RAX", 0, 4,
+                                                    "EAX"));
+    builder.CreateStore(blockedLoad, declarationCallOutputBlockedRax)
+        ->setMetadata("notdec.register.access",
+                      registerAccessMetadata(context, "RAX"));
+    builder.CreateRetVoid();
+  }
+  notdec::bin2llvm::NativePrototypeRecoveryOptions blockedRewriteOptions;
+  blockedRewriteOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallOutputBlockedModule, blockedRewriteOptions);
+  llvm::Function *blockedCalleeAfterRewrite =
+      declarationCallOutputBlockedModule.getFunction(
+          "declaration_call_output_blocked_callee");
+  ok &= expect(blockedCalleeAfterRewrite != nullptr &&
+                   blockedCalleeAfterRewrite->getReturnType()->isVoidTy(),
+               "declaration call output rewrite crossed a same-base store");
+  ok &= expect(declarationCallOutputBlockedUser != nullptr &&
+                   hasRegisterLoad(*declarationCallOutputBlockedUser, "EAX"),
+               "same-base store did not block declaration call output load rewrite");
+  if (llvm::verifyModule(declarationCallOutputBlockedModule, &llvm::errs())) {
+    std::cerr << "declaration call output blocked module verification failed\n";
     return EXIT_FAILURE;
   }
 

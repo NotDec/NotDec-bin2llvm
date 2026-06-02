@@ -5,6 +5,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -26,6 +27,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace notdec::bin2llvm {
@@ -338,9 +340,17 @@ std::optional<std::string> registerAccessName(llvm::Instruction &instruction) {
   return metadataField(*metadata, "name");
 }
 
+std::optional<std::string> registerAccessBase(llvm::Instruction &instruction) {
+  llvm::MDNode *metadata = instruction.getMetadata("notdec.register.access");
+  if (metadata == nullptr) {
+    return std::nullopt;
+  }
+  return metadataField(*metadata, "base");
+}
+
 bool isDeclarationCallOutputLoad(llvm::LoadInst &load) {
-  std::optional<std::string> registerName = registerAccessName(load);
-  if (!registerName) {
+  std::optional<std::string> registerBase = registerAccessBase(load);
+  if (!registerBase) {
     return false;
   }
 
@@ -348,7 +358,7 @@ bool isDeclarationCallOutputLoad(llvm::LoadInst &load) {
             end = load.getParent()->rend();
        iter != end; ++iter) {
     if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter)) {
-      if (registerAccessName(*store) == registerName) {
+      if (registerAccessBase(*store) == registerBase) {
         return false;
       }
       continue;
@@ -362,6 +372,147 @@ bool isDeclarationCallOutputLoad(llvm::LoadInst &load) {
            callee->isDeclaration();
   }
   return false;
+}
+
+llvm::CallInst *declarationCallOutputSource(llvm::LoadInst &load) {
+  std::optional<std::string> registerBase = registerAccessBase(load);
+  if (!registerBase) {
+    return nullptr;
+  }
+
+  for (auto iter = llvm::BasicBlock::reverse_iterator(load.getIterator()),
+            end = load.getParent()->rend();
+       iter != end; ++iter) {
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter)) {
+      if (registerAccessBase(*store) == registerBase) {
+        return nullptr;
+      }
+      continue;
+    }
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&*iter);
+    if (call == nullptr) {
+      continue;
+    }
+    llvm::Function *callee = call->getCalledFunction();
+    if (callee != nullptr && !callee->isIntrinsic() &&
+        callee->isDeclaration()) {
+      return call;
+    }
+    return nullptr;
+  }
+  return nullptr;
+}
+
+bool canRewriteDeclarationCallOutputLoad(llvm::LoadInst &load,
+                                         const NativePrototypeModel &model) {
+  if (load.getType() != llvm::Type::getInt64Ty(load.getContext())) {
+    return false;
+  }
+  std::optional<std::string> base = registerAccessBase(load);
+  if (!base || !model.findOutputRegister(*base)) {
+    return false;
+  }
+  return declarationCallOutputSource(load) != nullptr;
+}
+
+// A declaration rewrite is only safe when the exact call and its output load
+// stay in the same basic block with no same-base register store between them.
+struct DeclarationCallOutputRewrite {
+  llvm::CallInst *Call = nullptr;
+  llvm::LoadInst *Load = nullptr;
+};
+
+using DeclarationCallOutputRewrites =
+    std::map<llvm::Function *, std::vector<DeclarationCallOutputRewrite>>;
+
+DeclarationCallOutputRewrites collectDeclarationCallOutputRewrites(
+    llvm::Module &module, const NativePrototypeModel &model) {
+  DeclarationCallOutputRewrites rewrites;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+        if (load == nullptr ||
+            !canRewriteDeclarationCallOutputLoad(*load, model)) {
+          continue;
+        }
+        llvm::CallInst *call = declarationCallOutputSource(*load);
+        if (call == nullptr || call->arg_size() != 0 ||
+            !call->getType()->isVoidTy()) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr || !callee->isDeclaration() ||
+            callee->getFunctionType()->getReturnType() !=
+                llvm::Type::getVoidTy(module.getContext()) ||
+            callee->getFunctionType()->getNumParams() != 0) {
+          continue;
+        }
+        rewrites[callee].push_back({call, load});
+      }
+    }
+  }
+
+  for (auto iter = rewrites.begin(); iter != rewrites.end();) {
+    bool safe = true;
+    for (llvm::User *user : iter->first->users()) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+      if (call == nullptr || call->getCalledFunction() != iter->first ||
+          call->arg_size() != 0 || !call->getType()->isVoidTy()) {
+        safe = false;
+        break;
+      }
+    }
+    if (!safe) {
+      iter = rewrites.erase(iter);
+    } else {
+      ++iter;
+    }
+  }
+  return rewrites;
+}
+
+void rewriteDeclarationCallOutputs(llvm::Module &module,
+                                   const NativePrototypeModel &model) {
+  DeclarationCallOutputRewrites rewrites =
+      collectDeclarationCallOutputRewrites(module, model);
+  for (auto &[callee, callRewrites] : rewrites) {
+    std::string originalName = callee->getName().str();
+    callee->setName(originalName + ".old");
+    auto *newType = llvm::FunctionType::get(
+        llvm::Type::getInt64Ty(module.getContext()), {}, false);
+    llvm::Function *rewritten =
+        llvm::Function::Create(newType, callee->getLinkage(), originalName,
+                               module);
+    rewritten->copyMetadata(callee, 0);
+    rewritten->setCallingConv(callee->getCallingConv());
+
+    for (llvm::User *user : llvm::make_early_inc_range(callee->users())) {
+      auto *oldCall = llvm::dyn_cast<llvm::CallInst>(user);
+      if (oldCall == nullptr || oldCall->getCalledFunction() != callee ||
+          oldCall->arg_size() != 0 || !oldCall->getType()->isVoidTy()) {
+        continue;
+      }
+      llvm::IRBuilder<> builder(oldCall);
+      llvm::CallInst *newCall =
+          builder.CreateCall(rewritten->getFunctionType(), rewritten, {});
+      newCall->setCallingConv(oldCall->getCallingConv());
+      for (const DeclarationCallOutputRewrite &rewrite : callRewrites) {
+        if (rewrite.Call != oldCall) {
+          continue;
+        }
+        rewrite.Load->replaceAllUsesWith(newCall);
+        if (rewrite.Load->use_empty()) {
+          rewrite.Load->eraseFromParent();
+        }
+      }
+      oldCall->eraseFromParent();
+    }
+    callee->eraseFromParent();
+  }
 }
 
 bool hasUnsafeReturnValueLoad(
@@ -2104,6 +2255,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
   if (options.RewriteSignatures) {
     NativePrototypeModuleRewriteSummary rewriteSummary =
         rewriteNativeRecoveredPrototypes(module);
+    rewriteDeclarationCallOutputs(module, model);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
     summary.SignatureRewriteFunctionsRewritten =
         rewriteSummary.FunctionsRewritten;

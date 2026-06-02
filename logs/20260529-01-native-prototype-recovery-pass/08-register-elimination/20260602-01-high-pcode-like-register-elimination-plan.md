@@ -1794,3 +1794,140 @@ vector    store        access         partial  full         71
 
 - 更完整的方案是独立 call effect resolver，统一处理 ABI、direct callee metadata、recovered prototype 和 stack pointer。
 - 本轮先把 ABI stack pointer 从普通 killed-by-call 里拿出来，是一个小而可验证的步骤。
+
+## 阶段 C/D 小步：声明调用输出改成 LLVM 返回值
+
+背景：
+
+- 上一轮后固定三目标里剩余 `RAX` access load 主要来自声明调用后的 ABI 返回寄存器读取。
+- 典型形状是 `call void @strlen()` 后紧跟 `load i64, ptr @RAX, !notdec.register.access`。
+- 这类声明没有真实函数体，native prototype recovery 也不能从 callee 内部恢复返回值；但 ABI 已经说明 `RAX` 是输出寄存器。
+
+本轮只做窄规则：
+
+- 只处理 `declare void @foo()`，且所有 user 都是零参数 `call void @foo()`。
+- 只处理同一个 basic block 内，声明调用之后、目标寄存器读取之前没有同 `base` register store 的 load。
+- 只把 `i64` ABI output register load 改成调用结果。
+- 把声明从 `declare void @foo()` 重建成 `declare i64 @foo()`，并把匹配 callsite 改成 `call i64 @foo()`。
+- 不处理带参数声明、不处理非 `i64` 返回、不跨 block 推断、不处理间接调用。
+
+改动文件和函数：
+
+- `lib/passes/NativePrototypeRecovery.cpp:343`
+  - 新增 `registerAccessBase()`，按 metadata `base` 判断同一个物理寄存器，避免 `RAX/EAX` 这种 name 不同但 base 相同的场景误穿过 store。
+- `lib/passes/NativePrototypeRecovery.cpp:351`
+  - `isDeclarationCallOutputLoad()` 改成用 `base` 检查 store 屏障。
+- `lib/passes/NativePrototypeRecovery.cpp:377`
+  - 新增 `declarationCallOutputSource()`，找到同 block 内能作为输出来源的声明调用。
+- `lib/passes/NativePrototypeRecovery.cpp:406`
+  - 新增 `canRewriteDeclarationCallOutputLoad()`，限制 load 类型必须是 `i64` 且 base 必须是 ABI output register。
+- `lib/passes/NativePrototypeRecovery.cpp:420`
+  - 新增 `DeclarationCallOutputRewrite`，记录一条安全的 call/load 替换关系。
+- `lib/passes/NativePrototypeRecovery.cpp:428`
+  - 新增 `collectDeclarationCallOutputRewrites()`，按 declaration callee 收集可重写的 call output load，并过滤有复杂 user 的 declaration。
+- `lib/passes/NativePrototypeRecovery.cpp:478`
+  - 新增 `rewriteDeclarationCallOutputs()`，重建 declaration、替换 call、用 call result 替换 register load。
+- `lib/passes/NativePrototypeRecovery.cpp:2256`
+  - 在 signature rewrite 后调用 `rewriteDeclarationCallOutputs()`。
+- `tests/native_prototype_recovery_test.cpp:1653`
+  - 新增 `createDeclarationCallOutputCallerFunction()` 测试构造函数。
+- `tests/native_prototype_recovery_test.cpp:2211`
+  - 新增 `hasRegisterLoad()`，用于确认 register access load 是否还存在。
+- `tests/native_prototype_recovery_test.cpp:4798`
+  - 新增正向测试：`declare void` 调用后的 `RAX` load 被 `call i64` 结果替换。
+- `tests/native_prototype_recovery_test.cpp:4840`
+  - 新增负向测试：`RAX` store 后再读 `EAX` 时不能跨同 base store 重写。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-decl-call-output-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-decl-call-output-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-decl-call-output-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-decl-call-output.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 40s |
+| `libuv:shared-library` | 106s | 105s |
+| `memcached:executable` | 57s | 57s |
+
+残留统计变化：
+
+```text
+category  access_kind  metadata_kind  shape    value_shape  before  after
+gpr       load         access         full     full         19      13
+gpr       load         access         partial  full         9       3
+```
+
+完整本轮残留：
+
+```text
+category  access_kind  metadata_kind  shape    value_shape  count
+gpr       load         access         full     full         13
+gpr       load         access         partial  full         3
+gpr       load         external_input full     full         3190
+gpr       store        access         full     full         3601
+gpr       store        access         partial  full         11
+other     load         access         full     full         8
+other     load         external_input full     full         49
+other     store        access         partial  full         1
+vector    load         external_input full     full         70
+vector    store        access         partial  full         71
+```
+
+剩余 GPR access load 按 `base/name`：
+
+```text
+5 RBP/RBP
+2 RSP/RSP
+2 RBX/RBX
+2 RBX/EBX
+1 RDI/RDI
+1 RCX/RCX
+1 RAX/EAX
+1 R9/R9
+1 R8/R8
+```
+
+抽查：
+
+- 原先多处 `strlen`、`socket`、`bind`、`calloc`、`SSL_read`、`SSL_write` 等声明调用后的 `RAX` 读取被改成直接使用 `call i64` 结果。
+- 剩余 `RAX/EAX` 是 partial/full 形态，且前面存在同 base store，不在本轮安全范围内。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 固定三目标 GPR access load 从 28 降到 16，主要解决声明调用返回值噪声。 |
+| 理解成本 | 3 | 增加一段 declaration 专用 rewrite，但限制很窄，入口集中在 signature rewrite 后。 |
+| 维护成本 | 3 | 后续如果有统一 call effect resolver，应把 declaration output 也迁进去。 |
+
+有没有更好的方案：
+
+- 更完整方案是把外部函数原型恢复接到 ABI 和符号信息上，直接生成正确 declaration 类型。
+- 本轮只根据现有 ABI output register 和局部 IR 形状做保守替换，不猜参数和非 `i64` 返回。
