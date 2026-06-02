@@ -29,6 +29,20 @@ llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context,
   return llvm::MDNode::get(context, fields);
 }
 
+llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context,
+                                     const std::string &base,
+                                     const std::string &name,
+                                     uint32_t offset, uint32_t size) {
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "base=" + base),
+      llvm::MDString::get(context, "space=register"),
+      llvm::MDString::get(context, "offset=" + std::to_string(offset)),
+      llvm::MDString::get(context, "size=" + std::to_string(size)),
+      llvm::MDString::get(context, "name=" + name),
+  };
+  return llvm::MDNode::get(context, fields);
+}
+
 llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
                                            const std::string &name) {
   llvm::LLVMContext &context = module.getContext();
@@ -288,6 +302,47 @@ llvm::Function *createCallBetweenStoresFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createPartialStoreCoveredByFullStoreFunction(
+    llvm::Module &module, llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "partial_store_covered_by_full_store", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *alMetadata = registerAccessMetadata(context, "RAX", "AL", 0, 1);
+  llvm::MDNode *raxMetadata = registerAccessMetadata(context, "RAX");
+  llvm::StoreInst *partial = builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 5), rax);
+  partial->setMetadata("notdec.register.access", alMetadata);
+  llvm::StoreInst *full = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 6), rax);
+  full->setMetadata("notdec.register.access", raxMetadata);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createPartialStoresOnlyFunction(llvm::Module &module,
+                                                llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "partial_register_stores_only", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *alMetadata = registerAccessMetadata(context, "RAX", "AL", 0, 1);
+  llvm::StoreInst *first = builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 7), rax);
+  first->setMetadata("notdec.register.access", alMetadata);
+  llvm::StoreInst *second = builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 8), rax);
+  second->setMetadata("notdec.register.access", alMetadata);
+  builder.CreateRetVoid();
+  return function;
+}
+
 unsigned countRegisterLoads(const llvm::Function &function,
                             const llvm::GlobalVariable *global) {
   unsigned count = 0;
@@ -377,6 +432,9 @@ int main() {
       createOverwrittenStoreFunction(module, rax);
   llvm::Function *callBetweenStores =
       createCallBetweenStoresFunction(module, rax);
+  llvm::Function *partialCovered =
+      createPartialStoreCoveredByFullStoreFunction(module, rax);
+  llvm::Function *partialOnly = createPartialStoresOnlyFunction(module, rax);
 
   notdec::bin2llvm::NativeRegisterSSAOptions options;
   options.EnableRewrite = true;
@@ -406,7 +464,7 @@ int main() {
                "written killed-by-call RAX was not marked clobbered");
   ok &= expect(summary.PreservedRegisters == 1,
                "register effect summary had unexpected preserved count");
-  ok &= expect(summary.ClobberedRegisters == 5,
+  ok &= expect(summary.ClobberedRegisters == 6,
                "register effect summary had unexpected clobber count");
   ok &= expect(summary.DeadStoresRemoved >= 1,
                "register SSA did not remove the expected overwritten store");
@@ -436,5 +494,9 @@ int main() {
                "overwritten RAX store was not removed");
   ok &= expect(countRegisterStores(*callBetweenStores, rax) == 2,
                "RAX store before call barrier was removed");
+  ok &= expect(countRegisterStores(*partialCovered, rax) == 1,
+               "partial RAX store covered by full store was not removed");
+  ok &= expect(countRegisterStores(*partialOnly, rax) == 2,
+               "partial RAX stores were removed without full overwrite");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

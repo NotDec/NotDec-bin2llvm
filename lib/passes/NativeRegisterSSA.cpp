@@ -37,6 +37,7 @@ struct RegisterUnit {
 // promote". Partial accesses stay in memory form for now.
 struct AccessInfo {
   RegisterUnit *Unit = nullptr;
+  bool IsRegisterAccess = false;
   bool IsFullUnit = false;
 };
 
@@ -173,7 +174,7 @@ AccessInfo registerLoad(llvm::LoadInst &load,
     return {};
   }
   bool fullUnit = load.getType() == global->getValueType();
-  return AccessInfo{&it->second, fullUnit};
+  return AccessInfo{&it->second, true, fullUnit};
 }
 
 AccessInfo registerStore(
@@ -192,7 +193,7 @@ AccessInfo registerStore(
     return {};
   }
   bool fullUnit = store.getValueOperand()->getType() == global->getValueType();
-  return AccessInfo{&it->second, fullUnit};
+  return AccessInfo{&it->second, true, fullUnit};
 }
 
 bool isRegisterClobberCall(const llvm::Instruction &inst) {
@@ -326,20 +327,21 @@ private:
   void removeLocalDeadStores() {
     std::vector<llvm::Instruction *> deadStores;
     for (llvm::BasicBlock &block : Function) {
-      std::map<llvm::GlobalVariable *, llvm::StoreInst *> lastStore;
+      std::map<llvm::GlobalVariable *, std::vector<llvm::StoreInst *>>
+          pendingStores;
       for (llvm::Instruction &inst : block) {
         if (inst.isTerminator()) {
-          lastStore.clear();
+          pendingStores.clear();
           continue;
         }
         if (isRegisterClobberCall(inst)) {
-          lastStore.clear();
+          pendingStores.clear();
           continue;
         }
         if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
           AccessInfo access = registerLoad(*load, Units);
-          if (access.Unit != nullptr && access.IsFullUnit) {
-            lastStore.erase(access.Unit->Global);
+          if (access.Unit != nullptr && access.IsRegisterAccess) {
+            pendingStores.erase(access.Unit->Global);
           }
           continue;
         }
@@ -348,14 +350,16 @@ private:
           continue;
         }
         AccessInfo access = registerStore(*store, Units);
-        if (access.Unit == nullptr || !access.IsFullUnit) {
+        if (access.Unit == nullptr || !access.IsRegisterAccess) {
           continue;
         }
-        auto existing = lastStore.find(access.Unit->Global);
-        if (existing != lastStore.end()) {
-          deadStores.push_back(existing->second);
+        std::vector<llvm::StoreInst *> &stores =
+            pendingStores[access.Unit->Global];
+        if (access.IsFullUnit) {
+          deadStores.insert(deadStores.end(), stores.begin(), stores.end());
+          stores.clear();
         }
-        lastStore[access.Unit->Global] = store;
+        stores.push_back(store);
       }
     }
 

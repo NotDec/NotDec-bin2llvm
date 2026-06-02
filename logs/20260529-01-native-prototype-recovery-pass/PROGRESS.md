@@ -583,6 +583,9 @@
     - 文件：`include/notdec-bin2llvm/passes/NativeRegisterSSA.h`、`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
   - [x] 生产代码改动后跑固定 Bench2 回归 gate，确认 `vsftpd:executable`、`libuv:shared-library`、`memcached:executable` 的 all-confirmed / signature-rewrite 通过 LLVM 22 assemble/verify，skip reason 只剩 `already matches` / `declaration`，并记录残留下降。
     - 输出：`/tmp/notdec-bin2llvm-register-residue-dead-store-gate`
+  - [x] 扩展同 block dead register store cleanup，让后续 full store 能删除同 base 已 pending 的 partial store；固定三目标回归通过，但残留统计相比上一轮无新增下降。
+    - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-partial-covered-gate`
 
 ## 记录规则
 

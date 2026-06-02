@@ -428,3 +428,77 @@ ctest --test-dir build --output-on-failure
 - `libuv` 的 `prototype_return_candidates` / rewritten 数从 157/338 变成 155/337，skip reason gate 仍通过。判断是被删除的 store 本来被后续同 block store 覆盖，旧 return candidate 是更弱的候选；cleanup 让候选更保守。后续如果要确认具体函数，可继续用 residue details 和 prototype summary 定位。
 - 这个 cleanup 不是 flags SSA，也不是 partial access SSA。它只是删除同 block 内确定被覆盖的 full store。
 - 不跨 call、不跨 block、不处理 partial access，避免用局部清理替代真正的 storage SSA。
+
+## 阶段 A 局部清理补充：partial store 被 full store 覆盖
+
+上一轮只删除 full store 被后续 full store 覆盖的情况。本轮把同一 basic block 内“先 partial store，后 full store”的情况也纳入 cleanup：如果中间没有同 base register load、普通 call 或 terminator，后面的 full store 会完整覆盖前面的 partial store，前面的 partial store 可以删除。
+
+这个规则仍然不把 partial access 提升成 SSA，也不做 partial store 之间的合并。两个 partial store 连续出现时会保留，因为第二个 partial store 不一定覆盖第一个 store 涉及的全部位。遇到任意同 base register load 会清掉 pending store，避免删掉被读到的旧写。
+
+改动文件和函数：
+
+- `lib/passes/NativeRegisterSSA.cpp:36`
+  - `AccessInfo` 新增 `IsRegisterAccess`，把“这是寄存器访问”和“这是 full-unit 访问”分开。
+- `lib/passes/NativeRegisterSSA.cpp:158`
+  - `registerLoad()` 返回 `IsRegisterAccess=true`，partial load 也会作为 pending store 的读屏障。
+- `lib/passes/NativeRegisterSSA.cpp:180`
+  - `registerStore()` 返回 `IsRegisterAccess=true`，partial store 能进入局部 pending store 队列。
+- `lib/passes/NativeRegisterSSA.cpp:327`
+  - `FunctionPromoter::removeLocalDeadStores()` 的 pending store 从单个 full store 改成同 base register 的 store 列表。
+  - register load 清掉同 base pending store。
+  - full-unit store 删除同 base 已 pending 的 full/partial store，然后把自己作为新的 pending store。
+  - partial store 只加入 pending，不删除之前的 store。
+- `tests/native_register_effects_test.cpp:32`
+  - 新增可指定 `base/name/offset/size` 的 `registerAccessMetadata()`，用于构造 partial access metadata。
+- `tests/native_register_effects_test.cpp:305`
+  - 新增 `createPartialStoreCoveredByFullStoreFunction()`，覆盖 partial store 被 full store 删除的正例。
+- `tests/native_register_effects_test.cpp:326`
+  - 新增 `createPartialStoresOnlyFunction()`，覆盖 partial store 之间不能互删的反例。
+- `tests/native_register_effects_test.cpp:497`
+  - 新增两个 store 数量断言。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+ctest --test-dir build -R 'notdec.native_register_effects.preserved' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-partial-covered-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-partial-covered-gate/*.signature-rewrite.ll
+ctest --test-dir build --output-on-failure
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过，skip reason 仍只剩 `already matches` / `declaration`。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 107s | 107s |
+| `memcached:executable` | 57s | 57s |
+
+残留统计和上一轮 full-store cleanup 后相同：
+
+| kind | count |
+| --- | ---: |
+| `flags store access full` | 3813 |
+| `gpr store access full` | 3601 |
+| `gpr store access partial` | 14 |
+| `vector store access partial` | 71 |
+
+判断：
+
+- 这一步是语义上成立的小补强，但固定三目标没有新的残留下降。
+- 当前收益更大的方向仍然是 flags store、RSP/RBP store、以及后续真正的 storage range SSA。
