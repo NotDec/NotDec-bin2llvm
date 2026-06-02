@@ -460,6 +460,27 @@ llvm::Function *createPartialMetadataStorageValueFunction(
   return function;
 }
 
+llvm::Function *createWidePartialLoadFunction(llvm::Module &module,
+                                              llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "wide_partial_register_load", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *raxMetadata = registerAccessMetadata(context, "RAX");
+  llvm::MDNode *eaxMetadata = registerAccessMetadata(context, "RAX", "EAX", 0, 4);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 0x12340000abcdULL), rax);
+  store->setMetadata("notdec.register.access", raxMetadata);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rax->getValueType(), rax, "eax_wide");
+  load->setMetadata("notdec.register.access", eaxMetadata);
+  builder.CreateRet(load);
+  return function;
+}
+
 llvm::Function *createPartialLoadFunction(llvm::Module &module,
                                           llvm::GlobalVariable *rax) {
   llvm::LLVMContext &context = module.getContext();
@@ -749,6 +770,23 @@ bool metadataHasRegister(const llvm::Function &function, llvm::StringRef kind,
   return false;
 }
 
+bool functionReturnsConstant(const llvm::Function &function, uint64_t expected) {
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&inst);
+      if (ret == nullptr || ret->getReturnValue() == nullptr) {
+        continue;
+      }
+      auto *constant = llvm::dyn_cast<llvm::ConstantInt>(ret->getReturnValue());
+      if (constant == nullptr) {
+        return false;
+      }
+      return constant->getZExtValue() == expected;
+    }
+  }
+  return false;
+}
+
 bool expect(bool condition, const std::string &message) {
   if (condition) {
     return true;
@@ -799,6 +837,7 @@ int main() {
   llvm::Function *partialOnly = createPartialStoresOnlyFunction(module, rax);
   llvm::Function *partialMetadataStorage =
       createPartialMetadataStorageValueFunction(module, rax);
+  llvm::Function *widePartialLoad = createWidePartialLoadFunction(module, rax);
   llvm::Function *partialLoad = createPartialLoadFunction(module, rax);
   llvm::Function *loopCarriedRegisterValue =
       createLoopCarriedRegisterValueFunction(module, rax);
@@ -896,8 +935,15 @@ int main() {
   ok &= expect(metadataHasRegister(*partialOnly,
                                    "notdec.register.external_inputs", "RAX"),
                "partial RAX write did not keep old backing input");
-  ok &= expect(countRegisterLoads(*partialMetadataStorage, rax) == 0,
-               "partial metadata backing RAX load was not propagated");
+  ok &= expect(countRegisterLoads(*partialMetadataStorage, rax) == 1,
+               "partial metadata backing RAX store did not keep old high bits");
+  ok &= expect(metadataHasRegister(*partialMetadataStorage,
+                                   "notdec.register.external_inputs", "RAX"),
+               "partial metadata backing RAX store did not keep external input");
+  ok &= expect(countRegisterLoads(*widePartialLoad, rax) == 0,
+               "wide partial RAX load was not propagated");
+  ok &= expect(functionReturnsConstant(*widePartialLoad, 0xabcd),
+               "wide partial RAX load did not extract the metadata range");
   ok &= expect(countRegisterLoads(*partialLoad, rax) == 0,
                "partial RAX load was not replaced with an SSA extract");
   ok &= expect(countRegisterLoads(*loopCarriedRegisterValue, rax) == 0,

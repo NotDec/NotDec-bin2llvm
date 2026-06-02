@@ -4175,3 +4175,101 @@ return_path            1
 
 - 更强方案是直接在 pass 里输出 skip reason metadata。
 - 当前先改审计脚本更轻量，不会影响 IR，也适合继续观察 Bench2 残留。
+
+## 2026-06-02 实现记录：partial metadata 的宽值 load/store 进入 SSA
+
+背景：
+
+- Bench2 固定三目标里还有几条 `partial_access`，其中一些 store 是 `store i64`，但 metadata 标的是 `CL`、`BL`、`EDI` 这种 partial range。
+- 旧逻辑看到 IR value type 是 backing storage type，就把它当 full storage value，导致宽值 partial metadata 没走 read-modify-write，也不会标 synthetic。
+- 这里不能按 x86 `EAX` 名字写特例。规则仍然是：metadata range 是 partial，就按 partial range 处理。
+
+改动：
+
+- [NativeRegisterSSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSSA.cpp:404)
+  - `rewriteLoads` 改为只要 access 不是 full unit，就从 backing value 里 extract metadata range。
+  - extract 后再按原 load 类型做 zext/trunc，兼容 `load i64` + `EAX` metadata 这类宽值形态。
+- [NativeRegisterSSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSSA.cpp:444)
+  - `rewritePartialStores` 不再跳过 `store i64` + partial metadata。
+  - 宽值 partial store 仍走 `replacePartialValue`，把 value 的低位合进 backing storage，未写部分来自当前 backing value。
+- [native_register_effects_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_effects_test.cpp:463)
+  - 新增 `createWidePartialLoadFunction`，覆盖 `load i64` + `EAX` metadata 的读取。
+- [native_register_effects_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_effects_test.cpp:773)
+  - 新增 `functionReturnsConstant`，检查宽 partial load 最终只返回 metadata range 的低 32 位。
+- [native_register_effects_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_effects_test.cpp:938)
+  - 调整 `partial_metadata_storage_value` 断言：partial store 需要保留未写高位，所以应保留 `RAX` external input。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-wide-partial-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-wide-partial-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 42s |
+| `libuv:shared-library` | 106s | 108s |
+| `memcached:executable` | 58s | 58s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         14
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3187
+gpr       store        access           full     full         no         3308
+gpr       store        access           partial  full         yes        4
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         yes        1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-stack-equivalent-gate` 相比：
+
+- `gpr load external_input`：3188 -> 3187，少 1 个。
+- `gpr store access partial/full`：4 条仍在，但都从非 synthetic 变成 synthetic，说明宽值 partial store 已进入 backing storage SSA。
+- `other store access partial/full`：1 条也变成 synthetic。
+- `gpr load access partial/full` 仍是 3 条。抽查后都在调用后或 callee-saved/frame restore 附近，当前 `readRegister` 拿不到可信 reaching value，不能硬替换。
+
+判断：
+
+- 这一步修正了 partial metadata 宽值 access 的规则：以 metadata range 为准，不以 IR value type 假定 full access。
+- 固定三目标没有明显性能退化，`libuv` signature rewrite 多 2 秒，仍属同量级。
+- 剩余 partial load 的主要 blocker 已不是宽值类型，而是 call/current-value 证明不足。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 宽值 partial store 进入 SSA，external input 少 1 个；剩余 partial load 仍受 call/current-value 限制。 |
+| 理解成本 | 2 | 规则更符合 metadata 语义，但测试里需要明确 partial store 会保留未写高位。 |
+| 维护成本 | 2 | 后续仍可沿用；如果 lifting 改成窄值 partial access，也不会冲突。 |
+
+有没有更好的方案：
+
+- 更完整方案是继续做统一 current-value resolver，解决调用后 partial load 的 reaching value。
+- 本轮只修 metadata partial 和 IR type 不一致的问题，风险小，也直接对应真实 residue。

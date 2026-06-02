@@ -413,8 +413,11 @@ private:
       if (value == nullptr || value == load) {
         continue;
       }
-      if (!access.IsStorageValue) {
+      if (!access.IsFullUnit) {
         value = extractPartialValue(access, value, load);
+        llvm::IRBuilder<> builder(load);
+        value = resizeInteger(builder, value,
+                              llvm::cast<llvm::IntegerType>(load->getType()));
       }
       Replacement[load] = value;
       load->replaceAllUsesWith(value);
@@ -455,7 +458,7 @@ private:
 
     for (llvm::StoreInst *store : stores) {
       AccessInfo access = registerStore(*store, Units);
-      if (!canPromotePartialAccess(access) || access.IsStorageValue) {
+      if (!canPromotePartialAccess(access)) {
         continue;
       }
       llvm::Value *oldValue =
