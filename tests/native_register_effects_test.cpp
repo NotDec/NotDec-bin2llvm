@@ -405,6 +405,29 @@ llvm::Function *createReadFlagStoresFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createReadOneFlagStoreOtherFlagFunction(
+    llvm::Module &module, llvm::GlobalVariable *cf, llvm::GlobalVariable *of) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt8Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "read_one_flag_store_other_flag", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *cfMetadata = registerAccessMetadata(context, "CF", "CF", 512, 1);
+  llvm::MDNode *ofMetadata = registerAccessMetadata(context, "OF", "OF", 523, 1);
+  llvm::StoreInst *cfStore = builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 1), cf);
+  cfStore->setMetadata("notdec.register.access", cfMetadata);
+  llvm::StoreInst *ofStore = builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 1), of);
+  ofStore->setMetadata("notdec.register.access", ofMetadata);
+  llvm::LoadInst *load = builder.CreateLoad(cf->getValueType(), cf);
+  load->setMetadata("notdec.register.access", cfMetadata);
+  builder.CreateRet(load);
+  return function;
+}
+
 llvm::Function *createUnreadRipStoresFunction(llvm::Module &module,
                                               llvm::GlobalVariable *rip) {
   llvm::LLVMContext &context = module.getContext();
@@ -514,6 +537,7 @@ int main() {
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
   llvm::GlobalVariable *cf = createRegisterGlobal(module, "CF", 512, 1);
+  llvm::GlobalVariable *of = createRegisterGlobal(module, "OF", 523, 1);
   llvm::GlobalVariable *rip = createRegisterGlobal(module, "RIP", 648, 8);
   attachTestAbi(module);
   llvm::Function *preserved =
@@ -539,6 +563,8 @@ int main() {
       createPartialMetadataStorageValueFunction(module, rax);
   llvm::Function *unreadFlags = createUnreadFlagStoresFunction(module, cf);
   llvm::Function *readFlags = createReadFlagStoresFunction(module, cf);
+  llvm::Function *readOneFlag =
+      createReadOneFlagStoreOtherFlagFunction(module, cf, of);
   llvm::Function *unreadRip = createUnreadRipStoresFunction(module, rip);
   llvm::Function *readRip = createReadRipStoresFunction(module, rip);
 
@@ -574,7 +600,7 @@ int main() {
                "register effect summary had unexpected clobber count");
   ok &= expect(summary.DeadStoresRemoved >= 1,
                "register SSA did not remove the expected overwritten store");
-  ok &= expect(summary.UnreadFlagStoresRemoved == 1,
+  ok &= expect(summary.UnreadFlagStoresRemoved == 2,
                "register SSA did not remove unread flag stores");
   ok &= expect(summary.UnreadRipStoresRemoved == 1,
                "register SSA did not remove unread RIP stores");
@@ -614,6 +640,10 @@ int main() {
                "unread CF stores were not removed");
   ok &= expect(countRegisterStores(*readFlags, cf) == 1,
                "read CF store was removed");
+  ok &= expect(countRegisterStores(*readOneFlag, cf) == 1,
+               "read CF store was removed when another flag was unread");
+  ok &= expect(countRegisterStores(*readOneFlag, of) == 0,
+               "unread OF store was not removed when CF was read");
   ok &= expect(countRegisterStores(*unreadRip, rip) == 0,
                "unread RIP store was not removed");
   ok &= expect(countRegisterStores(*readRip, rip) == 1,

@@ -872,3 +872,94 @@ ctest --test-dir build --output-on-failure
 
 - 这一步没有改变语义，只修正 metadata 口径。
 - 固定三目标中一个误判 partial 被正确归类为 full。
+
+## 阶段 D 小步：按单个 flag 清理未读 store
+
+上一轮后 flags 还剩 `2366` 个 store。重新按 flag 名看读写后发现，剩余 flags load 全部是 `OF.external_input`，但旧规则只要函数读过任意 flags，就保留该函数内所有 flags store。这太粗。
+
+固定三目标同口径统计：
+
+```bash
+awk -F '\t' '$3=="flags" {if ($4=="load") l[$1 "\t" $2 "\t" $7]=1; if ($4=="store") s[$1 "\t" $2 "\t" $7]++} END {for (k in s) {split(k,a,"\t"); flag=a[3]; total[flag]+=s[k]; funcs[flag]++; if (!(k in l)) {nol[flag]+=s[k]; nolf[flag]++}} for (flag in total) print flag, total[flag], nolf[flag]+0, nol[flag]+0}' \
+  /tmp/notdec-bin2llvm-register-residue-callsite-access-metadata-gate/register-residue-details.tsv
+```
+
+结果：
+
+| flag | stores | no same-flag load funcs | stores in no same-flag load funcs |
+| --- | ---: | ---: | ---: |
+| `CF` | 475 | 215 | 475 |
+| `OF` | 475 | 200 | 459 |
+| `PF` | 470 | 213 | 470 |
+| `SF` | 473 | 213 | 473 |
+| `ZF` | 473 | 213 | 473 |
+
+本轮把 `removeUnreadFlagStores()` 从“函数是否读过任意 flag”改成“该 flag 自己是否被读过”。例如函数里读过 `OF` 时，只保留 `OF` store；同函数内没有被读过的 `CF/SF/ZF/PF` store 仍然删除。
+
+改动文件和函数：
+
+- `lib/passes/NativeRegisterSSA.cpp:419`
+  - `removeUnreadFlagStores()` 改为收集 `readFlags` 集合。
+  - 删除条件改为：这是 flag store，且同一个 flag 没有在原始函数中被 load。
+- `tests/native_register_effects_test.cpp:408`
+  - 新增 `createReadOneFlagStoreOtherFlagFunction()`，覆盖同函数读 `CF` 但写 `OF` 的情况。
+- `tests/native_register_effects_test.cpp:603`
+  - 更新 `UnreadFlagStoresRemoved` 断言。
+- `tests/native_register_effects_test.cpp:644`
+  - 新增断言：读过的 `CF` store 保留，未读的 `OF` store 删除。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+ctest --test-dir build -R 'notdec.native_register_effects.preserved' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-per-flag-unread-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-per-flag-unread-gate/*.signature-rewrite.ll
+ctest --test-dir build --output-on-failure
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 107s | 107s |
+| `memcached:executable` | 57s | 58s |
+
+残留对比：
+
+| kind | 上一轮 | 本轮 |
+| --- | ---: | ---: |
+| `flags store access full` | 2366 | 665 |
+| `gpr store access full` | 3601 | 3601 |
+| `gpr load access partial` | 18 | 18 |
+| `vector store access partial` | 71 | 71 |
+
+按 flag 看，本轮后 flags store 剩余：
+
+| flag | count |
+| --- | ---: |
+| `ZF` | 441 |
+| `CF` | 108 |
+| `OF` | 75 |
+| `SF` | 39 |
+| `PF` | 2 |
+
+判断：
+
+- flags store 下降 `1701`，耗时没有明显退化。
+- 剩下的 flags store 已经不能靠“单个 flag 没被读过”继续删，后续需要真正做 flags producer/consumer SSA。

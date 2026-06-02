@@ -598,6 +598,9 @@
   - [x] 修正 direct callsite input fallback load 的 register access metadata，避免把 full `RDI` fallback load 误判成 partial。
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-register-residue-callsite-access-metadata-gate`
+  - [x] 将 unread flags store cleanup 从函数级改成单个 flag 级，读过 `OF` 时仍删除未读的 `CF/SF/ZF/PF` store。
+    - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-per-flag-unread-gate`
 
 ## 记录规则
 

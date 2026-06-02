@@ -417,16 +417,12 @@ private:
   }
 
   void removeUnreadFlagStores() {
-    bool hasFlagLoad = false;
+    std::set<llvm::GlobalVariable *> readFlags;
     for (llvm::GlobalVariable *global : LoadedUnits) {
       auto it = Units.find(global);
       if (it != Units.end() && isFlagRegisterName(it->second.Name)) {
-        hasFlagLoad = true;
-        break;
+        readFlags.insert(global);
       }
-    }
-    if (hasFlagLoad) {
-      return;
     }
 
     std::vector<llvm::StoreInst *> deadStores;
@@ -437,7 +433,8 @@ private:
           continue;
         }
         AccessInfo access = registerStore(*store, Units);
-        if (access.Unit != nullptr && isFlagRegisterName(access.Unit->Name)) {
+        if (access.Unit != nullptr && isFlagRegisterName(access.Unit->Name) &&
+            readFlags.count(access.Unit->Global) == 0) {
           deadStores.push_back(store);
         }
       }
