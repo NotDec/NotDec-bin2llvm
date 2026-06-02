@@ -44,15 +44,18 @@ llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context,
 }
 
 llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
-                                           const std::string &name) {
+                                           const std::string &name,
+                                           uint32_t offset = 0,
+                                           uint32_t size = 8) {
   llvm::LLVMContext &context = module.getContext();
-  auto *type = llvm::Type::getInt64Ty(context);
+  llvm::Type *type = size == 1 ? llvm::Type::getInt8Ty(context)
+                               : llvm::Type::getInt64Ty(context);
   auto *global = new llvm::GlobalVariable(
       module, type, false, llvm::GlobalValue::ExternalLinkage, nullptr, name);
   llvm::Metadata *fields[] = {
       llvm::MDString::get(context, "space=register"),
-      llvm::MDString::get(context, "offset=0"),
-      llvm::MDString::get(context, "size=8"),
+      llvm::MDString::get(context, "offset=" + std::to_string(offset)),
+      llvm::MDString::get(context, "size=" + std::to_string(size)),
       llvm::MDString::get(context, "name=" + name),
   };
   global->setMetadata("notdec.register", llvm::MDNode::get(context, fields));
@@ -343,6 +346,45 @@ llvm::Function *createPartialStoresOnlyFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createUnreadFlagStoresFunction(llvm::Module &module,
+                                               llvm::GlobalVariable *cf) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "unread_flag_stores", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "CF", "CF", 512, 1);
+  llvm::StoreInst *first = builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0), cf);
+  first->setMetadata("notdec.register.access", metadata);
+  llvm::StoreInst *second = builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 1), cf);
+  second->setMetadata("notdec.register.access", metadata);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createReadFlagStoresFunction(llvm::Module &module,
+                                             llvm::GlobalVariable *cf) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt8Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "read_flag_stores", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "CF", "CF", 512, 1);
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 1), cf);
+  store->setMetadata("notdec.register.access", metadata);
+  llvm::LoadInst *load = builder.CreateLoad(cf->getValueType(), cf);
+  load->setMetadata("notdec.register.access", metadata);
+  builder.CreateRet(load);
+  return function;
+}
+
 unsigned countRegisterLoads(const llvm::Function &function,
                             const llvm::GlobalVariable *global) {
   unsigned count = 0;
@@ -415,6 +457,7 @@ int main() {
   llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *cf = createRegisterGlobal(module, "CF", 512, 1);
   attachTestAbi(module);
   llvm::Function *preserved =
       createFunction(module, "preserved_rbx", rbx, true);
@@ -435,6 +478,8 @@ int main() {
   llvm::Function *partialCovered =
       createPartialStoreCoveredByFullStoreFunction(module, rax);
   llvm::Function *partialOnly = createPartialStoresOnlyFunction(module, rax);
+  llvm::Function *unreadFlags = createUnreadFlagStoresFunction(module, cf);
+  llvm::Function *readFlags = createReadFlagStoresFunction(module, cf);
 
   notdec::bin2llvm::NativeRegisterSSAOptions options;
   options.EnableRewrite = true;
@@ -468,6 +513,8 @@ int main() {
                "register effect summary had unexpected clobber count");
   ok &= expect(summary.DeadStoresRemoved >= 1,
                "register SSA did not remove the expected overwritten store");
+  ok &= expect(summary.UnreadFlagStoresRemoved == 1,
+               "register SSA did not remove unread flag stores");
   ok &= expect(countRegisterLoads(*callEffects, rbx) == 0,
                "RBX load after call was not propagated");
   ok &= expect(countRegisterLoads(*callEffects, rax) == 1,
@@ -498,5 +545,9 @@ int main() {
                "partial RAX store covered by full store was not removed");
   ok &= expect(countRegisterStores(*partialOnly, rax) == 2,
                "partial RAX stores were removed without full overwrite");
+  ok &= expect(countRegisterStores(*unreadFlags, cf) == 0,
+               "unread CF stores were not removed");
+  ok &= expect(countRegisterStores(*readFlags, cf) == 1,
+               "read CF store was removed");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

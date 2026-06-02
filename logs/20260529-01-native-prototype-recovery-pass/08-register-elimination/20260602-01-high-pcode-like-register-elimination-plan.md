@@ -502,3 +502,104 @@ ctest --test-dir build --output-on-failure
 
 - 这一步是语义上成立的小补强，但固定三目标没有新的残留下降。
 - 当前收益更大的方向仍然是 flags store、RSP/RBP store、以及后续真正的 storage range SSA。
+
+## 阶段 A 局部清理补充：函数内未读 flags store
+
+固定三目标里，上一轮后仍有 `3813` 个 flags store。先用 details 做函数级统计：
+
+```bash
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-register-residue-partial-covered-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-bin2llvm-register-residue-partial-covered-gate/register-residue-details.tsv
+awk -F '\t' '$3=="flags" {if ($4=="load") l[$1 "\t" $2]=1; if ($4=="store") s[$1 "\t" $2]++} END {for (k in s) {total+=s[k]; funcs++; if (!(k in l)) {nol+=s[k]; nolf++}} print funcs, total, nolf, nol}' \
+  /tmp/notdec-bin2llvm-register-residue-partial-covered-gate/register-residue-details.tsv
+```
+
+结果是 `472` 个函数有 flags store，总数 `3813`；其中 `457` 个函数在 rewrite 后没有 flags load，包含 `3739` 个 store。
+
+本轮先做保守清理：如果函数原始扫描阶段没有任何 flags load，就删除该函数内的 flags store。判断使用 `scanBlock()` 阶段看到的原始 load，不使用 `rewriteLoads()` 后的 IR 状态，避免 load 被替换后误判。删掉 flags store 后，同步从 `StoredFullUnits` 移除对应 flags，避免函数 metadata 继续把它们当作 clobber。
+
+这仍然不是 flags SSA：
+
+- 有任何 flags load 的函数不清理。
+- 不跨函数推导 flags effect。
+- 不把 flags 当作 ABI 参数或返回值。
+- 不处理 flags producer/consumer 的 PHI。
+
+改动文件和函数：
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:24`
+  - `NativeRegisterSSAFunctionSummary` 新增 `UnreadFlagStoresRemoved`。
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:39`
+  - `NativeRegisterSSASummary` 新增 `UnreadFlagStoresRemoved`。
+- `lib/passes/NativeRegisterSSA.cpp:51`
+  - 新增 `isFlagRegisterName()`，只识别 x86 常见 flags 名。
+- `lib/passes/NativeRegisterSSA.cpp:252`
+  - `FunctionPromoter::run()` 在 `removeLocalDeadStores()` 后调用 `removeUnreadFlagStores()`。
+- `lib/passes/NativeRegisterSSA.cpp:271`
+  - `scanBlock()` 记录 `LoadedUnits`，用于判断函数原始 IR 是否读过 flags。
+- `lib/passes/NativeRegisterSSA.cpp:384`
+  - 新增 `removeUnreadFlagStores()`。
+  - 如果原始函数读过任何 flags，直接返回。
+  - 否则删除函数内所有 flags store，并更新 `UnreadFlagStoresRemoved`。
+  - 从 `StoredFullUnits` 删除这些 flags，保持 clobber metadata 和实际 IR 一致。
+- `lib/passes/NativeRegisterSSA.cpp:801`
+  - `addFunctionSummary()` 聚合 `UnreadFlagStoresRemoved`。
+- `lib/passes/NativeRegisterSSA.cpp:889`
+  - `printNativeRegisterSSASummary()` 打印 unread flags store 删除数量。
+- `tests/native_register_effects_test.cpp:46`
+  - `createRegisterGlobal()` 支持指定 offset/size，测试里能构造 i8 `CF`。
+- `tests/native_register_effects_test.cpp:349`
+  - 新增 `createUnreadFlagStoresFunction()`，覆盖没有 flags load 时删除 store。
+- `tests/native_register_effects_test.cpp:369`
+  - 新增 `createReadFlagStoresFunction()`，覆盖有 flags load 时不能删。
+- `tests/native_register_effects_test.cpp:516`
+  - 新增 `UnreadFlagStoresRemoved` 断言。
+- `tests/native_register_effects_test.cpp:549`
+  - 新增 unread/read flags store 数量断言。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+ctest --test-dir build -R 'notdec.native_register_effects.preserved' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-unread-flags-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-unread-flags-gate/*.signature-rewrite.ll
+ctest --test-dir build --output-on-failure
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 106s | 107s |
+| `memcached:executable` | 57s | 57s |
+
+残留对比：
+
+| kind | 上一轮 | 本轮 |
+| --- | ---: | ---: |
+| `flags store access full` | 3813 | 2366 |
+| `gpr store access full` | 3601 | 3601 |
+| `gpr store access partial` | 14 | 14 |
+| `vector store access partial` | 71 | 71 |
+
+判断：
+
+- flags store 下降 `1447`，耗时没有明显退化。
+- 本轮清理后仍有 `2366` 个 flags store，其中很多来自原始函数中出现过 flags load 的函数，后续需要真正的 flags SSA 或 producer/consumer 局部化，不能靠“未读 store”规则继续硬删。

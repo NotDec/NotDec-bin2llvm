@@ -48,6 +48,12 @@ struct AbiRegisterEffects {
   std::set<std::string> KilledByCall;
 };
 
+bool isFlagRegisterName(llvm::StringRef name) {
+  return name == "CF" || name == "PF" || name == "AF" || name == "ZF" ||
+         name == "SF" || name == "TF" || name == "IF" || name == "DF" ||
+         name == "OF";
+}
+
 std::optional<std::string> mdField(const llvm::MDNode *node,
                                    llvm::StringRef key) {
   if (node == nullptr) {
@@ -251,6 +257,7 @@ public:
     if (EnableRewrite) {
       rewriteLoads();
       removeLocalDeadStores();
+      removeUnreadFlagStores();
       attachRegisterEffectMetadata();
       eraseDeadPhis();
     } else {
@@ -267,6 +274,7 @@ private:
         AccessInfo access = registerLoad(*load, Units);
         if (access.Unit != nullptr) {
           ++Summary.LoadsSeen;
+          LoadedUnits.insert(access.Unit->Global);
           if (access.IsFullUnit) {
             Loads.push_back(load);
           }
@@ -370,6 +378,49 @@ private:
         inst->eraseFromParent();
         ++Summary.DeadStoresRemoved;
       }
+    }
+  }
+
+  void removeUnreadFlagStores() {
+    bool hasFlagLoad = false;
+    for (llvm::GlobalVariable *global : LoadedUnits) {
+      auto it = Units.find(global);
+      if (it != Units.end() && isFlagRegisterName(it->second.Name)) {
+        hasFlagLoad = true;
+        break;
+      }
+    }
+    if (hasFlagLoad) {
+      return;
+    }
+
+    std::vector<llvm::StoreInst *> deadStores;
+    for (llvm::BasicBlock &block : Function) {
+      for (llvm::Instruction &inst : block) {
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+        if (store == nullptr) {
+          continue;
+        }
+        AccessInfo access = registerStore(*store, Units);
+        if (access.Unit != nullptr && isFlagRegisterName(access.Unit->Name)) {
+          deadStores.push_back(store);
+        }
+      }
+    }
+
+    std::set<llvm::GlobalVariable *> removedFlags;
+    for (llvm::StoreInst *store : deadStores) {
+      AccessInfo access = registerStore(*store, Units);
+      if (access.Unit != nullptr) {
+        removedFlags.insert(access.Unit->Global);
+      }
+      if (store->use_empty()) {
+        store->eraseFromParent();
+        ++Summary.UnreadFlagStoresRemoved;
+      }
+    }
+    for (llvm::GlobalVariable *global : removedFlags) {
+      StoredFullUnits.erase(global);
     }
   }
 
@@ -729,6 +780,7 @@ private:
   std::vector<llvm::Instruction *> PendingErase;
   std::vector<llvm::PHINode *> DeadPhis;
   std::set<llvm::GlobalVariable *> StoredFullUnits;
+  std::set<llvm::GlobalVariable *> LoadedUnits;
   std::map<llvm::Value *, llvm::Value *> Replacement;
   std::map<BlockRegKey, llvm::Value *> EntryValue;
   std::map<BlockRegKey, llvm::Value *> ExitValue;
@@ -746,6 +798,7 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.StoresSeen += function.StoresSeen;
   total.LoadsReplaced += function.LoadsReplaced;
   total.DeadStoresRemoved += function.DeadStoresRemoved;
+  total.UnreadFlagStoresRemoved += function.UnreadFlagStoresRemoved;
   total.PhisCreated += function.PhisCreated;
   total.PhisSimplified += function.PhisSimplified;
   total.ExternalInputs += function.ExternalInputs;
@@ -833,6 +886,8 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
   os << "  stores: " << summary.StoresSeen << '\n';
   os << "  loads replaced: " << summary.LoadsReplaced << '\n';
   os << "  dead stores removed: " << summary.DeadStoresRemoved << '\n';
+  os << "  unread flag stores removed: " << summary.UnreadFlagStoresRemoved
+     << '\n';
   os << "  phis created: " << summary.PhisCreated << '\n';
   os << "  phis simplified: " << summary.PhisSimplified << '\n';
   os << "  external inputs: " << summary.ExternalInputs << '\n';

@@ -586,6 +586,9 @@
   - [x] 扩展同 block dead register store cleanup，让后续 full store 能删除同 base 已 pending 的 partial store；固定三目标回归通过，但残留统计相比上一轮无新增下降。
     - 文件：`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-register-residue-partial-covered-gate`
+  - [x] 清理函数内原始 IR 没有 flags load 的 flags store，避免把明显未读的 flags 写入继续保留成 register global 残留。
+    - 文件：`include/notdec-bin2llvm/passes/NativeRegisterSSA.h`、`lib/passes/NativeRegisterSSA.cpp`、`tests/native_register_effects_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-register-residue-unread-flags-gate`
 
 ## 记录规则
 
