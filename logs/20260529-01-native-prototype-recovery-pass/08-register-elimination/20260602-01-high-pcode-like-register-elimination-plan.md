@@ -2780,3 +2780,92 @@ vector    store        access           partial  full         71
 
 - 更完整方案是统一 current-value 查询，并支持 PHI / 多前驱等价判断。
 - 本轮只处理唯一前驱链，是为了在不引入 stack alias 和 PHI 复杂度的情况下先覆盖简单 CFG。
+
+## 阶段 A 小步：残留审计区分 synthetic partial store
+
+背景：
+
+- 最新固定三目标里，vector 长尾很集中：`vector load external_input full/full 70`，`vector store access partial/full 71`。
+- 这些 store 看起来像 partial SSA 生成的 RMW 残留，但实际需要先区分“`NativeRegisterSSA` 合成的 store”和“lowering 原本生成的 full backing store + partial metadata”。
+- 如果误把这两类混在一起，后续 cleanup 容易删掉真实保留 upper lane 的写。
+
+本轮范围：
+
+- residue audit 新增 `synthetic` 维度。
+- 识别 `!notdec.register.synthetic` metadata。
+- `--details | head` 这种常见用法不再因 SIGPIPE 打 traceback。
+- 不改 IR 生成，不改寄存器消除语义。
+
+改动文件和函数：
+
+- `scripts/native-register-residue-audit.py:10`
+  - 引入 `signal`，在 `main()` 里设置 SIGPIPE 默认处理。
+- `scripts/native-register-residue-audit.py:19`
+  - 新增 `SYNTHETIC_RE`，匹配 `!notdec.register.synthetic`。
+- `scripts/native-register-residue-audit.py:36`
+  - `RegisterAccess` 增加 `synthetic` 字段。
+- `scripts/native-register-residue-audit.py:205`
+  - `parse_accesses()` 记录每条 access 是否 synthetic。
+- `scripts/native-register-residue-audit.py:227`
+  - `summarize()` 的 key 增加 `synthetic`。
+- `scripts/native-register-residue-audit.py:241`
+  - summary 输出增加 `synthetic` 列。
+- `scripts/native-register-residue-audit.py:251`
+  - details 输出增加 `synthetic` 列。
+- `tests/native_register_residue_audit_test.py:28`
+  - 单测增加一条 `partial_storage_ssa` store，断言统计为 `synthetic=yes`。
+
+验证：
+
+```bash
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R native_register_residue --output-on-failure
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-stack-input-pred-gate/*.signature-rewrite.ll | head -5
+ctest --test-dir build --output-on-failure
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-stack-input-pred-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_register_residue_audit_test.py` 通过。
+- `notdec.native_register_residue_audit.unit` 通过。
+- 全量 CTest 10/10 通过。
+- `--details | head` 不再输出 `BrokenPipeError`。
+- 使用上一轮 `/tmp/notdec-bin2llvm-stack-input-pred-gate` 的 residue 复查，当前 vector partial stores 全部是 `synthetic=no`：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         22
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3190
+gpr       store        access           full     full         no         3583
+gpr       store        access           partial  full         no         11
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         no         1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         70
+vector    store        access           partial  full         no         71
+```
+
+判断：
+
+- 下一步不能只依赖 `notdec.register.synthetic` 删除 vector RMW。
+- 这些 vector stores 是 lowering 已经写成 full `ZMM*` backing value，但 metadata 仍标注 `XMM*` / lane range。
+- 后续如果要消这 70/71 个 vector 残留，需要按 register range 和 liveness 判断：未写 upper lane 是否真的会被后续读到，或者是否被后续 full store 覆盖。
+- 不应该直接把 partial vector write 当 full vector clobber，也不应该简单删除 external input。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 没直接减少 residue，但把 vector 尾巴的性质查清楚，避免下一步误删。 |
+| 理解成本 | 1 | 只是审计输出多一列。 |
+| 维护成本 | 1 | 对 IR pass 无影响，脚本格式变化需要读统计的人注意多了 `synthetic` 列。 |
+
+有没有更好的方案：
+
+- 可以直接做 vector liveness cleanup，但当前还没证明这些 store 是否都是 dead。
+- 先加审计维度更稳，后续再按 range/liveness 做窄 cleanup。

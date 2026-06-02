@@ -36,6 +36,7 @@ entry:
   %in = load i64, ptr @RAX, align 8, !notdec.register.external_input !4
   %al = load i8, ptr @RAX, align 1, !notdec.register.access !2
   store i64 %in, ptr @RAX, align 8, !notdec.register.access !1
+  store i64 %in, ptr @RAX, align 8, !notdec.register.access !2, !notdec.register.synthetic !7
   store i8 1, ptr @ZF, align 1, !notdec.register.access !6
   ret void
 }
@@ -46,6 +47,7 @@ entry:
 !4 = !{!"name=RAX", ptr @RAX}
 !5 = !{!"space=register", !"offset=16", !"size=1", !"name=ZF"}
 !6 = !{!"base=ZF", !"space=register", !"offset=16", !"size=1", !"name=ZF"}
+!7 = !{!"partial_storage_ssa"}
 """
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "sample.ll"
@@ -53,10 +55,11 @@ entry:
         accesses = module.parse_accesses(path)
 
     counts = module.summarize(accesses)
-    assert counts[("gpr", "load", "external_input", "full", "full")] == 1
-    assert counts[("gpr", "load", "access", "partial", "partial")] == 1
-    assert counts[("gpr", "store", "access", "full", "full")] == 1
-    assert counts[("flags", "store", "access", "full", "full")] == 1
+    assert counts[("gpr", "load", "external_input", "full", "full", "no")] == 1
+    assert counts[("gpr", "load", "access", "partial", "partial", "no")] == 1
+    assert counts[("gpr", "store", "access", "full", "full", "no")] == 1
+    assert counts[("gpr", "store", "access", "partial", "full", "yes")] == 1
+    assert counts[("flags", "store", "access", "full", "full", "no")] == 1
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import signal
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Iterable
 
 METADATA_RE = re.compile(r"^!(\d+)\s*=\s*!\{(.*)\}\s*$")
 MD_REF_RE = re.compile(r"!notdec\.register\.(access|external_input)\s+!(\d+)")
+SYNTHETIC_RE = re.compile(r"!notdec\.register\.synthetic\s+!\d+")
 GLOBAL_RE = re.compile(r"^(@[-a-zA-Z$._0-9]+)\s*=.*!notdec\.register\s+!(\d+)")
 PTR_GLOBAL_RE = re.compile(r"ptr\s+(@[-a-zA-Z$._0-9]+)")
 FIELD_RE = re.compile(r'!"([^"=]+)=([^"]*)"')
@@ -47,6 +49,7 @@ class RegisterAccess:
     value_size: int | None
     unit_offset: int | None
     unit_size: int | None
+    synthetic: bool
 
     @property
     def is_full(self) -> bool:
@@ -215,20 +218,22 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
                 value_size=value_size(line),
                 unit_offset=unit.offset if unit is not None else None,
                 unit_size=unit.size if unit is not None else None,
+                synthetic=SYNTHETIC_RE.search(line) is not None,
             )
         )
     return accesses
 
 
-def summarize(accesses: Iterable[RegisterAccess]) -> dict[tuple[str, str, str, str, str], int]:
-    counts: dict[tuple[str, str, str, str, str], int] = {}
+def summarize(accesses: Iterable[RegisterAccess]) -> dict[tuple[str, str, str, str, str, str], int]:
+    counts: dict[tuple[str, str, str, str, str, str], int] = {}
     for access in accesses:
         shape = "full" if access.is_full else "partial"
         value_shape = "full" if access.value_is_full else "partial"
         if access.value_size is None:
             value_shape = "unknown"
+        synthetic = "yes" if access.synthetic else "no"
         key = (access.category, access.access_kind, access.metadata_kind,
-               shape, value_shape)
+               shape, value_shape, synthetic)
         counts[key] = counts.get(key, 0) + 1
     return counts
 
@@ -237,7 +242,7 @@ def write_summary(accesses: list[RegisterAccess], output) -> None:
     writer = csv.writer(output, delimiter="\t", lineterminator="\n")
     writer.writerow([
         "category", "access_kind", "metadata_kind", "shape", "value_shape",
-        "count",
+        "synthetic", "count",
     ])
     for key, count in sorted(summarize(accesses).items()):
         writer.writerow([*key, count])
@@ -248,7 +253,7 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
     writer.writerow([
         "file", "function", "category", "access_kind", "metadata_kind",
         "shape", "value_shape", "base", "name", "space", "offset", "size",
-        "value_size", "instruction",
+        "value_size", "synthetic", "instruction",
     ])
     for access in accesses:
         writer.writerow([
@@ -267,11 +272,13 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
             access.offset,
             access.size,
             "" if access.value_size is None else access.value_size,
+            "yes" if access.synthetic else "no",
             access.instruction,
         ])
 
 
 def main(argv: list[str] | None = None) -> int:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     parser = argparse.ArgumentParser()
     parser.add_argument("ll", nargs="+", type=Path, help="LLVM .ll files to audit")
     parser.add_argument("--details", action="store_true", help="write per-access rows")
