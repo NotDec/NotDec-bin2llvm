@@ -2986,3 +2986,115 @@ vector    store        access           partial  full         no         71     
 
 - 更完整方案是把 ABI effect alias 做成统一 resolver，供 SSA、prototype recovery 和 cleanup 共用。
 - 本轮先做 rewrite 后窄清理，是为了避免提前影响 return recovery，同时先解决 fixed gate 上明显的 vector residue。
+
+## 阶段 D 小步：清理非返回 vector partial scratch store
+
+目标：
+
+- 在 signature rewrite 后，继续清理 return 前明显无用的 vector partial store。
+- 范围只限已经 rewrite 或本来就匹配 recovered prototype 的函数。
+- 不依赖 x86 `XMM1+` killed-by-call 猜测，也不把有函数内 load 依赖的 RMW store 删掉。
+
+实现：
+
+- `lib/passes/NativePrototypeRecovery.cpp:1251`
+  - 新增 `isVectorRegisterName()`，只识别 `XMM` / `YMM` / `ZMM` register metadata。
+- `lib/passes/NativePrototypeRecovery.cpp:1256`
+  - 新增 `accessIsVectorPartialStore()`，要求 store 有 `notdec.register.access` metadata、目标是 register global，且 access size 小于 backing register size。
+- `lib/passes/NativePrototypeRecovery.cpp:1280`
+  - 新增 `accessMatchesRecoveredReturn()`，如果该 access 对应 recovered return register，就不当 scratch 清理。
+- `lib/passes/NativePrototypeRecovery.cpp:1293`
+  - 新增 `functionHasRegisterAccessLoadForAccess()`，按 access 的 `name` 和 `base` 检查函数内是否存在对应 register access load；存在就保守保留 store。
+- `lib/passes/NativePrototypeRecovery.cpp:1369`
+  - 新增 `eraseDeadNonReturnVectorStores()`。
+  - 删除条件：同一 block 内 store 后到 `ret` 之前没有 call、是 vector partial store、不是 recovered return、函数内没有对应 register access load。
+- `lib/passes/NativePrototypeRecovery.cpp:2709`
+  - 在 `runNativePrototypeRecovery()` 的 signature rewrite 后调用该 cleanup。
+- `tests/native_prototype_recovery_test.cpp:187`
+  - 新增 `attachVectorXmm1ReturnTestAbi()`，构造 `XMM1_Qa` 返回 ABI，用来确认 cleanup 不抢在 return rewrite 前误删返回语义。
+- `tests/native_prototype_recovery_test.cpp:1678`
+  - `createKilledVectorScratchStoreFunction()` 新增 `baseName` 参数，让测试里 `ZMM1` global 的 metadata base 也能写成 `ZMM1`。
+- `tests/native_prototype_recovery_test.cpp:7244`
+  - 新增 dead non-return vector scratch 用例，断言 `XMM1` partial store 被清理。
+- `tests/native_prototype_recovery_test.cpp:7266`
+  - 新增 `XMM1_Qa` return 用例，断言函数被 rewrite 成 `i64()`，旧 register store 被 return rewrite 移除。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+./build/bin/native_register_effects_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-vector-cleanup-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-vector-cleanup-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-vector-cleanup-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-reg-details-vector-cleanup.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- `notdec-native-llvm` 构建通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 105s | 106s |
+| `memcached:executable` | 57s | 59s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         22
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3190
+gpr       store        access           full     full         no         3381
+gpr       store        access           partial  full         no         9
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+other     store        access           partial  full         no         1
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         7
+vector    store        access           partial  full         no         3
+```
+
+和上一步 `killedbycall scratch store` cleanup 的同口径结果相比：
+
+- `vector store access partial/full`：14 -> 3。
+- `vector load external_input full/full`：15 -> 7。
+- `gpr` store 计数这次输出和上一步记录不同，但本轮代码路径只删除 vector partial store，不会新增 GPR load/store。这个差异先记录，后续如果要精确归因，应在同一 commit 基线上重新跑一次 before/after。
+
+判断：
+
+- 这一步进一步消掉了 `uv_metrics_info`、`notdec_native_1da10` 这类 return 前非返回 vector scratch store。
+- 保留了三类风险用例：函数内有对应 vector load 的 RMW、store 后到 `ret` 前还有 call、recovered return 对应的 vector store。
+- 仍剩下的 3 个 vector partial store 需要继续看具体函数，不能靠扩大本 cleanup 条件直接删。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 6 | fixed gate 上 vector partial store 从 14 降到 3，vector external input 从 15 降到 7。 |
+| 理解成本 | 3 | 条件都集中在 post-rewrite cleanup，规则比较短，但需要知道它只处理 return 前死 store。 |
+| 维护成本 | 3 | 依赖 access metadata 的 base/name/size 准确性；如果 metadata 不准，会选择保守不删。 |
+
+有没有更好的方案：
+
+- 更完整方案仍然是统一 storage current-value 查询和 ABI effect alias resolver。
+- 本轮选择 cleanup，是因为它能先消掉明确无用的 vector scratch，不需要提前处理完整 vector/lane SSA。

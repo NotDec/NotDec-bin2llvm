@@ -184,6 +184,16 @@ void attachKilledVectorScratchTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachVectorXmm1ReturnTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+
+  notdec::bin2llvm::NativeAbiParamEntry xmm1 = inputRegister("XMM1_Qa");
+  abi.Outputs.push_back(std::move(xmm1));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 llvm::Function *createFunction(llvm::Module &module, const std::string &name) {
   llvm::LLVMContext &context = module.getContext();
   auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
@@ -1668,7 +1678,8 @@ llvm::Function *createWideVectorAndScalarReturnFunction(
 llvm::Function *createKilledVectorScratchStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *wide,
     const std::string &accessName, bool keepLoad,
-    llvm::Function *calleeAfterStore = nullptr) {
+    llvm::Function *calleeAfterStore = nullptr,
+    const std::string &baseName = "ZMM0") {
   llvm::LLVMContext &context = module.getContext();
   auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *function =
@@ -1677,7 +1688,7 @@ llvm::Function *createKilledVectorScratchStoreFunction(
   llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   llvm::MDNode *access =
-      registerAccessMetadata(context, "ZMM0", 4616, 8, accessName);
+      registerAccessMetadata(context, baseName, 4616, 8, accessName);
 
   llvm::Value *value =
       llvm::ConstantInt::get(wide->getValueType(), llvm::APInt(512, 0x1234));
@@ -7230,6 +7241,10 @@ int main() {
       createKilledVectorScratchStoreFunction(
           killedVectorScratchModule, "call_argument_killed_vector_scratch",
           killedVectorZmm, "XMM0_Qb", false, scratchCallCallee);
+  llvm::Function *deadNonReturnVectorScratch =
+      createKilledVectorScratchStoreFunction(killedVectorScratchModule,
+                                             "dead_non_return_vector_scratch",
+                                             killedVectorZmm, "XMM1", false);
   notdec::bin2llvm::runNativePrototypeRecovery(killedVectorScratchModule,
                                                rewriteOptions);
   ok &= expect(!hasRegisterStore(*deadKilledVectorScratch, "XMM0_Qb"),
@@ -7240,8 +7255,38 @@ int main() {
                "live killed-by-call vector scratch load was removed");
   ok &= expect(hasRegisterStore(*callArgumentKilledVectorScratch, "XMM0_Qb"),
                "killed-by-call vector store before call was removed");
+  ok &= expect(!hasRegisterStore(*deadNonReturnVectorScratch, "XMM1"),
+               "dead non-return vector scratch store was not removed");
   if (llvm::verifyModule(killedVectorScratchModule, &llvm::errs())) {
     std::cerr << "killed vector scratch module verification failed after "
+                 "prototype rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module vectorXmm1ReturnModule(
+      "native-prototype-vector-xmm1-return-test", context);
+  llvm::GlobalVariable *vectorXmm1ReturnZmm =
+      createRegisterGlobal(vectorXmm1ReturnModule, "ZMM1",
+                           llvm::IntegerType::get(context, 512));
+  attachVectorXmm1ReturnTestAbi(vectorXmm1ReturnModule);
+  llvm::Function *vectorXmm1ReturnFunction =
+      createKilledVectorScratchStoreFunction(vectorXmm1ReturnModule,
+                                             "return_xmm1", vectorXmm1ReturnZmm,
+                                             "XMM1_Qa", false, nullptr,
+                                             "ZMM1");
+  notdec::bin2llvm::runNativePrototypeRecovery(vectorXmm1ReturnModule,
+                                               rewriteOptions);
+  vectorXmm1ReturnFunction = vectorXmm1ReturnModule.getFunction("return_xmm1");
+  ok &= expect(vectorXmm1ReturnFunction != nullptr &&
+                   functionTypeShape(*vectorXmm1ReturnFunction->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef<llvm::Type *>{}),
+               "recovered XMM1 return function was not rewritten to i64()");
+  ok &= expect(vectorXmm1ReturnFunction != nullptr &&
+                   !hasRegisterStore(*vectorXmm1ReturnFunction, "XMM1_Qa"),
+               "recovered XMM1 return kept old register store");
+  if (llvm::verifyModule(vectorXmm1ReturnModule, &llvm::errs())) {
+    std::cerr << "vector XMM1 return module verification failed after "
                  "prototype rewrite\n";
     return EXIT_FAILURE;
   }

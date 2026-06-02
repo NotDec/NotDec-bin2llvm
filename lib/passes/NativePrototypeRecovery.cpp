@@ -1248,6 +1248,63 @@ bool storeIsDeadAtReturn(llvm::StoreInst &store) {
   return false;
 }
 
+bool isVectorRegisterName(llvm::StringRef name) {
+  return name.starts_with("XMM") || name.starts_with("YMM") ||
+         name.starts_with("ZMM");
+}
+
+bool accessIsVectorPartialStore(const llvm::MDNode &access,
+                                llvm::StoreInst &store) {
+  std::optional<std::string> name = metadataField(access, "name");
+  std::optional<std::string> base = metadataField(access, "base");
+  if ((!name || !isVectorRegisterName(*name)) &&
+      (!base || !isVectorRegisterName(*base))) {
+    return false;
+  }
+
+  auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+      store.getPointerOperand()->stripPointerCasts());
+  if (global == nullptr) {
+    return false;
+  }
+  llvm::MDNode *globalMetadata = global->getMetadata("notdec.register");
+  if (globalMetadata == nullptr) {
+    return false;
+  }
+  std::optional<uint64_t> accessSize = parseUint64Field(access, "size");
+  std::optional<uint64_t> unitSize =
+      parseUint64Field(*globalMetadata, "size");
+  return accessSize && unitSize && *accessSize < *unitSize;
+}
+
+bool accessMatchesRecoveredReturn(const llvm::MDNode &access,
+                                  const NativeRecoveredPrototype &prototype) {
+  for (const NativeRecoveredPrototypeParam &param : prototype.Returns) {
+    if (param.StorageKind != "register") {
+      continue;
+    }
+    if (accessMatchesEffectRegister(access, param.RegisterName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool functionHasRegisterAccessLoadForAccess(llvm::Function &function,
+                                            const llvm::MDNode &access) {
+  if (std::optional<std::string> name = metadataField(access, "name")) {
+    if (functionHasRegisterAccessLoad(function, *name)) {
+      return true;
+    }
+  }
+  if (std::optional<std::string> base = metadataField(access, "base")) {
+    if (functionHasRegisterAccessLoad(function, *base)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::set<std::string> killedByCallRegisterNames(const NativeAbiSpec &abi) {
   std::set<std::string> names;
   for (const NativeAbiEffect &effect : abi.Effects) {
@@ -1302,6 +1359,47 @@ void eraseDeadKilledByCallRegisterStores(llvm::Module &module,
     std::set<llvm::StoreInst *> uniqueStores(deadStores.begin(),
                                             deadStores.end());
     for (llvm::StoreInst *store : uniqueStores) {
+      llvm::Value *storedValue = store->getValueOperand();
+      store->eraseFromParent();
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
+    }
+  }
+}
+
+void eraseDeadNonReturnVectorStores(llvm::Module &module) {
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+    std::optional<NativeRecoveredPrototype> prototype =
+        readNativeRecoveredPrototypeMetadata(function);
+    if (!prototype) {
+      continue;
+    }
+
+    std::vector<llvm::StoreInst *> deadStores;
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+        if (store == nullptr || !storeIsDeadAtReturn(*store)) {
+          continue;
+        }
+        llvm::MDNode *access = store->getMetadata("notdec.register.access");
+        if (access == nullptr || !accessIsVectorPartialStore(*access, *store) ||
+            accessMatchesRecoveredReturn(*access, *prototype) ||
+            functionHasRegisterAccessLoadForAccess(function, *access)) {
+          continue;
+        }
+        deadStores.push_back(store);
+      }
+    }
+
+    for (llvm::StoreInst *store : deadStores) {
       llvm::Value *storedValue = store->getValueOperand();
       store->eraseFromParent();
       llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
@@ -2608,6 +2706,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
         rewriteNativeRecoveredPrototypes(module);
     rewriteDeclarationCallOutputs(module, model);
     eraseDeadKilledByCallRegisterStores(module, *abi);
+    eraseDeadNonReturnVectorStores(module);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
     summary.SignatureRewriteFunctionsRewritten =
         rewriteSummary.FunctionsRewritten;
