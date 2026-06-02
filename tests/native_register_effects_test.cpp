@@ -600,7 +600,7 @@ int main() {
                "register effect summary had unexpected clobber count");
   ok &= expect(summary.DeadStoresRemoved >= 1,
                "register SSA did not remove the expected overwritten store");
-  ok &= expect(summary.UnreadFlagStoresRemoved == 2,
+  ok &= expect(summary.UnreadFlagStoresRemoved == 4,
                "register SSA did not remove unread flag stores");
   ok &= expect(summary.UnreadRipStoresRemoved == 1,
                "register SSA did not remove unread RIP stores");
@@ -638,10 +638,10 @@ int main() {
                "partial metadata backing RAX load was not propagated");
   ok &= expect(countRegisterStores(*unreadFlags, cf) == 0,
                "unread CF stores were not removed");
-  ok &= expect(countRegisterStores(*readFlags, cf) == 1,
-               "read CF store was removed");
-  ok &= expect(countRegisterStores(*readOneFlag, cf) == 1,
-               "read CF store was removed when another flag was unread");
+  ok &= expect(countRegisterStores(*readFlags, cf) == 0,
+               "resolved CF store was not removed");
+  ok &= expect(countRegisterStores(*readOneFlag, cf) == 0,
+               "resolved CF store was not removed when another flag was unread");
   ok &= expect(countRegisterStores(*readOneFlag, of) == 0,
                "unread OF store was not removed when CF was read");
   ok &= expect(countRegisterStores(*unreadRip, rip) == 0,

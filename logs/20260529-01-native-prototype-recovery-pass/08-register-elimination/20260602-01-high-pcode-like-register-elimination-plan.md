@@ -963,3 +963,77 @@ ctest --test-dir build --output-on-failure
 
 - flags store 下降 `1701`，耗时没有明显退化。
 - 剩下的 flags store 已经不能靠“单个 flag 没被读过”继续删，后续需要真正做 flags producer/consumer SSA。
+
+## 阶段 D 小步：按 rewrite 后实际剩余 flag load 清理 store
+
+上一轮 `removeUnreadFlagStores()` 已经改成按单个 flag 判断，但判断依据还是 `scanBlock()` 阶段记录的原始 load。这个仍然偏保守：如果某个 flag load 已经在 `rewriteLoads()` 中被 SSA 值替换并删除，它就不应该继续保护后面的 flag store。
+
+本轮把 read flag 集合改成从 rewrite 后当前 IR 重新扫描：
+
+- `rewriteLoads()` 先替换可解析的 flag load。
+- `removeUnreadFlagStores()` 再扫描当前函数里还存在的 flag load。
+- 只有当前 IR 里仍有同一个 flag load 时，才保留该 flag store。
+
+这仍然不是完整 flags SSA。它只是删除已经没有任何当前 IR load 依赖的 flags store；还存在的 `OF.external_input` 相关 store 仍保留。
+
+改动文件和函数：
+
+- `lib/passes/NativeRegisterSSA.cpp:419`
+  - `removeUnreadFlagStores()` 不再使用 `LoadedUnits`。
+  - 改为扫描当前 IR 中仍存在的 `LoadInst`，用 `registerLoad()` 判断剩余 flag load。
+- `tests/native_register_effects_test.cpp:603`
+  - 更新 `UnreadFlagStoresRemoved` 断言。
+- `tests/native_register_effects_test.cpp:642`
+  - 更新断言：已经被 SSA 解析掉的 `CF` load 不再保护对应 `CF` store。
+
+验证：
+
+```bash
+cmake --build build --target native_register_effects_test -j2
+ctest --test-dir build -R 'notdec.native_register_effects.preserved' --output-on-failure
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-register-residue-post-rewrite-flag-liveness-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-register-residue-post-rewrite-flag-liveness-gate/*.signature-rewrite.ll
+ctest --test-dir build --output-on-failure
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 105s | 106s |
+| `memcached:executable` | 57s | 57s |
+
+残留对比：
+
+| kind | 上一轮 | 本轮 |
+| --- | ---: | ---: |
+| `flags store access full` | 665 | 16 |
+| `gpr store access full` | 3601 | 3601 |
+| `gpr load access partial` | 18 | 18 |
+| `vector store access partial` | 71 | 71 |
+
+本轮后剩余 flags store 全部是 `OF`：
+
+| flag | count |
+| --- | ---: |
+| `OF` | 16 |
+
+判断：
+
+- flags store 又下降 `649`，耗时没有明显退化。
+- 剩下的 `OF` store 与当前 IR 中仍存在的 `OF.external_input` load 同 flag，不能继续用未读规则删除。下一步要处理它们，需要真正的 flags SSA 或更准确的外部输入消除。

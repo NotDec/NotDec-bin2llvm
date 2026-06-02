@@ -418,10 +418,16 @@ private:
 
   void removeUnreadFlagStores() {
     std::set<llvm::GlobalVariable *> readFlags;
-    for (llvm::GlobalVariable *global : LoadedUnits) {
-      auto it = Units.find(global);
-      if (it != Units.end() && isFlagRegisterName(it->second.Name)) {
-        readFlags.insert(global);
+    for (llvm::BasicBlock &block : Function) {
+      for (llvm::Instruction &inst : block) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+        if (load == nullptr) {
+          continue;
+        }
+        AccessInfo access = registerLoad(*load, Units);
+        if (access.Unit != nullptr && isFlagRegisterName(access.Unit->Name)) {
+          readFlags.insert(access.Unit->Global);
+        }
       }
     }
 
