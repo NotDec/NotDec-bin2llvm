@@ -5692,6 +5692,83 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  llvm::Module declarationCallInputReturnModule(
+      "native-prototype-declaration-call-input-return-test", context);
+  llvm::GlobalVariable *declarationCallInputReturnRdi =
+      createRegisterGlobal(declarationCallInputReturnModule, "RDI");
+  attachTestAbi(declarationCallInputReturnModule);
+  auto *declarationCallInputReturnCalleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *declarationCallInputReturnCallee =
+      llvm::Function::Create(declarationCallInputReturnCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_return_callee",
+                             declarationCallInputReturnModule);
+  auto *declarationCallInputReturnUserType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputReturnUser = llvm::Function::Create(
+      declarationCallInputReturnUserType, llvm::GlobalValue::ExternalLinkage,
+      "declaration_call_input_return_user", declarationCallInputReturnModule);
+  llvm::BasicBlock *declarationCallInputReturnEntry =
+      llvm::BasicBlock::Create(context, "entry", declarationCallInputReturnUser);
+  llvm::Instruction *declarationCallInputReturnUse = nullptr;
+  {
+    llvm::IRBuilder<> builder(declarationCallInputReturnEntry);
+    llvm::Value *argument =
+        llvm::ConstantInt::get(declarationCallInputReturnRdi->getValueType(),
+                               0x1234);
+    llvm::StoreInst *store =
+        builder.CreateStore(argument, declarationCallInputReturnRdi);
+    store->setMetadata("notdec.register.access",
+                       registerAccessMetadata(context, "RDI"));
+    llvm::CallInst *call = builder.CreateCall(
+        declarationCallInputReturnCallee->getFunctionType(),
+        declarationCallInputReturnCallee);
+    declarationCallInputReturnUse = llvm::cast<llvm::Instruction>(
+        builder.CreateAdd(call, llvm::ConstantInt::get(call->getType(), 1)));
+    builder.CreateRetVoid();
+  }
+  notdec::bin2llvm::NativePrototypeRecoveryOptions returnInputOptions;
+  returnInputOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputReturnModule, returnInputOptions);
+  llvm::Function *returnInputCalleeAfterRewrite =
+      declarationCallInputReturnModule.getFunction(
+          "declaration_call_input_return_callee");
+  ok &= expect(returnInputCalleeAfterRewrite != nullptr &&
+                   functionTypeShape(
+                       *returnInputCalleeAfterRewrite->getFunctionType(),
+                       llvm::Type::getInt64Ty(context),
+                       llvm::ArrayRef<llvm::Type *>{i64Param}),
+               "declaration input rewrite did not preserve i64 return");
+  llvm::CallInst *declarationCallInputReturnNewCall = nullptr;
+  if (declarationCallInputReturnUser != nullptr) {
+    for (llvm::BasicBlock &block : *declarationCallInputReturnUser) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == returnInputCalleeAfterRewrite) {
+          declarationCallInputReturnNewCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(declarationCallInputReturnNewCall != nullptr &&
+                   declarationCallInputReturnNewCall->arg_size() == 1,
+               "declaration input rewrite did not add non-void call argument");
+  ok &= expect(declarationCallInputReturnUse != nullptr &&
+                   declarationCallInputReturnNewCall != nullptr &&
+                   declarationCallInputReturnUse->getOperand(0) ==
+                       declarationCallInputReturnNewCall,
+               "declaration input rewrite did not preserve call result uses");
+  ok &= expect(declarationCallInputReturnUser != nullptr &&
+                   !hasRegisterStore(*declarationCallInputReturnUser, "RDI"),
+               "declaration input rewrite kept old non-void input store");
+  if (llvm::verifyModule(declarationCallInputReturnModule, &llvm::errs())) {
+    std::cerr << "declaration call input return module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
   llvm::Module declarationCallInputPrefixModule(
       "native-prototype-declaration-call-input-prefix-test", context);
   llvm::GlobalVariable *declarationCallInputPrefixRdi =

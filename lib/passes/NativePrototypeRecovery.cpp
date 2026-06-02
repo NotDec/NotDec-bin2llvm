@@ -722,8 +722,7 @@ DeclarationCallInputRewrites collectDeclarationCallInputRewrites(
   DeclarationCallInputRewrites rewrites;
   for (llvm::Function &callee : module) {
     if (!callee.isDeclaration() || callee.isIntrinsic() ||
-        callee.arg_size() != 0 ||
-        !callee.getReturnType()->isVoidTy()) {
+        callee.arg_size() != 0) {
       continue;
     }
 
@@ -734,7 +733,7 @@ DeclarationCallInputRewrites collectDeclarationCallInputRewrites(
     for (llvm::User *user : callee.users()) {
       auto *call = llvm::dyn_cast<llvm::CallInst>(user);
       if (call == nullptr || call->getCalledFunction() != &callee ||
-          call->arg_size() != 0 || !call->getType()->isVoidTy()) {
+          call->arg_size() != 0 || call->getType() != callee.getReturnType()) {
         safe = false;
         break;
       }
@@ -791,7 +790,7 @@ void rewriteDeclarationCallInputs(llvm::Module &module,
     std::vector<llvm::Type *> paramTypes(inputs.size(),
                                          llvm::Type::getInt64Ty(module.getContext()));
     auto *newType = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(module.getContext()), paramTypes, false);
+        callee->getReturnType(), paramTypes, false);
     llvm::Function *rewritten =
         llvm::Function::Create(newType, callee->getLinkage(), originalName,
                                module);
@@ -803,6 +802,9 @@ void rewriteDeclarationCallInputs(llvm::Module &module,
       llvm::CallInst *newCall = builder.CreateCall(
           rewritten->getFunctionType(), rewritten, rewrite.Arguments);
       newCall->setCallingConv(rewrite.Call->getCallingConv());
+      if (!rewrite.Call->getType()->isVoidTy()) {
+        rewrite.Call->replaceAllUsesWith(newCall);
+      }
       eraseCallsiteInputStores(rewrite.InputStores);
       rewrite.Call->eraseFromParent();
     }

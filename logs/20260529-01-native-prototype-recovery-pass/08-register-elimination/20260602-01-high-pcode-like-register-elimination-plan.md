@@ -4658,3 +4658,99 @@ vector    load         external_input   full     full         no         1
 
 - 长期还是应该让 declaration prototype 来自更统一的 ABI/callsite 事实收集，而不是在 rewrite 阶段逐步推断。
 - 当前公共前缀方案风险低，适合作为下一步处理已有参数和返回值 declaration 前的过渡。
+
+## 2026-06-02 实现记录：非 void declaration call 的输入 rewrite
+
+背景：
+
+- 公共输入前缀 rewrite 后，固定三目标还有 90 个 declaration callsite input store。
+- 其中一类明显残留是 `i64 @fcntl64()`、`i64 @pthread_*()` 这类本来已有返回值的 declaration。旧规则只处理 `void()` declaration，所以这些输入 store 全部跳过。
+- 本轮只放宽返回类型，不处理已有参数：要求 declaration 仍然 `arg_size()==0`，所有 user 仍是直接 call，且 call 类型等于 callee 返回类型。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:720)
+  - 修改 `collectDeclarationCallInputRewrites`，去掉 `void` 返回限制，保留 declaration、非 intrinsic、零参数、所有 callsite 零参数且返回类型一致的安全条件。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:780)
+  - 修改 `rewriteDeclarationCallInputs`，新 declaration 沿用旧 callee 返回类型，而不是固定生成 `void(i64...)`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:800)
+  - 非 void call rewrite 时把旧 call 的所有 uses 替换为新 call，再删除旧 call，避免返回值用户悬空。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:5695)
+  - 新增非 void declaration 输入测试：`i64 @callee()` 前有 `RDI` store，rewrite 后 callee 为 `i64(i64)`，新 call 继续喂给原来的 `add`，旧 `RDI` store 被删除。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-decl-input-return-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-decl-input-return-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-decl-input-return-gate/*.signature-rewrite.ll \
+  | awk -F '\t' 'NR>1 && $5=="gpr" && $9=="callsite_input_store" {count[$22]++} END {for (k in count) print k, count[k]}' | sort
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 42s | 42s |
+| `libuv:shared-library` | 106s | 107s |
+| `memcached:executable` | 57s | 58s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         14
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3187
+gpr       store        access           full     full         no         3190
+gpr       store        access           partial  full         yes        5
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-decl-input-prefix-gate` 相比：
+
+- `gpr store access full/full`：3221 -> 3190，少 31。
+- `gpr store callsite_input_store`：115 -> 84，少 31。
+- declaration callsite input store：90 -> 59，少 31。
+- internal callsite input store 仍为 25。
+
+判断：
+
+- 这一步覆盖了外部函数已有返回值但输入还停在寄存器 store 的常见情况。
+- 固定三目标耗时同量级，没有看到性能退化。
+- 仍不处理已有参数的 declaration，因为要考虑参数拼接、旧 call 参数来源和 ABI slot 对齐，不能直接复用本轮规则。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 固定三目标再少 31 个 GPR store，主要来自非 void 外部调用输入。 |
+| 理解成本 | 2 | 只是把已有 declaration input rewrite 的返回类型从固定 void 改为沿用原类型。 |
+| 维护成本 | 3 | use 替换是必要条件；后续处理已有参数时要小心不要重复替换或错位。 |
+
+有没有更好的方案：
+
+- 更完整的方向还是统一 declaration 输入和输出 rewrite，一次性根据 callsite 事实生成完整 prototype。
+- 本轮只放宽返回类型，改动小，风险可控，适合先消掉明显残留。
