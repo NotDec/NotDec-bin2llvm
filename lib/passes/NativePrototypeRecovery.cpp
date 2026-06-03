@@ -2883,26 +2883,23 @@ void eraseUnusedRawStackFrameLoads(llvm::Module &module,
     }
 
     std::vector<llvm::LoadInst *> deadLoads;
-    for (const std::string &registerName : registerNames) {
-      llvm::LoadInst *base = externalInputLoadForRegister(function, registerName);
-      if (base == nullptr) {
-        continue;
-      }
-      for (llvm::BasicBlock &block : function) {
-        for (llvm::Instruction &instruction : block) {
-          auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
-          if (load == nullptr || !load->use_empty() || load->isVolatile() ||
-              load->isAtomic()) {
-            continue;
-          }
-          auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(
-              load->getPointerOperand()->stripPointerCasts());
-          if (pointer == nullptr) {
-            continue;
-          }
-          std::set<llvm::Value *> seen;
-          if (stackOffsetFromBase(pointer->getOperand(0), base, seen)) {
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+        if (load == nullptr || !load->use_empty() || load->isVolatile() ||
+            load->isAtomic()) {
+          continue;
+        }
+        auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(
+            load->getPointerOperand()->stripPointerCasts());
+        if (pointer == nullptr) {
+          continue;
+        }
+        for (const std::string &registerName : registerNames) {
+          if (valueUsesExternalInputRegister(*pointer->getOperand(0),
+                                             registerName)) {
             deadLoads.push_back(load);
+            break;
           }
         }
       }

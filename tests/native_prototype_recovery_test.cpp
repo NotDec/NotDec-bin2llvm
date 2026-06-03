@@ -2086,6 +2086,52 @@ llvm::Function *createRawRspLoadFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createPhiRawRspLoadFunction(llvm::Module &module,
+                                            const std::string &name,
+                                            llvm::GlobalVariable *rsp,
+                                            bool useLoadedValue) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *merge = llvm::BasicBlock::Create(context, "merge", function);
+  llvm::IRBuilder<> builder(entry);
+
+  llvm::LoadInst *base =
+      builder.CreateLoad(rsp->getValueType(), rsp, "RSP.external_input");
+  base->setMetadata("notdec.register.external_input",
+                    registerAccessMetadata(context, "RSP"));
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::Value *leftAddress = builder.CreateAdd(
+      base, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(right);
+  llvm::Value *rightAddress = builder.CreateAdd(
+      base, llvm::ConstantInt::get(rsp->getValueType(), -16, true));
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(merge);
+  llvm::PHINode *address = builder.CreatePHI(rsp->getValueType(), 2);
+  address->addIncoming(leftAddress, left);
+  address->addIncoming(rightAddress, right);
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  llvm::LoadInst *load =
+      builder.CreateLoad(rsp->getValueType(), pointer, "raw_rsp_phi_value");
+  if (useLoadedValue) {
+    builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 1));
+  }
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createInternalStackFrameRegisterStoreCallerFunction(
     llvm::Module &module, const std::string &name,
     llvm::GlobalVariable *global, const std::string &registerName,
@@ -8658,16 +8704,30 @@ int main() {
   llvm::Function *usedRawRspLoad =
       createRawRspLoadFunction(rawRspLoadModule, "used_raw_rsp_load", rawRsp,
                                true);
+  llvm::Function *unusedPhiRawRspLoad =
+      createPhiRawRspLoadFunction(rawRspLoadModule, "unused_phi_raw_rsp_load",
+                                  rawRsp, false);
+  llvm::Function *usedPhiRawRspLoad =
+      createPhiRawRspLoadFunction(rawRspLoadModule, "used_phi_raw_rsp_load",
+                                  rawRsp, true);
   notdec::bin2llvm::runNativePrototypeRecovery(rawRspLoadModule,
                                                rewriteOptions);
   ok &= expect(!hasIntToPtr(*unusedRawRspLoad),
                "unused raw RSP load kept old inttoptr");
   ok &= expect(!hasRegisterExternalInputLoad(*unusedRawRspLoad, "RSP"),
                "unused raw RSP load kept dead RSP external input");
+  ok &= expect(!hasIntToPtr(*unusedPhiRawRspLoad),
+               "unused phi raw RSP load kept old inttoptr");
+  ok &= expect(!hasRegisterExternalInputLoad(*unusedPhiRawRspLoad, "RSP"),
+               "unused phi raw RSP load kept dead RSP external input");
   ok &= expect(hasIntToPtr(*usedRawRspLoad),
                "used raw RSP load lost original inttoptr");
   ok &= expect(hasRegisterExternalInputLoad(*usedRawRspLoad, "RSP"),
                "used raw RSP load lost original external input");
+  ok &= expect(hasIntToPtr(*usedPhiRawRspLoad),
+               "used phi raw RSP load lost original inttoptr");
+  ok &= expect(hasRegisterExternalInputLoad(*usedPhiRawRspLoad, "RSP"),
+               "used phi raw RSP load lost original external input");
   if (llvm::verifyModule(rawRspLoadModule, &llvm::errs())) {
     std::cerr << "raw RSP load module verification failed after "
                  "prototype rewrite\n";

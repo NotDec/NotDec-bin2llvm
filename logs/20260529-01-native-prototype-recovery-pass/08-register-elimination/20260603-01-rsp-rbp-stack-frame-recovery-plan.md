@@ -1703,3 +1703,92 @@ other load access         full/full  8
 
 - 最终更好的形态是把这些 stack 地址值恢复成局部 stack object pointer，而不是靠 dead store cleanup 删除。
 - 当前样本里这些值只写 register global 后返回，没有后续语义使用；先删掉能减少错误外泄和后续 residue。
+
+# 2026-06-03 实现记录：放宽 unused raw stack/frame load 匹配
+
+背景：
+
+- 清理 stack/frame 派生非返回 store 后，剩余 `RSP` 里还有 `phi(RSP - const, RSP - const) -> inttoptr -> load`。
+- 旧 `eraseUnusedRawStackFrameLoads()` 只认唯一 external input base 加常量 offset，漏掉了 canonical IR 里经过 phi 的地址。
+- 这些 load 无 use、非 volatile、非 atomic，可以直接删除；used raw load 仍必须保留。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2868)
+  - `eraseUnusedRawStackFrameLoads()` 不再要求地址折成固定 offset。
+  - 对 `inttoptr` 的整数地址 operand 复用 `valueUsesExternalInputRegister()`，只要能追到 ABI stack/frame external input，就允许删除无 use raw load。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2089)
+  - 新增 `createPhiRawRspLoadFunction()`，构造 phi 地址上的 raw `RSP` load。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8707)
+  - 新增 unused / used phi raw load 测试：unused case 删除 `inttoptr` 和死 `RSP.external_input`，used case 保留。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-raw-stack-value-load-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-raw-stack-value-load-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-raw-stack-value-load-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-raw-stack-value-load-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 3s | 2s |
+| `php:extension-calendar` | 11s | 11s |
+
+residue 对比：
+
+```text
+after stack-derived non-return store cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  17
+gpr store access          full/full  114
+other load access         full/full  8
+
+after raw stack value load cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  15
+gpr store access          full/full  114
+other load access         full/full  8
+```
+
+判断：
+
+- 两个小目标上 GPR external input 从 `17` 降到 `15`，GPR store 不变。
+- 命中的是 canonical 后地址里经过 phi 的无用 raw stack load。
+- 规则仍只删除无 use、非 volatile、非 atomic 的 load，不删除 used caller-stack/frame load。
+- 剩余 `RSP/RBP` 主要是真实使用中的 caller-stack read，以及 `RBP + negative offset` frame-base/canary 读。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 只少 2 个 external input，但补上了 canonical phi 地址形态。 |
+| 理解成本 | 2 | 复用已有 stack/frame 值追踪，没有新增复杂状态。 |
+| 维护成本 | 2 | 规则更少依赖固定 offset，后续地址表达式变化时更稳。 |
+
+有没有更好的方案：
+
+- 对 used raw caller-stack load，不能简单删除；下一步要区分 return address / caller saved restore / frame-base canary 语义。
+- `RBP + negative offset` 仍需要先证明当前函数建立了 frame base，不能靠这条 unused-load 规则处理。
