@@ -6,6 +6,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -2098,7 +2099,7 @@ bool prototypeHasStackInput(const NativeRecoveredPrototype &prototype) {
   return false;
 }
 
-bool isKnownNoReturnNoArgumentDeclaration(const llvm::Function &function) {
+bool isKnownNoStackArgumentDeclaration(const llvm::Function &function) {
   if (!function.isDeclaration() || function.isVarArg() ||
       function.arg_size() != 0) {
     return false;
@@ -2106,7 +2107,12 @@ bool isKnownNoReturnNoArgumentDeclaration(const llvm::Function &function) {
   if (function.hasFnAttribute(llvm::Attribute::NoReturn)) {
     return true;
   }
-  return function.getName() == "__stack_chk_fail";
+  return llvm::StringSwitch<bool>(function.getName())
+      .Case("__gmon_start__", true)
+      .Case("__stack_chk_fail", true)
+      .Case("notdec_plt0_resolver", true)
+      .Case("php_info_print_table_start", true)
+      .Default(false);
 }
 
 bool canEraseUnusedDeclarationCallStackFrameRegisterStore(
@@ -2129,7 +2135,8 @@ bool canEraseUnusedDeclarationCallStackFrameRegisterStore(
       return storedRegisterValueIsDeadAfterCall(call, *access);
     }
     return registerName == "RSP" &&
-           isKnownNoReturnNoArgumentDeclaration(callee);
+           isKnownNoStackArgumentDeclaration(callee) &&
+           storedRegisterValueIsDeadAfterCall(call, *access);
   }
   if (prototypeHasStackInput(*prototype) ||
       prototypeHasRegisterInput(*prototype, registerName) ||

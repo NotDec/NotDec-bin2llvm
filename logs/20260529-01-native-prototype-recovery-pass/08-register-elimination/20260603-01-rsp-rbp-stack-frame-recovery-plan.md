@@ -1106,3 +1106,109 @@ stack/frame residue 前几类：
 
 - 更完整的方式是从导入符号、函数属性或 ABI 模型里获得 no-return 信息，而不是只认 `__stack_chk_fail` 名字。
 - 当前先做这个特例，是因为它在两个小目标里稳定出现，且语义边界很清楚。
+
+# 2026-06-03 实现记录：known no-stack declaration 前 RSP store 清理
+
+背景：
+
+- noreturn cleanup 后，两个小目标里剩余的 declaration call 前 `RSP` store 主要来自：
+  `__gmon_start__`、`notdec_plt0_resolver`、`php_info_print_table_start`。
+- 这些调用在当前 IR 里都是 0 参数 declaration；没有 stack input，也没有需要 caller 维护 `@RSP` 全局状态的证据。
+- 普通无 metadata declaration 仍不能放开，因为它可能依赖 stack argument 或真实 stack pointer。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:9)
+  - 新增 `llvm/ADT/StringSwitch.h`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2102)
+  - 将 `isKnownNoReturnNoArgumentDeclaration()` 改成 `isKnownNoStackArgumentDeclaration()`。
+  - 仍要求 callee 是 declaration、非 vararg、0 参数。
+  - 继续接受 LLVM `noreturn` 属性。
+  - 增加白名单：`__gmon_start__`、`__stack_chk_fail`、`notdec_plt0_resolver`、`php_info_print_table_start`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2118)
+  - callee 没 recovered prototype 时，`RSP` 只对 known no-stack declaration 放开，并且仍要求 call 后路径不读 `RSP`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8541)
+  - declaration call 前 `RSP` store 测试新增 `__gmon_start__` case。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8604)
+  - 断言 known no-stack declaration 前 `RSP` store 和死 `RSP.external_input` 会删除。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-known-nostack-call-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-known-nostack-call-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-known-nostack-call-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-known-nostack-call-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 3s | 3s |
+| `php:extension-calendar` | 12s | 12s |
+
+residue 对比：
+
+```text
+after noreturn declaration RSP cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  42
+gpr store access          full/full  141
+other load access         full/full  8
+
+after known no-stack declaration RSP cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  39
+gpr store access          full/full  138
+other load access         full/full  8
+```
+
+stack/frame residue 前几类：
+
+```text
+22 stack_pointer entry_external_input clobbers entry_external_input
+6  stack_pointer entry_external_input clobbers,external_inputs entry_external_input
+6  frame_pointer entry_external_input clobbers entry_external_input
+3  frame_pointer entry_external_input clobbers,external_inputs entry_external_input
+2  stack_pointer ordinary clobbers,external_inputs stack_pointer
+2  frame_pointer ordinary clobbers,external_inputs frame_pointer
+```
+
+判断：
+
+- 两个小目标上 GPR store 从 `141` 降到 `138`，GPR external input 从 `42` 降到 `39`。
+- `__gmon_start__`、`notdec_plt0_resolver`、`php_info_print_table_start` 前的 RSP before-call residue 消失。
+- 剩余 RSP/RBP 已经不再主要是 declaration before-call；下一步应回到 RBP frame-base 和 internal call/store path，而不是继续扩大 declaration 名字白名单。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 清掉 3 个 store 和 3 个 external input，覆盖当前两个小目标里的 0 参数 no-stack declaration。 |
+| 理解成本 | 2 | 条件仍很窄，但引入了名字白名单。 |
+| 维护成本 | 3 | 后续最好从导入符号/函数属性/ABI 模型获得 no-stack 信息，替换手写名字。 |
+
+有没有更好的方案：
+
+- 更完整方案是让 declaration import 信息带出参数/返回/noreturn 属性，或者在 prototype metadata 中表达 no-stack-call。
+- 当前先用白名单，是因为这些名字在两个小目标里明确命中，且普通无 metadata declaration 仍保留。
