@@ -4754,3 +4754,99 @@ vector    load         external_input   full     full         no         1
 
 - 更完整的方向还是统一 declaration 输入和输出 rewrite，一次性根据 callsite 事实生成完整 prototype。
 - 本轮只放宽返回类型，改动小，风险可控，适合先消掉明显残留。
+
+## 2026-06-02 实现记录：已改写 internal call 的旧输入 store 清理
+
+背景：
+
+- 非 void declaration 输入 rewrite 后，固定三目标还有 84 个 `gpr store callsite_input_store`，其中 25 个指向 internal call。
+- 其中一类是 internal callee 已经带 recovered prototype 参数，call 也已经传参，但 call 前仍保留同值的寄存器 input store。例如 `call @notdec_native_126d0(i64 2)` 前还有 `store i64 2, @RDI`。
+- 本轮不改 internal 函数签名，只删除这种已经被 call 参数取代的旧 store。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:815)
+  - 新增 `eraseRewrittenInternalCallInputStores`，遍历已有 `notdec.prototype.recovered` 的 internal callee。
+  - 只处理 callee 当前参数数量和 recovered input 数量一致的 call。
+  - 每个 register input 都要求 call 前存在本地 store、store value 等于对应 call 参数、且 call 会 clobber 该寄存器，才删除这些 store。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3177)
+  - signature rewrite pipeline 中，在 declaration input rewrite 后、dead killed-by-call store 清理前执行该清理。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:7693)
+  - 新增测试：internal callee 已是 `void(i64)` 且 recovered input 为 `RDI`，caller 在 call 前保存同值到 `RDI`；rewrite 后旧 `RDI` store 被删除。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+ctest --test-dir build --output-on-failure
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-internal-input-cleanup-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-internal-input-cleanup-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-internal-input-cleanup-gate/*.signature-rewrite.ll \
+  | awk -F '\t' 'NR>1 && $5=="gpr" && $9=="callsite_input_store" {count[$22]++} END {for (k in count) print k, count[k]}' | sort
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 40s |
+| `libuv:shared-library` | 106s | 106s |
+| `memcached:executable` | 56s | 57s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         14
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3187
+gpr       store        access           full     full         no         3177
+gpr       store        access           partial  full         yes        5
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-decl-input-return-gate` 相比：
+
+- `gpr store access full/full`：3190 -> 3177，少 13。
+- `gpr store callsite_input_store`：84 -> 71，少 13。
+- declaration callsite input store 仍为 59。
+- internal callsite input store：25 -> 12，少 13。
+
+判断：
+
+- 这一步只清理已经被 internal call 参数表达的旧寄存器 store，不改变 prototype 推断和签名。
+- 固定三目标耗时同量级，没有看到性能退化。
+- 剩余 internal 12 个多是已有参数 slot 和旧 store 不完全对应，或者 callee/callsite 仍需要更完整的 prototype 对齐，先不硬删。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 固定三目标少 13 个 GPR store，主要减少 internal callsite input residue。 |
+| 理解成本 | 2 | 逻辑是 post-rewrite cleanup，条件集中，和现有 `eraseCallsiteInputStores` 复用。 |
+| 维护成本 | 2 | 不改签名，风险主要在 store/value/call clobber 判断；已有单测覆盖同值删除。 |
+
+有没有更好的方案：
+
+- 更完整方案是让 internal callsite rewrite 在签名改写当轮就删除这些 store。
+- 当前作为后置 cleanup 更小，适合先消掉已改写 call 的明显残留。

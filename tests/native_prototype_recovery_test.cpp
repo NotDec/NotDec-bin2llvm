@@ -7690,6 +7690,61 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  llvm::Module rewrittenInternalInputStoreModule(
+      "native-prototype-rewritten-internal-input-store-test", context);
+  llvm::GlobalVariable *rewrittenInternalInputStoreRdi =
+      createRegisterGlobal(rewrittenInternalInputStoreModule, "RDI");
+  attachTestAbi(rewrittenInternalInputStoreModule);
+  auto *rewrittenInternalInputStoreCalleeType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context),
+      llvm::ArrayRef<llvm::Type *>{i64Param}, false);
+  llvm::Function *rewrittenInternalInputStoreCallee =
+      llvm::Function::Create(rewrittenInternalInputStoreCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "rewritten_internal_input_store_callee",
+                             rewrittenInternalInputStoreModule);
+  rewrittenInternalInputStoreCallee->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {{"RDI", 0}}, {}));
+  llvm::BasicBlock *rewrittenInternalInputStoreCalleeEntry =
+      llvm::BasicBlock::Create(context, "entry",
+                               rewrittenInternalInputStoreCallee);
+  {
+    llvm::IRBuilder<> builder(rewrittenInternalInputStoreCalleeEntry);
+    builder.CreateRetVoid();
+  }
+  auto *rewrittenInternalInputStoreCallerType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *rewrittenInternalInputStoreCaller =
+      llvm::Function::Create(rewrittenInternalInputStoreCallerType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "rewritten_internal_input_store_caller",
+                             rewrittenInternalInputStoreModule);
+  llvm::BasicBlock *rewrittenInternalInputStoreCallerEntry =
+      llvm::BasicBlock::Create(context, "entry",
+                               rewrittenInternalInputStoreCaller);
+  {
+    llvm::IRBuilder<> builder(rewrittenInternalInputStoreCallerEntry);
+    llvm::Value *argument = llvm::ConstantInt::get(
+        rewrittenInternalInputStoreRdi->getValueType(), 0x4444);
+    llvm::StoreInst *store =
+        builder.CreateStore(argument, rewrittenInternalInputStoreRdi);
+    store->setMetadata("notdec.register.access",
+                       registerAccessMetadata(context, "RDI"));
+    builder.CreateCall(rewrittenInternalInputStoreCallee->getFunctionType(),
+                       rewrittenInternalInputStoreCallee, {argument});
+    builder.CreateRetVoid();
+  }
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      rewrittenInternalInputStoreModule, rewriteOptions);
+  ok &= expect(rewrittenInternalInputStoreCaller != nullptr &&
+                   !hasRegisterStore(*rewrittenInternalInputStoreCaller, "RDI"),
+               "rewritten internal call kept old input store");
+  if (llvm::verifyModule(rewrittenInternalInputStoreModule, &llvm::errs())) {
+    std::cerr << "rewritten internal input store module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
   llvm::Module killedVectorScratchModule(
       "native-prototype-killed-vector-scratch-test", context);
   llvm::GlobalVariable *killedVectorZmm =

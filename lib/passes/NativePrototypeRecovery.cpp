@@ -812,6 +812,49 @@ void rewriteDeclarationCallInputs(llvm::Module &module,
   }
 }
 
+void eraseRewrittenInternalCallInputStores(llvm::Module &module) {
+  for (llvm::Function &callee : module) {
+    if (callee.isDeclaration()) {
+      continue;
+    }
+    std::optional<NativeRecoveredPrototype> prototype =
+        readNativeRecoveredPrototypeMetadata(callee);
+    if (!prototype || prototype->Inputs.empty() ||
+        callee.arg_size() != prototype->Inputs.size()) {
+      continue;
+    }
+    for (llvm::User *user : llvm::make_early_inc_range(callee.users())) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+      if (call == nullptr || call->getCalledFunction() != &callee ||
+          call->arg_size() != prototype->Inputs.size()) {
+        continue;
+      }
+      std::vector<llvm::StoreInst *> inputStores;
+      inputStores.reserve(prototype->Inputs.size());
+      bool safe = true;
+      for (uint64_t index = 0; index < prototype->Inputs.size(); ++index) {
+        const NativeRecoveredPrototypeParam &input = prototype->Inputs[index];
+        if (input.StorageKind != "register") {
+          inputStores.push_back(nullptr);
+          continue;
+        }
+        llvm::StoreInst *store = localCallsiteInputStoreBeforeCall(
+            *call, input.RegisterName, call->getArgOperand(index)->getType());
+        if (store == nullptr ||
+            store->getValueOperand() != call->getArgOperand(index) ||
+            !callClobbersRegister(*call, input.RegisterName)) {
+          safe = false;
+          break;
+        }
+        inputStores.push_back(store);
+      }
+      if (safe) {
+        eraseCallsiteInputStores(inputStores);
+      }
+    }
+  }
+}
+
 bool hasUnsafeReturnValueLoad(
     llvm::ArrayRef<NativePrototypeReturnBinding> returnBindings) {
   // A return value that is still a register load can also be a direct
@@ -3131,6 +3174,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
         rewriteNativeRecoveredPrototypes(module);
     rewriteDeclarationCallOutputs(module, model);
     rewriteDeclarationCallInputs(module, model);
+    eraseRewrittenInternalCallInputStores(module);
     eraseDeadKilledByCallRegisterStores(module, *abi);
     eraseDeadNonReturnVectorStores(module);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
