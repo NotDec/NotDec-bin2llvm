@@ -8532,6 +8532,12 @@ int main() {
           declarationRspStoreModule, "no_metadata_declaration_rsp_store",
           declarationRsp, "RSP", false, false,
           &noMetadataDeclarationRspCallee);
+  llvm::Function *noReturnDeclarationRspCallee = nullptr;
+  llvm::Function *noReturnDeclarationRspCaller =
+      createDeclarationStackFrameRegisterStoreCallerFunction(
+          declarationRspStoreModule, "noreturn_declaration_rsp_store",
+          declarationRsp, "RSP", false, false, &noReturnDeclarationRspCallee);
+  noReturnDeclarationRspCallee->setName("__stack_chk_fail");
   llvm::Function *callerReadsDeclarationRspCallee = nullptr;
   llvm::Function *callerReadsDeclarationRspCaller =
       createDeclarationStackFrameRegisterStoreCallerFunction(
@@ -8557,9 +8563,9 @@ int main() {
           &callerReadsDeclarationRbpCallee);
   for (llvm::Function *function :
        {deadDeclarationRspCaller, branchDeclarationRspCaller,
-        noMetadataDeclarationRspCaller, callerReadsDeclarationRspCaller,
-        deadDeclarationRbpCaller, noMetadataDeclarationRbpCaller,
-        callerReadsDeclarationRbpCaller}) {
+        noMetadataDeclarationRspCaller, noReturnDeclarationRspCaller,
+        callerReadsDeclarationRspCaller, deadDeclarationRbpCaller,
+        noMetadataDeclarationRbpCaller, callerReadsDeclarationRbpCaller}) {
     function->setMetadata(
         "notdec.prototype.recovered",
         makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {}));
@@ -8582,6 +8588,11 @@ int main() {
                "branch declaration call RSP store was not removed");
   ok &= expect(hasRegisterStore(*noMetadataDeclarationRspCaller, "RSP"),
                "declaration call RSP store without callee metadata was removed");
+  ok &= expect(!hasRegisterStore(*noReturnDeclarationRspCaller, "RSP"),
+               "known noreturn declaration call RSP store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*noReturnDeclarationRspCaller,
+                                             "RSP"),
+               "known noreturn declaration call kept dead RSP external input");
   ok &= expect(hasRegisterStore(*callerReadsDeclarationRspCaller, "RSP"),
                "declaration call RSP store needed after call was removed");
   ok &= expect(hasRegisterLoad(*callerReadsDeclarationRspCaller, "RSP"),

@@ -1004,3 +1004,105 @@ bb_3364:
   1. call 边界的 stack effect：`RSP` before-call store 要按 `stackshift/extrapop`、返回地址、outgoing stack arg 解释。
   2. `RBP` frame base：要证明 `RBP` 来自本函数稳定的 `RSP` 派生值，再把 `RBP + const` 映射进 `notdec_stack`。
 - 本轮保留的价值是把一个明确的 RBP call 前状态写清掉，同时没有放宽 RSP 的未知 declaration 语义。
+
+# 2026-06-03 实现记录：noreturn declaration 前 RSP store 清理
+
+背景：
+
+- frame register call-store cleanup 后，两个小目标还剩多处 `__stack_chk_fail` 前的 `RSP` store。
+- `__stack_chk_fail` 是已知 no-return、无参数声明。call 前写 `@RSP` 只是 lifted 全局寄存器状态维护，不影响后续返回路径。
+- 这条规则不能扩到普通无 metadata declaration；普通外部函数仍可能依赖 stack pointer、stack argument 或返回地址语义。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2101)
+  - 新增 `isKnownNoReturnNoArgumentDeclaration()`。
+  - 只接受 declaration、非 vararg、0 参数，并且有 LLVM `noreturn` 属性或名字是 `__stack_chk_fail`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2112)
+  - 在 callee 没有 recovered prototype 时，`RSP` 只对上述 no-return/no-arg declaration 放开。
+  - 普通无 metadata declaration 的 `RSP` store 仍保留。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8535)
+  - declaration call 前 store 测试新增 `__stack_chk_fail` case。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8589)
+  - 断言普通无 metadata `RSP` declaration 仍保留，`__stack_chk_fail` 前 `RSP` store 和死 `RSP.external_input` 会删除。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-noreturn-call-store-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-noreturn-call-store-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-noreturn-call-store-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-noreturn-call-store-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 2s | 3s |
+| `php:extension-calendar` | 12s | 12s |
+
+residue 对比：
+
+```text
+after frame register call-store cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  45
+gpr store access          full/full  149
+other load access         full/full  8
+
+after noreturn declaration RSP cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  42
+gpr store access          full/full  141
+other load access         full/full  8
+```
+
+stack/frame residue 前几类：
+
+```text
+23 stack_pointer entry_external_input clobbers entry_external_input
+8  stack_pointer entry_external_input clobbers,external_inputs entry_external_input
+6  frame_pointer entry_external_input clobbers entry_external_input
+3  frame_pointer entry_external_input clobbers,external_inputs entry_external_input
+2  stack_pointer before_call clobbers,external_inputs stack_pointer notdec_plt0_resolver declaration
+2  stack_pointer before_call clobbers,external_inputs stack_pointer __gmon_start__ declaration
+```
+
+判断：
+
+- 两个小目标上 GPR store 从 `149` 降到 `141`，GPR external input 从 `45` 降到 `42`。
+- `__stack_chk_fail` 前的 `RSP` before-call residue 消失。
+- 普通 declaration 的 `RSP` store 仍保留，下一步仍需要 call stack effect / PLT 语义，而不是继续按名字放宽。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 清掉 8 个 store 和 3 个 external input，命中明确 no-return 错误路径。 |
+| 理解成本 | 2 | 规则很窄，只新增一个 no-return/no-arg declaration 判断。 |
+| 维护成本 | 2 | 后续如果导入更完整的函数属性或 libc 知识，可以替换名字特判。 |
+
+有没有更好的方案：
+
+- 更完整的方式是从导入符号、函数属性或 ABI 模型里获得 no-return 信息，而不是只认 `__stack_chk_fail` 名字。
+- 当前先做这个特例，是因为它在两个小目标里稳定出现，且语义边界很清楚。

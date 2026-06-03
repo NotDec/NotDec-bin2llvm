@@ -649,6 +649,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-decl-call-sp-gate2`
+  - [x] 清理 known no-return/no-arg declaration 前 `RSP` store：普通无 metadata declaration 仍保留，`__stack_chk_fail` 前状态写删除；两个最小 Bench2 目标 signature-rewrite 通过，GPR store 从 149 降到 141，GPR external input 从 45 降到 42。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-rsp-noreturn-call-store-gate`
 
 ## 记录规则
 

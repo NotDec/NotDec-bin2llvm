@@ -2098,6 +2098,17 @@ bool prototypeHasStackInput(const NativeRecoveredPrototype &prototype) {
   return false;
 }
 
+bool isKnownNoReturnNoArgumentDeclaration(const llvm::Function &function) {
+  if (!function.isDeclaration() || function.isVarArg() ||
+      function.arg_size() != 0) {
+    return false;
+  }
+  if (function.hasFnAttribute(llvm::Attribute::NoReturn)) {
+    return true;
+  }
+  return function.getName() == "__stack_chk_fail";
+}
+
 bool canEraseUnusedDeclarationCallStackFrameRegisterStore(
     llvm::StoreInst &store, llvm::CallInst &call, llvm::Function &callee,
     llvm::StringRef registerName) {
@@ -2114,8 +2125,11 @@ bool canEraseUnusedDeclarationCallStackFrameRegisterStore(
   std::optional<NativeRecoveredPrototype> prototype =
       readNativeRecoveredPrototypeMetadata(callee);
   if (!prototype) {
-    return isFramePointerRegisterName(registerName) &&
-           storedRegisterValueIsDeadAfterCall(call, *access);
+    if (isFramePointerRegisterName(registerName)) {
+      return storedRegisterValueIsDeadAfterCall(call, *access);
+    }
+    return registerName == "RSP" &&
+           isKnownNoReturnNoArgumentDeclaration(callee);
   }
   if (prototypeHasStackInput(*prototype) ||
       prototypeHasRegisterInput(*prototype, registerName) ||
