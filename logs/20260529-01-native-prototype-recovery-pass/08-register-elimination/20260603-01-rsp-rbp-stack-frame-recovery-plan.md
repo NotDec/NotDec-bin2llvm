@@ -771,3 +771,115 @@ stack/frame residue 前几类：
 
 - 更完整方案仍然是把 call return address / stackshift 建模起来，而不是只删 unused load。
 - 本轮先删 unused raw load，是因为它不需要解释 stack argument 或 call frame 语义。
+
+# 2026-06-03 实现记录：无 stack input 的 declaration call 前 RSP store 清理
+
+背景：
+
+- unused raw load cleanup 后，GPR store 仍是 `158`，其中剩余大头是 declaration call 前的 `RSP` store。
+- 不是所有 declaration call 都能删：未知声明可能依赖栈参数或真实栈指针状态。
+- 但有一类已经比较明确：声明函数已经带 `notdec.prototype.recovered`，调用也已经改成显式寄存器参数，prototype 里没有 stack input。这时 call 前 `RSP` store 只是 lifted 全局寄存器状态维护；如果 caller 在 call 后也不读 `RSP`，可以删除。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2002)
+  - 新增递归 CFG liveness helper：`reachesReturnOrOverwriteWithoutCallOrAccessLoadRecursive()` 和 `allSuccessorsReachReturnOrOverwriteWithoutCallOrAccessLoadRecursive()`。
+  - 之前 call 后只看一层 successor；现在可以穿过中间 block，直到 return、同寄存器覆盖、同寄存器读或其它 call。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2056)
+  - `storedRegisterValueIsDeadAfterCall()` 改用递归 CFG liveness。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2087)
+  - 新增 `prototypeHasStackInput()`，识别 recovered prototype 是否有 stack storage input。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2097)
+  - 新增 `canEraseUnusedDeclarationCallStackPointerStore()`。
+  - 要求 callee 是非 vararg declaration，call arg 数和 callee arg 数一致。
+  - callee 必须有 recovered prototype，且 input 数和 call arg 数一致。
+  - prototype 不能包含 stack input，也不能包含 `RSP` register input。
+  - call 前到 call 之间不能有 `RSP` 读/写/其它 call，call 后路径不能读 `RSP`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2238)
+  - 新增 `eraseUnusedDeclarationCallStackPointerStores()`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:4086)
+  - 在 internal killed-input cleanup 后、internal call RSP cleanup 前调用 declaration call RSP cleanup。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2046)
+  - 新增 `createDeclarationRspStoreCallerFunction()`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8506)
+  - 新增 declaration call RSP store 测试：有 recovered prototype 且 call 后不读时删除；call 后经分支到 return 也删除；callee 没 metadata 时保留；caller call 后读 `RSP` 时保留。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-rbp-decl-call-sp-gate2 \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-rbp-decl-call-sp-gate2/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-rbp-decl-call-sp-gate2/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-rbp-decl-call-sp-details2.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 2s | 3s |
+| `php:extension-calendar` | 11s | 12s |
+
+residue 对比：
+
+```text
+after unused raw stack load cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  45
+gpr store access          full/full  158
+other load access         full/full  8
+
+after declaration call RSP cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  45
+gpr store access          full/full  150
+other load access         full/full  8
+```
+
+stack/frame residue 前几类：
+
+```text
+26 stack_pointer entry_external_input clobbers entry_external_input
+8  stack_pointer entry_external_input clobbers,external_inputs entry_external_input
+8  stack_pointer before_call clobbers stack_pointer
+6  frame_pointer entry_external_input clobbers entry_external_input
+5  stack_pointer before_call clobbers,external_inputs stack_pointer
+3  frame_pointer entry_external_input clobbers,external_inputs entry_external_input
+```
+
+判断：
+
+- 两个小目标上删除了 `8` 个 declaration call 前 `RSP` store，GPR store 从 `158` 降到 `150`。
+- GPR external input 没变，说明这些 store 的 `RSP.external_input` 仍被其它栈地址或 call frame 语义使用。
+- 剩余 declaration call 前 `RSP` store 主要是 callee 没有足够 prototype 信息、caller 后续路径仍读 `RSP`，或 call frame/stack input 语义还不明确。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 两个小目标少 8 个 GPR store，但剩余 call 栈语义仍未建模。 |
+| 理解成本 | 3 | 增加递归 CFG liveness 和 declaration recovered prototype 条件。 |
+| 维护成本 | 3 | 条件偏保守；后续引入 stackshift/stack input 后需要复核 declaration call 的 stack storage 判断。 |
+
+有没有更好的方案：
+
+- 最终仍应按 Ghidra 思路建 call stack effect，而不是只删 declaration call 前的 `RSP` store。
+- 本轮先处理无 stack input 的声明，是因为它和现有 declaration call 参数 rewrite 的语义一致，风险可控。

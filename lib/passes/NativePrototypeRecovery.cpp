@@ -1999,26 +1999,69 @@ bool canEraseUnusedInternalCallKilledStore(llvm::StoreInst &store,
   return !functionReadsRegisterName(callee, registerName);
 }
 
+bool reachesReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
+    llvm::Instruction *instruction, llvm::BasicBlock &block,
+    const llvm::MDNode &access, std::set<llvm::BasicBlock *> &seen);
+
+bool allSuccessorsReachReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
+    llvm::BasicBlock &block, const llvm::MDNode &access,
+    std::set<llvm::BasicBlock *> &seen) {
+  llvm::Instruction *terminator = block.getTerminator();
+  if (terminator == nullptr) {
+    return false;
+  }
+  if (llvm::isa<llvm::ReturnInst>(terminator)) {
+    return true;
+  }
+  if (llvm::isa<llvm::CallBase>(terminator)) {
+    return false;
+  }
+
+  bool sawSuccessor = false;
+  for (llvm::BasicBlock *successor : llvm::successors(&block)) {
+    sawSuccessor = true;
+    if (!seen.insert(successor).second) {
+      return false;
+    }
+    if (!reachesReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
+            successor->empty() ? nullptr : &successor->front(), *successor,
+            access, seen)) {
+      return false;
+    }
+  }
+  return sawSuccessor;
+}
+
+bool reachesReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
+    llvm::Instruction *instruction, llvm::BasicBlock &block,
+    const llvm::MDNode &access, std::set<llvm::BasicBlock *> &seen) {
+  while (instruction != nullptr) {
+    if (llvm::isa<llvm::ReturnInst>(instruction)) {
+      return true;
+    }
+    if (instructionWritesRegisterAccess(*instruction, access)) {
+      return true;
+    }
+    if (llvm::isa<llvm::CallBase>(instruction) ||
+        instructionReadsRegisterAccess(*instruction, access)) {
+      return false;
+    }
+    instruction = instruction->getNextNode();
+  }
+  return allSuccessorsReachReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
+      block, access, seen);
+}
+
 bool storedRegisterValueIsDeadAfterCall(llvm::CallInst &call,
                                         const llvm::MDNode &access) {
   std::set<llvm::BasicBlock *> seen;
   seen.insert(call.getParent());
-  llvm::Instruction *next = call.getNextNode();
-  while (next != nullptr) {
-    if (llvm::isa<llvm::ReturnInst>(next)) {
-      return true;
-    }
-    if (instructionWritesRegisterAccess(*next, access)) {
-      return true;
-    }
-    if (llvm::isa<llvm::CallBase>(next) ||
-        instructionReadsRegisterAccess(*next, access)) {
-      return false;
-    }
-    next = next->getNextNode();
+  if (llvm::Instruction *next = call.getNextNode()) {
+    return reachesReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
+        next, *call.getParent(), access, seen);
   }
-  return allSuccessorsReachReturnWithoutCallOrAccessLoad(*call.getParent(),
-                                                         access, seen);
+  return allSuccessorsReachReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
+      *call.getParent(), access, seen);
 }
 
 bool canEraseUnusedInternalCallStackPointerStore(
@@ -2037,6 +2080,38 @@ bool canEraseUnusedInternalCallStackPointerStore(
     return false;
   }
   if (functionReadsRegisterName(callee, registerName)) {
+    return false;
+  }
+  return storedRegisterValueIsDeadAfterCall(call, *access);
+}
+
+bool prototypeHasStackInput(const NativeRecoveredPrototype &prototype) {
+  for (const NativeRecoveredPrototypeParam &input : prototype.Inputs) {
+    if (input.StorageKind == "stack") {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool canEraseUnusedDeclarationCallStackPointerStore(
+    llvm::StoreInst &store, llvm::CallInst &call, llvm::Function &callee,
+    llvm::StringRef registerName) {
+  llvm::MDNode *access = store.getMetadata("notdec.register.access");
+  if (access == nullptr || !accessMatchesEffectRegister(*access, registerName)) {
+    return false;
+  }
+  if (valueIsNeededByInterveningInstruction(store, call, *access)) {
+    return false;
+  }
+  if (callee.isVarArg() || call.arg_size() != callee.arg_size()) {
+    return false;
+  }
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(callee);
+  if (!prototype || prototypeHasStackInput(*prototype) ||
+      prototypeHasRegisterInput(*prototype, registerName) ||
+      prototype->Inputs.size() != call.arg_size()) {
     return false;
   }
   return storedRegisterValueIsDeadAfterCall(call, *access);
@@ -2146,6 +2221,55 @@ void eraseUnusedInternalCallKilledInputStores(llvm::Module &module,
                                                    registerName)) {
             deadStores.push_back(store);
           }
+        }
+      }
+    }
+  }
+
+  std::set<llvm::StoreInst *> uniqueStores(deadStores.begin(),
+                                          deadStores.end());
+  for (llvm::StoreInst *store : uniqueStores) {
+    llvm::Value *storedValue = store->getValueOperand();
+    store->eraseFromParent();
+    llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
+  }
+}
+
+void eraseUnusedDeclarationCallStackPointerStores(llvm::Module &module,
+                                                  const NativeAbiSpec &abi) {
+  if (abi.StackPointerRegister.empty()) {
+    return;
+  }
+
+  std::vector<llvm::StoreInst *> deadStores;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr || !callee->isDeclaration() ||
+            callee->isIntrinsic()) {
+          continue;
+        }
+        llvm::StoreInst *store = localCallsiteInputStoreBeforeCall(
+            *call, abi.StackPointerRegister,
+            llvm::Type::getInt64Ty(module.getContext()));
+        if (store != nullptr &&
+            canEraseUnusedDeclarationCallStackPointerStore(
+                *store, *call, *callee, abi.StackPointerRegister)) {
+          deadStores.push_back(store);
         }
       }
     }
@@ -3959,6 +4083,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseRewrittenInternalCallInputStores(module);
     eraseDeadKilledByCallRegisterStores(module, *abi);
     eraseUnusedInternalCallKilledInputStores(module, *abi);
+    eraseUnusedDeclarationCallStackPointerStores(module, *abi);
     eraseUnusedInternalCallStackPointerStores(module, *abi);
     rewriteStaticStackMemoryAccesses(module, *abi);
     eraseUnusedRawStackFrameLoads(module, *abi);

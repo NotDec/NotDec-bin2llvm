@@ -2043,6 +2043,46 @@ llvm::Function *createInternalRspStoreCallerFunction(
   return caller;
 }
 
+llvm::Function *createDeclarationRspStoreCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    bool callerReadsRspAfterCall, bool branchAfterCall,
+    llvm::Function **calleeOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             name + "_callee", module);
+
+  llvm::Function *caller =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *base = createExternalInputLoad(builder, rsp, "RSP");
+  llvm::Value *adjusted = builder.CreateAdd(
+      base, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::StoreInst *store = builder.CreateStore(adjusted, rsp);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RSP"));
+  builder.CreateCall(callee->getFunctionType(), callee);
+  if (branchAfterCall) {
+    llvm::BasicBlock *afterCall =
+        llvm::BasicBlock::Create(context, "after_call", caller);
+    builder.CreateBr(afterCall);
+    builder.SetInsertPoint(afterCall);
+  }
+  if (callerReadsRspAfterCall) {
+    llvm::LoadInst *load = builder.CreateLoad(rsp->getValueType(), rsp);
+    load->setMetadata("notdec.register.access",
+                      registerAccessMetadata(context, "RSP"));
+    builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 1));
+  }
+  builder.CreateRetVoid();
+
+  *calleeOut = callee;
+  return caller;
+}
+
 llvm::Function *createInternalCallKilledGprStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName, llvm::Function *callee) {
@@ -8459,6 +8499,65 @@ int main() {
                "used raw RSP load lost original external input");
   if (llvm::verifyModule(rawRspLoadModule, &llvm::errs())) {
     std::cerr << "raw RSP load module verification failed after "
+                 "prototype rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationRspStoreModule(
+      "native-prototype-declaration-rsp-store-test", context);
+  llvm::GlobalVariable *declarationRsp =
+      createRegisterGlobal(declarationRspStoreModule, "RSP");
+  attachStackFramePreservedTestAbi(declarationRspStoreModule);
+  llvm::Function *deadDeclarationRspCallee = nullptr;
+  llvm::Function *deadDeclarationRspCaller =
+      createDeclarationRspStoreCallerFunction(
+          declarationRspStoreModule, "dead_declaration_rsp_store",
+          declarationRsp, false, false, &deadDeclarationRspCallee);
+  llvm::Function *branchDeclarationRspCallee = nullptr;
+  llvm::Function *branchDeclarationRspCaller =
+      createDeclarationRspStoreCallerFunction(
+          declarationRspStoreModule, "branch_declaration_rsp_store",
+          declarationRsp, false, true, &branchDeclarationRspCallee);
+  llvm::Function *noMetadataDeclarationRspCallee = nullptr;
+  llvm::Function *noMetadataDeclarationRspCaller =
+      createDeclarationRspStoreCallerFunction(
+          declarationRspStoreModule, "no_metadata_declaration_rsp_store",
+          declarationRsp, false, false, &noMetadataDeclarationRspCallee);
+  llvm::Function *callerReadsDeclarationRspCallee = nullptr;
+  llvm::Function *callerReadsDeclarationRspCaller =
+      createDeclarationRspStoreCallerFunction(
+          declarationRspStoreModule, "caller_reads_declaration_rsp_store",
+          declarationRsp, true, false, &callerReadsDeclarationRspCallee);
+  for (llvm::Function *function :
+       {deadDeclarationRspCaller, branchDeclarationRspCaller,
+        noMetadataDeclarationRspCaller, callerReadsDeclarationRspCaller}) {
+    function->setMetadata(
+        "notdec.prototype.recovered",
+        makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {}));
+  }
+  for (llvm::Function *function :
+       {deadDeclarationRspCallee, branchDeclarationRspCallee,
+        callerReadsDeclarationRspCallee}) {
+    function->setMetadata(
+        "notdec.prototype.recovered",
+        makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {}));
+  }
+  notdec::bin2llvm::runNativePrototypeRecovery(declarationRspStoreModule,
+                                               rewriteOptions);
+  ok &= expect(!hasRegisterStore(*deadDeclarationRspCaller, "RSP"),
+               "unused declaration call RSP store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*deadDeclarationRspCaller, "RSP"),
+               "unused declaration call RSP store kept dead RSP external input");
+  ok &= expect(!hasRegisterStore(*branchDeclarationRspCaller, "RSP"),
+               "branch declaration call RSP store was not removed");
+  ok &= expect(hasRegisterStore(*noMetadataDeclarationRspCaller, "RSP"),
+               "declaration call RSP store without callee metadata was removed");
+  ok &= expect(hasRegisterStore(*callerReadsDeclarationRspCaller, "RSP"),
+               "declaration call RSP store needed after call was removed");
+  ok &= expect(hasRegisterLoad(*callerReadsDeclarationRspCaller, "RSP"),
+               "caller RSP load after declaration call was removed");
+  if (llvm::verifyModule(declarationRspStoreModule, &llvm::errs())) {
+    std::cerr << "declaration RSP store module verification failed after "
                  "prototype rewrite\n";
     return EXIT_FAILURE;
   }
