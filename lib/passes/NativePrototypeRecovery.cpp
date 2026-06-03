@@ -591,6 +591,10 @@ void eraseCallsiteInputStores(llvm::ArrayRef<llvm::StoreInst *> inputStores);
 
 bool callClobbersRegister(llvm::CallBase &call, llvm::StringRef registerName);
 
+bool isFramePointerRegisterName(llvm::StringRef registerName);
+
+std::set<std::string> stackFrameRegisterNames(const NativeAbiSpec &abi);
+
 struct DeclarationCallInputRewrite {
   llvm::CallInst *Call = nullptr;
   std::vector<NativeRecoveredPrototypeParam> Inputs;
@@ -2064,7 +2068,7 @@ bool storedRegisterValueIsDeadAfterCall(llvm::CallInst &call,
       *call.getParent(), access, seen);
 }
 
-bool canEraseUnusedInternalCallStackPointerStore(
+bool canEraseUnusedInternalCallStackFrameRegisterStore(
     llvm::StoreInst &store, llvm::CallInst &call, llvm::Function &callee,
     llvm::StringRef registerName) {
   llvm::MDNode *access = store.getMetadata("notdec.register.access");
@@ -2094,7 +2098,7 @@ bool prototypeHasStackInput(const NativeRecoveredPrototype &prototype) {
   return false;
 }
 
-bool canEraseUnusedDeclarationCallStackPointerStore(
+bool canEraseUnusedDeclarationCallStackFrameRegisterStore(
     llvm::StoreInst &store, llvm::CallInst &call, llvm::Function &callee,
     llvm::StringRef registerName) {
   llvm::MDNode *access = store.getMetadata("notdec.register.access");
@@ -2109,7 +2113,11 @@ bool canEraseUnusedDeclarationCallStackPointerStore(
   }
   std::optional<NativeRecoveredPrototype> prototype =
       readNativeRecoveredPrototypeMetadata(callee);
-  if (!prototype || prototypeHasStackInput(*prototype) ||
+  if (!prototype) {
+    return isFramePointerRegisterName(registerName) &&
+           storedRegisterValueIsDeadAfterCall(call, *access);
+  }
+  if (prototypeHasStackInput(*prototype) ||
       prototypeHasRegisterInput(*prototype, registerName) ||
       prototype->Inputs.size() != call.arg_size()) {
     return false;
@@ -2235,9 +2243,10 @@ void eraseUnusedInternalCallKilledInputStores(llvm::Module &module,
   }
 }
 
-void eraseUnusedDeclarationCallStackPointerStores(llvm::Module &module,
-                                                  const NativeAbiSpec &abi) {
-  if (abi.StackPointerRegister.empty()) {
+void eraseUnusedDeclarationCallStackFrameRegisterStores(llvm::Module &module,
+                                                        const NativeAbiSpec &abi) {
+  std::set<std::string> registerNames = stackFrameRegisterNames(abi);
+  if (registerNames.empty()) {
     return;
   }
 
@@ -2263,13 +2272,14 @@ void eraseUnusedDeclarationCallStackPointerStores(llvm::Module &module,
             callee->isIntrinsic()) {
           continue;
         }
-        llvm::StoreInst *store = localCallsiteInputStoreBeforeCall(
-            *call, abi.StackPointerRegister,
-            llvm::Type::getInt64Ty(module.getContext()));
-        if (store != nullptr &&
-            canEraseUnusedDeclarationCallStackPointerStore(
-                *store, *call, *callee, abi.StackPointerRegister)) {
-          deadStores.push_back(store);
+        for (const std::string &registerName : registerNames) {
+          llvm::StoreInst *store = localCallsiteInputStoreBeforeCall(
+              *call, registerName, llvm::Type::getInt64Ty(module.getContext()));
+          if (store != nullptr &&
+              canEraseUnusedDeclarationCallStackFrameRegisterStore(
+                  *store, *call, *callee, registerName)) {
+            deadStores.push_back(store);
+          }
         }
       }
     }
@@ -2284,9 +2294,10 @@ void eraseUnusedDeclarationCallStackPointerStores(llvm::Module &module,
   }
 }
 
-void eraseUnusedInternalCallStackPointerStores(llvm::Module &module,
-                                               const NativeAbiSpec &abi) {
-  if (abi.StackPointerRegister.empty()) {
+void eraseUnusedInternalCallStackFrameRegisterStores(llvm::Module &module,
+                                                     const NativeAbiSpec &abi) {
+  std::set<std::string> registerNames = stackFrameRegisterNames(abi);
+  if (registerNames.empty()) {
     return;
   }
 
@@ -2311,13 +2322,14 @@ void eraseUnusedInternalCallStackPointerStores(llvm::Module &module,
         if (callee == nullptr || callee->isDeclaration()) {
           continue;
         }
-        llvm::StoreInst *store = localCallsiteInputStoreBeforeCall(
-            *call, abi.StackPointerRegister,
-            llvm::Type::getInt64Ty(module.getContext()));
-        if (store != nullptr &&
-            canEraseUnusedInternalCallStackPointerStore(
-                *store, *call, *callee, abi.StackPointerRegister)) {
-          deadStores.push_back(store);
+        for (const std::string &registerName : registerNames) {
+          llvm::StoreInst *store = localCallsiteInputStoreBeforeCall(
+              *call, registerName, llvm::Type::getInt64Ty(module.getContext()));
+          if (store != nullptr &&
+              canEraseUnusedInternalCallStackFrameRegisterStore(
+                  *store, *call, *callee, registerName)) {
+            deadStores.push_back(store);
+          }
         }
       }
     }
@@ -4083,8 +4095,8 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseRewrittenInternalCallInputStores(module);
     eraseDeadKilledByCallRegisterStores(module, *abi);
     eraseUnusedInternalCallKilledInputStores(module, *abi);
-    eraseUnusedDeclarationCallStackPointerStores(module, *abi);
-    eraseUnusedInternalCallStackPointerStores(module, *abi);
+    eraseUnusedDeclarationCallStackFrameRegisterStores(module, *abi);
+    eraseUnusedInternalCallStackFrameRegisterStores(module, *abi);
     rewriteStaticStackMemoryAccesses(module, *abi);
     eraseUnusedRawStackFrameLoads(module, *abi);
     eraseDeadStackFrameRegisterStores(module, *abi);

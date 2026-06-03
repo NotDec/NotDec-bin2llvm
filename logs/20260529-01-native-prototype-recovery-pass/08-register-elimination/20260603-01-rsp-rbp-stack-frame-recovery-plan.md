@@ -883,3 +883,124 @@ stack/frame residue 前几类：
 
 - 最终仍应按 Ghidra 思路建 call stack effect，而不是只删 declaration call 前的 `RSP` store。
 - 本轮先处理无 stack input 的声明，是因为它和现有 declaration call 参数 rewrite 的语义一致，风险可控。
+
+# 2026-06-03 实现记录：call 前 frame register store 清理
+
+背景：
+
+- declaration call 前 `RSP` store 清理后，两个小目标还剩一个明显的 `RBP` before-call 样本：
+  `notdec_native_3360` 在调用 `php_info_print_table_start()` 前把 `RSP - 8` 写进 `@RBP`。
+- 这个 `RBP` 写不是栈参数，也不是 callee 需要的显式输入；call 后 caller 也不再读取 `RBP`。
+- 但不能把规则直接扩大到所有寄存器。这里只处理 ABI stack pointer 和 x86 frame pointer 名字；`RSP` 仍要求 declaration callee 有 recovered prototype，避免未知栈参数/真实 stack pointer 语义被删。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:594)
+  - 给 `isFramePointerRegisterName()` 和 `stackFrameRegisterNames()` 增加前置声明，供 call cleanup 逻辑复用。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2071)
+  - 将 `canEraseUnusedInternalCallStackPointerStore()` 扩成 `canEraseUnusedInternalCallStackFrameRegisterStore()`。
+  - internal direct call 前的 dead store 现在按 `stackFrameRegisterNames(abi)` 同时检查 `RSP/RBP`。
+  - 仍要求 callee recovered prototype 不把该寄存器作为 input，callee body 不读该寄存器，caller call 后也不读。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2101)
+  - 将 declaration call 前的规则扩成 `canEraseUnusedDeclarationCallStackFrameRegisterStore()`。
+  - 对 `RSP`：仍要求 callee 有 recovered prototype，且无 stack input / 无 `RSP` input。
+  - 对 frame pointer 名字：callee 没 recovered prototype 时也允许删，但必须确认 caller call 后不读该 frame register。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2246)
+  - 将 declaration cleanup 从单一 stack pointer 改成遍历 `stackFrameRegisterNames(abi)`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2297)
+  - 将 internal call cleanup 同样改成遍历 `stackFrameRegisterNames(abi)`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:4098)
+  - signature rewrite cleanup pipeline 调用新的 stack/frame register cleanup。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2003)
+  - 将 internal call 前 store helper 参数化为 `createInternalStackFrameRegisterStoreCallerFunction()`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2050)
+  - 将 declaration call 前 store helper 参数化为 `createDeclarationStackFrameRegisterStoreCallerFunction()`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8512)
+  - declaration call 测试补 `RBP` 正反例：无 callee metadata 的 `RBP` call 前 store 可删；无 callee metadata 的 `RSP` 仍保留；call 后读 `RBP` 时保留。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8609)
+  - internal call 测试补 `RBP` 正反例：callee/caller 都不读时删除；callee 读或 caller call 后读时保留。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-rbp-frame-call-store-gate2 \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-rbp-frame-call-store-gate2/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-rbp-frame-call-store-gate2/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-rbp-frame-call-store-details2.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 3s | 3s |
+| `php:extension-calendar` | 12s | 12s |
+
+residue 对比：
+
+```text
+after declaration call RSP cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  45
+gpr store access          full/full  150
+other load access         full/full  8
+
+after frame register call-store cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  45
+gpr store access          full/full  149
+other load access         full/full  8
+```
+
+抽查：
+
+```llvm
+define { i64, i64 } @notdec_native_3360() {
+bb_3364:
+  %0 = add i64 %RSP.external_input, -8
+  %1 = add i64 %0, -8
+  store i64 %1, ptr @RSP, align 4, !notdec.register.access !91
+  call void @php_info_print_table_start()
+  ...
+}
+```
+
+判断：
+
+- 两个小目标只少了 `1` 个 GPR store，命中的是 `php_info_print_table_start()` 前的 `RBP` store。
+- `RSP` before-call store 没有继续放宽。剩余 `RSP` 仍要等 call `stackshift/extrapop`、返回地址、outgoing stack arg 建模，不能用 frame register cleanup 硬删。
+- 剩余 `RBP.external_input` 多数是 `RBP + negative offset -> inttoptr -> load`。这些更像 frame-relative 访问，不能仅凭 `RBP` 名字改成本地 alloca；要先证明当前函数 frame base。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 真实小目标只少 1 个 store，但补上了 RBP call 前 store 的安全规则。 |
+| 理解成本 | 3 | 原 RSP cleanup 被泛化成 stack/frame register cleanup，需要区分 RSP 和 frame pointer 的 declaration 条件。 |
+| 维护成本 | 3 | 后续引入 call stack effect 后，需要复核 declaration 无 metadata 的 frame pointer 特判。 |
+
+有没有更好的方案：
+
+- 这轮不是 RSP/RBP 的核心突破。真正的关键问题仍是两个：
+  1. call 边界的 stack effect：`RSP` before-call store 要按 `stackshift/extrapop`、返回地址、outgoing stack arg 解释。
+  2. `RBP` frame base：要证明 `RBP` 来自本函数稳定的 `RSP` 派生值，再把 `RBP + const` 映射进 `notdec_stack`。
+- 本轮保留的价值是把一个明确的 RBP call 前状态写清掉，同时没有放宽 RSP 的未知 declaration 语义。

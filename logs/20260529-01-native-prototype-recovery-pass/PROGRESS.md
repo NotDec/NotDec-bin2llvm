@@ -645,6 +645,8 @@
     - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-unused-raw-load-gate`
   - [x] 清理无 stack input 的 declaration call 前 `RSP` store：声明已有 recovered prototype、调用显式传参、caller 后续不读 `RSP` 时删除；两个最小 Bench2 目标 signature-rewrite 通过，GPR store 从 158 降到 150。
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+  - [x] 将 call 前 stack pointer store 清理扩到 frame register：`RBP` call 前 store 在 caller/callee 都不读时可删，`RSP` 仍保留 declaration prototype 门槛；两个最小 Bench2 目标 signature-rewrite 通过，GPR store 从 150 降到 149。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-decl-call-sp-gate2`
 
