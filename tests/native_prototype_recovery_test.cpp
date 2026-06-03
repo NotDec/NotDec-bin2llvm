@@ -137,6 +137,17 @@ void attachThreeInputTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachFourInputTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+  abi.Inputs.push_back(inputRegister("RDI"));
+  abi.Inputs.push_back(inputRegister("RSI"));
+  abi.Inputs.push_back(inputRegister("RDX"));
+  abi.Inputs.push_back(inputRegister("RCX"));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 void attachPreservedInputTestAbi(llvm::Module &module,
                                  const std::string &registerName) {
   notdec::bin2llvm::NativeAbiSpec abi;
@@ -5863,6 +5874,227 @@ int main() {
                "declaration input prefix rewrite kept common input stores");
   if (llvm::verifyModule(declarationCallInputPrefixModule, &llvm::errs())) {
     std::cerr << "declaration call input prefix module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputAppendModule(
+      "native-prototype-declaration-call-input-append-test", context);
+  llvm::GlobalVariable *declarationCallInputAppendRdx =
+      createRegisterGlobal(declarationCallInputAppendModule, "RDX");
+  llvm::GlobalVariable *declarationCallInputAppendRcx =
+      createRegisterGlobal(declarationCallInputAppendModule, "RCX");
+  attachFourInputTestAbi(declarationCallInputAppendModule);
+  auto *declarationCallInputAppendCalleeType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {i64Param, i64Param}, false);
+  llvm::Function *declarationCallInputAppendCallee =
+      llvm::Function::Create(declarationCallInputAppendCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_append_callee",
+                             declarationCallInputAppendModule);
+  declarationCallInputAppendCallee->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall",
+                                     {{"RDI", 0}, {"RSI", 1}}, {}));
+  auto *declarationCallInputAppendUserType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputAppendUser = llvm::Function::Create(
+      declarationCallInputAppendUserType, llvm::GlobalValue::ExternalLinkage,
+      "declaration_call_input_append_user",
+      declarationCallInputAppendModule);
+  llvm::Value *declarationCallInputAppendRdiArgument =
+      llvm::ConstantInt::get(i64Param, 0x1111);
+  llvm::Value *declarationCallInputAppendRsiArgument =
+      llvm::ConstantInt::get(i64Param, 0x2222);
+  llvm::BasicBlock *declarationCallInputAppendEntry =
+      llvm::BasicBlock::Create(context, "entry",
+                               declarationCallInputAppendUser);
+  {
+    llvm::IRBuilder<> builder(declarationCallInputAppendEntry);
+    llvm::Value *rdxArgument =
+        llvm::ConstantInt::get(declarationCallInputAppendRdx->getValueType(),
+                               0x3333);
+    llvm::StoreInst *rdxStore =
+        builder.CreateStore(rdxArgument, declarationCallInputAppendRdx);
+    rdxStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, "RDX"));
+    llvm::Value *rcxArgument =
+        llvm::ConstantInt::get(declarationCallInputAppendRcx->getValueType(),
+                               0x4444);
+    llvm::StoreInst *rcxStore =
+        builder.CreateStore(rcxArgument, declarationCallInputAppendRcx);
+    rcxStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, "RCX"));
+    builder.CreateCall(declarationCallInputAppendCallee->getFunctionType(),
+                       declarationCallInputAppendCallee,
+                       {declarationCallInputAppendRdiArgument,
+                        declarationCallInputAppendRsiArgument});
+    builder.CreateRetVoid();
+  }
+  notdec::bin2llvm::NativePrototypeRecoveryOptions appendInputOptions;
+  appendInputOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputAppendModule, appendInputOptions);
+  llvm::Function *appendCalleeAfterRewrite =
+      declarationCallInputAppendModule.getFunction(
+          "declaration_call_input_append_callee");
+  ok &= expect(appendCalleeAfterRewrite != nullptr &&
+                   functionTypeShape(
+                       *appendCalleeAfterRewrite->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef<llvm::Type *>{i64Param, i64Param,
+                                                    i64Param, i64Param}),
+               "declaration input append did not add later ABI inputs");
+  llvm::CallInst *declarationCallInputAppendNewCall = nullptr;
+  if (declarationCallInputAppendUser != nullptr) {
+    for (llvm::BasicBlock &block : *declarationCallInputAppendUser) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == appendCalleeAfterRewrite) {
+          declarationCallInputAppendNewCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(declarationCallInputAppendNewCall != nullptr &&
+                   declarationCallInputAppendNewCall->arg_size() == 4,
+               "declaration input append did not update call arguments");
+  ok &= expect(declarationCallInputAppendNewCall != nullptr &&
+                   declarationCallInputAppendNewCall->getArgOperand(0) ==
+                       declarationCallInputAppendRdiArgument &&
+                   declarationCallInputAppendNewCall->getArgOperand(1) ==
+                       declarationCallInputAppendRsiArgument,
+               "declaration input append did not preserve existing arguments");
+  ok &= expect(declarationCallInputAppendUser != nullptr &&
+                   !hasRegisterStore(*declarationCallInputAppendUser, "RDX") &&
+                   !hasRegisterStore(*declarationCallInputAppendUser, "RCX"),
+               "declaration input append kept old appended input stores");
+  if (llvm::verifyModule(declarationCallInputAppendModule, &llvm::errs())) {
+    std::cerr << "declaration call input append module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputAppendCommonSlotModule(
+      "native-prototype-declaration-call-input-append-common-slot-test",
+      context);
+  llvm::GlobalVariable *declarationCallInputAppendCommonSlotRdx =
+      createRegisterGlobal(declarationCallInputAppendCommonSlotModule, "RDX");
+  llvm::GlobalVariable *declarationCallInputAppendCommonSlotRcx =
+      createRegisterGlobal(declarationCallInputAppendCommonSlotModule, "RCX");
+  attachFourInputTestAbi(declarationCallInputAppendCommonSlotModule);
+  auto *declarationCallInputAppendCommonSlotCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                              {i64Param, i64Param}, false);
+  llvm::Function *declarationCallInputAppendCommonSlotCallee =
+      llvm::Function::Create(declarationCallInputAppendCommonSlotCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_append_common_slot_callee",
+                             declarationCallInputAppendCommonSlotModule);
+  declarationCallInputAppendCommonSlotCallee->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall",
+                                     {{"RDI", 0}, {"RSI", 1}}, {}));
+  llvm::Value *declarationCallInputAppendCommonSlotRdiArgument =
+      llvm::ConstantInt::get(i64Param, 0x1111);
+  llvm::Value *declarationCallInputAppendCommonSlotRsiArgument =
+      llvm::ConstantInt::get(i64Param, 0x2222);
+  auto *declarationCallInputAppendCommonSlotUserType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputAppendCommonSlotFirstUser =
+      llvm::Function::Create(declarationCallInputAppendCommonSlotUserType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_append_common_slot_first",
+                             declarationCallInputAppendCommonSlotModule);
+  {
+    llvm::BasicBlock *entry = llvm::BasicBlock::Create(
+        context, "entry", declarationCallInputAppendCommonSlotFirstUser);
+    llvm::IRBuilder<> builder(entry);
+    llvm::Value *rdxArgument = llvm::ConstantInt::get(
+        declarationCallInputAppendCommonSlotRdx->getValueType(), 0x3333);
+    llvm::StoreInst *rdxStore =
+        builder.CreateStore(rdxArgument,
+                            declarationCallInputAppendCommonSlotRdx);
+    rdxStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, "RDX"));
+    llvm::Value *rcxArgument = llvm::ConstantInt::get(
+        declarationCallInputAppendCommonSlotRcx->getValueType(), 0x4444);
+    llvm::StoreInst *rcxStore =
+        builder.CreateStore(rcxArgument,
+                            declarationCallInputAppendCommonSlotRcx);
+    rcxStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, "RCX"));
+    builder.CreateCall(
+        declarationCallInputAppendCommonSlotCallee->getFunctionType(),
+        declarationCallInputAppendCommonSlotCallee,
+        {declarationCallInputAppendCommonSlotRdiArgument,
+         declarationCallInputAppendCommonSlotRsiArgument});
+    builder.CreateRetVoid();
+  }
+  llvm::Function *declarationCallInputAppendCommonSlotSecondUser =
+      llvm::Function::Create(declarationCallInputAppendCommonSlotUserType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_append_common_slot_second",
+                             declarationCallInputAppendCommonSlotModule);
+  {
+    llvm::BasicBlock *entry = llvm::BasicBlock::Create(
+        context, "entry", declarationCallInputAppendCommonSlotSecondUser);
+    llvm::IRBuilder<> builder(entry);
+    llvm::Value *rcxArgument = llvm::ConstantInt::get(
+        declarationCallInputAppendCommonSlotRcx->getValueType(), 0x5555);
+    llvm::StoreInst *rcxStore =
+        builder.CreateStore(rcxArgument,
+                            declarationCallInputAppendCommonSlotRcx);
+    rcxStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, "RCX"));
+    builder.CreateCall(
+        declarationCallInputAppendCommonSlotCallee->getFunctionType(),
+        declarationCallInputAppendCommonSlotCallee,
+        {declarationCallInputAppendCommonSlotRdiArgument,
+         declarationCallInputAppendCommonSlotRsiArgument});
+    builder.CreateRetVoid();
+  }
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputAppendCommonSlotModule, appendInputOptions);
+  llvm::Function *appendCommonSlotCalleeAfterRewrite =
+      declarationCallInputAppendCommonSlotModule.getFunction(
+          "declaration_call_input_append_common_slot_callee");
+  ok &= expect(appendCommonSlotCalleeAfterRewrite != nullptr &&
+                   functionTypeShape(
+                       *appendCommonSlotCalleeAfterRewrite->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef<llvm::Type *>{i64Param, i64Param,
+                                                    i64Param}),
+               "declaration input append did not keep common later ABI slot");
+  llvm::CallInst *declarationCallInputAppendCommonSlotNewCall = nullptr;
+  if (declarationCallInputAppendCommonSlotFirstUser != nullptr) {
+    for (llvm::BasicBlock &block :
+         *declarationCallInputAppendCommonSlotFirstUser) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr &&
+            call->getCalledFunction() == appendCommonSlotCalleeAfterRewrite) {
+          declarationCallInputAppendCommonSlotNewCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(declarationCallInputAppendCommonSlotNewCall != nullptr &&
+                   declarationCallInputAppendCommonSlotNewCall->arg_size() == 3,
+               "declaration input append common slot did not update call");
+  ok &= expect(declarationCallInputAppendCommonSlotFirstUser != nullptr &&
+                   hasRegisterStore(
+                       *declarationCallInputAppendCommonSlotFirstUser, "RDX") &&
+                   !hasRegisterStore(
+                       *declarationCallInputAppendCommonSlotFirstUser, "RCX"),
+               "declaration input append common slot removed wrong stores");
+  ok &= expect(declarationCallInputAppendCommonSlotSecondUser != nullptr &&
+                   !hasRegisterStore(
+                       *declarationCallInputAppendCommonSlotSecondUser, "RCX"),
+               "declaration input append common slot kept old RCX store");
+  if (llvm::verifyModule(declarationCallInputAppendCommonSlotModule,
+                         &llvm::errs())) {
+    std::cerr << "declaration call input append common slot module "
+                 "verification failed\n";
     return EXIT_FAILURE;
   }
 

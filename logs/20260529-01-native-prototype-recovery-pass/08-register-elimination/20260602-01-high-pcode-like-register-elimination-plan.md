@@ -4850,3 +4850,113 @@ vector    load         external_input   full     full         no         1
 
 - 更完整方案是让 internal callsite rewrite 在签名改写当轮就删除这些 store。
 - 当前作为后置 cleanup 更小，适合先消掉已改写 call 的明显残留。
+
+## 2026-06-03 实现记录：已改写 declaration 的后续 ABI 输入追加
+
+背景：
+
+- 固定三目标里，上一轮后还有 59 个 declaration `callsite_input_store`。
+- 典型例子是 `__assert_fail(i64, i64)`：前两个输入已经是 LLVM call 参数，但调用点前仍保留 `RCX` / `RDX` 这类后续 ABI 输入 store。
+- 之前尝试靠已有函数参数数量或参数名推 ABI slot 不稳定。本轮只信任 `notdec.prototype.recovered` metadata。
+
+改动：
+
+- [NativePrototypeModel.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativePrototypeModel.h:26)
+  - 新增 `NativePrototypeModel::modelName()`，让 declaration rewrite 写回 recovered metadata 时能复用当前 ABI 名称。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:694)
+  - 新增 `commonDeclarationInputSlots()`，用于已有 recovered metadata 的 declaration：按所有 callsite 都能提供的 ABI slot 追加输入，不要求这些 slot 必须是连续前缀。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:732)
+  - 新增 `declarationInputParamMatchesAbi()` 和 `existingDeclarationInputs()`。
+  - 只有 declaration 当前参数数量、`notdec.prototype.recovered` 输入数量、ABI model、参数类型和 ABI slot 都匹配时，才允许在已有参数后追加输入。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:766)
+  - 新增 `declarationInputSuffix()`，要求新发现的输入 slot 必须在已有输入之后。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:793)
+  - `declarationCallInputRewriteForCall()` 保留已有 call 参数，只为后续输入查找调用点当前寄存器值和待删除 store。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:826)
+  - `collectDeclarationCallInputRewrites()` 不再只处理零参数 declaration。
+  - 零参数 declaration 仍沿用公共前缀规则；已有 recovered metadata 的 declaration 使用公共 ABI slot 规则。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:916)
+  - `rewriteDeclarationCallInputs()` 循环执行，允许同一轮先从零参数声明恢复出前几个参数，再基于新写入的 metadata 继续追加后续公共输入。
+  - 新建 declaration 时写回完整 `notdec.prototype.recovered`，避免后续追加只能靠 LLVM 参数名猜 slot。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:140)
+  - 新增四寄存器测试 ABI。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:5880)
+  - 新增测试：已有 `RDI/RSI` declaration 输入后，追加 `RDX/RCX`，并删除旧 input store。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:5977)
+  - 新增测试：两个 callsite 只有 `RCX` 是公共后续 slot，rewrite 只追加 `RCX`，保留非公共的 `RDX` store。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-decl-input-slot-append-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-decl-input-slot-append-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-decl-input-slot-append-gate/*.signature-rewrite.ll \
+  | awk -F '\t' 'NR>1 && $5=="gpr" && $9=="callsite_input_store" {count[$22]++} END {for (k in count) print k, count[k]}' | sort
+ctest --test-dir build --output-on-failure
+git diff --check
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 41s |
+| `libuv:shared-library` | 106s | 107s |
+| `memcached:executable` | 57s | 57s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         14
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3187
+gpr       store        access           full     full         no         3157
+gpr       store        access           partial  full         yes        5
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-internal-input-cleanup-gate` 相比：
+
+- `gpr store access full/full`：3177 -> 3157，少 20。
+- declaration `callsite_input_store`：59 -> 39，少 20。
+- internal `callsite_input_store`：仍为 12。
+
+判断：
+
+- 这一步解决的是“declaration 已经有一部分 LLVM 参数，但后续 ABI 输入还停在寄存器 store”的情况。
+- 对真实 `__assert_fail` 这类调用，公共的 `RCX` 后续输入可以进入 declaration 签名；非公共的 `RDX` 仍保留，不硬删。
+- 固定三目标耗时同量级，`libuv` signature rewrite 多 1 秒，暂未看到明显性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 固定三目标再少 20 个 GPR store，declaration input residue 从 59 降到 39。 |
+| 理解成本 | 3 | declaration rewrite 现在分零参数首次恢复和已有 metadata 追加两种路径，需要看 metadata 校验条件。 |
+| 维护成本 | 3 | 依赖 recovered metadata 的 ABI slot，比较稳；后续如果支持非 i64 或 stack declaration 输入，需要扩展校验。 |
+
+有没有更好的方案：
+
+- 更完整的方向还是统一 declaration 的真实 prototype 建模，按外部符号或调试信息直接知道完整参数。
+- 当前没有这些信息，只能从 callsite 事实保守恢复公共输入；这比按参数名或参数数量猜 slot 更稳。

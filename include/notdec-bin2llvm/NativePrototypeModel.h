@@ -23,6 +23,8 @@ class NativePrototypeModel {
 public:
   explicit NativePrototypeModel(const NativeAbiSpec &abi) : Abi(abi) {}
 
+  const std::string &modelName() const { return Abi.PrototypeName; }
+
   std::optional<NativeStorageMatch> findInputRegister(
       const std::string &name) const;
   std::optional<NativeStorageMatch> findOutputRegister(
