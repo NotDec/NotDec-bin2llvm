@@ -1939,7 +1939,12 @@ bool instructionWritesRegisterAccess(llvm::Instruction &instruction,
   return false;
 }
 
+bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
+    llvm::BasicBlock &block, const llvm::MDNode &access,
+    std::set<llvm::BasicBlock *> &seen);
+
 bool reachesReturnWithoutCallOrAccessLoad(llvm::Instruction *instruction,
+                                          llvm::BasicBlock &block,
                                           const llvm::MDNode &access,
                                           std::set<llvm::BasicBlock *> &seen) {
   while (instruction != nullptr) {
@@ -1959,7 +1964,7 @@ bool reachesReturnWithoutCallOrAccessLoad(llvm::Instruction *instruction,
     }
     instruction = instruction->getNextNode();
   }
-  return false;
+  return allSuccessorsReachReturnWithoutCallOrAccessLoad(block, access, seen);
 }
 
 bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
@@ -1981,11 +1986,13 @@ bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
   bool sawSuccessor = false;
   for (llvm::BasicBlock *successor : llvm::successors(&block)) {
     sawSuccessor = true;
-    if (!seen.insert(successor).second) {
+    std::set<llvm::BasicBlock *> pathSeen = seen;
+    if (!pathSeen.insert(successor).second) {
       return false;
     }
     if (!reachesReturnWithoutCallOrAccessLoad(
-            successor->empty() ? nullptr : &successor->front(), access, seen)) {
+            successor->empty() ? nullptr : &successor->front(), *successor,
+            access, pathSeen)) {
       return false;
     }
   }
@@ -2078,12 +2085,13 @@ bool allSuccessorsReachReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
   bool sawSuccessor = false;
   for (llvm::BasicBlock *successor : llvm::successors(&block)) {
     sawSuccessor = true;
-    if (!seen.insert(successor).second) {
+    std::set<llvm::BasicBlock *> pathSeen = seen;
+    if (!pathSeen.insert(successor).second) {
       return false;
     }
     if (!reachesReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
             successor->empty() ? nullptr : &successor->front(), *successor,
-            access, seen)) {
+            access, pathSeen)) {
       return false;
     }
   }

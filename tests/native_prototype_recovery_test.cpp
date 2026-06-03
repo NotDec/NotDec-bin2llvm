@@ -1904,6 +1904,37 @@ llvm::Function *createPreservedStackFrameStoreFunction(
   return function;
 }
 
+llvm::Function *createDiamondStackFrameStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *access = registerAccessMetadata(context, registerName);
+
+  // The two branches share the same return block.  The liveness walk must treat
+  // this as a normal diamond CFG, not as a loop back to an already-seen block.
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x12345678), global);
+  store->setMetadata("notdec.register.access", access);
+  builder.CreateCondBr(llvm::PoisonValue::get(llvm::Type::getInt1Ty(context)),
+                       left, right);
+  builder.SetInsertPoint(left);
+  builder.CreateBr(join);
+  builder.SetInsertPoint(right);
+  builder.CreateBr(join);
+  builder.SetInsertPoint(join);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createStaticRspStackMemoryFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
     bool escapePointer) {
@@ -8488,12 +8519,16 @@ int main() {
   llvm::Function *liveRbpRestore = createPreservedStackFrameStoreFunction(
       stackFramePreservedModule, "live_rbp_restore", preservedRbp, "RBP",
       true);
+  llvm::Function *diamondRspRestore = createDiamondStackFrameStoreFunction(
+      stackFramePreservedModule, "diamond_rsp_restore", preservedRsp, "RSP");
   attachRegisterEffectMetadata(*deadRspRestore, "notdec.register.preserves",
                                preservedRsp, "RSP");
   attachRegisterEffectMetadata(*deadRbpRestore, "notdec.register.preserves",
                                preservedRbp, "RBP");
   attachRegisterEffectMetadata(*liveRbpRestore, "notdec.register.preserves",
                                preservedRbp, "RBP");
+  attachRegisterEffectMetadata(*diamondRspRestore, "notdec.register.preserves",
+                               preservedRsp, "RSP");
   notdec::bin2llvm::runNativePrototypeRecovery(stackFramePreservedModule,
                                                rewriteOptions);
   ok &= expect(!hasRegisterStore(*deadRspRestore, "RSP"),
@@ -8504,6 +8539,8 @@ int main() {
                "live preserved RBP restore store was removed");
   ok &= expect(hasRegisterLoad(*liveRbpRestore, "RBP"),
                "live preserved RBP load was removed");
+  ok &= expect(!hasRegisterStore(*diamondRspRestore, "RSP"),
+               "diamond shared-successor RSP store was not removed");
   if (llvm::verifyModule(stackFramePreservedModule, &llvm::errs())) {
     std::cerr << "stack/frame preserved cleanup module verification failed "
                  "after prototype rewrite\n";

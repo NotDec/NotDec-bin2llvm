@@ -665,6 +665,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-native-stack-cleanup-gate`
+  - [x] 修正 return-path liveness 对 shared successor 的误判：每条 successor path 独立维护 `seen`，并允许穿过中间空跳转到 return；两个最小 Bench2 目标 signature-rewrite 通过，GPR store 从 134 降到 128，stack/frame store residue 清零。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-rsp-shared-successor-gate`
 
 ## 记录规则
 

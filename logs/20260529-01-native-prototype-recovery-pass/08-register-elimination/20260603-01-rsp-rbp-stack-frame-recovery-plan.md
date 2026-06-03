@@ -1418,3 +1418,96 @@ other load access         full/full  8
 
 - 更完整的 RBP 方案仍是证明 frame base：入口保存旧 `RBP`，新 `RBP` 来自当前 `RSP`，再把 `RBP + const` 映射进 `notdec_stack`。
 - 当前这步先清理已经本地化的 native stack 噪声，避免把缺少 frame-base 证据的 raw `RBP` 访问误改掉。
+
+# 2026-06-03 实现记录：return-path shared successor 活性修正
+
+背景：
+
+- native stack alloca cleanup 后，两个小目标里还剩少量明显的 `RSP` dead store。
+- 典型形态是 `notdec_native_1000` / `notdec_native_3000`：`store @RSP` 后进入 diamond CFG，两条分支汇合到同一个 return block。
+- 旧的 return-path liveness 在所有 successor 之间共用同一个 `seen` 集合。第一条分支访问 shared successor 后，第二条分支再看到同一个 successor，就被误判为循环，从而保留死 store。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1942)
+  - 给 `allSuccessorsReachReturnWithoutCallOrAccessLoad()` 增加前置声明，让 `reachesReturnWithoutCallOrAccessLoad()` 可以递归穿过后继 block。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1946)
+  - `reachesReturnWithoutCallOrAccessLoad()` 增加当前 block 参数，走到 block 末尾时继续检查 successor。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1970)
+  - `allSuccessorsReachReturnWithoutCallOrAccessLoad()` 对每条 successor path 复制 `seen`，只把单条路径内回到已见 block 当作循环风险。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2069)
+  - `allSuccessorsReachReturnOrOverwriteWithoutCallOrAccessLoadRecursive()` 同样改成 per-path `seen`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1907)
+  - 新增 `createDiamondStackFrameStoreFunction()`，构造 store 后 diamond CFG 共享 return block 的 case。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8522)
+  - 新增 `diamond_rsp_restore` 测试，断言 shared-successor CFG 上的 dead `RSP` store 会删除。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-shared-successor-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-shared-successor-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-shared-successor-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-shared-successor-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 3s | 3s |
+| `php:extension-calendar` | 12s | 12s |
+
+residue 对比：
+
+```text
+after native stack alloca cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  35
+gpr store access          full/full  134
+other load access         full/full  8
+
+after shared-successor liveness fix:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  35
+gpr store access          full/full  128
+other load access         full/full  8
+```
+
+判断：
+
+- 两个小目标上 GPR store 从 `134` 降到 `128`，GPR external input 不变。
+- 命中的是 CFG 活性误判，不是放宽 call/RSP 语义。
+- 剩余 stack/frame residue 只剩 external input，没有 `RSP/RBP` store 类 residue。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 清掉 6 个 store，并修正了一个 CFG 活性判断 bug。 |
+| 理解成本 | 2 | 改动集中在 liveness traversal，规则本身没有新增语义假设。 |
+| 维护成本 | 2 | per-path `seen` 是常规 CFG DFS 写法，后续更复杂 CFG 也更合理。 |
+
+有没有更好的方案：
+
+- 如果后续 dead-store cleanup 扩大范围，可以考虑统一成一个小的 CFG liveness walker，减少多处递归函数重复。
+- 当前先做局部修正，是因为问题明确命中 RSP/RBP return-path cleanup，改动范围更小。
