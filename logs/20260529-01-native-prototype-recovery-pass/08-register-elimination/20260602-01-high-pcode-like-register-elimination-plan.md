@@ -4960,3 +4960,108 @@ vector    load         external_input   full     full         no         1
 
 - 更完整的方向还是统一 declaration 的真实 prototype 建模，按外部符号或调试信息直接知道完整参数。
 - 当前没有这些信息，只能从 callsite 事实保守恢复公共输入；这比按参数名或参数数量猜 slot 更稳。
+
+## 2026-06-03 实现记录：未被 internal callee 消费的 killed GPR 输入 store 清理
+
+背景：
+
+- declaration 后续输入追加后，固定三目标还剩 12 个 internal `callsite_input_store`。
+- 其中一类不是“已改写参数的旧 store”，而是 direct internal call 前写了 caller-saved GPR，但 callee 既没有 recovered input，也没有读取该寄存器。
+- 原有 killed-by-call cleanup 故意不删除紧贴 call 前的 store，因为未知 call 可能把它当隐式输入。本轮只处理 direct internal callee，并检查 callee 不消费该寄存器。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1808)
+  - 新增 `prototypeHasRegisterInput()`，判断 callee recovered prototype 是否已经声明某个 register input。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1844)
+  - 新增 `loadReadsRegisterName()` 和 `functionReadsRegisterName()`，检查 internal callee 是否读取该寄存器，包括普通 register access load 和 external input load。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1964)
+  - 新增 `valueIsNeededByInterveningInstruction()`，要求从 store 到 call 之间没有同寄存器读写或其他 call。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1981)
+  - 新增 `canEraseUnusedInternalCallKilledStore()`，只有 call clobber 该寄存器、callee prototype 不声明输入、callee 函数体也不读取时才允许删除。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2062)
+  - 新增 `eraseUnusedInternalCallKilledInputStores()`，只扫描 direct internal call，不处理 declaration、indirect call、vector。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3461)
+  - signature rewrite 后置清理中，在普通 killed-by-call cleanup 后调用该 internal-only cleanup。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1860)
+  - 新增 `createInternalCallKilledGprStoreFunction()` 构造 internal call 前的 killed GPR store。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1880)
+  - 新增 `createRegisterLoadFunction()` 构造 callee 读取该寄存器的反例。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8080)
+  - 新增测试：callee 不读 `RDI` 时删除 caller 的旧 store；callee 读取 `RDI` 时保留。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-unused-internal-killed-input-gate \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-unused-internal-killed-input-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-unused-internal-killed-input-gate/*.signature-rewrite.ll \
+  | awk -F '\t' 'NR>1 && $5=="gpr" && $9=="callsite_input_store" {count[$22]++} END {for (k in count) print k, count[k]}' | sort
+ctest --test-dir build --output-on-failure
+git diff --check
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- 全量 CTest 10/10 通过。
+- 固定三目标 Bench2 gate 通过，LLVM 22 assemble/verify 通过。
+- 固定三目标耗时：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `vsftpd:executable` | 41s | 42s |
+| `libuv:shared-library` | 106s | 107s |
+| `memcached:executable` | 57s | 58s |
+
+residue 结果：
+
+```text
+category  access_kind  metadata_kind    shape    value_shape  synthetic  count
+gpr       load         access           full     full         no         14
+gpr       load         access           partial  full         no         3
+gpr       load         external_input   full     full         no         3187
+gpr       store        access           full     full         no         3156
+gpr       store        access           partial  full         yes        5
+other     load         access           full     full         no         8
+other     load         external_input   full     full         no         49
+vector    load         access           full     full         no         1
+vector    load         external_input   full     full         no         1
+```
+
+和上一轮 `/tmp/notdec-bin2llvm-decl-input-slot-append-gate` 相比：
+
+- `gpr store access full/full`：3157 -> 3156，少 1。
+- internal `callsite_input_store`：12 -> 11，少 1。
+- declaration `callsite_input_store`：仍为 39。
+
+判断：
+
+- 这一步收益很小，但规则比通用 killed-by-call cleanup 更窄：只处理 direct internal callee，且明确证明 callee 不消费该寄存器。
+- 不处理 declaration、indirect call、vector，也不删除 callee prototype 已声明的 register input。
+- 固定三目标耗时同量级，signature rewrite 各多约 0-1 秒，暂未看到明显性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 1 | 固定三目标只少 1 个 GPR store。 |
+| 理解成本 | 2 | 规则集中在 post-prototype cleanup，条件比较直白。 |
+| 维护成本 | 2 | 只依赖 direct internal callee 和 register load metadata；后续有统一 current-value/call-effect resolver 时可以合并进去。 |
+
+有没有更好的方案：
+
+- 更完整的方向还是统一 call effect resolver，让 internal call 前后的寄存器值查询和 cleanup 共用一套逻辑。
+- 当前先用很窄的规则消掉确定没被 callee 消费的旧 store，避免扩大原有 killed-by-call cleanup 的误删风险。

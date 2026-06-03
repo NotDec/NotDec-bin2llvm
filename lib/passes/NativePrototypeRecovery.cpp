@@ -1805,6 +1805,19 @@ bool accessMatchesRecoveredReturn(const llvm::MDNode &access,
   return false;
 }
 
+bool prototypeHasRegisterInput(const NativeRecoveredPrototype &prototype,
+                               llvm::StringRef registerName) {
+  for (const NativeRecoveredPrototypeParam &param : prototype.Inputs) {
+    if (param.StorageKind != "register") {
+      continue;
+    }
+    if (registerNameMatchesEffect(param.RegisterName, registerName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool instructionReadsRegisterAccess(llvm::Instruction &instruction,
                                     const llvm::MDNode &access) {
   auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
@@ -1823,6 +1836,34 @@ bool instructionReadsRegisterAccess(llvm::Instruction &instruction,
   if (std::optional<std::string> base = metadataField(access, "base")) {
     if (accessMatchesEffectRegister(*loadAccess, *base)) {
       return true;
+    }
+  }
+  return false;
+}
+
+bool loadReadsRegisterName(llvm::LoadInst &load, llvm::StringRef registerName) {
+  if (llvm::MDNode *access = load.getMetadata("notdec.register.access")) {
+    if (accessMatchesEffectRegister(*access, registerName)) {
+      return true;
+    }
+  }
+  if (llvm::MDNode *externalInput =
+          load.getMetadata("notdec.register.external_input")) {
+    if (accessMatchesEffectRegister(*externalInput, registerName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool functionReadsRegisterName(llvm::Function &function,
+                               llvm::StringRef registerName) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (load != nullptr && loadReadsRegisterName(*load, registerName)) {
+        return true;
+      }
     }
   }
   return false;
@@ -1920,6 +1961,43 @@ bool storeIsDeadOnAllReturnPaths(llvm::StoreInst &store,
                                                          access, seen);
 }
 
+bool valueIsNeededByInterveningInstruction(llvm::StoreInst &store,
+                                           llvm::CallInst &call,
+                                           const llvm::MDNode &access) {
+  for (llvm::Instruction *instruction = store.getNextNode(); instruction != nullptr;
+       instruction = instruction->getNextNode()) {
+    if (instruction == &call) {
+      return false;
+    }
+    if (llvm::isa<llvm::CallBase>(instruction) ||
+        instructionReadsRegisterAccess(*instruction, access) ||
+        instructionWritesRegisterAccess(*instruction, access)) {
+      return true;
+    }
+  }
+  return true;
+}
+
+bool canEraseUnusedInternalCallKilledStore(llvm::StoreInst &store,
+                                           llvm::CallInst &call,
+                                           llvm::Function &callee,
+                                           llvm::StringRef registerName) {
+  if (!callClobbersRegister(call, registerName)) {
+    return false;
+  }
+  if (valueIsNeededByInterveningInstruction(store, call,
+                                            *store.getMetadata(
+                                                "notdec.register.access"))) {
+    return false;
+  }
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(callee);
+  if (prototype && prototypeHasRegisterInput(*prototype, registerName)) {
+    return false;
+  }
+  return !functionReadsRegisterName(callee, registerName);
+}
+
 std::set<std::string> killedByCallRegisterNames(const NativeAbiSpec &abi) {
   std::set<std::string> names;
   for (const NativeAbiEffect &effect : abi.Effects) {
@@ -1978,6 +2056,63 @@ void eraseDeadKilledByCallRegisterStores(llvm::Module &module,
       store->eraseFromParent();
       llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
     }
+  }
+}
+
+void eraseUnusedInternalCallKilledInputStores(llvm::Module &module,
+                                              const NativeAbiSpec &abi) {
+  std::set<std::string> killedRegisters = killedByCallRegisterNames(abi);
+  if (killedRegisters.empty()) {
+    return;
+  }
+
+  std::vector<llvm::StoreInst *> deadStores;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr || callee->isDeclaration()) {
+          continue;
+        }
+        for (const std::string &registerName : killedRegisters) {
+          llvm::StoreInst *store = localCallsiteInputStoreBeforeCall(
+              *call, registerName, llvm::Type::getInt64Ty(module.getContext()));
+          if (store == nullptr) {
+            continue;
+          }
+          llvm::MDNode *access = store->getMetadata("notdec.register.access");
+          if (access == nullptr ||
+              !accessMatchesEffectRegister(*access, registerName)) {
+            continue;
+          }
+          if (canEraseUnusedInternalCallKilledStore(*store, *call, *callee,
+                                                   registerName)) {
+            deadStores.push_back(store);
+          }
+        }
+      }
+    }
+  }
+
+  std::set<llvm::StoreInst *> uniqueStores(deadStores.begin(),
+                                          deadStores.end());
+  for (llvm::StoreInst *store : uniqueStores) {
+    llvm::Value *storedValue = store->getValueOperand();
+    store->eraseFromParent();
+    llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
   }
 }
 
@@ -3323,6 +3458,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     rewriteDeclarationCallInputs(module, model);
     eraseRewrittenInternalCallInputStores(module);
     eraseDeadKilledByCallRegisterStores(module, *abi);
+    eraseUnusedInternalCallKilledInputStores(module, *abi);
     eraseDeadNonReturnVectorStores(module);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
     summary.SignatureRewriteFunctionsRewritten =

@@ -1857,6 +1857,45 @@ llvm::Function *createKilledGprScratchStoreFunction(
   return function;
 }
 
+llvm::Function *createInternalCallKilledGprStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName, llvm::Function *callee) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *access = registerAccessMetadata(context, registerName);
+  llvm::Value *value =
+      llvm::ConstantInt::get(global->getValueType(), 0x12345678);
+  llvm::StoreInst *store = builder.CreateStore(value, global);
+  store->setMetadata("notdec.register.access", access);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createRegisterLoadFunction(llvm::Module &module,
+                                           const std::string &name,
+                                           llvm::GlobalVariable *global,
+                                           const std::string &registerName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *load = builder.CreateLoad(global->getValueType(), global);
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, registerName));
+  builder.CreateAdd(load, llvm::ConstantInt::get(global->getValueType(), 1));
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createTemporaryReturnStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName, llvm::StoreInst **temporaryStore,
@@ -8038,6 +8077,21 @@ int main() {
                                           "overwritten_gpr_scratch",
                                           killedGprRdi, "RDI", false, false,
                                           true);
+  llvm::Function *unusedInternalKilledGprCallee =
+      createFunction(killedGprScratchModule,
+                     "unused_internal_killed_gpr_callee");
+  llvm::Function *unusedInternalKilledGprCaller =
+      createInternalCallKilledGprStoreFunction(
+          killedGprScratchModule, "unused_internal_killed_gpr_caller",
+          killedGprRdi, "RDI", unusedInternalKilledGprCallee);
+  llvm::Function *usedInternalKilledGprCallee =
+      createRegisterLoadFunction(killedGprScratchModule,
+                                 "used_internal_killed_gpr_callee",
+                                 killedGprRdi, "RDI");
+  llvm::Function *usedInternalKilledGprCaller =
+      createInternalCallKilledGprStoreFunction(
+          killedGprScratchModule, "used_internal_killed_gpr_caller",
+          killedGprRdi, "RDI", usedInternalKilledGprCallee);
   notdec::bin2llvm::runNativePrototypeRecovery(killedGprScratchModule,
                                                rewriteOptions);
   ok &= expect(!hasRegisterStore(*deadKilledGprScratch, "RDI"),
@@ -8048,6 +8102,10 @@ int main() {
                "later GPR scratch load was removed");
   ok &= expect(!hasRegisterStore(*overwrittenKilledGprScratch, "RDI"),
                "overwritten killed-by-call GPR scratch store was not removed");
+  ok &= expect(!hasRegisterStore(*unusedInternalKilledGprCaller, "RDI"),
+               "unused internal killed-by-call GPR store was not removed");
+  ok &= expect(hasRegisterStore(*usedInternalKilledGprCaller, "RDI"),
+               "used internal killed-by-call GPR store was removed");
   if (llvm::verifyModule(killedGprScratchModule, &llvm::errs())) {
     std::cerr << "killed GPR scratch module verification failed after "
                  "prototype rewrite\n";
