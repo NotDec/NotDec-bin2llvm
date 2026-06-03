@@ -667,3 +667,107 @@ other load access         full/full  8
 
 - 真正能消掉当前 before-call 大头的方案，是引入 Ghidra 式 `stackshift/extrapop` 和 stack argument 建模。
 - 本轮只做 internal direct-call 的安全子集，是为了先避免把 declaration/native 边界语义弄错。
+
+# 2026-06-03 实现记录：无用 raw RSP/RBP stack load 清理
+
+背景：
+
+- internal call 前 `RSP` store 清理后，两个小目标仍有 `57` 个 GPR external input，其中 `RSP` entry external input 是最大项。
+- 抽查发现其中一部分只是 `RSP.external_input -> inttoptr -> load`，但 load 结果没有任何 use。
+- 这类 load 不是 stack 参数，也不是 call frame 状态；非 volatile、非 atomic 且结果无用时，可以直接删掉，并递归 DCE 掉 `inttoptr` 和 `RSP.external_input` 链。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2403)
+  - 新增 `eraseUnusedRawStackFrameLoads()`。
+  - 只处理 signature rewrite 后已经 `already matches` 的函数。
+  - base 必须是唯一 `RSP/RBP` external input load。
+  - load 必须是非 volatile、非 atomic、无 use。
+  - pointer 必须是 `inttoptr`，且地址能用 canonical `add/sub` 折成 base + 常量。
+  - 删除 load 后递归 DCE pointer 链。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3964)
+  - 在静态 stack alloca rewrite 后、RSP/RBP return-path store cleanup 前调用。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1976)
+  - 新增 `createRawRspLoadFunction()`，构造 unused / used raw `RSP` load。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8441)
+  - 新增测试：unused raw `RSP` load 应删除 `inttoptr` 和死 `RSP.external_input`；used raw `RSP` load 必须保留。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-rbp-unused-raw-load-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-rbp-unused-raw-load-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-rbp-unused-raw-load-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-rbp-unused-raw-load-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 3s | 3s |
+| `php:extension-calendar` | 12s | 12s |
+
+residue 对比：
+
+```text
+after internal call RSP cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  57
+gpr store access          full/full  158
+other load access         full/full  8
+
+after unused raw stack load cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  45
+gpr store access          full/full  158
+other load access         full/full  8
+```
+
+stack/frame residue 前几类：
+
+```text
+26 stack_pointer entry_external_input clobbers entry_external_input
+15 stack_pointer before_call clobbers stack_pointer
+8  stack_pointer entry_external_input clobbers,external_inputs entry_external_input
+6  stack_pointer before_call clobbers,external_inputs stack_pointer
+6  frame_pointer entry_external_input clobbers entry_external_input
+3  frame_pointer entry_external_input clobbers,external_inputs entry_external_input
+```
+
+判断：
+
+- GPR external input 从 `57` 降到 `45`，主要来自 unused raw `RSP` return-address-like load。
+- GPR store 仍是 `158`，说明剩余大头还是 call 前 `RSP` 状态和 declaration call 语义。
+- 这轮没有处理 used raw load，也没有把 `RBP` entry frame slot 改成 alloca，避免把已有 frame 内容误当本地未初始化 alloca。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 两个小目标少 12 个 GPR external input，但 store 不变。 |
+| 理解成本 | 2 | 规则只看 unused 普通 load 和 canonical stack/frame base 地址。 |
+| 维护成本 | 2 | 不影响 used stack load、call frame、declaration call；后续可和 call stack effect 合并。 |
+
+有没有更好的方案：
+
+- 更完整方案仍然是把 call return address / stackshift 建模起来，而不是只删 unused load。
+- 本轮先删 unused raw load，是因为它不需要解释 stack argument 或 call frame 语义。

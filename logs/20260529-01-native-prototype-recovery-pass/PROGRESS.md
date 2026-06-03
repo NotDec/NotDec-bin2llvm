@@ -639,6 +639,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-internal-call-sp-gate`
+  - [x] 清理 unused raw `RSP/RBP` stack load：只删除无 use、非 volatile、非 atomic、地址能折成 stack/frame external input + 常量的 raw load；两个最小 Bench2 目标 signature-rewrite 通过，GPR external input 从 57 降到 45。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-unused-raw-load-gate`
 
 ## 记录规则
 

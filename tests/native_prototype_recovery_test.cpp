@@ -1973,6 +1973,33 @@ llvm::Function *createStaticRspDeadStackSaveFunction(
   return function;
 }
 
+llvm::Function *createRawRspLoadFunction(llvm::Module &module,
+                                         const std::string &name,
+                                         llvm::GlobalVariable *rsp,
+                                         bool useLoadedValue) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  llvm::LoadInst *base =
+      builder.CreateLoad(rsp->getValueType(), rsp, "RSP.external_input");
+  base->setMetadata("notdec.register.external_input",
+                    registerAccessMetadata(context, "RSP"));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(base, llvm::PointerType::getUnqual(context));
+  llvm::LoadInst *load =
+      builder.CreateLoad(rsp->getValueType(), pointer, "raw_rsp_value");
+  if (useLoadedValue) {
+    builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 1));
+  }
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createInternalRspStoreCallerFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
     bool calleeReadsRsp, bool callerReadsRspAfterCall,
@@ -8407,6 +8434,31 @@ int main() {
                "dead static RSP stack save kept dead RBP external input");
   if (llvm::verifyModule(staticRspStackModule, &llvm::errs())) {
     std::cerr << "static RSP stack memory module verification failed after "
+                 "prototype rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module rawRspLoadModule("native-prototype-raw-rsp-load-test", context);
+  llvm::GlobalVariable *rawRsp = createRegisterGlobal(rawRspLoadModule, "RSP");
+  attachStackFramePreservedTestAbi(rawRspLoadModule);
+  llvm::Function *unusedRawRspLoad =
+      createRawRspLoadFunction(rawRspLoadModule, "unused_raw_rsp_load", rawRsp,
+                               false);
+  llvm::Function *usedRawRspLoad =
+      createRawRspLoadFunction(rawRspLoadModule, "used_raw_rsp_load", rawRsp,
+                               true);
+  notdec::bin2llvm::runNativePrototypeRecovery(rawRspLoadModule,
+                                               rewriteOptions);
+  ok &= expect(!hasIntToPtr(*unusedRawRspLoad),
+               "unused raw RSP load kept old inttoptr");
+  ok &= expect(!hasRegisterExternalInputLoad(*unusedRawRspLoad, "RSP"),
+               "unused raw RSP load kept dead RSP external input");
+  ok &= expect(hasIntToPtr(*usedRawRspLoad),
+               "used raw RSP load lost original inttoptr");
+  ok &= expect(hasRegisterExternalInputLoad(*usedRawRspLoad, "RSP"),
+               "used raw RSP load lost original external input");
+  if (llvm::verifyModule(rawRspLoadModule, &llvm::errs())) {
+    std::cerr << "raw RSP load module verification failed after "
                  "prototype rewrite\n";
     return EXIT_FAILURE;
   }

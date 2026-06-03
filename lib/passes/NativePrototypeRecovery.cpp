@@ -2400,6 +2400,58 @@ void eraseDeadStaticStackStores(
   }
 }
 
+void eraseUnusedRawStackFrameLoads(llvm::Module &module,
+                                   const NativeAbiSpec &abi) {
+  std::set<std::string> registerNames = stackFrameRegisterNames(abi);
+  if (registerNames.empty()) {
+    return;
+  }
+
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+
+    std::vector<llvm::LoadInst *> deadLoads;
+    for (const std::string &registerName : registerNames) {
+      llvm::LoadInst *base = externalInputLoadForRegister(function, registerName);
+      if (base == nullptr) {
+        continue;
+      }
+      for (llvm::BasicBlock &block : function) {
+        for (llvm::Instruction &instruction : block) {
+          auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+          if (load == nullptr || !load->use_empty() || load->isVolatile() ||
+              load->isAtomic()) {
+            continue;
+          }
+          auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(
+              load->getPointerOperand()->stripPointerCasts());
+          if (pointer == nullptr) {
+            continue;
+          }
+          std::set<llvm::Value *> seen;
+          if (stackOffsetFromBase(pointer->getOperand(0), base, seen)) {
+            deadLoads.push_back(load);
+          }
+        }
+      }
+    }
+
+    std::set<llvm::LoadInst *> uniqueLoads(deadLoads.begin(), deadLoads.end());
+    for (llvm::LoadInst *load : uniqueLoads) {
+      llvm::Value *pointer = load->getPointerOperand();
+      load->eraseFromParent();
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(pointer);
+    }
+  }
+}
+
 void rewriteStaticStackMemoryAccesses(llvm::Module &module,
                                       const NativeAbiSpec &abi) {
   if (abi.StackPointerRegister.empty()) {
@@ -3909,6 +3961,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseUnusedInternalCallKilledInputStores(module, *abi);
     eraseUnusedInternalCallStackPointerStores(module, *abi);
     rewriteStaticStackMemoryAccesses(module, *abi);
+    eraseUnusedRawStackFrameLoads(module, *abi);
     eraseDeadStackFrameRegisterStores(module, *abi);
     eraseDeadNonReturnVectorStores(module);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
