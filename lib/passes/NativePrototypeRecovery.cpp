@@ -2116,6 +2116,74 @@ void eraseUnusedInternalCallKilledInputStores(llvm::Module &module,
   }
 }
 
+bool isFramePointerRegisterName(llvm::StringRef registerName) {
+  return registerName == "RBP" || registerName == "EBP" ||
+         registerName == "BP";
+}
+
+std::set<std::string> stackFrameRegisterNames(const NativeAbiSpec &abi) {
+  std::set<std::string> names;
+  if (!abi.StackPointerRegister.empty()) {
+    names.insert(abi.StackPointerRegister);
+  }
+  for (const NativeAbiEffect &effect : abi.Effects) {
+    if (effect.Kind != NativeAbiEffectKind::Unaffected ||
+        effect.Storage.Kind != NativeAbiStorageKind::Register ||
+        effect.Storage.Name.empty()) {
+      continue;
+    }
+    if (isFramePointerRegisterName(effect.Storage.Name)) {
+      names.insert(effect.Storage.Name);
+    }
+  }
+  return names;
+}
+
+void eraseDeadStackFrameRegisterStores(llvm::Module &module,
+                                       const NativeAbiSpec &abi) {
+  std::set<std::string> registerNames = stackFrameRegisterNames(abi);
+  if (registerNames.empty()) {
+    return;
+  }
+
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+
+    std::vector<llvm::StoreInst *> deadStores;
+    for (const std::string &registerName : registerNames) {
+      for (llvm::BasicBlock &block : function) {
+        for (llvm::Instruction &instruction : block) {
+          auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+          if (store == nullptr) {
+            continue;
+          }
+          llvm::MDNode *access = store->getMetadata("notdec.register.access");
+          if (access != nullptr &&
+              accessMatchesEffectRegister(*access, registerName) &&
+              storeIsDeadOnAllReturnPaths(*store, *access)) {
+            deadStores.push_back(store);
+          }
+        }
+      }
+    }
+
+    std::set<llvm::StoreInst *> uniqueStores(deadStores.begin(),
+                                            deadStores.end());
+    for (llvm::StoreInst *store : uniqueStores) {
+      llvm::Value *storedValue = store->getValueOperand();
+      store->eraseFromParent();
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
+    }
+  }
+}
+
 void eraseDeadNonReturnVectorStores(llvm::Module &module) {
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
@@ -3459,6 +3527,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseRewrittenInternalCallInputStores(module);
     eraseDeadKilledByCallRegisterStores(module, *abi);
     eraseUnusedInternalCallKilledInputStores(module, *abi);
+    eraseDeadStackFrameRegisterStores(module, *abi);
     eraseDeadNonReturnVectorStores(module);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
     summary.SignatureRewriteFunctionsRewritten =

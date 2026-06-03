@@ -242,3 +242,106 @@ Ghidra 的关键不是“删除 RSP/RBP”，而是把栈建成独立的 spaceba
 - 不把正 offset stack 统一当本地变量。
 - 不用 slot + mem2reg 兜底。
 - 不在第一版处理复杂动态栈、stack realign、栈地址逃逸。
+
+# 2026-06-03 实现记录：RSP/RBP return-path 死 store 清理
+
+背景：
+
+- 两个小 Bench2 目标里，`RSP/RBP` 残留大多不是 partial access，而是 entry external input、return path store、before-call stack adjustment。
+- 其中 return path 上的 `RSP/RBP` store 在后续没有同寄存器 load/call 时，只是在维护全局寄存器状态；栈地址计算本身已经使用 canonical SSA value，不需要再依赖 store 到 `@RSP/@RBP`。
+- 这一步先做阶段 4 的安全子集：只删死的 stack pointer / frame pointer store，不做 alloca rewrite，不删 call 前 store。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2119)
+  - 新增 `isFramePointerRegisterName()`，只把 `RBP/EBP/BP` 作为第一版 frame pointer 名字。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2124)
+  - 新增 `stackFrameRegisterNames()`，从 ABI `StackPointerRegister` 取 stack pointer，并从 ABI unaffected 里取 frame pointer。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2142)
+  - 新增 `eraseDeadStackFrameRegisterStores()`。
+  - 只处理 rewrite 后已经 `already matches` 的函数。
+  - store 必须有 `notdec.register.access`，且匹配 stack/frame register。
+  - 复用已有 `storeIsDeadOnAllReturnPaths()`，要求 store 后所有路径到 return 或被同寄存器后续 store 覆盖，中间不能有普通 call 或同寄存器 load。
+  - 删除 store 后对 store value 做 `RecursivelyDeleteTriviallyDeadInstructions()`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3530)
+  - 在 signature rewrite 后置 cleanup 中，在 killed-by-call cleanup 之后、vector cleanup 之前调用。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:222)
+  - 新增 `attachStackFramePreservedTestAbi()`，构造含 `RSP` stack pointer 和 `RBP` unaffected 的测试 ABI。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1877)
+  - 新增 `createPreservedStackFrameStoreFunction()`，构造 canonical store/store/ret 和 store/store/load/ret 形态。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2604)
+  - 新增 `attachRegisterEffectMetadata()`，用于测试里附加 register effect metadata。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8175)
+  - 新增 RSP/RBP cleanup 正反例：死的 RSP/RBP store 应删除，后续有 RBP load 的 store 必须保留。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test notdec-native-llvm -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+git diff --check
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-rbp-small-gate2 \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-rbp-small-gate2/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-rbp-small-gate2/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-rbp-small-details2.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- `git diff --check` 通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 3s | 3s |
+| `php:extension-calendar` | 12s | 11s |
+
+residue 对比：
+
+```text
+before:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  135
+gpr store access          full/full  248
+other load access         full/full  8
+other load external_input full/full  1
+
+after:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  135
+gpr store access          full/full  158
+other load access         full/full  8
+other load external_input full/full  1
+```
+
+判断：
+
+- 两个小目标上 GPR full store 少了 `90`，主要来自 RSP/RBP return-path store。
+- entry external input 没变，因为剩余 `RSP/RBP` 仍被 stack address 计算和 before-call stack adjustment 使用。
+- 剩余 `RSP/RBP` 主要是 `entry_external_input` 和 `before_call_path`，这需要后续静态 stack alloca / raw stack address rewrite，不能靠本轮死 store cleanup 删除。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 两个小目标少 90 个 GPR store，但还没处理 entry input 和 call 前栈状态。 |
+| 理解成本 | 2 | 复用已有 return-path liveness，新增规则只限 ABI stack pointer 和 x86 frame pointer。 |
+| 维护成本 | 2 | 后续 alloca rewrite 可以继续复用这个 cleanup；如果扩展到其它架构，需要补 frame pointer 名字来源。 |
+
+有没有更好的方案：
+
+- 更完整方案仍然是阶段 1/2 的静态 stack alloca 和 RBP frame base rewrite。
+- 本轮先删 return-path 死 store，是因为它基于 canonical IR 的本地 liveness，风险小，并且两个小目标能直接看到残留下降。

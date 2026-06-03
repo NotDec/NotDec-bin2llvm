@@ -623,6 +623,10 @@
   - [x] 支持 shared return successor 的 all-predecessor 返回候选：所有前驱都写同一 ABI output 且值等价时才恢复，冲突或缺 store 保守跳过。
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-shared-return-pred-gate`
+  - [x] 清理 RSP/RBP return-path 死 store：只处理 ABI stack pointer 和 x86 frame pointer，复用 return-path liveness，两个最小 Bench2 目标 signature-rewrite 通过，GPR full store 从 248 降到 158。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-small-gate2`
 
 ## 记录规则
 

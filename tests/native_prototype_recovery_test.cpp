@@ -219,6 +219,23 @@ void attachKilledGprScratchTestAbi(llvm::Module &module,
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachStackFramePreservedTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+
+  for (llvm::StringRef registerName : {"RSP", "RBP"}) {
+    notdec::bin2llvm::NativeAbiEffect unaffected;
+    unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
+    unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    unaffected.Storage.Name = registerName.str();
+    abi.Effects.push_back(std::move(unaffected));
+  }
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 void attachVectorXmm1ReturnTestAbi(llvm::Module &module) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__stdcall";
@@ -1857,6 +1874,36 @@ llvm::Function *createKilledGprScratchStoreFunction(
   return function;
 }
 
+llvm::Function *createPreservedStackFrameStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
+    const std::string &registerName, bool loadAfterStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *access = registerAccessMetadata(context, registerName);
+
+  // This mirrors canonicalized prologue/epilogue noise: one stack/frame
+  // register write is overwritten by the final preserved restore before ret.
+  llvm::StoreInst *setup = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x12345678), global);
+  setup->setMetadata("notdec.register.access", access);
+  llvm::StoreInst *restore = builder.CreateStore(
+      llvm::ConstantInt::get(global->getValueType(), 0x87654321), global);
+  restore->setMetadata("notdec.register.access", access);
+  if (loadAfterStore) {
+    llvm::LoadInst *load = builder.CreateLoad(global->getValueType(), global);
+    load->setMetadata("notdec.register.access", access);
+    (void)builder.CreateAdd(load,
+                            llvm::ConstantInt::get(global->getValueType(), 1));
+  }
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createInternalCallKilledGprStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName, llvm::Function *callee) {
@@ -2552,6 +2599,19 @@ void attachExternalInputs(llvm::Function &function,
   }
   function.setMetadata("notdec.register.external_inputs",
                        llvm::MDNode::get(context, entries));
+}
+
+void attachRegisterEffectMetadata(llvm::Function &function,
+                                  llvm::StringRef kind,
+                                  llvm::GlobalVariable *global,
+                                  llvm::StringRef name) {
+  llvm::LLVMContext &context = function.getContext();
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, ("name=" + name).str()),
+      llvm::ValueAsMetadata::get(global),
+  };
+  llvm::Metadata *entries[] = {llvm::MDNode::get(context, fields)};
+  function.setMetadata(kind, llvm::MDNode::get(context, entries));
 }
 
 bool metadataHasRegister(const llvm::Function &function, llvm::StringRef kind,
@@ -8109,6 +8169,44 @@ int main() {
   if (llvm::verifyModule(killedGprScratchModule, &llvm::errs())) {
     std::cerr << "killed GPR scratch module verification failed after "
                  "prototype rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module stackFramePreservedModule(
+      "native-prototype-stack-frame-preserved-cleanup-test", context);
+  llvm::GlobalVariable *preservedRsp =
+      createRegisterGlobal(stackFramePreservedModule, "RSP");
+  llvm::GlobalVariable *preservedRbp =
+      createRegisterGlobal(stackFramePreservedModule, "RBP");
+  attachStackFramePreservedTestAbi(stackFramePreservedModule);
+  llvm::Function *deadRspRestore = createPreservedStackFrameStoreFunction(
+      stackFramePreservedModule, "dead_rsp_restore", preservedRsp, "RSP",
+      false);
+  llvm::Function *deadRbpRestore = createPreservedStackFrameStoreFunction(
+      stackFramePreservedModule, "dead_rbp_restore", preservedRbp, "RBP",
+      false);
+  llvm::Function *liveRbpRestore = createPreservedStackFrameStoreFunction(
+      stackFramePreservedModule, "live_rbp_restore", preservedRbp, "RBP",
+      true);
+  attachRegisterEffectMetadata(*deadRspRestore, "notdec.register.preserves",
+                               preservedRsp, "RSP");
+  attachRegisterEffectMetadata(*deadRbpRestore, "notdec.register.preserves",
+                               preservedRbp, "RBP");
+  attachRegisterEffectMetadata(*liveRbpRestore, "notdec.register.preserves",
+                               preservedRbp, "RBP");
+  notdec::bin2llvm::runNativePrototypeRecovery(stackFramePreservedModule,
+                                               rewriteOptions);
+  ok &= expect(!hasRegisterStore(*deadRspRestore, "RSP"),
+               "dead preserved RSP restore stores were not removed");
+  ok &= expect(!hasRegisterStore(*deadRbpRestore, "RBP"),
+               "dead preserved RBP restore stores were not removed");
+  ok &= expect(hasRegisterStore(*liveRbpRestore, "RBP"),
+               "live preserved RBP restore store was removed");
+  ok &= expect(hasRegisterLoad(*liveRbpRestore, "RBP"),
+               "live preserved RBP load was removed");
+  if (llvm::verifyModule(stackFramePreservedModule, &llvm::errs())) {
+    std::cerr << "stack/frame preserved cleanup module verification failed "
+                 "after prototype rewrite\n";
     return EXIT_FAILURE;
   }
 
