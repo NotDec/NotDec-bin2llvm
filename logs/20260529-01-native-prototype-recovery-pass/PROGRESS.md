@@ -573,6 +573,8 @@
 - [ ] 阶段 8: `08-register-elimination`
   - [x] 编写 HighPCode-like register elimination 总体规划，明确 Ghidra heritage / subflow / prototype recovery 对应实现和 native 缺口。
     - 记录：`08-register-elimination/20260602-01-high-pcode-like-register-elimination-plan.md`
+  - [x] 编写 RSP/RBP stack frame recovery 规划，调研 wasm StackAlloca 和 Ghidra spacebase/stackpointer 做法，明确 native 侧先审计、再分静态 RSP、RBP frame base、动态 alloca、callee-saved cleanup 推进。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
   - [x] 实现阶段 A 残留寄存器审计脚本，统计 `.ll` 中 `notdec.register.access` / `notdec.register.external_input` 的 full/partial、load/store 和寄存器类别。
     - 文件：`scripts/native-register-residue-audit.py`
   - [x] 添加审计脚本单测并注册到 CTest。
