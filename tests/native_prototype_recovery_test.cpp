@@ -8534,6 +8534,8 @@ int main() {
       createRegisterGlobal(stackFramePreservedModule, "RBP");
   llvm::GlobalVariable *preservedRax =
       createRegisterGlobal(stackFramePreservedModule, "RAX");
+  llvm::GlobalVariable *preservedRdx =
+      createRegisterGlobal(stackFramePreservedModule, "RDX");
   attachStackFramePreservedTestAbi(stackFramePreservedModule);
   llvm::Function *deadRspRestore = createPreservedStackFrameStoreFunction(
       stackFramePreservedModule, "dead_rsp_restore", preservedRsp, "RSP",
@@ -8552,6 +8554,12 @@ int main() {
                                             preservedRsp, "RSP", preservedRax,
                                             "RAX");
   attachExternalInputs(*stackDerivedRaxReturn, {{"RSP", preservedRsp}});
+  llvm::Function *stackDerivedRdxStore =
+      createStackDerivedReturnStoreFunction(stackFramePreservedModule,
+                                            "dead_rsp_derived_rdx",
+                                            preservedRsp, "RSP", preservedRdx,
+                                            "RDX");
+  attachExternalInputs(*stackDerivedRdxStore, {{"RSP", preservedRsp}});
   attachRegisterEffectMetadata(*deadRspRestore, "notdec.register.preserves",
                                preservedRsp, "RSP");
   attachRegisterEffectMetadata(*deadRbpRestore, "notdec.register.preserves",
@@ -8575,6 +8583,10 @@ int main() {
   ok &= expect(!metadataHasRegister(*stackDerivedRaxReturn,
                                     "notdec.prototype.return_candidates", "RAX"),
                "stack-derived RAX return was incorrectly marked as a candidate");
+  ok &= expect(!hasRegisterStore(*stackDerivedRdxStore, "RDX"),
+               "dead stack-derived RDX store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*stackDerivedRdxStore, "RSP"),
+               "dead stack-derived RDX store kept dead RSP external input");
   if (llvm::verifyModule(stackFramePreservedModule, &llvm::errs())) {
     std::cerr << "stack/frame preserved cleanup module verification failed "
                  "after prototype rewrite\n";

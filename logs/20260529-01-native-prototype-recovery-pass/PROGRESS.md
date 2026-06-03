@@ -673,6 +673,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-stack-derived-return-gate`
+  - [x] 清理 stack/frame external input 派生的非返回寄存器 store：signature rewrite 后目标 register 不是 recovered return 且所有后续路径不读时删除；两个最小 Bench2 目标 signature-rewrite 通过，GPR external input 从 30 降到 17，GPR store 从 128 降到 114。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-stack-derived-store-gate`
 
 ## 记录规则
 

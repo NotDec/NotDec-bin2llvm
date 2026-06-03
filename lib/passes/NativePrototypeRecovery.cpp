@@ -3122,6 +3122,50 @@ void eraseDeadNonReturnVectorStores(llvm::Module &module) {
   }
 }
 
+void eraseDeadStackFrameDerivedNonReturnStores(llvm::Module &module,
+                                               const NativeAbiSpec &abi) {
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+    std::optional<NativeRecoveredPrototype> prototype =
+        readNativeRecoveredPrototypeMetadata(function);
+    if (!prototype) {
+      continue;
+    }
+
+    std::vector<llvm::StoreInst *> deadStores;
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+        if (store == nullptr) {
+          continue;
+        }
+        llvm::MDNode *access = store->getMetadata("notdec.register.access");
+        if (access == nullptr ||
+            accessMatchesRecoveredReturn(*access, *prototype) ||
+            !valueIsStackFrameExternalInputDerived(*store->getValueOperand(),
+                                                   abi) ||
+            !storeIsDeadOnAllReturnPaths(*store, *access)) {
+          continue;
+        }
+        deadStores.push_back(store);
+      }
+    }
+
+    for (llvm::StoreInst *store : deadStores) {
+      llvm::Value *storedValue = store->getValueOperand();
+      store->eraseFromParent();
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
+    }
+  }
+}
+
 struct ReturnLoadSearchResult {
   llvm::LoadInst *Load = nullptr;
   llvm::BasicBlock *SharedSuccessor = nullptr;
@@ -4435,6 +4479,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseDeadStackFrameRegisterStores(module, *abi);
     eraseDeadNativeStackAllocas(module);
     eraseDeadNonReturnVectorStores(module);
+    eraseDeadStackFrameDerivedNonReturnStores(module, *abi);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
     summary.SignatureRewriteFunctionsRewritten =
         rewriteSummary.FunctionsRewritten;

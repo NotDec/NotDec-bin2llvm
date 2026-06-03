@@ -1607,3 +1607,99 @@ other load access         full/full  8
 
 - 更完整的做法是先恢复 native stack 地址，再让这些 stack 地址值不要逃到 ABI register global。
 - 当前先阻止错误 return 恢复，避免把栈地址当函数返回值继续传播。
+
+# 2026-06-03 实现记录：清理 stack/frame 派生的非返回寄存器 store
+
+背景：
+
+- 过滤 stack/frame 派生返回候选后，剩余一类典型形态是 `RSP.external_input + const` 被写入 `RCX/R15/RDX` 等非返回寄存器，然后函数返回。
+- 这类 store 的值不是本函数 LLVM 返回值，也不是后续 call/input 需要的状态；如果目标寄存器之后所有路径都不读，可以删除。
+- 规则必须基于 signature rewrite 后的 canonical IR，因为这时 `notdec.prototype.recovered` 已能说明哪些 register 是真实返回。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3125)
+  - 新增 `eraseDeadStackFrameDerivedNonReturnStores()`。
+  - 只处理 signature rewrite 后已经 eligible 且不需要继续 rewrite 的函数。
+  - store 目标如果命中 `notdec.prototype.recovered` 的 register return，则保留。
+  - store value 必须能通过 `valueIsStackFrameExternalInputDerived()` 追到 `RSP/RBP.external_input`。
+  - 复用 `storeIsDeadOnAllReturnPaths()`，确保后续所有路径没有 register read/call use，或者被 overwrite。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:4479)
+  - 在 signature rewrite cleanup 链末尾调用该规则。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8537)
+  - stack-frame 测试模块新增 `RDX` global。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8557)
+  - 新增 `dead_rsp_derived_rdx`，构造 `RSP.external_input - const -> store @RDX` 的非返回 store。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8586)
+  - 断言 `RDX` store 和死 `RSP.external_input` 都被删除。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-stack-derived-store-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-stack-derived-store-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-stack-derived-store-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-stack-derived-store-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 2s | 3s |
+| `php:extension-calendar` | 12s | 12s |
+
+residue 对比：
+
+```text
+after stack-derived return filtering:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  30
+gpr store access          full/full  128
+other load access         full/full  8
+
+after stack-derived non-return store cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  17
+gpr store access          full/full  114
+other load access         full/full  8
+```
+
+判断：
+
+- 两个小目标上 GPR external input 从 `30` 降到 `17`，GPR store 从 `128` 降到 `114`。
+- 命中的是 stack/frame 地址值写入非返回 register global 后直接返回的残留。
+- 规则依赖 `notdec.prototype.recovered`，不会删除真实 ABI return register store。
+- 剩余 `RSP/RBP` 主要是 raw caller-stack load，以及 `RBP + negative offset` frame-base 访问；这些仍需要更强的 frame base 证据。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 少 13 个 external input 和 14 个 store，直接清理一类 stack address escape 残留。 |
+| 理解成本 | 3 | 多了一个基于 recovered prototype 的 store cleanup，但复用现有 liveness 和 stack/frame 值追踪。 |
+| 维护成本 | 3 | 边界依赖 recovered metadata；后续若 rewrite 顺序调整，需要确认仍在 rewrite 后调用。 |
+
+有没有更好的方案：
+
+- 最终更好的形态是把这些 stack 地址值恢复成局部 stack object pointer，而不是靠 dead store cleanup 删除。
+- 当前样本里这些值只写 register global 后返回，没有后续语义使用；先删掉能减少错误外泄和后续 residue。
