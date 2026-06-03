@@ -594,6 +594,8 @@ bool callClobbersRegister(llvm::CallBase &call, llvm::StringRef registerName);
 
 bool isFramePointerRegisterName(llvm::StringRef registerName);
 
+bool isKnownNoStackArgumentDeclaration(const llvm::Function &function);
+
 std::set<std::string> stackFrameRegisterNames(const NativeAbiSpec &abi);
 
 struct DeclarationCallInputRewrite {
@@ -1875,6 +1877,45 @@ bool functionReadsRegisterName(llvm::Function &function,
   return false;
 }
 
+bool callMayReadRegisterName(llvm::CallBase &call,
+                             llvm::StringRef registerName) {
+  if (registerName != "RSP" && !isFramePointerRegisterName(registerName)) {
+    return true;
+  }
+  llvm::Function *callee = call.getCalledFunction();
+  if (callee == nullptr) {
+    return true;
+  }
+  if (callee->isIntrinsic()) {
+    return false;
+  }
+  if (callee->isDeclaration()) {
+    return !(registerName == "RSP" &&
+             isKnownNoStackArgumentDeclaration(*callee));
+  }
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(*callee);
+  if (prototype && prototypeHasRegisterInput(*prototype, registerName)) {
+    return true;
+  }
+  return functionReadsRegisterName(*callee, registerName);
+}
+
+bool callMayReadRegisterAccess(llvm::CallBase &call,
+                               const llvm::MDNode &access) {
+  if (std::optional<std::string> name = metadataField(access, "name")) {
+    if (callMayReadRegisterName(call, *name)) {
+      return true;
+    }
+  }
+  if (std::optional<std::string> base = metadataField(access, "base")) {
+    if (callMayReadRegisterName(call, *base)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool instructionWritesRegisterAccess(llvm::Instruction &instruction,
                                      const llvm::MDNode &access) {
   auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
@@ -1908,8 +1949,12 @@ bool reachesReturnWithoutCallOrAccessLoad(llvm::Instruction *instruction,
     if (instructionWritesRegisterAccess(*instruction, access)) {
       return true;
     }
-    if (llvm::isa<llvm::CallBase>(instruction) ||
-        instructionReadsRegisterAccess(*instruction, access)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallBase>(instruction)) {
+      if (callMayReadRegisterAccess(*call, access)) {
+        return false;
+      }
+    }
+    if (instructionReadsRegisterAccess(*instruction, access)) {
       return false;
     }
     instruction = instruction->getNextNode();
@@ -1927,8 +1972,10 @@ bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
   if (llvm::isa<llvm::ReturnInst>(terminator)) {
     return true;
   }
-  if (llvm::isa<llvm::CallBase>(terminator)) {
-    return false;
+  if (auto *call = llvm::dyn_cast<llvm::CallBase>(terminator)) {
+    if (callMayReadRegisterAccess(*call, access)) {
+      return false;
+    }
   }
 
   bool sawSuccessor = false;
@@ -1957,8 +2004,12 @@ bool storeIsDeadOnAllReturnPaths(llvm::StoreInst &store,
     if (instructionWritesRegisterAccess(*next, access)) {
       return true;
     }
-    if (llvm::isa<llvm::CallBase>(next) ||
-        instructionReadsRegisterAccess(*next, access)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallBase>(next)) {
+      if (callMayReadRegisterAccess(*call, access)) {
+        return false;
+      }
+    }
+    if (instructionReadsRegisterAccess(*next, access)) {
       return false;
     }
     next = next->getNextNode();
@@ -2018,8 +2069,10 @@ bool allSuccessorsReachReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
   if (llvm::isa<llvm::ReturnInst>(terminator)) {
     return true;
   }
-  if (llvm::isa<llvm::CallBase>(terminator)) {
-    return false;
+  if (auto *call = llvm::dyn_cast<llvm::CallBase>(terminator)) {
+    if (callMayReadRegisterAccess(*call, access)) {
+      return false;
+    }
   }
 
   bool sawSuccessor = false;
@@ -2047,8 +2100,12 @@ bool reachesReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
     if (instructionWritesRegisterAccess(*instruction, access)) {
       return true;
     }
-    if (llvm::isa<llvm::CallBase>(instruction) ||
-        instructionReadsRegisterAccess(*instruction, access)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallBase>(instruction)) {
+      if (callMayReadRegisterAccess(*call, access)) {
+        return false;
+      }
+    }
+    if (instructionReadsRegisterAccess(*instruction, access)) {
       return false;
     }
     instruction = instruction->getNextNode();

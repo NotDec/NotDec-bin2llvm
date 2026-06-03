@@ -657,6 +657,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rsp-known-nostack-call-gate`
+  - [x] 放宽 RSP/RBP return-path dead store 的 call 活性：已知 no-stack declaration 或 internal callee 不读对应寄存器时，call 不再保护死 store；普通寄存器和未知 declaration 仍保守，两个最小 Bench2 目标 signature-rewrite 通过，GPR store 从 138 降到 134，GPR external input 从 39 降到 37。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-rsp-call-liveness-gate`
 
 ## 记录规则
 

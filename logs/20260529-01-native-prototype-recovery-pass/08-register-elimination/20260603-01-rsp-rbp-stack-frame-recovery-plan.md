@@ -1212,3 +1212,110 @@ stack/frame residue 前几类：
 
 - 更完整方案是让 declaration import 信息带出参数/返回/noreturn 属性，或者在 prototype metadata 中表达 no-stack-call。
 - 当前先用白名单，是因为这些名字在两个小目标里明确命中，且普通无 metadata declaration 仍保留。
+
+# 2026-06-03 实现记录：RSP/RBP dead store 跨 no-stack call 活性
+
+背景：
+
+- known no-stack declaration cleanup 后，仍有一些 `RSP/RBP` store 因为中间经过 call 被 return-path dead-store 规则保守保护。
+- 旧规则把任何 call 都当成同寄存器读屏障。这对普通寄存器是安全的，但对已知不读 `RSP` 的 declaration，或已知不读 `RSP/RBP` 的 internal callee，会留下无用的栈/帧寄存器状态写。
+- 这一步只放宽 `RSP` 和 x86 frame pointer 名字；其它寄存器仍把 call 当成可能读，避免误删普通 GPR/vector 的 killed-by-call store。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1880)
+  - 新增 `callMayReadRegisterName()`。
+  - 非 `RSP/RBP/EBP/BP` 一律保守返回 may-read。
+  - declaration 只在 `RSP` 且 `isKnownNoStackArgumentDeclaration()` 成立时认为不读。
+  - internal callee 用 recovered prototype 和函数体真实 load 判断是否会读该寄存器。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1904)
+  - 新增 `callMayReadRegisterAccess()`，从 `notdec.register.access` 的 `name/base` 字段取寄存器名。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1942)
+  - 更新 `reachesReturnWithoutCallOrAccessLoad()`、`storeIsDeadOnAllReturnPaths()`、`reachesReturnOrOverwriteWithoutCallOrAccessLoadRecursive()` 等 return-path 活性检查。
+  - call 不再固定阻断，只有 `callMayReadRegisterAccess()` 为 true 时才阻断。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2092)
+  - 新增 `createBranchDeclarationRspStoreCallerFunction()`，覆盖跨 basic block 的 call 后 return 场景。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8585)
+  - 新增 `branch_known_nostack_rsp_store`，`__gmon_start__` 前的 dead `RSP` store 可删。
+  - 新增 `branch_unknown_rsp_store`，普通未知 declaration 前的 `RSP` store 仍保留。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-call-liveness-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-call-liveness-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-call-liveness-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-call-liveness-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 3s | 3s |
+| `php:extension-calendar` | 12s | 12s |
+
+residue 对比：
+
+```text
+after known no-stack declaration RSP cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  39
+gpr store access          full/full  138
+other load access         full/full  8
+
+after RSP/RBP call liveness cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  37
+gpr store access          full/full  134
+other load access         full/full  8
+```
+
+stack/frame residue 前几类：
+
+```text
+22 stack_pointer entry_external_input clobbers entry_external_input
+6  frame_pointer entry_external_input clobbers entry_external_input
+4  stack_pointer entry_external_input clobbers,external_inputs entry_external_input
+3  frame_pointer entry_external_input clobbers,external_inputs entry_external_input
+2  stack_pointer ordinary clobbers,external_inputs stack_pointer
+1  frame_pointer entry_external_input preserves entry_external_input
+```
+
+判断：
+
+- 两个小目标上 GPR store 从 `138` 降到 `134`，GPR external input 从 `39` 降到 `37`。
+- 旧的 call barrier 确实留下了跨 block 的 no-stack call 前死 store；现在这类可证明 case 能删除。
+- 未知 declaration 仍保留，非 RSP/RBP 寄存器仍不放宽。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 两个小目标少 4 个 store、2 个 external input，是 cleanup 小步，不是 RSP/RBP 核心建模。 |
+| 理解成本 | 3 | return-path liveness 从“遇 call 停止”变成按寄存器判断 call 是否会读。 |
+| 维护成本 | 3 | 规则只放宽 stack/frame register；后续如果有更完整 call effect，可替换 `callMayReadRegisterName()` 的 declaration 特判。 |
+
+有没有更好的方案：
+
+- 更完整的方案仍是按 Ghidra 的 call stack effect 建模 `stackshift/extrapop`、返回地址和 outgoing stack arg。
+- 当前这步的价值是先去掉已证明 no-stack/no-read call 保护住的死状态写，不继续扩大 declaration 名字白名单。

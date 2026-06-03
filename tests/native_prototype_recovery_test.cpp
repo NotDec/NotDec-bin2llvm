@@ -2089,6 +2089,41 @@ llvm::Function *createDeclarationStackFrameRegisterStoreCallerFunction(
   return caller;
 }
 
+llvm::Function *createBranchDeclarationRspStoreCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::StringRef calleeName, llvm::Function **calleeOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = module.getFunction(calleeName);
+  if (callee == nullptr) {
+    callee =
+        llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                               calleeName, module);
+  }
+
+  llvm::Function *caller =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call_block", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *base = createExternalInputLoad(builder, rsp, "RSP");
+  llvm::Value *adjusted = builder.CreateAdd(
+      base, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::StoreInst *store = builder.CreateStore(adjusted, rsp);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RSP"));
+  builder.CreateBr(callBlock);
+
+  builder.SetInsertPoint(callBlock);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+
+  *calleeOut = callee;
+  return caller;
+}
+
 llvm::Function *createInternalCallKilledGprStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName, llvm::Function *callee) {
@@ -8545,6 +8580,16 @@ int main() {
           declarationRsp, "RSP", false, false,
           &knownNoStackDeclarationRspCallee);
   knownNoStackDeclarationRspCallee->setName("__gmon_start__");
+  llvm::Function *branchKnownNoStackRspCallee = nullptr;
+  llvm::Function *branchKnownNoStackRspCaller =
+      createBranchDeclarationRspStoreCallerFunction(
+          declarationRspStoreModule, "branch_known_nostack_rsp_store",
+          declarationRsp, "__gmon_start__", &branchKnownNoStackRspCallee);
+  llvm::Function *branchUnknownRspCallee = nullptr;
+  llvm::Function *branchUnknownRspCaller =
+      createBranchDeclarationRspStoreCallerFunction(
+          declarationRspStoreModule, "branch_unknown_rsp_store",
+          declarationRsp, "unknown_stack_callee", &branchUnknownRspCallee);
   llvm::Function *callerReadsDeclarationRspCallee = nullptr;
   llvm::Function *callerReadsDeclarationRspCaller =
       createDeclarationStackFrameRegisterStoreCallerFunction(
@@ -8571,7 +8616,8 @@ int main() {
   for (llvm::Function *function :
        {deadDeclarationRspCaller, branchDeclarationRspCaller,
         noMetadataDeclarationRspCaller, noReturnDeclarationRspCaller,
-        knownNoStackDeclarationRspCaller, callerReadsDeclarationRspCaller,
+        knownNoStackDeclarationRspCaller, branchKnownNoStackRspCaller,
+        branchUnknownRspCaller, callerReadsDeclarationRspCaller,
         deadDeclarationRbpCaller, noMetadataDeclarationRbpCaller,
         callerReadsDeclarationRbpCaller}) {
     function->setMetadata(
@@ -8606,6 +8652,13 @@ int main() {
   ok &= expect(!hasRegisterExternalInputLoad(*knownNoStackDeclarationRspCaller,
                                              "RSP"),
                "known no-stack declaration call kept dead RSP external input");
+  ok &= expect(!hasRegisterStore(*branchKnownNoStackRspCaller, "RSP"),
+               "branch known no-stack declaration RSP store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*branchKnownNoStackRspCaller,
+                                             "RSP"),
+               "branch known no-stack declaration kept dead RSP external input");
+  ok &= expect(hasRegisterStore(*branchUnknownRspCaller, "RSP"),
+               "branch unknown declaration RSP store was removed");
   ok &= expect(hasRegisterStore(*callerReadsDeclarationRspCaller, "RSP"),
                "declaration call RSP store needed after call was removed");
   ok &= expect(hasRegisterLoad(*callerReadsDeclarationRspCaller, "RSP"),
