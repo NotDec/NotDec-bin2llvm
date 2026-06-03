@@ -631,6 +631,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-static-stack-gate`
+  - [x] 清理静态 `notdec_stack.native` 中没有 overlapping load 的死保存槽，删除由此变死的 `RBP/RSP` external input；两个最小 Bench2 目标 signature-rewrite 通过，GPR external input 从 128 降到 57。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-dead-stack-store-gate`
 
 ## 记录规则
 

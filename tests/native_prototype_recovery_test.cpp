@@ -1945,6 +1945,34 @@ llvm::Function *createStaticRspStackMemoryFunction(
   return function;
 }
 
+llvm::Function *createStaticRspDeadStackSaveFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::GlobalVariable *rbp) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  llvm::LoadInst *rspBase =
+      builder.CreateLoad(rsp->getValueType(), rsp, "RSP.external_input");
+  rspBase->setMetadata("notdec.register.external_input",
+                       registerAccessMetadata(context, "RSP"));
+  llvm::LoadInst *rbpBase =
+      builder.CreateLoad(rbp->getValueType(), rbp, "RBP.external_input");
+  rbpBase->setMetadata("notdec.register.external_input",
+                       registerAccessMetadata(context, "RBP"));
+  llvm::Value *address = builder.CreateAdd(
+      rspBase, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  builder.CreateStore(rbpBase, pointer);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createInternalCallKilledGprStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName, llvm::Function *callee) {
@@ -8303,11 +8331,15 @@ int main() {
       "native-prototype-static-rsp-stack-memory-test", context);
   llvm::GlobalVariable *staticRsp =
       createRegisterGlobal(staticRspStackModule, "RSP");
+  llvm::GlobalVariable *staticRbp =
+      createRegisterGlobal(staticRspStackModule, "RBP");
   attachStackFramePreservedTestAbi(staticRspStackModule);
   llvm::Function *staticRspLocal = createStaticRspStackMemoryFunction(
       staticRspStackModule, "static_rsp_local", staticRsp, false);
   llvm::Function *staticRspEscaped = createStaticRspStackMemoryFunction(
       staticRspStackModule, "static_rsp_escaped", staticRsp, true);
+  llvm::Function *staticRspDeadSave = createStaticRspDeadStackSaveFunction(
+      staticRspStackModule, "static_rsp_dead_save", staticRsp, staticRbp);
   notdec::bin2llvm::runNativePrototypeRecovery(staticRspStackModule,
                                                rewriteOptions);
   ok &= expect(hasAllocaNamed(*staticRspLocal, "notdec_stack.native"),
@@ -8322,6 +8354,14 @@ int main() {
                "escaped RSP stack pointer lost original inttoptr");
   ok &= expect(hasRegisterExternalInputLoad(*staticRspEscaped, "RSP"),
                "escaped RSP stack pointer lost original external input");
+  ok &= expect(!hasAllocaNamed(*staticRspDeadSave, "notdec_stack.native"),
+               "dead static RSP stack save kept unused native stack alloca");
+  ok &= expect(!hasIntToPtr(*staticRspDeadSave),
+               "dead static RSP stack save kept old inttoptr");
+  ok &= expect(!hasRegisterExternalInputLoad(*staticRspDeadSave, "RSP"),
+               "dead static RSP stack save kept dead RSP external input");
+  ok &= expect(!hasRegisterExternalInputLoad(*staticRspDeadSave, "RBP"),
+               "dead static RSP stack save kept dead RBP external input");
   if (llvm::verifyModule(staticRspStackModule, &llvm::errs())) {
     std::cerr << "static RSP stack memory module verification failed after "
                  "prototype rewrite\n";

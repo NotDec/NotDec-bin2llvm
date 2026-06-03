@@ -2260,6 +2260,55 @@ struct StaticStackMemoryAccess {
   uint64_t Size = 0;
 };
 
+bool stackRangesOverlap(int64_t leftOffset, uint64_t leftSize,
+                        int64_t rightOffset, uint64_t rightSize) {
+  int64_t leftEnd = leftOffset + static_cast<int64_t>(leftSize);
+  int64_t rightEnd = rightOffset + static_cast<int64_t>(rightSize);
+  return leftOffset < rightEnd && rightOffset < leftEnd;
+}
+
+bool staticStackStoreIsLoaded(
+    const StaticStackMemoryAccess &storeAccess,
+    const std::vector<StaticStackMemoryAccess> &accesses) {
+  for (const StaticStackMemoryAccess &access : accesses) {
+    if (!llvm::isa<llvm::LoadInst>(access.Memory)) {
+      continue;
+    }
+    if (stackRangesOverlap(storeAccess.Offset, storeAccess.Size, access.Offset,
+                           access.Size)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void eraseDeadStaticStackStores(
+    const std::vector<StaticStackMemoryAccess> &accesses) {
+  // The store has to be deleted before its GEP and stored value can become
+  // trivially dead.
+  struct DeadStore {
+    llvm::StoreInst *Store = nullptr;
+    llvm::Value *StoredValue = nullptr;
+    llvm::Value *Pointer = nullptr;
+  };
+
+  std::vector<DeadStore> deadStores;
+  for (const StaticStackMemoryAccess &access : accesses) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(access.Memory);
+    if (store == nullptr || staticStackStoreIsLoaded(access, accesses)) {
+      continue;
+    }
+    deadStores.push_back({store, store->getValueOperand(),
+                          store->getPointerOperand()});
+  }
+
+  for (const DeadStore &deadStore : deadStores) {
+    deadStore.Store->eraseFromParent();
+    llvm::RecursivelyDeleteTriviallyDeadInstructions(deadStore.Pointer);
+    llvm::RecursivelyDeleteTriviallyDeadInstructions(deadStore.StoredValue);
+  }
+}
+
 void rewriteStaticStackMemoryAccesses(llvm::Module &module,
                                       const NativeAbiSpec &abi) {
   if (abi.StackPointerRegister.empty()) {
@@ -2375,6 +2424,7 @@ void rewriteStaticStackMemoryAccesses(llvm::Module &module,
         llvm::RecursivelyDeleteTriviallyDeadInstructions(access.Pointer);
       }
     }
+    eraseDeadStaticStackStores(accesses);
   }
 }
 

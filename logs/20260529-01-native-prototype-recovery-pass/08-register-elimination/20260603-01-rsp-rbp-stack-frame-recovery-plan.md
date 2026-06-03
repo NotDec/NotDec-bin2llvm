@@ -468,3 +468,115 @@ other load external_input full/full  1
 
 - 更完整的路线仍然是先抽出通用的 stack base/value 识别，再同时支持 RSP、RBP 和动态 alloca。
 - 本轮先做 RSP 静态负 offset，是因为它基于优化后的 canonical IR，语义边界清楚，能快速验证 alloca rewrite 对 Bench2 不破坏 assemble/verify。
+
+# 2026-06-03 实现记录：清理未读取的静态栈保存槽
+
+背景：
+
+- 静态 RSP alloca 改写后，很多剩余 `RBP.external_input` 来自函数序言形态：把入口 `RBP` 保存到 `notdec_stack.native`，但后面没有从该槽读回。
+- 这些保存槽地址不逃逸，且 alloca 是当前 pass 新建的本地对象；如果没有 overlapping load，这个 store 没有语义消费者。
+- 先清掉这类 dead stack store，比直接把 `RBP` 当 frame base 更安全。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2263)
+  - 新增 `stackRangesOverlap()`，用 byte range 判断两个静态栈访问是否重叠。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2270)
+  - 新增 `staticStackStoreIsLoaded()`，只有存在 overlapping load 时才保留 store。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2285)
+  - 新增 `eraseDeadStaticStackStores()`。
+  - 删除没有 overlapping load 的 `notdec_stack.native` store。
+  - store 删除后递归 DCE store pointer 和 store value，因此未使用的 `RBP.external_input` / `RSP.external_input` 会一起消失。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2427)
+  - 在 `rewriteStaticStackMemoryAccesses()` 完成 pointer 改写后调用 dead stack store cleanup。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1948)
+  - 新增 `createStaticRspDeadStackSaveFunction()`，构造 `RSP - 8` 栈槽保存 `RBP.external_input` 但没有 load 的 case。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8341)
+  - 新增断言：dead save case 不应保留 `notdec_stack.native`、旧 `inttoptr`、`RSP.external_input`、`RBP.external_input`。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-rbp-dead-stack-store-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-rbp-dead-stack-store-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-rbp-dead-stack-store-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-rbp-dead-stack-store-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 3s | 2s |
+| `php:extension-calendar` | 11s | 11s |
+
+residue 对比：
+
+```text
+after static RSP alloca:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  128
+gpr store access          full/full  158
+other load access         full/full  8
+other load external_input full/full  1
+
+after dead stack store cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  57
+gpr store access          full/full  158
+other load access         full/full  8
+```
+
+stack/frame residue 前几类：
+
+```text
+34 stack_pointer entry_external_input clobbers entry_external_input
+15 stack_pointer before_call clobbers stack_pointer
+12 stack_pointer entry_external_input clobbers,external_inputs entry_external_input
+6  stack_pointer before_call clobbers,external_inputs stack_pointer
+6  frame_pointer entry_external_input clobbers entry_external_input
+3  frame_pointer entry_external_input clobbers,external_inputs entry_external_input
+```
+
+判断：
+
+- GPR external input 从 `128` 降到 `57`，主要清掉了保存但没有读取的 `RBP` / callee-saved register stack save。
+- `notdec_stack.native` 出现次数从 `238` 降到 `14`，说明很多 alloca 只服务于死保存槽，已被 DCE。
+- GPR store 仍是 `158`，瓶颈已经转向 call 前 `RSP` 状态和真正被保留的寄存器 store。
+- 耗时同量级，没有看到性能退化。
+
+剩余问题：
+
+- `RBP` frame-base raw memory access 仍未处理，剩下的 `RBP.external_input` 里还有 `RBP + negative offset -> inttoptr -> load`。
+- `RSP` before-call store 仍较多，这需要区分 outgoing stack arg、return address 模拟和真正跨 call 的 stack pointer state。
+- 当前 cleanup 只按静态 range 判断 load/store，不做 alias 推理；这是有意保守。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 两个小目标 external input 大幅下降，但仍没解决 call 前 RSP 和 RBP frame-base。 |
+| 理解成本 | 2 | 只在当前 pass 新建的静态 alloca 访问集合里做 range 检查，规则简单。 |
+| 维护成本 | 2 | 后续扩展 RBP/dynamic alloca 时可以复用同一 dead stack store cleanup。 |
+
+有没有更好的方案：
+
+- 如果以后统一建 stack object，应把这个 cleanup 放到统一 stack access 收集后执行。
+- 当前先放在 RSP 静态改写里，是因为数据来源完整，地址不逃逸，风险低。
