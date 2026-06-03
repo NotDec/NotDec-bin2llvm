@@ -1511,3 +1511,99 @@ other load access         full/full  8
 
 - 如果后续 dead-store cleanup 扩大范围，可以考虑统一成一个小的 CFG liveness walker，减少多处递归函数重复。
 - 当前先做局部修正，是因为问题明确命中 RSP/RBP return-path cleanup，改动范围更小。
+
+# 2026-06-03 实现记录：过滤 stack/frame 派生返回候选
+
+背景：
+
+- shared-successor 修正后，两个小 Bench2 目标的 stack/frame store residue 已清零，但还有 `RSP.external_input`。
+- 抽查 `php-extension-calendar` 里 `notdec_native_37d0` 一类函数，`RSP.external_input - const` 被写到 ABI output register，prototype recovery 会把它当作返回值。
+- 这类值只是当前 native stack 地址，不应恢复成 LLVM ABI return；否则 signature rewrite 后仍会保留 `RSP.external_input` 链。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:55)
+  - 给 `accessMatchesEffectRegister()` 和 `stackFrameRegisterNames()` 增加前置声明，供返回候选过滤复用。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:203)
+  - 新增 `valueUsesExternalInputRegister()`，沿 `add/sub/and/ptrtoint/inttoptr/phi` 追踪值是否来自指定 register external input。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:244)
+  - 新增 `valueIsStackFrameExternalInputDerived()`，用 ABI stack pointer 和 frame pointer 集合判断值是否来自 stack/frame external input。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:4349)
+  - 收集 `returnTrialsBefore()` 结果时跳过 stack/frame external input 派生值。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:222)
+  - `attachStackFramePreservedTestAbi()` 增加 `RAX` output，让 stack-frame 专用测试能覆盖 return candidate。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1776)
+  - 新增 `createStackDerivedReturnStoreFunction()`，构造 `RSP.external_input - const -> store @RAX`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8549)
+  - 新增 `return_rsp_derived_rax`，断言它不会被标成 `RAX` return candidate。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-stack-derived-return-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-stack-derived-return-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-stack-derived-return-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-stack-derived-return-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 2s | 3s |
+| `php:extension-calendar` | 12s | 12s |
+
+residue 对比：
+
+```text
+after shared-successor liveness fix:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  35
+gpr store access          full/full  128
+other load access         full/full  8
+
+after stack-derived return filtering:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  30
+gpr store access          full/full  128
+other load access         full/full  8
+```
+
+判断：
+
+- 两个小目标上 GPR external input 从 `35` 降到 `30`，GPR store 不变。
+- 命中的是 `RSP/RBP.external_input + const` 被误当 ABI return 的形态。
+- 这一步不改 raw stack memory，也不把 `RBP + const` 当作本函数 frame base。
+- 剩余 `RSP/RBP` 主要是 stack 地址值继续写入非返回寄存器，以及少量 `RSP` caller-stack raw load。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 少 5 个 external input，并修正一类错误 prototype return。 |
+| 理解成本 | 2 | 只在 return candidate 收集处过滤，值追踪范围有限。 |
+| 维护成本 | 2 | 规则依赖 ABI stack/frame register 集合，边界清楚；后续可扩展更多无害 cast/op。 |
+
+有没有更好的方案：
+
+- 更完整的做法是先恢复 native stack 地址，再让这些 stack 地址值不要逃到 ABI register global。
+- 当前先阻止错误 return 恢复，避免把栈地址当函数返回值继续传播。

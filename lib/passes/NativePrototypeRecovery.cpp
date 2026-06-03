@@ -52,6 +52,11 @@ std::optional<std::string> metadataField(const llvm::MDNode &node,
 std::optional<uint64_t> parseUint64Field(const llvm::MDNode &node,
                                          llvm::StringRef key);
 
+bool accessMatchesEffectRegister(const llvm::MDNode &access,
+                                 llvm::StringRef effectName);
+
+std::set<std::string> stackFrameRegisterNames(const NativeAbiSpec &abi);
+
 llvm::MDNode *inputCandidateMetadata(llvm::LLVMContext &context,
                                      const NativeParamActive &active) {
   if (active.Trials.empty()) {
@@ -191,6 +196,57 @@ bool sameReturnStoreValue(llvm::Value &first, llvm::Value &second,
       }
     }
     return phi->getNumIncomingValues() > 0;
+  }
+  return false;
+}
+
+bool valueUsesExternalInputRegister(llvm::Value &value,
+                                    llvm::StringRef registerName,
+                                    unsigned depth = 0) {
+  if (depth >= 8) {
+    return false;
+  }
+  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&value)) {
+    llvm::MDNode *metadata =
+        load->getMetadata("notdec.register.external_input");
+    return metadata != nullptr &&
+           accessMatchesEffectRegister(*metadata, registerName);
+  }
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&value)) {
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      if (incoming != nullptr &&
+          valueUsesExternalInputRegister(*incoming, registerName, depth + 1)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  auto *op = llvm::dyn_cast<llvm::Operator>(&value);
+  if (op == nullptr) {
+    return false;
+  }
+  if (op->getOpcode() != llvm::Instruction::Add &&
+      op->getOpcode() != llvm::Instruction::Sub &&
+      op->getOpcode() != llvm::Instruction::And &&
+      op->getOpcode() != llvm::Instruction::PtrToInt &&
+      op->getOpcode() != llvm::Instruction::IntToPtr) {
+    return false;
+  }
+  for (llvm::Value *operand : op->operands()) {
+    if (operand != nullptr &&
+        valueUsesExternalInputRegister(*operand, registerName, depth + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool valueIsStackFrameExternalInputDerived(llvm::Value &value,
+                                           const NativeAbiSpec &abi) {
+  for (const std::string &registerName : stackFrameRegisterNames(abi)) {
+    if (valueUsesExternalInputRegister(value, registerName)) {
+      return true;
+    }
   }
   return false;
 }
@@ -4291,6 +4347,10 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
       if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator())) {
         ++returnCount;
         for (NativeParamTrial &trial : returnTrialsBefore(*ret, model)) {
+          if (trial.Value != nullptr &&
+              valueIsStackFrameExternalInputDerived(*trial.Value, *abi)) {
+            continue;
+          }
           uint64_t slot = trial.Slot;
           ++returnSlotCounts[slot];
           returnTrialsBySlot.try_emplace(slot, trial);

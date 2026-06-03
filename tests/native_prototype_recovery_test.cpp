@@ -224,6 +224,7 @@ void attachStackFramePreservedTestAbi(llvm::Module &module) {
   abi.PrototypeName = "__stdcall";
   abi.StackPointerRegister = "RSP";
   abi.StackPointerSpace = "register";
+  abi.Outputs.push_back(inputRegister("RAX"));
 
   for (llvm::StringRef registerName : {"RSP", "RBP"}) {
     notdec::bin2llvm::NativeAbiEffect unaffected;
@@ -1769,6 +1770,28 @@ llvm::Function *createReturnStoreFunction(llvm::Module &module,
   if (returnStore != nullptr) {
     *returnStore = store;
   }
+  return function;
+}
+
+llvm::Function *createStackDerivedReturnStoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *stack,
+    const std::string &stackRegisterName, llvm::GlobalVariable *output,
+    const std::string &outputRegisterName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *base =
+      createExternalInputLoad(builder, stack, stackRegisterName);
+  llvm::Value *address = builder.CreateAdd(
+      base, llvm::ConstantInt::get(stack->getValueType(), -32, true));
+  llvm::StoreInst *store = builder.CreateStore(address, output);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, outputRegisterName));
+  builder.CreateRetVoid();
   return function;
 }
 
@@ -8509,6 +8532,8 @@ int main() {
       createRegisterGlobal(stackFramePreservedModule, "RSP");
   llvm::GlobalVariable *preservedRbp =
       createRegisterGlobal(stackFramePreservedModule, "RBP");
+  llvm::GlobalVariable *preservedRax =
+      createRegisterGlobal(stackFramePreservedModule, "RAX");
   attachStackFramePreservedTestAbi(stackFramePreservedModule);
   llvm::Function *deadRspRestore = createPreservedStackFrameStoreFunction(
       stackFramePreservedModule, "dead_rsp_restore", preservedRsp, "RSP",
@@ -8521,6 +8546,12 @@ int main() {
       true);
   llvm::Function *diamondRspRestore = createDiamondStackFrameStoreFunction(
       stackFramePreservedModule, "diamond_rsp_restore", preservedRsp, "RSP");
+  llvm::Function *stackDerivedRaxReturn =
+      createStackDerivedReturnStoreFunction(stackFramePreservedModule,
+                                            "return_rsp_derived_rax",
+                                            preservedRsp, "RSP", preservedRax,
+                                            "RAX");
+  attachExternalInputs(*stackDerivedRaxReturn, {{"RSP", preservedRsp}});
   attachRegisterEffectMetadata(*deadRspRestore, "notdec.register.preserves",
                                preservedRsp, "RSP");
   attachRegisterEffectMetadata(*deadRbpRestore, "notdec.register.preserves",
@@ -8541,6 +8572,9 @@ int main() {
                "live preserved RBP load was removed");
   ok &= expect(!hasRegisterStore(*diamondRspRestore, "RSP"),
                "diamond shared-successor RSP store was not removed");
+  ok &= expect(!metadataHasRegister(*stackDerivedRaxReturn,
+                                    "notdec.prototype.return_candidates", "RAX"),
+               "stack-derived RAX return was incorrectly marked as a candidate");
   if (llvm::verifyModule(stackFramePreservedModule, &llvm::errs())) {
     std::cerr << "stack/frame preserved cleanup module verification failed "
                  "after prototype rewrite\n";

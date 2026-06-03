@@ -669,6 +669,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rsp-shared-successor-gate`
+  - [x] 过滤 stack/frame external input 派生的返回候选：`RSP/RBP.external_input + const` 不再被恢复成 ABI return；两个最小 Bench2 目标 signature-rewrite 通过，GPR external input 从 35 降到 30。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-stack-derived-return-gate`
 
 ## 记录规则
 
