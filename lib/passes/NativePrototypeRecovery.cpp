@@ -1999,6 +1999,49 @@ bool canEraseUnusedInternalCallKilledStore(llvm::StoreInst &store,
   return !functionReadsRegisterName(callee, registerName);
 }
 
+bool storedRegisterValueIsDeadAfterCall(llvm::CallInst &call,
+                                        const llvm::MDNode &access) {
+  std::set<llvm::BasicBlock *> seen;
+  seen.insert(call.getParent());
+  llvm::Instruction *next = call.getNextNode();
+  while (next != nullptr) {
+    if (llvm::isa<llvm::ReturnInst>(next)) {
+      return true;
+    }
+    if (instructionWritesRegisterAccess(*next, access)) {
+      return true;
+    }
+    if (llvm::isa<llvm::CallBase>(next) ||
+        instructionReadsRegisterAccess(*next, access)) {
+      return false;
+    }
+    next = next->getNextNode();
+  }
+  return allSuccessorsReachReturnWithoutCallOrAccessLoad(*call.getParent(),
+                                                         access, seen);
+}
+
+bool canEraseUnusedInternalCallStackPointerStore(
+    llvm::StoreInst &store, llvm::CallInst &call, llvm::Function &callee,
+    llvm::StringRef registerName) {
+  llvm::MDNode *access = store.getMetadata("notdec.register.access");
+  if (access == nullptr || !accessMatchesEffectRegister(*access, registerName)) {
+    return false;
+  }
+  if (valueIsNeededByInterveningInstruction(store, call, *access)) {
+    return false;
+  }
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(callee);
+  if (prototype && prototypeHasRegisterInput(*prototype, registerName)) {
+    return false;
+  }
+  if (functionReadsRegisterName(callee, registerName)) {
+    return false;
+  }
+  return storedRegisterValueIsDeadAfterCall(call, *access);
+}
+
 std::set<std::string> killedByCallRegisterNames(const NativeAbiSpec &abi) {
   std::set<std::string> names;
   for (const NativeAbiEffect &effect : abi.Effects) {
@@ -2103,6 +2146,54 @@ void eraseUnusedInternalCallKilledInputStores(llvm::Module &module,
                                                    registerName)) {
             deadStores.push_back(store);
           }
+        }
+      }
+    }
+  }
+
+  std::set<llvm::StoreInst *> uniqueStores(deadStores.begin(),
+                                          deadStores.end());
+  for (llvm::StoreInst *store : uniqueStores) {
+    llvm::Value *storedValue = store->getValueOperand();
+    store->eraseFromParent();
+    llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
+  }
+}
+
+void eraseUnusedInternalCallStackPointerStores(llvm::Module &module,
+                                               const NativeAbiSpec &abi) {
+  if (abi.StackPointerRegister.empty()) {
+    return;
+  }
+
+  std::vector<llvm::StoreInst *> deadStores;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr || callee->isDeclaration()) {
+          continue;
+        }
+        llvm::StoreInst *store = localCallsiteInputStoreBeforeCall(
+            *call, abi.StackPointerRegister,
+            llvm::Type::getInt64Ty(module.getContext()));
+        if (store != nullptr &&
+            canEraseUnusedInternalCallStackPointerStore(
+                *store, *call, *callee, abi.StackPointerRegister)) {
+          deadStores.push_back(store);
         }
       }
     }
@@ -3816,6 +3907,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseRewrittenInternalCallInputStores(module);
     eraseDeadKilledByCallRegisterStores(module, *abi);
     eraseUnusedInternalCallKilledInputStores(module, *abi);
+    eraseUnusedInternalCallStackPointerStores(module, *abi);
     rewriteStaticStackMemoryAccesses(module, *abi);
     eraseDeadStackFrameRegisterStores(module, *abi);
     eraseDeadNonReturnVectorStores(module);

@@ -580,3 +580,90 @@ stack/frame residue 前几类：
 
 - 如果以后统一建 stack object，应把这个 cleanup 放到统一 stack access 收集后执行。
 - 当前先放在 RSP 静态改写里，是因为数据来源完整，地址不逃逸，风险低。
+
+# 2026-06-03 实现记录：internal call 前 RSP store 安全清理
+
+背景：
+
+- dead stack store cleanup 后，剩余 `RSP` store 大多在 call 前。
+- declaration call 仍可能代表未知 native 边界，不能直接删。
+- internal call 可以做更窄判断：如果 callee 不读 `RSP`，store 到 call 之间没有 `RSP` 读/写/其它 call，并且 call 后到 return 或覆盖前也没有 `RSP` 读，这个 call 前 `RSP` store 就只是旧全局寄存器状态维护。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2002)
+  - 新增 `storedRegisterValueIsDeadAfterCall()`，检查 call 后路径上是否没有同寄存器读，直到 return 或同寄存器覆盖。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2024)
+  - 新增 `canEraseUnusedInternalCallStackPointerStore()`。
+  - 要求 call 前局部 store 没有被 intervening instruction 使用。
+  - 要求 callee recovered prototype 没有 `RSP` register input，且 callee body 不读 `RSP`。
+  - 要求 call 后该 store value 不再被 caller 读取。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2163)
+  - 新增 `eraseUnusedInternalCallStackPointerStores()`，只处理 ABI stack pointer，只处理非 declaration direct internal call。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3910)
+  - 在 internal killed-input cleanup 后、静态 stack alloca rewrite 前调用。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1976)
+  - 新增 `createInternalRspStoreCallerFunction()`，构造 call 前 `RSP` store 的可删/不可删 case。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8414)
+  - 新增三组测试：callee 不读且 caller 后续不读时删除；callee 读 `RSP` 时保留；caller call 后读 `RSP` 时保留。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-rbp-internal-call-sp-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-rbp-internal-call-sp-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-rbp-internal-call-sp-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-rbp-internal-call-sp-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 3s | 3s |
+| `php:extension-calendar` | 12s | 11s |
+
+residue 汇总和上一轮相同：
+
+```text
+gpr load  access          full/full  1
+gpr load  external_input  full/full  57
+gpr store access          full/full  158
+other load access         full/full  8
+```
+
+判断：
+
+- 这两个小目标没有命中新规则，残留统计不变。
+- 剩余两个 internal before-call/path 样本的 callee 会读 `RSP`，所以当前规则正确保留。
+- declaration call 前的 `RSP` store 仍不处理；这需要更完整的 call stack effect / stack argument 语义。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 补上 internal direct-call 的安全子集，但当前两个小目标没有 residue 下降。 |
+| 理解成本 | 2 | 和已有 internal killed-input cleanup 并列，条件集中在 call 前后局部 liveness。 |
+| 维护成本 | 2 | 不碰 declaration call，不改变 RBP/alloca 逻辑，后续可扩展到 CFG 前驱等价值。 |
+
+有没有更好的方案：
+
+- 真正能消掉当前 before-call 大头的方案，是引入 Ghidra 式 `stackshift/extrapop` 和 stack argument 建模。
+- 本轮只做 internal direct-call 的安全子集，是为了先避免把 declaration/native 边界语义弄错。

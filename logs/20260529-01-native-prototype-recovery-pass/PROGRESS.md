@@ -635,6 +635,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-dead-stack-store-gate`
+  - [x] 补充 internal call 前 `RSP` store 的安全清理：callee 不读 `RSP` 且 caller call 后不读时删除；两个最小 Bench2 目标 signature-rewrite 通过，但当前样本未命中，残留统计不变。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-internal-call-sp-gate`
 
 ## 记录规则
 
