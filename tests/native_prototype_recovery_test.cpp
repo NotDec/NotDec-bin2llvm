@@ -23,6 +23,11 @@
 
 namespace {
 
+llvm::MDNode *makeRecoveredPrototypeMetadata(
+    llvm::LLVMContext &context, llvm::StringRef model,
+    llvm::ArrayRef<std::pair<llvm::StringRef, uint64_t>> inputs,
+    llvm::ArrayRef<std::pair<llvm::StringRef, uint64_t>> returns);
+
 llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
                                            const std::string &name,
                                            llvm::Type *type) {
@@ -2128,6 +2133,181 @@ llvm::Function *createPhiRawRspLoadFunction(llvm::Module &module,
   if (useLoadedValue) {
     builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 1));
   }
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createStoredRbpRawLoadFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::GlobalVariable *rbp) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             name + "_callee", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  calleeBuilder.CreateRetVoid();
+
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspBase =
+      builder.CreateLoad(rsp->getValueType(), rsp, "RSP.external_input");
+  rspBase->setMetadata("notdec.register.external_input",
+                       registerAccessMetadata(context, "RSP"));
+  llvm::Value *frameBase = builder.CreateAdd(
+      rspBase, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::StoreInst *store = builder.CreateStore(frameBase, rbp);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RBP"));
+  builder.CreateCall(callee->getFunctionType(), callee);
+  llvm::LoadInst *rbpLoad = builder.CreateLoad(rbp->getValueType(), rbp,
+                                               "RBP.frame_base");
+  rbpLoad->setMetadata("notdec.register.access",
+                       registerAccessMetadata(context, "RBP"));
+  llvm::Value *address = builder.CreateAdd(
+      rbpLoad, llvm::ConstantInt::get(rbp->getValueType(), 8));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  builder.CreateLoad(rbp->getValueType(), pointer, "unused_frame_load");
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createMergedStoredRbpRawLoadFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::GlobalVariable *rbp) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             name + "_callee", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  calleeBuilder.CreateRetVoid();
+
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *merge = llvm::BasicBlock::Create(context, "merge", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspBase =
+      builder.CreateLoad(rsp->getValueType(), rsp, "RSP.external_input");
+  rspBase->setMetadata("notdec.register.external_input",
+                       registerAccessMetadata(context, "RSP"));
+  llvm::Value *frameBase = builder.CreateAdd(
+      rspBase, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::StoreInst *store = builder.CreateStore(frameBase, rbp);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RBP"));
+  builder.CreateCondBr(llvm::ConstantInt::getFalse(context), merge, merge);
+
+  builder.SetInsertPoint(merge);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  llvm::LoadInst *rbpLoad = builder.CreateLoad(rbp->getValueType(), rbp,
+                                               "RBP.frame_base");
+  rbpLoad->setMetadata("notdec.register.access",
+                       registerAccessMetadata(context, "RBP"));
+  llvm::Value *address = builder.CreateAdd(
+      rbpLoad, llvm::ConstantInt::get(rbp->getValueType(), 8));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  builder.CreateLoad(rbp->getValueType(), pointer, "unused_frame_load");
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createCallReturnStoredRbpRawLoadFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::GlobalVariable *rbp) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *i64 = llvm::Type::getInt64Ty(context);
+  auto *calleeType =
+      llvm::FunctionType::get(i64, llvm::ArrayRef<llvm::Type *>{i64, i64, i64},
+                              false);
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             name + "_callee", module);
+  callee->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall",
+                                     {{"RDI", 0}, {"RSI", 1}, {"RDX", 2}},
+                                     {{"RAX", 0}}));
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  calleeBuilder.CreateRet(callee->getArg(0));
+
+  auto *funcType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), llvm::ArrayRef<llvm::Type *>{i64, i64},
+      false);
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  function->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall",
+                                     {{"RDI", 0}, {"RDX", 1}}, {}));
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *merge = llvm::BasicBlock::Create(context, "merge", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspBase =
+      builder.CreateLoad(rsp->getValueType(), rsp, "RSP.external_input");
+  rspBase->setMetadata("notdec.register.external_input",
+                       registerAccessMetadata(context, "RSP"));
+  llvm::Value *frameBase = builder.CreateAdd(
+      rspBase, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::StoreInst *store = builder.CreateStore(frameBase, rbp);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RBP"));
+  builder.CreateCondBr(llvm::ConstantInt::getFalse(context), merge, merge);
+
+  builder.SetInsertPoint(merge);
+  llvm::Value *callResult = builder.CreateCall(
+      callee->getFunctionType(), callee,
+      {function->getArg(0), llvm::ConstantInt::get(i64, 63920),
+       function->getArg(1)});
+  (void)callResult;
+  llvm::LoadInst *rbpLoad = builder.CreateLoad(rbp->getValueType(), rbp,
+                                               "RBP.frame_base");
+  rbpLoad->setMetadata("notdec.register.access",
+                       registerAccessMetadata(context, "RBP"));
+  llvm::Value *address = builder.CreateAdd(
+      rbpLoad, llvm::ConstantInt::get(rbp->getValueType(), 8));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  builder.CreateLoad(rbp->getValueType(), pointer, "unused_frame_load");
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createExternalRbpRawLoadFunction(llvm::Module &module,
+                                                 const std::string &name,
+                                                 llvm::GlobalVariable *rbp) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rbpBase =
+      builder.CreateLoad(rbp->getValueType(), rbp, "RBP.external_input");
+  rbpBase->setMetadata("notdec.register.external_input",
+                       registerAccessMetadata(context, "RBP"));
+  llvm::Value *address = builder.CreateAdd(
+      rbpBase, llvm::ConstantInt::get(rbp->getValueType(), -8, true));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  llvm::LoadInst *load =
+      builder.CreateLoad(rbp->getValueType(), pointer, "external_frame_load");
+  builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 1));
   builder.CreateRetVoid();
   return function;
 }
@@ -8697,6 +8877,7 @@ int main() {
 
   llvm::Module rawRspLoadModule("native-prototype-raw-rsp-load-test", context);
   llvm::GlobalVariable *rawRsp = createRegisterGlobal(rawRspLoadModule, "RSP");
+  llvm::GlobalVariable *rawRbp = createRegisterGlobal(rawRspLoadModule, "RBP");
   attachStackFramePreservedTestAbi(rawRspLoadModule);
   llvm::Function *unusedRawRspLoad =
       createRawRspLoadFunction(rawRspLoadModule, "unused_raw_rsp_load", rawRsp,
@@ -8710,6 +8891,19 @@ int main() {
   llvm::Function *usedPhiRawRspLoad =
       createPhiRawRspLoadFunction(rawRspLoadModule, "used_phi_raw_rsp_load",
                                   rawRsp, true);
+  llvm::Function *storedRbpRawLoad =
+      createStoredRbpRawLoadFunction(rawRspLoadModule, "stored_rbp_raw_load",
+                                     rawRsp, rawRbp);
+  llvm::Function *mergedStoredRbpRawLoad =
+      createMergedStoredRbpRawLoadFunction(rawRspLoadModule,
+                                           "merged_stored_rbp_raw_load", rawRsp,
+                                           rawRbp);
+  llvm::Function *callReturnStoredRbpRawLoad =
+      createCallReturnStoredRbpRawLoadFunction(
+          rawRspLoadModule, "call_return_stored_rbp_raw_load", rawRsp, rawRbp);
+  llvm::Function *externalRbpRawLoad =
+      createExternalRbpRawLoadFunction(rawRspLoadModule,
+                                       "external_rbp_raw_load", rawRbp);
   notdec::bin2llvm::runNativePrototypeRecovery(rawRspLoadModule,
                                                rewriteOptions);
   ok &= expect(!hasIntToPtr(*unusedRawRspLoad),
@@ -8728,6 +8922,30 @@ int main() {
                "used phi raw RSP load lost original inttoptr");
   ok &= expect(hasRegisterExternalInputLoad(*usedPhiRawRspLoad, "RSP"),
                "used phi raw RSP load lost original external input");
+  ok &= expect(!hasRegisterLoad(*storedRbpRawLoad, "RBP"),
+               "stored RBP frame-base load was not replaced");
+  ok &= expect(!hasRegisterStore(*storedRbpRawLoad, "RBP"),
+               "stored RBP frame-base store was not removed after replacement");
+  ok &= expect(!hasIntToPtr(*storedRbpRawLoad),
+               "stored RBP frame-base raw load kept old inttoptr");
+  ok &= expect(!hasRegisterExternalInputLoad(*storedRbpRawLoad, "RSP"),
+               "stored RBP frame-base cleanup kept dead RSP external input");
+  ok &= expect(!hasRegisterLoad(*mergedStoredRbpRawLoad, "RBP"),
+               "merged stored RBP frame-base load was not replaced");
+  ok &= expect(!hasRegisterStore(*mergedStoredRbpRawLoad, "RBP"),
+               "merged stored RBP frame-base store was not removed");
+  ok &= expect(!hasIntToPtr(*mergedStoredRbpRawLoad),
+               "merged stored RBP frame-base raw load kept old inttoptr");
+  ok &= expect(!hasRegisterLoad(*callReturnStoredRbpRawLoad, "RBP"),
+               "call-return stored RBP frame-base load was not replaced");
+  ok &= expect(!hasRegisterStore(*callReturnStoredRbpRawLoad, "RBP"),
+               "call-return stored RBP frame-base store was not removed");
+  ok &= expect(!hasIntToPtr(*callReturnStoredRbpRawLoad),
+               "call-return stored RBP frame-base raw load kept old inttoptr");
+  ok &= expect(hasIntToPtr(*externalRbpRawLoad),
+               "external RBP frame raw load lost original inttoptr");
+  ok &= expect(hasRegisterExternalInputLoad(*externalRbpRawLoad, "RBP"),
+               "external RBP frame raw load lost original external input");
   if (llvm::verifyModule(rawRspLoadModule, &llvm::errs())) {
     std::cerr << "raw RSP load module verification failed after "
                  "prototype rewrite\n";

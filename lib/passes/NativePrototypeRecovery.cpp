@@ -1920,6 +1920,16 @@ bool loadReadsRegisterName(llvm::LoadInst &load, llvm::StringRef registerName) {
   return false;
 }
 
+bool storeWritesRegisterName(llvm::StoreInst &store,
+                             llvm::StringRef registerName) {
+  if (llvm::MDNode *access = store.getMetadata("notdec.register.access")) {
+    if (accessMatchesEffectRegister(*access, registerName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool functionReadsRegisterName(llvm::Function &function,
                                llvm::StringRef registerName) {
   for (llvm::BasicBlock &block : function) {
@@ -1927,6 +1937,31 @@ bool functionReadsRegisterName(llvm::Function &function,
       auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
       if (load != nullptr && loadReadsRegisterName(*load, registerName)) {
         return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool functionMayTouchRegisterName(llvm::Function &function,
+                                  llvm::StringRef registerName) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+        if (!load->use_empty() && loadReadsRegisterName(*load, registerName)) {
+          return true;
+        }
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+        if (storeWritesRegisterName(*store, registerName)) {
+          return true;
+        }
+      }
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr || !callee->isIntrinsic()) {
+          return true;
+        }
       }
     }
   }
@@ -1970,6 +2005,26 @@ bool callMayReadRegisterAccess(llvm::CallBase &call,
     }
   }
   return false;
+}
+
+bool callInvalidatesKnownFrameRegisterValue(llvm::CallBase &call,
+                                            llvm::StringRef registerName) {
+  llvm::Function *callee = call.getCalledFunction();
+  if (callee == nullptr) {
+    return true;
+  }
+  if (callee->isIntrinsic()) {
+    return false;
+  }
+  if (callee->isDeclaration()) {
+    return true;
+  }
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(*callee);
+  if (prototype && prototypeHasRegisterInput(*prototype, registerName)) {
+    return true;
+  }
+  return functionMayTouchRegisterName(*callee, registerName);
 }
 
 bool instructionWritesRegisterAccess(llvm::Instruction &instruction,
@@ -2544,6 +2599,159 @@ llvm::LoadInst *externalInputLoadForRegister(llvm::Function &function,
     }
   }
   return result;
+}
+
+bool registerAccessMatchesName(const llvm::Instruction &instruction,
+                               llvm::StringRef metadataName,
+                               llvm::StringRef registerName) {
+  llvm::MDNode *access = instruction.getMetadata(metadataName);
+  return access != nullptr && accessMatchesEffectRegister(*access, registerName);
+}
+
+std::optional<llvm::Value *>
+mergeKnownRegisterValueAtBlockEntry(llvm::BasicBlock &block,
+                                    const std::map<llvm::BasicBlock *,
+                                                   llvm::Value *> &blockOut) {
+  llvm::Value *merged = nullptr;
+  bool sawPredecessor = false;
+  for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
+    sawPredecessor = true;
+    auto found = blockOut.find(predecessor);
+    if (found == blockOut.end() || found->second == nullptr) {
+      return std::nullopt;
+    }
+    if (merged == nullptr) {
+      merged = found->second;
+      continue;
+    }
+    if (merged != found->second) {
+      return std::nullopt;
+    }
+  }
+  if (!sawPredecessor) {
+    return std::nullopt;
+  }
+  return merged;
+}
+
+llvm::Value *knownFrameRegisterValueAfterBlock(
+    llvm::BasicBlock &block, llvm::Value *currentValue,
+    llvm::StringRef frameRegisterName, llvm::StringRef stackRegisterName) {
+  for (llvm::Instruction &instruction : block) {
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+      if (!registerAccessMatchesName(*store, "notdec.register.access",
+                                     frameRegisterName)) {
+        continue;
+      }
+      llvm::Value *storedValue = store->getValueOperand();
+      currentValue =
+          valueUsesExternalInputRegister(*storedValue, stackRegisterName)
+              ? storedValue
+              : nullptr;
+      continue;
+    }
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+    if (call != nullptr &&
+        callInvalidatesKnownFrameRegisterValue(*call, frameRegisterName)) {
+      currentValue = nullptr;
+    }
+  }
+  return currentValue;
+}
+
+void replaceStoredFramePointerRegisterLoads(llvm::Function &function,
+                                            llvm::StringRef frameRegisterName,
+                                            llvm::StringRef stackRegisterName) {
+  // Only propagate frame registers that were just stored from the local stack
+  // pointer. External RBP-based frames stay as raw loads.
+  std::map<llvm::BasicBlock *, llvm::Value *> blockOut;
+  bool changed = true;
+  size_t iterations = 0;
+  size_t maxIterations = std::max<size_t>(1, function.size() * 4);
+  while (changed && iterations++ < maxIterations) {
+    changed = false;
+    for (llvm::BasicBlock &block : function) {
+      llvm::Value *entryValue = nullptr;
+      if (std::optional<llvm::Value *> merged =
+              mergeKnownRegisterValueAtBlockEntry(block, blockOut)) {
+        entryValue = *merged;
+      }
+      llvm::Value *outValue = knownFrameRegisterValueAfterBlock(
+          block, entryValue, frameRegisterName, stackRegisterName);
+      auto found = blockOut.find(&block);
+      if (found == blockOut.end() || found->second != outValue) {
+        blockOut[&block] = outValue;
+        changed = true;
+      }
+    }
+  }
+
+  std::vector<llvm::LoadInst *> deadLoads;
+  for (llvm::BasicBlock &block : function) {
+    llvm::Value *currentValue = nullptr;
+    if (std::optional<llvm::Value *> merged =
+            mergeKnownRegisterValueAtBlockEntry(block, blockOut)) {
+      currentValue = *merged;
+    }
+    for (llvm::Instruction &instruction : block) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+        if (currentValue != nullptr &&
+            registerAccessMatchesName(*load, "notdec.register.access",
+                                      frameRegisterName)) {
+          load->replaceAllUsesWith(currentValue);
+          deadLoads.push_back(load);
+          continue;
+        }
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+        if (!registerAccessMatchesName(*store, "notdec.register.access",
+                                       frameRegisterName)) {
+          continue;
+        }
+        llvm::Value *storedValue = store->getValueOperand();
+        currentValue =
+            valueUsesExternalInputRegister(*storedValue, stackRegisterName)
+                ? storedValue
+                : nullptr;
+        continue;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+      if (call != nullptr &&
+          callInvalidatesKnownFrameRegisterValue(*call, frameRegisterName)) {
+        currentValue = nullptr;
+      }
+    }
+  }
+
+  for (llvm::LoadInst *load : deadLoads) {
+    load->eraseFromParent();
+  }
+}
+
+void replaceStoredFramePointerRegisterLoads(llvm::Module &module,
+                                            const NativeAbiSpec &abi) {
+  if (abi.StackPointerRegister.empty()) {
+    return;
+  }
+  for (const NativeAbiEffect &effect : abi.Effects) {
+    if (effect.Kind != NativeAbiEffectKind::Unaffected ||
+        effect.Storage.Kind != NativeAbiStorageKind::Register ||
+        !isFramePointerRegisterName(effect.Storage.Name)) {
+      continue;
+    }
+    for (llvm::Function &function : module) {
+      if (function.isDeclaration()) {
+        continue;
+      }
+      NativePrototypeRewriteEligibility eligibility =
+          getNativePrototypeRewriteEligibility(function);
+      if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+        continue;
+      }
+      replaceStoredFramePointerRegisterLoads(function, effect.Storage.Name,
+                                             abi.StackPointerRegister);
+    }
+  }
 }
 
 std::optional<int64_t> signedConstantValue(llvm::Value *value) {
@@ -4472,6 +4680,9 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseUnusedDeclarationCallStackFrameRegisterStores(module, *abi);
     eraseUnusedInternalCallStackFrameRegisterStores(module, *abi);
     rewriteStaticStackMemoryAccesses(module, *abi);
+    eraseUnusedRawStackFrameLoads(module, *abi);
+    eraseDeadStackFrameRegisterStores(module, *abi);
+    replaceStoredFramePointerRegisterLoads(module, *abi);
     eraseUnusedRawStackFrameLoads(module, *abi);
     eraseDeadStackFrameRegisterStores(module, *abi);
     eraseDeadNativeStackAllocas(module);

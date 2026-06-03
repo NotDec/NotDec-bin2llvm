@@ -1846,3 +1846,100 @@ other    load        external_input full  full        no        2
 - 新 gate 更大，残留数会明显高于旧 helper gate，不能和旧数字直接比较。
 - `sockets.so` 暴露更多 call 前 `RSP` store、`RBP + const` raw load/store、canary/frame-base 形态，更适合推动后续 frame-base 和 call stack effect。
 - 下一步不要为了降低数字直接删除 used raw load。`RBP` frame-base 仍要先证明 prologue/epilogue 和偏移范围；call 前 `RSP` store 仍要确认 stack input / declaration prototype / callee 读写关系。
+
+# 2026-06-03 实现：stored RBP frame-base raw load 清理
+
+背景：
+
+- shared library gate 里 `php:extension-sockets` 的 `notdec_native_10ef0` 有一类窄形态：
+  - 入口读 `RSP.external_input`。
+  - 本函数内计算 `RSP - 8` 并 `store` 到 `RBP`。
+  - call 后再 `load @RBP`，用 `RBP + 8` 做 unused raw load。
+- 这不是外部 caller frame，也不是直接读取返回地址；`RBP` 的值来自当前函数刚保存的 local stack pointer 派生值。
+- 不能推广到所有 `RBP.external_input + const`。那类仍可能是 caller frame、保存寄存器、canary 或共享 epilogue。
+
+实现：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1923)
+  - 新增 `storeWritesRegisterName`、`functionMayTouchRegisterName`，用于判断 internal callee 是否仍可能读写指定 frame register。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2010)
+  - 新增 `callInvalidatesKnownFrameRegisterValue`：未知 call、declaration、callee prototype 显式输入该寄存器、callee 仍读写该寄存器时，清掉已知 frame register 值。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2604)
+  - 新增 `replaceStoredFramePointerRegisterLoads`：只传播本函数内 `store @RBP` 的值，且 stored value 必须能追到 `RSP.external_input`。
+  - 多前驱 block 只在所有前驱同一个已知值时合并，否则保守跳过。
+  - 替换后删除旧 `load @RBP`，后续 raw load/dead store cleanup 继续删除暴露出的无用链。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:4682)
+  - pass 顺序调整为先清一轮 raw stack load 和 dead stack/frame store，再做 stored-RBP 替换，然后再清一轮 raw stack load 和 dead stack/frame store。
+  - 原因：callee 中间态可能还有马上会被清掉的 dead `store @RBP`，如果过早判断 call effect，会误判 call 会 touch RBP。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2140)
+  - 新增 stored RBP 正例：直线块、merge block、call-return 后继续替换。
+  - 新增反例：`RBP.external_input` 派生的 used raw load 必须保留。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8878)
+  - 将这些 case 接入 raw stack load 测试模块。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test notdec-native-llvm -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rbp-stored-frame-final-gate \
+  --target php:extension-calendar \
+  --target php:extension-sockets
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rbp-stored-frame-final-gate/*.signature-rewrite.ll
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- 两个 shared library 都通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `php:extension-calendar` | 11s | 11s |
+| `php:extension-sockets` | 38s | 39s |
+
+residue 对比：
+
+```text
+shared gate baseline:
+gpr load  access          full/full  6
+gpr load  external_input  full/full  119
+gpr store access          full/full  505
+other load access         full/full  44
+other load external_input full/full  2
+
+after stored RBP cleanup:
+gpr load  access          full/full  5
+gpr load  external_input  full/full  119
+gpr store access          full/full  504
+other load access         full/full  44
+other load external_input full/full  2
+```
+
+判断：
+
+- 命中 `php:extension-sockets` 的 `notdec_native_10ef0`：`load @RBP`、`RBP+8` raw load 和对应 dead `store @RBP` 被清掉。
+- 改善很小，但它解决了 shared gate 当前 RBP 瓶颈里一个真实、可证明的子集。
+- 规则仍保守：external `RBP` frame、callee 读写 `RBP`、declaration call、不同前驱 frame 值，都不替换。
+- 当前运行时间和 baseline 同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | shared gate 只少 1 个 GPR load 和 1 个 GPR store，但命中了真实 RBP frame-base 中间态。 |
+| 理解成本 | 3 | 新增了一个很小的数据流，规则窄，合并策略简单。 |
+| 维护成本 | 3 | 依赖 pass 顺序，已在日志里说明为什么需要先清 dead store。后续若重排 cleanup 要注意这个关系。 |
+
+有没有更好的方案：
+
+- 真正的下一步仍是函数本地 stack frame 建模，把确定的 `RSP/RBP` frame access 统一转 `alloca/notdec_stack`。
+- 这次不碰动态 alloca，也不把 used caller-stack/return-address/canary raw load 当垃圾删。
