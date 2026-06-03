@@ -1904,6 +1904,47 @@ llvm::Function *createPreservedStackFrameStoreFunction(
   return function;
 }
 
+llvm::Function *createStaticRspStackMemoryFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    bool escapePointer) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RSP");
+
+  llvm::LoadInst *base =
+      builder.CreateLoad(rsp->getValueType(), rsp, "RSP.external_input");
+  base->setMetadata("notdec.register.external_input", metadata);
+  llvm::Value *address = builder.CreateAdd(
+      base, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+
+  if (escapePointer) {
+    auto *escapeType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(context),
+        llvm::ArrayRef<llvm::Type *>{llvm::PointerType::getUnqual(context)},
+        false);
+    llvm::Function *escape =
+        llvm::Function::Create(escapeType, llvm::GlobalValue::ExternalLinkage,
+                               name + "_escape", module);
+    builder.CreateCall(escape->getFunctionType(), escape, {pointer});
+  } else {
+    builder.CreateStore(llvm::ConstantInt::get(rsp->getValueType(), 0x55),
+                        pointer);
+    llvm::LoadInst *load =
+        builder.CreateLoad(rsp->getValueType(), pointer, "local_stack_value");
+    (void)builder.CreateAdd(load,
+                            llvm::ConstantInt::get(rsp->getValueType(), 1));
+  }
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createInternalCallKilledGprStoreFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *global,
     const std::string &registerName, llvm::Function *callee) {
@@ -2741,6 +2782,54 @@ bool hasRegisterLoad(const llvm::Function &function, llvm::StringRef name) {
         if (field != nullptr && field->getString() == expected) {
           return true;
         }
+      }
+    }
+  }
+  return false;
+}
+
+bool hasRegisterExternalInputLoad(const llvm::Function &function,
+                                  llvm::StringRef name) {
+  std::string expected = ("name=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &instruction : block) {
+      if (!llvm::isa<llvm::LoadInst>(&instruction)) {
+        continue;
+      }
+      llvm::MDNode *metadata =
+          instruction.getMetadata("notdec.register.external_input");
+      if (metadata == nullptr) {
+        continue;
+      }
+      for (const llvm::MDOperand &operand : metadata->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (field != nullptr && field->getString() == expected) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool hasIntToPtr(const llvm::Function &function) {
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &instruction : block) {
+      if (llvm::isa<llvm::IntToPtrInst>(&instruction)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool hasAllocaNamed(const llvm::Function &function, llvm::StringRef prefix) {
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &instruction : block) {
+      auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
+      if (alloca != nullptr && alloca->hasName() &&
+          alloca->getName().starts_with(prefix)) {
+        return true;
       }
     }
   }
@@ -8207,6 +8296,35 @@ int main() {
   if (llvm::verifyModule(stackFramePreservedModule, &llvm::errs())) {
     std::cerr << "stack/frame preserved cleanup module verification failed "
                  "after prototype rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module staticRspStackModule(
+      "native-prototype-static-rsp-stack-memory-test", context);
+  llvm::GlobalVariable *staticRsp =
+      createRegisterGlobal(staticRspStackModule, "RSP");
+  attachStackFramePreservedTestAbi(staticRspStackModule);
+  llvm::Function *staticRspLocal = createStaticRspStackMemoryFunction(
+      staticRspStackModule, "static_rsp_local", staticRsp, false);
+  llvm::Function *staticRspEscaped = createStaticRspStackMemoryFunction(
+      staticRspStackModule, "static_rsp_escaped", staticRsp, true);
+  notdec::bin2llvm::runNativePrototypeRecovery(staticRspStackModule,
+                                               rewriteOptions);
+  ok &= expect(hasAllocaNamed(*staticRspLocal, "notdec_stack.native"),
+               "static RSP local stack access did not create native stack alloca");
+  ok &= expect(!hasIntToPtr(*staticRspLocal),
+               "static RSP local stack access kept old inttoptr");
+  ok &= expect(!hasRegisterExternalInputLoad(*staticRspLocal, "RSP"),
+               "static RSP local stack access kept dead RSP external input");
+  ok &= expect(!hasAllocaNamed(*staticRspEscaped, "notdec_stack.native"),
+               "escaped RSP stack pointer incorrectly created native stack alloca");
+  ok &= expect(hasIntToPtr(*staticRspEscaped),
+               "escaped RSP stack pointer lost original inttoptr");
+  ok &= expect(hasRegisterExternalInputLoad(*staticRspEscaped, "RSP"),
+               "escaped RSP stack pointer lost original external input");
+  if (llvm::verifyModule(staticRspStackModule, &llvm::errs())) {
+    std::cerr << "static RSP stack memory module verification failed after "
+                 "prototype rewrite\n";
     return EXIT_FAILURE;
   }
 

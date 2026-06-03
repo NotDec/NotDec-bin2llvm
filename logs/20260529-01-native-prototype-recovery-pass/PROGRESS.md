@@ -627,6 +627,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-small-gate2`
+  - [x] 改写静态 RSP 负 offset raw stack access：非逃逸 `RSP.external_input + const -> inttoptr -> load/store` 转入口 `notdec_stack.native` alloca，两个最小 Bench2 目标 signature-rewrite 通过，GPR external input 从 135 降到 128。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-rsp-rbp-static-stack-gate`
 
 ## 记录规则
 

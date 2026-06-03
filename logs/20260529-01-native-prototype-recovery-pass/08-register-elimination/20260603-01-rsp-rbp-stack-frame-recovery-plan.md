@@ -345,3 +345,126 @@ other load external_input full/full  1
 
 - 更完整方案仍然是阶段 1/2 的静态 stack alloca 和 RBP frame base rewrite。
 - 本轮先删 return-path 死 store，是因为它基于 canonical IR 的本地 liveness，风险小，并且两个小目标能直接看到残留下降。
+
+# 2026-06-03 实现记录：静态 RSP 栈内存 alloca 改写
+
+背景：
+
+- return-path 死 store 清理后，两个小 Bench2 目标的 GPR store 从 `248` 降到 `158`，但 `RSP.external_input` 仍有 `135` 个。
+- 剩余 `RSP` 里有一部分是 canonical IR 中的 `RSP.external_input + 负常量 -> inttoptr -> load/store`。
+- 这类地址如果没有逃逸，可以按 wasm `StackAlloca` 的方向先放进函数入口 alloca。它不再需要用原始进程地址表达，也能让死的 `RSP.external_input` 链被 DCE。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2125)
+  - 新增 `hasExistingNotDecStackAlloca()`，已有 `notdec_stack*` alloca 的函数先跳过，避免和 Ghidra/Heritage 已建模的栈空间重复。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2156)
+  - 新增 `externalInputLoadForRegister()`，只在函数里存在唯一 `RSP` external input load 时继续处理。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2188)
+  - 新增 `stackOffsetFromBase()`，识别 canonical `add/sub` 常量偏移；当前只接受能折成固定 `int64_t` 的 offset。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2256)
+  - 新增 `StaticStackMemoryAccess`，记录可改写的 load/store、原始 `inttoptr`、栈 offset 和访问大小。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2263)
+  - 新增 `rewriteStaticStackMemoryAccesses()`。
+  - 只处理 signature rewrite 后已经 `already matches` 的函数。
+  - 只处理 `RSP.external_input + negative constant` 的 direct `inttoptr`。
+  - 只接受 pointer 用户全是直接 `load/store`；传给 call、作为别的指针计算、正 offset、跨过 offset 0 的访问都跳过。
+  - 按 `[low, high)` 建入口 `notdec_stack.native` alloca，把访问 pointer 改为 alloca 内 byte GEP。
+  - 改写后删除无用 `inttoptr`，并让递归 DCE 清掉死的 `RSP.external_input` 链。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3769)
+  - 在 signature rewrite cleanup 中，先做静态栈内存改写，再做 RSP/RBP return-path 死 store 清理。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1907)
+  - 新增 `createStaticRspStackMemoryFunction()`，构造非逃逸和逃逸两种 `RSP - 8` raw stack access。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2791)
+  - 新增 `hasRegisterExternalInputLoad()` / `hasIntToPtr()` / `hasAllocaNamed()` 测试辅助。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8302)
+  - 新增静态 RSP 栈内存测试：非逃逸 case 应生成 `notdec_stack.native`，删除旧 `inttoptr` 和死 `RSP.external_input`；逃逸 case 必须保持原 IR。
+
+验证：
+
+```bash
+cmake --build build --target native_prototype_recovery_test notdec-native-llvm -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+git diff --check
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-rbp-static-stack-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-rbp-static-stack-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-rbp-static-stack-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-rbp-static-stack-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- `git diff --check` 通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 2s | 3s |
+| `php:extension-calendar` | 11s | 12s |
+
+residue 对比：
+
+```text
+after return-store cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  135
+gpr store access          full/full  158
+other load access         full/full  8
+other load external_input full/full  1
+
+after static RSP alloca:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  128
+gpr store access          full/full  158
+other load access         full/full  8
+other load external_input full/full  1
+```
+
+判断：
+
+- 两个小目标上 `RSP` external input 残留少了 `7` 个；`notdec_stack.native` 在输出里出现 `238` 次，说明有一批 raw stack access 被替换成了 alloca/GEP。
+- GPR store 数没变，符合预期：这轮只改写静态栈内存地址，不处理 before-call 的 `RSP` 状态写。
+- 这不是完整 RSP/RBP 消除。剩余主要还是 `RSP/RBP` entry external input、before-call stack pointer、以及 RBP frame-base 相关访问。
+- 耗时和上一轮同量级，没有看到性能退化。
+
+剩余问题：
+
+- `RBP` 还没建 frame base。下一步需要识别 `RBP = RSP + const` 或 entry 保存的 frame pointer，再把 RBP-based 负 offset raw stack access 并入同一个 alloca。
+- `before_call_path` 上的 `RSP` 调整还没处理。这里可能对应 call frame / return address / outgoing stack args，不能直接删。
+- 当前遇到任意逃逸 stack pointer 会整函数跳过，保守但漏掉 mixed safe/unsafe 场景。后续可以改成只跳过逃逸 pointer，不必跳过整函数。
+
+当前两个小目标里 stack/frame residue 前几类：
+
+```text
+34 stack_pointer entry_external_input clobbers entry_external_input
+30 frame_pointer entry_external_input clobbers entry_external_input
+15 stack_pointer before_call_path clobbers stack_pointer
+12 stack_pointer entry_external_input clobbers,external_inputs entry_external_input
+8  stack_pointer before_call_path clobbers,external_inputs stack_pointer
+4  frame_pointer entry_external_input clobbers,external_inputs entry_external_input
+```
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 能消掉一类确定的静态 RSP raw stack access，但两个小目标只减少 7 个 external input，还没处理 RBP 和 call 前栈状态。 |
+| 理解成本 | 3 | 增加了 offset 匹配和 alloca 改写，但规则集中在一个 helper，限制条件明确。 |
+| 维护成本 | 3 | 保守跳过能降低误改风险；后续扩展到 RBP/dynamic alloca 时需要复用这套 access 收集逻辑，避免重复。 |
+
+有没有更好的方案：
+
+- 更完整的路线仍然是先抽出通用的 stack base/value 识别，再同时支持 RSP、RBP 和动态 alloca。
+- 本轮先做 RSP 静态负 offset，是因为它基于优化后的 canonical IR，语义边界清楚，能快速验证 alloca rewrite 对 Bench2 不破坏 assemble/verify。
