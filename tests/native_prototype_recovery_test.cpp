@@ -1973,6 +1973,38 @@ llvm::Function *createStaticRspDeadStackSaveFunction(
   return function;
 }
 
+llvm::Function *createStaticRspUnusedSavedFrameLoadFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::GlobalVariable *rbp) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  llvm::LoadInst *rspBase =
+      builder.CreateLoad(rsp->getValueType(), rsp, "RSP.external_input");
+  rspBase->setMetadata("notdec.register.external_input",
+                       registerAccessMetadata(context, "RSP"));
+  llvm::LoadInst *rbpBase =
+      builder.CreateLoad(rbp->getValueType(), rbp, "RBP.external_input");
+  rbpBase->setMetadata("notdec.register.external_input",
+                       registerAccessMetadata(context, "RBP"));
+  llvm::Value *address = builder.CreateAdd(
+      rspBase, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  // The load keeps the save slot alive during the initial static stack rewrite.
+  // The later native-stack cleanup should then remove the unused load and the
+  // save it protected.
+  builder.CreateStore(rbpBase, pointer);
+  builder.CreateLoad(rbp->getValueType(), pointer, "unused_saved_rbp");
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createRawRspLoadFunction(llvm::Module &module,
                                          const std::string &name,
                                          llvm::GlobalVariable *rsp,
@@ -8491,6 +8523,10 @@ int main() {
       staticRspStackModule, "static_rsp_escaped", staticRsp, true);
   llvm::Function *staticRspDeadSave = createStaticRspDeadStackSaveFunction(
       staticRspStackModule, "static_rsp_dead_save", staticRsp, staticRbp);
+  llvm::Function *staticRspUnusedSavedFrameLoad =
+      createStaticRspUnusedSavedFrameLoadFunction(
+          staticRspStackModule, "static_rsp_unused_saved_frame_load", staticRsp,
+          staticRbp);
   notdec::bin2llvm::runNativePrototypeRecovery(staticRspStackModule,
                                                rewriteOptions);
   ok &= expect(hasAllocaNamed(*staticRspLocal, "notdec_stack.native"),
@@ -8513,6 +8549,17 @@ int main() {
                "dead static RSP stack save kept dead RSP external input");
   ok &= expect(!hasRegisterExternalInputLoad(*staticRspDeadSave, "RBP"),
                "dead static RSP stack save kept dead RBP external input");
+  ok &= expect(!hasAllocaNamed(*staticRspUnusedSavedFrameLoad,
+                               "notdec_stack.native"),
+               "unused saved frame load kept dead native stack alloca");
+  ok &= expect(!hasIntToPtr(*staticRspUnusedSavedFrameLoad),
+               "unused saved frame load kept old inttoptr");
+  ok &= expect(
+      !hasRegisterExternalInputLoad(*staticRspUnusedSavedFrameLoad, "RSP"),
+      "unused saved frame load kept dead RSP external input");
+  ok &= expect(
+      !hasRegisterExternalInputLoad(*staticRspUnusedSavedFrameLoad, "RBP"),
+      "unused saved frame load kept dead RBP external input");
   if (llvm::verifyModule(staticRspStackModule, &llvm::errs())) {
     std::cerr << "static RSP stack memory module verification failed after "
                  "prototype rewrite\n";

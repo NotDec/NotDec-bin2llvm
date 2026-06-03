@@ -661,6 +661,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rsp-call-liveness-gate`
+  - [x] 清理 `notdec_stack.native` 上后续暴露出的无用 load/save：只处理不逃逸 alloca 的常量 offset 直接 load/store，删除无 use load 后再删除无 overlapping load 的保存槽；两个最小 Bench2 目标 signature-rewrite 通过，GPR external input 从 37 降到 35。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-native-stack-cleanup-gate`
 
 ## 记录规则
 

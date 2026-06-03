@@ -2614,6 +2614,193 @@ void eraseDeadStaticStackStores(
   }
 }
 
+// A direct load/store through the synthetic native stack alloca.  This cleanup
+// only reasons about already-local stack storage; it does not reinterpret raw
+// RSP/RBP-derived addresses as frame bases.
+struct NativeStackAllocaAccess {
+  llvm::Instruction *Memory = nullptr;
+  llvm::Value *Pointer = nullptr;
+  int64_t Offset = 0;
+  uint64_t Size = 0;
+};
+
+std::optional<int64_t> nativeStackAllocaOffset(llvm::Value *value,
+                                               llvm::AllocaInst *alloca) {
+  value = value->stripPointerCasts();
+  if (value == alloca) {
+    return 0;
+  }
+
+  auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value);
+  if (gep == nullptr || gep->getPointerOperand()->stripPointerCasts() != alloca) {
+    return std::nullopt;
+  }
+  if (gep->getSourceElementType() != llvm::Type::getInt8Ty(alloca->getContext()) ||
+      gep->getNumIndices() != 1) {
+    return std::nullopt;
+  }
+  auto *offset = llvm::dyn_cast<llvm::ConstantInt>(gep->idx_begin()->get());
+  if (offset == nullptr || offset->getBitWidth() > 64) {
+    return std::nullopt;
+  }
+  return offset->getSExtValue();
+}
+
+std::optional<std::vector<NativeStackAllocaAccess>>
+nativeStackAllocaAccesses(llvm::AllocaInst &alloca,
+                          const llvm::DataLayout &layout) {
+  std::vector<NativeStackAllocaAccess> accesses;
+  std::vector<llvm::User *> users(alloca.user_begin(), alloca.user_end());
+  for (llvm::User *user : users) {
+    auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user);
+    if (gep == nullptr) {
+      return std::nullopt;
+    }
+    std::optional<int64_t> offset = nativeStackAllocaOffset(gep, &alloca);
+    if (!offset) {
+      return std::nullopt;
+    }
+    for (llvm::User *pointerUser : gep->users()) {
+      auto *memory = llvm::dyn_cast<llvm::Instruction>(pointerUser);
+      if (memory == nullptr ||
+          (llvm::isa<llvm::LoadInst>(memory) &&
+           memory->getOperand(0) != gep) ||
+          (llvm::isa<llvm::StoreInst>(memory) &&
+           memory->getOperand(1) != gep) ||
+          (!llvm::isa<llvm::LoadInst>(memory) &&
+           !llvm::isa<llvm::StoreInst>(memory))) {
+        return std::nullopt;
+      }
+      std::optional<uint64_t> size = memoryAccessSize(layout, *memory);
+      if (!size || *size == 0) {
+        return std::nullopt;
+      }
+      accesses.push_back({memory, gep, *offset, *size});
+    }
+  }
+  return accesses;
+}
+
+bool nativeStackStoreIsLoaded(
+    const NativeStackAllocaAccess &storeAccess,
+    const std::vector<NativeStackAllocaAccess> &accesses) {
+  for (const NativeStackAllocaAccess &access : accesses) {
+    if (!llvm::isa<llvm::LoadInst>(access.Memory)) {
+      continue;
+    }
+    if (stackRangesOverlap(storeAccess.Offset, storeAccess.Size, access.Offset,
+                           access.Size)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool eraseUnusedNativeStackAllocaLoads(llvm::AllocaInst &alloca,
+                                       const llvm::DataLayout &layout) {
+  std::optional<std::vector<NativeStackAllocaAccess>> accesses =
+      nativeStackAllocaAccesses(alloca, layout);
+  if (!accesses) {
+    return false;
+  }
+
+  std::vector<llvm::LoadInst *> deadLoads;
+  for (const NativeStackAllocaAccess &access : *accesses) {
+    auto *load = llvm::dyn_cast<llvm::LoadInst>(access.Memory);
+    if (load != nullptr && load->use_empty() && !load->isVolatile() &&
+        !load->isAtomic()) {
+      deadLoads.push_back(load);
+    }
+  }
+
+  bool changed = false;
+  for (llvm::LoadInst *load : deadLoads) {
+    llvm::Value *pointer = load->getPointerOperand();
+    load->eraseFromParent();
+    if (auto *pointerInstruction = llvm::dyn_cast<llvm::Instruction>(pointer);
+        pointerInstruction != nullptr && pointerInstruction->use_empty()) {
+      pointerInstruction->eraseFromParent();
+    }
+    changed = true;
+  }
+  return changed;
+}
+
+bool eraseDeadNativeStackAllocaStores(llvm::AllocaInst &alloca,
+                                      const llvm::DataLayout &layout) {
+  std::optional<std::vector<NativeStackAllocaAccess>> accesses =
+      nativeStackAllocaAccesses(alloca, layout);
+  if (!accesses) {
+    return false;
+  }
+
+  struct DeadStore {
+    llvm::StoreInst *Store = nullptr;
+    llvm::Value *StoredValue = nullptr;
+    llvm::Value *Pointer = nullptr;
+  };
+
+  std::vector<DeadStore> deadStores;
+  for (const NativeStackAllocaAccess &access : *accesses) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(access.Memory);
+    if (store == nullptr || store->isVolatile() || store->isAtomic() ||
+        nativeStackStoreIsLoaded(access, *accesses)) {
+      continue;
+    }
+    deadStores.push_back({store, store->getValueOperand(),
+                          store->getPointerOperand()});
+  }
+
+  bool changed = false;
+  for (const DeadStore &deadStore : deadStores) {
+    deadStore.Store->eraseFromParent();
+    if (auto *pointerInstruction =
+            llvm::dyn_cast<llvm::Instruction>(deadStore.Pointer);
+        pointerInstruction != nullptr && pointerInstruction->use_empty()) {
+      pointerInstruction->eraseFromParent();
+    }
+    llvm::RecursivelyDeleteTriviallyDeadInstructions(deadStore.StoredValue);
+    changed = true;
+  }
+  return changed;
+}
+
+void eraseDeadNativeStackAllocas(llvm::Module &module) {
+  const llvm::DataLayout &layout = module.getDataLayout();
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+
+    std::vector<llvm::AllocaInst *> allocas;
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
+        if (alloca != nullptr && alloca->hasName() &&
+            alloca->getName().starts_with("notdec_stack.native")) {
+          allocas.push_back(alloca);
+        }
+      }
+    }
+
+    for (llvm::AllocaInst *alloca : allocas) {
+      bool changed = true;
+      while (changed) {
+        changed = eraseUnusedNativeStackAllocaLoads(*alloca, layout);
+        changed |= eraseDeadNativeStackAllocaStores(*alloca, layout);
+      }
+      if (alloca->use_empty()) {
+        alloca->eraseFromParent();
+      }
+    }
+  }
+}
+
 void eraseUnusedRawStackFrameLoads(llvm::Module &module,
                                    const NativeAbiSpec &abi) {
   std::set<std::string> registerNames = stackFrameRegisterNames(abi);
@@ -4178,6 +4365,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     rewriteStaticStackMemoryAccesses(module, *abi);
     eraseUnusedRawStackFrameLoads(module, *abi);
     eraseDeadStackFrameRegisterStores(module, *abi);
+    eraseDeadNativeStackAllocas(module);
     eraseDeadNonReturnVectorStores(module);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
     summary.SignatureRewriteFunctionsRewritten =

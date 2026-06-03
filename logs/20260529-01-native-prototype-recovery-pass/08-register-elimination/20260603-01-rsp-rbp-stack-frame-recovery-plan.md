@@ -1319,3 +1319,102 @@ stack/frame residue 前几类：
 
 - 更完整的方案仍是按 Ghidra 的 call stack effect 建模 `stackshift/extrapop`、返回地址和 outgoing stack arg。
 - 当前这步的价值是先去掉已证明 no-stack/no-read call 保护住的死状态写，不继续扩大 declaration 名字白名单。
+
+# 2026-06-03 实现记录：native stack alloca 后置死 load/save 清理
+
+背景：
+
+- 静态 RSP alloca rewrite 会把 `RSP.external_input + const -> inttoptr -> load/store` 改成 `notdec_stack.native`。
+- 第一轮 `eraseDeadStaticStackStores()` 只按当时存在的 load 判断 store 是否活着。后续 cleanup 可能让某些 load 变成无 use，但不会再回头删掉它保护的保存槽。
+- 两个小目标里有这种形态：保存旧 `RBP` 到 `notdec_stack.native`，之后从槽里读出来但读值无用，导致 `RBP.external_input` 继续残留。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2617)
+  - 新增 `NativeStackAllocaAccess`，只描述已经本地化的 `notdec_stack.native` 直接 load/store。
+  - 规则不重新解释 raw `RSP/RBP` 地址，也不把 `RBP.external_input` 当本函数 frame base。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2646)
+  - 新增 `nativeStackAllocaAccesses()`，只接受 `notdec_stack.native + 常量 offset` 的直接 load/store。
+  - 遇到 alloca 逃逸、非 load/store 用户、非常量 GEP、未知访问大小时跳过整个 alloca。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2696)
+  - 新增 `eraseUnusedNativeStackAllocaLoads()`，删除无 use、非 volatile、非 atomic 的 native stack load。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2726)
+  - 新增 `eraseDeadNativeStackAllocaStores()`，按剩余 load 覆盖范围删除没有 overlapping load 的 store，并递归删掉由此暴露的 dead value。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2765)
+  - 新增 `eraseDeadNativeStackAllocas()`，循环执行 dead load / dead store 清理，最后删除无 use 的 `notdec_stack.native`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:4365)
+  - 在 `eraseDeadStackFrameRegisterStores()` 之后、vector store cleanup 之前调用 native stack alloca cleanup。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1976)
+  - 新增 `createStaticRspUnusedSavedFrameLoadFunction()`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8527)
+  - 新增 `static_rsp_unused_saved_frame_load` 测试，覆盖“保存旧 RBP 的槽被无用 load 暂时保护，后置 cleanup 应删除 load/save/alloca/external input”的 case。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-native-stack-cleanup-gate \
+  --target lighttpd:helper \
+  --target php:extension-calendar
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-native-stack-cleanup-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-native-stack-cleanup-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-native-stack-cleanup-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- Bench2 两个小目标通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `lighttpd:helper` | 3s | 3s |
+| `php:extension-calendar` | 12s | 12s |
+
+residue 对比：
+
+```text
+after RSP/RBP call liveness cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  37
+gpr store access          full/full  134
+other load access         full/full  8
+
+after native stack alloca cleanup:
+gpr load  access          full/full  1
+gpr load  external_input  full/full  35
+gpr store access          full/full  134
+other load access         full/full  8
+```
+
+判断：
+
+- 两个小目标上 GPR external input 从 `37` 降到 `35`，GPR store 不变。
+- 命中的是已经 rewrite 成 `notdec_stack.native` 的旧 frame save/load 噪声，不涉及 raw `RBP + const` frame-base 推断。
+- 剩余 `RBP.external_input + negative offset` 仍不能直接改本地 alloca，因为当前样本缺少“本函数建立 RBP”的证据。
+- 耗时同量级，没有看到性能退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | 只少 2 个 external input，但清掉了一类后续 cleanup 暴露出的旧 frame save。 |
+| 理解成本 | 3 | 增加了 native stack alloca 内部访问枚举，但边界较窄。 |
+| 维护成本 | 3 | 目前只支持 `i8` GEP 常量 offset 的直接 load/store；后续若生成更复杂 GEP，需要扩展解析。 |
+
+有没有更好的方案：
+
+- 更完整的 RBP 方案仍是证明 frame base：入口保存旧 `RBP`，新 `RBP` 来自当前 `RSP`，再把 `RBP + const` 映射进 `notdec_stack`。
+- 当前这步先清理已经本地化的 native stack 噪声，避免把缺少 frame-base 证据的 raw `RBP` 访问误改掉。
