@@ -681,6 +681,9 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-raw-stack-value-load-gate`
+  - [x] 调整 RSP/RBP 后续小 gate：不再用 `lighttpd:helper` 作为主 gate，改用两个较小 shared library `php:extension-calendar` 和 `php:extension-sockets`，避免独立 helper/启动代码里的底层 caller stack 行为主导测试。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 输出：`/tmp/notdec-bin2llvm-shared-small-rsp-rbp-gate`
 
 ## 记录规则
 

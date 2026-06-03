@@ -1792,3 +1792,57 @@ other load access         full/full  8
 
 - 对 used raw caller-stack load，不能简单删除；下一步要区分 return address / caller saved restore / frame-base canary 语义。
 - `RBP + negative offset` 仍需要先证明当前函数建立了 frame base，不能靠这条 unused-load 规则处理。
+
+# 2026-06-03 测试口径调整：后续小 gate 改用 shared library
+
+背景：
+
+- 之前 RSP/RBP 小 gate 用 `lighttpd:helper` + `php:extension-calendar`。
+- `lighttpd:helper` 对应 `/usr/sbin/lighttpd-angel`，作为独立 helper 会带进 `_start`、返回地址读取、PLT resolver、caller stack 等底层入口行为。
+- 这些行为不是当前 RSP/RBP 栈帧恢复最想优先处理的函数形态，容易把注意力拉到启动代码和手写底层栈操作。
+- 后续这一轮主 gate 改成两个较小的 Bench2 shared object：
+  - `php:extension-calendar`：`/usr/lib/php/20230831/calendar.so`，约 39K。
+  - `php:extension-sockets`：`/usr/lib/php/20230831/sockets.so`，约 107K。
+
+验证：
+
+```bash
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-shared-small-rsp-rbp-gate \
+  --target php:extension-calendar \
+  --target php:extension-sockets
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-shared-small-rsp-rbp-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-shared-small-rsp-rbp-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-shared-small-rsp-rbp-details.tsv
+```
+
+结果：
+
+- 两个 shared library 都通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `php:extension-calendar` | 11s | 11s |
+| `php:extension-sockets` | 40s | 41s |
+
+当前 residue summary：
+
+```text
+category access_kind metadata_kind shape value_shape synthetic count
+gpr      load        access        full  full        no        6
+gpr      load        external_input full  full        no        119
+gpr      store       access        full  full        no        505
+other    load        access        full  full        no        44
+other    load        external_input full  full        no        2
+```
+
+判断：
+
+- 旧 `lighttpd:helper` 结果只作为历史记录保留，不再作为这一轮 RSP/RBP 小 gate 的主判断标准。
+- 新 gate 更大，残留数会明显高于旧 helper gate，不能和旧数字直接比较。
+- `sockets.so` 暴露更多 call 前 `RSP` store、`RBP + const` raw load/store、canary/frame-base 形态，更适合推动后续 frame-base 和 call stack effect。
+- 下一步不要为了降低数字直接删除 used raw load。`RBP` frame-base 仍要先证明 prologue/epilogue 和偏移范围；call 前 `RSP` store 仍要确认 stack input / declaration prototype / callee 读写关系。
