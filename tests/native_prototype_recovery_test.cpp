@@ -132,6 +132,32 @@ void attachTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachRawStackInputTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "ram";
+  abi.StackShift = 8;
+  abi.ExtraPop = 8;
+  abi.Inputs.push_back(inputStack(8, 8));
+
+  notdec::bin2llvm::NativeAbiEffect unaffected;
+  unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
+  unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  unaffected.Storage.Name = "RBX";
+  abi.Effects.push_back(std::move(unaffected));
+
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.Align = 8;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "RAX";
+  abi.Outputs.push_back(std::move(output));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 void attachThreeInputTestAbi(llvm::Module &module) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__stdcall";
@@ -1517,6 +1543,69 @@ llvm::Function *createStackInputFunction(llvm::Module &module,
   if (used) {
     builder.CreateAdd(load, llvm::ConstantInt::get(load->getType(), 1));
   }
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createRawCallerStackInputReturnFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::GlobalVariable *rax, uint32_t inputSize = 8,
+    llvm::LoadInst **inputLoad = nullptr) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  // Entry RSP points at the return address.  The first caller stack argument is
+  // therefore RSP + 8 in this lifted shape.
+  llvm::LoadInst *base = createExternalInputLoad(builder, rsp, "RSP");
+  llvm::Value *address = builder.CreateAdd(
+      base, llvm::ConstantInt::get(rsp->getValueType(), 8, true));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  llvm::Type *inputType = llvm::IntegerType::get(context, inputSize * 8);
+  llvm::LoadInst *load =
+      builder.CreateLoad(inputType, pointer, "caller_stack_arg");
+  if (inputLoad != nullptr) {
+    *inputLoad = load;
+  }
+  llvm::Value *returnValue = load;
+  if (inputSize < 8) {
+    returnValue = builder.CreateZExt(load, rax->getValueType());
+  }
+  llvm::StoreInst *store = builder.CreateStore(returnValue, rax);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RAX"));
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createRawCallerStackSavedRegisterRestoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::GlobalVariable *saved, llvm::StringRef savedRegisterName) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  // Same RSP + 8 address as the first caller stack argument.  If it only restores
+  // a preserved register, it is ABI cleanup rather than a real input.
+  llvm::LoadInst *base = createExternalInputLoad(builder, rsp, "RSP");
+  llvm::Value *address = builder.CreateAdd(
+      base, llvm::ConstantInt::get(rsp->getValueType(), 8, true));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  llvm::LoadInst *restoreValue =
+      builder.CreateLoad(saved->getValueType(), pointer, "saved_restore");
+  llvm::StoreInst *restore = builder.CreateStore(restoreValue, saved);
+  restore->setMetadata("notdec.register.access",
+                       registerAccessMetadata(context, savedRegisterName.str()));
   builder.CreateRetVoid();
   return function;
 }
@@ -4178,6 +4267,81 @@ int main() {
                    stackInputLoadUser->getOperand(0) ==
                        &*stackInputFunction->arg_begin(),
                "rewritten stack input-only function did not use new argument");
+
+  llvm::Module rawCallerStackInputModule(
+      "native-prototype-raw-caller-stack-input-test", context);
+  llvm::GlobalVariable *rawCallerStackRsp =
+      createRegisterGlobal(rawCallerStackInputModule, "RSP");
+  llvm::GlobalVariable *rawCallerStackRax =
+      createRegisterGlobal(rawCallerStackInputModule, "RAX");
+  llvm::GlobalVariable *rawCallerStackRbx =
+      createRegisterGlobal(rawCallerStackInputModule, "RBX");
+  attachRawStackInputTestAbi(rawCallerStackInputModule);
+  createRawCallerStackInputReturnFunction(
+      rawCallerStackInputModule, "raw_caller_stack_input_return",
+      rawCallerStackRsp, rawCallerStackRax);
+  createRawCallerStackInputReturnFunction(
+      rawCallerStackInputModule, "raw_caller_stack_i32_input_return",
+      rawCallerStackRsp, rawCallerStackRax, 4);
+  createRawCallerStackSavedRegisterRestoreFunction(
+      rawCallerStackInputModule, "raw_caller_stack_saved_rbx_restore",
+      rawCallerStackRsp, rawCallerStackRbx, "RBX");
+  notdec::bin2llvm::NativePrototypeRecoveryOptions rawCallerStackOptions;
+  rawCallerStackOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(rawCallerStackInputModule,
+                                               rawCallerStackOptions);
+  llvm::Function *rawCallerStackInput =
+      rawCallerStackInputModule.getFunction("raw_caller_stack_input_return");
+  llvm::Function *rawCallerStackI32Input =
+      rawCallerStackInputModule.getFunction("raw_caller_stack_i32_input_return");
+  llvm::Function *rawCallerStackSavedRbxRestore =
+      rawCallerStackInputModule.getFunction("raw_caller_stack_saved_rbx_restore");
+  ok &= expect(rawCallerStackInput != nullptr &&
+                   functionTypeShape(*rawCallerStackInput->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef(i64Param)),
+               "raw caller-stack input function was not rewritten to i64(i64)");
+  ok &= expect(rawCallerStackInput != nullptr &&
+                   !hasRegisterExternalInputLoad(*rawCallerStackInput, "RSP"),
+               "raw caller-stack input kept old RSP external input");
+  ok &= expect(rawCallerStackInput != nullptr &&
+                   !hasIntToPtr(*rawCallerStackInput),
+               "raw caller-stack input kept old inttoptr");
+  ok &= expect(rawCallerStackInput != nullptr &&
+                   !hasRegisterStore(*rawCallerStackInput, "RAX"),
+               "raw caller-stack input kept old return register store");
+  llvm::Type *i32Param = llvm::Type::getInt32Ty(context);
+  ok &= expect(rawCallerStackI32Input != nullptr &&
+                   functionTypeShape(*rawCallerStackI32Input->getFunctionType(),
+                                     llvm::Type::getInt64Ty(context),
+                                     llvm::ArrayRef(i32Param)),
+               "raw i32 caller-stack input function was not rewritten to i64(i32)");
+  ok &= expect(rawCallerStackI32Input != nullptr &&
+                   !hasRegisterExternalInputLoad(*rawCallerStackI32Input,
+                                                 "RSP"),
+               "raw i32 caller-stack input kept old RSP external input");
+  ok &= expect(rawCallerStackI32Input != nullptr &&
+                   !hasIntToPtr(*rawCallerStackI32Input),
+               "raw i32 caller-stack input kept old inttoptr");
+  ok &= expect(rawCallerStackI32Input != nullptr &&
+                   !hasRegisterStore(*rawCallerStackI32Input, "RAX"),
+               "raw i32 caller-stack input kept old return register store");
+  ok &= expect(rawCallerStackSavedRbxRestore != nullptr &&
+                   rawCallerStackSavedRbxRestore->getFunctionType()->getNumParams() ==
+                       0,
+               "raw saved RBX restore was misclassified as a stack input");
+  ok &= expect(rawCallerStackSavedRbxRestore != nullptr &&
+                   !hasRegisterStore(*rawCallerStackSavedRbxRestore, "RBX"),
+               "raw saved RBX restore kept dead restore store");
+  ok &= expect(rawCallerStackSavedRbxRestore != nullptr &&
+                   !hasRegisterExternalInputLoad(*rawCallerStackSavedRbxRestore,
+                                                 "RSP"),
+               "raw saved RBX restore kept dead RSP external input");
+  if (llvm::verifyModule(rawCallerStackInputModule, &llvm::errs())) {
+    std::cerr << "raw caller-stack input module verification failed after "
+                 "prototype rewrite\n";
+    return EXIT_FAILURE;
+  }
 
   llvm::Module callsiteModule("native-prototype-input-callsite-rewrite-test",
                               context);

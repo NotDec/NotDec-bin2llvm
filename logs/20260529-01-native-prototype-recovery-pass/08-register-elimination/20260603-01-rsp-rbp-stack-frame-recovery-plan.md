@@ -2490,3 +2490,127 @@ other load external_input full/full  2
 
 - 更完整的做法是先把 saved-register save/restore 建成明确 ABI preserve 事件，再由寄存器状态模型统一消掉。
 - 当前先做窄 cleanup，是因为它只处理返回路径上从栈 load 回 preserved register 的明确形态，能避开 canary、stack arg、return address。
+
+# 2026-06-04 实现：raw caller-stack 首槽输入恢复
+
+背景：
+
+- saved-register restore 清理后，`php:extension-sockets` 还剩 4 个 `RSP caller_stack,call_frame_state`。
+- 真实形态是入口 `RSP` 指向 return address，代码从 `RSP + 8` raw load 读取第一个 caller-stack 参数，然后把值作为返回值。
+- 这类 load 不能按 raw load 删除，应该恢复成函数参数；但同样的 `RSP + 8` 也可能只是 saved-register restore 槽，必须避开。
+
+实现：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:110)
+  - 新增 `stackInputMetadata()`，给 raw caller-stack load 补 `notdec.stack.input` 元数据，复用现有 stack input binding/rewrite。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:343)
+  - 新增 `rawStackInputOffset()`，用已有 `stackOffsetFromBase()` 判断 raw load 地址是否来自入口 `RSP.external_input`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:354)
+  - 新增 `matchingStackInputSpace()`，只接受 ABI stack input pentry 能匹配的 offset/size。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:370)
+  - 新增 `loadOnlyFeedsDeadPreservedRegisterRestore()`。
+  - 如果 stack load 只写回 ABI `Unaffected` preserved register，且该 store 到返回前不再被读取，就不把它当参数候选。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:410)
+  - `stackInputTrials()` 现在接收 ABI。
+  - 继续保留 metadata stack input 必须来自当前 `notdec_stack` alloca 的约束。
+  - 新增 raw caller-stack 路径：当前只认 `rawOffset == abi.StackShift`，也就是入口 return address 后的第一个 caller-stack slot。
+  - raw load 匹配后写入 `notdec.stack.input` 元数据，让后续 rewrite 使用同一套绑定逻辑。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:5146)
+  - `buildNativeRecoveredPrototypeFunctionType()` 支持 1 到 8 字节整数输入参数。
+  - 这样 4 字节 caller-stack 参数能恢复成 `i32`，不是被硬限制成 `i64`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:5178)
+  - 新增 `supportedNativeInputParamType()`，签名 rewrite 输入参数接受 byte-aligned、宽度不超过 64 bit 的整数。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:5250)
+  - `getNativePrototypeInputBindings()` 对 stack input 使用 size 精确匹配。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:5268)
+  - 新增 `eraseReplacedInputLoad()`，替换 stack input load 后递归删除死掉的 raw pointer 链，避免残留 `inttoptr` 和死 `RSP.external_input`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:135)
+  - `attachRawStackInputTestAbi()` 增加 `RSP` stack pointer 语义、`StackShift=8`、stack input pentry，以及 `RBX` preserved effect。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1550)
+  - 新增 `createRawCallerStackInputReturnFunction()`，覆盖 `RSP+8` raw load 恢复成参数并返回的形态。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1586)
+  - 新增 `createRawCallerStackSavedRegisterRestoreFunction()`，覆盖同样 `RSP+8` 但只恢复 `RBX` 的反例。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:4271)
+  - 新增三个测试函数：
+    - `raw_caller_stack_input_return` -> `i64(i64)`。
+    - `raw_caller_stack_i32_input_return` -> `i64(i32)`。
+    - `raw_caller_stack_saved_rbx_restore` 不允许变成 stack input，并且 dead restore store 被清掉。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-raw-caller-stack-filtered-gate \
+  --target php:extension-calendar \
+  --target php:extension-sockets
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-raw-caller-stack-filtered-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-raw-caller-stack-filtered-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-raw-caller-stack-filtered-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_residue_audit_test.py` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 两个 Bench2 shared library 都通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `php:extension-calendar` | 12s | 11s |
+| `php:extension-sockets` | 40s | 41s |
+
+residue：
+
+```text
+gpr load  external_input  full/full  75
+gpr store access          full/full  296
+other load access         full/full  44
+other load external_input full/full  2
+```
+
+和 saved-register restore 基线比：
+
+- `gpr load external_input`: 79 -> 75，4 个 raw caller-stack `RSP` load 消失。
+- `gpr store access`: 296 -> 296，没有新增 preserved restore store。
+- normalized store 明细对比：新增 0，删除 0。
+
+真实例子：
+
+- `notdec_native_dc60`
+- `notdec_native_dc80`
+- `notdec_native_dca0`
+- `notdec_native_dcc0`
+
+这 4 个函数从 raw `RSP+8` load 变成 `i64(i32)` 参数函数，旧 `RSP.external_input`、`inttoptr`、`store @RAX` 都被清掉。
+
+判断：
+
+- caller-stack 首槽输入恢复已经能工作，并且没有把 saved-register restore 槽误当成参数。
+- 当前规则故意只认 `abi.StackShift`。更远的 stack arg 还没展开，因为真实样例里容易混到 saved-register restore、caller frame 和 chunk 边界。
+- 剩余 `RSP/RBP` 主要还是 `RBP` stack canary、caller frame、call frame state。下一步不应该继续扩大 raw stack arg 规则，而是先把 canary/caller-frame/call-frame-state 分类稳定。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 明确消掉 4 个真实 caller-stack RSP 残留，且没有增加 store residue。 |
+| 理解成本 | 3 | 新增了 raw stack input 入口和 restore-only 过滤，但仍复用现有 stack input rewrite。 |
+| 维护成本 | 3 | 后续扩大到更多 stack arg 时，`rawOffset == StackShift` 这条临时限制需要替换成更完整的 caller stack range 判断。 |
+
+有没有更好的方案：
+
+- 更完整的方案是先恢复 call frame：return address、caller stack arg、callee-saved restore、dynamic stack 都有明确分类，再统一把 stack input 暴露成参数。
+- 当前先做首槽，是因为它能解决已观察到的 4 个 shared library RSP 残留，同时用 preserved restore 过滤避免误改 ABI cleanup。

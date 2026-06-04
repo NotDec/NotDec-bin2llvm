@@ -57,6 +57,25 @@ bool accessMatchesEffectRegister(const llvm::MDNode &access,
 
 std::set<std::string> stackFrameRegisterNames(const NativeAbiSpec &abi);
 
+std::set<std::string> preservedNonStackFrameRegisterNames(
+    const NativeAbiSpec &abi);
+
+llvm::LoadInst *externalInputLoadForRegister(llvm::Function &function,
+                                             llvm::StringRef registerName);
+
+std::optional<int64_t> stackOffsetFromBase(llvm::Value *value,
+                                           llvm::Value *base,
+                                           std::set<llvm::Value *> &seen);
+
+std::optional<uint64_t> memoryAccessSize(const llvm::DataLayout &layout,
+                                         llvm::Instruction &instruction);
+
+bool callMayReadRegisterName(llvm::CallBase &call, llvm::StringRef registerName);
+
+bool storeIsDeadOnAllReturnPaths(
+    llvm::StoreInst &store, const llvm::MDNode &access,
+    llvm::function_ref<bool(llvm::CallBase &, llvm::StringRef)> mayReadName);
+
 llvm::MDNode *inputCandidateMetadata(llvm::LLVMContext &context,
                                      const NativeParamActive &active) {
   if (active.Trials.empty()) {
@@ -86,6 +105,17 @@ llvm::MDNode *inputCandidateMetadata(llvm::LLVMContext &context,
     entries.push_back(llvm::MDNode::get(context, fields));
   }
   return llvm::MDNode::get(context, entries);
+}
+
+llvm::MDNode *stackInputMetadata(llvm::LLVMContext &context,
+                                 llvm::StringRef space, uint64_t offset,
+                                 uint32_t size) {
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, ("space=" + space).str()),
+      llvm::MDString::get(context, "offset=" + std::to_string(offset)),
+      llvm::MDString::get(context, "size=" + std::to_string(size)),
+  };
+  return llvm::MDNode::get(context, fields);
 }
 
 std::vector<NativeRecoveredPrototypeParam> recoveredParams(
@@ -310,12 +340,84 @@ std::optional<int64_t> constantByteOffsetFromBase(llvm::Value *pointer,
   return offset.getSExtValue();
 }
 
+std::optional<int64_t> rawStackInputOffset(llvm::LoadInst &load,
+                                           llvm::LoadInst &stackBase) {
+  auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(
+      load.getPointerOperand()->stripPointerCasts());
+  if (pointer == nullptr) {
+    return std::nullopt;
+  }
+  std::set<llvm::Value *> seen;
+  return stackOffsetFromBase(pointer->getOperand(0), &stackBase, seen);
+}
+
+std::optional<std::string>
+matchingStackInputSpace(const NativeAbiSpec &abi,
+                        const NativePrototypeModel &model, uint64_t offset,
+                        uint32_t size) {
+  for (const NativeAbiParamEntry &entry : abi.Inputs) {
+    if (entry.Storage.Kind != NativeAbiStorageKind::Stack ||
+        entry.Storage.Space.empty()) {
+      continue;
+    }
+    if (model.findInputStack(entry.Storage.Space, offset, size)) {
+      return entry.Storage.Space;
+    }
+  }
+  return std::nullopt;
+}
+
+bool loadOnlyFeedsDeadPreservedRegisterRestore(llvm::LoadInst &load,
+                                               const NativeAbiSpec &abi) {
+  std::set<std::string> registerNames =
+      preservedNonStackFrameRegisterNames(abi);
+  if (registerNames.empty() || load.use_empty()) {
+    return false;
+  }
+
+  // Saved-register restore slots look like a stack load immediately written back
+  // to an unaffected GPR in the epilogue.  Do not turn that load into a function
+  // argument; after signature rewrite the later cleanup can no longer see the
+  // original load/store restore pair.
+  bool sawRestoreStore = false;
+  for (llvm::User *user : load.users()) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(user);
+    if (store == nullptr || store->getValueOperand() != &load) {
+      return false;
+    }
+
+    llvm::MDNode *access = store->getMetadata("notdec.register.access");
+    if (access == nullptr ||
+        !storeIsDeadOnAllReturnPaths(*store, *access, callMayReadRegisterName)) {
+      return false;
+    }
+
+    bool preservedStore = false;
+    for (const std::string &registerName : registerNames) {
+      if (accessMatchesEffectRegister(*access, registerName)) {
+        preservedStore = true;
+        break;
+      }
+    }
+    if (!preservedStore) {
+      return false;
+    }
+    sawRestoreStore = true;
+  }
+  return sawRestoreStore;
+}
+
 std::vector<NativeParamTrial> stackInputTrials(llvm::Function &function,
-                                               const NativePrototypeModel &model) {
+                                               const NativePrototypeModel &model,
+                                               const NativeAbiSpec &abi) {
   std::vector<NativeParamTrial> trials;
   std::optional<llvm::AllocaInst *> stackBase = functionStackAlloca(function);
   const llvm::Module *module = function.getParent();
-  if (!stackBase || module == nullptr) {
+  llvm::LoadInst *rawStackBase =
+      abi.StackPointerRegister.empty()
+          ? nullptr
+          : externalInputLoadForRegister(function, abi.StackPointerRegister);
+  if ((!stackBase && rawStackBase == nullptr) || module == nullptr) {
     return trials;
   }
 
@@ -326,27 +428,57 @@ std::vector<NativeParamTrial> stackInputTrials(llvm::Function &function,
         continue;
       }
       llvm::MDNode *metadata = load->getMetadata("notdec.stack.input");
-      if (metadata == nullptr) {
+      std::optional<std::string> space;
+      std::optional<uint64_t> offset;
+      std::optional<uint64_t> size;
+      if (metadata != nullptr) {
+        space = metadataField(*metadata, "space");
+        offset = parseUint64Field(*metadata, "offset");
+        size = parseUint64Field(*metadata, "size");
+        // Metadata stack inputs must still come from the current function's
+        // explicit stack object.
+        if (!stackBase ||
+            !constantByteOffsetFromBase(load->getPointerOperand(), *stackBase,
+                                        module->getDataLayout())) {
+          continue;
+        }
+      } else if (rawStackBase != nullptr) {
+        std::optional<int64_t> rawOffset =
+            rawStackInputOffset(*load, *rawStackBase);
+        std::optional<uint64_t> accessSize =
+            memoryAccessSize(module->getDataLayout(), *load);
+        if (!rawOffset || *rawOffset < 0 ||
+            abi.StackShift == 0 ||
+            static_cast<uint64_t>(*rawOffset) != abi.StackShift ||
+            !accessSize ||
+            *accessSize >
+                static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+          continue;
+        }
+        offset = static_cast<uint64_t>(*rawOffset);
+        size = *accessSize;
+        space = matchingStackInputSpace(
+            abi, model, *offset, static_cast<uint32_t>(*size));
+      } else {
         continue;
       }
-      // Stack candidates come from HeritageToLLVM metadata, not from pointer
-      // arithmetic alone.  The GEP/base check keeps the metadata tied to the
-      // current function's stack object.
-      std::optional<std::string> space = metadataField(*metadata, "space");
-      std::optional<uint64_t> offset = parseUint64Field(*metadata, "offset");
-      std::optional<uint64_t> size = parseUint64Field(*metadata, "size");
       if (!space || !offset || !size ||
           *size > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
         continue;
       }
-      if (!constantByteOffsetFromBase(load->getPointerOperand(), *stackBase,
-                                      module->getDataLayout())) {
+      if (loadOnlyFeedsDeadPreservedRegisterRestore(*load, abi)) {
         continue;
       }
       std::optional<NativeStorageMatch> match =
           model.findInputStack(*space, *offset, static_cast<uint32_t>(*size));
       if (!match) {
         continue;
+      }
+      if (metadata == nullptr) {
+        load->setMetadata(
+            "notdec.stack.input",
+            stackInputMetadata(function.getContext(), *space, *offset,
+                               static_cast<uint32_t>(*size)));
       }
 
       NativeParamTrial trial;
@@ -4844,7 +4976,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
         active.Trials.push_back(std::move(trial));
       }
     }
-    for (NativeParamTrial &trial : stackInputTrials(function, model)) {
+    for (NativeParamTrial &trial : stackInputTrials(function, model, *abi)) {
       addUniqueTrialBySlot(active, inputSlots, std::move(trial));
     }
     sortTrialsBySlot(active);
@@ -5020,10 +5152,11 @@ std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
     if (param.StorageKind != "register" && param.StorageKind != "stack") {
       return std::nullopt;
     }
-    if (param.Size != 8) {
+    if (param.Size == 0 || param.Size > 8) {
       return std::nullopt;
     }
-    paramTypes.push_back(registerType);
+    paramTypes.push_back(
+        llvm::IntegerType::get(context, static_cast<unsigned>(param.Size * 8)));
   }
 
   llvm::Type *returnType = llvm::Type::getVoidTy(context);
@@ -5040,6 +5173,15 @@ std::optional<llvm::FunctionType *> buildNativeRecoveredPrototypeFunctionType(
     returnType = llvm::StructType::get(context, returnElements);
   }
   return llvm::FunctionType::get(returnType, paramTypes, false);
+}
+
+bool supportedNativeInputParamType(llvm::Type *type) {
+  auto *integer = llvm::dyn_cast<llvm::IntegerType>(type);
+  if (integer == nullptr) {
+    return false;
+  }
+  unsigned width = integer->getBitWidth();
+  return width != 0 && width <= 64 && width % 8 == 0;
 }
 
 NativePrototypeRewriteEligibility
@@ -5126,6 +5268,12 @@ llvm::LoadInst *inputBindingLoad(const NativePrototypeInputBinding &binding) {
     return binding.ExternalInputLoad;
   }
   return binding.StackInputLoad;
+}
+
+void eraseReplacedInputLoad(llvm::LoadInst &load) {
+  llvm::Value *pointer = load.getPointerOperand();
+  load.eraseFromParent();
+  llvm::RecursivelyDeleteTriviallyDeadInstructions(pointer);
 }
 
 bool hasStackInputBinding(
@@ -5392,7 +5540,7 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
     return result;
   }
   for (llvm::Type *paramType : (*recoveredType)->params()) {
-    if (!paramType->isIntegerTy(64)) {
+    if (!supportedNativeInputParamType(paramType)) {
       result.Reason = "unsupported recovered prototype type";
       return result;
     }
@@ -5446,7 +5594,7 @@ rewriteNativeRecoveredPrototypeInputOnly(llvm::Function &function) {
     argument->setName(inputLoad->getName());
     inputLoad->replaceAllUsesWith(&*argument);
     if (inputLoad->use_empty()) {
-      inputLoad->eraseFromParent();
+      eraseReplacedInputLoad(*inputLoad);
     }
     ++argument;
   }
@@ -5492,7 +5640,7 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
     return result;
   }
   for (llvm::Type *paramType : (*recoveredType)->params()) {
-    if (!paramType->isIntegerTy(64)) {
+    if (!supportedNativeInputParamType(paramType)) {
       result.Reason = "unsupported recovered prototype type";
       return result;
     }
@@ -5574,7 +5722,7 @@ rewriteNativeRecoveredPrototypeInputReturn(llvm::Function &function) {
     }
     inputLoad->replaceAllUsesWith(&*argument);
     if (inputLoad->use_empty()) {
-      inputLoad->eraseFromParent();
+      eraseReplacedInputLoad(*inputLoad);
     }
     ++argument;
   }
@@ -5743,7 +5891,7 @@ rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
     return result;
   }
   for (llvm::Type *paramType : (*recoveredType)->params()) {
-    if (!paramType->isIntegerTy(64)) {
+    if (!supportedNativeInputParamType(paramType)) {
       result.Reason = "unsupported recovered prototype type";
       return result;
     }
@@ -5823,7 +5971,7 @@ rewriteNativeRecoveredPrototypeInputMultiReturn(llvm::Function &function) {
     }
     inputLoad->replaceAllUsesWith(&*argument);
     if (inputLoad->use_empty()) {
-      inputLoad->eraseFromParent();
+      eraseReplacedInputLoad(*inputLoad);
     }
     ++argument;
   }
