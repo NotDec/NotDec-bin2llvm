@@ -9584,6 +9584,12 @@ int main() {
           declarationRspStoreModule, "noreturn_declaration_rsp_store",
           declarationRsp, "RSP", false, false, &noReturnDeclarationRspCallee);
   noReturnDeclarationRspCallee->setName("__stack_chk_fail");
+  llvm::Function *abortDeclarationRspCallee = nullptr;
+  llvm::Function *abortDeclarationRspCaller =
+      createDeclarationStackFrameRegisterStoreCallerFunction(
+          declarationRspStoreModule, "abort_declaration_rsp_store",
+          declarationRsp, "RSP", false, false, &abortDeclarationRspCallee);
+  abortDeclarationRspCallee->setName("abort");
   llvm::Function *knownNoStackDeclarationRspCallee = nullptr;
   llvm::Function *knownNoStackDeclarationRspCaller =
       createDeclarationStackFrameRegisterStoreCallerFunction(
@@ -9639,6 +9645,7 @@ int main() {
   for (llvm::Function *function :
        {deadDeclarationRspCaller, branchDeclarationRspCaller,
         noMetadataDeclarationRspCaller, noReturnDeclarationRspCaller,
+        abortDeclarationRspCaller,
         knownNoStackDeclarationRspCaller, libcNoStackDeclarationRspCaller,
         branchKnownNoStackRspCaller,
         branchUnknownRspCaller, callerReadsDeclarationRspCaller,
@@ -9671,6 +9678,10 @@ int main() {
   ok &= expect(!hasRegisterExternalInputLoad(*noReturnDeclarationRspCaller,
                                              "RSP"),
                "known noreturn declaration call kept dead RSP external input");
+  ok &= expect(!hasRegisterStore(*abortDeclarationRspCaller, "RSP"),
+               "abort declaration call RSP store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*abortDeclarationRspCaller, "RSP"),
+               "abort declaration call kept dead RSP external input");
   ok &= expect(!hasRegisterStore(*knownNoStackDeclarationRspCaller, "RSP"),
                "known no-stack declaration call RSP store was not removed");
   ok &= expect(!hasRegisterExternalInputLoad(*knownNoStackDeclarationRspCaller,

@@ -2951,3 +2951,83 @@ other	load	external_input	full	full	no	2
 
 - 更完整方案是从 call-site 栈语义恢复入手，恢复内部 helper 的真实参数和返回语义。
 - 当前先做死参数收缩，是因为这个样例的 `RSP - 16` 没有真实栈访问语义，只是死寄存器状态传播。保守删掉它，比新增一个假的栈语义节点更准确。
+
+# 2026-06-04 实现：识别 abort no-return 清理 call-frame RSP
+
+背景：
+
+- 扩展到 `libuv:shared-library` 后，发现大量 `notdec_native_9b40` 这类短函数：
+  - 入口加载 `RSP.external_input`。
+  - 调用 `abort` 前写 `@RSP`。
+  - 调用后直接 `ret`。
+- 这类 `RSP` 写入只是模拟 call frame 栈顶，`abort` 不返回，也没有 stack arg 语义。之前只识别 `__stack_chk_fail`，所以这些 store 没被清掉。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2549)
+  - `isKnownNoReturnDeclaration()` 增加 `abort`。
+  - `isKnownNoStackArgumentDeclaration()` 已经委托 no-return 判断，所以不需要再单独加一份白名单。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:9587)
+  - 新增 `abort_declaration_rsp_store` 正例，验证 call 前 `RSP` store 和死的 `RSP.external_input` 都被删除。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-abort-noreturn-gate \
+  --target libuv:shared-library
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-abort-noreturn-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-abort-noreturn-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-bin2llvm-abort-noreturn-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `libuv:shared-library` 通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `libuv:shared-library` | 101s | 104s |
+
+`libuv` 上 `RSP/RBP` 明细行数：
+
+```text
+before: 178
+after:   78
+```
+
+`after` 剩余分类：
+
+```text
+60 call_frame_state
+10 stack_frame_state
+4  saved_register_restore,call_frame_state
+2  frame_base_state
+2  chunk_phi
+```
+
+判断：
+
+- `abort` 这批 no-return call-frame RSP store 被清掉。
+- 没把 `pthread_*`、`fopen`、`send/recv` 这类普通外部声明加入 no-stack 白名单，因为它们有真实 ABI 参数，只是当前 declaration 还没恢复参数，不能按 `abort` 处理。
+- 下一步应处理普通外部声明 call-site 输入恢复，尤其是把寄存器/栈参数恢复到 declaration call 的参数，而不是继续扩大 no-stack 白名单。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | `libuv` 上 RSP/RBP residue 从 178 降到 78，处理的是明确 no-return 子类。 |
+| 理解成本 | 1 | 只增加一个 libc no-return 名称。 |
+| 维护成本 | 1 | 风险低；如果后续从 ELF/ABI metadata 自动识别 no-return，可替换这份手工表。 |

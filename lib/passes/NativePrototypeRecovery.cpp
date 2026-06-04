@@ -2555,6 +2555,7 @@ bool isKnownNoReturnDeclaration(const llvm::Function &function) {
     return true;
   }
   return llvm::StringSwitch<bool>(function.getName())
+      .Case("abort", true)
       .Case("__stack_chk_fail", true)
       .Default(false);
 }
