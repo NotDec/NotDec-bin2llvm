@@ -2569,6 +2569,31 @@ llvm::Function *createExternalRbpRawLoadFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createExternalRbpRawStoreFunction(llvm::Module &module,
+                                                  const std::string &name,
+                                                  llvm::GlobalVariable *rbp) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rbpBase =
+      builder.CreateLoad(rbp->getValueType(), rbp, "RBP.external_input");
+  rbpBase->setMetadata("notdec.register.external_input",
+                       registerAccessMetadata(context, "RBP"));
+  llvm::Value *address = builder.CreateAdd(
+      rbpBase, llvm::ConstantInt::get(rbp->getValueType(), -36, true));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), -1,
+                                             true),
+                      pointer);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createInternalStackFrameRegisterStoreCallerFunction(
     llvm::Module &module, const std::string &name,
     llvm::GlobalVariable *global, const std::string &registerName,
@@ -9352,6 +9377,9 @@ int main() {
   llvm::Function *externalRbpRawLoad =
       createExternalRbpRawLoadFunction(rawRspLoadModule,
                                        "external_rbp_raw_load", rawRbp);
+  llvm::Function *externalRbpRawStore =
+      createExternalRbpRawStoreFunction(rawRspLoadModule,
+                                        "external_rbp_raw_store", rawRbp);
   llvm::Function *noReturnFallthrough =
       createNoReturnFallthroughFunction(rawRspLoadModule,
                                         "noreturn_fallthrough");
@@ -9397,10 +9425,18 @@ int main() {
                "call-return stored RBP frame-base store was not removed");
   ok &= expect(!hasIntToPtr(*callReturnStoredRbpRawLoad),
                "call-return stored RBP frame-base raw load kept old inttoptr");
-  ok &= expect(hasIntToPtr(*externalRbpRawLoad),
-               "external RBP frame raw load lost original inttoptr");
-  ok &= expect(hasRegisterExternalInputLoad(*externalRbpRawLoad, "RBP"),
-               "external RBP frame raw load lost original external input");
+  ok &= expect(hasCallTo(*externalRbpRawLoad, "notdec_caller_frame_load_i64"),
+               "external RBP frame raw load was not classified");
+  ok &= expect(!hasIntToPtr(*externalRbpRawLoad),
+               "external RBP frame load kept old inttoptr");
+  ok &= expect(!hasRegisterExternalInputLoad(*externalRbpRawLoad, "RBP"),
+               "external RBP frame load kept old external input");
+  ok &= expect(hasCallTo(*externalRbpRawStore, "notdec_caller_frame_store_i32"),
+               "external RBP frame raw store was not classified");
+  ok &= expect(!hasIntToPtr(*externalRbpRawStore),
+               "external RBP frame store kept old inttoptr");
+  ok &= expect(!hasRegisterExternalInputLoad(*externalRbpRawStore, "RBP"),
+               "external RBP frame store kept old external input");
   ok &= expect(blockEndsWithUnreachable(*noReturnFallthrough, "fail"),
                "known noreturn call kept fallthrough terminator");
   ok &= expect(!phiHasIncomingFromBlock(*noReturnFallthrough, "merged_value",

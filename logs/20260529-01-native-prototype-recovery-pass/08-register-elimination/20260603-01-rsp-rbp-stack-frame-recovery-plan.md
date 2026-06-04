@@ -2730,3 +2730,122 @@ other load external_input full/full  2
 
 - 更完整方案是先修函数 chunk 边界，让 `__stack_chk_fail` 后的错误 fallthrough 不进入函数体。
 - 当前先做 no-return prepass 加 canary 语义化，是因为它能直接处理真实 shared library 的 canary residue，并且不会把 caller-frame 或 call-frame-state 当成普通栈槽删掉。
+
+# 2026-06-04 实现：caller-frame raw RBP 访问语义化
+
+背景：
+
+- canary 清理后，两个 Bench2 shared library 只剩 3 个 `RBP caller_frame` 和 1 个 `RSP call_frame_state`。
+- 3 个 `RBP caller_frame` 都是入口外部 `RBP - const` 直接访问：
+  - `notdec_native_65cc`：向父 frame 写 `i32 -1`。
+  - `notdec_native_6108`：从父 frame 读 `i32` 后传给 `zend_argument_type_error`。
+  - `notdec_native_670c`：从父 frame 读 `i64` 后传给 `freeaddrinfo`。
+- 这些不是当前函数本地栈槽，不能转 `alloca`。它们更像 chunk 访问父函数 frame，所以这轮只把 raw RBP 访问分类成显式 caller-frame 语义。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2187)
+  - `callMayReadRegisterName()` 把 `notdec_caller_frame_*` 语义调用当成不读取 `RSP/RBP` 的调用。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3774)
+  - 新增 `supportedCallerFrameAccessType()`，当前只支持 `i32/i64`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3780)
+  - 新增 `getOrCreateCallerFrameAccessDeclaration()`。
+  - load 生成 `notdec_caller_frame_load_i32/i64(offset)`。
+  - store 生成 `notdec_caller_frame_store_i32/i64(offset, value)`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3806)
+  - 新增 `rewriteCallerFramePointerAccess()`。
+  - 只匹配 `RBP.external_input + 负常量 -> inttoptr -> 直接 load/store`。
+  - 不接受 volatile/atomic，不接受非直接用户，不接受正 offset。
+  - 改写后删除旧 load/store、`inttoptr` 和死的 `RBP.external_input` 链。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3879)
+  - 新增 `rewriteCallerFrameAccesses()`，只处理 ABI stack-frame register 里的 frame pointer，不处理 `RSP`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:5588)
+  - 在 signature rewrite 后置 cleanup 中，放在 saved-register restore 清理之后调用。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2572)
+  - 新增 `createExternalRbpRawStoreFunction()`，覆盖外部 RBP frame store。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:9377)
+  - 原 `external_rbp_raw_load` 从“必须保留 raw RBP”改成 caller-frame load 正例。
+  - 新增 caller-frame store 正例，要求旧 `inttoptr` 和 `RBP.external_input` 被清掉。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-caller-frame-gate \
+  --target php:extension-calendar \
+  --target php:extension-sockets
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-caller-frame-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-caller-frame-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-bin2llvm-caller-frame-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_residue_audit_test.py` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 两个 Bench2 shared library 都通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `php:extension-calendar` | 12s | 12s |
+| `php:extension-sockets` | 40s | 41s |
+
+residue 对比：
+
+```text
+before:
+gpr load  external_input  full/full  33
+gpr store access          full/full  291
+other load external_input full/full  2
+
+after:
+gpr load  external_input  full/full  30
+gpr store access          full/full  291
+other load external_input full/full  2
+```
+
+剩余 `RSP/RBP` 分类：
+
+```text
+1 RSP call_frame_state
+```
+
+真实语义化结果：
+
+```llvm
+call void @notdec_caller_frame_store_i32(i64 -36, i32 %unique_6a80_4)
+%0 = call i32 @notdec_caller_frame_load_i32(i64 -68)
+%0 = call i64 @notdec_caller_frame_load_i64(i64 -152)
+```
+
+判断：
+
+- `RBP caller_frame` 从 3 降到 0。
+- 这轮没有把父 frame 当成本地 alloca，也没有扩大到 `RSP`。
+- 剩余唯一 `RSP call_frame_state` 是 `notdec_native_10ef0` 里把 `RSP.external_input - 16` 作为参数传给内部函数 `notdec_native_102f0`。这属于 call-site 栈状态传递，不适合继续用 raw load/store cleanup 解决。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | shared gate 上 caller-frame RBP 清零，只剩 call-frame-state RSP。 |
+| 理解成本 | 3 | 新增 caller-frame 语义声明，但 matcher 条件很窄。 |
+| 维护成本 | 3 | 后续如果修 chunk/function boundary，应把这些 caller-frame 调用替换成真正的父函数 frame 引用或合并后的本地访问。 |
+
+有没有更好的方案：
+
+- 更完整方案是修函数边界，把这些 chunk 合回父函数，或者在 IR 层显式建 chunk parent frame。
+- 当前先分类成 `notdec_caller_frame_*`，是因为它不假装这是本地栈，也能去掉最后几个 raw RBP 依赖。

@@ -2184,6 +2184,9 @@ bool callMayReadRegisterName(llvm::CallBase &call,
   if (callee->getName() == "notdec_stack_canary_check") {
     return false;
   }
+  if (callee->getName().starts_with("notdec_caller_frame_")) {
+    return false;
+  }
   if (callee->isDeclaration()) {
     return !(registerName == "RSP" &&
              isKnownNoStackArgumentDeclaration(*callee));
@@ -3764,6 +3767,154 @@ void eraseDeadPreservedRegisterRestoreStores(llvm::Module &module,
       llvm::Value *storedValue = store->getValueOperand();
       store->eraseFromParent();
       llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
+    }
+  }
+}
+
+bool supportedCallerFrameAccessType(llvm::Type *type) {
+  auto *integer = llvm::dyn_cast<llvm::IntegerType>(type);
+  return integer != nullptr &&
+         (integer->getBitWidth() == 32 || integer->getBitWidth() == 64);
+}
+
+llvm::Function *getOrCreateCallerFrameAccessDeclaration(llvm::Module &module,
+                                                        bool isStore,
+                                                        llvm::Type *valueType) {
+  if (!supportedCallerFrameAccessType(valueType)) {
+    return nullptr;
+  }
+  auto *integer = llvm::cast<llvm::IntegerType>(valueType);
+  std::string name =
+      "notdec_caller_frame_" + std::string(isStore ? "store_i" : "load_i") +
+      std::to_string(integer->getBitWidth());
+  if (llvm::Function *existing = module.getFunction(name)) {
+    return existing;
+  }
+
+  llvm::Type *offsetType = llvm::Type::getInt64Ty(module.getContext());
+  llvm::FunctionType *type = nullptr;
+  if (isStore) {
+    type = llvm::FunctionType::get(llvm::Type::getVoidTy(module.getContext()),
+                                   {offsetType, valueType}, false);
+  } else {
+    type = llvm::FunctionType::get(valueType, {offsetType}, false);
+  }
+  return llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage, name,
+                                module);
+}
+
+bool rewriteCallerFramePointerAccess(llvm::IntToPtrInst &pointer,
+                                     llvm::LoadInst &frameBase,
+                                     llvm::Module &module) {
+  std::set<llvm::Value *> seen;
+  std::optional<int64_t> offset =
+      stackOffsetFromBase(pointer.getOperand(0), &frameBase, seen);
+  if (!offset || *offset >= 0) {
+    return false;
+  }
+
+  std::vector<llvm::Instruction *> memoryUsers;
+  for (llvm::User *user : pointer.users()) {
+    auto *memory = llvm::dyn_cast<llvm::Instruction>(user);
+    if (memory == nullptr ||
+        (llvm::isa<llvm::LoadInst>(memory) && memory->getOperand(0) != &pointer) ||
+        (llvm::isa<llvm::StoreInst>(memory) &&
+         memory->getOperand(1) != &pointer) ||
+        (!llvm::isa<llvm::LoadInst>(memory) &&
+         !llvm::isa<llvm::StoreInst>(memory))) {
+      return false;
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(memory)) {
+      if (load->isVolatile() || load->isAtomic() ||
+          !supportedCallerFrameAccessType(load->getType())) {
+        return false;
+      }
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(memory)) {
+      if (store->isVolatile() || store->isAtomic() ||
+          !supportedCallerFrameAccessType(store->getValueOperand()->getType())) {
+        return false;
+      }
+    }
+    memoryUsers.push_back(memory);
+  }
+  if (memoryUsers.empty()) {
+    return false;
+  }
+
+  for (llvm::Instruction *memory : memoryUsers) {
+    llvm::IRBuilder<> builder(memory);
+    llvm::Value *offsetValue = llvm::ConstantInt::get(
+        llvm::Type::getInt64Ty(module.getContext()), *offset, true);
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(memory)) {
+      llvm::Function *callee =
+          getOrCreateCallerFrameAccessDeclaration(module, false,
+                                                  load->getType());
+      if (callee == nullptr) {
+        return false;
+      }
+      llvm::CallInst *call =
+          builder.CreateCall(callee->getFunctionType(), callee, {offsetValue});
+      load->replaceAllUsesWith(call);
+      load->eraseFromParent();
+      continue;
+    }
+    auto *store = llvm::cast<llvm::StoreInst>(memory);
+    llvm::Function *callee = getOrCreateCallerFrameAccessDeclaration(
+        module, true, store->getValueOperand()->getType());
+    if (callee == nullptr) {
+      return false;
+    }
+    builder.CreateCall(callee->getFunctionType(), callee,
+                       {offsetValue, store->getValueOperand()});
+    store->eraseFromParent();
+  }
+
+  if (pointer.use_empty()) {
+    llvm::RecursivelyDeleteTriviallyDeadInstructions(&pointer);
+  }
+  return true;
+}
+
+void rewriteCallerFrameAccesses(llvm::Module &module,
+                                const NativeAbiSpec &abi) {
+  std::set<std::string> registerNames = stackFrameRegisterNames(abi);
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+
+    for (const std::string &registerName : registerNames) {
+      if (registerName == abi.StackPointerRegister ||
+          !isFramePointerRegisterName(registerName)) {
+        continue;
+      }
+      llvm::LoadInst *frameBase =
+          externalInputLoadForRegister(function, registerName);
+      if (frameBase == nullptr) {
+        continue;
+      }
+
+      std::vector<llvm::IntToPtrInst *> pointers;
+      for (llvm::BasicBlock &block : function) {
+        for (llvm::Instruction &instruction : block) {
+          auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(&instruction);
+          if (pointer != nullptr) {
+            pointers.push_back(pointer);
+          }
+        }
+      }
+      for (llvm::IntToPtrInst *pointer : pointers) {
+        rewriteCallerFramePointerAccess(*pointer, *frameBase, module);
+      }
+      if (frameBase->getParent() != nullptr && frameBase->use_empty()) {
+        frameBase->eraseFromParent();
+      }
     }
   }
 }
@@ -5434,6 +5585,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseDeadNonReturnVectorStores(module);
     eraseDeadStackFrameDerivedNonReturnStores(module, *abi);
     eraseDeadPreservedRegisterRestoreStores(module, *abi);
+    rewriteCallerFrameAccesses(module, *abi);
     eraseDeadNativeStackAllocas(module);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
     summary.SignatureRewriteFunctionsRewritten =
