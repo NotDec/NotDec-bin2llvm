@@ -1943,3 +1943,100 @@ other load external_input full/full  2
 
 - 真正的下一步仍是函数本地 stack frame 建模，把确定的 `RSP/RBP` frame access 统一转 `alloca/notdec_stack`。
 - 这次不碰动态 alloca，也不把 used caller-stack/return-address/canary raw load 当垃圾删。
+
+# 2026-06-04 实现：扩展 0 参数 no-stack declaration RSP store 清理
+
+背景：
+
+- shared library gate 里剩余 `RSP` store 有一部分是 call 前栈状态写，目标是 0 参数 declaration：
+  - `__errno_location`
+  - `strerror`
+  - `if_nametoindex`
+- 这些 declaration 在当前 IR 中没有参数，不需要 caller stack 参数。
+- 普通 unknown declaration 仍不能删，因为可能需要 caller stack 状态。
+
+实现：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2278)
+  - 扩展 `isKnownNoStackArgumentDeclaration` 白名单。
+  - 新增 `__errno_location`、`strerror`、`if_nametoindex`、`zend_wrong_param_count`。
+  - 仍要求 callee 是 declaration、非 vararg、`arg_size() == 0`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:9031)
+  - 补 `__errno_location` no-stack declaration case。
+  - 保留普通 no-metadata declaration 的反例，确认 unknown declaration 不会被误删。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-known-nostack-decl-gate \
+  --target php:extension-calendar \
+  --target php:extension-sockets
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-known-nostack-decl-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-known-nostack-decl-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-known-nostack-decl-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 两个 shared library 都通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `php:extension-calendar` | 13s | 12s |
+| `php:extension-sockets` | 42s | 40s |
+
+residue 对比：
+
+```text
+after stored RBP cleanup:
+gpr load  access          full/full  5
+gpr load  external_input  full/full  119
+gpr store access          full/full  504
+other load access         full/full  44
+other load external_input full/full  2
+
+after known no-stack declaration expansion:
+gpr load  access          full/full  5
+gpr load  external_input  full/full  117
+gpr store access          full/full  497
+other load access         full/full  44
+other load external_input full/full  2
+```
+
+判断：
+
+- 命中 `__errno_location`、`strerror`、`if_nametoindex` 前的 `RSP` store。
+- `zend_wrong_param_count` 仍有一条保留，因为 call 前还有 return-address raw store 等 intervening instruction；现有规则保守保留是对的。
+- 剩余 stack/frame residue 主要是：
+  - `RBP.external_input`：46
+  - `RSP.external_input`：43
+  - `sockets_strerror` internal call 前 `RSP` store：8
+  - `RBP` frame store：2
+- 没有看到运行时间明显退化。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 2 | shared gate 少 7 个 GPR store、2 个 external input，收益明确但范围小。 |
+| 理解成本 | 1 | 只是扩展已有 0 参数 no-stack declaration 白名单。 |
+| 维护成本 | 2 | 白名单需要人工维护，但仍有 declaration/arg/vararg 门槛。 |
+
+有没有更好的方案：
+
+- `sockets_strerror` 是 internal callee，不能按 declaration 白名单删；要么恢复它的 frame 语义，要么证明 caller 传进去的 RSP 状态不被 callee 使用。
+- 大量 `RBP.external_input` 仍是外部 frame/canary/saved-register 形态，下一步要做本地 frame tracking，不能直接删。

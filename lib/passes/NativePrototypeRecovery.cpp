@@ -2285,9 +2285,13 @@ bool isKnownNoStackArgumentDeclaration(const llvm::Function &function) {
   }
   return llvm::StringSwitch<bool>(function.getName())
       .Case("__gmon_start__", true)
+      .Case("__errno_location", true)
       .Case("__stack_chk_fail", true)
+      .Case("if_nametoindex", true)
       .Case("notdec_plt0_resolver", true)
       .Case("php_info_print_table_start", true)
+      .Case("strerror", true)
+      .Case("zend_wrong_param_count", true)
       .Default(false);
 }
 

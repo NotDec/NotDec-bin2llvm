@@ -688,6 +688,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rbp-stored-frame-final-gate`
+  - [x] 扩展 0 参数 no-stack declaration 前 `RSP` store 清理：覆盖 `__errno_location`、`strerror`、`if_nametoindex`、`zend_wrong_param_count`，普通 unknown declaration 仍保留；两个 shared library gate 通过，GPR external input 从 119 降到 117，GPR store 从 504 降到 497。
+    - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-rsp-known-nostack-decl-gate`
 
 ## 记录规则
 

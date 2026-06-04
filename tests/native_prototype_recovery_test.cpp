@@ -8988,6 +8988,13 @@ int main() {
           declarationRsp, "RSP", false, false,
           &knownNoStackDeclarationRspCallee);
   knownNoStackDeclarationRspCallee->setName("__gmon_start__");
+  llvm::Function *libcNoStackDeclarationRspCallee = nullptr;
+  llvm::Function *libcNoStackDeclarationRspCaller =
+      createDeclarationStackFrameRegisterStoreCallerFunction(
+          declarationRspStoreModule, "libc_nostack_declaration_rsp_store",
+          declarationRsp, "RSP", false, false,
+          &libcNoStackDeclarationRspCallee);
+  libcNoStackDeclarationRspCallee->setName("__errno_location");
   llvm::Function *branchKnownNoStackRspCallee = nullptr;
   llvm::Function *branchKnownNoStackRspCaller =
       createBranchDeclarationRspStoreCallerFunction(
@@ -9024,7 +9031,8 @@ int main() {
   for (llvm::Function *function :
        {deadDeclarationRspCaller, branchDeclarationRspCaller,
         noMetadataDeclarationRspCaller, noReturnDeclarationRspCaller,
-        knownNoStackDeclarationRspCaller, branchKnownNoStackRspCaller,
+        knownNoStackDeclarationRspCaller, libcNoStackDeclarationRspCaller,
+        branchKnownNoStackRspCaller,
         branchUnknownRspCaller, callerReadsDeclarationRspCaller,
         deadDeclarationRbpCaller, noMetadataDeclarationRbpCaller,
         callerReadsDeclarationRbpCaller}) {
@@ -9060,6 +9068,11 @@ int main() {
   ok &= expect(!hasRegisterExternalInputLoad(*knownNoStackDeclarationRspCaller,
                                              "RSP"),
                "known no-stack declaration call kept dead RSP external input");
+  ok &= expect(!hasRegisterStore(*libcNoStackDeclarationRspCaller, "RSP"),
+               "libc no-stack declaration call RSP store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*libcNoStackDeclarationRspCaller,
+                                             "RSP"),
+               "libc no-stack declaration call kept dead RSP external input");
   ok &= expect(!hasRegisterStore(*branchKnownNoStackRspCaller, "RSP"),
                "branch known no-stack declaration RSP store was not removed");
   ok &= expect(!hasRegisterExternalInputLoad(*branchKnownNoStackRspCaller,
