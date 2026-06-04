@@ -2849,3 +2849,105 @@ call void @notdec_caller_frame_store_i32(i64 -36, i32 %unique_6a80_4)
 
 - 更完整方案是修函数边界，把这些 chunk 合回父函数，或者在 IR 层显式建 chunk parent frame。
 - 当前先分类成 `notdec_caller_frame_*`，是因为它不假装这是本地栈，也能去掉最后几个 raw RBP 依赖。
+
+# 2026-06-04 实现：内部 helper 死参数收缩清理 call-frame-state RSP
+
+背景：
+
+- caller-frame 语义化后，两个 Bench2 shared library 只剩 1 个 `RSP call_frame_state`。
+- 真实样例在 `php-extension-sockets.signature-rewrite.ll`：
+  - `notdec_native_10ef0` 计算 `RSP.external_input - 16`，作为第三个参数传给 `notdec_native_102f0`。
+  - `notdec_native_102f0` 只把这个参数写进 `@R9`，函数内没有再读，调用点之后也没有读 `R9`。
+- 这不是一个应保留的 stack semantic，而是内部 helper 传播了已经没用的寄存器状态。直接新增一个 `RSP - 16` 语义调用不合适，应该删掉这条死参数链。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3774)
+  - 新增 `callsitePathReadsRegisterAfterCall()`，判断调用点之后是否还会读某个寄存器。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3787)
+  - 新增 `argumentOnlyFeedsDeadRegisterStore()`，只接受“参数唯一用途是非 volatile/atomic 的 `store arg, @REG`，且 store 后到 return 不再读该寄存器”的窄形态。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3817)
+  - 新增 `directInternalCallsites()`，要求被收缩函数所有 use 都是直接调用，避免改错间接调用或签名不一致的调用。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3841)
+  - 新增 `shrinkInternalFunctionArguments()`，重建内部函数签名、更新 `notdec.prototype.recovered` metadata，并同步改写所有直接 callsite。
+  - 删除旧 call 后，对被移除实参调用 `RecursivelyDeleteTriviallyDeadInstructions()`，让 `RSP.external_input - const` 这类死链一起清掉。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3933)
+  - 新增 `eraseDeadInternalCallArgumentRegisterStores()`，统一找出这种死参数、删掉寄存器 store、再收缩函数参数。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:5798)
+  - 在 signature rewrite 后置 cleanup 中，放在 caller-frame access 改写之后执行。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:3660)
+  - 新增 `firstCallTo()` 测试 helper。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:9116)
+  - 新增 `dead_internal_argument_callee/caller` 正例：callee 的第二个参数只写 `R8`，caller 用 `RSP.external_input - 16` 传入。验证 pass 后 callee/callsite 都只剩 1 个参数，`R8` store 和 caller 里的 `RSP.external_input` 都被清掉。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-dead-internal-argument-gate \
+  --target php:extension-calendar \
+  --target php:extension-sockets
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-dead-internal-argument-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-dead-internal-argument-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-bin2llvm-dead-internal-argument-details.tsv
+awk -F'\t' 'NR>1 && $15 ~ /RSP|RBP/ {print}' \
+  /tmp/notdec-bin2llvm-dead-internal-argument-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_residue_audit_test.py` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 两个 Bench2 shared library 都通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `php:extension-calendar` | 11s | 11s |
+| `php:extension-sockets` | 39s | 40s |
+
+residue：
+
+```text
+category	access_kind	metadata_kind	shape	value_shape	synthetic	count
+gpr	load	external_input	full	full	no	21
+gpr	store	access	full	full	no	193
+other	load	external_input	full	full	no	2
+```
+
+剩余 `RSP/RBP` 分类：
+
+```text
+无
+```
+
+判断：
+
+- 两个 shared library 上的 `RSP/RBP` raw residue 暂时清零。
+- 这轮没有扩大到删除所有 `R8/R9` store，只处理“内部 helper 参数唯一用途是死寄存器 store”的形态。
+- 仍然不能说整个 RSP/RBP 问题结束。当前只证明这两个 shared library 的已知残留清掉了，下一步还要继续做本地栈槽转 `alloca`、动态栈调整、stack arg / return-address 分类和函数 chunk 边界。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 当前 shared gate 上最后一个 `RSP call_frame_state` 清零。 |
+| 理解成本 | 4 | 需要重建函数签名和 callsite，比纯 matcher 删除复杂。 |
+| 维护成本 | 3 | 条件很窄，后续如果 prototype rewrite 有统一的函数参数收缩工具，可以把这里合进去。 |
+
+有没有更好的方案：
+
+- 更完整方案是从 call-site 栈语义恢复入手，恢复内部 helper 的真实参数和返回语义。
+- 当前先做死参数收缩，是因为这个样例的 `RSP - 16` 没有真实栈访问语义，只是死寄存器状态传播。保守删掉它，比新增一个假的栈语义节点更准确。

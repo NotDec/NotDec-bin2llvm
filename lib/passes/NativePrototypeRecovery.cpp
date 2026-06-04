@@ -3771,6 +3771,215 @@ void eraseDeadPreservedRegisterRestoreStores(llvm::Module &module,
   }
 }
 
+bool callsitePathReadsRegisterAfterCall(llvm::CallInst &call,
+                                        llvm::StringRef registerName) {
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(call.getContext(),
+                          ("name=" + registerName).str()),
+  };
+  llvm::MDNode *access = llvm::MDNode::get(call.getContext(), fields);
+  std::set<llvm::BasicBlock *> seen;
+  return !reachesReturnWithoutCallOrAccessLoad(
+      call.getNextNode(), *call.getParent(), *access, seen,
+      callMayReadRegisterName);
+}
+
+bool argumentOnlyFeedsDeadRegisterStore(llvm::Argument &argument,
+                                        llvm::StoreInst *&deadStore,
+                                        std::string &registerName) {
+  if (argument.use_empty() || !argument.hasOneUse()) {
+    return false;
+  }
+  auto *store = llvm::dyn_cast<llvm::StoreInst>(*argument.user_begin());
+  if (store == nullptr || store->getValueOperand() != &argument ||
+      store->isVolatile() || store->isAtomic()) {
+    return false;
+  }
+  llvm::MDNode *access = store->getMetadata("notdec.register.access");
+  if (access == nullptr) {
+    return false;
+  }
+  std::optional<std::string> name = metadataField(*access, "name");
+  if (!name || name->empty()) {
+    return false;
+  }
+  std::set<llvm::BasicBlock *> seen;
+  if (!reachesReturnWithoutCallOrAccessLoad(store->getNextNode(),
+                                            *store->getParent(), *access,
+                                            seen, callMayReadRegisterName)) {
+    return false;
+  }
+  deadStore = store;
+  registerName = *name;
+  return true;
+}
+
+std::optional<std::vector<llvm::CallInst *>>
+directInternalCallsites(llvm::Function &function) {
+  std::vector<llvm::CallInst *> calls;
+  for (llvm::User *user : function.users()) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+    if (call == nullptr || call->getCalledFunction() != &function ||
+        call->arg_size() != function.arg_size()) {
+      return std::nullopt;
+    }
+    calls.push_back(call);
+  }
+  return calls;
+}
+
+bool callsitesDoNotReadRegisterAfterCall(llvm::ArrayRef<llvm::CallInst *> calls,
+                                         llvm::StringRef registerName) {
+  for (llvm::CallInst *call : calls) {
+    if (callsitePathReadsRegisterAfterCall(*call, registerName)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool shrinkInternalFunctionArguments(llvm::Function &function,
+                                     llvm::ArrayRef<uint8_t> keep) {
+  if (keep.size() != function.arg_size() ||
+      llvm::all_of(keep, [](uint8_t value) { return value != 0; })) {
+    return false;
+  }
+  std::optional<NativeRecoveredPrototype> prototype =
+      readNativeRecoveredPrototypeMetadata(function);
+  if (!prototype || prototype->Inputs.size() != function.arg_size()) {
+    return false;
+  }
+  std::optional<std::vector<llvm::CallInst *>> calls =
+      directInternalCallsites(function);
+  if (!calls) {
+    return false;
+  }
+
+  std::vector<llvm::Type *> paramTypes;
+  std::vector<NativeRecoveredPrototypeParam> inputs;
+  for (uint64_t index = 0; index < keep.size(); ++index) {
+    if (keep[index] == 0) {
+      continue;
+    }
+    paramTypes.push_back(function.getFunctionType()->getParamType(index));
+    inputs.push_back(prototype->Inputs[index]);
+  }
+  auto *newType = llvm::FunctionType::get(function.getReturnType(), paramTypes,
+                                          function.isVarArg());
+  llvm::Module *module = function.getParent();
+  if (module == nullptr) {
+    return false;
+  }
+
+  std::string originalName = function.getName().str();
+  function.setName(originalName + ".old");
+  llvm::Function *rewritten =
+      llvm::Function::Create(newType, function.getLinkage(), originalName,
+                             module);
+  rewritten->copyAttributesFrom(&function);
+  rewritten->copyMetadata(&function, 0);
+  rewritten->setCallingConv(function.getCallingConv());
+  NativeRecoveredPrototype newPrototype = *prototype;
+  newPrototype.Inputs = std::move(inputs);
+  rewritten->setMetadata(
+      "notdec.prototype.recovered",
+      recoveredPrototypeMetadata(module->getContext(), newPrototype));
+  rewritten->setMetadata("notdec.register.external_inputs", nullptr);
+  rewritten->setMetadata("notdec.prototype.input_candidates", nullptr);
+  rewritten->setMetadata("notdec.prototype.return_candidates", nullptr);
+  rewritten->splice(rewritten->end(), &function);
+
+  auto newArg = rewritten->arg_begin();
+  for (uint64_t index = 0; index < keep.size(); ++index) {
+    llvm::Argument *oldArg = function.getArg(index);
+    if (keep[index] == 0) {
+      oldArg->replaceAllUsesWith(llvm::UndefValue::get(oldArg->getType()));
+      continue;
+    }
+    newArg->setName(oldArg->getName());
+    oldArg->replaceAllUsesWith(&*newArg);
+    ++newArg;
+  }
+
+  for (llvm::CallInst *call : *calls) {
+    llvm::IRBuilder<> builder(call);
+    std::vector<llvm::Value *> args;
+    std::vector<llvm::Value *> removedArgs;
+    for (uint64_t index = 0; index < keep.size(); ++index) {
+      if (keep[index] != 0) {
+        args.push_back(call->getArgOperand(index));
+      } else {
+        removedArgs.push_back(call->getArgOperand(index));
+      }
+    }
+    llvm::CallInst *newCall =
+        builder.CreateCall(rewritten->getFunctionType(), rewritten, args);
+    newCall->setCallingConv(call->getCallingConv());
+    if (!call->getType()->isVoidTy()) {
+      call->replaceAllUsesWith(newCall);
+    }
+    call->eraseFromParent();
+    // Removed helper arguments often carry dead stack pointer arithmetic, such
+    // as RSP.external_input - 16. Drop that chain immediately when it is unused.
+    for (llvm::Value *removedArg : removedArgs) {
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(removedArg);
+    }
+  }
+
+  function.eraseFromParent();
+  return true;
+}
+
+void eraseDeadInternalCallArgumentRegisterStores(llvm::Module &module) {
+  // Some internal helpers only forward register state through arguments and
+  // immediately store it into another register global. If nobody reads that
+  // register afterwards, shrink the helper instead of keeping dead RSP/RBP math.
+  std::vector<llvm::Function *> functions;
+  for (llvm::Function &function : module.functions()) {
+    functions.push_back(&function);
+  }
+  for (llvm::Function *function : functions) {
+    if (function->isDeclaration() || function->arg_empty()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(*function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+    std::optional<std::vector<llvm::CallInst *>> calls =
+        directInternalCallsites(*function);
+    if (!calls) {
+      continue;
+    }
+
+    std::vector<uint8_t> keep(function->arg_size(), 1);
+    std::vector<llvm::StoreInst *> deadStores;
+    for (llvm::Argument &argument : function->args()) {
+      llvm::StoreInst *deadStore = nullptr;
+      std::string registerName;
+      if (!argumentOnlyFeedsDeadRegisterStore(argument, deadStore,
+                                              registerName)) {
+        continue;
+      }
+      if (!callsitesDoNotReadRegisterAfterCall(*calls, registerName)) {
+        continue;
+      }
+      keep[argument.getArgNo()] = 0;
+      deadStores.push_back(deadStore);
+    }
+    if (llvm::all_of(keep, [](uint8_t value) { return value != 0; })) {
+      continue;
+    }
+    for (llvm::StoreInst *store : deadStores) {
+      if (store->getParent() != nullptr) {
+        store->eraseFromParent();
+      }
+    }
+    shrinkInternalFunctionArguments(*function, keep);
+  }
+}
+
 bool supportedCallerFrameAccessType(llvm::Type *type) {
   auto *integer = llvm::dyn_cast<llvm::IntegerType>(type);
   return integer != nullptr &&
@@ -5586,6 +5795,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseDeadStackFrameDerivedNonReturnStores(module, *abi);
     eraseDeadPreservedRegisterRestoreStores(module, *abi);
     rewriteCallerFrameAccesses(module, *abi);
+    eraseDeadInternalCallArgumentRegisterStores(module);
     eraseDeadNativeStackAllocas(module);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
     summary.SignatureRewriteFunctionsRewritten =

@@ -3657,6 +3657,23 @@ bool hasCallTo(const llvm::Function &function, llvm::StringRef calleeName) {
   return false;
 }
 
+llvm::CallInst *firstCallTo(llvm::Function &function,
+                            llvm::StringRef calleeName) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+      if (call == nullptr) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee != nullptr && callee->getName() == calleeName) {
+        return call;
+      }
+    }
+  }
+  return nullptr;
+}
+
 bool blockEndsWithUnreachable(const llvm::Function &function,
                               llvm::StringRef blockName) {
   for (const llvm::BasicBlock &block : function) {
@@ -9093,6 +9110,86 @@ int main() {
                "rewritten internal call kept old input store");
   if (llvm::verifyModule(rewrittenInternalInputStoreModule, &llvm::errs())) {
     std::cerr << "rewritten internal input store module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module deadInternalArgumentStoreModule(
+      "native-prototype-dead-internal-argument-store-test", context);
+  llvm::GlobalVariable *deadInternalArgumentRsp =
+      createRegisterGlobal(deadInternalArgumentStoreModule, "RSP");
+  llvm::GlobalVariable *deadInternalArgumentR8 =
+      createRegisterGlobal(deadInternalArgumentStoreModule, "R8");
+  attachTestAbi(deadInternalArgumentStoreModule);
+  auto *deadInternalArgumentCalleeType = llvm::FunctionType::get(
+      i64Param, llvm::ArrayRef<llvm::Type *>{i64Param, i64Param}, false);
+  llvm::Function *deadInternalArgumentCallee =
+      llvm::Function::Create(deadInternalArgumentCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "dead_internal_argument_callee",
+                             deadInternalArgumentStoreModule);
+  deadInternalArgumentCallee->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall",
+                                     {{"RDI", 0}, {"RSI", 1}}, {{"RAX", 0}}));
+  llvm::BasicBlock *deadInternalArgumentCalleeEntry =
+      llvm::BasicBlock::Create(context, "entry", deadInternalArgumentCallee);
+  {
+    llvm::IRBuilder<> builder(deadInternalArgumentCalleeEntry);
+    llvm::StoreInst *deadStore =
+        builder.CreateStore(deadInternalArgumentCallee->getArg(1),
+                            deadInternalArgumentR8);
+    deadStore->setMetadata("notdec.register.access",
+                           registerAccessMetadata(context, "R8"));
+    builder.CreateRet(deadInternalArgumentCallee->getArg(0));
+  }
+  auto *deadInternalArgumentCallerType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *deadInternalArgumentCaller =
+      llvm::Function::Create(deadInternalArgumentCallerType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "dead_internal_argument_caller",
+                             deadInternalArgumentStoreModule);
+  llvm::BasicBlock *deadInternalArgumentCallerEntry =
+      llvm::BasicBlock::Create(context, "entry", deadInternalArgumentCaller);
+  {
+    llvm::IRBuilder<> builder(deadInternalArgumentCallerEntry);
+    llvm::LoadInst *rspBase = builder.CreateLoad(
+        deadInternalArgumentRsp->getValueType(), deadInternalArgumentRsp,
+        "RSP.external_input");
+    rspBase->setMetadata("notdec.register.external_input",
+                         registerAccessMetadata(context, "RSP"));
+    llvm::Value *stackArgument = builder.CreateAdd(
+        rspBase,
+        llvm::ConstantInt::get(deadInternalArgumentRsp->getValueType(), -16,
+                               true));
+    std::vector<llvm::Value *> args = {
+        llvm::ConstantInt::get(i64Param, 0x1234), stackArgument};
+    builder.CreateCall(deadInternalArgumentCallee->getFunctionType(),
+                       deadInternalArgumentCallee, args);
+    builder.CreateRetVoid();
+  }
+  notdec::bin2llvm::runNativePrototypeRecovery(deadInternalArgumentStoreModule,
+                                               rewriteOptions);
+  deadInternalArgumentCallee =
+      deadInternalArgumentStoreModule.getFunction("dead_internal_argument_callee");
+  deadInternalArgumentCaller =
+      deadInternalArgumentStoreModule.getFunction("dead_internal_argument_caller");
+  ok &= expect(deadInternalArgumentCallee != nullptr &&
+                   functionTypeShape(*deadInternalArgumentCallee
+                                          ->getFunctionType(),
+                                     i64Param, llvm::ArrayRef(i64Param)),
+               "dead internal argument callee was not shrunk");
+  llvm::CallInst *deadInternalArgumentCall =
+      firstCallTo(*deadInternalArgumentCaller, "dead_internal_argument_callee");
+  ok &= expect(deadInternalArgumentCall != nullptr &&
+                   deadInternalArgumentCall->arg_size() == 1,
+               "dead internal argument callsite was not shrunk");
+  ok &= expect(!hasRegisterStore(*deadInternalArgumentCallee, "R8"),
+               "dead internal argument register store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*deadInternalArgumentCaller, "RSP"),
+               "dead internal argument kept dead RSP external input");
+  if (llvm::verifyModule(deadInternalArgumentStoreModule, &llvm::errs())) {
+    std::cerr << "dead internal argument store module verification failed\n";
     return EXIT_FAILURE;
   }
 
