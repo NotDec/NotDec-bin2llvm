@@ -2181,6 +2181,9 @@ bool callMayReadRegisterName(llvm::CallBase &call,
   if (callee->isIntrinsic()) {
     return false;
   }
+  if (callee->getName() == "notdec_stack_canary_check") {
+    return false;
+  }
   if (callee->isDeclaration()) {
     return !(registerName == "RSP" &&
              isKnownNoStackArgumentDeclaration(*callee));
@@ -3765,6 +3768,350 @@ void eraseDeadPreservedRegisterRestoreStores(llvm::Module &module,
   }
 }
 
+llvm::Function *getOrCreateStackCanaryCheckDeclaration(llvm::Module &module) {
+  llvm::Function *existing = module.getFunction("notdec_stack_canary_check");
+  if (existing != nullptr) {
+    return existing;
+  }
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(module.getContext()), {}, false);
+  return llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                                "notdec_stack_canary_check", module);
+}
+
+bool loadReadsRegisterExternalInput(llvm::LoadInst &load,
+                                    llvm::StringRef name) {
+  llvm::MDNode *access = load.getMetadata("notdec.register.external_input");
+  return access != nullptr && accessMatchesEffectRegister(*access, name);
+}
+
+bool pureInstructionOnlyFeedsBlock(llvm::Instruction &instruction,
+                                   const std::set<llvm::Instruction *> &blockSet) {
+  if (instruction.mayHaveSideEffects()) {
+    return false;
+  }
+  if (!llvm::isa<llvm::BinaryOperator>(&instruction) &&
+      !llvm::isa<llvm::CastInst>(&instruction) &&
+      !llvm::isa<llvm::GetElementPtrInst>(&instruction)) {
+    return false;
+  }
+  for (llvm::User *user : instruction.users()) {
+    auto *userInstruction = llvm::dyn_cast<llvm::Instruction>(user);
+    if (userInstruction == nullptr ||
+        blockSet.find(userInstruction) == blockSet.end()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool storeIsStackChkFailReturnAddress(llvm::StoreInst &store,
+                                      llvm::ArrayRef<llvm::Value *> stackValues) {
+  if (store.isVolatile() ||
+      store.getMetadata("notdec.register.access") != nullptr ||
+      !llvm::isa<llvm::ConstantInt>(store.getValueOperand())) {
+    return false;
+  }
+  auto *pointer =
+      llvm::dyn_cast<llvm::IntToPtrInst>(store.getPointerOperand());
+  if (pointer == nullptr) {
+    return false;
+  }
+  return llvm::is_contained(stackValues, pointer->getOperand(0));
+}
+
+bool blockOnlyCallsStackChkFail(llvm::BasicBlock &block,
+                                const NativeAbiSpec &abi) {
+  llvm::CallInst *failCall = nullptr;
+  std::set<llvm::Instruction *> beforeFail;
+  bool sawFailCall = false;
+  for (llvm::Instruction &instruction : block) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+    if (!sawFailCall) {
+      if (call == nullptr) {
+        beforeFail.insert(&instruction);
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee == nullptr || callee->getName() != "__stack_chk_fail") {
+        return false;
+      }
+      failCall = call;
+      sawFailCall = true;
+      continue;
+    }
+    if (llvm::isa<llvm::UnreachableInst>(&instruction) ||
+        llvm::isa<llvm::ReturnInst>(&instruction)) {
+      continue;
+    }
+    return false;
+  }
+  if (failCall == nullptr) {
+    return false;
+  }
+
+  std::vector<llvm::Value *> stackValues;
+  for (llvm::Instruction *instruction : beforeFail) {
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(instruction)) {
+      if (load->isVolatile() ||
+          !loadReadsRegisterExternalInput(*load, abi.StackPointerRegister)) {
+        return false;
+      }
+      continue;
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(instruction)) {
+      if (store->isVolatile()) {
+        return false;
+      }
+      if (registerAccessMatchesName(*store, "notdec.register.access",
+                                    abi.StackPointerRegister)) {
+        stackValues.push_back(store->getValueOperand());
+        continue;
+      }
+      if (storeIsStackChkFailReturnAddress(*store, stackValues)) {
+        continue;
+      }
+      return false;
+    }
+    if (!pureInstructionOnlyFeedsBlock(*instruction, beforeFail)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<bool> conditionTrueMeansCanaryEqual(llvm::Value *condition,
+                                                  llvm::ICmpInst **equalCmp) {
+  auto *cmp = llvm::dyn_cast_or_null<llvm::ICmpInst>(condition);
+  if (cmp == nullptr) {
+    return std::nullopt;
+  }
+
+  if (cmp->getPredicate() != llvm::ICmpInst::ICMP_NE &&
+      cmp->getPredicate() != llvm::ICmpInst::ICMP_EQ) {
+    return std::nullopt;
+  }
+
+  llvm::Value *maybeZext = nullptr;
+  llvm::Value *maybeZero = nullptr;
+  if (llvm::isa<llvm::ConstantInt>(cmp->getOperand(0))) {
+    maybeZero = cmp->getOperand(0);
+    maybeZext = cmp->getOperand(1);
+  } else if (llvm::isa<llvm::ConstantInt>(cmp->getOperand(1))) {
+    maybeZero = cmp->getOperand(1);
+    maybeZext = cmp->getOperand(0);
+  }
+  auto *zero = llvm::dyn_cast_or_null<llvm::ConstantInt>(maybeZero);
+  auto *zext = llvm::dyn_cast_or_null<llvm::ZExtInst>(maybeZext);
+  if (zero != nullptr && zero->isZero() && zext != nullptr) {
+    auto *inner = llvm::dyn_cast<llvm::ICmpInst>(zext->getOperand(0));
+    if (inner == nullptr || inner->getPredicate() != llvm::ICmpInst::ICMP_EQ) {
+      return std::nullopt;
+    }
+    *equalCmp = inner;
+    return cmp->getPredicate() == llvm::ICmpInst::ICMP_NE;
+  }
+
+  *equalCmp = cmp;
+  return cmp->getPredicate() == llvm::ICmpInst::ICMP_EQ;
+}
+
+std::optional<int64_t> loadOffsetFromExternalRegister(
+    llvm::LoadInst &load, llvm::Function &function, llvm::StringRef name) {
+  llvm::LoadInst *base = externalInputLoadForRegister(function, name);
+  if (base == nullptr) {
+    return std::nullopt;
+  }
+  return rawStackInputOffset(load, *base);
+}
+
+bool loadIsFrameCanarySlot(llvm::LoadInst &load, const NativeAbiSpec &abi) {
+  llvm::Function *function = load.getFunction();
+  if (function == nullptr) {
+    return false;
+  }
+  for (llvm::BasicBlock &block : *function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *base = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (base == nullptr) {
+        continue;
+      }
+      llvm::MDNode *metadata =
+          base->getMetadata("notdec.register.external_input");
+      std::optional<std::string> name =
+          metadata == nullptr ? std::nullopt : metadataField(*metadata, "name");
+      if (!name || !isFramePointerRegisterName(*name)) {
+        continue;
+      }
+      std::optional<int64_t> offset =
+          rawStackInputOffset(load, *base);
+      if (offset && *offset < 0) {
+        return true;
+      }
+    }
+  }
+  for (const std::string &name : stackFrameRegisterNames(abi)) {
+    if (name == abi.StackPointerRegister || !isFramePointerRegisterName(name)) {
+      continue;
+    }
+    std::optional<int64_t> offset =
+        loadOffsetFromExternalRegister(load, *function, name);
+    if (offset && *offset < 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool loadReadsRegisterAccess(llvm::LoadInst &load, llvm::StringRef name) {
+  llvm::MDNode *access = load.getMetadata("notdec.register.access");
+  return access != nullptr && accessMatchesEffectRegister(*access, name);
+}
+
+bool loadIsFsCanary(llvm::LoadInst &load) {
+  llvm::Function *function = load.getFunction();
+  if (function == nullptr) {
+    return false;
+  }
+  for (llvm::BasicBlock &block : *function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *base = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (base == nullptr || !loadReadsRegisterAccess(*base, "FS_OFFSET")) {
+        continue;
+      }
+      std::set<llvm::Value *> seen;
+      std::optional<int64_t> offset =
+          rawStackInputOffset(load, *base);
+      if (offset && *offset == 40) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool canReplaceCanaryLoadUses(llvm::LoadInst &frameLoad,
+                              llvm::LoadInst &fsLoad,
+                              llvm::ICmpInst &equalCmp,
+                              std::set<llvm::Instruction *> &diffs) {
+  for (llvm::LoadInst *load : {&frameLoad, &fsLoad}) {
+    for (llvm::User *user : load->users()) {
+      if (user == &equalCmp) {
+        continue;
+      }
+      auto *diff = llvm::dyn_cast<llvm::BinaryOperator>(user);
+      if (diff == nullptr || diff->getOpcode() != llvm::Instruction::Sub ||
+          diff->getOperand(0) != &frameLoad || diff->getOperand(1) != &fsLoad) {
+        return false;
+      }
+      diffs.insert(diff);
+    }
+  }
+  return true;
+}
+
+void eraseDeadLoadAndPointer(llvm::LoadInst &load) {
+  if (!load.use_empty()) {
+    return;
+  }
+  llvm::Value *pointer = load.getPointerOperand();
+  load.eraseFromParent();
+  llvm::RecursivelyDeleteTriviallyDeadInstructions(pointer);
+}
+
+bool eraseStackCanaryCheck(llvm::BranchInst &branch, const NativeAbiSpec &abi) {
+  if (!branch.isConditional()) {
+    return false;
+  }
+
+  llvm::ICmpInst *equalCmp = nullptr;
+  std::optional<bool> trueMeansEqual =
+      conditionTrueMeansCanaryEqual(branch.getCondition(), &equalCmp);
+  if (!trueMeansEqual || equalCmp == nullptr) {
+    return false;
+  }
+
+  llvm::BasicBlock *success =
+      *trueMeansEqual ? branch.getSuccessor(0) : branch.getSuccessor(1);
+  llvm::BasicBlock *fail =
+      *trueMeansEqual ? branch.getSuccessor(1) : branch.getSuccessor(0);
+  if (success == fail || !blockOnlyCallsStackChkFail(*fail, abi)) {
+    return false;
+  }
+
+  auto *first = llvm::dyn_cast<llvm::LoadInst>(equalCmp->getOperand(0));
+  auto *second = llvm::dyn_cast<llvm::LoadInst>(equalCmp->getOperand(1));
+  if (first == nullptr || second == nullptr) {
+    return false;
+  }
+  llvm::LoadInst *frameLoad = nullptr;
+  llvm::LoadInst *fsLoad = nullptr;
+  if (loadIsFrameCanarySlot(*first, abi) && loadIsFsCanary(*second)) {
+    frameLoad = first;
+    fsLoad = second;
+  } else if (loadIsFrameCanarySlot(*second, abi) && loadIsFsCanary(*first)) {
+    frameLoad = second;
+    fsLoad = first;
+  } else {
+    return false;
+  }
+
+  std::set<llvm::Instruction *> diffs;
+  if (!canReplaceCanaryLoadUses(*frameLoad, *fsLoad, *equalCmp, diffs)) {
+    return false;
+  }
+
+  llvm::Function *function = branch.getFunction();
+  llvm::Module *module = function == nullptr ? nullptr : function->getParent();
+  if (module == nullptr) {
+    return false;
+  }
+
+  llvm::IRBuilder<> builder(&branch);
+  builder.CreateCall(getOrCreateStackCanaryCheckDeclaration(*module));
+
+  llvm::Value *zero = llvm::ConstantInt::get(frameLoad->getType(), 0);
+  for (llvm::Instruction *diff : diffs) {
+    diff->replaceAllUsesWith(zero);
+  }
+
+  llvm::Value *oldCondition = branch.getCondition();
+  builder.SetInsertPoint(&branch);
+  builder.CreateBr(success);
+  branch.eraseFromParent();
+  for (llvm::Instruction *diff : diffs) {
+    llvm::RecursivelyDeleteTriviallyDeadInstructions(diff);
+  }
+  eraseDeadLoadAndPointer(*frameLoad);
+  eraseDeadLoadAndPointer(*fsLoad);
+  llvm::RecursivelyDeleteTriviallyDeadInstructions(oldCondition);
+  llvm::removeUnreachableBlocks(*function);
+  return true;
+}
+
+void eraseStackCanaryChecks(llvm::Module &module, const NativeAbiSpec &abi) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (llvm::Function &function : module) {
+      if (function.isDeclaration()) {
+        continue;
+      }
+      for (llvm::BasicBlock &block : llvm::make_early_inc_range(function)) {
+        auto *branch = llvm::dyn_cast_or_null<llvm::BranchInst>(
+            block.getTerminator());
+        if (branch != nullptr && eraseStackCanaryCheck(*branch, abi)) {
+          changed = true;
+          break;
+        }
+      }
+      if (changed) {
+        break;
+      }
+    }
+  }
+}
+
 struct ReturnLoadSearchResult {
   llvm::LoadInst *Load = nullptr;
   llvm::BasicBlock *SharedSuccessor = nullptr;
@@ -4924,6 +5271,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
   }
 
   NativePrototypeModel model(*abi);
+  truncateKnownNoReturnDeclarationCalls(module);
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;
@@ -5064,6 +5412,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
   }
 
   if (options.RewriteSignatures) {
+    eraseStackCanaryChecks(module, *abi);
     NativePrototypeModuleRewriteSummary rewriteSummary =
         rewriteNativeRecoveredPrototypes(module);
     truncateKnownNoReturnDeclarationCalls(module);

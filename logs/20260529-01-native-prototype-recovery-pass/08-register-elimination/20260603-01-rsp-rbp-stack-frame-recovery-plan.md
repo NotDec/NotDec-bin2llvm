@@ -2614,3 +2614,119 @@ other load external_input full/full  2
 
 - 更完整的方案是先恢复 call frame：return address、caller stack arg、callee-saved restore、dynamic stack 都有明确分类，再统一把 stack input 暴露成参数。
 - 当前先做首槽，是因为它能解决已观察到的 4 个 shared library RSP 残留，同时用 preserved restore 过滤避免误改 ABI cleanup。
+
+# 2026-06-04 实现：stack canary raw RBP load 语义化
+
+背景：
+
+- raw caller-stack 首槽恢复后，两个 Bench2 shared library 里还剩 44 个 `RBP stack_canary`。
+- 这些不是本地变量 alloca，也不是普通 raw load。典型形态是 `RBP - const` 读取保存的 canary，和 `FS_OFFSET + 40` 当前 canary 比较；失败路径调用 `__stack_chk_fail`。
+- 一些函数 chunk 里，`__stack_chk_fail` 前后还混有 call-frame setup 或错误 fallthrough 代码。必须先按 no-return 清掉不可达后继，再匹配 canary。
+
+改动：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2184)
+  - `callMayReadRegisterName()` 把 `notdec_stack_canary_check` 当成不读取 `RSP/RBP` 的语义调用，避免后续 dead-store 判断被它挡住。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3771)
+  - 新增 `getOrCreateStackCanaryCheckDeclaration()`，用 `notdec_stack_canary_check()` 表达已经识别出的 stack protector 检查。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3782)
+  - 新增 `loadReadsRegisterExternalInput()`、`pureInstructionOnlyFeedsBlock()`、`storeIsStackChkFailReturnAddress()`、`blockOnlyCallsStackChkFail()`。
+  - fail block 只接受 `__stack_chk_fail`，以及它前面的 `RSP` call-frame store、return-address store 和本块内纯地址计算。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3883)
+  - 新增 canary compare 识别：支持 `icmp eq` 和 `zext i1 -> i8 -> icmp eq 0` 这种 lowered 条件。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3928)
+  - 新增 `loadIsFrameCanarySlot()` 和 `loadIsFsCanary()`。
+  - frame canary 只接受 frame pointer 负 offset；当前 canary 只接受 `FS_OFFSET + 40`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3993)
+  - 新增 `canReplaceCanaryLoadUses()`，只允许 canary load 除 compare 外还被 `saved - current` 差值使用。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:4022)
+  - 新增 `eraseStackCanaryCheck()` / `eraseStackCanaryChecks()`。
+  - 成功匹配后插入 `notdec_stack_canary_check()`，把 canary 差值替成 0，删除旧 branch、fail block、raw frame load、FS load 和死 pointer 链。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:5274)
+  - 在 prototype candidate 收集前先跑 `truncateKnownNoReturnDeclarationCalls()`，避免 `__stack_chk_fail` 后的错误 fallthrough 污染返回值候选。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:5415)
+  - 在 signature rewrite 后置 cleanup 开始处调用 `eraseStackCanaryChecks()`；后面保留一次 no-return truncate，清理后续 rewrite 暴露出的 no-return fallthrough。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2313)
+  - 新增 `createStackCanaryCheckFunction()`，覆盖 `RBP - const` saved canary、`FS_OFFSET + 40` current canary、fail 前 call-frame setup、fail 后错误 fallthrough。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:3619)
+  - 新增 `hasCallTo()` 测试辅助。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:9359)
+  - 在 raw RSP/RBP cleanup 测试里加入 canary case，要求旧 `__stack_chk_fail`、`RBP.external_input`、`inttoptr`、`store @RAX` 都被清掉，并保留 `notdec_stack_canary_check()`。
+
+验证：
+
+```bash
+git diff --check
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-stack-canary-noreturn-prepass-gate \
+  --target php:extension-calendar \
+  --target php:extension-sockets
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-stack-canary-noreturn-prepass-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-stack-canary-noreturn-prepass-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-bin2llvm-stack-canary-noreturn-prepass-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- `native_register_residue_audit_test.py` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 两个 Bench2 shared library 都通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `php:extension-calendar` | 12s | 11s |
+| `php:extension-sockets` | 39s | 40s |
+
+residue 对比：
+
+```text
+before:
+gpr load  external_input  full/full  75
+gpr store access          full/full  296
+other load access         full/full  44
+other load external_input full/full  2
+
+after:
+gpr load  external_input  full/full  33
+gpr store access          full/full  291
+other load external_input full/full  2
+```
+
+剩余 `RSP/RBP` 分类：
+
+```text
+3 RBP caller_frame
+1 RSP call_frame_state
+```
+
+判断：
+
+- `RBP stack_canary` 从 44 降到 0。
+- 生成了 37 个 `notdec_stack_canary_check()` 调用，旧 canary raw load / FS load / `__stack_chk_fail` fail path 在匹配函数里被语义化。
+- `other load access` 从 44 降到 0，说明 `FS_OFFSET + 40` canary load 也一起清掉。
+- 剩余 `RSP/RBP` 不是 canary，而是 caller frame / call frame state，下一步应继续做函数边界和 call-frame 语义，不应按 canary 规则扩大删除。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 5 | shared gate 上 canary 类 RBP 残留清零，且 `FS_OFFSET` canary load 同步消失。 |
+| 理解成本 | 3 | matcher 较多，但每个条件都围绕 canary 固定形态，风险集中。 |
+| 维护成本 | 3 | 后续如果引入正式 stack protector 语义节点，可把 `notdec_stack_canary_check()` 替换成更标准的内部 intrinsic。 |
+
+有没有更好的方案：
+
+- 更完整方案是先修函数 chunk 边界，让 `__stack_chk_fail` 后的错误 fallthrough 不进入函数体。
+- 当前先做 no-return prepass 加 canary 语义化，是因为它能直接处理真实 shared library 的 canary residue，并且不会把 caller-frame 或 call-frame-state 当成普通栈槽删掉。

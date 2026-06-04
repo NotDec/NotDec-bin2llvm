@@ -2310,6 +2310,90 @@ llvm::Function *createNoReturnFallthroughFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createStackCanaryCheckFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::GlobalVariable *rbp, llvm::GlobalVariable *fsOffset,
+    llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::Function *fail = module.getFunction("__stack_chk_fail");
+  if (fail == nullptr) {
+    auto *failType =
+        llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+    fail = llvm::Function::Create(failType, llvm::GlobalValue::ExternalLinkage,
+                                  "__stack_chk_fail", module);
+  }
+
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *okBlock = llvm::BasicBlock::Create(context, "ok", function);
+  llvm::BasicBlock *failBlock =
+      llvm::BasicBlock::Create(context, "fail", function);
+  llvm::IRBuilder<> builder(entry);
+
+  // This is the common stack protector epilogue shape in chunked functions:
+  // read saved canary from the caller frame, compare it with FS:0x28, then call
+  // __stack_chk_fail on mismatch.
+  llvm::LoadInst *frameBase =
+      builder.CreateLoad(rbp->getValueType(), rbp, "RBP.external_input");
+  frameBase->setMetadata("notdec.register.external_input",
+                         registerAccessMetadata(context, "RBP"));
+  llvm::LoadInst *stackBase =
+      builder.CreateLoad(rsp->getValueType(), rsp, "RSP.external_input");
+  stackBase->setMetadata("notdec.register.external_input",
+                         registerAccessMetadata(context, "RSP"));
+  llvm::Value *frameAddress = builder.CreateAdd(
+      frameBase, llvm::ConstantInt::get(rbp->getValueType(), -24, true));
+  llvm::Value *framePointer =
+      builder.CreateIntToPtr(frameAddress, llvm::PointerType::getUnqual(context));
+  llvm::LoadInst *savedCanary =
+      builder.CreateLoad(rbp->getValueType(), framePointer, "saved_canary");
+
+  llvm::LoadInst *fsBase =
+      builder.CreateLoad(fsOffset->getValueType(), fsOffset, "FS_OFFSET");
+  fsBase->setMetadata("notdec.register.access",
+                      registerAccessMetadata(context, "FS_OFFSET"));
+  llvm::Value *fsAddress = builder.CreateAdd(
+      fsBase, llvm::ConstantInt::get(fsOffset->getValueType(), 40, true));
+  llvm::Value *fsPointer =
+      builder.CreateIntToPtr(fsAddress, llvm::PointerType::getUnqual(context));
+  llvm::LoadInst *currentCanary =
+      builder.CreateLoad(fsOffset->getValueType(), fsPointer, "current_canary");
+
+  llvm::Value *diff = builder.CreateSub(savedCanary, currentCanary);
+  llvm::StoreInst *returnStore = builder.CreateStore(diff, rax);
+  returnStore->setMetadata("notdec.register.access",
+                           registerAccessMetadata(context, "RAX"));
+  llvm::Value *equal = builder.CreateICmpEQ(savedCanary, currentCanary);
+  llvm::Value *equalByte = builder.CreateZExt(equal, llvm::Type::getInt8Ty(context));
+  llvm::Value *notEqual = builder.CreateICmpEQ(
+      equalByte, llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0));
+  builder.CreateCondBr(notEqual, failBlock, okBlock);
+
+  builder.SetInsertPoint(okBlock);
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(failBlock);
+  llvm::Value *nextStack = builder.CreateAdd(
+      stackBase, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::StoreInst *stackStore = builder.CreateStore(nextStack, rsp);
+  stackStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, "RSP"));
+  llvm::Value *returnAddressPointer =
+      builder.CreateIntToPtr(nextStack, llvm::PointerType::getUnqual(context));
+  builder.CreateStore(llvm::ConstantInt::get(rsp->getValueType(), 15056),
+                      returnAddressPointer);
+  builder.CreateCall(fail->getFunctionType(), fail, {});
+  llvm::StoreInst *deadAfterFail = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 1), rax);
+  deadAfterFail->setMetadata("notdec.register.access",
+                             registerAccessMetadata(context, "RAX"));
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createStoredRbpRawLoadFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
     llvm::GlobalVariable *rbp) {
@@ -3525,6 +3609,22 @@ bool hasAllocaNamed(const llvm::Function &function, llvm::StringRef prefix) {
       auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
       if (alloca != nullptr && alloca->hasName() &&
           alloca->getName().starts_with(prefix)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool hasCallTo(const llvm::Function &function, llvm::StringRef calleeName) {
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &instruction : block) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+      if (call == nullptr) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee != nullptr && callee->getName() == calleeName) {
         return true;
       }
     }
@@ -9223,6 +9323,9 @@ int main() {
   llvm::Module rawRspLoadModule("native-prototype-raw-rsp-load-test", context);
   llvm::GlobalVariable *rawRsp = createRegisterGlobal(rawRspLoadModule, "RSP");
   llvm::GlobalVariable *rawRbp = createRegisterGlobal(rawRspLoadModule, "RBP");
+  llvm::GlobalVariable *rawRax = createRegisterGlobal(rawRspLoadModule, "RAX");
+  llvm::GlobalVariable *rawFsOffset =
+      createRegisterGlobal(rawRspLoadModule, "FS_OFFSET");
   attachStackFramePreservedTestAbi(rawRspLoadModule);
   llvm::Function *unusedRawRspLoad =
       createRawRspLoadFunction(rawRspLoadModule, "unused_raw_rsp_load", rawRsp,
@@ -9252,8 +9355,12 @@ int main() {
   llvm::Function *noReturnFallthrough =
       createNoReturnFallthroughFunction(rawRspLoadModule,
                                         "noreturn_fallthrough");
+  llvm::Function *stackCanaryCheck =
+      createStackCanaryCheckFunction(rawRspLoadModule, "stack_canary_check",
+                                     rawRsp, rawRbp, rawFsOffset, rawRax);
   notdec::bin2llvm::runNativePrototypeRecovery(rawRspLoadModule,
                                                rewriteOptions);
+  stackCanaryCheck = rawRspLoadModule.getFunction("stack_canary_check");
   ok &= expect(!hasIntToPtr(*unusedRawRspLoad),
                "unused raw RSP load kept old inttoptr");
   ok &= expect(!hasRegisterExternalInputLoad(*unusedRawRspLoad, "RSP"),
@@ -9299,6 +9406,16 @@ int main() {
   ok &= expect(!phiHasIncomingFromBlock(*noReturnFallthrough, "merged_value",
                                         "fail"),
                "known noreturn call kept dead successor PHI incoming");
+  ok &= expect(hasCallTo(*stackCanaryCheck, "notdec_stack_canary_check"),
+               "stack canary check was not preserved as semantic call");
+  ok &= expect(!hasCallTo(*stackCanaryCheck, "__stack_chk_fail"),
+               "stack canary check kept old fail call");
+  ok &= expect(!hasRegisterExternalInputLoad(*stackCanaryCheck, "RBP"),
+               "stack canary check kept dead RBP external input");
+  ok &= expect(!hasIntToPtr(*stackCanaryCheck),
+               "stack canary check kept old raw memory pointer");
+  ok &= expect(!hasRegisterStore(*stackCanaryCheck, "RAX"),
+               "stack canary check kept old return register store");
   if (llvm::verifyModule(rawRspLoadModule, &llvm::errs())) {
     std::cerr << "raw RSP load module verification failed after "
                  "prototype rewrite\n";
