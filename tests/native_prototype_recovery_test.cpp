@@ -231,7 +231,7 @@ void attachStackFramePreservedTestAbi(llvm::Module &module) {
   abi.StackPointerSpace = "register";
   abi.Outputs.push_back(inputRegister("RAX"));
 
-  for (llvm::StringRef registerName : {"RSP", "RBP"}) {
+  for (llvm::StringRef registerName : {"RSP", "RBP", "RBX"}) {
     notdec::bin2llvm::NativeAbiEffect unaffected;
     unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
     unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
@@ -1928,6 +1928,45 @@ llvm::Function *createPreservedStackFrameStoreFunction(
     (void)builder.CreateAdd(load,
                             llvm::ConstantInt::get(global->getValueType(), 1));
   }
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createSavedRegisterRestoreFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *stack,
+    const std::string &stackRegisterName, llvm::GlobalVariable *saved,
+    const std::string &savedRegisterName, int64_t offset,
+    bool loadAfterStore) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  // This is the epilogue shape left by lifting callee-saved register restore:
+  // load the saved value from the native stack and write it back to the
+  // preserved register just before returning.
+  llvm::LoadInst *base =
+      createExternalInputLoad(builder, stack, stackRegisterName);
+  llvm::Value *address = builder.CreateAdd(
+      base, llvm::ConstantInt::get(stack->getValueType(), offset, true));
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, llvm::PointerType::getUnqual(context));
+  llvm::LoadInst *restoreValue =
+      builder.CreateLoad(saved->getValueType(), pointer, "saved_restore");
+  llvm::StoreInst *restore = builder.CreateStore(restoreValue, saved);
+  llvm::MDNode *access = registerAccessMetadata(context, savedRegisterName);
+  restore->setMetadata("notdec.register.access", access);
+
+  if (loadAfterStore) {
+    llvm::LoadInst *load = builder.CreateLoad(saved->getValueType(), saved);
+    load->setMetadata("notdec.register.access", access);
+    (void)builder.CreateAdd(load,
+                            llvm::ConstantInt::get(saved->getValueType(), 1));
+  }
+
   builder.CreateRetVoid();
   return function;
 }
@@ -8870,6 +8909,8 @@ int main() {
       createRegisterGlobal(stackFramePreservedModule, "RSP");
   llvm::GlobalVariable *preservedRbp =
       createRegisterGlobal(stackFramePreservedModule, "RBP");
+  llvm::GlobalVariable *preservedRbx =
+      createRegisterGlobal(stackFramePreservedModule, "RBX");
   llvm::GlobalVariable *preservedRax =
       createRegisterGlobal(stackFramePreservedModule, "RAX");
   llvm::GlobalVariable *preservedRdx =
@@ -8898,6 +8939,21 @@ int main() {
                                             preservedRsp, "RSP", preservedRdx,
                                             "RDX");
   attachExternalInputs(*stackDerivedRdxStore, {{"RSP", preservedRsp}});
+  llvm::Function *deadSavedRbxRestore =
+      createSavedRegisterRestoreFunction(
+          stackFramePreservedModule, "dead_saved_rbx_restore", preservedRsp,
+          "RSP", preservedRbx, "RBX", 16, false);
+  attachExternalInputs(*deadSavedRbxRestore, {{"RSP", preservedRsp}});
+  llvm::Function *deadLocalSavedRbxRestore =
+      createSavedRegisterRestoreFunction(
+          stackFramePreservedModule, "dead_local_saved_rbx_restore",
+          preservedRsp, "RSP", preservedRbx, "RBX", -16, false);
+  attachExternalInputs(*deadLocalSavedRbxRestore, {{"RSP", preservedRsp}});
+  llvm::Function *liveSavedRbxRestore =
+      createSavedRegisterRestoreFunction(
+          stackFramePreservedModule, "live_saved_rbx_restore", preservedRsp,
+          "RSP", preservedRbx, "RBX", 24, true);
+  attachExternalInputs(*liveSavedRbxRestore, {{"RSP", preservedRsp}});
   attachRegisterEffectMetadata(*deadRspRestore, "notdec.register.preserves",
                                preservedRsp, "RSP");
   attachRegisterEffectMetadata(*deadRbpRestore, "notdec.register.preserves",
@@ -8925,6 +8981,19 @@ int main() {
                "dead stack-derived RDX store was not removed");
   ok &= expect(!hasRegisterExternalInputLoad(*stackDerivedRdxStore, "RSP"),
                "dead stack-derived RDX store kept dead RSP external input");
+  ok &= expect(!hasRegisterStore(*deadSavedRbxRestore, "RBX"),
+               "dead saved RBX restore store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*deadSavedRbxRestore, "RSP"),
+               "dead saved RBX restore kept dead RSP external input");
+  ok &= expect(!hasRegisterStore(*deadLocalSavedRbxRestore, "RBX"),
+               "dead local-stack saved RBX restore store was not removed");
+  ok &= expect(!hasAllocaNamed(*deadLocalSavedRbxRestore,
+                               "notdec_stack.native"),
+               "dead local-stack saved RBX restore kept native stack alloca");
+  ok &= expect(hasRegisterStore(*liveSavedRbxRestore, "RBX"),
+               "live saved RBX restore store was removed");
+  ok &= expect(hasRegisterLoad(*liveSavedRbxRestore, "RBX"),
+               "live saved RBX restore load was removed");
   if (llvm::verifyModule(stackFramePreservedModule, &llvm::errs())) {
     std::cerr << "stack/frame preserved cleanup module verification failed "
                  "after prototype rewrite\n";

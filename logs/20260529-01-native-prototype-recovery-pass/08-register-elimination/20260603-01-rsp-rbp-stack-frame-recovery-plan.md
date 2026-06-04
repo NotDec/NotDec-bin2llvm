@@ -2376,3 +2376,117 @@ RSP/RBP 分类：
 
 - 最终应该在 call-site stack semantic 恢复时直接删除/替换这些旧 RSP 状态 store，而不是靠后置 cleanup 多跑一轮。
 - 这次先放在 prototype recovery cleanup，是因为收益明确、规则保守，并且能直接消掉 Bench2 shared library gate 的最后 RSP/RBP store。
+
+# 2026-06-04 实现：saved-register restore 清理
+
+背景：
+
+- 上一轮后，shared library gate 里 `RSP/RBP` store 已清零，但还有一批 `RSP/RBP.external_input`。
+- 其中大头是 saved-register restore：从 caller/native stack 读出保存的 `RBX/R12-R15`，返回前写回 preserved register。
+- 这类访问不是业务 raw load/store。能证明返回后没人读该 restored value 时，可以按 ABI preserve 噪声清理；但不能碰 stack arg、return address、canary。
+
+实现：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2741)
+  - 新增 `preservedNonStackFrameRegisterNames()`。
+  - 只选择 ABI `Unaffected` 里的普通 preserved register，排除 `RSP/RBP` 这类 stack/frame register。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3555)
+  - 新增 `valueIsNativeStackAllocaPointer()`。
+  - 识别已经由静态栈槽改写产生的 `notdec_stack.native` load。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3570)
+  - 新增 `valueIsSavedRegisterRestoreLoad()`。
+  - 只接受两种来源：raw `RSP/RBP` 派生 `inttoptr` load，或 `notdec_stack.native` load。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3585)
+  - 新增 `eraseDeadPreservedRegisterRestoreStores()`。
+  - 条件：store 目标是 preserved 非 stack/frame register；store value 是 saved-register restore load；不是 recovered return；沿所有 return path 没有同寄存器读/call 读取。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:4955)
+  - 在 signature rewrite 后置 cleanup 中调用 saved-register restore 清理。
+  - 清理后再跑一次 `eraseDeadNativeStackAllocas()`，删除因 restore store 被删而空掉的 `notdec_stack.native`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:234)
+  - 测试 ABI 增加 `RBX` preserved。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:1935)
+  - 新增 `createSavedRegisterRestoreFunction()`，构造 raw stack load 后写回 preserved register 的 epilogue 形态。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8942)
+  - 增加 saved RBX restore 正反例：
+    - raw `RSP + positive offset` restore 可删。
+    - `RSP + negative offset` 先转 `notdec_stack.native` 后仍可删，并清掉 alloca。
+    - store 后又读 `RBX` 的 live restore 必须保留。
+
+验证：
+
+```bash
+git diff --check
+python3 tests/native_register_residue_audit_test.py
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-saved-restore-gate \
+  --target php:extension-calendar \
+  --target php:extension-sockets
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-saved-restore-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-saved-restore-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-saved-restore-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 两个 shared library 都通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `php:extension-calendar` | 11s | 11s |
+| `php:extension-sockets` | 39s | 40s |
+
+residue 对比：
+
+```text
+before:
+gpr load  external_input  full/full  107
+gpr store access          full/full  449
+other load access         full/full  44
+other load external_input full/full  2
+
+after:
+gpr load  external_input  full/full  79
+gpr store access          full/full  296
+other load access         full/full  44
+other load external_input full/full  2
+```
+
+剩余 `RSP/RBP` external input 分类：
+
+```text
+44 RBP entry_external_input stack_canary
+4  RSP entry_external_input caller_stack,call_frame_state
+2  RBP entry_external_input caller_frame
+2  RSP entry_external_input call_frame_state
+```
+
+判断：
+
+- saved-register restore 大头已清掉，`RSP/RBP.external_input` 不再主要卡在 callee-saved restore。
+- 剩余 RSP/RBP 主要是 canary、caller frame、caller stack 和 call frame state。
+- 这些不能继续按 raw load/store 删除；下一步要做 canary 分类保留、caller-stack/return-address/call-frame 语义恢复。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | shared gate 的 GPR external input 和 GPR store 都明显下降，且时间没有退化。 |
+| 理解成本 | 3 | 多了一个 preserved-register restore 专用规则，但条件集中，和已有 dead-store 活性判断复用。 |
+| 维护成本 | 3 | 后续如果引入正式 stack object / call-frame 模型，这条后置 cleanup 应迁到语义恢复阶段。 |
+
+有没有更好的方案：
+
+- 更完整的做法是先把 saved-register save/restore 建成明确 ABI preserve 事件，再由寄存器状态模型统一消掉。
+- 当前先做窄 cleanup，是因为它只处理返回路径上从栈 load 回 preserved register 的明确形态，能避开 canary、stack arg、return address。

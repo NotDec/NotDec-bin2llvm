@@ -2738,6 +2738,22 @@ std::set<std::string> stackFrameRegisterNames(const NativeAbiSpec &abi) {
   return names;
 }
 
+std::set<std::string> preservedNonStackFrameRegisterNames(
+    const NativeAbiSpec &abi) {
+  std::set<std::string> stackFrameNames = stackFrameRegisterNames(abi);
+  std::set<std::string> names;
+  for (const NativeAbiEffect &effect : abi.Effects) {
+    if (effect.Kind != NativeAbiEffectKind::Unaffected ||
+        effect.Storage.Kind != NativeAbiStorageKind::Register ||
+        effect.Storage.Name.empty() ||
+        stackFrameNames.count(effect.Storage.Name) != 0) {
+      continue;
+    }
+    names.insert(effect.Storage.Name);
+  }
+  return names;
+}
+
 llvm::LoadInst *externalInputLoadForRegister(llvm::Function &function,
                                              llvm::StringRef registerName) {
   llvm::LoadInst *result = nullptr;
@@ -3525,6 +3541,87 @@ void eraseDeadStackFrameDerivedNonReturnStores(llvm::Module &module,
           continue;
         }
         deadStores.push_back(store);
+      }
+    }
+
+    for (llvm::StoreInst *store : deadStores) {
+      llvm::Value *storedValue = store->getValueOperand();
+      store->eraseFromParent();
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
+    }
+  }
+}
+
+bool valueIsNativeStackAllocaPointer(llvm::Value &value, unsigned depth = 0) {
+  if (depth >= 8) {
+    return false;
+  }
+  llvm::Value *stripped = value.stripPointerCasts();
+  auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(stripped);
+  if (alloca != nullptr) {
+    return alloca->hasName() &&
+           alloca->getName().starts_with("notdec_stack.native");
+  }
+  auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(stripped);
+  return gep != nullptr &&
+         valueIsNativeStackAllocaPointer(*gep->getPointerOperand(), depth + 1);
+}
+
+bool valueIsSavedRegisterRestoreLoad(llvm::Value &value,
+                                     const NativeAbiSpec &abi) {
+  auto *load = llvm::dyn_cast<llvm::LoadInst>(&value);
+  if (load == nullptr || load->isVolatile() || load->isAtomic()) {
+    return false;
+  }
+
+  llvm::Value *pointer = load->getPointerOperand()->stripPointerCasts();
+  if (auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(pointer)) {
+    return valueIsStackFrameExternalInputDerived(*intToPtr->getOperand(0), abi);
+  }
+
+  return valueIsNativeStackAllocaPointer(*pointer);
+}
+
+void eraseDeadPreservedRegisterRestoreStores(llvm::Module &module,
+                                             const NativeAbiSpec &abi) {
+  std::set<std::string> registerNames =
+      preservedNonStackFrameRegisterNames(abi);
+  if (registerNames.empty()) {
+    return;
+  }
+
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+    std::optional<NativeRecoveredPrototype> prototype =
+        readNativeRecoveredPrototypeMetadata(function);
+
+    std::vector<llvm::StoreInst *> deadStores;
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+        if (store == nullptr) {
+          continue;
+        }
+        llvm::MDNode *access = store->getMetadata("notdec.register.access");
+        if (access == nullptr ||
+            (prototype && accessMatchesRecoveredReturn(*access, *prototype)) ||
+            !valueIsSavedRegisterRestoreLoad(*store->getValueOperand(), abi) ||
+            !storeIsDeadOnAllReturnPaths(*store, *access)) {
+          continue;
+        }
+        for (const std::string &registerName : registerNames) {
+          if (accessMatchesEffectRegister(*access, registerName)) {
+            deadStores.push_back(store);
+            break;
+          }
+        }
       }
     }
 
@@ -4855,6 +4952,8 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseDeadNativeStackAllocas(module);
     eraseDeadNonReturnVectorStores(module);
     eraseDeadStackFrameDerivedNonReturnStores(module, *abi);
+    eraseDeadPreservedRegisterRestoreStores(module, *abi);
+    eraseDeadNativeStackAllocas(module);
     summary.SignatureRewriteFunctionsSeen = rewriteSummary.FunctionsSeen;
     summary.SignatureRewriteFunctionsRewritten =
         rewriteSummary.FunctionsRewritten;
