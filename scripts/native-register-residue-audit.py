@@ -29,6 +29,8 @@ LABEL_RE = re.compile(r"^[-a-zA-Z$._0-9]+:\s*(?:;.*)?$")
 DEFINE_RE = re.compile(r"^define\b.*@([-a-zA-Z$._0-9]+)\(")
 DECLARE_RE = re.compile(r"^declare\b.*@([-a-zA-Z$._0-9]+)\(")
 CALLED_FUNCTION_RE = re.compile(r"\bcall\b.*@([-a-zA-Z$._0-9]+)\(")
+SSA_DEF_RE = re.compile(r"^\s*(%[-a-zA-Z$._0-9]+)\s*=")
+CALLEE_SAVED_STORE_RE = re.compile(r"store\b.*ptr @(RBX|RBP|R12|R13|R14|R15)\b")
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,7 @@ class RegisterAccess:
     local_context: str
     function_effects: str
     residue_reason: str
+    stack_semantic: str
     nearby_call: str
     nearby_call_kind: str
     base: str
@@ -334,6 +337,149 @@ def nearby_call_kind(call_name: str, declarations: set[str]) -> str:
     return "internal"
 
 
+def function_bounds(lines: list[str], index: int) -> tuple[int, int]:
+    start = index
+    while start > 0 and not lines[start].strip().startswith("define "):
+        start -= 1
+    end = index + 1
+    while end < len(lines) and lines[end].strip() != "}":
+        end += 1
+    return start, end
+
+
+def defined_value(line: str) -> str:
+    match = SSA_DEF_RE.match(line)
+    return match.group(1) if match else ""
+
+
+def value_ref_pattern(value: str) -> str:
+    return rf"(?<![-a-zA-Z$._0-9]){re.escape(value)}(?![-a-zA-Z$._0-9])"
+
+
+def values_derived_from(lines: list[str], value: str) -> set[str]:
+    values = {value} if value else set()
+    changed = True
+    while changed:
+        changed = False
+        for line in lines:
+            defined = defined_value(line)
+            if defined == "" or defined in values:
+                continue
+            if any(re.search(value_ref_pattern(existing), line) for existing in values):
+                values.add(defined)
+                changed = True
+    return values
+
+
+def value_has_offset_use(lines: list[str], values: set[str], negative: bool) -> bool:
+    if not values:
+        return False
+    escaped_values = "|".join(re.escape(value) for value in sorted(values))
+    sign = "-" if negative else ""
+    pattern = re.compile(rf"\badd i64 ({escaped_values}), {sign}[0-9]+")
+    return any(pattern.search(line) for line in lines)
+
+
+def value_feeds_raw_memory(lines: list[str], values: set[str]) -> bool:
+    if not values:
+        return False
+    return any(
+        "inttoptr" in line
+        and any(
+            re.search(value_ref_pattern(value), line)
+            for value in values
+        )
+        for line in lines
+    )
+
+
+def value_has_direct_offset_use(lines: list[str], value: str, negative: bool) -> bool:
+    if value == "":
+        return False
+    sign = "-" if negative else ""
+    pattern = re.compile(rf"\badd i64 {re.escape(value)}, {sign}[0-9]+")
+    return any(pattern.search(line) for line in lines)
+
+
+def stack_semantic_for_access(
+    lines: list[str],
+    index: int,
+    storage_role: str,
+    access_kind: str,
+    metadata_kind: str,
+    local_context: str,
+    instruction: str,
+) -> str:
+    if storage_role not in {"stack_pointer", "frame_pointer"}:
+        return ""
+
+    labels: list[str] = []
+    if access_kind == "store":
+        if storage_role == "stack_pointer" and local_context in {
+            "before_call",
+            "before_call_path",
+        }:
+            labels.append("call_frame_state")
+        elif storage_role == "stack_pointer":
+            labels.append("stack_frame_state")
+        elif local_context in {"before_ret", "return_path"}:
+            labels.append("saved_register_restore")
+        else:
+            labels.append("frame_base_state")
+
+    if metadata_kind != "external_input":
+        return ",".join(labels)
+
+    value = defined_value(instruction)
+    start, end = function_bounds(lines, index)
+    function_lines = lines[start:end]
+    function_text = "\n".join(function_lines)
+    derived_values = values_derived_from(function_lines, value)
+
+    # Stack canary checks normally read a frame slot and compare it with
+    # FS:0x28 before branching to __stack_chk_fail.
+    if (
+        storage_role == "frame_pointer"
+        and value_has_offset_use(function_lines, derived_values, negative=True)
+        and "FS_OFFSET" in function_text
+        and "__stack_chk_fail" in function_text
+    ):
+        labels.append("stack_canary")
+
+    # A raw frame/caller-stack load feeding an ABI-preserved register store is
+    # usually epilogue restore traffic.  Keep this as an audit label only.
+    if (
+        value_feeds_raw_memory(function_lines, derived_values)
+        or value_has_offset_use(function_lines, derived_values, negative=True)
+        or value_has_offset_use(function_lines, derived_values, negative=False)
+    ) and any(CALLEE_SAVED_STORE_RE.search(line) for line in function_lines):
+        labels.append("saved_register_restore")
+
+    if storage_role == "stack_pointer" and value_has_offset_use(
+        function_lines, derived_values, negative=False
+    ):
+        labels.append("caller_stack")
+    if storage_role == "stack_pointer" and value_has_offset_use(
+        function_lines, derived_values, negative=True
+    ):
+        labels.append("call_frame_state")
+    if (
+        storage_role == "frame_pointer"
+        and value_has_offset_use(function_lines, derived_values, negative=True)
+        and "stack_canary" not in labels
+        and "saved_register_restore" not in labels
+    ):
+        labels.append("caller_frame")
+
+    if storage_role == "frame_pointer" and any(
+        value_has_direct_offset_use(function_lines, value, negative)
+        for negative in (True, False)
+    ) and len(derived_values) > 1:
+        labels.append("chunk_phi")
+
+    return ",".join(dict.fromkeys(labels))
+
+
 def storage_role(name: str) -> str:
     upper = name.upper()
     if upper in {"RSP", "ESP", "SP"}:
@@ -492,6 +638,9 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
             base,
         )
         nearby_call_name = nearby_call_after(lines, index)
+        context = local_context(lines, index, block, metadata_kind)
+        kind = instruction_kind(line)
+        role = storage_role(access_name or base)
         accesses.append(
             RegisterAccess(
                 file=str(path),
@@ -500,19 +649,23 @@ def parse_accesses(path: Path) -> list[RegisterAccess]:
                 block=block,
                 instruction=line.strip(),
                 metadata_kind=metadata_kind,
-                access_kind=instruction_kind(line),
+                access_kind=kind,
                 category=classify_register(access_name or base),
-                storage_role=storage_role(access_name or base),
-                local_context=local_context(lines, index, block, metadata_kind),
+                storage_role=role,
+                local_context=context,
                 function_effects=effects,
                 residue_reason=residue_reason_for_access(
-                    instruction_kind(line),
+                    kind,
                     metadata_kind,
                     classify_register(access_name or base),
-                    storage_role(access_name or base),
-                    local_context(lines, index, block, metadata_kind),
+                    role,
+                    context,
                     effects,
                     is_full,
+                ),
+                stack_semantic=stack_semantic_for_access(
+                    lines, index, role, kind, metadata_kind, context,
+                    line.strip()
                 ),
                 nearby_call=nearby_call_name,
                 nearby_call_kind=nearby_call_kind(nearby_call_name,
@@ -559,10 +712,11 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
     writer = csv.writer(output, delimiter="\t", lineterminator="\n")
     writer.writerow([
         "file", "line", "function", "block", "category", "storage_role",
-        "local_context", "function_effects", "residue_reason", "access_kind",
-        "metadata_kind", "shape", "value_shape", "base", "name", "space",
-        "offset", "size", "value_size", "synthetic", "nearby_call",
-        "nearby_call_kind", "instruction",
+        "local_context", "function_effects", "residue_reason",
+        "stack_semantic", "access_kind", "metadata_kind", "shape",
+        "value_shape", "base", "name", "space", "offset", "size",
+        "value_size", "synthetic", "nearby_call", "nearby_call_kind",
+        "instruction",
     ])
     for access in accesses:
         writer.writerow([
@@ -575,6 +729,7 @@ def write_details(accesses: list[RegisterAccess], output) -> None:
             access.local_context,
             access.function_effects,
             access.residue_reason,
+            access.stack_semantic,
             access.access_kind,
             access.metadata_kind,
             "full" if access.is_full else "partial",

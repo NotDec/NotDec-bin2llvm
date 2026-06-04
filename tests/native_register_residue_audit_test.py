@@ -206,9 +206,67 @@ entry:
     assert accesses[0].nearby_call_kind == "internal"
 
 
+def test_stack_semantic_labels_frame_and_caller_stack_patterns() -> None:
+    module = load_audit_module()
+    ir = """
+@RSP = external global i64, !notdec.register !0
+@RBP = external global i64, !notdec.register !2
+@RBX = external global i64, !notdec.register !4
+@FS_OFFSET = external global i64, !notdec.register !6
+
+define void @sample_stack_semantics() {
+entry:
+  %rsp = load i64, ptr @RSP, align 8, !notdec.register.external_input !1
+  %rbp = load i64, ptr @RBP, align 8, !notdec.register.external_input !3
+  %canary_addr = add i64 %rbp, -24
+  %canary_ptr = inttoptr i64 %canary_addr to ptr
+  %canary = load i64, ptr %canary_ptr, align 1
+  %fs = load i64, ptr @FS_OFFSET, align 8, !notdec.register.access !7
+  %fs_canary_addr = add i64 %fs, 40
+  %fs_canary_ptr = inttoptr i64 %fs_canary_addr to ptr
+  %fs_canary = load i64, ptr %fs_canary_ptr, align 1
+  %ok = icmp eq i64 %canary, %fs_canary
+  br i1 %ok, label %restore, label %fail
+
+restore:
+  %restore_addr = add i64 %rsp, 16
+  %restore_ptr = inttoptr i64 %restore_addr to ptr
+  %saved = load i64, ptr %restore_ptr, align 1
+  store i64 %saved, ptr @RBX, align 8, !notdec.register.access !5
+  ret void
+
+fail:
+  call void @__stack_chk_fail()
+  ret void
+}
+
+declare void @__stack_chk_fail()
+
+!0 = !{!"space=register", !"offset=32", !"size=8", !"name=RSP"}
+!1 = !{!"name=RSP", ptr @RSP}
+!2 = !{!"space=register", !"offset=40", !"size=8", !"name=RBP"}
+!3 = !{!"name=RBP", ptr @RBP}
+!4 = !{!"space=register", !"offset=24", !"size=8", !"name=RBX"}
+!5 = !{!"base=RBX", !"space=register", !"offset=24", !"size=8", !"name=RBX"}
+!6 = !{!"space=register", !"offset=256", !"size=8", !"name=FS_OFFSET"}
+!7 = !{!"base=FS_OFFSET", !"space=register", !"offset=256", !"size=8", !"name=FS_OFFSET"}
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "sample.ll"
+        path.write_text(ir, encoding="utf-8")
+        accesses = module.parse_accesses(path)
+
+    by_name = {access.name: access for access in accesses}
+    assert "stack_canary" in by_name["RBP"].stack_semantic
+    assert "saved_register_restore" in by_name["RBP"].stack_semantic
+    assert "caller_stack" in by_name["RSP"].stack_semantic
+    assert "saved_register_restore" in by_name["RSP"].stack_semantic
+
+
 if __name__ == "__main__":
     test_register_access_summary_classifies_full_and_partial()
     test_register_access_details_include_residue_reason()
     test_callsite_input_store_wins_over_after_call_context()
     test_callsite_input_store_can_have_stack_adjustment_before_call()
     test_nearby_call_kind_marks_defined_callee_as_internal()
+    test_stack_semantic_labels_frame_and_caller_stack_patterns()

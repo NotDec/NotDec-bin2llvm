@@ -2040,3 +2040,87 @@ other load external_input full/full  2
 
 - `sockets_strerror` 是 internal callee，不能按 declaration 白名单删；要么恢复它的 frame 语义，要么证明 caller 传进去的 RSP 状态不被 callee 使用。
 - 大量 `RBP.external_input` 仍是外部 frame/canary/saved-register 形态，下一步要做本地 frame tracking，不能直接删。
+
+# 2026-06-04 实现：RSP/RBP 剩余残留语义审计
+
+背景：
+
+- known no-stack declaration cleanup 后，shared library gate 剩余的 `RSP/RBP` 主要是 `entry_external_input`，单看原来的 `residue_reason` 只能知道它们还被使用，不能区分是本地栈、调用栈、canary、保存寄存器恢复，还是函数 chunk。
+- 抽查 `php:extension-sockets` 发现大量形态是：
+  - `RBP - offset` 读 canary，再和 `FS_OFFSET + 40` 比较。
+  - `RBP/RSP + offset` 读 saved register，再写回 `RBX/R12-R15`。
+  - `RSP` call 前 store，给内部 helper 保留 call frame state。
+- 这些都不能按普通 raw load/store 删除。先把审计脚本分类补清楚，再决定后续 pass 怎么做。
+
+实现：
+
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:32)
+  - 新增 SSA 定义和 callee-saved store 的文本匹配，用于审计 raw stack/frame use chain。
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:359)
+  - 新增 `values_derived_from()`，追踪 `external_input -> add/phi/...` 的简单 SSA 派生值。
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:404)
+  - 新增 `stack_semantic_for_access()`。
+  - 当前只打审计标签，不作为删除依据。
+  - 标签包括 `stack_canary`、`saved_register_restore`、`caller_stack`、`call_frame_state`、`frame_base_state`、`caller_frame`、`chunk_phi`。
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:711)
+  - `--details` 输出新增 `stack_semantic` 列。
+- [native_register_residue_audit_test.py](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_residue_audit_test.py:209)
+  - 新增 `test_stack_semantic_labels_frame_and_caller_stack_patterns()`，覆盖 canary、saved-register restore、caller-stack 标签。
+
+验证：
+
+```bash
+git diff --check
+python3 tests/native_register_residue_audit_test.py
+ctest --test-dir build -R native_register_residue --output-on-failure
+
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-known-nostack-decl-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-known-nostack-decl-details-semantic.tsv
+```
+
+结果：
+
+- `python3 tests/native_register_residue_audit_test.py` 通过。
+- `notdec.native_register_residue_audit.unit` 通过。
+- `git diff --check` 通过。
+- 重新审计已有 shared gate artifacts 后，当前 `RSP/RBP` 残留都能分类，没有空 `stack_semantic`。
+
+剩余 `RSP/RBP` 语义分类：
+
+```text
+39 RBP entry_external_input stack_canary,saved_register_restore,chunk_phi
+28 RSP entry_external_input saved_register_restore,caller_stack,call_frame_state
+10 RSP entry_external_input saved_register_restore,call_frame_state
+8  RSP store before sockets_strerror call_frame_state
+4  RBP entry_external_input stack_canary,saved_register_restore
+4  RSP entry_external_input caller_stack,call_frame_state
+2  RBP entry_external_input saved_register_restore,chunk_phi
+2  RBP store frame_base_state
+1  RBP entry_external_input stack_canary,chunk_phi
+1  RSP store before zend_wrong_param_count call_frame_state
+1  RSP store stack_frame_state
+1  RSP entry_external_input call_frame_state
+```
+
+判断：
+
+- 当前 shared library gate 的 RSP/RBP 瓶颈已经不是“静态本地栈槽转 alloca”。
+- 大头是 canary、保存寄存器恢复、caller stack/call frame state，并且很多通过 PHI 落在共享 epilogue/chunk 里。
+- 继续靠删除 raw load/store 会破坏语义。下一步应转向：
+  - 函数边界/chunk 识别，避免把共享 epilogue 当独立函数入口。
+  - call-site stack effect / stack argument / return-address 建模。
+  - 对 canary 和 saved-register restore 做明确语义标记，再决定是否能在 prototype rewrite 后清理。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 3 | 没减少 residue，但把剩余 RSP/RBP 全部分到语义类里，明确了下一步不是继续盲删。 |
+| 理解成本 | 2 | 只是审计脚本新增一列，不影响 pass 行为。 |
+| 维护成本 | 2 | 分类是保守文本识别，后续可替换成真实 IR 数据流；当前不会影响生成 IR。 |
+
+有没有更好的方案：
+
+- 最终应该在 IR/pass 内有正式 stack semantic metadata，而不是只靠审计脚本文本识别。
+- 这次先放在审计脚本，是因为它能低风险确认路线：剩余问题已经进入 chunk/call-stack 语义，不适合继续用 raw load/store cleanup 硬削。
