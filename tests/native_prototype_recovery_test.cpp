@@ -2446,6 +2446,38 @@ llvm::Function *createDeclarationStackFrameRegisterStoreCallerFunction(
   return caller;
 }
 
+llvm::Function *createDeclarationFrameBaseStoreCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::GlobalVariable *rbp, llvm::Function **calleeOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             name + "_callee", module);
+
+  llvm::Function *caller =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call_block", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *base = createExternalInputLoad(builder, rsp, "RSP");
+  llvm::Value *frameBase = builder.CreateAdd(
+      base, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::StoreInst *store = builder.CreateStore(frameBase, rbp);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RBP"));
+  builder.CreateBr(callBlock);
+
+  builder.SetInsertPoint(callBlock);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  builder.CreateRetVoid();
+
+  *calleeOut = callee;
+  return caller;
+}
+
 llvm::Function *createBranchDeclarationRspStoreCallerFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
     llvm::StringRef calleeName, llvm::Function **calleeOut) {
@@ -4831,6 +4863,9 @@ int main() {
                    llvm::isa<llvm::ConstantInt>(
                        rewrittenPredecessorCallsiteCall->getArgOperand(0)),
                "predecessor callsite argument did not use register store value");
+  ok &= expect(predecessorCallsiteCaller != nullptr &&
+                   !hasRegisterStore(*predecessorCallsiteCaller, "RDI"),
+               "predecessor callsite input kept old register store");
   if (llvm::verifyModule(predecessorCallsiteModule, &llvm::errs())) {
     std::cerr << "predecessor callsite module verification failed after "
                  "input-only rewrite\n";
@@ -4891,6 +4926,9 @@ int main() {
                    llvm::isa<llvm::ConstantInt>(
                        rewrittenLinearPredecessorCallsiteCall->getArgOperand(0)),
                "linear predecessor callsite argument did not use register store value");
+  ok &= expect(linearPredecessorCallsiteCaller != nullptr &&
+                   !hasRegisterStore(*linearPredecessorCallsiteCaller, "RDI"),
+               "linear predecessor callsite input kept old register store");
   if (llvm::verifyModule(linearPredecessorCallsiteModule, &llvm::errs())) {
     std::cerr << "linear predecessor callsite module verification failed after "
                  "input-only rewrite\n";
@@ -9110,6 +9148,11 @@ int main() {
           declarationRspStoreModule, "caller_reads_declaration_rbp_store",
           declarationRbp, "RBP", true, false,
           &callerReadsDeclarationRbpCallee);
+  llvm::Function *deadDeclarationFrameBaseCallee = nullptr;
+  llvm::Function *deadDeclarationFrameBaseCaller =
+      createDeclarationFrameBaseStoreCallerFunction(
+          declarationRspStoreModule, "dead_declaration_frame_base_store",
+          declarationRsp, declarationRbp, &deadDeclarationFrameBaseCallee);
   for (llvm::Function *function :
        {deadDeclarationRspCaller, branchDeclarationRspCaller,
         noMetadataDeclarationRspCaller, noReturnDeclarationRspCaller,
@@ -9117,7 +9160,7 @@ int main() {
         branchKnownNoStackRspCaller,
         branchUnknownRspCaller, callerReadsDeclarationRspCaller,
         deadDeclarationRbpCaller, noMetadataDeclarationRbpCaller,
-        callerReadsDeclarationRbpCaller}) {
+        callerReadsDeclarationRbpCaller, deadDeclarationFrameBaseCaller}) {
     function->setMetadata(
         "notdec.prototype.recovered",
         makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {}));
@@ -9180,6 +9223,12 @@ int main() {
                "declaration call RBP store needed after call was removed");
   ok &= expect(hasRegisterLoad(*callerReadsDeclarationRbpCaller, "RBP"),
                "caller RBP load after declaration call was removed");
+  ok &= expect(!hasRegisterStore(*deadDeclarationFrameBaseCaller, "RBP"),
+               "dead declaration call frame-base RBP store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*deadDeclarationFrameBaseCaller,
+                                             "RSP"),
+               "dead declaration call frame-base store kept dead RSP external "
+               "input");
   if (llvm::verifyModule(declarationRspStoreModule, &llvm::errs())) {
     std::cerr << "declaration RSP store module verification failed after "
                  "prototype rewrite\n";

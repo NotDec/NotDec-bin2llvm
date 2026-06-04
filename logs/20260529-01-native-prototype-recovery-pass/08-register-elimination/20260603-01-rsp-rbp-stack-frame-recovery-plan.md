@@ -2250,3 +2250,129 @@ RSP/RBP 分类：
 
 - 更完整方案是在 native lowering 时就给 `__stack_chk_fail` 等 noreturn call 生成正确 CFG，不要等 prototype recovery 后置 cleanup 修。
 - 这次先放在 prototype recovery cleanup，是因为当前 fake chunk residue 出现在 signature rewrite 后，能低风险验证真实收益。
+
+# 2026-06-04 实现：清理死 RBP frame-base store 和线性 call-site RSP store
+
+背景：
+
+- 上一轮 gate 后，剩余 RSP/RBP store 只剩：
+  - 2 个 `RBP store frame_base_state`，来自 `RBP = RSP - 8` 后没人再读的帧基址状态。
+  - 1 个 `RSP store stack_frame_state`，来自 `notdec_native_6b40` 在 `zval_ptr_dtor(i64)` 前设置 call-site 栈状态。
+- 这些都不是 canary、saved-register restore 或 stack arg 本体。它们是 signature rewrite 后还没被清掉的旧寄存器状态。
+
+实现：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1131)
+  - 新增 `LocalCallsiteInputStoreLookup`，把“没找到 store”和“中间被 load/call 阻断”分开。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1139)
+  - 新增 `uniqueEdgeTarget()` 和 `uniqueEdgeSource()`。
+  - 对 `br i1 false, label %x, label %x` 这种重复边按线性路径处理；真实多分支仍保守放弃。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1165)
+  - 扩展 `localCallsiteInputStoreBeforeCall()`，允许沿唯一前驱向上找旧 call-site input store。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2064)
+  - 新增 `callMayReadRegisterNameForDeadFrameStore()`。
+  - 死 RBP frame-base store 判断不再把 declaration call 当成会读当前函数的 `@RBP` 状态。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2076)
+  - `callMayReadRegisterAccess()` 支持传入不同的 call-read 判断函数。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2207)
+  - `storeIsDeadOnAllReturnPaths()` 支持传入不同的 call-read 判断函数。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2236)
+  - `valueIsNeededByInterveningInstruction()` 支持沿唯一后继从 store 扫到目标 call。
+  - 中途遇到 call、同寄存器读写、走不到目标 call 或 CFG 环时仍保守失败。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:3433)
+  - `eraseDeadStackFrameRegisterStores()` 对 frame-pointer store 使用新的 dead-frame call-read 判断。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:4849)
+  - `rewriteStaticStackMemoryAccesses()` 后再跑一次 `eraseUnusedDeclarationCallStackFrameRegisterStores()`。
+  - 这一步会清掉 `notdec_native_6b40` 里静态栈槽转 alloca 后暴露出来的死 RSP call-site store。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2449)
+  - 新增 `createDeclarationFrameBaseStoreCallerFunction()`，覆盖 `RBP = RSP - 8; call declaration; ret`。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:4866)
+  - 前驱 call-site input rewrite 测试增加旧寄存器 store 删除断言。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:4929)
+  - 线性前驱 call-site input rewrite 测试增加旧寄存器 store 删除断言。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:9151)
+  - declaration RSP/RBP store 测试加入死 frame-base store case。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:9226)
+  - 断言死 RBP frame-base store 和对应 RSP external input 都被清掉。
+
+验证：
+
+```bash
+git diff --check
+python3 tests/native_register_residue_audit_test.py
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-framebase-callsite-final-gate \
+  --target php:extension-calendar \
+  --target php:extension-sockets
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-framebase-callsite-final-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-framebase-callsite-final-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-framebase-callsite-final-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 两个 shared library 都通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `php:extension-calendar` | 11s | 11s |
+| `php:extension-sockets` | 39s | 40s |
+
+residue 对比：
+
+```text
+before:
+gpr load  external_input  full/full  109
+gpr store access          full/full  452
+other load access         full/full  44
+other load external_input full/full  2
+
+after:
+gpr load  external_input  full/full  107
+gpr store access          full/full  449
+other load access         full/full  44
+other load external_input full/full  2
+```
+
+RSP/RBP 分类：
+
+```text
+43 RBP entry_external_input stack_canary,saved_register_restore
+28 RSP entry_external_input saved_register_restore,caller_stack,call_frame_state
+4  RSP entry_external_input caller_stack,call_frame_state
+2  RBP entry_external_input saved_register_restore
+1  RBP entry_external_input stack_canary
+1  RSP entry_external_input call_frame_state
+```
+
+判断：
+
+- `RBP store frame_base_state` 从 2 降到 0。
+- `RSP store stack_frame_state` 从 1 降到 0。
+- 当前 shared library gate 里 RSP/RBP 已经没有 store 残留，只剩 entry external input load。
+- 剩余 RSP/RBP 主要是 stack canary、saved-register restore、caller-stack/call-frame state；下一步不能按死 store/load 删除，需要继续做明确语义恢复。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | 清掉最后的 RSP/RBP store 残留，且 gate 时间没有明显退化。 |
+| 理解成本 | 3 | 增加了线性前驱/后继扫描，逻辑比原来同块查找复杂。 |
+| 维护成本 | 3 | 后续最好把重复边处理和线性路径 helper 合并到已有 CFG 工具函数，避免多处各写一份。 |
+
+有没有更好的方案：
+
+- 最终应该在 call-site stack semantic 恢复时直接删除/替换这些旧 RSP 状态 store，而不是靠后置 cleanup 多跑一轮。
+- 这次先放在 prototype recovery cleanup，是因为收益明确、规则保守，并且能直接消掉 Bench2 shared library gate 的最后 RSP/RBP store。

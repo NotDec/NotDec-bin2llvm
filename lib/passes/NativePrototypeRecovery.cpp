@@ -1128,35 +1128,102 @@ std::optional<llvm::Value *> registerStoreValueInReverseRange(
   return std::nullopt;
 }
 
+struct LocalCallsiteInputStoreLookup {
+  bool Blocked = false;
+  llvm::StoreInst *Store = nullptr;
+};
+
+// Treat duplicate CFG edges as one edge. Some lifted branches use
+// `br i1 false, label %x, label %x`; that is still a linear path for this
+// cleanup.
+llvm::BasicBlock *uniqueEdgeTarget(llvm::iterator_range<
+                                   llvm::succ_iterator> blocks) {
+  llvm::BasicBlock *result = nullptr;
+  for (llvm::BasicBlock *block : blocks) {
+    if (result != nullptr && result != block) {
+      return nullptr;
+    }
+    result = block;
+  }
+  return result;
+}
+
+llvm::BasicBlock *uniqueEdgeSource(llvm::iterator_range<
+                                   llvm::pred_iterator> blocks) {
+  llvm::BasicBlock *result = nullptr;
+  for (llvm::BasicBlock *block : blocks) {
+    if (result != nullptr && result != block) {
+      return nullptr;
+    }
+    result = block;
+  }
+  return result;
+}
+
+// The callsite cleanup needs to distinguish "no store yet" from "a load/call
+// made the search unsafe"; both used to be represented as nullptr.
 llvm::StoreInst *localCallsiteInputStoreBeforeCall(
     llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *valueType) {
-  for (auto iter = llvm::BasicBlock::reverse_iterator(call.getIterator()),
-            end = call.getParent()->rend();
-       iter != end; ++iter) {
-    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter)) {
-      llvm::MDNode *metadata = load->getMetadata("notdec.register.access");
-      if (metadata != nullptr && metadataField(*metadata, "name") == registerName) {
-        return nullptr;
-      }
-      continue;
-    }
-    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter)) {
-      llvm::MDNode *metadata = store->getMetadata("notdec.register.access");
-      if (metadata == nullptr || metadataField(*metadata, "name") != registerName) {
+  auto findLocalStore = [&](llvm::BasicBlock::reverse_iterator iter,
+                            llvm::BasicBlock::reverse_iterator end)
+      -> LocalCallsiteInputStoreLookup {
+    for (; iter != end; ++iter) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&*iter)) {
+        llvm::MDNode *metadata = load->getMetadata("notdec.register.access");
+        if (metadata != nullptr &&
+            metadataField(*metadata, "name") == registerName) {
+          return {true, nullptr};
+        }
         continue;
       }
-      llvm::Value *value = store->getValueOperand();
-      if (value == nullptr || value->getType() != valueType) {
-        return nullptr;
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&*iter)) {
+        llvm::MDNode *metadata = store->getMetadata("notdec.register.access");
+        if (metadata == nullptr ||
+            metadataField(*metadata, "name") != registerName) {
+          continue;
+        }
+        llvm::Value *value = store->getValueOperand();
+        if (value == nullptr || value->getType() != valueType) {
+          return {true, nullptr};
+        }
+        return {false, store};
       }
-      return store;
-    }
-    if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
-      llvm::Function *callee = previousCall->getCalledFunction();
-      if (callee == nullptr || !callee->isIntrinsic()) {
-        return nullptr;
+      if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
+        llvm::Function *callee = previousCall->getCalledFunction();
+        if (callee == nullptr || !callee->isIntrinsic()) {
+          return {true, nullptr};
+        }
       }
     }
+    return {};
+  };
+
+  LocalCallsiteInputStoreLookup local =
+      findLocalStore(llvm::BasicBlock::reverse_iterator(call.getIterator()),
+                     call.getParent()->rend());
+  if (local.Blocked || local.Store != nullptr) {
+    return local.Store;
+  }
+
+  llvm::BasicBlock *current = call.getParent();
+  std::set<llvm::BasicBlock *> visited;
+  while (visited.insert(current).second) {
+    llvm::BasicBlock *predecessor =
+        uniqueEdgeSource(llvm::predecessors(current));
+    if (predecessor == nullptr) {
+      return nullptr;
+    }
+
+    if (uniqueEdgeTarget(llvm::successors(predecessor)) != current) {
+      return nullptr;
+    }
+
+    LocalCallsiteInputStoreLookup predecessorStore =
+        findLocalStore(predecessor->rbegin(), predecessor->rend());
+    if (predecessorStore.Blocked || predecessorStore.Store != nullptr) {
+      return predecessorStore.Store;
+    }
+    current = predecessor;
   }
   return nullptr;
 }
@@ -1994,15 +2061,29 @@ bool callMayReadRegisterName(llvm::CallBase &call,
   return functionReadsRegisterName(*callee, registerName);
 }
 
-bool callMayReadRegisterAccess(llvm::CallBase &call,
-                               const llvm::MDNode &access) {
+bool callMayReadRegisterNameForDeadFrameStore(llvm::CallBase &call,
+                                              llvm::StringRef registerName) {
+  if (!isFramePointerRegisterName(registerName)) {
+    return callMayReadRegisterName(call, registerName);
+  }
+  llvm::Function *callee = call.getCalledFunction();
+  if (callee != nullptr && callee->isDeclaration()) {
+    return false;
+  }
+  return callMayReadRegisterName(call, registerName);
+}
+
+bool callMayReadRegisterAccess(
+    llvm::CallBase &call, const llvm::MDNode &access,
+    llvm::function_ref<bool(llvm::CallBase &, llvm::StringRef)> mayReadName =
+        callMayReadRegisterName) {
   if (std::optional<std::string> name = metadataField(access, "name")) {
-    if (callMayReadRegisterName(call, *name)) {
+    if (mayReadName(call, *name)) {
       return true;
     }
   }
   if (std::optional<std::string> base = metadataField(access, "base")) {
-    if (callMayReadRegisterName(call, *base)) {
+    if (mayReadName(call, *base)) {
       return true;
     }
   }
@@ -2059,12 +2140,16 @@ bool isFunctionExitInstruction(llvm::Instruction *instruction) {
 
 bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
     llvm::BasicBlock &block, const llvm::MDNode &access,
-    std::set<llvm::BasicBlock *> &seen);
+    std::set<llvm::BasicBlock *> &seen,
+    llvm::function_ref<bool(llvm::CallBase &, llvm::StringRef)> mayReadName);
 
 bool reachesReturnWithoutCallOrAccessLoad(llvm::Instruction *instruction,
                                           llvm::BasicBlock &block,
                                           const llvm::MDNode &access,
-                                          std::set<llvm::BasicBlock *> &seen) {
+                                          std::set<llvm::BasicBlock *> &seen,
+                                          llvm::function_ref<bool(
+                                              llvm::CallBase &,
+                                              llvm::StringRef)> mayReadName) {
   while (instruction != nullptr) {
     if (isFunctionExitInstruction(instruction)) {
       return true;
@@ -2073,7 +2158,7 @@ bool reachesReturnWithoutCallOrAccessLoad(llvm::Instruction *instruction,
       return true;
     }
     if (auto *call = llvm::dyn_cast<llvm::CallBase>(instruction)) {
-      if (callMayReadRegisterAccess(*call, access)) {
+      if (callMayReadRegisterAccess(*call, access, mayReadName)) {
         return false;
       }
     }
@@ -2082,12 +2167,14 @@ bool reachesReturnWithoutCallOrAccessLoad(llvm::Instruction *instruction,
     }
     instruction = instruction->getNextNode();
   }
-  return allSuccessorsReachReturnWithoutCallOrAccessLoad(block, access, seen);
+  return allSuccessorsReachReturnWithoutCallOrAccessLoad(block, access, seen,
+                                                        mayReadName);
 }
 
 bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
     llvm::BasicBlock &block, const llvm::MDNode &access,
-    std::set<llvm::BasicBlock *> &seen) {
+    std::set<llvm::BasicBlock *> &seen,
+    llvm::function_ref<bool(llvm::CallBase &, llvm::StringRef)> mayReadName) {
   llvm::Instruction *terminator = block.getTerminator();
   if (terminator == nullptr) {
     return false;
@@ -2096,7 +2183,7 @@ bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
     return true;
   }
   if (auto *call = llvm::dyn_cast<llvm::CallBase>(terminator)) {
-    if (callMayReadRegisterAccess(*call, access)) {
+    if (callMayReadRegisterAccess(*call, access, mayReadName)) {
       return false;
     }
   }
@@ -2110,15 +2197,17 @@ bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
     }
     if (!reachesReturnWithoutCallOrAccessLoad(
             successor->empty() ? nullptr : &successor->front(), *successor,
-            access, pathSeen)) {
+            access, pathSeen, mayReadName)) {
       return false;
     }
   }
   return sawSuccessor;
 }
 
-bool storeIsDeadOnAllReturnPaths(llvm::StoreInst &store,
-                                 const llvm::MDNode &access) {
+bool storeIsDeadOnAllReturnPaths(
+    llvm::StoreInst &store, const llvm::MDNode &access,
+    llvm::function_ref<bool(llvm::CallBase &, llvm::StringRef)> mayReadName =
+        callMayReadRegisterName) {
   std::set<llvm::BasicBlock *> seen;
   seen.insert(store.getParent());
   llvm::Instruction *next = store.getNextNode();
@@ -2130,7 +2219,7 @@ bool storeIsDeadOnAllReturnPaths(llvm::StoreInst &store,
       return true;
     }
     if (auto *call = llvm::dyn_cast<llvm::CallBase>(next)) {
-      if (callMayReadRegisterAccess(*call, access)) {
+      if (callMayReadRegisterAccess(*call, access, mayReadName)) {
         return false;
       }
     }
@@ -2140,22 +2229,39 @@ bool storeIsDeadOnAllReturnPaths(llvm::StoreInst &store,
     next = next->getNextNode();
   }
   return allSuccessorsReachReturnWithoutCallOrAccessLoad(*store.getParent(),
-                                                         access, seen);
+                                                         access, seen,
+                                                         mayReadName);
 }
 
 bool valueIsNeededByInterveningInstruction(llvm::StoreInst &store,
                                            llvm::CallInst &call,
                                            const llvm::MDNode &access) {
-  for (llvm::Instruction *instruction = store.getNextNode(); instruction != nullptr;
-       instruction = instruction->getNextNode()) {
-    if (instruction == &call) {
-      return false;
+  if (store.getFunction() != call.getFunction()) {
+    return true;
+  }
+
+  llvm::BasicBlock *block = store.getParent();
+  llvm::Instruction *instruction = store.getNextNode();
+  std::set<llvm::BasicBlock *> visited;
+  while (block != nullptr && visited.insert(block).second) {
+    while (instruction != nullptr) {
+      if (instruction == &call) {
+        return false;
+      }
+      if (llvm::isa<llvm::CallBase>(instruction) ||
+          instructionReadsRegisterAccess(*instruction, access) ||
+          instructionWritesRegisterAccess(*instruction, access)) {
+        return true;
+      }
+      instruction = instruction->getNextNode();
     }
-    if (llvm::isa<llvm::CallBase>(instruction) ||
-        instructionReadsRegisterAccess(*instruction, access) ||
-        instructionWritesRegisterAccess(*instruction, access)) {
+
+    if (block == call.getParent()) {
       return true;
     }
+    block = uniqueEdgeTarget(llvm::successors(block));
+    instruction =
+        block != nullptr && !block->empty() ? &block->front() : nullptr;
   }
   return true;
 }
@@ -3324,7 +3430,11 @@ void eraseDeadStackFrameRegisterStores(llvm::Module &module,
           llvm::MDNode *access = store->getMetadata("notdec.register.access");
           if (access != nullptr &&
               accessMatchesEffectRegister(*access, registerName) &&
-              storeIsDeadOnAllReturnPaths(*store, *access)) {
+              storeIsDeadOnAllReturnPaths(
+                  *store, *access,
+                  isFramePointerRegisterName(registerName)
+                      ? callMayReadRegisterNameForDeadFrameStore
+                      : callMayReadRegisterName)) {
             deadStores.push_back(store);
           }
         }
@@ -4736,6 +4846,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseUnusedDeclarationCallStackFrameRegisterStores(module, *abi);
     eraseUnusedInternalCallStackFrameRegisterStores(module, *abi);
     rewriteStaticStackMemoryAccesses(module, *abi);
+    eraseUnusedDeclarationCallStackFrameRegisterStores(module, *abi);
     eraseUnusedRawStackFrameLoads(module, *abi);
     eraseDeadStackFrameRegisterStores(module, *abi);
     replaceStoredFramePointerRegisterLoads(module, *abi);
