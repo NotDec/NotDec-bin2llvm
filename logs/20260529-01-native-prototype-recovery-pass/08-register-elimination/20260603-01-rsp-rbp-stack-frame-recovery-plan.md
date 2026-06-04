@@ -2124,3 +2124,129 @@ python3 scripts/native-register-residue-audit.py --details \
 
 - 最终应该在 IR/pass 内有正式 stack semantic metadata，而不是只靠审计脚本文本识别。
 - 这次先放在审计脚本，是因为它能低风险确认路线：剩余问题已经进入 chunk/call-stack 语义，不适合继续用 raw load/store cleanup 硬削。
+
+# 2026-06-04 实现：noreturn CFG 截断清理 fake chunk PHI
+
+背景：
+
+- 上一轮 `stack_semantic` 审计把很多 `RBP.external_input` 标成 `chunk_phi`，但其中一部分是脚本文本匹配太宽。
+- 收窄后，真正的 `chunk_phi` 只剩 `php:extension-sockets` 的 4 个函数：
+  - `notdec_native_60f0`
+  - `notdec_native_625f`
+  - `notdec_native_6379`
+  - `notdec_native_6460`
+- 抽查发现这些不是正常共享 epilogue，而是 `__stack_chk_fail()` 后还保留 fallthrough/branch，错误路径又回到正常块，导致 `RBP/RSP` 形成 PHI。
+- 这类 CFG 本身不对，应先把已知 noreturn call 后的路径截断，再清无前驱死块。
+
+实现：
+
+- [native-register-residue-audit.py](/sn640/NotDec/external/NotDec-bin2llvm/scripts/native-register-residue-audit.py:374)
+  - 新增 `derived_values_include_phi()`。
+  - `chunk_phi` 只有在 `RBP.external_input` 派生链里真的出现 PHI 时才标记，避免把普通 `RBP + const` canary/restore 误判成 chunk。
+- [native_register_residue_audit_test.py](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_residue_audit_test.py:263)
+  - 新增 `test_stack_semantic_marks_chunk_phi_only_for_phi_derived_frame()`。
+  - 覆盖 direct frame 不标 `chunk_phi`，PHI frame 才标。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2055)
+  - 新增 `isFunctionExitInstruction()`，让已有 store liveness 同时接受 `ret` 和 `unreachable`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2305)
+  - 新增 `isKnownNoReturnDeclaration()`。
+  - 第一版只接受 declaration、非 vararg、0 参数，并且有 LLVM `noreturn` 属性或名字是 `__stack_chk_fail`。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:2318)
+  - 新增 `truncateKnownNoReturnDeclarationCalls()`。
+  - 对已知 noreturn declaration call 后的下一条指令调用 `llvm::changeToUnreachable()`。
+  - 对改动过的函数调用 `llvm::removeUnreachableBlocks()`，清掉截断后留下的无前驱块和死 PHI incoming。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:4725)
+  - 在 signature rewrite 后置 cleanup 一开始调用 noreturn CFG 截断。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:2137)
+  - 新增 `createNoReturnFallthroughFunction()`。
+  - 构造 `call __stack_chk_fail(); br merge`，merge 里有 PHI。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:3375)
+  - 新增 `blockEndsWithUnreachable()` 和 `phiHasIncomingFromBlock()` 测试辅助。
+- [native_prototype_recovery_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_prototype_recovery_test.cpp:8978)
+  - raw RSP/RBP cleanup 测试增加 noreturn fallthrough case。
+  - 断言 `fail` block 变成 `unreachable`，merge PHI 不再含 `fail` incoming。
+
+验证：
+
+```bash
+git diff --check
+python3 tests/native_register_residue_audit_test.py
+cmake --build build --target native_prototype_recovery_test -j2
+./build/bin/native_prototype_recovery_test
+ctest --test-dir build -R 'notdec\.native_(prototype|instcombine|register|abi)|native_register_residue' --output-on-failure
+cmake --build build --target notdec-native-llvm -j2
+
+scripts/bench2-native-prototype-audit.sh \
+  --build-dir build \
+  --out-dir /tmp/notdec-bin2llvm-rsp-noreturn-unreachable-gate \
+  --target php:extension-calendar \
+  --target php:extension-sockets
+
+python3 scripts/native-register-residue-audit.py \
+  /tmp/notdec-bin2llvm-rsp-noreturn-unreachable-gate/*.signature-rewrite.ll
+python3 scripts/native-register-residue-audit.py --details \
+  /tmp/notdec-bin2llvm-rsp-noreturn-unreachable-gate/*.signature-rewrite.ll \
+  > /tmp/notdec-rsp-noreturn-unreachable-details.tsv
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 CTest 6/6 通过。
+- `notdec-native-llvm` 构建通过。
+- 两个 shared library 都通过 LLVM 22 assemble/verify：
+
+| target | all-confirmed | signature-rewrite |
+| --- | ---: | ---: |
+| `php:extension-calendar` | 11s | 12s |
+| `php:extension-sockets` | 40s | 40s |
+
+residue 对比：
+
+```text
+after known no-stack declaration expansion:
+gpr load  external_input  full/full  117
+gpr store access          full/full  497
+other load access         full/full  44
+other load external_input full/full  2
+
+after noreturn CFG truncate:
+gpr load  external_input  full/full  109
+gpr store access          full/full  452
+other load access         full/full  44
+other load external_input full/full  2
+```
+
+RSP/RBP 分类：
+
+```text
+43 RBP entry_external_input stack_canary,saved_register_restore
+28 RSP entry_external_input saved_register_restore,caller_stack,call_frame_state
+4  RSP entry_external_input caller_stack,call_frame_state
+2  RBP entry_external_input saved_register_restore
+2  RSP entry_external_input saved_register_restore,call_frame_state
+2  RBP store frame_base_state
+1  RBP entry_external_input stack_canary
+1  RSP store stack_frame_state
+1  RSP entry_external_input call_frame_state
+```
+
+判断：
+
+- `chunk_phi` 从 4 降到 0。
+- `__stack_chk_fail` 后的错误 fallthrough 已变成 `unreachable`，截断后留下的无前驱块也被清掉。
+- 这轮实际推进的是“函数边界和 chunk 问题”的一个子集：不是合并 chunk，而是先修正 noreturn 造成的假 chunk。
+- 剩余 RSP/RBP 已经主要是 canary、saved-register restore、caller-stack/call-frame state。下一步应继续恢复这些语义，而不是按死代码删。
+
+复杂度评分：
+
+| 角度 | 分数 | 判断 |
+| --- | ---: | --- |
+| 实现效果 | 4 | shared gate 清掉 fake chunk PHI，GPR store 少 45，external input 少 8。 |
+| 理解成本 | 2 | 规则很窄，只处理已知 noreturn declaration call 后的 CFG。 |
+| 维护成本 | 2 | 后续需要把 noreturn 信息来源扩展到更正式的 import/prototype metadata，但当前白名单很小。 |
+
+有没有更好的方案：
+
+- 更完整方案是在 native lowering 时就给 `__stack_chk_fail` 等 noreturn call 生成正确 CFG，不要等 prototype recovery 后置 cleanup 修。
+- 这次先放在 prototype recovery cleanup，是因为当前 fake chunk residue 出现在 signature rewrite 后，能低风险验证真实收益。

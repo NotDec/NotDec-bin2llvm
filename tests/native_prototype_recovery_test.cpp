@@ -2137,6 +2137,51 @@ llvm::Function *createPhiRawRspLoadFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createNoReturnFallthroughFunction(llvm::Module &module,
+                                                  const std::string &name) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::Function *fail = module.getFunction("__stack_chk_fail");
+  if (fail == nullptr) {
+    auto *failType =
+        llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+    fail = llvm::Function::Create(failType, llvm::GlobalValue::ExternalLinkage,
+                                  "__stack_chk_fail", module);
+  }
+
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *failBlock =
+      llvm::BasicBlock::Create(context, "fail", function);
+  llvm::BasicBlock *normalBlock =
+      llvm::BasicBlock::Create(context, "normal", function);
+  llvm::BasicBlock *merge = llvm::BasicBlock::Create(context, "merge", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), failBlock,
+                       normalBlock);
+
+  builder.SetInsertPoint(failBlock);
+  builder.CreateCall(fail->getFunctionType(), fail, {});
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(normalBlock);
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(merge);
+  llvm::PHINode *phi =
+      builder.CreatePHI(llvm::Type::getInt64Ty(context), 2, "merged_value");
+  phi->addIncoming(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1),
+                   failBlock);
+  phi->addIncoming(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 2),
+                   normalBlock);
+  (void)builder.CreateAdd(
+      phi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createStoredRbpRawLoadFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
     llvm::GlobalVariable *rbp) {
@@ -3321,6 +3366,35 @@ bool hasAllocaNamed(const llvm::Function &function, llvm::StringRef prefix) {
       if (alloca != nullptr && alloca->hasName() &&
           alloca->getName().starts_with(prefix)) {
         return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool blockEndsWithUnreachable(const llvm::Function &function,
+                              llvm::StringRef blockName) {
+  for (const llvm::BasicBlock &block : function) {
+    if (block.getName() == blockName) {
+      return llvm::isa<llvm::UnreachableInst>(block.getTerminator());
+    }
+  }
+  return false;
+}
+
+bool phiHasIncomingFromBlock(const llvm::Function &function,
+                             llvm::StringRef phiName,
+                             llvm::StringRef blockName) {
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &instruction : block) {
+      auto *phi = llvm::dyn_cast<llvm::PHINode>(&instruction);
+      if (phi == nullptr || phi->getName() != phiName) {
+        continue;
+      }
+      for (unsigned index = 0; index < phi->getNumIncomingValues(); ++index) {
+        if (phi->getIncomingBlock(index)->getName() == blockName) {
+          return true;
+        }
       }
     }
   }
@@ -8904,6 +8978,9 @@ int main() {
   llvm::Function *externalRbpRawLoad =
       createExternalRbpRawLoadFunction(rawRspLoadModule,
                                        "external_rbp_raw_load", rawRbp);
+  llvm::Function *noReturnFallthrough =
+      createNoReturnFallthroughFunction(rawRspLoadModule,
+                                        "noreturn_fallthrough");
   notdec::bin2llvm::runNativePrototypeRecovery(rawRspLoadModule,
                                                rewriteOptions);
   ok &= expect(!hasIntToPtr(*unusedRawRspLoad),
@@ -8946,6 +9023,11 @@ int main() {
                "external RBP frame raw load lost original inttoptr");
   ok &= expect(hasRegisterExternalInputLoad(*externalRbpRawLoad, "RBP"),
                "external RBP frame raw load lost original external input");
+  ok &= expect(blockEndsWithUnreachable(*noReturnFallthrough, "fail"),
+               "known noreturn call kept fallthrough terminator");
+  ok &= expect(!phiHasIncomingFromBlock(*noReturnFallthrough, "merged_value",
+                                        "fail"),
+               "known noreturn call kept dead successor PHI incoming");
   if (llvm::verifyModule(rawRspLoadModule, &llvm::errs())) {
     std::cerr << "raw RSP load module verification failed after "
                  "prototype rewrite\n";

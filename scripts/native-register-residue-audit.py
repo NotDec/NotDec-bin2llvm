@@ -371,6 +371,13 @@ def values_derived_from(lines: list[str], value: str) -> set[str]:
     return values
 
 
+def derived_values_include_phi(lines: list[str], values: set[str]) -> bool:
+    return any(
+        defined_value(line) in values and " phi " in line
+        for line in lines
+    )
+
+
 def value_has_offset_use(lines: list[str], values: set[str], negative: bool) -> bool:
     if not values:
         return False
@@ -471,10 +478,9 @@ def stack_semantic_for_access(
     ):
         labels.append("caller_frame")
 
-    if storage_role == "frame_pointer" and any(
-        value_has_direct_offset_use(function_lines, value, negative)
-        for negative in (True, False)
-    ) and len(derived_values) > 1:
+    if storage_role == "frame_pointer" and derived_values_include_phi(
+        function_lines, derived_values
+    ):
         labels.append("chunk_phi")
 
     return ",".join(dict.fromkeys(labels))

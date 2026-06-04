@@ -652,6 +652,8 @@ bool isFramePointerRegisterName(llvm::StringRef registerName);
 
 bool isKnownNoStackArgumentDeclaration(const llvm::Function &function);
 
+bool isKnownNoReturnDeclaration(const llvm::Function &function);
+
 std::set<std::string> stackFrameRegisterNames(const NativeAbiSpec &abi);
 
 struct DeclarationCallInputRewrite {
@@ -2050,6 +2052,11 @@ bool instructionWritesRegisterAccess(llvm::Instruction &instruction,
   return false;
 }
 
+bool isFunctionExitInstruction(llvm::Instruction *instruction) {
+  return llvm::isa<llvm::ReturnInst>(instruction) ||
+         llvm::isa<llvm::UnreachableInst>(instruction);
+}
+
 bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
     llvm::BasicBlock &block, const llvm::MDNode &access,
     std::set<llvm::BasicBlock *> &seen);
@@ -2059,7 +2066,7 @@ bool reachesReturnWithoutCallOrAccessLoad(llvm::Instruction *instruction,
                                           const llvm::MDNode &access,
                                           std::set<llvm::BasicBlock *> &seen) {
   while (instruction != nullptr) {
-    if (llvm::isa<llvm::ReturnInst>(instruction)) {
+    if (isFunctionExitInstruction(instruction)) {
       return true;
     }
     if (instructionWritesRegisterAccess(*instruction, access)) {
@@ -2085,7 +2092,7 @@ bool allSuccessorsReachReturnWithoutCallOrAccessLoad(
   if (terminator == nullptr) {
     return false;
   }
-  if (llvm::isa<llvm::ReturnInst>(terminator)) {
+  if (isFunctionExitInstruction(terminator)) {
     return true;
   }
   if (auto *call = llvm::dyn_cast<llvm::CallBase>(terminator)) {
@@ -2116,7 +2123,7 @@ bool storeIsDeadOnAllReturnPaths(llvm::StoreInst &store,
   seen.insert(store.getParent());
   llvm::Instruction *next = store.getNextNode();
   while (next != nullptr) {
-    if (llvm::isa<llvm::ReturnInst>(next)) {
+    if (isFunctionExitInstruction(next)) {
       return true;
     }
     if (instructionWritesRegisterAccess(*next, access)) {
@@ -2184,7 +2191,7 @@ bool allSuccessorsReachReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
   if (terminator == nullptr) {
     return false;
   }
-  if (llvm::isa<llvm::ReturnInst>(terminator)) {
+  if (isFunctionExitInstruction(terminator)) {
     return true;
   }
   if (auto *call = llvm::dyn_cast<llvm::CallBase>(terminator)) {
@@ -2213,7 +2220,7 @@ bool reachesReturnOrOverwriteWithoutCallOrAccessLoadRecursive(
     llvm::Instruction *instruction, llvm::BasicBlock &block,
     const llvm::MDNode &access, std::set<llvm::BasicBlock *> &seen) {
   while (instruction != nullptr) {
-    if (llvm::isa<llvm::ReturnInst>(instruction)) {
+    if (isFunctionExitInstruction(instruction)) {
       return true;
     }
     if (instructionWritesRegisterAccess(*instruction, access)) {
@@ -2280,7 +2287,7 @@ bool isKnownNoStackArgumentDeclaration(const llvm::Function &function) {
       function.arg_size() != 0) {
     return false;
   }
-  if (function.hasFnAttribute(llvm::Attribute::NoReturn)) {
+  if (isKnownNoReturnDeclaration(function)) {
     return true;
   }
   return llvm::StringSwitch<bool>(function.getName())
@@ -2293,6 +2300,50 @@ bool isKnownNoStackArgumentDeclaration(const llvm::Function &function) {
       .Case("strerror", true)
       .Case("zend_wrong_param_count", true)
       .Default(false);
+}
+
+bool isKnownNoReturnDeclaration(const llvm::Function &function) {
+  if (!function.isDeclaration() || function.isVarArg() ||
+      function.arg_size() != 0) {
+    return false;
+  }
+  if (function.hasFnAttribute(llvm::Attribute::NoReturn)) {
+    return true;
+  }
+  return llvm::StringSwitch<bool>(function.getName())
+      .Case("__stack_chk_fail", true)
+      .Default(false);
+}
+
+void truncateKnownNoReturnDeclarationCalls(llvm::Module &module) {
+  std::vector<std::pair<llvm::Instruction *, llvm::Function *>> truncatePoints;
+  for (llvm::Function &function : module.functions()) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call == nullptr || call->getNextNode() == nullptr) {
+          continue;
+        }
+        auto *callee = call->getCalledFunction();
+        if (callee == nullptr || !isKnownNoReturnDeclaration(*callee)) {
+          continue;
+        }
+        truncatePoints.push_back({call->getNextNode(), &function});
+        break;
+      }
+    }
+  }
+  std::set<llvm::Function *> changedFunctions;
+  for (auto [truncatePoint, function] : truncatePoints) {
+    llvm::changeToUnreachable(truncatePoint);
+    changedFunctions.insert(function);
+  }
+  for (llvm::Function *function : changedFunctions) {
+    llvm::removeUnreachableBlocks(*function);
+  }
 }
 
 bool canEraseUnusedDeclarationCallStackFrameRegisterStore(
@@ -4676,6 +4727,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
   if (options.RewriteSignatures) {
     NativePrototypeModuleRewriteSummary rewriteSummary =
         rewriteNativeRecoveredPrototypes(module);
+    truncateKnownNoReturnDeclarationCalls(module);
     rewriteDeclarationCallOutputs(module, model);
     rewriteDeclarationCallInputs(module, model);
     eraseRewrittenInternalCallInputStores(module);

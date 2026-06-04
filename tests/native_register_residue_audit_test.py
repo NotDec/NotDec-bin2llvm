@@ -263,6 +263,74 @@ declare void @__stack_chk_fail()
     assert "saved_register_restore" in by_name["RSP"].stack_semantic
 
 
+def test_stack_semantic_marks_chunk_phi_only_for_phi_derived_frame() -> None:
+    module = load_audit_module()
+    ir = """
+@RBP = external global i64, !notdec.register !0
+@FS_OFFSET = external global i64, !notdec.register !2
+
+define void @sample_direct_frame() {
+entry:
+  %rbp = load i64, ptr @RBP, align 8, !notdec.register.external_input !1
+  %canary_addr = add i64 %rbp, -24
+  %canary_ptr = inttoptr i64 %canary_addr to ptr
+  %canary = load i64, ptr %canary_ptr, align 1
+  %fs = load i64, ptr @FS_OFFSET, align 8, !notdec.register.access !3
+  %fs_canary_addr = add i64 %fs, 40
+  %fs_canary_ptr = inttoptr i64 %fs_canary_addr to ptr
+  %fs_canary = load i64, ptr %fs_canary_ptr, align 1
+  %ok = icmp eq i64 %canary, %fs_canary
+  br i1 %ok, label %done, label %fail
+
+done:
+  ret void
+
+fail:
+  call void @__stack_chk_fail()
+  ret void
+}
+
+define void @sample_phi_frame() {
+entry:
+  %rbp = load i64, ptr @RBP, align 8, !notdec.register.external_input !1
+  br label %body
+
+body:
+  %frame = phi i64 [ %rbp, %entry ], [ %frame, %loop ]
+  %canary_addr = add i64 %frame, -24
+  %canary_ptr = inttoptr i64 %canary_addr to ptr
+  %canary = load i64, ptr %canary_ptr, align 1
+  %fs = load i64, ptr @FS_OFFSET, align 8, !notdec.register.access !3
+  %fs_canary_addr = add i64 %fs, 40
+  %fs_canary_ptr = inttoptr i64 %fs_canary_addr to ptr
+  %fs_canary = load i64, ptr %fs_canary_ptr, align 1
+  %ok = icmp eq i64 %canary, %fs_canary
+  br i1 %ok, label %done, label %loop
+
+loop:
+  br label %body
+
+done:
+  ret void
+}
+
+declare void @__stack_chk_fail()
+
+!0 = !{!"space=register", !"offset=40", !"size=8", !"name=RBP"}
+!1 = !{!"name=RBP", ptr @RBP}
+!2 = !{!"space=register", !"offset=256", !"size=8", !"name=FS_OFFSET"}
+!3 = !{!"base=FS_OFFSET", !"space=register", !"offset=256", !"size=8", !"name=FS_OFFSET"}
+"""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "sample.ll"
+        path.write_text(ir, encoding="utf-8")
+        accesses = module.parse_accesses(path)
+
+    by_function = {access.function: access for access in accesses if access.name == "RBP"}
+    assert "chunk_phi" not in by_function["sample_direct_frame"].stack_semantic
+    assert "chunk_phi" in by_function["sample_phi_frame"].stack_semantic
+
+
 if __name__ == "__main__":
     test_register_access_summary_classifies_full_and_partial()
     test_register_access_details_include_residue_reason()
@@ -270,3 +338,4 @@ if __name__ == "__main__":
     test_callsite_input_store_can_have_stack_adjustment_before_call()
     test_nearby_call_kind_marks_defined_callee_as_internal()
     test_stack_semantic_labels_frame_and_caller_stack_patterns()
+    test_stack_semantic_marks_chunk_phi_only_for_phi_derived_frame()
