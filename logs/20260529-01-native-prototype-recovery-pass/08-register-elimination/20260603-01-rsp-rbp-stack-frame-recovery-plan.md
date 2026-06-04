@@ -3031,3 +3031,70 @@ after:   78
 | 实现效果 | 3 | `libuv` 上 RSP/RBP residue 从 178 降到 78，处理的是明确 no-return 子类。 |
 | 理解成本 | 1 | 只增加一个 libc no-return 名称。 |
 | 维护成本 | 1 | 风险低；如果后续从 ELF/ABI metadata 自动识别 no-return，可替换这份手工表。 |
+
+# 2026-06-04 技术决策点：普通外部声明 call-site 参数来源
+
+现象：
+
+- `abort` 处理后，`libuv:shared-library` 仍剩 78 行 `RSP/RBP` 明细。
+- 最大类仍是 `call_frame_state`：
+
+```text
+60 call_frame_state
+10 stack_frame_state
+4  saved_register_restore,call_frame_state
+2  frame_base_state
+2  chunk_phi
+```
+
+代表样例：
+
+```llvm
+define void @uv_mutex_lock() {
+entry:
+  %RSP.external_input = load i64, ptr @RSP
+  ...
+  store i64 %1, ptr @RSP
+  %2 = call i64 @pthread_mutex_lock()
+  ...
+}
+
+declare i64 @pthread_mutex_lock()
+```
+
+判断：
+
+- 这不是 `abort` 那种 no-return/no-stack 调用。
+- `pthread_mutex_lock` 真实 ABI 里有参数，但当前 IR 声明是 `i64 @pthread_mutex_lock()`，没有参数。
+- 现有 `rewriteDeclarationCallInputs()` 只能从 call 前的 register store 推断参数，比如 `store ..., @RDI`。
+- 这个样例 call 前只有 `RSP` store，没有 `RDI` store，所以它无法知道 `pthread_mutex_lock` 应该有 `RDI` 参数。
+- 因此，继续把 `pthread_*`、`fopen`、`send/recv` 加进 no-stack 白名单会删错真实 call-site 栈语义。
+
+具体涉及代码：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:832)
+  - `declarationInputParamsBeforeCall()` 只扫描 call 前的 register store。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativePrototypeRecovery.cpp:1025)
+  - `collectDeclarationCallInputRewrites()` 要求每个 declaration call 都能收集到输入集合，否则跳过。
+- [NativePrototypeModel.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativePrototypeModel.cpp:7)
+  - `NativePrototypeModel` 只提供 ABI storage slot 匹配，不提供 libc/pthread 这类外部符号的真实函数原型。
+
+下一步路线选择：
+
+1. 引入外部符号原型来源。
+   - 来源可以是 Ghidra data type manager / debug info / 手工最小表。
+   - 先只覆盖 Bench2 shared library 里反复出现的声明，比如 `pthread_mutex_lock(pthread_mutex_t*)`、`pthread_rwlock_*`、`send/recv`、`fopen`。
+   - 然后让 declaration rewrite 根据“已知外部原型”补参数，而不是只靠 call 前 store 反推。
+
+2. 对没有已知原型的普通 declaration，继续保守保留 call-frame `RSP`。
+   - 不把它们当 no-stack 删除。
+   - 不把 call 前 `RSP` store 转成本地 alloca。
+
+3. 同时继续分类 `stack_frame_state`、`frame_base_state`、`chunk_phi`。
+   - 这些更接近本地栈帧 / 函数 chunk 边界问题。
+   - 不应和普通外部声明参数缺失混在同一个 cleanup 里解决。
+
+当前结论：
+
+- 已经遇到明确路线决策：要继续清普通外部声明调用前的 `RSP`，需要先决定外部函数原型从哪里来。
+- 最保守、最符合语义的下一步，是加一个小的 external prototype provider，而不是扩大 no-stack 白名单。
