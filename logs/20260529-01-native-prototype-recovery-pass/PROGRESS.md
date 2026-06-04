@@ -692,6 +692,10 @@
     - 记录：`08-register-elimination/20260603-01-rsp-rbp-stack-frame-recovery-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-rsp-known-nostack-decl-gate`
+  - [x] 增加最小 external prototype provider：已知外部 declaration 可按 provider 参数个数和 ABI slot 补 register 参数，普通无 provider declaration 仍保守；`libuv:shared-library` 完整 gate 通过，`wolfssl` 已生成 signature-rewrite IR 通过 LLVM 22 verify，但 all-confirmed 超 18 分钟未完成。
+    - 记录：`08-register-elimination/20260604-01-external-prototype-provider-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-external-prototype-provider-gate`
 
 ## 记录规则
 

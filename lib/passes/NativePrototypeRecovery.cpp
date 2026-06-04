@@ -799,6 +799,90 @@ struct DeclarationCallInputRewrite {
 using DeclarationCallInputRewrites =
     std::map<llvm::Function *, std::vector<DeclarationCallInputRewrite>>;
 
+std::optional<uint64_t> knownExternalPrototypeInputCount(
+    llvm::StringRef functionName) {
+  // Small provider for Bench2 external declarations.  It carries only fixed
+  // integer/pointer input count; ABI storage still comes from NativeAbiSpec.
+  return llvm::StringSwitch<std::optional<uint64_t>>(functionName)
+      .Case("__tls_get_addr", 1)
+      .Case("chdir", 1)
+      .Case("fopen", 2)
+      .Case("gnu_get_libc_version", 0)
+      .Case("kill", 2)
+      .Case("pthread_barrier_destroy", 1)
+      .Case("pthread_barrier_wait", 1)
+      .Case("pthread_cond_broadcast", 1)
+      .Case("pthread_cond_destroy", 1)
+      .Case("pthread_cond_signal", 1)
+      .Case("pthread_cond_wait", 2)
+      .Case("pthread_join", 2)
+      .Case("pthread_mutex_destroy", 1)
+      .Case("pthread_mutex_lock", 1)
+      .Case("pthread_mutex_trylock", 1)
+      .Case("pthread_mutex_unlock", 1)
+      .Case("pthread_once", 2)
+      .Case("pthread_rwlock_destroy", 1)
+      .Case("pthread_rwlock_rdlock", 1)
+      .Case("pthread_rwlock_tryrdlock", 1)
+      .Case("pthread_rwlock_trywrlock", 1)
+      .Case("pthread_rwlock_unlock", 1)
+      .Case("pthread_rwlock_wrlock", 1)
+      .Case("recv", 4)
+      .Case("sched_getcpu", 0)
+      .Case("sem_post", 1)
+      .Case("send", 4)
+      .Case("strlen", 1)
+      .Case("unsetenv", 1)
+      .Default(std::nullopt);
+}
+
+std::optional<std::vector<NativeRecoveredPrototypeParam>>
+knownExternalPrototypeInputs(const llvm::Function &callee,
+                             const NativeAbiSpec &abi,
+                             const NativePrototypeModel &model) {
+  if (!callee.isDeclaration() || callee.isVarArg()) {
+    return std::nullopt;
+  }
+  std::optional<uint64_t> inputCount =
+      knownExternalPrototypeInputCount(callee.getName());
+  if (!inputCount) {
+    return std::nullopt;
+  }
+
+  std::vector<NativeRecoveredPrototypeParam> inputs;
+  inputs.reserve(*inputCount);
+  for (const NativeAbiParamEntry &entry : abi.Inputs) {
+    if (inputs.size() == *inputCount) {
+      break;
+    }
+    if (entry.Storage.Kind != NativeAbiStorageKind::Register) {
+      continue;
+    }
+    if (llvm::StringRef(entry.Storage.Name).starts_with("XMM")) {
+      continue;
+    }
+    if (entry.MaxSize < 8) {
+      continue;
+    }
+    std::optional<NativeStorageMatch> match =
+        model.findInputRegister(entry.Storage.Name);
+    if (!match) {
+      return std::nullopt;
+    }
+
+    NativeRecoveredPrototypeParam param;
+    param.RegisterName = entry.Storage.Name;
+    param.StorageKind = "register";
+    param.Size = 8;
+    param.Slot = match->Slot;
+    inputs.push_back(std::move(param));
+  }
+  if (inputs.size() != *inputCount) {
+    return std::nullopt;
+  }
+  return inputs;
+}
+
 std::optional<NativeRecoveredPrototypeParam> declarationInputParamForStore(
     llvm::StoreInst &store, const NativePrototypeModel &model) {
   llvm::MDNode *metadata = store.getMetadata("notdec.register.access");
@@ -988,6 +1072,99 @@ declarationInputSuffix(
   return suffix;
 }
 
+bool inferredDeclarationInputsFitProvider(
+    llvm::ArrayRef<NativeRecoveredPrototypeParam> inferredInputs,
+    llvm::ArrayRef<NativeRecoveredPrototypeParam> providerInputs) {
+  if (inferredInputs.size() > providerInputs.size()) {
+    return false;
+  }
+  std::set<uint64_t> providerSlots;
+  for (const NativeRecoveredPrototypeParam &input : providerInputs) {
+    providerSlots.insert(input.Slot);
+  }
+  for (const NativeRecoveredPrototypeParam &input : inferredInputs) {
+    if (providerSlots.find(input.Slot) == providerSlots.end()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::optional<std::vector<NativeRecoveredPrototypeParam>>
+providerDeclarationInputSuffix(
+    llvm::ArrayRef<NativeRecoveredPrototypeParam> existingInputs,
+    llvm::ArrayRef<NativeRecoveredPrototypeParam> providerInputs) {
+  if (existingInputs.size() >= providerInputs.size()) {
+    return std::nullopt;
+  }
+  for (uint64_t index = 0; index < existingInputs.size(); ++index) {
+    if (!sameDeclarationInputParam(existingInputs[index],
+                                   providerInputs[index])) {
+      return std::nullopt;
+    }
+  }
+  return std::vector<NativeRecoveredPrototypeParam>(
+      providerInputs.begin() + existingInputs.size(), providerInputs.end());
+}
+
+bool declarationTypeMatchesProviderInputs(
+    const llvm::Function &callee,
+    llvm::ArrayRef<NativeRecoveredPrototypeParam> inputs,
+    const NativePrototypeModel &model) {
+  if (callee.arg_size() != inputs.size()) {
+    return false;
+  }
+  for (uint64_t index = 0; index < inputs.size(); ++index) {
+    if (callee.getFunctionType()->getParamType(index) !=
+            llvm::Type::getInt64Ty(callee.getContext()) ||
+        !declarationInputParamMatchesAbi(inputs[index], model)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void annotateKnownExternalDeclarationPrototypes(
+    llvm::Module &module, const NativeAbiSpec &abi,
+    const NativePrototypeModel &model) {
+  for (llvm::Function &callee : module) {
+    std::optional<std::vector<NativeRecoveredPrototypeParam>> providerInputs =
+        knownExternalPrototypeInputs(callee, abi, model);
+    if (!providerInputs ||
+        !declarationTypeMatchesProviderInputs(callee, *providerInputs, model)) {
+      continue;
+    }
+
+    std::optional<NativeRecoveredPrototype> oldPrototype =
+        readNativeRecoveredPrototypeMetadata(callee);
+    if (oldPrototype && (!oldPrototype->Returns.empty() ||
+                         oldPrototype->ModelName != model.modelName() ||
+                         oldPrototype->Inputs.size() != providerInputs->size())) {
+      continue;
+    }
+    if (oldPrototype) {
+      bool sameInputs = true;
+      for (uint64_t index = 0; index < providerInputs->size(); ++index) {
+        if (!sameDeclarationInputParam(oldPrototype->Inputs[index],
+                                       (*providerInputs)[index])) {
+          sameInputs = false;
+          break;
+        }
+      }
+      if (!sameInputs) {
+        continue;
+      }
+    }
+
+    NativeRecoveredPrototype prototype;
+    prototype.ModelName = model.modelName();
+    prototype.Inputs = *providerInputs;
+    callee.setMetadata(
+        "notdec.prototype.recovered",
+        recoveredPrototypeMetadata(module.getContext(), prototype));
+  }
+}
+
 std::optional<DeclarationCallInputRewrite> declarationCallInputRewriteForCall(
     llvm::CallInst &call, uint64_t existingArgumentCount,
     llvm::ArrayRef<NativeRecoveredPrototypeParam> inputs) {
@@ -1022,10 +1199,58 @@ std::optional<DeclarationCallInputRewrite> declarationCallInputRewriteForCall(
 }
 
 DeclarationCallInputRewrites collectDeclarationCallInputRewrites(
-    llvm::Module &module, const NativePrototypeModel &model) {
+    llvm::Module &module, const NativeAbiSpec &abi,
+    const NativePrototypeModel &model) {
   DeclarationCallInputRewrites rewrites;
   for (llvm::Function &callee : module) {
     if (!callee.isDeclaration() || callee.isIntrinsic()) {
+      continue;
+    }
+
+    std::optional<std::vector<NativeRecoveredPrototypeParam>> providerInputs =
+        knownExternalPrototypeInputs(callee, abi, model);
+    if (providerInputs) {
+      std::optional<std::vector<NativeRecoveredPrototypeParam>> existingInputs =
+          existingDeclarationInputs(callee, model);
+      if (!existingInputs) {
+        continue;
+      }
+      std::optional<std::vector<NativeRecoveredPrototypeParam>> suffix =
+          providerDeclarationInputSuffix(*existingInputs, *providerInputs);
+      if (!suffix) {
+        continue;
+      }
+
+      std::vector<DeclarationCallInputRewrite> callRewrites;
+      bool safe = true;
+      for (llvm::User *user : callee.users()) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+        if (call == nullptr || call->getCalledFunction() != &callee ||
+            call->arg_size() != callee.arg_size() ||
+            call->getType() != callee.getReturnType()) {
+          safe = false;
+          break;
+        }
+        std::vector<NativeRecoveredPrototypeParam> inferredInputs =
+            declarationInputParamsBeforeCall(*call, model);
+        if (!inferredDeclarationInputsFitProvider(inferredInputs,
+                                                  *providerInputs)) {
+          safe = false;
+          break;
+        }
+        std::optional<DeclarationCallInputRewrite> rewrite =
+            declarationCallInputRewriteForCall(*call, existingInputs->size(),
+                                               *suffix);
+        if (!rewrite) {
+          safe = false;
+          break;
+        }
+        rewrite->Inputs = *providerInputs;
+        callRewrites.push_back(std::move(*rewrite));
+      }
+      if (safe && !callRewrites.empty()) {
+        rewrites[&callee] = std::move(callRewrites);
+      }
       continue;
     }
 
@@ -1112,10 +1337,11 @@ DeclarationCallInputRewrites collectDeclarationCallInputRewrites(
 }
 
 void rewriteDeclarationCallInputs(llvm::Module &module,
+                                  const NativeAbiSpec &abi,
                                   const NativePrototypeModel &model) {
   while (true) {
     DeclarationCallInputRewrites rewrites =
-        collectDeclarationCallInputRewrites(module, model);
+        collectDeclarationCallInputRewrites(module, abi, model);
     if (rewrites.empty()) {
       break;
     }
@@ -5778,7 +6004,8 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
         rewriteNativeRecoveredPrototypes(module);
     truncateKnownNoReturnDeclarationCalls(module);
     rewriteDeclarationCallOutputs(module, model);
-    rewriteDeclarationCallInputs(module, model);
+    rewriteDeclarationCallInputs(module, *abi, model);
+    annotateKnownExternalDeclarationPrototypes(module, *abi, model);
     eraseRewrittenInternalCallInputStores(module);
     eraseDeadKilledByCallRegisterStores(module, *abi);
     eraseUnusedInternalCallKilledInputStores(module, *abi);

@@ -168,6 +168,17 @@ void attachThreeInputTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachXmmFirstInputTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+  abi.Inputs.push_back(inputRegister("XMM0_Qa"));
+  abi.Inputs.push_back(inputRegister("XMM1_Qa"));
+  abi.Inputs.push_back(inputRegister("RDI"));
+  abi.Inputs.push_back(inputRegister("RSI"));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 void attachFourInputTestAbi(llvm::Module &module) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__stdcall";
@@ -256,6 +267,24 @@ void attachStackFramePreservedTestAbi(llvm::Module &module) {
   abi.StackPointerRegister = "RSP";
   abi.StackPointerSpace = "register";
   abi.Outputs.push_back(inputRegister("RAX"));
+
+  for (llvm::StringRef registerName : {"RSP", "RBP", "RBX"}) {
+    notdec::bin2llvm::NativeAbiEffect unaffected;
+    unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
+    unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    unaffected.Storage.Name = registerName.str();
+    abi.Effects.push_back(std::move(unaffected));
+  }
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
+void attachStackFrameInputTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__stdcall";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  abi.Inputs.push_back(inputRegister("RDI"));
 
   for (llvm::StringRef registerName : {"RSP", "RBP", "RBX"}) {
     notdec::bin2llvm::NativeAbiEffect unaffected;
@@ -3611,6 +3640,32 @@ bool hasRegisterExternalInputLoad(const llvm::Function &function,
         if (field != nullptr && field->getString() == expected) {
           return true;
         }
+      }
+    }
+  }
+  return false;
+}
+
+bool valueHasRegisterName(llvm::Value &value, llvm::StringRef name) {
+  std::string expected = ("name=" + name).str();
+  if (auto *argument = llvm::dyn_cast<llvm::Argument>(&value)) {
+    return argument->hasName() &&
+           argument->getName().starts_with((name + ".").str());
+  }
+  auto *instruction = llvm::dyn_cast<llvm::Instruction>(&value);
+  if (instruction == nullptr) {
+    return false;
+  }
+  for (llvm::StringRef metadataName :
+       {"notdec.register.external_input", "notdec.register.access"}) {
+    llvm::MDNode *metadata = instruction->getMetadata(metadataName);
+    if (metadata == nullptr) {
+      continue;
+    }
+    for (const llvm::MDOperand &operand : metadata->operands()) {
+      auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+      if (field != nullptr && field->getString() == expected) {
+        return true;
       }
     }
   }
@@ -7275,6 +7330,216 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  llvm::Module declarationCallInputProviderModule(
+      "native-prototype-declaration-call-input-provider-test", context);
+  llvm::GlobalVariable *declarationCallInputProviderRdi =
+      createRegisterGlobal(declarationCallInputProviderModule, "RDI");
+  attachXmmFirstInputTestAbi(declarationCallInputProviderModule);
+  auto *declarationCallInputProviderCalleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *declarationCallInputProviderCallee =
+      llvm::Function::Create(declarationCallInputProviderCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "pthread_mutex_lock",
+                             declarationCallInputProviderModule);
+  auto *declarationCallInputProviderUserType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputProviderUser = llvm::Function::Create(
+      declarationCallInputProviderUserType, llvm::GlobalValue::ExternalLinkage,
+      "declaration_call_input_provider_user",
+      declarationCallInputProviderModule);
+  llvm::LoadInst *declarationCallInputProviderEntryRdi = nullptr;
+  {
+    llvm::BasicBlock *entry = llvm::BasicBlock::Create(
+        context, "entry", declarationCallInputProviderUser);
+    llvm::IRBuilder<> builder(entry);
+    declarationCallInputProviderEntryRdi =
+        createExternalInputLoad(builder, declarationCallInputProviderRdi, "RDI");
+    builder.CreateAdd(declarationCallInputProviderEntryRdi,
+                      llvm::ConstantInt::get(i64Param, 1));
+    builder.CreateCall(declarationCallInputProviderCallee->getFunctionType(),
+                       declarationCallInputProviderCallee);
+    builder.CreateRetVoid();
+  }
+  attachExternalInputs(*declarationCallInputProviderUser,
+                       {{"RDI", declarationCallInputProviderRdi}});
+  notdec::bin2llvm::NativePrototypeRecoveryOptions providerInputOptions;
+  providerInputOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputProviderModule, providerInputOptions);
+  llvm::Function *providerCalleeAfterRewrite =
+      declarationCallInputProviderModule.getFunction("pthread_mutex_lock");
+  ok &= expect(providerCalleeAfterRewrite != nullptr &&
+                   functionTypeShape(
+                       *providerCalleeAfterRewrite->getFunctionType(),
+                       llvm::Type::getInt64Ty(context),
+                       llvm::ArrayRef<llvm::Type *>{i64Param}),
+               "provider declaration input rewrite did not add RDI argument");
+  declarationCallInputProviderUser =
+      declarationCallInputProviderModule.getFunction(
+          "declaration_call_input_provider_user");
+  llvm::CallInst *declarationCallInputProviderNewCall =
+      firstCallTo(*declarationCallInputProviderUser, "pthread_mutex_lock");
+  ok &= expect(declarationCallInputProviderNewCall != nullptr &&
+                   declarationCallInputProviderNewCall->arg_size() == 1,
+               "provider declaration input rewrite did not update call");
+  std::optional<notdec::bin2llvm::NativeRecoveredPrototype> providerPrototype =
+      providerCalleeAfterRewrite != nullptr
+          ? notdec::bin2llvm::readNativeRecoveredPrototypeMetadata(
+                *providerCalleeAfterRewrite)
+          : std::nullopt;
+  ok &= expect(providerPrototype && providerPrototype->Inputs.size() == 1 &&
+                   recoveredPrototypeParamAt(providerPrototype->Inputs, 0,
+                                             "RDI"),
+               "provider declaration input rewrite did not choose GPR RDI");
+  ok &= expect(declarationCallInputProviderNewCall != nullptr &&
+                   valueHasRegisterName(
+                       *declarationCallInputProviderNewCall->getArgOperand(0),
+                       "RDI"),
+               "provider declaration input rewrite did not use GPR RDI");
+  if (llvm::verifyModule(declarationCallInputProviderModule, &llvm::errs())) {
+    std::cerr << "declaration call input provider module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputProviderSkipModule(
+      "native-prototype-declaration-call-input-provider-skip-test", context);
+  llvm::GlobalVariable *declarationCallInputProviderSkipRdi =
+      createRegisterGlobal(declarationCallInputProviderSkipModule, "RDI");
+  llvm::GlobalVariable *declarationCallInputProviderSkipRsi =
+      createRegisterGlobal(declarationCallInputProviderSkipModule, "RSI");
+  attachTestAbi(declarationCallInputProviderSkipModule);
+  auto *declarationCallInputProviderSkipCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputProviderSkipCallee =
+      llvm::Function::Create(declarationCallInputProviderSkipCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "pthread_mutex_unlock",
+                             declarationCallInputProviderSkipModule);
+  auto *declarationCallInputProviderSkipUserType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputProviderSkipUser =
+      llvm::Function::Create(declarationCallInputProviderSkipUserType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_provider_skip_user",
+                             declarationCallInputProviderSkipModule);
+  {
+    llvm::BasicBlock *entry = llvm::BasicBlock::Create(
+        context, "entry", declarationCallInputProviderSkipUser);
+    llvm::IRBuilder<> builder(entry);
+    llvm::StoreInst *rdiStore =
+        builder.CreateStore(llvm::ConstantInt::get(i64Param, 0x1111),
+                            declarationCallInputProviderSkipRdi);
+    rdiStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, "RDI"));
+    llvm::StoreInst *rsiStore =
+        builder.CreateStore(llvm::ConstantInt::get(i64Param, 0x2222),
+                            declarationCallInputProviderSkipRsi);
+    rsiStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, "RSI"));
+    builder.CreateCall(
+        declarationCallInputProviderSkipCallee->getFunctionType(),
+        declarationCallInputProviderSkipCallee);
+    builder.CreateRetVoid();
+  }
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputProviderSkipModule, providerInputOptions);
+  llvm::Function *providerSkipCalleeAfterRewrite =
+      declarationCallInputProviderSkipModule.getFunction(
+          "pthread_mutex_unlock");
+  ok &= expect(providerSkipCalleeAfterRewrite != nullptr &&
+                   providerSkipCalleeAfterRewrite->arg_size() == 0,
+               "provider declaration input rewrite ignored extra inferred input");
+  ok &= expect(declarationCallInputProviderSkipUser != nullptr &&
+                   hasRegisterStore(*declarationCallInputProviderSkipUser,
+                                    "RDI") &&
+                   hasRegisterStore(*declarationCallInputProviderSkipUser,
+                                    "RSI"),
+               "provider declaration input skip erased input stores");
+  if (llvm::verifyModule(declarationCallInputProviderSkipModule,
+                         &llvm::errs())) {
+    std::cerr << "declaration call input provider skip module verification "
+                 "failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputProviderRspModule(
+      "native-prototype-declaration-call-input-provider-rsp-test", context);
+  llvm::GlobalVariable *declarationCallInputProviderRsp =
+      createRegisterGlobal(declarationCallInputProviderRspModule, "RSP");
+  createRegisterGlobal(declarationCallInputProviderRspModule, "RDI");
+  attachStackFrameInputTestAbi(declarationCallInputProviderRspModule);
+  llvm::Function *declarationCallInputProviderRspCallee = nullptr;
+  llvm::Function *declarationCallInputProviderRspCaller =
+      createDeclarationStackFrameRegisterStoreCallerFunction(
+          declarationCallInputProviderRspModule,
+          "declaration_call_input_provider_rsp_user",
+          declarationCallInputProviderRsp, "RSP", false, false,
+          &declarationCallInputProviderRspCallee);
+  declarationCallInputProviderRspCallee->setName("pthread_mutex_lock");
+  declarationCallInputProviderRspCaller->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {}));
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputProviderRspModule, providerInputOptions);
+  llvm::Function *providerRspCalleeAfterRewrite =
+      declarationCallInputProviderRspModule.getFunction("pthread_mutex_lock");
+  ok &= expect(providerRspCalleeAfterRewrite != nullptr &&
+                   functionTypeShape(
+                       *providerRspCalleeAfterRewrite->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef<llvm::Type *>{i64Param}),
+               "provider RSP declaration rewrite did not add RDI argument");
+  ok &= expect(!hasRegisterStore(*declarationCallInputProviderRspCaller,
+                                 "RSP"),
+               "provider declaration call kept old RSP store");
+  ok &= expect(!hasRegisterExternalInputLoad(
+                   *declarationCallInputProviderRspCaller, "RSP"),
+               "provider declaration call kept dead RSP external input");
+  if (llvm::verifyModule(declarationCallInputProviderRspModule,
+                         &llvm::errs())) {
+    std::cerr << "declaration call input provider RSP module verification "
+                 "failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputProviderNoInputRspModule(
+      "native-prototype-declaration-call-input-provider-no-input-rsp-test",
+      context);
+  llvm::GlobalVariable *declarationCallInputProviderNoInputRsp =
+      createRegisterGlobal(declarationCallInputProviderNoInputRspModule, "RSP");
+  attachStackFrameInputTestAbi(declarationCallInputProviderNoInputRspModule);
+  llvm::Function *declarationCallInputProviderNoInputRspCallee = nullptr;
+  llvm::Function *declarationCallInputProviderNoInputRspCaller =
+      createDeclarationStackFrameRegisterStoreCallerFunction(
+          declarationCallInputProviderNoInputRspModule,
+          "declaration_call_input_provider_no_input_rsp_user",
+          declarationCallInputProviderNoInputRsp, "RSP", false, false,
+          &declarationCallInputProviderNoInputRspCallee);
+  declarationCallInputProviderNoInputRspCallee->setName("sched_getcpu");
+  declarationCallInputProviderNoInputRspCaller->setMetadata(
+      "notdec.prototype.recovered",
+      makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {}));
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputProviderNoInputRspModule, providerInputOptions);
+  llvm::Function *providerNoInputRspCalleeAfterRewrite =
+      declarationCallInputProviderNoInputRspModule.getFunction("sched_getcpu");
+  ok &= expect(providerNoInputRspCalleeAfterRewrite != nullptr &&
+                   providerNoInputRspCalleeAfterRewrite->arg_size() == 0,
+               "provider zero-input declaration changed call arity");
+  ok &= expect(!hasRegisterStore(
+                   *declarationCallInputProviderNoInputRspCaller, "RSP"),
+               "provider zero-input declaration call kept old RSP store");
+  ok &= expect(!hasRegisterExternalInputLoad(
+                   *declarationCallInputProviderNoInputRspCaller, "RSP"),
+               "provider zero-input declaration call kept dead RSP input");
+  if (llvm::verifyModule(declarationCallInputProviderNoInputRspModule,
+                         &llvm::errs())) {
+    std::cerr << "declaration call input provider zero-input RSP module "
+                 "verification failed\n";
+    return EXIT_FAILURE;
+  }
+
   llvm::Module inputReturnCallsiteModule(
       "native-prototype-input-return-callsite-rewrite-test", context);
   llvm::GlobalVariable *inputReturnCallsiteRdi =
@@ -9604,6 +9869,13 @@ int main() {
           declarationRsp, "RSP", false, false,
           &libcNoStackDeclarationRspCallee);
   libcNoStackDeclarationRspCallee->setName("__errno_location");
+  llvm::Function *providerNoStackDeclarationRspCallee = nullptr;
+  llvm::Function *providerNoStackDeclarationRspCaller =
+      createDeclarationStackFrameRegisterStoreCallerFunction(
+          declarationRspStoreModule, "provider_nostack_declaration_rsp_store",
+          declarationRsp, "RSP", false, false,
+          &providerNoStackDeclarationRspCallee);
+  providerNoStackDeclarationRspCallee->setName("sched_getcpu");
   llvm::Function *branchKnownNoStackRspCallee = nullptr;
   llvm::Function *branchKnownNoStackRspCaller =
       createBranchDeclarationRspStoreCallerFunction(
@@ -9647,7 +9919,7 @@ int main() {
         noMetadataDeclarationRspCaller, noReturnDeclarationRspCaller,
         abortDeclarationRspCaller,
         knownNoStackDeclarationRspCaller, libcNoStackDeclarationRspCaller,
-        branchKnownNoStackRspCaller,
+        providerNoStackDeclarationRspCaller, branchKnownNoStackRspCaller,
         branchUnknownRspCaller, callerReadsDeclarationRspCaller,
         deadDeclarationRbpCaller, noMetadataDeclarationRbpCaller,
         callerReadsDeclarationRbpCaller, deadDeclarationFrameBaseCaller}) {
@@ -9682,6 +9954,8 @@ int main() {
                "abort declaration call RSP store was not removed");
   ok &= expect(!hasRegisterExternalInputLoad(*abortDeclarationRspCaller, "RSP"),
                "abort declaration call kept dead RSP external input");
+  ok &= expect(!hasRegisterStore(*providerNoStackDeclarationRspCaller, "RSP"),
+               "provider no-stack declaration call RSP store was not removed");
   ok &= expect(!hasRegisterStore(*knownNoStackDeclarationRspCaller, "RSP"),
                "known no-stack declaration call RSP store was not removed");
   ok &= expect(!hasRegisterExternalInputLoad(*knownNoStackDeclarationRspCaller,
