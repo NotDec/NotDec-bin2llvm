@@ -3913,6 +3913,84 @@ void eraseDeadStackFrameRegisterStores(llvm::Module &module,
   }
 }
 
+bool functionHasRegisterLoad(llvm::Function &function,
+                             llvm::StringRef registerName) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (load != nullptr && loadReadsRegisterName(*load, registerName)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool functionCallsMayReadRegister(llvm::Function &function,
+                                  llvm::StringRef registerName) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+      if (call != nullptr &&
+          callMayReadRegisterNameForDeadFrameStore(*call, registerName)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void eraseDeadFrameBaseRegisterStores(llvm::Module &module,
+                                      const NativeAbiSpec &abi) {
+  if (abi.StackPointerRegister.empty()) {
+    return;
+  }
+
+  for (const NativeAbiEffect &effect : abi.Effects) {
+    if (effect.Kind != NativeAbiEffectKind::Unaffected ||
+        effect.Storage.Kind != NativeAbiStorageKind::Register ||
+        !isFramePointerRegisterName(effect.Storage.Name)) {
+      continue;
+    }
+
+    for (llvm::Function &function : module) {
+      if (function.isDeclaration()) {
+        continue;
+      }
+      NativePrototypeRewriteEligibility eligibility =
+          getNativePrototypeRewriteEligibility(function);
+      if (!eligibility.Eligible || eligibility.NeedsRewrite ||
+          functionHasRegisterLoad(function, effect.Storage.Name) ||
+          functionCallsMayReadRegister(function, effect.Storage.Name)) {
+        continue;
+      }
+
+      std::vector<llvm::StoreInst *> deadStores;
+      for (llvm::BasicBlock &block : function) {
+        for (llvm::Instruction &instruction : block) {
+          auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+          if (store == nullptr) {
+            continue;
+          }
+          llvm::MDNode *access = store->getMetadata("notdec.register.access");
+          if (access != nullptr &&
+              accessMatchesEffectRegister(*access, effect.Storage.Name) &&
+              valueUsesExternalInputRegister(*store->getValueOperand(),
+                                             abi.StackPointerRegister)) {
+            deadStores.push_back(store);
+          }
+        }
+      }
+
+      for (llvm::StoreInst *store : deadStores) {
+        llvm::Value *storedValue = store->getValueOperand();
+        store->eraseFromParent();
+        llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
+      }
+    }
+  }
+}
+
 void eraseDeadNonReturnVectorStores(llvm::Module &module) {
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
@@ -6098,6 +6176,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     eraseUnusedRawStackFrameLoads(module, *abi);
     eraseDeadStackFrameRegisterStores(module, *abi);
     replaceStoredFramePointerRegisterLoads(module, *abi);
+    eraseDeadFrameBaseRegisterStores(module, *abi);
     eraseUnusedRawStackFrameLoads(module, *abi);
     eraseDeadStackFrameRegisterStores(module, *abi);
     eraseDeadNativeStackAllocas(module);

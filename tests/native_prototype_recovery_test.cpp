@@ -9969,6 +9969,11 @@ int main() {
       createDeclarationFrameBaseStoreCallerFunction(
           declarationRspStoreModule, "dead_declaration_frame_base_store",
           declarationRsp, declarationRbp, &deadDeclarationFrameBaseCallee);
+  llvm::Function *deadLocalFrameBaseCallee = nullptr;
+  llvm::Function *deadLocalFrameBaseCaller =
+      createDeclarationFrameBaseStoreCallerFunction(
+          declarationRspStoreModule, "dead_local_frame_base_store",
+          declarationRsp, declarationRbp, &deadLocalFrameBaseCallee);
   for (llvm::Function *function :
        {deadDeclarationRspCaller, branchDeclarationRspCaller,
         noMetadataDeclarationRspCaller, noReturnDeclarationRspCaller,
@@ -9978,7 +9983,8 @@ int main() {
         returningRawFrameCaller, branchKnownNoStackRspCaller,
         branchUnknownRspCaller, callerReadsDeclarationRspCaller,
         deadDeclarationRbpCaller, noMetadataDeclarationRbpCaller,
-        callerReadsDeclarationRbpCaller, deadDeclarationFrameBaseCaller}) {
+        callerReadsDeclarationRbpCaller, deadDeclarationFrameBaseCaller,
+        deadLocalFrameBaseCaller}) {
     function->setMetadata(
         "notdec.prototype.recovered",
         makeRecoveredPrototypeMetadata(context, "__stdcall", {}, {}));
@@ -10061,6 +10067,10 @@ int main() {
                                              "RSP"),
                "dead declaration call frame-base store kept dead RSP external "
                "input");
+  ok &= expect(!hasRegisterStore(*deadLocalFrameBaseCaller, "RBP"),
+               "dead local frame-base RBP store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*deadLocalFrameBaseCaller, "RSP"),
+               "dead local frame-base store kept dead RSP external input");
   if (llvm::verifyModule(declarationRspStoreModule, &llvm::errs())) {
     std::cerr << "declaration RSP store module verification failed after "
                  "prototype rewrite\n";

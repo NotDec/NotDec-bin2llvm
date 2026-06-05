@@ -700,6 +700,10 @@
     - 记录：`08-register-elimination/20260605-01-noreturn-call-frame-state-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-noreturn-call-frame-gate`
+  - [x] 清理死 frame-base `RBP` store：没有真实 `RBP` load、call 不读 `RBP`、且 store value 来自 `RSP.external_input` 时删除；`libuv:shared-library` 完整 gate 通过，`frame_base_state` 清零，`RSP/RBP` 明细从 15 行降到 13 行。
+    - 记录：`08-register-elimination/20260605-02-dead-frame-base-store-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-dead-frame-base-gate2`
 
 ## 记录规则
 
