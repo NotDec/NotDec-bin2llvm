@@ -696,6 +696,10 @@
     - 记录：`08-register-elimination/20260604-01-external-prototype-provider-plan.md`
     - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
     - 输出：`/tmp/notdec-bin2llvm-external-prototype-provider-gate`
+  - [x] 清理 `__assert_fail` 这类 no-return declaration 前的 raw call-frame return-address store，并放开对应 `RSP` 活性；`libuv:shared-library` 完整 gate 通过，`RSP/RBP` 明细从 29 行降到 15 行。
+    - 记录：`08-register-elimination/20260605-01-noreturn-call-frame-state-plan.md`
+    - 文件：`lib/passes/NativePrototypeRecovery.cpp`、`tests/native_prototype_recovery_test.cpp`
+    - 输出：`/tmp/notdec-bin2llvm-noreturn-call-frame-gate`
 
 ## 记录规则
 

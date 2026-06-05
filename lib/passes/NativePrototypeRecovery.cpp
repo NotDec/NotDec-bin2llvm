@@ -72,6 +72,8 @@ std::optional<uint64_t> memoryAccessSize(const llvm::DataLayout &layout,
 
 bool callMayReadRegisterName(llvm::CallBase &call, llvm::StringRef registerName);
 
+bool isNoReturnDeclarationWithExplicitArguments(const llvm::Function &function);
+
 bool storeIsDeadOnAllReturnPaths(
     llvm::StoreInst &store, const llvm::MDNode &access,
     llvm::function_ref<bool(llvm::CallBase &, llvm::StringRef)> mayReadName);
@@ -2414,6 +2416,10 @@ bool callMayReadRegisterName(llvm::CallBase &call,
     return false;
   }
   if (callee->isDeclaration()) {
+    if (registerName == "RSP" &&
+        isNoReturnDeclarationWithExplicitArguments(*callee)) {
+      return false;
+    }
     return !(registerName == "RSP" &&
              isKnownNoStackArgumentDeclaration(*callee));
   }
@@ -2814,6 +2820,81 @@ void truncateKnownNoReturnDeclarationCalls(llvm::Module &module) {
   }
   for (llvm::Function *function : changedFunctions) {
     llvm::removeUnreachableBlocks(*function);
+  }
+}
+
+bool isNoReturnDeclarationWithExplicitArguments(const llvm::Function &function) {
+  if (!function.isDeclaration() || function.isVarArg()) {
+    return false;
+  }
+  if (function.hasFnAttribute(llvm::Attribute::NoReturn)) {
+    return true;
+  }
+  return llvm::StringSwitch<bool>(function.getName())
+      .Case("__assert_fail", true)
+      .Default(false);
+}
+
+bool isRawStackFrameReturnAddressStore(llvm::StoreInst &store,
+                                       const NativeAbiSpec &abi) {
+  if (store.isVolatile() || store.isAtomic()) {
+    return false;
+  }
+  auto *storedValue = llvm::dyn_cast<llvm::ConstantInt>(store.getValueOperand());
+  if (storedValue == nullptr || storedValue->getBitWidth() > 64) {
+    return false;
+  }
+  auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(
+      store.getPointerOperand()->stripPointerCasts());
+  if (pointer == nullptr) {
+    return false;
+  }
+  return valueIsStackFrameExternalInputDerived(*pointer->getOperand(0), abi);
+}
+
+void eraseNoReturnDeclarationCallFrameStores(llvm::Module &module,
+                                             const NativeAbiSpec &abi) {
+  std::vector<llvm::StoreInst *> deadStores;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    NativePrototypeRewriteEligibility eligibility =
+        getNativePrototypeRewriteEligibility(function);
+    if (!eligibility.Eligible || eligibility.NeedsRewrite) {
+      continue;
+    }
+
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call == nullptr || call->arg_empty()) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr ||
+            !isNoReturnDeclarationWithExplicitArguments(*callee)) {
+          continue;
+        }
+        llvm::Instruction *previous = call->getPrevNode();
+        if (previous == nullptr) {
+          continue;
+        }
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(previous);
+        if (store != nullptr && isRawStackFrameReturnAddressStore(*store, abi)) {
+          deadStores.push_back(store);
+        }
+      }
+    }
+  }
+
+  std::set<llvm::StoreInst *> uniqueStores(deadStores.begin(), deadStores.end());
+  for (llvm::StoreInst *store : uniqueStores) {
+    llvm::Value *storedValue = store->getValueOperand();
+    llvm::Value *pointer = store->getPointerOperand();
+    store->eraseFromParent();
+    llvm::RecursivelyDeleteTriviallyDeadInstructions(pointer);
+    llvm::RecursivelyDeleteTriviallyDeadInstructions(storedValue);
   }
 }
 
@@ -6003,6 +6084,7 @@ NativePrototypeRecoverySummary runNativePrototypeRecovery(
     NativePrototypeModuleRewriteSummary rewriteSummary =
         rewriteNativeRecoveredPrototypes(module);
     truncateKnownNoReturnDeclarationCalls(module);
+    eraseNoReturnDeclarationCallFrameStores(module, *abi);
     rewriteDeclarationCallOutputs(module, model);
     rewriteDeclarationCallInputs(module, *abi, model);
     annotateKnownExternalDeclarationPrototypes(module, *abi, model);

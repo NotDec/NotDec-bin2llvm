@@ -2712,6 +2712,50 @@ llvm::Function *createDeclarationStackFrameRegisterStoreCallerFunction(
   return caller;
 }
 
+llvm::Function *createDeclarationRawCallFrameStoreCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
+    llvm::StringRef calleeName, bool noReturnCallee,
+    llvm::Function **calleeOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *i64 = llvm::Type::getInt64Ty(context);
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                              llvm::ArrayRef<llvm::Type *>{i64, i64, i64},
+                              false);
+  llvm::Function *callee = module.getFunction(calleeName);
+  if (callee == nullptr) {
+    callee = llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                                    calleeName, module);
+  }
+  if (noReturnCallee) {
+    callee->addFnAttr(llvm::Attribute::NoReturn);
+  }
+
+  auto *callerType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *caller =
+      llvm::Function::Create(callerType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *base = createExternalInputLoad(builder, rsp, "RSP");
+  llvm::Value *adjusted = builder.CreateAdd(
+      base, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::StoreInst *stackStore = builder.CreateStore(adjusted, rsp);
+  stackStore->setMetadata("notdec.register.access",
+                          registerAccessMetadata(context, "RSP"));
+  llvm::Value *returnAddressPointer =
+      builder.CreateIntToPtr(adjusted, llvm::PointerType::getUnqual(context));
+  builder.CreateStore(llvm::ConstantInt::get(i64, 0xabc), returnAddressPointer);
+  builder.CreateCall(callee->getFunctionType(), callee,
+                     {llvm::ConstantInt::get(i64, 1),
+                      llvm::ConstantInt::get(i64, 2),
+                      llvm::ConstantInt::get(i64, 3)});
+  builder.CreateRetVoid();
+
+  *calleeOut = callee;
+  return caller;
+}
+
 llvm::Function *createDeclarationFrameBaseStoreCallerFunction(
     llvm::Module &module, const std::string &name, llvm::GlobalVariable *rsp,
     llvm::GlobalVariable *rbp, llvm::Function **calleeOut) {
@@ -9876,6 +9920,17 @@ int main() {
           declarationRsp, "RSP", false, false,
           &providerNoStackDeclarationRspCallee);
   providerNoStackDeclarationRspCallee->setName("sched_getcpu");
+  llvm::Function *assertFailRawFrameCallee = nullptr;
+  llvm::Function *assertFailRawFrameCaller =
+      createDeclarationRawCallFrameStoreCallerFunction(
+          declarationRspStoreModule, "assert_fail_raw_call_frame_store",
+          declarationRsp, "__assert_fail", false, &assertFailRawFrameCallee);
+  llvm::Function *returningRawFrameCallee = nullptr;
+  llvm::Function *returningRawFrameCaller =
+      createDeclarationRawCallFrameStoreCallerFunction(
+          declarationRspStoreModule, "returning_raw_call_frame_store",
+          declarationRsp, "returning_raw_frame_callee", false,
+          &returningRawFrameCallee);
   llvm::Function *branchKnownNoStackRspCallee = nullptr;
   llvm::Function *branchKnownNoStackRspCaller =
       createBranchDeclarationRspStoreCallerFunction(
@@ -9919,7 +9974,8 @@ int main() {
         noMetadataDeclarationRspCaller, noReturnDeclarationRspCaller,
         abortDeclarationRspCaller,
         knownNoStackDeclarationRspCaller, libcNoStackDeclarationRspCaller,
-        providerNoStackDeclarationRspCaller, branchKnownNoStackRspCaller,
+        providerNoStackDeclarationRspCaller, assertFailRawFrameCaller,
+        returningRawFrameCaller, branchKnownNoStackRspCaller,
         branchUnknownRspCaller, callerReadsDeclarationRspCaller,
         deadDeclarationRbpCaller, noMetadataDeclarationRbpCaller,
         callerReadsDeclarationRbpCaller, deadDeclarationFrameBaseCaller}) {
@@ -9956,6 +10012,14 @@ int main() {
                "abort declaration call kept dead RSP external input");
   ok &= expect(!hasRegisterStore(*providerNoStackDeclarationRspCaller, "RSP"),
                "provider no-stack declaration call RSP store was not removed");
+  ok &= expect(!hasRegisterStore(*assertFailRawFrameCaller, "RSP"),
+               "__assert_fail raw call-frame RSP store was not removed");
+  ok &= expect(!hasRegisterExternalInputLoad(*assertFailRawFrameCaller, "RSP"),
+               "__assert_fail raw call-frame kept dead RSP external input");
+  ok &= expect(!hasIntToPtr(*assertFailRawFrameCaller),
+               "__assert_fail raw call-frame kept return-address pointer");
+  ok &= expect(hasRegisterStore(*returningRawFrameCaller, "RSP"),
+               "returning raw call-frame RSP store was removed");
   ok &= expect(!hasRegisterStore(*knownNoStackDeclarationRspCaller, "RSP"),
                "known no-stack declaration call RSP store was not removed");
   ok &= expect(!hasRegisterExternalInputLoad(*knownNoStackDeclarationRspCaller,
