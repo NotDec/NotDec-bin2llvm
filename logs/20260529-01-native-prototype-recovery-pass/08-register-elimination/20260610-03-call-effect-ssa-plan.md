@@ -1364,3 +1364,106 @@ ctest --test-dir /tmp/notdec-bin2llvm-build \
 - 实现效果：2/10。只减少字符串重复构造，不改变 IR 语义。
 - 复杂度：1/10。只新增一个缓存结构。
 - 维护成本：1/10。`CallsiteInfo` 后续也可承载更多 callsite 事实。
+
+## 2026-06-10 实现记录：prototype recovery 消费 call return effect
+
+本次推进阶段 5 的一个明确缺口：register SSA 后，`call; load RAX` 可能已经变成 `call; %RAX.return.call_effect = freeze undef`。prototype recovery 的 direct callsite return rewrite 之前只认识旧的寄存器 load，现在补上同 block `kind=return` call effect value。
+
+### 改动
+
+- `lib/passes/NativePrototypeRecovery.cpp:4938`
+  - `ReturnLoadSearchResult` 增加 `Value`。
+  - 旧 `Load` 仍保留给 shared-successor PHI 路径用。
+
+- `lib/passes/NativePrototypeRecovery.cpp:5098`
+  - 新增 `isReturnCallEffectValue()`。
+  - 只接受 metadata 同时满足 `kind=return` 和 `register=<return register>` 的 instruction。
+  - `clobber_unknown` / `unknown_effect` 不会被当成 return load。
+
+- `lib/passes/NativePrototypeRecovery.cpp:5118`
+  - `findReturnLoadBeforeStoreInRange()` 在旧 register access load/store 判断前，先识别同 block 的 return call effect value。
+
+- `lib/passes/NativePrototypeRecovery.cpp:5417`
+  - `rewriteCallsiteReturnLoad()` 改为替换 `result.Value`。
+  - 如果仍是旧 load，行为不变；如果是 call effect instruction，则直接用新 typed call result 替换它。
+
+- `lib/passes/NativePrototypeRecovery.cpp:4979`
+  - multi-return / input+multi-return callsite 结构增加 `ReturnValues`。
+  - 避免 collection 接受 call effect value 后 rewrite 阶段只看 `Load` 而漏替换。
+  - shared-successor 路径仍要求 `Load`，因为 call effect value 没有 register pointer，不能给其它 predecessor 生成 incoming load。
+
+- `tests/native_prototype_recovery_test.cpp:374`
+  - 新增 `createReturnEffectCallerFunction()`，构造 direct call 后的 `notdec.register.call_effect kind=return` value。
+
+- `tests/native_prototype_recovery_test.cpp:5997`
+  - 新增 return-only rewrite 断言：
+    - callee 被改成 `i64()`。
+    - caller 里的 call effect value 被新 call result 替换。
+    - 新 call result 被使用。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_prototype_recovery_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+ctest --test-dir /tmp/notdec-bin2llvm-build \
+  -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' \
+  --output-on-failure
+
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target notdec-native-llvm -j2
+
+/usr/bin/time -f 'TIME native-llvm-call-effect-return-consume %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-call-effect-return-consume.ll \
+  > /tmp/hexx64-1156e0-call-effect-return-consume.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-effect-return-consume.ll \
+  -o /tmp/hexx64-1156e0-call-effect-return-consume.bc
+
+/usr/bin/time -f 'TIME opt-verify-call-effect-return-consume %e' \
+  /sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-effect-return-consume.bc \
+  -o /tmp/hexx64-1156e0-call-effect-return-consume.verified.bc
+
+/usr/bin/time -f 'TIME limited-summary-call-effect-return-consume %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-discover \
+  --decode-seed-limit 20 --summary-json /bin/ls \
+  > /tmp/binls-native-summary-call-effect-return-consume.json
+```
+
+结果：
+
+- `native_prototype_recovery_test` 通过。
+- 相关 `ctest` 6 项通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `58.62s`。
+- `llvm-as` 通过。
+- `opt -passes=verify` 通过，时间 `0.95s`。
+- `/bin/ls --decode-seed-limit 20` 时间 `0.21s`。
+- `/tmp/hexx64-1156e0-call-effect-return-consume.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_effect` 数量：`1677`
+  - `notdec.register.call_input_candidate` 数量：`99`
+  - `notdec.register.call_input_candidates` 数量：`39`
+  - `callsite_id=` 数量：`1737`
+  - `kind=return` 数量：`508`
+  - `kind=clobber_unknown` 数量：`0`
+  - `kind=unknown_effect` 数量：`1169`
+
+### 判断
+
+- 这一步让 prototype recovery 能直接消费 register SSA 产生的 `kind=return` value，而不是只依赖旧的 register load。
+- `clobber_unknown` 和 `unknown_effect` 仍不会参与 return rewrite。
+- shared-successor return rewrite 暂时仍只支持旧 load 形态。要支持 call effect value 的 shared-successor，需要另一套 incoming value 生成策略，不在本轮硬做。
+
+评分：
+
+- 实现效果：6/10。阶段 5 的 return 消费路径更贴近显式 call effect 数据流。
+- 复杂度：4/10。`ReturnLoadSearchResult` 从 load 扩成 value，但旧 load 路径保留。
+- 维护成本：4/10。后续如果继续支持 shared-successor call effect，需要扩展当前边界。

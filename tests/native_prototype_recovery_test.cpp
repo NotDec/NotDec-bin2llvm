@@ -371,6 +371,35 @@ llvm::Function *createReturnLoadCallerFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createReturnEffectCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    llvm::GlobalVariable *output, const std::string &registerName,
+    llvm::Instruction **effectOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callee->getFunctionType(), callee);
+  llvm::Instruction *effect = llvm::cast<llvm::Instruction>(
+      builder.CreateFreeze(llvm::UndefValue::get(output->getValueType()),
+                           registerName + ".return.call_effect"));
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "kind=return"),
+      llvm::MDString::get(context, "source=abi_output"),
+      llvm::MDString::get(context, "register=" + registerName),
+      llvm::ValueAsMetadata::get(output),
+  };
+  effect->setMetadata("notdec.register.call_effect",
+                      llvm::MDNode::get(context, fields));
+  builder.CreateAdd(effect, llvm::ConstantInt::get(output->getValueType(), 1));
+  builder.CreateRetVoid();
+  *effectOut = effect;
+  return function;
+}
+
 llvm::Function *createUnmarkedReturnLoadCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *output, llvm::LoadInst **loadOut) {
@@ -5965,6 +5994,59 @@ int main() {
   if (llvm::verifyModule(returnCallsiteModule, &llvm::errs())) {
     std::cerr
         << "callsite module verification failed after return-only rewrite\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module returnEffectCallsiteModule(
+      "native-prototype-return-effect-callsite-rewrite-test", context);
+  llvm::GlobalVariable *returnEffectCallsiteRax =
+      createRegisterGlobal(returnEffectCallsiteModule, "RAX");
+  attachTestAbi(returnEffectCallsiteModule);
+  llvm::StoreInst *returnEffectCallsiteStore = nullptr;
+  llvm::Function *returnEffectCallsiteFunction = createReturnStoreFunction(
+      returnEffectCallsiteModule, "callsite_return_effect_rax",
+      returnEffectCallsiteRax, "RAX", &returnEffectCallsiteStore);
+  llvm::Instruction *returnEffectCallsiteValue = nullptr;
+  createReturnEffectCallerFunction(
+      returnEffectCallsiteModule, "call_callsite_return_effect_rax",
+      returnEffectCallsiteFunction, returnEffectCallsiteRax, "RAX",
+      &returnEffectCallsiteValue);
+  notdec::bin2llvm::runNativePrototypeRecovery(returnEffectCallsiteModule,
+                                               options);
+  notdec::bin2llvm::NativePrototypeRewriteResult
+      returnEffectCallsiteRewriteResult =
+          notdec::bin2llvm::rewriteNativeRecoveredPrototypeReturnOnly(
+              *returnEffectCallsiteFunction);
+  ok &= expect(returnEffectCallsiteRewriteResult.Rewritten,
+               "return-only prototype with call effect value was not rewritten");
+  returnEffectCallsiteFunction = returnEffectCallsiteRewriteResult.Function;
+  llvm::CallInst *rewrittenReturnEffectCallsiteCall = nullptr;
+  llvm::Function *returnEffectCallsiteCaller =
+      returnEffectCallsiteModule.getFunction("call_callsite_return_effect_rax");
+  if (returnEffectCallsiteCaller != nullptr) {
+    for (llvm::BasicBlock &block : *returnEffectCallsiteCaller) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call != nullptr && call->getCalledFunction() ==
+                                   returnEffectCallsiteFunction) {
+          rewrittenReturnEffectCallsiteCall = call;
+        }
+      }
+    }
+  }
+  ok &= expect(rewrittenReturnEffectCallsiteCall != nullptr &&
+                   rewrittenReturnEffectCallsiteCall->getType() ==
+                       llvm::Type::getInt64Ty(context),
+               "call effect direct callsite did not return i64");
+  ok &= expect(returnEffectCallsiteValue != nullptr &&
+                   returnEffectCallsiteValue->use_empty(),
+               "call effect return value was not replaced");
+  ok &= expect(rewrittenReturnEffectCallsiteCall != nullptr &&
+                   !rewrittenReturnEffectCallsiteCall->use_empty(),
+               "call effect direct callsite result was not used");
+  if (llvm::verifyModule(returnEffectCallsiteModule, &llvm::errs())) {
+    std::cerr << "call effect return callsite module verification failed after "
+                 "return-only rewrite\n";
     return EXIT_FAILURE;
   }
 

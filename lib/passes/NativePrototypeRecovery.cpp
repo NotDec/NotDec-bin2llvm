@@ -4935,6 +4935,7 @@ void eraseStackCanaryChecks(llvm::Module &module, const NativeAbiSpec &abi) {
 
 struct ReturnLoadSearchResult {
   llvm::LoadInst *Load = nullptr;
+  llvm::Value *Value = nullptr;
   llvm::BasicBlock *SharedSuccessor = nullptr;
   llvm::BasicBlock *CallPredecessor = nullptr;
   bool Blocked = false;
@@ -4944,6 +4945,13 @@ struct ReturnLoadSearchResult {
 ReturnLoadSearchResult foundReturnLoad(llvm::LoadInst *load) {
   ReturnLoadSearchResult result;
   result.Load = load;
+  result.Value = load;
+  return result;
+}
+
+ReturnLoadSearchResult foundReturnValue(llvm::Value *value) {
+  ReturnLoadSearchResult result;
+  result.Value = value;
   return result;
 }
 
@@ -4969,6 +4977,7 @@ struct MultiReturnCallsiteRewrite {
   // Kept ABI-slot aligned.  A null entry means the caller does not use that
   // return component before it is overwritten or before control leaves the path.
   std::vector<llvm::LoadInst *> ReturnLoads;
+  std::vector<llvm::Value *> ReturnValues;
   std::vector<ReturnLoadSearchResult> ReturnLoadResults;
   std::vector<std::string> ReturnRegisterNames;
 };
@@ -4989,6 +4998,7 @@ struct InputMultiReturnCallsiteRewrite {
   std::vector<llvm::StoreInst *> InputStores;
   // Same slot order as the recovered returns; null entries are unused results.
   std::vector<llvm::LoadInst *> ReturnLoads;
+  std::vector<llvm::Value *> ReturnValues;
   std::vector<ReturnLoadSearchResult> ReturnLoadResults;
   std::vector<std::string> ReturnRegisterNames;
 };
@@ -5085,6 +5095,17 @@ bool callClobbersRegister(llvm::CallBase &call, llvm::StringRef registerName) {
   return unaffected.count(registerName.str()) == 0;
 }
 
+bool isReturnCallEffectValue(llvm::Instruction &inst,
+                             llvm::StringRef registerName) {
+  llvm::MDNode *metadata = inst.getMetadata("notdec.register.call_effect");
+  if (metadata == nullptr) {
+    return false;
+  }
+  return metadataField(*metadata, "kind") == std::optional<std::string>("return") &&
+         metadataField(*metadata, "register") ==
+             std::optional<std::string>(registerName.str());
+}
+
 ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
     llvm::BasicBlock::iterator iter, llvm::BasicBlock::iterator end,
     llvm::StringRef returnRegisterName) {
@@ -5093,6 +5114,9 @@ ReturnLoadSearchResult findReturnLoadBeforeStoreInRange(
       if (callClobbersRegister(*call, returnRegisterName)) {
         return clobberedReturnLoadSearch();
       }
+    }
+    if (isReturnCallEffectValue(*iter, returnRegisterName)) {
+      return foundReturnValue(&*iter);
     }
     std::optional<std::string> name;
     if (llvm::MDNode *metadata =
@@ -5153,7 +5177,7 @@ ReturnLoadSearchResult findDominatedSuccessorReturnLoad(
 
     ReturnLoadSearchResult blockResult = findReturnLoadBeforeStoreInRange(
         current->begin(), current->end(), returnRegisterName);
-    if (blockResult.Load != nullptr || blockResult.Blocked ||
+    if (blockResult.Value != nullptr || blockResult.Blocked ||
         blockResult.Clobbered) {
       return blockResult;
     }
@@ -5185,8 +5209,11 @@ ReturnLoadSearchResult findMixedSuccessorReturnLoad(
     if (successorResult.Blocked) {
       return blockedReturnLoadSearch();
     }
-    if (successorResult.Load != nullptr) {
+    if (successorResult.Value != nullptr) {
       if (load != nullptr) {
+        return blockedReturnLoadSearch();
+      }
+      if (successorResult.Load == nullptr) {
         return blockedReturnLoadSearch();
       }
       load = successorResult.Load;
@@ -5197,8 +5224,11 @@ ReturnLoadSearchResult findMixedSuccessorReturnLoad(
     }
     ReturnLoadSearchResult nestedResult =
         findDominatedSuccessorReturnLoad(*successor, returnRegisterName);
-    if (nestedResult.Load != nullptr) {
+    if (nestedResult.Value != nullptr) {
       if (load != nullptr) {
+        return blockedReturnLoadSearch();
+      }
+      if (nestedResult.Load == nullptr) {
         return blockedReturnLoadSearch();
       }
       load = nestedResult.Load;
@@ -5233,7 +5263,7 @@ ReturnLoadSearchResult findSharedSuccessorUnusedReturn(
 
     ReturnLoadSearchResult blockResult = findReturnLoadBeforeStoreInRange(
         current->begin(), current->end(), returnRegisterName);
-    if (blockResult.Load != nullptr || blockResult.Blocked) {
+    if (blockResult.Value != nullptr || blockResult.Blocked) {
       return blockedReturnLoadSearch();
     }
     if (blockResult.Clobbered) {
@@ -5258,7 +5288,7 @@ findCallsiteReturnLoad(llvm::CallInst &oldCall,
   llvm::BasicBlock::iterator localIter(oldCall.getIterator());
   ReturnLoadSearchResult localResult = findReturnLoadBeforeStoreInRange(
       ++localIter, oldCall.getParent()->end(), returnRegisterName);
-  if (localResult.Load != nullptr || localResult.Blocked ||
+  if (localResult.Value != nullptr || localResult.Blocked ||
       localResult.Clobbered) {
     return localResult;
   }
@@ -5296,8 +5326,11 @@ findCallsiteReturnLoad(llvm::CallInst &oldCall,
     ReturnLoadSearchResult successorResult = findReturnLoadBeforeStoreInRange(
         successor->begin(), successor->end(), returnRegisterName);
     if (hasMultiplePredecessors) {
-      if (successorResult.Load != nullptr) {
+      if (successorResult.Value != nullptr) {
         if (!allowSharedSuccessorLoad) {
+          return blockedReturnLoadSearch();
+        }
+        if (successorResult.Load == nullptr) {
           return blockedReturnLoadSearch();
         }
         successorResult.SharedSuccessor = successor;
@@ -5311,13 +5344,13 @@ findCallsiteReturnLoad(llvm::CallInst &oldCall,
         std::set<llvm::BasicBlock *> activeBlocks;
         ReturnLoadSearchResult unusedResult = findSharedSuccessorUnusedReturn(
             *successor, returnRegisterName, activeBlocks);
-        if (unusedResult.Blocked || unusedResult.Load != nullptr) {
+        if (unusedResult.Blocked || unusedResult.Value != nullptr) {
           return blockedReturnLoadSearch();
         }
       }
       return {};
     }
-    if (successorResult.Load != nullptr || successorResult.Blocked ||
+    if (successorResult.Value != nullptr || successorResult.Blocked ||
         successorResult.Clobbered) {
       return successorResult;
     }
@@ -5327,7 +5360,7 @@ findCallsiteReturnLoad(llvm::CallInst &oldCall,
   ReturnLoadSearchResult unusedResult =
       findSharedSuccessorUnusedReturn(*current, returnRegisterName,
                                       activeBlocks);
-  if (unusedResult.Blocked || unusedResult.Load != nullptr) {
+  if (unusedResult.Blocked || unusedResult.Value != nullptr) {
     return blockedReturnLoadSearch();
   }
   return {};
@@ -5384,21 +5417,27 @@ void rewriteCallsiteReturnLoad(llvm::CallInst &oldCall, llvm::CallInst &newCall,
       findCallsiteReturnLoad(oldCall, returnRegisterName,
                              allowSharedSuccessorLoad);
   llvm::LoadInst *load = result.Load;
-  if (load == nullptr) {
+  llvm::Value *value = result.Value;
+  if (value == nullptr) {
     return;
   }
-  if (load->getType() != newCall.getType()) {
+  if (value->getType() != newCall.getType()) {
     return;
   }
 
   if (result.SharedSuccessor != nullptr && result.CallPredecessor != nullptr) {
+    if (load == nullptr) {
+      return;
+    }
     replaceSharedSuccessorReturnLoad(*load, newCall, result, returnRegisterName);
     return;
   }
 
-  load->replaceAllUsesWith(&newCall);
-  if (load->use_empty()) {
-    load->eraseFromParent();
+  value->replaceAllUsesWith(&newCall);
+  if (auto *inst = llvm::dyn_cast<llvm::Instruction>(value)) {
+    if (inst->use_empty()) {
+      inst->eraseFromParent();
+    }
   }
 }
 
@@ -5424,8 +5463,8 @@ bool callsiteHasMismatchedReturnLoad(llvm::CallInst &callsite,
   ReturnLoadSearchResult result =
       findCallsiteReturnLoad(callsite, returnRegisterName,
                              allowSharedSuccessorLoad);
-  return result.Blocked || (result.Load != nullptr &&
-                            result.Load->getType() != returnType);
+  return result.Blocked || (result.Value != nullptr &&
+                            result.Value->getType() != returnType);
 }
 
 ReturnOnlyCallsiteCollectionResult
@@ -5479,18 +5518,20 @@ MultiReturnCallsiteCollectionResult collectMultiReturnDirectCallsites(
     MultiReturnCallsiteRewrite rewrite;
     rewrite.Call = call;
     rewrite.ReturnLoads.reserve(returns.size());
+    rewrite.ReturnValues.reserve(returns.size());
     rewrite.ReturnLoadResults.reserve(returns.size());
     rewrite.ReturnRegisterNames.reserve(returns.size());
     for (uint64_t index = 0; index < returns.size(); ++index) {
       ReturnLoadSearchResult loadResult =
           findCallsiteReturnLoad(*call, returns[index].RegisterName, true);
       if (loadResult.Blocked ||
-          (loadResult.Load != nullptr &&
-           loadResult.Load->getType() != returnType.getElementType(index))) {
+          (loadResult.Value != nullptr &&
+           loadResult.Value->getType() != returnType.getElementType(index))) {
         result.FailureReason = "unsafe callsite return load";
         return result;
       }
       rewrite.ReturnLoads.push_back(loadResult.Load);
+      rewrite.ReturnValues.push_back(loadResult.Value);
       rewrite.ReturnLoadResults.push_back(loadResult);
       rewrite.ReturnRegisterNames.push_back(returns[index].RegisterName);
     }
@@ -5509,13 +5550,19 @@ void rewriteMultiReturnDirectCallsites(
     newCall->setCallingConv(callsite.Call->getCallingConv());
     for (uint64_t index = 0; index < callsite.ReturnLoads.size(); ++index) {
       llvm::LoadInst *load = callsite.ReturnLoads[index];
-      if (load == nullptr) {
+      llvm::Value *value = index < callsite.ReturnValues.size()
+                               ? callsite.ReturnValues[index]
+                               : load;
+      if (value == nullptr) {
         continue;
       }
       llvm::Value *field =
           builder.CreateExtractValue(newCall, {static_cast<unsigned>(index)});
       if (index < callsite.ReturnLoadResults.size() &&
           callsite.ReturnLoadResults[index].SharedSuccessor != nullptr) {
+        if (load == nullptr) {
+          continue;
+        }
         llvm::StringRef registerName =
             index < callsite.ReturnRegisterNames.size()
                 ? llvm::StringRef(callsite.ReturnRegisterNames[index])
@@ -5525,9 +5572,11 @@ void rewriteMultiReturnDirectCallsites(
                                          registerName);
         continue;
       }
-      load->replaceAllUsesWith(field);
-      if (load->use_empty()) {
-        load->eraseFromParent();
+      value->replaceAllUsesWith(field);
+      if (auto *inst = llvm::dyn_cast<llvm::Instruction>(value)) {
+        if (inst->use_empty()) {
+          inst->eraseFromParent();
+        }
       }
     }
     callsite.Call->eraseFromParent();
@@ -5577,18 +5626,20 @@ collectInputMultiReturnDirectCallsites(
       rewrite.InputStores.push_back(inputStore);
     }
     rewrite.ReturnLoads.reserve(returns.size());
+    rewrite.ReturnValues.reserve(returns.size());
     rewrite.ReturnLoadResults.reserve(returns.size());
     rewrite.ReturnRegisterNames.reserve(returns.size());
     for (uint64_t index = 0; index < returns.size(); ++index) {
       ReturnLoadSearchResult loadResult =
           findCallsiteReturnLoad(*call, returns[index].RegisterName, true);
       if (loadResult.Blocked ||
-          (loadResult.Load != nullptr &&
-           loadResult.Load->getType() != returnType.getElementType(index))) {
+          (loadResult.Value != nullptr &&
+           loadResult.Value->getType() != returnType.getElementType(index))) {
         result.FailureReason = "unsafe callsite return load";
         return result;
       }
       rewrite.ReturnLoads.push_back(loadResult.Load);
+      rewrite.ReturnValues.push_back(loadResult.Value);
       rewrite.ReturnLoadResults.push_back(loadResult);
       rewrite.ReturnRegisterNames.push_back(returns[index].RegisterName);
     }
@@ -5608,13 +5659,19 @@ void rewriteInputMultiReturnDirectCallsites(
     eraseCallsiteInputStores(callsite.InputStores);
     for (uint64_t index = 0; index < callsite.ReturnLoads.size(); ++index) {
       llvm::LoadInst *load = callsite.ReturnLoads[index];
-      if (load == nullptr) {
+      llvm::Value *value = index < callsite.ReturnValues.size()
+                               ? callsite.ReturnValues[index]
+                               : load;
+      if (value == nullptr) {
         continue;
       }
       llvm::Value *field =
           builder.CreateExtractValue(newCall, {static_cast<unsigned>(index)});
       if (index < callsite.ReturnLoadResults.size() &&
           callsite.ReturnLoadResults[index].SharedSuccessor != nullptr) {
+        if (load == nullptr) {
+          continue;
+        }
         llvm::StringRef registerName =
             index < callsite.ReturnRegisterNames.size()
                 ? llvm::StringRef(callsite.ReturnRegisterNames[index])
@@ -5624,9 +5681,11 @@ void rewriteInputMultiReturnDirectCallsites(
                                          registerName);
         continue;
       }
-      load->replaceAllUsesWith(field);
-      if (load->use_empty()) {
-        load->eraseFromParent();
+      value->replaceAllUsesWith(field);
+      if (auto *inst = llvm::dyn_cast<llvm::Instruction>(value)) {
+        if (inst->use_empty()) {
+          inst->eraseFromParent();
+        }
       }
     }
     callsite.Call->eraseFromParent();
