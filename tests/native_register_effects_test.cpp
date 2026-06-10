@@ -80,6 +80,13 @@ void attachTestAbi(llvm::Module &module) {
   output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
   output.Storage.Name = "RAX";
   abi.Outputs.push_back(std::move(output));
+  notdec::bin2llvm::NativeAbiParamEntry secondOutput;
+  secondOutput.MinSize = 1;
+  secondOutput.MaxSize = 8;
+  secondOutput.Storage.Kind =
+      notdec::bin2llvm::NativeAbiStorageKind::Register;
+  secondOutput.Storage.Name = "RDX";
+  abi.Outputs.push_back(std::move(secondOutput));
 
   notdec::bin2llvm::NativeAbiEffect unaffected;
   unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
@@ -275,6 +282,61 @@ llvm::Function *createDirectCallEffectFunction(llvm::Module &module,
       builder.CreateLoad(rbx->getValueType(), rbx, "rbx_after_direct_call");
   loadRbx->setMetadata("notdec.register.access", rbxMetadata);
   builder.CreateRet(loadRbx);
+  return function;
+}
+
+void attachRecoveredReturnMetadata(llvm::Function &function,
+                                   llvm::StringRef registerName) {
+  llvm::LLVMContext &context = function.getContext();
+  llvm::Metadata *returnFields[] = {
+      llvm::MDString::get(context, "storage=register"),
+      llvm::MDString::get(context, ("name=" + registerName).str()),
+      llvm::MDString::get(context, "size=8"),
+      llvm::MDString::get(context, "slot=0"),
+  };
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "model=__stdcall"),
+      llvm::MDString::get(context, "input_count=0"),
+      llvm::MDString::get(context, "return_count=1"),
+      llvm::MDNode::get(context, {}),
+      llvm::MDNode::get(context,
+                        {llvm::MDNode::get(context, returnFields)}),
+  };
+  function.setMetadata("notdec.prototype.recovered",
+                       llvm::MDNode::get(context, fields));
+}
+
+llvm::Function *createDirectRecoveredReturnEffectFunction(
+    llvm::Module &module, llvm::GlobalVariable *rax,
+    llvm::GlobalVariable *rdx) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "callee_recovered_returns_rax", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  calleeBuilder.CreateRetVoid();
+  attachRecoveredReturnMetadata(*callee, "RAX");
+
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "direct_recovered_return_effects", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *raxMetadata = registerAccessMetadata(context, "RAX");
+  llvm::MDNode *rdxMetadata = registerAccessMetadata(context, "RDX");
+
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *loadRax =
+      builder.CreateLoad(rax->getValueType(), rax, "rax_after_direct_return");
+  loadRax->setMetadata("notdec.register.access", raxMetadata);
+  llvm::LoadInst *loadRdx =
+      builder.CreateLoad(rdx->getValueType(), rdx, "rdx_after_direct_return");
+  loadRdx->setMetadata("notdec.register.access", rdxMetadata);
+  builder.CreateRet(builder.CreateAdd(loadRax, loadRdx));
   return function;
 }
 
@@ -1024,6 +1086,7 @@ int main() {
   llvm::Module module("native-register-effects-test", context);
   llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
   llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP", 32, 8);
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
   llvm::GlobalVariable *cf = createRegisterGlobal(module, "CF", 512, 1);
@@ -1043,6 +1106,8 @@ int main() {
       createRepeatedLoadAfterCallFunction(module, rax);
   llvm::Function *directCallEffects =
       createDirectCallEffectFunction(module, rbx);
+  llvm::Function *directRecoveredReturnEffects =
+      createDirectRecoveredReturnEffectFunction(module, rax, rdx);
   llvm::Function *callerBeforeClobberingCallee =
       createCallerBeforeClobberingCalleeFunction(module, rbx);
   llvm::Function *staleMetadata = createStaleMetadataFunction(module, rbx);
@@ -1138,6 +1203,12 @@ int main() {
                "repeated RAX loads after call did not reuse call effect");
   ok &= expect(countRegisterLoads(*directCallEffects, rbx) == 0,
                "RBX load after direct preserving call was not propagated");
+  ok &= expect(countCallEffects(*directRecoveredReturnEffects, "return",
+                                "RAX") == 1,
+               "direct recovered RAX return was not used as call return");
+  ok &= expect(countCallEffects(*directRecoveredReturnEffects, "return",
+                                "RDX") == 0,
+               "direct recovered callee treated non-return RDX as call return");
   ok &= expect(countRegisterLoads(*callerBeforeClobberingCallee, rbx) == 0,
                "RBX load after direct clobbering callee was not rewritten");
   ok &= expect(countCallEffects(*callerBeforeClobberingCallee,

@@ -962,3 +962,93 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：6/10。trivial PHI 删除会向后传播到 PHI users。
 - 复杂度：3/10。递归范围小，带 visited 防环。
 - 维护成本：3/10。逻辑集中在 `simplifyPhi()`，后续完整 SSA 构建重构可继续复用。
+
+## 2026-06-10 实现记录：阶段 2 direct callee recovered return 精化
+
+本次补阶段 2 里还没完成的一点：direct call 优先读取 callee recovered return metadata。之前只要 register 是 ABI output，就会标成 `kind=return`；现在 direct internal callee 如果已经有 recovered returns，就只把 recovered return register 标成 `return`。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:400`
+  - 新增 `recoveredPrototypeReturnsRegister()`，读取 callee 的 `notdec.prototype.recovered` metadata return list。
+
+- `lib/passes/NativeRegisterSSA.cpp:433`
+  - 新增 `functionHasRecoveredReturns()`，判断 direct callee 是否已经有 recovered return。
+
+- `lib/passes/NativeRegisterSSA.cpp:1081`
+  - `callEffectKind()` 对 direct internal callee 先看 recovered return：
+    - 如果 callee recovered returns 包含该 register，返回 `kind=return`。
+    - 如果 callee 已有 recovered returns 但不包含该 register，不再走 ABI output fallback。
+    - 没有 recovered returns 的 call 仍按 ABI output fallback。
+
+- `tests/native_register_effects_test.cpp:77`
+  - 测试 ABI 增加 RDX output，覆盖多 ABI output 场景。
+
+- `tests/native_register_effects_test.cpp:284`
+  - 新增 `attachRecoveredReturnMetadata()`，给测试 callee 手写 recovered RAX return。
+
+- `tests/native_register_effects_test.cpp:307`
+  - 新增 `createDirectRecoveredReturnEffectFunction()`。
+  - callee recovered returns 只有 RAX，caller 在 call 后读取 RAX/RDX。
+
+- `tests/native_register_effects_test.cpp:1154`
+  - 新增断言：
+    - direct recovered RAX return 生成 `kind=return`。
+    - direct recovered callee 的非 return RDX 不再被 ABI output fallback 标成 `kind=return`。
+
+### 判断
+
+- 这一步只在 direct internal callee 已有 recovered returns 时收窄 ABI output。
+- 外部 declaration、indirect call、还没有 recovered returns 的 direct call，仍保留 ABI output fallback。
+- 如果 callee recovered prototype 后续变化，当前 pass 的 callee-first 顺序仍是关键前提。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-direct-return %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-direct-return.ll \
+  > /tmp/hexx64-1156e0-direct-return.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-direct-return.ll \
+  -o /tmp/hexx64-1156e0-direct-return.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-direct-return.bc \
+  -o /tmp/hexx64-1156e0-direct-return.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `54.90s`。
+- `llvm-as` 通过。
+- `opt -passes=verify` 通过，时间 `0.94s`。
+- `/tmp/hexx64-1156e0-direct-return.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_input_candidate` 数量：`163`
+  - `notdec.register.call_input_candidates` 数量：`61`
+  - `notdec.register.call_effect` 数量：`1677`
+  - `kind=return` 数量：`508`
+  - `kind=clobber_unknown` 数量：`0`
+  - `kind=unknown_effect` 数量：`1169`
+
+### 性能和风险
+
+- `hexx64.so -f 0x1156e0` 没有性能回退。
+- 当前只读 register return metadata，不处理 stack/vector return 精化。
+- direct callee 没有 recovered returns 时仍使用 ABI output，保持之前保守行为。
+
+评分：
+
+- 实现效果：6/10。direct callee recovered return 能收窄 ABI output，避免 RDX 这类 possible output 被误当真实 return。
+- 复杂度：3/10。只读取已有 metadata，没有引入 prototype recovery 依赖。
+- 维护成本：3/10。metadata 读取逻辑局部，后续可以替换成共享 helper。

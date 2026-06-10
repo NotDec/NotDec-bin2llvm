@@ -400,6 +400,48 @@ bool functionMetadataHasRegister(const llvm::Function &function,
   return false;
 }
 
+bool recoveredPrototypeReturnsRegister(const llvm::Function &function,
+                                       llvm::StringRef registerName) {
+  llvm::MDNode *prototype = function.getMetadata("notdec.prototype.recovered");
+  if (prototype == nullptr || prototype->getNumOperands() != 5) {
+    return false;
+  }
+  auto *returns = llvm::dyn_cast_or_null<llvm::MDNode>(prototype->getOperand(4));
+  if (returns == nullptr) {
+    return false;
+  }
+  std::string expectedName = ("name=" + registerName).str();
+  for (const llvm::MDOperand &operand : returns->operands()) {
+    auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+    if (entry == nullptr) {
+      continue;
+    }
+    bool isRegister = false;
+    bool hasName = false;
+    for (const llvm::MDOperand &fieldOperand : entry->operands()) {
+      auto *field = llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+      if (field == nullptr) {
+        continue;
+      }
+      isRegister |= field->getString() == "storage=register";
+      hasName |= field->getString() == expectedName;
+    }
+    if (isRegister && hasName) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool functionHasRecoveredReturns(const llvm::Function &function) {
+  llvm::MDNode *prototype = function.getMetadata("notdec.prototype.recovered");
+  if (prototype == nullptr || prototype->getNumOperands() != 5) {
+    return false;
+  }
+  auto *returns = llvm::dyn_cast_or_null<llvm::MDNode>(prototype->getOperand(4));
+  return returns != nullptr && returns->getNumOperands() != 0;
+}
+
 // FunctionPromoter owns the per-function SSA caches. It follows the on-demand
 // SSA construction shape: a read asks for the reaching value, predecessor reads
 // create PHIs only when needed, and unresolved external reads become one
@@ -1077,6 +1119,9 @@ private:
     auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
     llvm::Function *callee =
         call == nullptr ? nullptr : call->getCalledFunction();
+    bool calleeHasRecoveredReturns =
+        callee != nullptr && !callee->isDeclaration() &&
+        functionHasRecoveredReturns(*callee);
     if (callee != nullptr && !callee->isDeclaration()) {
       if (functionMetadataHasRegister(*callee, "notdec.register.preserves",
                                       unit.Name)) {
@@ -1086,11 +1131,15 @@ private:
                                       unit.Name)) {
         return std::string("clobber_unknown");
       }
+      if (calleeHasRecoveredReturns &&
+          recoveredPrototypeReturnsRegister(*callee, unit.Name)) {
+        return std::string("return");
+      }
     }
     if (AbiEffects.Unaffected.count(unit.Name) != 0) {
       return std::nullopt;
     }
-    if (AbiEffects.Outputs.count(unit.Name) != 0) {
+    if (!calleeHasRecoveredReturns && AbiEffects.Outputs.count(unit.Name) != 0) {
       return std::string("return");
     }
     if (AbiEffects.KilledByCall.count(unit.Name) != 0) {
