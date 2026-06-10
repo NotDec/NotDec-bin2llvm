@@ -360,10 +360,14 @@ public:
       removeUnreadRipStores();
       attachRegisterEffectMetadata();
       removeDeadExternalInputs();
+      finalizePendingPhis();
       eraseDeadPhis();
+      eraseUnusedPendingPhis();
     } else {
       collectExternalInputsOnly();
       attachRegisterEffectMetadata();
+      finalizePendingPhis();
+      eraseUnusedPendingPhis();
     }
     attachExternalInputMetadata();
   }
@@ -1073,8 +1077,73 @@ private:
   void eraseDeadPhis() {
     for (llvm::PHINode *phi : DeadPhis) {
       if (phi->use_empty()) {
+        forgetPendingPhi(*phi);
         phi->eraseFromParent();
       }
+    }
+  }
+
+  void finalizePendingPhis() {
+    for (const auto &[key, phi] : PendingPhi) {
+      (void)key;
+      if (phi == nullptr || phi->getParent() == nullptr) {
+        continue;
+      }
+      completePhiIncoming(*phi);
+    }
+  }
+
+  void completePhiIncoming(llvm::PHINode &phi) {
+    llvm::BasicBlock *block = phi.getParent();
+    if (block == nullptr) {
+      return;
+    }
+
+    // Braun-style lazy SSA may create a temporary PHI while recursive lookup is
+    // still resolving a loop.  The original algorithm later seals the block and
+    // fills every predecessor operand.  Our CFG is already complete, so the pass
+    // end is the seal point: no PHI may be left with fewer incoming edges than
+    // the LLVM CFG requires.
+    std::vector<llvm::BasicBlock *> unmatchedIncoming;
+    for (llvm::BasicBlock *incomingBlock : phi.blocks()) {
+      unmatchedIncoming.push_back(incomingBlock);
+    }
+
+    for (llvm::BasicBlock *pred : llvm::predecessors(block)) {
+      auto matched = std::find(unmatchedIncoming.begin(),
+                               unmatchedIncoming.end(), pred);
+      if (matched != unmatchedIncoming.end()) {
+        unmatchedIncoming.erase(matched);
+        continue;
+      }
+
+      // A missing operand means recursive lookup could not prove the register
+      // value on this edge, usually because a call clobber stopped the search.
+      // `undef` keeps the PHI structurally valid without pretending the value is
+      // the function-entry external input.
+      phi.addIncoming(llvm::UndefValue::get(phi.getType()), pred);
+    }
+  }
+
+  void eraseUnusedPendingPhis() {
+    for (auto it = PendingPhi.begin(); it != PendingPhi.end();) {
+      llvm::PHINode *phi = it->second;
+      if (phi != nullptr && phi->getParent() != nullptr && phi->use_empty()) {
+        phi->eraseFromParent();
+        it = PendingPhi.erase(it);
+        continue;
+      }
+      ++it;
+    }
+  }
+
+  void forgetPendingPhi(llvm::PHINode &phi) {
+    for (auto it = PendingPhi.begin(); it != PendingPhi.end();) {
+      if (it->second == &phi) {
+        it = PendingPhi.erase(it);
+        continue;
+      }
+      ++it;
     }
   }
 

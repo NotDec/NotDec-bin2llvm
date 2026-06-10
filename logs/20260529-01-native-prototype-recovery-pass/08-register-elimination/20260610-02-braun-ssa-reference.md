@@ -382,3 +382,82 @@ Braun 算法没有 call clobber 这一层。
 - 对每个仍在 IR 里的 PHI：`phi.getNumIncomingValues()` 必须等于 `pred_size(phi.getParent())`。
 - `hexx64.so -f 0x1156e0` 默认 register SSA 至少能通过 verifier。
 - 不退回 slot fallback / mem2reg。
+
+## 2026-06-10 实现记录：补 pending PHI finalize
+
+从映射回 Braun 算法看，直接问题在这里：
+
+- Braun 的 `incompletePhis` 只是临时状态，`sealBlock` 必须调用 `addPhiOperands` 补齐 predecessor operands。
+- 当前 `NativeRegisterSSA` 的 `PendingPhi` 只记录“已经创建过 PHI”，没有 finalize。
+- `readBlockEntry` 递归遇到环时会通过 `ensurePhi` 创建空 PHI；如果后续某条 predecessor 因 call clobber 返回 `nullptr`，这个空 PHI 可能留在 IR 里。
+
+本次先做最小修复，不重写整套 SSA 构建：
+
+- `lib/passes/NativeRegisterSSA.cpp:363`
+  - `FunctionPromoter::run` 在 register SSA 读写和 effect metadata 都完成后调用 `finalizePendingPhis()`。
+  - 然后删除 `DeadPhis` 和无 use 的 pending PHI。
+
+- `lib/passes/NativeRegisterSSA.cpp:1086`
+  - 新增 `finalizePendingPhis()`。
+  - 遍历所有 `PendingPhi`，把 pass 结束当成 sealed point。
+
+- `lib/passes/NativeRegisterSSA.cpp:1096`
+  - 新增 `completePhiIncoming()`。
+  - 按当前 LLVM CFG 的 `predecessors(block)` 检查每个 PHI 的 incoming。
+  - 已有 incoming 就消费一个；缺失的 edge 补 `undef`。
+  - 这里不用 function-entry external input，因为 call clobber 后的寄存器值不是函数入口值。`undef` 表示这条边的寄存器值未知。
+
+- `lib/passes/NativeRegisterSSA.cpp:1128`
+  - 新增 `eraseUnusedPendingPhis()`，删除 finalize 后仍无 use 的临时 PHI。
+
+- `lib/passes/NativeRegisterSSA.cpp:1140`
+  - 新增 `forgetPendingPhi()`，避免已删除 trivial PHI 还留在 `PendingPhi` 里。
+
+验证：
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target notdec-native-llvm native_register_effects_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-regssa-fix %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-regssa-fix.ll \
+  > /tmp/hexx64-1156e0-regssa-fix.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-regssa-fix.ll \
+  -o /tmp/hexx64-1156e0-regssa-fix.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-regssa-fix.bc \
+  -o /tmp/hexx64-1156e0-regssa-fix.verified.bc
+
+/usr/bin/time -f 'TIME limited-summary-after-ssa %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-discover \
+  --decode-seed-limit 20 --summary-json /bin/ls \
+  > /tmp/binls-native-summary-after-ssa.json
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `hexx64.so -f 0x1156e0` 默认 register SSA 成功输出 `.ll`，时间 `53.62s`。
+- `llvm-as` 通过，时间 `1.59s`。
+- `opt -passes=verify` 通过，时间 `0.88s`。
+- `/bin/ls --decode-seed-limit 20` 仍为 `0.22s`。
+- 输出里原先报错的 `%RCX.regssa80782` 变成合法 PHI：两条 predecessor 都补为 `undef`。
+
+风险：
+
+- 这是结构修复，不是完整重写 Braun 算法。
+- `undef` 的语义是“这条边寄存器值未知”。它比错误地使用 external input 更保守，但后续如果要表达 call-clobbered unknown value，最好引入明确的 clobber unknown value 或跳过相关 load rewrite。
+
+评分：
+
+- 实现效果：7/10。修掉 PHI incoming verifier 错误，`hexx64.so -f 0x1156e0` 默认路径可过验证。
+- 复杂度：3/10。只加 pass 结束 finalize，没有重写递归算法。
+- 维护成本：4/10。`undef` 是明确但偏粗的未知值表达，后续语义精化时需要回看。
