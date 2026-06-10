@@ -95,6 +95,11 @@ struct CallEffectInfo {
   std::string Source;
 };
 
+struct CallsiteInfo {
+  uint64_t Index = 0;
+  std::string Id;
+};
+
 bool isFlagRegisterName(llvm::StringRef name) {
   return name == "CF" || name == "PF" || name == "AF" || name == "ZF" ||
          name == "SF" || name == "TF" || name == "IF" || name == "DF" ||
@@ -521,7 +526,11 @@ private:
       if (isRegisterClobberCall(inst)) {
         ++Summary.CallsSeen;
         HasCall.insert(&block);
-        CallsiteId.try_emplace(&inst, CallsiteId.size());
+        uint64_t index = CallsiteIds.size();
+        CallsiteIds.try_emplace(
+            &inst, CallsiteInfo{
+                       index,
+                       Function.getName().str() + ":" + std::to_string(index)});
       }
     }
   }
@@ -1531,11 +1540,11 @@ private:
   }
 
   std::string callsiteId(const llvm::Instruction &call) const {
-    auto found = CallsiteId.find(&call);
-    if (found == CallsiteId.end()) {
+    auto found = CallsiteIds.find(&call);
+    if (found == CallsiteIds.end()) {
       return "";
     }
-    return Function.getName().str() + ":" + std::to_string(found->second);
+    return found->second.Id;
   }
 
   void eraseUnusedPendingPhis() {
@@ -1719,7 +1728,7 @@ private:
   std::map<BlockRegKey, PendingPhiInfo> PendingPhi;
   std::map<CallEffectKey, llvm::Value *> CallEffectValue;
   std::map<EdgeEffectKey, llvm::Value *> EdgeEffectValue;
-  std::map<const llvm::Instruction *, uint64_t> CallsiteId;
+  std::map<const llvm::Instruction *, CallsiteInfo> CallsiteIds;
   std::set<BlockRegKey> ResolvingEntry;
   std::map<llvm::GlobalVariable *, llvm::Value *> ExternalInputValue;
   std::set<llvm::BasicBlock *> HasCall;

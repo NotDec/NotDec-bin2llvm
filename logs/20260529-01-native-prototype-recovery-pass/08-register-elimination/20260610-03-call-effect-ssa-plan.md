@@ -1286,3 +1286,81 @@ ctest --test-dir /tmp/notdec-bin2llvm-build \
 - 实现效果：5/10。补齐来源审计信息，但不改变恢复能力。
 - 复杂度：2/10。只是在现有 effect 判定上携带 source。
 - 维护成本：2/10。字段稳定，后续消费时直接按 `source=` 判断。
+
+## 2026-06-10 实现记录：缓存 callsite id 字符串
+
+本次处理前面记录里的一个性能风险：`callsiteId()` 每次都拼 `function:index` 字符串。改动只缓存字符串，不改变 metadata 内容。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:95`
+  - 新增 `CallsiteInfo`，保存 callsite index 和已经拼好的 id 字符串。
+
+- `lib/passes/NativeRegisterSSA.cpp:524`
+  - `scanBlock()` 分配 callsite 编号时同步生成 `FunctionName:index`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1536`
+  - `callsiteId()` 改为直接返回缓存字符串。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-callsite-cache %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-callsite-cache.ll \
+  > /tmp/hexx64-1156e0-callsite-cache.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-callsite-cache.ll \
+  -o /tmp/hexx64-1156e0-callsite-cache.bc
+
+/usr/bin/time -f 'TIME opt-verify-callsite-cache %e' \
+  /sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-callsite-cache.bc \
+  -o /tmp/hexx64-1156e0-callsite-cache.verified.bc
+
+ctest --test-dir /tmp/notdec-bin2llvm-build \
+  -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' \
+  --output-on-failure
+
+/usr/bin/time -f 'TIME limited-summary-callsite-cache %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-discover \
+  --decode-seed-limit 20 --summary-json /bin/ls \
+  > /tmp/binls-native-summary-callsite-cache.json
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 `ctest` 6 项通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `57.81s`。
+- `llvm-as` 通过。
+- `opt -passes=verify` 通过，时间 `0.95s`。
+- `/bin/ls --decode-seed-limit 20` 时间 `0.22s`。
+- `/tmp/hexx64-1156e0-callsite-cache.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_effect` 数量：`1677`
+  - `notdec.register.call_input_candidate` 数量：`99`
+  - `notdec.register.call_input_candidates` 数量：`39`
+  - `callsite_id=` 数量：`1737`
+  - `kind=return` 数量：`508`
+  - `kind=unknown_effect` 数量：`1169`
+
+### 判断
+
+- 这一步没有带来明显运行时间改善，`57.81s` 和上一轮 `57.68s` 基本持平。
+- 改动仍有价值：metadata 内容稳定，同时避免后续继续增加 callsite metadata 时反复拼字符串。
+- 下一步真正有语义收益的方向是跨 block call input candidate，但这需要新的 current-value resolver，不能直接复用会制造 entry input 的 `readRegister()`。
+
+评分：
+
+- 实现效果：2/10。只减少字符串重复构造，不改变 IR 语义。
+- 复杂度：1/10。只新增一个缓存结构。
+- 维护成本：1/10。`CallsiteInfo` 后续也可承载更多 callsite 事实。
