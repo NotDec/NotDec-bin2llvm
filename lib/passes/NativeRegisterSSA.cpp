@@ -1269,8 +1269,26 @@ private:
         continue;
       }
 
-      phi.addIncoming(edgeUnknownEffectValue(*pred, phi), pred);
+      phi.addIncoming(missingPhiIncomingValue(*pred, phi), pred);
     }
+  }
+
+  llvm::Value *missingPhiIncomingValue(llvm::BasicBlock &pred,
+                                       llvm::PHINode &phi) {
+    llvm::GlobalVariable *global = pendingPhiRegister(phi);
+    if (global == nullptr) {
+      return edgeUnknownEffectValue(pred, phi);
+    }
+    auto unitIterator = Units.find(global);
+    if (unitIterator == Units.end()) {
+      return edgeUnknownEffectValue(pred, phi);
+    }
+
+    llvm::Value *incoming = resolveValue(readBlockExit(pred, unitIterator->second));
+    if (incoming != nullptr) {
+      return incoming;
+    }
+    return edgeUnknownEffectValue(pred, phi);
   }
 
   llvm::Value *callEffectValue(llvm::Instruction &call, RegisterUnit &unit,

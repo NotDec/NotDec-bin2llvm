@@ -710,3 +710,77 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：4/10。修掉了 trivial PHI cache 明显问题，但还没完成阶段 4 全部目标。
 - 复杂度：2/10。只新增一个 cache 替换 helper 和一个测试。
 - 维护成本：2/10。逻辑局部，后续完整 PHI 状态机仍可复用这一步。
+
+## 2026-06-10 实现记录：阶段 4 missing incoming 重查 predecessor exit
+
+本次继续推进阶段 4，但仍不一次性改完整 `PendingPhi` 状态机。改动点是：pending PHI finalize 发现缺 incoming 时，先按 Braun `addPhiOperands` 的方向重新查询 predecessor exit value，只有查不到时才生成 edge `unknown_effect`。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:1239`
+  - `completePhiIncoming()` 缺 incoming 时不再直接调用 `edgeUnknownEffectValue()`。
+  - 改为调用 `missingPhiIncomingValue(pred, phi)`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1243`
+  - 新增 `missingPhiIncomingValue()`。
+  - 通过 `pendingPhiRegister(phi)` 找回 register backing global。
+  - 用 `readBlockExit(pred, unit)` 重新查询 predecessor 出口值。
+  - 查询成功时补真实 incoming。
+  - 只有找不到 register unit 或查询仍失败时，才 fallback 到 `edgeUnknownEffectValue()`。
+
+### 判断
+
+- 这一步让 finalize 更接近 Braun 的 `addPhiOperands`。
+- 仍保留现有 recursion guard 和 edge unknown fallback。
+- 还没有把 `PendingPhi` 改成带 `Incomplete/Completing/Complete` 的状态对象。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-phi-finalize %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-phi-finalize.ll \
+  > /tmp/hexx64-1156e0-phi-finalize.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-phi-finalize.ll \
+  -o /tmp/hexx64-1156e0-phi-finalize.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-phi-finalize.bc \
+  -o /tmp/hexx64-1156e0-phi-finalize.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `54.28s`。
+- `llvm-as` 通过。
+- `opt -passes=verify` 通过，时间 `0.95s`。
+- `/tmp/hexx64-1156e0-phi-finalize.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_input_candidate` 数量：`163`
+  - `notdec.register.call_input_candidates` 数量：`61`
+  - `notdec.register.call_effect` 数量：`1677`
+  - `kind=return` 数量：`508`
+  - `kind=clobber_unknown` 数量：`0`
+  - `kind=unknown_effect` 数量：`1169`
+
+### 性能和风险
+
+- 这一步没有性能回退。
+- 如果 `readBlockExit()` 在 finalize 阶段触发新的 recursive pending phi，现有 `ResolvingEntry` 仍负责打断递归。
+- 完整状态对象仍是后续工作，不在这一步强做。
+
+评分：
+
+- 实现效果：5/10。missing incoming 会优先补真实 predecessor exit，语义比 edge unknown 更好。
+- 复杂度：2/10。只新增一个查询 helper。
+- 维护成本：3/10。仍依赖当前 pending PHI cache，后续状态机重构时需要纳入统一 `addPhiOperands`。
