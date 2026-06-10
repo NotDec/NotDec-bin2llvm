@@ -880,3 +880,85 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：6/10。pending PHI 状态已显式化，finalize 不再把所有 pending PHI 一律当未完成。
 - 复杂度：3/10。数据结构变了，但没有改核心递归策略。
 - 维护成本：3/10。状态语义明确，后续继续收敛到 Braun 的 `seal_all_blocks` 更容易。
+
+## 2026-06-10 实现记录：阶段 4 trivial PHI 递归简化
+
+本次补齐阶段 4 里 `tryRemoveTrivialPhi` 的另一个明确缺口：一个 PHI 被简化后，使用它的其它 PHI 可能也变成 trivial，需要继续尝试简化。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:1207`
+  - `simplifyPhi(phi)` 改成外层入口，创建 `visiting` 集合。
+
+- `lib/passes/NativeRegisterSSA.cpp:1212`
+  - 新增递归版 `simplifyPhi(phi, visiting)`。
+  - 简化当前 PHI 前，先收集它的 PHI users。
+  - 当前 PHI `replaceAllUsesWith(same)` 后，对这些 PHI users 递归调用 `simplifyPhi()`。
+  - `visiting` 防止 PHI 环里重复递归。
+
+- `tests/native_register_effects_test.cpp:618`
+  - 新增 `createCascadedTrivialRegisterPhiFunction()`。
+  - 构造两层 join，第二层 PHI 依赖第一层 PHI。
+
+- `tests/native_register_effects_test.cpp:1000`
+  - 新增断言：
+    - cascaded trivial RAX load 被替换。
+    - cascaded trivial RAX PHI 全部被删除。
+    - 返回值仍是 `0x5151`。
+
+### 判断
+
+- 这一步更接近 SPIRV-Tools / Braun 风格的 `TryRemoveTrivialPhi`。
+- 当前只递归处理 PHI users，不扩大到任意 instruction users。
+- `EntryValue` / `ExitValue` / `Replacement` cache 仍由上一轮 `replaceCachedValue()` 同步。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-phi-recursive %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-phi-recursive.ll \
+  > /tmp/hexx64-1156e0-phi-recursive.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-phi-recursive.ll \
+  -o /tmp/hexx64-1156e0-phi-recursive.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-phi-recursive.bc \
+  -o /tmp/hexx64-1156e0-phi-recursive.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `54.85s`。
+- `llvm-as` 通过。
+- `opt -passes=verify` 通过，时间 `0.97s`。
+- `/tmp/hexx64-1156e0-phi-recursive.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_input_candidate` 数量：`163`
+  - `notdec.register.call_input_candidates` 数量：`61`
+  - `notdec.register.call_effect` 数量：`1677`
+  - `kind=return` 数量：`508`
+  - `kind=clobber_unknown` 数量：`0`
+  - `kind=unknown_effect` 数量：`1169`
+
+### 性能和风险
+
+- `hexx64.so -f 0x1156e0` 没有性能回退。
+- 递归只发生在 PHI users 上，范围受限。
+- 后续如果要完全对齐 Braun，还可以把 `completePhiIncoming()` 重命名/拆成显式 `addPhiOperands()`，但当前功能上已覆盖计划里列出的 trivial PHI 删除缺口。
+
+评分：
+
+- 实现效果：6/10。trivial PHI 删除会向后传播到 PHI users。
+- 复杂度：3/10。递归范围小，带 visited 防环。
+- 维护成本：3/10。逻辑集中在 `simplifyPhi()`，后续完整 SSA 构建重构可继续复用。

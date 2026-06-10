@@ -1205,6 +1205,15 @@ private:
   }
 
   llvm::Value *simplifyPhi(llvm::PHINode *phi) {
+    std::set<llvm::PHINode *> visiting;
+    return simplifyPhi(phi, visiting);
+  }
+
+  llvm::Value *simplifyPhi(llvm::PHINode *phi,
+                           std::set<llvm::PHINode *> &visiting) {
+    if (phi == nullptr || !visiting.insert(phi).second) {
+      return phi;
+    }
     llvm::Value *same = nullptr;
     for (llvm::Value *incoming : phi->incoming_values()) {
       if (incoming == phi) {
@@ -1215,16 +1224,30 @@ private:
         continue;
       }
       if (same != incoming) {
+        visiting.erase(phi);
         return phi;
       }
     }
     if (same == nullptr) {
+      visiting.erase(phi);
       return phi;
+    }
+    std::vector<llvm::PHINode *> phiUsers;
+    for (llvm::User *user : phi->users()) {
+      if (auto *userPhi = llvm::dyn_cast<llvm::PHINode>(user)) {
+        phiUsers.push_back(userPhi);
+      }
     }
     replaceCachedValue(phi, same);
     phi->replaceAllUsesWith(same);
     DeadPhis.push_back(phi);
     ++Summary.PhisSimplified;
+    for (llvm::PHINode *userPhi : phiUsers) {
+      if (userPhi->getParent() != nullptr) {
+        (void)simplifyPhi(userPhi, visiting);
+      }
+    }
+    visiting.erase(phi);
     return same;
   }
 

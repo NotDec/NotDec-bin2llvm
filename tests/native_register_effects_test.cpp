@@ -608,6 +608,57 @@ llvm::Function *createTrivialJoinRegisterPhiFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createCascadedTrivialRegisterPhiFunction(
+    llvm::Module &module, llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "cascaded_trivial_register_phi", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *firstJoin =
+      llvm::BasicBlock::Create(context, "first_join", function);
+  llvm::BasicBlock *bypass =
+      llvm::BasicBlock::Create(context, "bypass", function);
+  llvm::BasicBlock *secondJoin =
+      llvm::BasicBlock::Create(context, "second_join", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RAX");
+
+  builder.CreateCondBr(llvm::ConstantInt::getFalse(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 0x5151), rax);
+  leftStore->setMetadata("notdec.register.access", metadata);
+  builder.CreateBr(firstJoin);
+
+  builder.SetInsertPoint(right);
+  llvm::StoreInst *rightStore = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 0x5151), rax);
+  rightStore->setMetadata("notdec.register.access", metadata);
+  builder.CreateBr(firstJoin);
+
+  builder.SetInsertPoint(firstJoin);
+  builder.CreateCondBr(llvm::ConstantInt::getFalse(context), secondJoin,
+                       bypass);
+
+  builder.SetInsertPoint(bypass);
+  llvm::StoreInst *bypassStore = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 0x5151), rax);
+  bypassStore->setMetadata("notdec.register.access", metadata);
+  builder.CreateBr(secondJoin);
+
+  builder.SetInsertPoint(secondJoin);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rax->getValueType(), rax, "second_join_rax");
+  load->setMetadata("notdec.register.access", metadata);
+  builder.CreateRet(load);
+  return function;
+}
+
 llvm::Function *createUnreachableRegisterLoadFunction(
     llvm::Module &module, llvm::GlobalVariable *rax) {
   llvm::LLVMContext &context = module.getContext();
@@ -1016,6 +1067,8 @@ int main() {
       createLoopCarriedRegisterValueFunction(module, rax);
   llvm::Function *trivialJoinRegisterPhi =
       createTrivialJoinRegisterPhiFunction(module, rax);
+  llvm::Function *cascadedTrivialRegisterPhi =
+      createCascadedTrivialRegisterPhiFunction(module, rax);
   llvm::Function *unreachableRegisterLoad =
       createUnreachableRegisterLoadFunction(module, rax);
   llvm::Function *unreadFlags = createUnreadFlagStoresFunction(module, cf);
@@ -1143,6 +1196,12 @@ int main() {
                "trivial join RAX PHI was not removed");
   ok &= expect(functionReturnsConstant(*trivialJoinRegisterPhi, 0x4242),
                "trivial join RAX value was not preserved");
+  ok &= expect(countRegisterLoads(*cascadedTrivialRegisterPhi, rax) == 0,
+               "cascaded trivial RAX load was not replaced");
+  ok &= expect(countRegisterPhis(*cascadedTrivialRegisterPhi, "RAX") == 0,
+               "cascaded trivial RAX PHIs were not removed");
+  ok &= expect(functionReturnsConstant(*cascadedTrivialRegisterPhi, 0x5151),
+               "cascaded trivial RAX value was not preserved");
   ok &= expect(unreachableRegisterLoad->size() == 1 &&
                    countRegisterLoads(*unreachableRegisterLoad, rax) == 0,
                "unreachable register load block was not removed");
