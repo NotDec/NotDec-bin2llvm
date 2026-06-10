@@ -405,3 +405,91 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：7/10。阶段 1 目标达成，消除了裸 `undef` PHI，并显式记录 call effect。
 - 复杂度：5/10。新增 call/edge effect cache 和 metadata，但仍局限在 register SSA。
 - 维护成本：5/10。`call_block` 不是稳定 callsite id，后续接 prototype recovery 前需要再细化。
+
+## 2026-06-10 实现记录：阶段 2 ABI output 显式化为 call return
+
+本次完成阶段 2 的第一步：根据 ABI `<output>` 把 call 后返回寄存器建模为 `kind=return`，不再把 ABI output 和 killed-by-call 混在一起。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:62`
+  - `AbiRegisterEffects` 增加 `Outputs`，保存 ABI output register 名。
+
+- `lib/passes/NativeRegisterSSA.cpp:187`
+  - `collectAbiRegisterEffects` 解析 `notdec.abi` metadata 的第二个 child list，即 output pentries。
+  - 只收 register output，stack output 暂不处理。
+
+- `lib/passes/NativeRegisterSSA.cpp:953`
+  - `callEffectKind` 的优先级调整为：
+    - stack pointer / callee preserves / ABI unaffected：无 effect。
+    - direct callee metadata 明确 clobbers：`clobber_unknown`。
+    - ABI output register：`return`。
+    - ABI killedbycall：`clobber_unknown`。
+    - 其它：`unknown_effect`。
+
+- `tests/native_register_effects_test.cpp:65`
+  - 测试 ABI 增加 RAX output pentry。
+
+- `tests/native_register_effects_test.cpp:928`
+  - 测试 external call 后 RAX load 被替换成 `kind=return`。
+  - 重复 RAX load 复用同一个 `return` call effect，并确认没有误用 `clobber_unknown`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target notdec-native-llvm native_register_effects_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-call-return %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-call-return.ll \
+  > /tmp/hexx64-1156e0-call-return.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-return.ll \
+  -o /tmp/hexx64-1156e0-call-return.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-return.bc \
+  -o /tmp/hexx64-1156e0-call-return.verified.bc
+
+/usr/bin/time -f 'TIME limited-summary-call-return %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-discover \
+  --decode-seed-limit 20 --summary-json /bin/ls \
+  > /tmp/binls-native-summary-call-return.json
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `56.49s`。
+- `llvm-as` 通过，时间 `1.79s`。
+- `opt -passes=verify` 通过，时间 `1.03s`。
+- `/bin/ls --decode-seed-limit 20` 时间 `0.24s`，`confirmed_functions=20`，`basic_blocks=41`，`instructions=136`。
+- `/tmp/hexx64-1156e0-call-return.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_effect` 数量：`1658`
+  - `kind=return` 数量：`504`
+  - `kind=clobber_unknown` 数量：`0`
+  - `kind=unknown_effect` 数量：`1154`
+
+### 判断
+
+- direct callee metadata 仍优先于 ABI output。也就是说，如果本模块 callee 分析证明某个 output register 被 clobber 而不是返回值，当前仍会用 `clobber_unknown`。
+- 外部 call / 还没有具体 callee metadata 的 call，按 ABI output 建 `return`。
+- 这一步还没有区分“函数实际返回了几个 ABI output”。例如 SysV 下 `RDX` 是 ABI output slot，但大多数函数只返回 `RAX`。当前先保留 ABI-level possible return，后续需要 prototype recovery 用实际使用和 callee prototype 精化。
+
+### 性能和风险
+
+- `hexx64.so -f 0x1156e0` 从阶段 1 的 `55.17s` 到 `56.49s`，增加约 `1.32s`。
+- `RDX` 现在按 ABI output 标为 `return`，可能对只返回 `RAX` 的普通函数偏宽。后续阶段需要用 callee recovered prototype / callsite usage 缩小。
+
+评分：
+
+- 实现效果：7/10。ABI output 已和 clobber 分开，RAX/RDX 能作为 call return 传播。
+- 复杂度：3/10。只复用现有 ABI metadata，没有改 ABI parser。
+- 维护成本：4/10。output set 仍是 ABI-level，后续需要 prototype recovery 精化。

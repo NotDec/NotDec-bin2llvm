@@ -62,6 +62,7 @@ using EdgeEffectKey =
 struct AbiRegisterEffects {
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
+  std::set<std::string> Outputs;
   std::string StackPointerRegister;
 };
 
@@ -195,38 +196,65 @@ AbiRegisterEffects collectAbiRegisterEffects(llvm::Module &module) {
             mdField(abiNode, "stackpointer.register")) {
       effects.StackPointerRegister = *stackPointer;
     }
+    std::vector<llvm::MDNode *> childLists;
     for (const llvm::MDOperand &operand : abiNode->operands()) {
-      auto *effectList = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
-      if (effectList == nullptr) {
-        continue;
+      auto *child = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+      if (child != nullptr) {
+        childLists.push_back(child);
       }
-      for (const llvm::MDOperand &effectOperand : effectList->operands()) {
-        auto *effectNode =
-            llvm::dyn_cast_or_null<llvm::MDNode>(effectOperand.get());
-        if (effectNode == nullptr) {
+    }
+    if (childLists.size() >= 2) {
+      for (const llvm::MDOperand &entryOperand : childLists[1]->operands()) {
+        auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(entryOperand.get());
+        if (entry == nullptr) {
           continue;
         }
-        std::optional<std::string> effectKind = mdField(effectNode, "effect");
-        bool isUnaffected = effectKind == std::optional<std::string>("unaffected");
-        bool isKilledByCall =
-            effectKind == std::optional<std::string>("killedbycall");
-        if (!isUnaffected && !isKilledByCall) {
-          continue;
-        }
-        for (const llvm::MDOperand &storageOperand : effectNode->operands()) {
+        for (const llvm::MDOperand &storageOperand : entry->operands()) {
           auto *storageNode =
               llvm::dyn_cast_or_null<llvm::MDNode>(storageOperand.get());
-          if (storageNode == nullptr || mdField(storageNode, "kind") !=
-                                            std::optional<std::string>("register")) {
+          if (storageNode == nullptr ||
+              mdField(storageNode, "kind") !=
+                  std::optional<std::string>("register")) {
             continue;
           }
           std::optional<std::string> name = mdField(storageNode, "name");
           if (name && !name->empty()) {
-            if (isUnaffected) {
-              effects.Unaffected.insert(*name);
-            } else {
-              effects.KilledByCall.insert(*name);
-            }
+            effects.Outputs.insert(*name);
+          }
+        }
+      }
+    }
+    if (childLists.size() < 3) {
+      return effects;
+    }
+    llvm::MDNode *effectList = childLists[2];
+    for (const llvm::MDOperand &effectOperand : effectList->operands()) {
+      auto *effectNode =
+          llvm::dyn_cast_or_null<llvm::MDNode>(effectOperand.get());
+      if (effectNode == nullptr) {
+        continue;
+      }
+      std::optional<std::string> effectKind = mdField(effectNode, "effect");
+      bool isUnaffected = effectKind == std::optional<std::string>("unaffected");
+      bool isKilledByCall =
+          effectKind == std::optional<std::string>("killedbycall");
+      if (!isUnaffected && !isKilledByCall) {
+        continue;
+      }
+      for (const llvm::MDOperand &storageOperand : effectNode->operands()) {
+        auto *storageNode =
+            llvm::dyn_cast_or_null<llvm::MDNode>(storageOperand.get());
+        if (storageNode == nullptr ||
+            mdField(storageNode, "kind") !=
+                std::optional<std::string>("register")) {
+          continue;
+        }
+        std::optional<std::string> name = mdField(storageNode, "name");
+        if (name && !name->empty()) {
+          if (isUnaffected) {
+            effects.Unaffected.insert(*name);
+          } else {
+            effects.KilledByCall.insert(*name);
           }
         }
       }
@@ -943,6 +971,9 @@ private:
     }
     if (AbiEffects.Unaffected.count(unit.Name) != 0) {
       return std::nullopt;
+    }
+    if (AbiEffects.Outputs.count(unit.Name) != 0) {
+      return std::string("return");
     }
     if (AbiEffects.KilledByCall.count(unit.Name) != 0) {
       return std::string("clobber_unknown");

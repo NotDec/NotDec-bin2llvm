@@ -67,6 +67,13 @@ void attachTestAbi(llvm::Module &module) {
   abi.PrototypeName = "__stdcall";
   abi.StackPointerRegister = "RSP";
   abi.StackPointerSpace = "register";
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "RAX";
+  abi.Outputs.push_back(std::move(output));
+
   notdec::bin2llvm::NativeAbiEffect unaffected;
   unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
   unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
@@ -922,14 +929,16 @@ int main() {
                "RBX load after call was not propagated");
   ok &= expect(countRegisterLoads(*callEffects, rax) == 0,
                "RAX load after call was not rewritten to call effect");
-  ok &= expect(countCallEffects(*callEffects, "clobber_unknown", "RAX") == 1,
-               "RAX call clobber was not made explicit");
+  ok &= expect(countCallEffects(*callEffects, "return", "RAX") == 1,
+               "RAX call return was not made explicit");
   ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
                "RSP load after call was not propagated");
   ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 0,
                "repeated RAX loads after call were not rewritten");
   ok &= expect(countCallEffects(*repeatedLoadAfterCall, "clobber_unknown",
-                                "RAX") == 1,
+                                "RAX") == 0,
+               "repeated RAX loads after call used clobber instead of return");
+  ok &= expect(countCallEffects(*repeatedLoadAfterCall, "return", "RAX") == 1,
                "repeated RAX loads after call did not reuse call effect");
   ok &= expect(countRegisterLoads(*directCallEffects, rbx) == 0,
                "RBX load after direct preserving call was not propagated");
