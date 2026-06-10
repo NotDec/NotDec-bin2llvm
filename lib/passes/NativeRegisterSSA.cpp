@@ -87,6 +87,14 @@ struct PendingPhiInfo {
   PendingPhiState State = PendingPhiState::Incomplete;
 };
 
+// CallEffectInfo keeps the data-flow effect separate from why that effect was
+// chosen.  The kind drives SSA behavior; the source is audit metadata for later
+// prototype recovery decisions.
+struct CallEffectInfo {
+  std::string Kind;
+  std::string Source;
+};
+
 bool isFlagRegisterName(llvm::StringRef name) {
   return name == "CF" || name == "PF" || name == "AF" || name == "ZF" ||
          name == "SF" || name == "TF" || name == "IF" || name == "DF" ||
@@ -980,9 +988,9 @@ private:
         continue;
       }
       if (isRegisterClobberCall(inst)) {
-        if (std::optional<std::string> effectKind =
+        if (std::optional<CallEffectInfo> effect =
                 callEffectKind(inst, unit)) {
-          return callEffectValue(inst, unit, *effectKind);
+          return callEffectValue(inst, unit, *effect);
         }
         continue;
       }
@@ -1137,7 +1145,7 @@ private:
     return callEffectKind(inst, unit).has_value();
   }
 
-  std::optional<std::string> callEffectKind(
+  std::optional<CallEffectInfo> callEffectKind(
       const llvm::Instruction &inst, const RegisterUnit &unit) const {
     if (!AbiEffects.StackPointerRegister.empty() &&
         unit.Name == AbiEffects.StackPointerRegister) {
@@ -1156,23 +1164,23 @@ private:
       }
       if (functionMetadataHasRegister(*callee, "notdec.register.clobbers",
                                       unit.Name)) {
-        return std::string("clobber_unknown");
+        return CallEffectInfo{"clobber_unknown", "callee_clobbers"};
       }
       if (calleeHasRecoveredReturns &&
           recoveredPrototypeReturnsRegister(*callee, unit.Name)) {
-        return std::string("return");
+        return CallEffectInfo{"return", "callee_recovered_return"};
       }
     }
     if (AbiEffects.Unaffected.count(unit.Name) != 0) {
       return std::nullopt;
     }
     if (!calleeHasRecoveredReturns && AbiEffects.Outputs.count(unit.Name) != 0) {
-      return std::string("return");
+      return CallEffectInfo{"return", "abi_output"};
     }
     if (AbiEffects.KilledByCall.count(unit.Name) != 0) {
-      return std::string("clobber_unknown");
+      return CallEffectInfo{"clobber_unknown", "abi_killedbycall"};
     }
-    return std::string("unknown_effect");
+    return CallEffectInfo{"unknown_effect", "abi_unknown"};
   }
 
   llvm::Value *readBlockEntry(llvm::BasicBlock &block, RegisterUnit &unit) {
@@ -1424,8 +1432,8 @@ private:
   }
 
   llvm::Value *callEffectValue(llvm::Instruction &call, RegisterUnit &unit,
-                               llvm::StringRef effectKind) {
-    CallEffectKey key{&call, unit.Global, effectKind.str()};
+                               const CallEffectInfo &effectInfo) {
+    CallEffectKey key{&call, unit.Global, effectInfo.Kind};
     auto cached = CallEffectValue.find(key);
     if (cached != CallEffectValue.end()) {
       return cached->second;
@@ -1442,11 +1450,12 @@ private:
     llvm::IRBuilder<> builder(insertBefore);
     llvm::Value *undef = llvm::UndefValue::get(unit.Global->getValueType());
     std::string name =
-        unit.Name + "." + effectKind.str() + ".call_effect";
+        unit.Name + "." + effectInfo.Kind + ".call_effect";
     llvm::Instruction *effect =
         llvm::cast<llvm::Instruction>(builder.CreateFreeze(undef, name));
     effect->setMetadata("notdec.register.call_effect",
-                        callEffectMetadata(unit, effectKind, &call));
+                        callEffectMetadata(unit, effectInfo.Kind,
+                                           effectInfo.Source, &call));
     CallEffectValue.emplace(key, effect);
     return effect;
   }
@@ -1477,7 +1486,8 @@ private:
         llvm::cast<llvm::Instruction>(builder.CreateFreeze(
             undef, unit.Name + ".unknown_effect.edge_effect"));
     effect->setMetadata("notdec.register.call_effect",
-                        callEffectMetadata(unit, "unknown_effect", nullptr));
+                        callEffectMetadata(unit, "unknown_effect",
+                                           "phi_missing_incoming", nullptr));
     EdgeEffectValue.emplace(key, effect);
     return effect;
   }
@@ -1493,11 +1503,14 @@ private:
 
   llvm::MDNode *callEffectMetadata(RegisterUnit &unit,
                                    llvm::StringRef effectKind,
+                                   llvm::StringRef effectSource,
                                    llvm::Instruction *call) {
     llvm::LLVMContext &context = Function.getContext();
     std::vector<llvm::Metadata *> fields;
     fields.push_back(llvm::MDString::get(context,
                                          "kind=" + effectKind.str()));
+    fields.push_back(llvm::MDString::get(context,
+                                         "source=" + effectSource.str()));
     fields.push_back(llvm::MDString::get(context, "register=" + unit.Name));
     fields.push_back(llvm::ValueAsMetadata::get(unit.Global));
     if (call != nullptr) {

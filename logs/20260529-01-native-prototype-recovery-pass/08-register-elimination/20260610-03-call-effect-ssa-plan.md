@@ -1177,3 +1177,112 @@ ctest --test-dir /tmp/notdec-bin2llvm-build \
 - 实现效果：6/10。call effect/input candidate 都有稳定 callsite id，且 IR dominance 合法。
 - 复杂度：4/10。新增 callsite id map、dominance 过滤和 dead PHI 去重。
 - 维护成本：4/10。metadata 更可追踪，但后续仍需要处理跨 block candidate。
+
+## 2026-06-10 实现记录：call effect source metadata
+
+本次继续补阶段 1 里“区分 ABI fallback 和 callee prototype 精化来源”的缺口。只补 metadata，不改变 call effect 判定顺序。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:90`
+  - 新增 `CallEffectInfo`。
+  - `Kind` 继续决定 SSA 行为，`Source` 只记录为什么选这个 effect。
+
+- `lib/passes/NativeRegisterSSA.cpp:1148`
+  - `callEffectKind()` 改为返回 `CallEffectInfo`。
+  - 当前 source 分类：
+    - `callee_clobbers`
+    - `callee_recovered_return`
+    - `abi_output`
+    - `abi_killedbycall`
+    - `abi_unknown`
+
+- `lib/passes/NativeRegisterSSA.cpp:1434`
+  - `callEffectValue()` 接收 `CallEffectInfo`。
+  - cache key 仍只用 call/register/kind，不因为 source 增加重复 value。
+
+- `lib/passes/NativeRegisterSSA.cpp:1489`
+  - PHI missing incoming fallback 的 edge unknown 标为 `source=phi_missing_incoming`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1504`
+  - `callEffectMetadata()` 增加 `source=...` 字段。
+
+- `tests/native_register_effects_test.cpp:988`
+  - `callEffectHasCallsiteId()` 抽成通用 `callEffectHasField()`。
+
+- `tests/native_register_effects_test.cpp:1259`
+  - 新增断言：
+    - external ABI output RAX return 带 `source=abi_output`。
+    - direct recovered return RAX 带 `source=callee_recovered_return`。
+    - direct callee RBX clobber 带 `source=callee_clobbers`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target notdec-native-llvm -j2
+
+/usr/bin/time -f 'TIME native-llvm-call-effect-source %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-call-effect-source.ll \
+  > /tmp/hexx64-1156e0-call-effect-source.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-effect-source.ll \
+  -o /tmp/hexx64-1156e0-call-effect-source.bc
+
+/usr/bin/time -f 'TIME opt-verify-call-effect-source %e' \
+  /sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-effect-source.bc \
+  -o /tmp/hexx64-1156e0-call-effect-source.verified.bc
+
+ctest --test-dir /tmp/notdec-bin2llvm-build \
+  -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' \
+  --output-on-failure
+
+/usr/bin/time -f 'TIME limited-summary-call-effect-source %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-discover \
+  --decode-seed-limit 20 --summary-json /bin/ls \
+  > /tmp/binls-native-summary-call-effect-source.json
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 `ctest` 6 项通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `57.68s`。
+- `llvm-as` 通过。
+- `opt -passes=verify` 通过，时间 `0.93s`。
+- `/bin/ls --decode-seed-limit 20` 时间 `0.22s`。
+- `/tmp/hexx64-1156e0-call-effect-source.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_effect` 数量：`1677`
+  - `notdec.register.call_input_candidate` 数量：`98`
+  - `notdec.register.call_input_candidates` 数量：`39`
+  - `kind=return` 数量：`508`
+  - `kind=clobber_unknown` 数量：`0`
+  - `kind=unknown_effect` 数量：`1169`
+  - `source=abi_output` 数量：`508`
+  - `source=abi_unknown` 数量：`1169`
+  - `source=callee_recovered_return` 数量：`0`
+  - `source=callee_clobbers` 数量：`0`
+  - `source=phi_missing_incoming` 数量：`0`
+
+### 判断
+
+- 这一步让 call effect metadata 能说明“来自 ABI fallback”还是“来自 callee metadata”，后续 prototype recovery 可以更保守地消费。
+- `hexx64.so -f 0x1156e0` 当前没有 direct callee recovered source，测试里已覆盖 direct callee 两类 source。
+- 本次没有处理跨 block call input candidate。那个需要新的 current-value resolver，仍是单独技术决策点。
+
+评分：
+
+- 实现效果：5/10。补齐来源审计信息，但不改变恢复能力。
+- 复杂度：2/10。只是在现有 effect 判定上携带 source。
+- 维护成本：2/10。字段稳定，后续消费时直接按 `source=` 判断。

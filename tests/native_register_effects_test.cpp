@@ -985,11 +985,13 @@ unsigned countCallEffects(const llvm::Function &function, llvm::StringRef kind,
   return count;
 }
 
-bool callEffectHasCallsiteId(const llvm::Function &function,
-                             llvm::StringRef kind,
-                             llvm::StringRef name) {
+bool callEffectHasField(const llvm::Function &function,
+                        llvm::StringRef kind,
+                        llvm::StringRef name,
+                        llvm::StringRef expectedField) {
   std::string expectedKind = ("kind=" + kind).str();
   std::string expectedRegister = ("register=" + name).str();
+  bool matchPrefix = expectedField.ends_with("=");
   for (const llvm::BasicBlock &block : function) {
     for (const llvm::Instruction &inst : block) {
       llvm::MDNode *node = inst.getMetadata("notdec.register.call_effect");
@@ -998,7 +1000,7 @@ bool callEffectHasCallsiteId(const llvm::Function &function,
       }
       bool hasKind = false;
       bool hasRegister = false;
-      bool hasCallsite = false;
+      bool hasField = false;
       for (const llvm::MDOperand &operand : node->operands()) {
         auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
         if (field == nullptr) {
@@ -1006,14 +1008,22 @@ bool callEffectHasCallsiteId(const llvm::Function &function,
         }
         hasKind |= field->getString() == expectedKind;
         hasRegister |= field->getString() == expectedRegister;
-        hasCallsite |= field->getString().starts_with("callsite_id=");
+        hasField |= matchPrefix
+                        ? field->getString().starts_with(expectedField)
+                        : field->getString() == expectedField;
       }
       if (hasKind && hasRegister) {
-        return hasCallsite;
+        return hasField;
       }
     }
   }
   return false;
+}
+
+bool callEffectHasCallsiteId(const llvm::Function &function,
+                             llvm::StringRef kind,
+                             llvm::StringRef name) {
+  return callEffectHasField(function, kind, name, "callsite_id=");
 }
 
 unsigned countRegisterPhis(const llvm::Function &function,
@@ -1249,6 +1259,9 @@ int main() {
                "RAX call return was not made explicit");
   ok &= expect(callEffectHasCallsiteId(*callEffects, "return", "RAX"),
                "RAX call return did not record a callsite id");
+  ok &= expect(callEffectHasField(*callEffects, "return", "RAX",
+                                  "source=abi_output"),
+               "RAX call return did not record ABI output source");
   ok &= expect(countCallInputCandidates(*callInputCandidate, "RDI") == 1,
                "RDI call input candidate value was not made explicit");
   ok &= expect(hasCallInputCandidateMetadata(*callInputCandidate, "RDI"),
@@ -1269,6 +1282,10 @@ int main() {
   ok &= expect(countCallEffects(*directRecoveredReturnEffects, "return",
                                 "RAX") == 1,
                "direct recovered RAX return was not used as call return");
+  ok &= expect(callEffectHasField(*directRecoveredReturnEffects, "return",
+                                  "RAX",
+                                  "source=callee_recovered_return"),
+               "direct recovered RAX return did not record callee source");
   ok &= expect(countCallEffects(*directRecoveredReturnEffects, "return",
                                 "RDX") == 0,
                "direct recovered callee treated non-return RDX as call return");
@@ -1277,6 +1294,10 @@ int main() {
   ok &= expect(countCallEffects(*callerBeforeClobberingCallee,
                                 "clobber_unknown", "RBX") == 1,
                "direct callee RBX clobber was not made explicit");
+  ok &= expect(callEffectHasField(*callerBeforeClobberingCallee,
+                                  "clobber_unknown", "RBX",
+                                  "source=callee_clobbers"),
+               "direct callee RBX clobber did not record callee source");
   ok &= expect(staleMetadata->getMetadata("notdec.register.external_inputs") ==
                    nullptr,
                "stale external input metadata was not cleared");
