@@ -985,6 +985,37 @@ unsigned countCallEffects(const llvm::Function &function, llvm::StringRef kind,
   return count;
 }
 
+bool callEffectHasCallsiteId(const llvm::Function &function,
+                             llvm::StringRef kind,
+                             llvm::StringRef name) {
+  std::string expectedKind = ("kind=" + kind).str();
+  std::string expectedRegister = ("register=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      llvm::MDNode *node = inst.getMetadata("notdec.register.call_effect");
+      if (node == nullptr) {
+        continue;
+      }
+      bool hasKind = false;
+      bool hasRegister = false;
+      bool hasCallsite = false;
+      for (const llvm::MDOperand &operand : node->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (field == nullptr) {
+          continue;
+        }
+        hasKind |= field->getString() == expectedKind;
+        hasRegister |= field->getString() == expectedRegister;
+        hasCallsite |= field->getString().starts_with("callsite_id=");
+      }
+      if (hasKind && hasRegister) {
+        return hasCallsite;
+      }
+    }
+  }
+  return false;
+}
+
 unsigned countRegisterPhis(const llvm::Function &function,
                            llvm::StringRef name) {
   unsigned count = 0;
@@ -1048,6 +1079,34 @@ bool hasCallInputCandidateMetadata(const llvm::Function &function,
             return true;
           }
         }
+      }
+    }
+  }
+  return false;
+}
+
+bool callInputCandidateHasCallsiteId(const llvm::Function &function,
+                                     llvm::StringRef name) {
+  std::string expectedRegister = ("register=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      llvm::MDNode *node =
+          inst.getMetadata("notdec.register.call_input_candidate");
+      if (node == nullptr) {
+        continue;
+      }
+      bool hasRegister = false;
+      bool hasCallsite = false;
+      for (const llvm::MDOperand &operand : node->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (field == nullptr) {
+          continue;
+        }
+        hasRegister |= field->getString() == expectedRegister;
+        hasCallsite |= field->getString().starts_with("callsite_id=");
+      }
+      if (hasRegister) {
+        return hasCallsite;
       }
     }
   }
@@ -1188,10 +1247,14 @@ int main() {
                "RAX load after call was not rewritten to call effect");
   ok &= expect(countCallEffects(*callEffects, "return", "RAX") == 1,
                "RAX call return was not made explicit");
+  ok &= expect(callEffectHasCallsiteId(*callEffects, "return", "RAX"),
+               "RAX call return did not record a callsite id");
   ok &= expect(countCallInputCandidates(*callInputCandidate, "RDI") == 1,
                "RDI call input candidate value was not made explicit");
   ok &= expect(hasCallInputCandidateMetadata(*callInputCandidate, "RDI"),
                "RDI call input candidate metadata was not attached to call");
+  ok &= expect(callInputCandidateHasCallsiteId(*callInputCandidate, "RDI"),
+               "RDI call input candidate did not record a callsite id");
   ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
                "RSP load after call was not propagated");
   ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 0,

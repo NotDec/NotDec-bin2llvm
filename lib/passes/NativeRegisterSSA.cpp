@@ -513,6 +513,7 @@ private:
       if (isRegisterClobberCall(inst)) {
         ++Summary.CallsSeen;
         HasCall.insert(&block);
+        CallsiteId.try_emplace(&inst, CallsiteId.size());
       }
     }
   }
@@ -1062,6 +1063,10 @@ private:
       RegisterUnit &unit = *unitIt->second;
       llvm::Value *value = localValueBeforeCallInput(call, unit);
       value = resolveValue(value);
+      if (!valueDominatesCallInput(value, call)) {
+        ++slot;
+        continue;
+      }
       auto *integerType =
           value == nullptr ? nullptr : llvm::dyn_cast<llvm::IntegerType>(
                                          value->getType());
@@ -1075,6 +1080,8 @@ private:
           llvm::cast<llvm::Instruction>(builder.CreateFreeze(
               value, unit.Name + ".call_input_candidate"));
       llvm::Metadata *fields[] = {
+          llvm::MDString::get(context,
+                              "callsite_id=" + callsiteId(call)),
           llvm::MDString::get(context, "slot=" + std::to_string(slot)),
           llvm::MDString::get(context, "register=" + unit.Name),
           llvm::ValueAsMetadata::get(unit.Global),
@@ -1091,6 +1098,26 @@ private:
     }
     call.setMetadata("notdec.register.call_input_candidates",
                      llvm::MDNode::get(context, entries));
+  }
+
+  bool valueDominatesCallInput(llvm::Value *value, llvm::CallBase &call) const {
+    if (value == nullptr) {
+      return false;
+    }
+    if (llvm::isa<llvm::Constant>(value) || llvm::isa<llvm::Argument>(value)) {
+      return true;
+    }
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
+    if (inst == nullptr) {
+      return false;
+    }
+    if (inst->getParent() != call.getParent()) {
+      return false;
+    }
+    if (llvm::isa<llvm::PHINode>(inst)) {
+      return true;
+    }
+    return inst->comesBefore(&call);
   }
 
   llvm::Value *resolveValue(llvm::Value *value) {
@@ -1260,7 +1287,8 @@ private:
 
   llvm::Value *simplifyPhi(llvm::PHINode *phi,
                            std::set<llvm::PHINode *> &visiting) {
-    if (phi == nullptr || !visiting.insert(phi).second) {
+    if (phi == nullptr || phi->getParent() == nullptr ||
+        DeadPhiSet.count(phi) != 0 || !visiting.insert(phi).second) {
       return phi;
     }
     llvm::Value *same = nullptr;
@@ -1290,6 +1318,7 @@ private:
     replaceCachedValue(phi, same);
     phi->replaceAllUsesWith(same);
     DeadPhis.push_back(phi);
+    DeadPhiSet.insert(phi);
     ++Summary.PhisSimplified;
     for (llvm::PHINode *userPhi : phiUsers) {
       if (userPhi->getParent() != nullptr) {
@@ -1326,7 +1355,7 @@ private:
 
   void eraseDeadPhis() {
     for (llvm::PHINode *phi : DeadPhis) {
-      if (phi->use_empty()) {
+      if (phi != nullptr && phi->getParent() != nullptr && phi->use_empty()) {
         forgetPendingPhi(*phi);
         phi->eraseFromParent();
       }
@@ -1472,6 +1501,8 @@ private:
     fields.push_back(llvm::MDString::get(context, "register=" + unit.Name));
     fields.push_back(llvm::ValueAsMetadata::get(unit.Global));
     if (call != nullptr) {
+      fields.push_back(llvm::MDString::get(
+          context, "callsite_id=" + callsiteId(*call)));
       if (llvm::BasicBlock *parent = call->getParent()) {
         fields.push_back(llvm::MDString::get(
             context, ("call_block=" + parent->getName()).str()));
@@ -1484,6 +1515,14 @@ private:
       }
     }
     return llvm::MDNode::getDistinct(context, fields);
+  }
+
+  std::string callsiteId(const llvm::Instruction &call) const {
+    auto found = CallsiteId.find(&call);
+    if (found == CallsiteId.end()) {
+      return "";
+    }
+    return Function.getName().str() + ":" + std::to_string(found->second);
   }
 
   void eraseUnusedPendingPhis() {
@@ -1658,6 +1697,7 @@ private:
   std::vector<llvm::LoadInst *> Loads;
   std::vector<llvm::Instruction *> PendingErase;
   std::vector<llvm::PHINode *> DeadPhis;
+  std::set<llvm::PHINode *> DeadPhiSet;
   std::set<llvm::GlobalVariable *> StoredFullUnits;
   std::set<llvm::GlobalVariable *> LoadedUnits;
   std::map<llvm::Value *, llvm::Value *> Replacement;
@@ -1666,6 +1706,7 @@ private:
   std::map<BlockRegKey, PendingPhiInfo> PendingPhi;
   std::map<CallEffectKey, llvm::Value *> CallEffectValue;
   std::map<EdgeEffectKey, llvm::Value *> EdgeEffectValue;
+  std::map<const llvm::Instruction *, uint64_t> CallsiteId;
   std::set<BlockRegKey> ResolvingEntry;
   std::map<llvm::GlobalVariable *, llvm::Value *> ExternalInputValue;
   std::set<llvm::BasicBlock *> HasCall;

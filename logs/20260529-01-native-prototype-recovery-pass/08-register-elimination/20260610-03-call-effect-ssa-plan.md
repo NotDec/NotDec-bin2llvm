@@ -1052,3 +1052,128 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：6/10。direct callee recovered return 能收窄 ABI output，避免 RDX 这类 possible output 被误当真实 return。
 - 复杂度：3/10。只读取已有 metadata，没有引入 prototype recovery 依赖。
 - 维护成本：3/10。metadata 读取逻辑局部，后续可以替换成共享 helper。
+
+## 2026-06-10 实现记录：稳定 callsite id 和 candidate dominance 修复
+
+本次补上前面阶段 1/3 留下的 callsite 标识问题：call effect 和 call input candidate 都写入稳定的函数内 `callsite_id`。验证时发现 call input candidate helper 可能使用不支配 call 的 SSA value，顺手修掉这个 verifier 问题；同时修掉递归 PHI 简化带来的重复删除问题。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:513`
+  - `scanBlock()` 给每个非 intrinsic call 分配函数内顺序编号，保存到 `CallsiteId`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1082`
+  - call input candidate helper metadata 增加 `callsite_id=<function>:<index>`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1103`
+  - 新增 `valueDominatesCallInput()`。
+  - call input candidate 只接受：
+    - constant
+    - function argument
+    - 同 block PHI
+    - 同 block 且在 call 前的 instruction
+  - 不支配 call 的跨 block instruction 暂时跳过，避免生成非法 IR。
+
+- `lib/passes/NativeRegisterSSA.cpp:1290`
+  - `simplifyPhi()` 跳过已经进入 `DeadPhiSet` 的 PHI。
+  - 修复递归 trivial PHI 简化后同一个 PHI 被重复加入 `DeadPhis`，最终 `eraseFromParent()` 重复删除崩溃的问题。
+
+- `lib/passes/NativeRegisterSSA.cpp:1503`
+  - call effect metadata 增加 `callsite_id=<function>:<index>`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1517`
+  - 新增 `callsiteId()`，统一生成 metadata 字符串。
+
+- `tests/native_register_effects_test.cpp:988`
+  - 新增 `callEffectHasCallsiteId()`。
+
+- `tests/native_register_effects_test.cpp:1088`
+  - 新增 `callInputCandidateHasCallsiteId()`。
+
+- `tests/native_register_effects_test.cpp:1250`
+  - 新增断言：
+    - RAX call return effect 有 callsite id。
+    - RDI call input candidate 有 callsite id。
+
+### 过程中发现的问题
+
+第一次重链 `notdec-native-llvm` 后，`hexx64.so -f 0x1156e0` 崩在：
+
+```text
+FunctionPromoter::eraseDeadPhis
+llvm::Instruction::eraseFromParent
+```
+
+原因是递归 PHI 简化会让同一个 PHI 多次进入 `DeadPhis`。这不是 callsite id 本身的问题，但这次完整重链 CLI 后暴露出来。已用 `DeadPhiSet` 修掉。
+
+第二次运行时 verifier 报：
+
+```text
+Instruction does not dominate all uses!
+%R8.call_input_candidate = freeze ...
+```
+
+原因是 call input candidate helper 插在 call 前，但 candidate value 可能来自不支配该 call 的其它 block。当前先保守过滤；跨 block call input candidate 需要单独的 current-value resolver，不能直接复用会制造 entry input 的 `readRegister()`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-callsite-id %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-callsite-id.ll \
+  > /tmp/hexx64-1156e0-callsite-id.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-callsite-id.ll \
+  -o /tmp/hexx64-1156e0-callsite-id.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-callsite-id.bc \
+  -o /tmp/hexx64-1156e0-callsite-id.verified.bc
+
+ctest --test-dir /tmp/notdec-bin2llvm-build \
+  -R 'notdec\.native_(register|prototype|instcombine|abi)|native_register_residue' \
+  --output-on-failure
+
+/usr/bin/time -f 'TIME limited-summary-callsite-id %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-discover \
+  --decode-seed-limit 20 --summary-json /bin/ls \
+  > /tmp/binls-native-summary-callsite-id.json
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- 相关 `ctest` 6 项通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `58.17s`。
+- `llvm-as` 通过。
+- `opt -passes=verify` 通过，时间 `0.93s`。
+- `/bin/ls --decode-seed-limit 20` 时间 `0.24s`，`confirmed_functions=20`，`basic_blocks=41`，`instructions=136`。
+- `/tmp/hexx64-1156e0-callsite-id.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_input_candidate` 数量：`99`
+  - `notdec.register.call_input_candidates` 数量：`39`
+  - `notdec.register.call_effect` 数量：`1677`
+  - `callsite_id=` 数量：`1737`
+  - `kind=return` 数量：`508`
+  - `kind=clobber_unknown` 数量：`0`
+  - `kind=unknown_effect` 数量：`1169`
+
+### 性能和风险
+
+- `hexx64.so -f 0x1156e0` 本次为 `58.17s`，比上一轮 `54.90s` 慢约 `3.27s`。本次增加了 callsite id 字符串 metadata，同时 call input candidate 做 dominance 过滤；后续如果性能敏感，可以把 `callsiteId()` 的字符串缓存进 map，避免每次构造。
+- call input candidate 从 `163` 降到 `99`，这是 dominance 过滤后的保守结果。
+- 跨 block call input candidate 仍未解决，需要专门的 current-value resolver。
+
+评分：
+
+- 实现效果：6/10。call effect/input candidate 都有稳定 callsite id，且 IR dominance 合法。
+- 复杂度：4/10。新增 callsite id map、dominance 过滤和 dead PHI 去重。
+- 维护成本：4/10。metadata 更可追踪，但后续仍需要处理跨 block candidate。
