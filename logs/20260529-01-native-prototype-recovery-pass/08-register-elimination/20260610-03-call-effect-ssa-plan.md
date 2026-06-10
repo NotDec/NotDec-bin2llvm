@@ -1467,3 +1467,45 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：6/10。阶段 5 的 return 消费路径更贴近显式 call effect 数据流。
 - 复杂度：4/10。`ReturnLoadSearchResult` 从 load 扩成 value，但旧 load 路径保留。
 - 维护成本：4/10。后续如果继续支持 shared-successor call effect，需要扩展当前边界。
+
+## 当前技术决策点
+
+按这个计划继续推进，当前已经不是“补一个判断”能安全解决的状态。剩下两个方向都需要先定语义。
+
+### 1. 跨 block call input candidate
+
+当前 register SSA 只记录同 block、且支配 call 的 input candidate。原因是：
+
+- 直接用 `readRegister()` 会在找不到本地定义时创建 function entry external input。
+- 对 call input 来说，这会把每个 call 都变成“可能读所有 ABI input register”，制造假参数。
+- 直接把跨 block value 插到 call 前 helper，又会遇到 LLVM dominance 问题。
+
+要继续做，需要先决定一个新的 current-value resolver：
+
+- 是否允许沿唯一 predecessor 追踪。
+- 多 predecessor 时是要求所有 predecessor 等价，还是在 call block 前插 PHI。
+- 如果 value 来自 call effect，是传递 candidate，还是阻断。
+- 查不到值时是“不记录 candidate”，还是记录一个 unknown candidate。
+
+在这些规则定下来前，不应该继续扩大 candidate 范围。
+
+### 2. shared-successor return call effect
+
+当前 prototype recovery 已能消费同 block 的 `kind=return` call effect value。shared-successor return rewrite 仍只支持旧 load 形态。
+
+原因是旧 load 有 register pointer，可以在其它 predecessor 上生成 incoming load：
+
+```text
+call path:       new typed call result
+other pred path: load @RAX
+join:           phi
+```
+
+但 call effect value 没有 pointer，只是一个绑定 callsite 的 SSA value。要支持 shared successor，需要先决定其它 predecessor 的 incoming 值来源：
+
+- 重新从 register storage load。
+- 复用 register SSA 的 current value。
+- 生成 unknown effect。
+- 或者暂时禁止 shared-successor call effect rewrite。
+
+这里如果选错，会把不同路径上的返回寄存器值混掉，所以需要先定语义。
