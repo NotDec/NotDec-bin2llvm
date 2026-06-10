@@ -572,6 +572,42 @@ llvm::Function *createLoopCarriedRegisterValueFunction(
   return function;
 }
 
+llvm::Function *createTrivialJoinRegisterPhiFunction(llvm::Module &module,
+                                                     llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "trivial_join_register_phi", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RAX");
+
+  builder.CreateCondBr(llvm::ConstantInt::getFalse(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 0x4242), rax);
+  leftStore->setMetadata("notdec.register.access", metadata);
+  builder.CreateBr(join);
+
+  builder.SetInsertPoint(right);
+  llvm::StoreInst *rightStore = builder.CreateStore(
+      llvm::ConstantInt::get(rax->getValueType(), 0x4242), rax);
+  rightStore->setMetadata("notdec.register.access", metadata);
+  builder.CreateBr(join);
+
+  builder.SetInsertPoint(join);
+  llvm::LoadInst *load =
+      builder.CreateLoad(rax->getValueType(), rax, "joined_rax");
+  load->setMetadata("notdec.register.access", metadata);
+  builder.CreateRet(load);
+  return function;
+}
+
 llvm::Function *createUnreachableRegisterLoadFunction(
     llvm::Module &module, llvm::GlobalVariable *rax) {
   llvm::LLVMContext &context = module.getContext();
@@ -836,6 +872,20 @@ unsigned countCallEffects(const llvm::Function &function, llvm::StringRef kind,
   return count;
 }
 
+unsigned countRegisterPhis(const llvm::Function &function,
+                           llvm::StringRef name) {
+  unsigned count = 0;
+  std::string prefix = (name + ".regssa").str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::PHINode &phi : block.phis()) {
+      if (phi.getName().starts_with(prefix)) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
 unsigned countCallInputCandidates(const llvm::Function &function,
                                   llvm::StringRef name) {
   unsigned count = 0;
@@ -964,6 +1014,8 @@ int main() {
   llvm::Function *partialLoad = createPartialLoadFunction(module, rax);
   llvm::Function *loopCarriedRegisterValue =
       createLoopCarriedRegisterValueFunction(module, rax);
+  llvm::Function *trivialJoinRegisterPhi =
+      createTrivialJoinRegisterPhiFunction(module, rax);
   llvm::Function *unreachableRegisterLoad =
       createUnreachableRegisterLoadFunction(module, rax);
   llvm::Function *unreadFlags = createUnreadFlagStoresFunction(module, cf);
@@ -1085,6 +1137,12 @@ int main() {
                "partial RAX load was not replaced with an SSA extract");
   ok &= expect(countRegisterLoads(*loopCarriedRegisterValue, rax) == 0,
                "loop-carried RAX load was not replaced with a PHI");
+  ok &= expect(countRegisterLoads(*trivialJoinRegisterPhi, rax) == 0,
+               "trivial join RAX load was not replaced");
+  ok &= expect(countRegisterPhis(*trivialJoinRegisterPhi, "RAX") == 0,
+               "trivial join RAX PHI was not removed");
+  ok &= expect(functionReturnsConstant(*trivialJoinRegisterPhi, 0x4242),
+               "trivial join RAX value was not preserved");
   ok &= expect(unreachableRegisterLoad->size() == 1 &&
                    countRegisterLoads(*unreachableRegisterLoad, rax) == 0,
                "unreachable register load block was not removed");

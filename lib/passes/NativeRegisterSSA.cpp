@@ -1195,10 +1195,35 @@ private:
     if (same == nullptr) {
       return phi;
     }
+    replaceCachedValue(phi, same);
     phi->replaceAllUsesWith(same);
     DeadPhis.push_back(phi);
     ++Summary.PhisSimplified;
     return same;
+  }
+
+  void replaceCachedValue(llvm::Value *oldValue, llvm::Value *newValue) {
+    if (oldValue == nullptr || newValue == nullptr || oldValue == newValue) {
+      return;
+    }
+    for (auto &[key, value] : EntryValue) {
+      (void)key;
+      if (value == oldValue) {
+        value = newValue;
+      }
+    }
+    for (auto &[key, value] : ExitValue) {
+      (void)key;
+      if (value == oldValue) {
+        value = newValue;
+      }
+    }
+    for (auto &[value, replacement] : Replacement) {
+      (void)value;
+      if (replacement == oldValue) {
+        replacement = newValue;
+      }
+    }
   }
 
   void eraseDeadPhis() {

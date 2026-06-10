@@ -622,3 +622,91 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：6/10。call input 已显式可见，并接入 declaration input 推断；但跨 block、stack、XMM 还没做。
 - 复杂度：5/10。新增 helper metadata 和 prototype recovery fallback，范围仍局限在 register input。
 - 维护成本：5/10。metadata 形态清楚，但后续需要统一 callsite id 和 current-value resolver。
+
+## 2026-06-10 实现记录：阶段 4 小步修复 trivial PHI cache
+
+本次没有直接把 `PendingPhi` 改成完整状态机，只先修阶段 4 里最明显的问题：trivial PHI 删除时，IR use 被替换了，但 `EntryValue` / `ExitValue` / `Replacement` 里可能还缓存旧 PHI。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:1181`
+  - `simplifyPhi()` 在 `replaceAllUsesWith()` 之前调用 `replaceCachedValue()`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1204`
+  - 新增 `replaceCachedValue()`。
+  - 同步更新：
+    - `EntryValue`
+    - `ExitValue`
+    - `Replacement`
+  - 避免后续 `resolveValue()` 继续拿到已经被 trivial 化的旧 PHI。
+
+- `tests/native_register_effects_test.cpp:542`
+  - 新增 `createTrivialJoinRegisterPhiFunction()`。
+  - 构造 diamond CFG，左右两边都写同一个 RAX 常量，join block 读取 RAX。
+
+- `tests/native_register_effects_test.cpp:839`
+  - 新增 `countRegisterPhis()`。
+
+- `tests/native_register_effects_test.cpp:966`
+  - 新增断言：
+    - trivial join 的 RAX load 被替换。
+    - trivial RAX PHI 被删除。
+    - 返回常量仍是 `0x4242`。
+
+### 判断
+
+- 这是阶段 4 的低风险子集。
+- 当前还没有把 `PendingPhi` 改成 `Incomplete/Completing/Complete` 状态对象。
+- 当前也还没有把 `finalizePendingPhis()` 改成完整 `seal_all_blocks + addPhiOperands`。
+- 这一步只修正 cache 和 IR 不一致的问题，为后续完整重构降低风险。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-phi-cache %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-phi-cache.ll \
+  > /tmp/hexx64-1156e0-phi-cache.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-phi-cache.ll \
+  -o /tmp/hexx64-1156e0-phi-cache.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-phi-cache.bc \
+  -o /tmp/hexx64-1156e0-phi-cache.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `54.38s`。
+- `llvm-as` 通过。
+- `opt -passes=verify` 通过，时间 `0.97s`。
+- `/tmp/hexx64-1156e0-phi-cache.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_input_candidate` 数量：`163`
+  - `notdec.register.call_input_candidates` 数量：`61`
+  - `notdec.register.call_effect` 数量：`1677`
+  - `kind=return` 数量：`508`
+  - `kind=clobber_unknown` 数量：`0`
+  - `kind=unknown_effect` 数量：`1169`
+
+### 性能和风险
+
+- 这一步只更新缓存指针，不增加新的 CFG/SSA 查询。
+- `hexx64.so -f 0x1156e0` 没有性能回退。
+- 后续仍需要继续处理完整 `PendingPhi` 状态和 finalize 语义。
+
+评分：
+
+- 实现效果：4/10。修掉了 trivial PHI cache 明显问题，但还没完成阶段 4 全部目标。
+- 复杂度：2/10。只新增一个 cache 替换 helper 和一个测试。
+- 维护成本：2/10。逻辑局部，后续完整 PHI 状态机仍可复用这一步。
