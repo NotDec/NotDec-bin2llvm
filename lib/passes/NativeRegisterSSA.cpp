@@ -22,6 +22,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -53,6 +54,10 @@ struct AccessInfo {
 };
 
 using BlockRegKey = std::pair<llvm::BasicBlock *, llvm::GlobalVariable *>;
+using CallEffectKey =
+    std::tuple<llvm::Instruction *, llvm::GlobalVariable *, std::string>;
+using EdgeEffectKey =
+    std::tuple<llvm::BasicBlock *, llvm::GlobalVariable *, std::string>;
 
 struct AbiRegisterEffects {
   std::set<std::string> Unaffected;
@@ -854,15 +859,11 @@ private:
     if (local != nullptr) {
       return local;
     }
-    if (hasCallBefore(block, unit, before)) {
-      return nullptr;
-    }
     return readBlockEntry(block, unit);
   }
 
   llvm::Value *localValueBefore(llvm::BasicBlock &block, RegisterUnit &unit,
                                 llvm::Instruction *before) {
-    bool passedBarrier = false;
     for (llvm::Instruction &inst : llvm::reverse(block)) {
       if (&inst == before) {
         continue;
@@ -870,11 +871,11 @@ private:
       if (before != nullptr && !inst.comesBefore(before)) {
         continue;
       }
-      if (isRegisterClobberCall(inst) && callClobbersRegister(inst, unit)) {
-        passedBarrier = true;
-        continue;
-      }
-      if (passedBarrier) {
+      if (isRegisterClobberCall(inst)) {
+        if (std::optional<std::string> effectKind =
+                callEffectKind(inst, unit)) {
+          return callEffectValue(inst, unit, *effectKind);
+        }
         continue;
       }
       if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
@@ -916,24 +917,16 @@ private:
     return value;
   }
 
-  bool hasCallBefore(llvm::BasicBlock &block, RegisterUnit &unit,
-                     llvm::Instruction *before) {
-    for (llvm::Instruction &inst : block) {
-      if (&inst == before) {
-        return false;
-      }
-      if (isRegisterClobberCall(inst) && callClobbersRegister(inst, unit)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   bool callClobbersRegister(const llvm::Instruction &inst,
                             const RegisterUnit &unit) const {
+    return callEffectKind(inst, unit).has_value();
+  }
+
+  std::optional<std::string> callEffectKind(
+      const llvm::Instruction &inst, const RegisterUnit &unit) const {
     if (!AbiEffects.StackPointerRegister.empty() &&
         unit.Name == AbiEffects.StackPointerRegister) {
-      return false;
+      return std::nullopt;
     }
     auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
     llvm::Function *callee =
@@ -941,17 +934,20 @@ private:
     if (callee != nullptr && !callee->isDeclaration()) {
       if (functionMetadataHasRegister(*callee, "notdec.register.preserves",
                                       unit.Name)) {
-        return false;
+        return std::nullopt;
       }
       if (functionMetadataHasRegister(*callee, "notdec.register.clobbers",
                                       unit.Name)) {
-        return true;
+        return std::string("clobber_unknown");
       }
     }
     if (AbiEffects.Unaffected.count(unit.Name) != 0) {
-      return false;
+      return std::nullopt;
     }
-    return true;
+    if (AbiEffects.KilledByCall.count(unit.Name) != 0) {
+      return std::string("clobber_unknown");
+    }
+    return std::string("unknown_effect");
   }
 
   llvm::Value *readBlockEntry(llvm::BasicBlock &block, RegisterUnit &unit) {
@@ -975,13 +971,6 @@ private:
     }
 
     std::vector<llvm::BasicBlock *> preds(predIt, predEnd);
-    for (llvm::BasicBlock *pred : preds) {
-      if (blockHasClobberingCall(*pred, unit) &&
-          localValueBefore(*pred, unit, pred->getTerminator()) == nullptr) {
-        ResolvingEntry.erase(key);
-        return nullptr;
-      }
-    }
 
     std::vector<std::pair<llvm::BasicBlock *, llvm::Value *>> incomingValues;
     for (llvm::BasicBlock *pred : preds) {
@@ -1028,8 +1017,12 @@ private:
       return local;
     }
     if (blockHasClobberingCall(block, unit)) {
-      ExitValue.emplace(key, nullptr);
-      return nullptr;
+      llvm::Instruction *terminator = block.getTerminator();
+      llvm::Value *effect = terminator == nullptr
+                                ? nullptr
+                                : localValueBefore(block, unit, terminator);
+      ExitValue.emplace(key, effect);
+      return effect;
     }
     llvm::Value *entry = readBlockEntry(block, unit);
     ExitValue.emplace(key, entry);
@@ -1117,12 +1110,100 @@ private:
         continue;
       }
 
-      // A missing operand means recursive lookup could not prove the register
-      // value on this edge, usually because a call clobber stopped the search.
-      // `undef` keeps the PHI structurally valid without pretending the value is
-      // the function-entry external input.
-      phi.addIncoming(llvm::UndefValue::get(phi.getType()), pred);
+      phi.addIncoming(edgeUnknownEffectValue(*pred, phi), pred);
     }
+  }
+
+  llvm::Value *callEffectValue(llvm::Instruction &call, RegisterUnit &unit,
+                               llvm::StringRef effectKind) {
+    CallEffectKey key{&call, unit.Global, effectKind.str()};
+    auto cached = CallEffectValue.find(key);
+    if (cached != CallEffectValue.end()) {
+      return cached->second;
+    }
+
+    llvm::Instruction *insertBefore = call.getNextNode();
+    if (insertBefore == nullptr) {
+      insertBefore = call.getParent()->getTerminator();
+    }
+    if (insertBefore == nullptr) {
+      return llvm::UndefValue::get(unit.Global->getValueType());
+    }
+
+    llvm::IRBuilder<> builder(insertBefore);
+    llvm::Value *undef = llvm::UndefValue::get(unit.Global->getValueType());
+    std::string name =
+        unit.Name + "." + effectKind.str() + ".call_effect";
+    llvm::Instruction *effect =
+        llvm::cast<llvm::Instruction>(builder.CreateFreeze(undef, name));
+    effect->setMetadata("notdec.register.call_effect",
+                        callEffectMetadata(unit, effectKind, &call));
+    CallEffectValue.emplace(key, effect);
+    return effect;
+  }
+
+  llvm::Value *edgeUnknownEffectValue(llvm::BasicBlock &pred,
+                                      llvm::PHINode &phi) {
+    llvm::Instruction *terminator = pred.getTerminator();
+    if (terminator == nullptr) {
+      return llvm::UndefValue::get(phi.getType());
+    }
+    llvm::GlobalVariable *global = pendingPhiRegister(phi);
+    if (global == nullptr) {
+      return llvm::UndefValue::get(phi.getType());
+    }
+    auto unitIterator = Units.find(global);
+    if (unitIterator == Units.end()) {
+      return llvm::UndefValue::get(phi.getType());
+    }
+    RegisterUnit &unit = unitIterator->second;
+    EdgeEffectKey key{&pred, global, "unknown_effect"};
+    auto cached = EdgeEffectValue.find(key);
+    if (cached != EdgeEffectValue.end()) {
+      return cached->second;
+    }
+    llvm::IRBuilder<> builder(terminator);
+    llvm::Value *undef = llvm::UndefValue::get(phi.getType());
+    llvm::Instruction *effect =
+        llvm::cast<llvm::Instruction>(builder.CreateFreeze(
+            undef, unit.Name + ".unknown_effect.edge_effect"));
+    effect->setMetadata("notdec.register.call_effect",
+                        callEffectMetadata(unit, "unknown_effect", nullptr));
+    EdgeEffectValue.emplace(key, effect);
+    return effect;
+  }
+
+  llvm::GlobalVariable *pendingPhiRegister(llvm::PHINode &phi) const {
+    for (const auto &[key, pendingPhi] : PendingPhi) {
+      if (pendingPhi == &phi) {
+        return key.second;
+      }
+    }
+    return nullptr;
+  }
+
+  llvm::MDNode *callEffectMetadata(RegisterUnit &unit,
+                                   llvm::StringRef effectKind,
+                                   llvm::Instruction *call) {
+    llvm::LLVMContext &context = Function.getContext();
+    std::vector<llvm::Metadata *> fields;
+    fields.push_back(llvm::MDString::get(context,
+                                         "kind=" + effectKind.str()));
+    fields.push_back(llvm::MDString::get(context, "register=" + unit.Name));
+    fields.push_back(llvm::ValueAsMetadata::get(unit.Global));
+    if (call != nullptr) {
+      if (llvm::BasicBlock *parent = call->getParent()) {
+        fields.push_back(llvm::MDString::get(
+            context, ("call_block=" + parent->getName()).str()));
+      }
+      if (auto *callBase = llvm::dyn_cast<llvm::CallBase>(call)) {
+        if (llvm::Function *callee = callBase->getCalledFunction()) {
+          fields.push_back(llvm::MDString::get(
+              context, ("callee=" + callee->getName()).str()));
+        }
+      }
+    }
+    return llvm::MDNode::getDistinct(context, fields);
   }
 
   void eraseUnusedPendingPhis() {
@@ -1303,6 +1384,8 @@ private:
   std::map<BlockRegKey, llvm::Value *> EntryValue;
   std::map<BlockRegKey, llvm::Value *> ExitValue;
   std::map<BlockRegKey, llvm::PHINode *> PendingPhi;
+  std::map<CallEffectKey, llvm::Value *> CallEffectValue;
+  std::map<EdgeEffectKey, llvm::Value *> EdgeEffectValue;
   std::set<BlockRegKey> ResolvingEntry;
   std::map<llvm::GlobalVariable *, llvm::Value *> ExternalInputValue;
   std::set<llvm::BasicBlock *> HasCall;

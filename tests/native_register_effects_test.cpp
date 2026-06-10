@@ -770,6 +770,35 @@ bool metadataHasRegister(const llvm::Function &function, llvm::StringRef kind,
   return false;
 }
 
+unsigned countCallEffects(const llvm::Function &function, llvm::StringRef kind,
+                          llvm::StringRef name) {
+  unsigned count = 0;
+  std::string expectedKind = ("kind=" + kind).str();
+  std::string expectedRegister = ("register=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      llvm::MDNode *node = inst.getMetadata("notdec.register.call_effect");
+      if (node == nullptr) {
+        continue;
+      }
+      bool hasKind = false;
+      bool hasRegister = false;
+      for (const llvm::MDOperand &operand : node->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (field == nullptr) {
+          continue;
+        }
+        hasKind |= field->getString() == expectedKind;
+        hasRegister |= field->getString() == expectedRegister;
+      }
+      if (hasKind && hasRegister) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
 bool functionReturnsConstant(const llvm::Function &function, uint64_t expected) {
   for (const llvm::BasicBlock &block : function) {
     for (const llvm::Instruction &inst : block) {
@@ -891,16 +920,24 @@ int main() {
                "register SSA did not remove unread RIP stores");
   ok &= expect(countRegisterLoads(*callEffects, rbx) == 0,
                "RBX load after call was not propagated");
-  ok &= expect(countRegisterLoads(*callEffects, rax) == 1,
-               "RAX load after call was incorrectly propagated");
+  ok &= expect(countRegisterLoads(*callEffects, rax) == 0,
+               "RAX load after call was not rewritten to call effect");
+  ok &= expect(countCallEffects(*callEffects, "clobber_unknown", "RAX") == 1,
+               "RAX call clobber was not made explicit");
   ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
                "RSP load after call was not propagated");
-  ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 1,
-               "repeated RAX load after call was not reused");
+  ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 0,
+               "repeated RAX loads after call were not rewritten");
+  ok &= expect(countCallEffects(*repeatedLoadAfterCall, "clobber_unknown",
+                                "RAX") == 1,
+               "repeated RAX loads after call did not reuse call effect");
   ok &= expect(countRegisterLoads(*directCallEffects, rbx) == 0,
                "RBX load after direct preserving call was not propagated");
-  ok &= expect(countRegisterLoads(*callerBeforeClobberingCallee, rbx) == 1,
-               "RBX load after late direct clobbering callee was propagated");
+  ok &= expect(countRegisterLoads(*callerBeforeClobberingCallee, rbx) == 0,
+               "RBX load after direct clobbering callee was not rewritten");
+  ok &= expect(countCallEffects(*callerBeforeClobberingCallee,
+                                "clobber_unknown", "RBX") == 1,
+               "direct callee RBX clobber was not made explicit");
   ok &= expect(staleMetadata->getMetadata("notdec.register.external_inputs") ==
                    nullptr,
                "stale external input metadata was not cleared");

@@ -286,3 +286,122 @@ LLVM 侧：
 - 不先做大范围 signature rewrite。
 - 不把 call clobber 全部当 function entry input。
 - 不把所有 unknown 都继续裸 `undef`。
+
+## 2026-06-10 实现记录：阶段 1 clobber unknown 显式化
+
+本次先完成阶段 1，不改真实 call signature，不接 prototype recovery。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:56`
+  - 新增 `CallEffectKey` / `EdgeEffectKey`，缓存同一 call/register/effect 和同一 edge/register/effect 的显式 effect value。
+
+- `lib/passes/NativeRegisterSSA.cpp:856`
+  - `readRegister` 不再因为 call clobber 直接返回 `nullptr`。
+  - call 影响由 `localValueBefore` 统一转换成显式 value。
+
+- `lib/passes/NativeRegisterSSA.cpp:865`
+  - `localValueBefore` 遇到 call 时调用 `callEffectKind`。
+  - 如果该寄存器受 call 影响，返回 `callEffectValue`。
+  - preserved / unaffected register 继续向前查本地定义。
+
+- `lib/passes/NativeRegisterSSA.cpp:920`
+  - `callEffectKind` 复用现有 ABI/callee metadata：
+    - stack pointer / ABI unaffected / callee preserves：无 effect。
+    - callee clobbers 或 ABI killedbycall：`clobber_unknown`。
+    - 其它 call effect：`unknown_effect`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1008`
+  - `readBlockExit` 遇到 clobbering call 时不缓存 `nullptr`，而是通过 `localValueBefore(... terminator)` 生成显式 call effect value。
+
+- `lib/passes/NativeRegisterSSA.cpp:1089`
+  - pending PHI finalize 缺 incoming 时不再补裸 `undef`。
+  - 改为 `edgeUnknownEffectValue`，生成带 `notdec.register.call_effect` metadata 的 `unknown_effect` value。
+
+- `lib/passes/NativeRegisterSSA.cpp:1117`
+  - `callEffectValue` 用 `freeze undef` 作为 typed placeholder，并挂 `notdec.register.call_effect`。
+  - 这里保留了 NotDec 语义信息，后续 pass 能看到这是 call effect，不是普通未知常量。
+
+- `lib/passes/NativeRegisterSSA.cpp:1185`
+  - `callEffectMetadata` 记录：
+    - `kind=clobber_unknown|unknown_effect`
+    - `register=<name>`
+    - register backing global
+    - `call_block=<block name>`
+    - `callee=<function name>`（如果是 direct call）
+
+- `tests/native_register_effects_test.cpp:773`
+  - 新增 `countCallEffects`，检查 call effect metadata。
+
+- `tests/native_register_effects_test.cpp:921`
+  - 更新测试预期：
+    - external call 后 RAX load 被替换为 `clobber_unknown` call effect。
+    - 重复 RAX load 复用同一个 call effect。
+    - direct callee metadata 标明 clobber 后，caller 里的 RBX load 被替换为 `clobber_unknown` call effect。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target notdec-native-llvm native_register_effects_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-call-effect %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-call-effect.ll \
+  > /tmp/hexx64-1156e0-call-effect.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-effect.ll \
+  -o /tmp/hexx64-1156e0-call-effect.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-effect.bc \
+  -o /tmp/hexx64-1156e0-call-effect.verified.bc
+
+/usr/bin/time -f 'TIME limited-summary-call-effect %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-discover \
+  --decode-seed-limit 20 --summary-json /bin/ls \
+  > /tmp/binls-native-summary-call-effect.json
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `55.17s`。
+- `llvm-as` 通过，时间 `1.78s`。
+- `opt -passes=verify` 通过，时间 `0.99s`。
+- `/bin/ls --decode-seed-limit 20` 时间 `0.23s`，`confirmed_functions=20`，`basic_blocks=41`，`instructions=136`。
+- `/tmp/hexx64-1156e0-call-effect.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_effect` 数量：`1658`
+  - `kind=clobber_unknown` 数量：`504`
+  - `kind=unknown_effect` 数量：`1154`
+
+### 遇到的技术判断
+
+1. LLVM metadata 不能直接把 local call instruction 作为普通 metadata operand 保存。
+   - 试过 `ValueAsMetadata` / `LocalAsMetadata`，`verifyModule` 都报 `Invalid operand for global metadata`。
+   - 当前先记录 `call_block` 和 `callee` 字符串，保证 IR 合法。
+   - 后续如果需要精确 callsite id，需要单独生成稳定字符串编号，或者换一种合法的 intrinsic/helper 建模。
+
+2. x86-64 gcc cspec 默认 `<killedbycall>` 只列出 `RAX/RDX/XMM0`。
+   - 当前未列入 `killedbycall`、也不是 `unaffected` 的寄存器，如 `RCX/RDI/RSI/R8/R9/R10/R11`，被标成 `unknown_effect`。
+   - 这比擅自标成 `clobber_unknown` 更保守，也更贴近当前解析到的 Ghidra facts。
+   - 如果后续希望按 ABI caller-saved 全部建模为 clobber，需要明确补充 ABI effect 来源，不能在 register SSA 里硬编码。
+
+### 性能和风险
+
+- `hexx64.so -f 0x1156e0` 从上一轮约 `53.62s` 到 `55.17s`，增加约 `1.55s`。
+- call effect value 当前是 `freeze undef`，语义上仍是 unknown placeholder，但 metadata 已经保留了 NotDec 需要的来源信息。
+- 还没有实现阶段 2 的 call return value，所以 `RAX/RDX` 目前仍归为 `clobber_unknown`，不是 return。
+- 还没有实现阶段 3 的 call input candidate。
+
+评分：
+
+- 实现效果：7/10。阶段 1 目标达成，消除了裸 `undef` PHI，并显式记录 call effect。
+- 复杂度：5/10。新增 call/edge effect cache 和 metadata，但仍局限在 register SSA。
+- 维护成本：5/10。`call_block` 不是稳定 callsite id，后续接 prototype recovery 前需要再细化。
