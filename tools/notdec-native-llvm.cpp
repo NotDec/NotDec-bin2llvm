@@ -880,6 +880,10 @@ int main(int argc, char **argv) {
     std::unique_ptr<notdec::bin2llvm::NativeProgramState> selectedState;
     if (options->AllConfirmed || options->FunctionEntry ||
         !options->FunctionName.empty()) {
+      if (options->FunctionEntry && !options->AllConfirmed) {
+        options->DecodeOptions.InitialFunctionEntries.push_back(
+            *options->FunctionEntry);
+      }
       selectedState =
           std::make_unique<notdec::bin2llvm::NativeProgramState>(
               runNativeDiscovery(*binary, options->DecodeOptions));

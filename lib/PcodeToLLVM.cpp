@@ -196,6 +196,12 @@ private:
 
     std::set<size_t> starts;
     starts.insert(0);
+    for (const auto &[blockAddress, successors] : Config.BlockSuccessors) {
+      addBlockStart(starts, firstOpForAddress, blockAddress);
+      for (uint64_t successor : successors) {
+        addBlockStart(starts, firstOpForAddress, successor);
+      }
+    }
     for (size_t index = 0; index < program.Ops.size(); ++index) {
       const PcodeOpView &op = program.Ops[index];
       if (op.Opcode == PcodeOpcode::Branch ||

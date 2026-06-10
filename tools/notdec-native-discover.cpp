@@ -219,6 +219,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     } else {
       options.QueryAddress = *address;
     }
+    if (options.QueryFunctionEntry) {
+      options.DecodeOptions.InitialFunctionEntries.push_back(
+          *options.QueryFunctionEntry);
+    }
     options.ElfPath = args[2];
     return options;
   }

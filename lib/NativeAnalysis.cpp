@@ -1322,7 +1322,7 @@ public:
     std::deque<DecodeQueueItem> decodeQueue;
     std::set<std::pair<uint64_t, uint64_t>> queuedSeeds;
     std::set<std::pair<uint64_t, uint64_t>> decodedSeeds;
-    enqueueInitialSeeds(state, decodeQueue, queuedSeeds);
+    enqueueInitialSeeds(state, Options, decodeQueue, queuedSeeds);
 
     uint64_t decodedSeedCount = 0;
     while (!decodeQueue.empty()) {
@@ -1341,19 +1341,21 @@ public:
           !state.isExecutableAddress(item.BlockAddress)) {
         continue;
       }
-      std::vector<uint64_t> callTargets;
-      std::vector<uint64_t> branchTargets;
-      decodeSeed(state, decoder, item.FunctionEntry, item.BlockAddress,
-                 callTargets, branchTargets);
+      DecodeSeedResult result =
+          decodeSeed(state, decoder, item.FunctionEntry, item.BlockAddress);
       ++decodedSeedCount;
-      for (uint64_t target : callTargets) {
+      for (uint64_t target : result.CallTargets) {
         state.addFunctionSeed(target, 0, "", "sleigh-direct-call",
                               NativeFunctionConfidence::High);
         enqueueSeed(state, target, target, decodeQueue, queuedSeeds);
       }
-      for (uint64_t target : branchTargets) {
+      for (uint64_t target : result.BranchTargets) {
         enqueueSeed(state, item.FunctionEntry, target, decodeQueue,
                     queuedSeeds);
+      }
+      if (result.FallthroughTarget) {
+        enqueueSeed(state, item.FunctionEntry, *result.FallthroughTarget,
+                    decodeQueue, queuedSeeds);
       }
     }
   }
@@ -1376,6 +1378,15 @@ private:
   struct DirectControlFlowResult {
     std::map<uint64_t, DecodedFlowInfo> FlowInfos;
     std::vector<uint64_t> CallTargets;
+  };
+
+  // A seed decode is intentionally small. If the window ends without a real
+  // control-flow terminator, the next address is still part of the same
+  // function and should be decoded as another block.
+  struct DecodeSeedResult {
+    std::vector<uint64_t> CallTargets;
+    std::vector<uint64_t> BranchTargets;
+    std::optional<uint64_t> FallthroughTarget;
   };
 
   // Direct calls start a new function.  Direct branches keep the same function
@@ -1426,9 +1437,17 @@ private:
   }
 
   static void enqueueInitialSeeds(NativeProgramState &state,
+                                  const NativeSleighDecodeOptions &options,
                                   std::deque<DecodeQueueItem> &decodeQueue,
                                   std::set<std::pair<uint64_t, uint64_t>>
                                       &queuedSeeds) {
+    if (!options.InitialFunctionEntries.empty()) {
+      for (uint64_t entry : options.InitialFunctionEntries) {
+        enqueueSeed(state, entry, entry, decodeQueue, queuedSeeds);
+      }
+      return;
+    }
+
     for (NativeFunctionConfidence confidence :
          {NativeFunctionConfidence::High, NativeFunctionConfidence::Medium,
           NativeFunctionConfidence::Low}) {
@@ -1458,13 +1477,13 @@ private:
     return true;
   }
 
-  void decodeSeed(NativeProgramState &state, SleighInstructionDecoder &decoder,
-                  uint64_t functionEntry, uint64_t address,
-                  std::vector<uint64_t> &callTargets,
-                  std::vector<uint64_t> &branchTargets) {
+  DecodeSeedResult decodeSeed(NativeProgramState &state,
+                              SleighInstructionDecoder &decoder,
+                              uint64_t functionEntry, uint64_t address) {
+    DecodeSeedResult result;
     std::optional<uint64_t> availableBytes = executableBytesFrom(state, address);
     if (!availableBytes || *availableBytes == 0) {
-      return;
+      return result;
     }
 
     uint64_t decodeBytes = std::min(
@@ -1498,11 +1517,47 @@ private:
           addDirectControlFlow(state, decode.Pcode);
       flowInfos = std::move(flowResult.FlowInfos);
       for (uint64_t target : flowResult.CallTargets) {
-        addUniqueAddress(callTargets, target);
+        addUniqueAddress(result.CallTargets, target);
       }
     }
+    result.FallthroughTarget = fallthroughTargetForDecodedWindow(
+        state, functionEntry, rangeStart, rangeEnd, decodeBytes,
+        decode.Instructions, flowInfos);
     addDecodedFunctionBlocks(state, functionEntry, rangeStart, rangeEnd,
-                             decode.Instructions, flowInfos, branchTargets);
+                             decode.Instructions, flowInfos,
+                             result.FallthroughTarget, result.BranchTargets);
+    return result;
+  }
+
+  static std::optional<uint64_t> fallthroughTargetForDecodedWindow(
+      NativeProgramState &state, uint64_t entry, uint64_t rangeStart,
+      uint64_t rangeEnd, uint64_t decodeBytes,
+      const std::vector<SleighInstructionSummary> &instructions,
+      const std::map<uint64_t, DecodedFlowInfo> &flowInfos) {
+    if (instructions.empty() || rangeStart == 0 || rangeStart >= rangeEnd) {
+      return std::nullopt;
+    }
+    const SleighInstructionSummary &last = instructions.back();
+    if (last.Address + last.Size != rangeEnd) {
+      return std::nullopt;
+    }
+    auto flowIterator = flowInfos.find(last.Address);
+    if (flowIterator != flowInfos.end() &&
+        (flowIterator->second.HasUnconditionalBranch ||
+         flowIterator->second.HasIndirectBranch ||
+         flowIterator->second.HasReturn)) {
+      return std::nullopt;
+    }
+    if (!state.isExecutableAddress(rangeEnd) ||
+        isKnownOtherFunctionEntry(state, entry, rangeEnd)) {
+      return std::nullopt;
+    }
+    bool hitInstructionLimit = instructions.size() == MaxInstructionsPerSeed;
+    bool hitByteLimit = rangeEnd == rangeStart + decodeBytes;
+    if (!hitInstructionLimit && !hitByteLimit) {
+      return std::nullopt;
+    }
+    return rangeEnd;
   }
 
   static void addDecodedFunctionBlocks(
@@ -1510,6 +1565,7 @@ private:
       uint64_t rangeEnd,
       const std::vector<SleighInstructionSummary> &instructions,
       const std::map<uint64_t, DecodedFlowInfo> &flowInfos,
+      std::optional<uint64_t> fallthroughTarget,
       std::vector<uint64_t> &branchTargets) {
     if (rangeStart == 0 || rangeStart >= rangeEnd) {
       return;
@@ -1518,6 +1574,10 @@ private:
     std::vector<NativeBasicBlock> blocks =
         buildDecodedBlocks(instructions, flowInfos, rangeStart, rangeEnd);
     for (NativeBasicBlock &block : blocks) {
+      if (fallthroughTarget && block.End == rangeEnd &&
+          block.Successors.empty()) {
+        block.Successors.push_back(*fallthroughTarget);
+      }
       eraseKnownOtherFunctionSuccessors(state, entry, block.Successors);
       for (uint64_t successor : block.Successors) {
         if (successor < rangeStart || successor >= rangeEnd) {

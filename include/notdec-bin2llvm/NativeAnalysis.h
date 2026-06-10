@@ -318,6 +318,7 @@ private:
 // pass explicit limits without changing the correctness-oriented default path.
 struct NativeSleighDecodeOptions {
   std::optional<uint64_t> MaxDecodedSeeds;
+  std::vector<uint64_t> InitialFunctionEntries;
 };
 
 std::unique_ptr<NativeAnalyzer> createElfLoadAnalyzer();
