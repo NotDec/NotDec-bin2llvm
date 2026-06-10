@@ -170,6 +170,204 @@ Braun lazy SSA 的关键规则：
 
 这几个分类不一定都要变成不同 LLVM instruction，但 metadata 里必须能区分。
 
+## 按 Ghidra 思路做完整
+
+这块不能只补几个 `undef` 或 metadata。完整做法应该把四件事分清楚：
+
+1. storage model
+2. call effect model
+3. SSA construction
+4. prototype recovery consumption
+
+### 1. storage model：先统一“寄存器存储位置”
+
+Ghidra 的 `EffectRecord` 不是按 LLVM value 判断，而是按 storage range 判断。native 侧也应该先把 register 统一到 backing storage：
+
+- `RAX/EAX/AX/AL` 归到同一个 backing register，再用 bit 操作处理 partial access。
+- ABI input/output/killed/unaffected 都映射到 backing register。
+- call effect、PHI、entry input 都只针对 backing register 建模。
+
+这样做的原因很简单：call 杀的是 ABI storage，不是某条 LLVM load，也不是某个 partial alias。
+
+当前代码已经大体这样做，后续要补的是：所有 call input/output/effect metadata 都必须用同一套 `RegisterUnit` 和 ABI pentry 映射，不要在不同阶段各自按字符串猜寄存器。
+
+### 2. call effect model：call 后值必须显式存在
+
+Ghidra 的 `guardCalls()` 会把 call 对 storage 的影响插成数据流 guard：
+
+- `unaffected`：不插 guard，继续使用 call 前值。
+- `killedbycall`：插 creation-style indirect，表示 call 创建了新未知值。
+- `return_address` / `unknown_effect`：插普通 indirect，表示值经过 call 影响。
+
+native 侧对应做法：
+
+- preserved register：`readRegister(... before call)` 继续向前查。
+- return register：生成 `call_return` value。
+- killed register：生成 `call_clobber_unknown` value。
+- 信息不足：生成 `call_unknown_effect` value。
+
+关键要求：
+
+- `call_clobber_unknown` 不能参与 return 推断。
+- `call_return` 不能只来自 ABI output，还要能被 direct callee recovered prototype 缩小。
+- `call_unknown_effect` 是保守阻断，不是函数入口参数，也不是真实返回值。
+- 每个 effect value 必须带 `callsite_id`，否则后续很难把 input、output、residue 对回同一个 call。
+
+### 3. call input model：参数候选和 call effect 同属一个 callsite
+
+Ghidra 在 heritage 里会把可能作为参数的 varnode 注册成 input trial。native 侧不一定马上改真实 LLVM call signature，但应该先稳定记录事实：
+
+- callsite id
+- ABI slot
+- register
+- call 前 SSA value 的来源
+- callee 是 direct / declaration / indirect
+- 这个候选来自 ABI fallback 还是 callee prototype
+
+推荐短期形态：
+
+- metadata 挂在轻量 helper instruction 上，helper 使用 call 前 SSA value，保证 value 的支配关系由 LLVM verifier 检查。
+- call instruction 本身只挂不依赖 local value 的汇总 metadata。
+
+这比把 local SSA value 硬塞进全局 metadata 稳，也比直接改所有 call signature 风险低。
+
+### 4. SSA construction：Braun 只解决“怎么补 PHI”，不替 call effect 做决定
+
+Braun lazy SSA 的职责是：
+
+- 某个 block 入口要读寄存器值时，递归找 predecessor exit value。
+- 遇到环或 join 先建 incomplete PHI。
+- CFG predecessor 完整后，给 PHI 补齐 incoming。
+- 补完后删 trivial PHI。
+
+call effect 的职责是：
+
+- `readBlockExit(pred, reg)` 发现最后一个相关 call 时，回答 call 后这个 reg 是什么值。
+
+这两个职责不能混在一起。正确边界是：
+
+```text
+readBlockEntry(block, reg)
+  -> 对每个 pred 调 readBlockExit(pred, reg)
+  -> readBlockExit 内部处理 local store/load/call effect
+  -> readBlockEntry 只负责 PHI 合流
+```
+
+也就是说，PHI finalize 缺 incoming 时，不应该直接补 `undef`，也不应该猜 entry input；它应该重新走 `readBlockExit(pred, reg)`。如果 predecessor exit 是 call 后未知值，就由 call effect model 创建 `call_unknown_effect` 或 `call_clobber_unknown`。
+
+### 5. prototype recovery：消费显式事实，不反推结构洞
+
+后续 prototype recovery 应该只消费这些明确事实：
+
+- function entry input：说明 caller 传进当前函数的寄存器值。
+- call input candidate：说明当前函数传给 callee 的寄存器值。
+- call return：说明 callee 可能写出的返回值。
+- preserved：说明 call 没有改这个 storage。
+
+不应该消费：
+
+- `clobber_unknown` 作为返回值。
+- `unknown_effect` 作为参数。
+- PHI 里为了结构合法临时补出来的裸 `undef`。
+
+这样做以后，prototype recovery 的判断会更接近 Ghidra：先有 callsite trials，再逐步确认 prototype，而不是从 IR 结构洞里猜参数和返回。
+
+## 当前代码应该对齐的模块边界
+
+建议把当前 `NativeRegisterSSA` 里的职责按下面方式收紧：
+
+- `readRegister` / `readBlockEntry` / `readBlockExit`
+  - 只负责寄存器 reaching value 查询。
+  - 不直接做 prototype rewrite。
+
+- `callEffectValue`
+  - 只负责创建 call 后寄存器值。
+  - 输入是 call、register、effect kind、effect source。
+  - 输出是可被 SSA/PHI 使用的 LLVM value。
+
+- `attachCallInputCandidates`
+  - 只负责记录 call 前 input candidate。
+  - 不决定最终函数签名。
+
+- `finalizePendingPhis`
+  - 等价于 Braun 的 `seal_all_blocks`。
+  - 对 missing incoming 重新走 predecessor exit 查询。
+  - 不直接生成无来源 `undef`。
+
+- `simplifyPhi`
+  - 删除 trivial PHI 时同步更新 `EntryValue`、`ExitValue`、`Replacement` 和 PHI cache。
+
+- `NativePrototypeRecovery`
+  - 消费 call input/output metadata。
+  - 负责把候选事实变成真实 function/call signature。
+
+这个边界的好处是：SSA 构建不需要理解“这个参数最终是否真的存在”，prototype recovery 也不需要猜“这个 PHI 为什么缺 incoming”。
+
+## 推荐实现顺序
+
+### 第一步：把 callsite fact 稳定下来
+
+目标：
+
+- 每个 call 有稳定 `callsite_id`。
+- call effect 和 call input candidate 都带同一个 id。
+- metadata 字段固定，后续工具和测试不用反复改。
+
+判断标准：
+
+- 同一个 call 的 input candidate 和 return/clobber effect 能按 id 对上。
+- `hexx64.so -f 0x1156e0` 能过 LLVM 22 verifier。
+
+### 第二步：把 PHI finalize 完全改成 Braun 语义
+
+目标：
+
+- pending PHI 有明确状态，至少区分 creating / complete。
+- finalize 时对每条 predecessor 边重新走 `readBlockExit`。
+- trivial PHI 删除后同步所有 cache。
+
+判断标准：
+
+- 没有 operandless PHI。
+- 没有 incoming 少于 CFG predecessor 的 PHI。
+- register PHI incoming 不出现裸 `undef`。
+
+### 第三步：让 direct callee prototype 精化 caller effect
+
+目标：
+
+- direct callee 已恢复 return 时，caller 侧只保留真实 return register。
+- direct callee 已确认 preserved/clobbered 时，覆盖 ABI fallback。
+- declaration / indirect call 继续用 ABI fallback。
+
+判断标准：
+
+- 非真实 return 的 ABI output 不再误导 prototype recovery。
+- `clobber_unknown` 和 `return` 的数量分布可解释。
+
+### 第四步：把 call input candidate 接入 prototype recovery
+
+目标：
+
+- register 参数候选从 callsite metadata 来。
+- function entry input 和 call input 分开处理。
+- declaration 和 internal direct call 使用同一套 candidate fact。
+
+判断标准：
+
+- callsite input store residue 下降。
+- 不把 `unknown_effect` 或 `clobber_unknown` 当参数。
+
+### 第五步：再考虑 stack 和 XMM
+
+register GPR 路线稳定后，再扩：
+
+- stack argument：要结合 Ghidra stack space / `stackshift` / `extrapop`。
+- XMM：要确认 cspec storage、partial lane、LLVM type 表达。
+- indirect call：先记录 fact，不急着强推 prototype。
+
+这些不应该混在第一轮 register SSA 修复里。
+
 ## native 侧要复刻的策略
 
 ### 1. 先算 call effect，不要先断流
