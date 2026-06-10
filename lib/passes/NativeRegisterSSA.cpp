@@ -72,6 +72,21 @@ struct FlagBlockLiveness {
   std::set<llvm::GlobalVariable *> LiveOut;
 };
 
+enum class PendingPhiState {
+  Incomplete,
+  Completing,
+  Complete,
+};
+
+// PendingPhiInfo is the explicit state for Braun-style temporary PHIs.  The CFG
+// is already known, so `Incomplete` means "created to break recursion and still
+// needs finalize"; `Complete` means all known predecessor incoming values were
+// added.
+struct PendingPhiInfo {
+  llvm::PHINode *Phi = nullptr;
+  PendingPhiState State = PendingPhiState::Incomplete;
+};
+
 bool isFlagRegisterName(llvm::StringRef name) {
   return name == "CF" || name == "PF" || name == "AF" || name == "ZF" ||
          name == "SF" || name == "TF" || name == "IF" || name == "DF" ||
@@ -1126,12 +1141,13 @@ private:
     }
 
     llvm::PHINode *phi =
-        pendingPhi != PendingPhi.end() ? pendingPhi->second
+        pendingPhi != PendingPhi.end() ? pendingPhi->second.Phi
                                        : ensurePhi(block, unit);
     EntryValue.emplace(key, phi);
     for (const auto &[pred, incoming] : incomingValues) {
       phi->addIncoming(incoming, pred);
     }
+    markPendingPhiComplete(*phi);
 
     llvm::Value *simplified = simplifyPhi(phi);
     EntryValue[key] = simplified;
@@ -1167,15 +1183,25 @@ private:
     BlockRegKey key{&block, unit.Global};
     auto existing = PendingPhi.find(key);
     if (existing != PendingPhi.end()) {
-      return existing->second;
+      return existing->second.Phi;
     }
 
     llvm::IRBuilder<> builder(&*block.getFirstInsertionPt());
     auto *phi = builder.CreatePHI(unit.Global->getValueType(), 0,
                                   unit.Name + ".regssa");
-    PendingPhi.emplace(key, phi);
+    PendingPhi.emplace(key, PendingPhiInfo{phi, PendingPhiState::Incomplete});
     ++Summary.PhisCreated;
     return phi;
+  }
+
+  void markPendingPhiComplete(llvm::PHINode &phi) {
+    for (auto &[key, info] : PendingPhi) {
+      (void)key;
+      if (info.Phi == &phi) {
+        info.State = PendingPhiState::Complete;
+        return;
+      }
+    }
   }
 
   llvm::Value *simplifyPhi(llvm::PHINode *phi) {
@@ -1236,12 +1262,17 @@ private:
   }
 
   void finalizePendingPhis() {
-    for (const auto &[key, phi] : PendingPhi) {
+    for (auto &[key, info] : PendingPhi) {
       (void)key;
-      if (phi == nullptr || phi->getParent() == nullptr) {
+      llvm::PHINode *phi = info.Phi;
+      if (phi == nullptr || phi->getParent() == nullptr ||
+          info.State == PendingPhiState::Complete) {
         continue;
       }
+      info.State = PendingPhiState::Completing;
       completePhiIncoming(*phi);
+      info.State = PendingPhiState::Complete;
+      (void)simplifyPhi(phi);
     }
   }
 
@@ -1352,7 +1383,7 @@ private:
 
   llvm::GlobalVariable *pendingPhiRegister(llvm::PHINode &phi) const {
     for (const auto &[key, pendingPhi] : PendingPhi) {
-      if (pendingPhi == &phi) {
+      if (pendingPhi.Phi == &phi) {
         return key.second;
       }
     }
@@ -1385,7 +1416,7 @@ private:
 
   void eraseUnusedPendingPhis() {
     for (auto it = PendingPhi.begin(); it != PendingPhi.end();) {
-      llvm::PHINode *phi = it->second;
+      llvm::PHINode *phi = it->second.Phi;
       if (phi != nullptr && phi->getParent() != nullptr && phi->use_empty()) {
         phi->eraseFromParent();
         it = PendingPhi.erase(it);
@@ -1397,7 +1428,7 @@ private:
 
   void forgetPendingPhi(llvm::PHINode &phi) {
     for (auto it = PendingPhi.begin(); it != PendingPhi.end();) {
-      if (it->second == &phi) {
+      if (it->second.Phi == &phi) {
         it = PendingPhi.erase(it);
         continue;
       }
@@ -1560,7 +1591,7 @@ private:
   std::map<llvm::Value *, llvm::Value *> Replacement;
   std::map<BlockRegKey, llvm::Value *> EntryValue;
   std::map<BlockRegKey, llvm::Value *> ExitValue;
-  std::map<BlockRegKey, llvm::PHINode *> PendingPhi;
+  std::map<BlockRegKey, PendingPhiInfo> PendingPhi;
   std::map<CallEffectKey, llvm::Value *> CallEffectValue;
   std::map<EdgeEffectKey, llvm::Value *> EdgeEffectValue;
   std::set<BlockRegKey> ResolvingEntry;

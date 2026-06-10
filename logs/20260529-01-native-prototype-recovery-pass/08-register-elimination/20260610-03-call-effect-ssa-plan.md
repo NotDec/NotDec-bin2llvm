@@ -784,3 +784,99 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：5/10。missing incoming 会优先补真实 predecessor exit，语义比 edge unknown 更好。
 - 复杂度：2/10。只新增一个查询 helper。
 - 维护成本：3/10。仍依赖当前 pending PHI cache，后续状态机重构时需要纳入统一 `addPhiOperands`。
+
+## 2026-06-10 实现记录：阶段 4 PendingPhi 状态显式化
+
+本次把 `PendingPhi` 从裸 `PHINode *` cache 改成带状态的数据结构。目标是先让 incomplete PHI 的状态可见，后续再继续收敛到完整 `seal_all_blocks + addPhiOperands`。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:74`
+  - 新增 `PendingPhiState`：
+    - `Incomplete`
+    - `Completing`
+    - `Complete`
+
+- `lib/passes/NativeRegisterSSA.cpp:84`
+  - 新增 `PendingPhiInfo`。
+  - 保存 `PHINode *Phi` 和 `PendingPhiState State`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1129`
+  - `readBlockEntry()` 取 pending PHI 时改读 `PendingPhiInfo::Phi`。
+  - 正常补完 incoming 后调用 `markPendingPhiComplete()`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1176`
+  - `ensurePhi()` 创建 `PendingPhiInfo{phi, Incomplete}`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1181`
+  - 新增 `markPendingPhiComplete()`，按 PHI 指针把状态改成 `Complete`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1238`
+  - `finalizePendingPhis()` 跳过 `Complete` PHI。
+  - 对还没完成的 PHI 标成 `Completing`，补 incoming 后标成 `Complete`，再尝试 trivial PHI 删除。
+
+- `lib/passes/NativeRegisterSSA.cpp:1354`
+  - `pendingPhiRegister()` 改为从 `PendingPhiInfo::Phi` 查 register。
+
+- `lib/passes/NativeRegisterSSA.cpp:1386`
+  - `eraseUnusedPendingPhis()` / `forgetPendingPhi()` 改为使用 `PendingPhiInfo::Phi`。
+
+### 判断
+
+- 这一步满足阶段 4 里“`PendingPhi` 不能只是 `PHINode *` cache”的要求。
+- 目前状态还比较轻：
+  - `Incomplete`：递归中创建，等待补 incoming。
+  - `Completing`：finalize 正在补 incoming。
+  - `Complete`：已经补过 incoming，不需要 finalize 再处理。
+- 没有引入动态 sealed block API，因为 native LLVM CFG 在 pass 运行时已经完整。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-phi-state %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-phi-state.ll \
+  > /tmp/hexx64-1156e0-phi-state.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-phi-state.ll \
+  -o /tmp/hexx64-1156e0-phi-state.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-phi-state.bc \
+  -o /tmp/hexx64-1156e0-phi-state.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `54.60s`。
+- `llvm-as` 通过。
+- `opt -passes=verify` 通过，时间 `0.95s`。
+- `/tmp/hexx64-1156e0-phi-state.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_input_candidate` 数量：`163`
+  - `notdec.register.call_input_candidates` 数量：`61`
+  - `notdec.register.call_effect` 数量：`1677`
+  - `kind=return` 数量：`508`
+  - `kind=clobber_unknown` 数量：`0`
+  - `kind=unknown_effect` 数量：`1169`
+
+### 性能和风险
+
+- `hexx64.so -f 0x1156e0` 没有性能回退。
+- 当前状态机还没有记录“哪些 predecessor incoming 已经补过”，仍依赖 `completePhiIncoming()` 对现有 incoming block 去重。
+- 如果后续要彻底贴近 Braun，可以把 `completePhiIncoming()` 拆成 `addPhiOperands(variable, phi)`，并把 incoming 去重、补边、trivial PHI 删除放进同一个流程。
+
+评分：
+
+- 实现效果：6/10。pending PHI 状态已显式化，finalize 不再把所有 pending PHI 一律当未完成。
+- 复杂度：3/10。数据结构变了，但没有改核心递归策略。
+- 维护成本：3/10。状态语义明确，后续继续收敛到 Braun 的 `seal_all_blocks` 更容易。
