@@ -71,6 +71,8 @@ Bench2 真实项目集合在 `/sn640/NotDec-Exp/Bench2`：
 - `manifest/benchmark-needed.tsv`：目标的动态依赖。
 - `bin2llvm-ir/`：bin2llvm 相关 JSON、`.ll`、`.bc`、日志和 Ghidra project。
 
+本地 Ghidra 源码在 `/sn640/ghidra`。需要查 Ghidra 实现时直接从这里找，不要全盘搜索。
+
 bin2llvm native 链路写计划时，优先按这个结构写，范围只限
 `external/NotDec-bin2llvm` 的 native 路线：
 
