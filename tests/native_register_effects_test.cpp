@@ -67,6 +67,13 @@ void attachTestAbi(llvm::Module &module) {
   abi.PrototypeName = "__stdcall";
   abi.StackPointerRegister = "RSP";
   abi.StackPointerSpace = "register";
+  notdec::bin2llvm::NativeAbiParamEntry input;
+  input.MinSize = 1;
+  input.MaxSize = 8;
+  input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  input.Storage.Name = "RDI";
+  abi.Inputs.push_back(std::move(input));
+
   notdec::bin2llvm::NativeAbiParamEntry output;
   output.MinSize = 1;
   output.MaxSize = 8;
@@ -147,6 +154,29 @@ llvm::Function *createCallEffectFunction(llvm::Module &module,
       builder.CreateLoad(rax->getValueType(), rax, "rax_after_call");
   loadRax->setMetadata("notdec.register.access", raxMetadata);
   builder.CreateRet(builder.CreateAdd(loadRbx, loadRax));
+  return function;
+}
+
+llvm::Function *createCallInputCandidateFunction(llvm::Module &module,
+                                                 llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "call_input_candidate_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "call_input_candidate", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RDI");
+
+  llvm::StoreInst *store = builder.CreateStore(
+      llvm::ConstantInt::get(rdi->getValueType(), 0x7777), rdi);
+  store->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
   return function;
 }
 
@@ -806,6 +836,61 @@ unsigned countCallEffects(const llvm::Function &function, llvm::StringRef kind,
   return count;
 }
 
+unsigned countCallInputCandidates(const llvm::Function &function,
+                                  llvm::StringRef name) {
+  unsigned count = 0;
+  std::string expectedRegister = ("register=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      llvm::MDNode *node =
+          inst.getMetadata("notdec.register.call_input_candidate");
+      if (node == nullptr) {
+        continue;
+      }
+      for (const llvm::MDOperand &operand : node->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (field != nullptr && field->getString() == expectedRegister) {
+          ++count;
+          break;
+        }
+      }
+    }
+  }
+  return count;
+}
+
+bool hasCallInputCandidateMetadata(const llvm::Function &function,
+                                   llvm::StringRef name) {
+  std::string expectedRegister = ("register=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      llvm::MDNode *node =
+          call->getMetadata("notdec.register.call_input_candidates");
+      if (node == nullptr) {
+        continue;
+      }
+      for (const llvm::MDOperand &entryOperand : node->operands()) {
+        auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(entryOperand.get());
+        if (entry == nullptr) {
+          continue;
+        }
+        for (const llvm::MDOperand &fieldOperand : entry->operands()) {
+          auto *field =
+              llvm::dyn_cast_or_null<llvm::MDString>(fieldOperand.get());
+          if (field != nullptr && field->getString() == expectedRegister) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
 bool functionReturnsConstant(const llvm::Function &function, uint64_t expected) {
   for (const llvm::BasicBlock &block : function) {
     for (const llvm::Instruction &inst : block) {
@@ -849,6 +934,8 @@ int main() {
   llvm::Function *clobbered =
       createFunction(module, "clobbered_rbx", rbx, false);
   llvm::Function *callEffects = createCallEffectFunction(module, rbx, rax);
+  llvm::Function *callInputCandidate =
+      createCallInputCandidateFunction(module, rdi);
   llvm::Function *stackPointerCallEffects =
       createStackPointerCallEffectFunction(module, rsp);
   llvm::Function *repeatedLoadAfterCall =
@@ -931,6 +1018,10 @@ int main() {
                "RAX load after call was not rewritten to call effect");
   ok &= expect(countCallEffects(*callEffects, "return", "RAX") == 1,
                "RAX call return was not made explicit");
+  ok &= expect(countCallInputCandidates(*callInputCandidate, "RDI") == 1,
+               "RDI call input candidate value was not made explicit");
+  ok &= expect(hasCallInputCandidateMetadata(*callInputCandidate, "RDI"),
+               "RDI call input candidate metadata was not attached to call");
   ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
                "RSP load after call was not propagated");
   ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 0,

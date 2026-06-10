@@ -63,6 +63,7 @@ struct AbiRegisterEffects {
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
   std::set<std::string> Outputs;
+  std::vector<std::string> Inputs;
   std::string StackPointerRegister;
 };
 
@@ -204,6 +205,25 @@ AbiRegisterEffects collectAbiRegisterEffects(llvm::Module &module) {
       }
     }
     if (childLists.size() >= 2) {
+      for (const llvm::MDOperand &entryOperand : childLists[0]->operands()) {
+        auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(entryOperand.get());
+        if (entry == nullptr) {
+          continue;
+        }
+        for (const llvm::MDOperand &storageOperand : entry->operands()) {
+          auto *storageNode =
+              llvm::dyn_cast_or_null<llvm::MDNode>(storageOperand.get());
+          if (storageNode == nullptr ||
+              mdField(storageNode, "kind") !=
+                  std::optional<std::string>("register")) {
+            continue;
+          }
+          std::optional<std::string> name = mdField(storageNode, "name");
+          if (name && !name->empty()) {
+            effects.Inputs.push_back(*name);
+          }
+        }
+      }
       for (const llvm::MDOperand &entryOperand : childLists[1]->operands()) {
         auto *entry = llvm::dyn_cast_or_null<llvm::MDNode>(entryOperand.get());
         if (entry == nullptr) {
@@ -388,6 +408,7 @@ public:
     if (EnableRewrite) {
       rewritePartialStores();
       rewriteLoads();
+      attachCallInputCandidates();
       removeLocalDeadStores();
       removeUnreadFlagStores();
       removeUnreadRipStores();
@@ -398,6 +419,7 @@ public:
       eraseUnusedPendingPhis();
     } else {
       collectExternalInputsOnly();
+      attachCallInputCandidates();
       attachRegisterEffectMetadata();
       finalizePendingPhis();
       eraseUnusedPendingPhis();
@@ -931,6 +953,87 @@ private:
       }
     }
     return nullptr;
+  }
+
+  llvm::Value *localValueBeforeCallInput(llvm::CallBase &call,
+                                         RegisterUnit &unit) {
+    llvm::BasicBlock *block = call.getParent();
+    if (block == nullptr) {
+      return nullptr;
+    }
+
+    // Input candidates are only facts already visible before the call.  Do not
+    // fall back to block entry here: that would turn every call into a possible
+    // read of every ABI input register and create fake function inputs.
+    return localValueBefore(*block, unit, &call);
+  }
+
+  void attachCallInputCandidates() {
+    if (AbiEffects.Inputs.empty()) {
+      return;
+    }
+
+    std::map<std::string, RegisterUnit *> inputUnits;
+    for (auto &[global, unit] : Units) {
+      (void)global;
+      inputUnits.emplace(unit.Name, &unit);
+    }
+
+    for (llvm::BasicBlock &block : Function) {
+      for (llvm::Instruction &inst : block) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+        if (call == nullptr || !isRegisterClobberCall(inst)) {
+          continue;
+        }
+        attachCallInputCandidates(*call, inputUnits);
+      }
+    }
+  }
+
+  void attachCallInputCandidates(
+      llvm::CallBase &call,
+      const std::map<std::string, RegisterUnit *> &inputUnits) {
+    llvm::LLVMContext &context = Function.getContext();
+    std::vector<llvm::Metadata *> entries;
+    uint64_t slot = 0;
+    for (const std::string &registerName : AbiEffects.Inputs) {
+      auto unitIt = inputUnits.find(registerName);
+      if (unitIt == inputUnits.end()) {
+        ++slot;
+        continue;
+      }
+      RegisterUnit &unit = *unitIt->second;
+      llvm::Value *value = localValueBeforeCallInput(call, unit);
+      value = resolveValue(value);
+      auto *integerType =
+          value == nullptr ? nullptr : llvm::dyn_cast<llvm::IntegerType>(
+                                         value->getType());
+      if (integerType == nullptr || integerType->getBitWidth() != 64) {
+        ++slot;
+        continue;
+      }
+
+      llvm::IRBuilder<> builder(&call);
+      llvm::Instruction *candidate =
+          llvm::cast<llvm::Instruction>(builder.CreateFreeze(
+              value, unit.Name + ".call_input_candidate"));
+      llvm::Metadata *fields[] = {
+          llvm::MDString::get(context, "slot=" + std::to_string(slot)),
+          llvm::MDString::get(context, "register=" + unit.Name),
+          llvm::ValueAsMetadata::get(unit.Global),
+      };
+      candidate->setMetadata("notdec.register.call_input_candidate",
+                             llvm::MDNode::get(context, fields));
+      entries.push_back(llvm::MDNode::get(context, fields));
+      ++slot;
+    }
+
+    if (entries.empty()) {
+      call.setMetadata("notdec.register.call_input_candidates", nullptr);
+      return;
+    }
+    call.setMetadata("notdec.register.call_input_candidates",
+                     llvm::MDNode::get(context, entries));
   }
 
   llvm::Value *resolveValue(llvm::Value *value) {

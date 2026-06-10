@@ -775,6 +775,10 @@ std::optional<llvm::Value *> callsiteInputValueBeforeCall(
     llvm::CallInst &call, const NativeRecoveredPrototypeParam &input,
     llvm::Type *paramType);
 
+std::optional<llvm::Value *> callInputCandidateValueBeforeCall(
+    llvm::CallInst &call, const NativeRecoveredPrototypeParam &input,
+    llvm::Type *paramType);
+
 llvm::StoreInst *localCallsiteInputStoreBeforeCall(
     llvm::CallInst &call, llvm::StringRef registerName, llvm::Type *valueType);
 
@@ -914,9 +918,45 @@ std::optional<NativeRecoveredPrototypeParam> declarationInputParamForStore(
   return param;
 }
 
+std::optional<NativeRecoveredPrototypeParam>
+declarationInputParamForCandidate(llvm::MDNode &candidate,
+                                  const NativePrototypeModel &model) {
+  std::optional<std::string> registerName = metadataField(candidate, "register");
+  if (!registerName) {
+    return std::nullopt;
+  }
+  std::optional<NativeStorageMatch> match =
+      model.findInputRegister(*registerName);
+  if (!match) {
+    return std::nullopt;
+  }
+
+  NativeRecoveredPrototypeParam param;
+  param.RegisterName = *registerName;
+  param.StorageKind = "register";
+  param.Size = 8;
+  param.Slot = match->Slot;
+  return param;
+}
+
 std::vector<NativeRecoveredPrototypeParam> declarationInputParamsBeforeCall(
     llvm::CallInst &call, const NativePrototypeModel &model) {
   std::map<uint64_t, NativeRecoveredPrototypeParam> paramsBySlot;
+  if (llvm::MDNode *candidates =
+          call.getMetadata("notdec.register.call_input_candidates")) {
+    for (const llvm::MDOperand &operand : candidates->operands()) {
+      auto *candidate = llvm::dyn_cast_or_null<llvm::MDNode>(operand.get());
+      if (candidate == nullptr) {
+        continue;
+      }
+      std::optional<NativeRecoveredPrototypeParam> param =
+          declarationInputParamForCandidate(*candidate, model);
+      if (!param) {
+        continue;
+      }
+      paramsBySlot.try_emplace(param->Slot, *param);
+    }
+  }
   for (auto iter = llvm::BasicBlock::reverse_iterator(call.getIterator()),
             end = call.getParent()->rend();
        iter != end; ++iter) {
@@ -1184,6 +1224,9 @@ std::optional<DeclarationCallInputRewrite> declarationCallInputRewriteForCall(
     llvm::Type *paramType = llvm::Type::getInt64Ty(call.getContext());
     std::optional<llvm::Value *> argument =
         callsiteInputValueBeforeCall(call, input, paramType);
+    if (!argument) {
+      argument = callInputCandidateValueBeforeCall(call, input, paramType);
+    }
     if (!argument) {
       return std::nullopt;
     }
@@ -1484,6 +1527,38 @@ std::optional<llvm::Value *> registerStoreValueInReverseRange(
       return std::nullopt;
     }
     return value;
+  }
+  return std::nullopt;
+}
+
+std::optional<llvm::Value *> callInputCandidateValueBeforeCall(
+    llvm::CallInst &call, const NativeRecoveredPrototypeParam &input,
+    llvm::Type *paramType) {
+  for (auto iter = llvm::BasicBlock::reverse_iterator(call.getIterator()),
+            end = call.getParent()->rend();
+       iter != end; ++iter) {
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(&*iter);
+    if (inst == nullptr) {
+      continue;
+    }
+    if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(inst)) {
+      llvm::Function *callee = previousCall->getCalledFunction();
+      if (callee == nullptr || !callee->isIntrinsic()) {
+        return std::nullopt;
+      }
+      continue;
+    }
+
+    llvm::MDNode *metadata =
+        inst->getMetadata("notdec.register.call_input_candidate");
+    if (metadata == nullptr ||
+        metadataField(*metadata, "register") != input.RegisterName) {
+      continue;
+    }
+    if (inst->getType() != paramType) {
+      return std::nullopt;
+    }
+    return inst;
   }
   return std::nullopt;
 }

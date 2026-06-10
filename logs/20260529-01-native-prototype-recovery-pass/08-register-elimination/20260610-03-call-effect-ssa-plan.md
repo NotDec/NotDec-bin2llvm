@@ -493,3 +493,132 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：7/10。ABI output 已和 clobber 分开，RAX/RDX 能作为 call return 传播。
 - 复杂度：3/10。只复用现有 ABI metadata，没有改 ABI parser。
 - 维护成本：4/10。output set 仍是 ABI-level，后续需要 prototype recovery 精化。
+
+## 2026-06-10 实现记录：阶段 3 call input candidate 显式化
+
+本次完成阶段 3 的保守子集：register SSA 阶段给 callsite 产出 ABI register input candidate，并让 prototype recovery 能消费这些 candidate。暂不改 stack input、XMM input，也不把所有 ABI input 都强行变成函数入口 input。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:62`
+  - `AbiRegisterEffects` 增加 `Inputs`，保存 ABI input register 顺序。
+
+- `lib/passes/NativeRegisterSSA.cpp:207`
+  - `collectAbiRegisterEffects` 解析 `notdec.abi` 的 input pentry child list。
+  - 当前只收 register storage 名，保持 ABI 顺序。
+
+- `lib/passes/NativeRegisterSSA.cpp:408`
+  - `run()` 在 `rewriteLoads()` 之后调用 `attachCallInputCandidates()`。
+  - 这样 call input candidate 看到的是已经 SSA 化后的本地值。
+
+- `lib/passes/NativeRegisterSSA.cpp:958`
+  - 新增 `localValueBeforeCallInput()`。
+  - 这里只查 call 前本地可见值，不 fallback 到 block entry。
+  - 原因是如果 fallback 到 entry，会把每个 call 都建成可能读取所有 ABI input register，制造假的函数入口 input。
+
+- `lib/passes/NativeRegisterSSA.cpp:971`
+  - 新增 `attachCallInputCandidates()`。
+  - 对每个非 intrinsic call，按 ABI input register 顺序尝试读取 call 前本地 SSA 值。
+  - 只处理 64-bit integer register candidate。
+  - 对每个 candidate 创建 `freeze value` helper，并挂 `notdec.register.call_input_candidate`。
+  - 同时在 call 上挂 `notdec.register.call_input_candidates`，记录 `slot`、`register` 和 backing global。
+
+- `lib/passes/NativePrototypeRecovery.cpp:921`
+  - 新增 `declarationInputParamForCandidate()`，把 call input candidate metadata 转成 `NativeRecoveredPrototypeParam`。
+
+- `lib/passes/NativePrototypeRecovery.cpp:942`
+  - `declarationInputParamsBeforeCall()` 先读取 `notdec.register.call_input_candidates`。
+  - 旧的 call 前 store 回看逻辑保留，作为兼容路径。
+
+- `lib/passes/NativePrototypeRecovery.cpp:1534`
+  - 新增 `callInputCandidateValueBeforeCall()`，从 call 前同块最近的 candidate helper 取实际 SSA value。
+
+- `lib/passes/NativePrototypeRecovery.cpp:1186`
+  - `declarationCallInputRewriteForCall()` 在旧的 `callsiteInputValueBeforeCall()` 失败后，尝试使用 `callInputCandidateValueBeforeCall()`。
+
+- `tests/native_register_effects_test.cpp:70`
+  - 测试 ABI 增加 RDI input pentry。
+
+- `tests/native_register_effects_test.cpp:160`
+  - 新增 `createCallInputCandidateFunction()`，构造 `store RDI; call` 场景。
+
+- `tests/native_register_effects_test.cpp:839`
+  - 新增 `countCallInputCandidates()` 和 `hasCallInputCandidateMetadata()`，分别检查 helper metadata 和 callsite metadata。
+
+- `tests/native_register_effects_test.cpp:936`
+  - 新增阶段 3 断言：
+    - RDI call input candidate helper 被创建。
+    - call 上有 RDI input candidate metadata。
+
+### 技术判断
+
+- 没有把 local SSA value 直接塞进 call metadata。
+  - 之前 call effect 阶段已经确认 LLVM 不接受 local instruction 作为全局 metadata operand。
+  - 这次采用本地 helper instruction 承载 value，call metadata 只记录 slot/register/global。
+
+- 没有对所有 ABI input 调完整 `readRegister()`。
+  - 完整 `readRegister()` 在找不到本地定义时会创建 function entry external input。
+  - 对 call input candidate 来说这会过宽：每个 call 都会看起来读了所有 ABI input。
+  - 当前只接受 call 前本地已经能看到的值，后续如果要跨 block，需要单独做“不会制造新 entry input”的 current-value resolver。
+
+- prototype recovery 消费 candidate 仍然保守。
+  - candidate 能帮助 declaration input 推断。
+  - 但真实 rewrite 仍要求能拿到 64-bit value。
+  - stack/XMM/变参暂不处理。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target notdec-native-llvm native_register_effects_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-call-input %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-call-input.ll \
+  > /tmp/hexx64-1156e0-call-input.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-input.ll \
+  -o /tmp/hexx64-1156e0-call-input.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-input.bc \
+  -o /tmp/hexx64-1156e0-call-input.verified.bc
+
+/usr/bin/time -f 'TIME limited-summary-call-input %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-discover \
+  --decode-seed-limit 20 --summary-json /bin/ls \
+  > /tmp/binls-native-summary-call-input.json
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `hexx64.so -f 0x1156e0` 默认路径成功，时间 `56.64s`。
+- `llvm-as` 通过，时间约 `1.79s`。
+- `opt -passes=verify` 通过，时间 `1.05s`。
+- `/bin/ls --decode-seed-limit 20` 时间 `0.23s`，`confirmed_functions=20`，`basic_blocks=41`，`instructions=136`。
+- `/tmp/hexx64-1156e0-call-input.ll` 中：
+  - register PHI incoming 裸 `undef` 数量：`0`
+  - `notdec.register.call_input_candidate` 数量：`163`
+  - `notdec.register.call_input_candidates` 数量：`61`
+  - `notdec.register.call_effect` 数量：`1677`
+  - `kind=return` 数量：`508`
+  - `kind=clobber_unknown` 数量：`0`
+  - `kind=unknown_effect` 数量：`1169`
+
+### 性能和风险
+
+- `hexx64.so -f 0x1156e0` 从阶段 2 的 `56.49s` 到 `56.64s`，变化很小。
+- candidate helper 当前是 `freeze value`。这能把 metadata 绑在本地 SSA value 上，但后续如果优化 pass 删除 unused helper，需要在使用前保留或转成更稳定的 helper intrinsic-like op。
+- 当前只覆盖同 block call 前本地值。跨 block input candidate 需要一个不会制造 entry input 的 current-value resolver。
+
+评分：
+
+- 实现效果：6/10。call input 已显式可见，并接入 declaration input 推断；但跨 block、stack、XMM 还没做。
+- 复杂度：5/10。新增 helper metadata 和 prototype recovery fallback，范围仍局限在 register input。
+- 维护成本：5/10。metadata 形态清楚，但后续需要统一 callsite id 和 current-value resolver。
