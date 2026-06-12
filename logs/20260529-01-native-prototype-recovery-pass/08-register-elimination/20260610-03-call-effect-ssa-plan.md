@@ -172,6 +172,7 @@ store i64 %rbx.after.call, ptr @RBX
 - input side：`load register` 紧跟 `call_input` helper，然后才是真实 call。
 - output side：真实 call 后紧跟 `call_return` / `call_effect` helper，再紧跟写回 register 的 `store`。
 - 不要把 load/store 拉到很远的位置。`load` 是 call 点看到的 register 值，`store` 是 call 后 register state 的新定义，二者都应该作为 Register SSA 的普通读写点。
+- call 侧只暴露这个 call 自己的 input/effect，不负责回看 call 前已有 store，也不负责匹配 call 后已有 load；这些数据流关系交给 Register SSA。
 
 metadata 只记录解释信息，例如：
 
@@ -379,7 +380,7 @@ LLVM 侧：
 
 - 按 ABI input / callee metadata 构造 call input helper，不维护长期并行 fact 表。
 - helper operand 来自 call 前对应 register load，后续由 Register SSA 把这个 load 接到正确 SSA value。
-- 删除 `attachCallInputCandidates()` 里只扫同 block 的 current-value 逻辑。
+- 删除 `attachCallInputCandidates()` 里只扫同 block 的 current-value 逻辑；如果还有类似“匹配 call 前 store / call 后 load”的补丁逻辑，也随这次重构去掉。
 - candidate helper 只承载 SSA 查询返回的合法 value；不要继续用 `freeze value` 当临时标记。
 - helper 使用 dedicated intrinsic-like declaration，例如 `@notdec.register.call_input.*`。
 - candidate metadata 增加 strength：
