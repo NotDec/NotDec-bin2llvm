@@ -116,7 +116,7 @@ Ghidra 的 call effect 模型不是简单“遇到 call 就断开”，而是把
 
 ```text
 扫描 register storage access
-  -> 给 call 建显式 register input use / output effect fact
+  -> 给 call 插入显式 register input helper / output effect helper
   -> Register SSA 统一处理 load/store/call-use/call-effect
   -> candidate metadata 消费 SSA 结果
   -> prototype recovery 消费 strong/weak candidate
@@ -139,37 +139,52 @@ Ghidra 对应点：
 
 native 侧不一定马上改真实 LLVM call signature，但要达到同样语义：
 
-- 在 Register SSA 内部把 call input fact 当作 register read。
-- 如果不能改 call operand，就用 helper 承载 value，但 helper 的 operand 必须来自统一 SSA 查询结果。
+- 在 Register SSA 内部把 call input 当作 register read。
+- 如果不能改真实 call operand，就用 helper call 承载 value，但 helper 的 operand 必须来自统一 SSA 查询结果。
 - 不再从另一个 block 随手拿 instruction 当 helper operand。
 
-#### use/effect fact
+#### 用 helper/intrinsic-like call 承载 use/effect
 
-建议新增一个函数内 fact 层，不需要做大抽象，先服务 `NativeRegisterSSA`：
+这里不建议长期维护一个和 IR 并行的 `Fact` 表。原因很简单：metadata 不是 SSA use，独立表也容易和 IR 失步。真正的数据流应该落在 IR 里，C++ 里的结构体最多作为构造时的临时 descriptor。
 
-```text
-CallRegisterFact {
-  call instruction
-  callsite_id
-  kind = input_use | return | clobber_unknown | unknown_effect | preserved
-  register unit
-  abi slot
-  source = abi | callee_recovered | callee_metadata
-}
+call input 推荐形态：
+
+```llvm
+%rdi.before.call = ...
+call void @notdec.register.call_input.i64(i64 %rdi.before.call),
+  !notdec.register.call_input_candidate !{...}
+call void @target(...)
 ```
+
+call effect / return 推荐形态：
+
+```llvm
+%rax.after.call = call i64 @notdec.register.call_return.i64(),
+  !notdec.register.call_effect !{...}
+%rbx.after.call = call i64 @notdec.register.call_effect.i64(),
+  !notdec.register.call_effect !{...}
+```
+
+metadata 只记录解释信息，例如：
+
+- `callsite_id`
+- `register`
+- `slot`
+- `kind = input_use | return | clobber_unknown | unknown_effect | preserved`
+- `source = abi_input | abi_output | abi_unknown | callee_recovered_return | callee_clobbers`
+- `strength`
+- backing global / storage range
 
 生成时机：
 
 1. 扫描函数和 ABI model，给每个非 intrinsic call 建 callsite id。
-2. 对 ABI input pentry 生成 `input_use` fact。
-3. 对 ABI output / killedbycall / unaffected 生成 effect fact。
+2. 对 ABI input pentry，在 call 前通过 `readRegister(callBlock, unit, call)` 取 SSA value，再插入 `call_input` helper。
+3. 对 ABI output / killedbycall / unknown effect，在 call 后插入 `call_return` / `call_effect` helper。
 4. direct callee 已有 recovered prototype / preserves / clobbers 时，覆盖 ABI fallback。
 
-然后 `NativeRegisterSSA` 使用这些 fact：
+这样更接近 Ghidra 的 `opInsertInput()`：Ghidra 是把 input varnode 直接插进 CALL p-code op；LLVM 侧暂时不改真实 call signature，所以用紧邻 call 的 helper 代表这个 use。
 
-- `input_use`：调用统一的 `readRegister(callBlock, unit, call)`，这就是一次普通 use。
-- `return` / `clobber_unknown` / `unknown_effect`：继续由 `callEffectValue()` 建 call 后值。
-- `preserved`：继续向 call 前读值。
+helper 不能被当成普通可删的纯函数。不要标 `readnone`、`speculatable` 这类属性；必要时用保守 side-effect 属性，保证优化不会随便删除、合并或移动它。metadata 只能说明来源，不能替代 helper operand，因为 metadata 本身不会形成 SSA use，本地 SSA value 也不能安全塞进全局 metadata。
 
 #### candidate 强弱分类
 
@@ -207,7 +222,7 @@ callEffectValue(call, register, kind)
 - `clobber_unknown`
 - `unknown_effect`
 
-实现形式先用 LLVM intrinsic-like helper declaration 或 freeze/undef 包装都可以，但必须带 metadata。
+实现形式优先换成 LLVM intrinsic-like helper declaration。当前 `freeze undef` 只能算过渡表示，能挂 metadata，但不是理想的数据流节点，后续不应该继续扩大这种用法。
 
 建议 metadata：
 
@@ -351,10 +366,11 @@ LLVM 侧：
 
 ### 阶段 3b：重构 call input 为 SSA use
 
-- 在 SSA 前收集 `CallRegisterFact`。
-- `input_use` fact 通过 `readRegister(callBlock, unit, call)` 进入 Register SSA。
+- 按 ABI input / callee metadata 构造 call input helper，不维护长期并行 fact 表。
+- helper operand 通过 `readRegister(callBlock, unit, call)` 进入 Register SSA。
 - 删除 `attachCallInputCandidates()` 里只扫同 block 的 current-value 逻辑。
-- candidate helper 只承载 SSA 查询返回的合法 value。
+- candidate helper 只承载 SSA 查询返回的合法 value；不要继续用 `freeze value` 当临时标记。
+- helper 使用 dedicated intrinsic-like declaration，例如 `@notdec.register.call_input.*`。
 - candidate metadata 增加 strength：
   - `strong_local_def`
   - `strong_phi`
@@ -1597,11 +1613,12 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 对 call input 来说，这会把每个 call 都变成“可能读所有 ABI input register”，制造假参数。
 - 直接把跨 block value 插到 call 前 helper，又会遇到 LLVM dominance 问题。
 
-所以这里不应该单独设计一个和 SSA 并行的 current-value resolver，而应该重构 `attachCallInputCandidates()`：
+所以这里不应该单独设计一个和 SSA 并行的 current-value resolver，也不应该维护一个长期独立的 call input fact 表。应该重构 `attachCallInputCandidates()`：
 
-- 先有 call input fact。
-- fact 作为 register SSA use 查询 current value。
-- metadata 记录 SSA 查询结果和 strength。
+- 先按 ABI / callee metadata 决定这个 callsite 有哪些 input candidate。
+- 每个 candidate 作为 register SSA use 查询 current value。
+- 用 dedicated helper call 承载这个 SSA value。
+- metadata 只记录 callsite、register、slot、source 和 strength。
 - prototype recovery 根据 strength 决定是否消费。
 
 剩下需要定的是 candidate 语义，不是 PHI 语义：
