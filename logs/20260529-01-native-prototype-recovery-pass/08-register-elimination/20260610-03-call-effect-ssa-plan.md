@@ -108,6 +108,91 @@ Ghidra 的 call effect 模型不是简单“遇到 call 就断开”，而是把
 
 ## 建议设计
 
+### 0. 先显式化 register use/effect，再做 Register SSA
+
+当前 `attachCallInputCandidates()` 是 register SSA 之后的补丁：它重新扫描 call 前局部值，再造 candidate helper。这条路不完整，因为 call input 没有真正进入 SSA use 链。
+
+更合理的结构要贴近 Ghidra heritage：
+
+```text
+扫描 register storage access
+  -> 给 call 建显式 register input use / output effect fact
+  -> Register SSA 统一处理 load/store/call-use/call-effect
+  -> candidate metadata 消费 SSA 结果
+  -> prototype recovery 消费 strong/weak candidate
+```
+
+关键变化：
+
+- call input 不再是 SSA 之后“看一眼同 block store”的 metadata 补丁。
+- ABI input register 在 call 点表现成一次 register use。
+- 多前驱、循环、trivial PHI 全部交给 Braun-style Register SSA。
+- candidate 只负责记录“这个 callsite 的某个 ABI slot 读到了哪个 SSA value”，不自己重新查 CFG。
+
+Ghidra 对应点：
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/heritage.cc:1495`
+  - `guardCalls()` 发现可能 input 时注册 input trial。
+  - 创建对应 `Varnode`。
+  - `fd->opInsertInput(op, vn, op->numInput())` 把它插成 CALL 的 input。
+- 后续 heritage SSA 把这个 CALL input 当普通 use rename，不需要单独处理跨 block dominance。
+
+native 侧不一定马上改真实 LLVM call signature，但要达到同样语义：
+
+- 在 Register SSA 内部把 call input fact 当作 register read。
+- 如果不能改 call operand，就用 helper 承载 value，但 helper 的 operand 必须来自统一 SSA 查询结果。
+- 不再从另一个 block 随手拿 instruction 当 helper operand。
+
+#### use/effect fact
+
+建议新增一个函数内 fact 层，不需要做大抽象，先服务 `NativeRegisterSSA`：
+
+```text
+CallRegisterFact {
+  call instruction
+  callsite_id
+  kind = input_use | return | clobber_unknown | unknown_effect | preserved
+  register unit
+  abi slot
+  source = abi | callee_recovered | callee_metadata
+}
+```
+
+生成时机：
+
+1. 扫描函数和 ABI model，给每个非 intrinsic call 建 callsite id。
+2. 对 ABI input pentry 生成 `input_use` fact。
+3. 对 ABI output / killedbycall / unaffected 生成 effect fact。
+4. direct callee 已有 recovered prototype / preserves / clobbers 时，覆盖 ABI fallback。
+
+然后 `NativeRegisterSSA` 使用这些 fact：
+
+- `input_use`：调用统一的 `readRegister(callBlock, unit, call)`，这就是一次普通 use。
+- `return` / `clobber_unknown` / `unknown_effect`：继续由 `callEffectValue()` 建 call 后值。
+- `preserved`：继续向 call 前读值。
+
+#### candidate 强弱分类
+
+把 call input 作为 SSA use 后，会自然拿到跨 block PHI，也会自然拿到 function entry input。这里不能再用“是否跨 block”当安全边界，应该给 candidate 分级：
+
+- `strong_local_def`
+  - call 前本函数内明确写入该 register。
+- `strong_phi`
+  - PHI 的 incoming 都能追到本函数内明确写入或其它 strong candidate。
+- `weak_entry_input`
+  - 值只来自 function entry external input。可能是真参数转发，也可能只是寄存器仍然活着。
+- `blocked_call_effect`
+  - 值来自 `unknown_effect` 或 `clobber_unknown`，默认不作为参数 candidate。
+- `return_forward`
+  - 值来自前一个 call 的 `kind=return`。是否当参数转发，要单独规则，第一版可以先记 weak 或阻断。
+
+prototype recovery 第一版只用 strong candidate 推 signature rewrite；weak candidate 可以进审计 metadata，不直接改 signature。
+
+这样可以同时满足两点：
+
+- SSA 层不绕开 PHI，不再有跨 block dominance 问题。
+- prototype 层不把所有 ABI input / entry input 都误判成真实参数。
+
 ### 1. 引入 call effect value
 
 在 `NativeRegisterSSA` 内部新增一个创建 helper value 的接口，例如：
@@ -175,7 +260,7 @@ otherwise -> readBlockEntry
 
 Ghidra 在 heritage 里遇到可能 input 的 storage，会注册 trial 并把 varnode 插到 CALL input。
 
-LLVM 侧可以先不改真实 call signature，但要记录 metadata：
+LLVM 侧可以先不改真实 call signature，但 call input 必须先作为 register SSA use，再记录 metadata：
 
 ```text
 notdec.register.call_input_candidate
@@ -183,14 +268,16 @@ notdec.register.call_input_candidate
 
 触发条件：
 
-- call 前某个 ABI input register 的值被读取，并且该 call 的 prototype 可能使用它。
-- 或者 prototype recovery 已经认为 callee 需要这个 input。
+- ABI / callee prototype 认为该 callsite 可能读取某个 input register。
+- Register SSA 在 call 点为该 register 查询 current value。
+- current value 分类为 strong / weak / blocked。
 
-短期可以先只记录 direct use：
+短期改造目标：
 
 - 对每个 call，查 ABI input pentries。
-- 对这些 register 调 `readRegister(block, unit, call)`。
-- 如果值非空，记录 call input candidate。
+- 对这些 register 调 `readRegister(callBlock, unit, call)`，不要再只扫同 block。
+- 如果 SSA 查询产生 PHI，就让现有 pending PHI / finalize / trivial PHI 逻辑处理。
+- metadata 记录 candidate strength，prototype recovery 只消费 strong candidate。
 
 ### 4. 明确 call output candidate
 
@@ -261,6 +348,27 @@ LLVM 侧：
 判断标准：
 
 - 典型 `mov rdi, x; call f` 能在 callsite metadata 里看到 `RDI=x`。
+
+### 阶段 3b：重构 call input 为 SSA use
+
+- 在 SSA 前收集 `CallRegisterFact`。
+- `input_use` fact 通过 `readRegister(callBlock, unit, call)` 进入 Register SSA。
+- 删除 `attachCallInputCandidates()` 里只扫同 block 的 current-value 逻辑。
+- candidate helper 只承载 SSA 查询返回的合法 value。
+- candidate metadata 增加 strength：
+  - `strong_local_def`
+  - `strong_phi`
+  - `weak_entry_input`
+  - `blocked_call_effect`
+  - `return_forward`
+- prototype recovery 第一版只用 strong candidate 推 signature rewrite。
+
+判断标准：
+
+- 跨 block 参数准备能形成合法 candidate，不触发 LLVM dominance 错误。
+- 多前驱时由 Register SSA 建 PHI，PHI incoming 仍满足阶段 4 的 verifier 要求。
+- entry input 不会直接导致 declaration / direct call 被误改 signature。
+- `hexx64.so -f 0x1156e0` 的 `llvm-as` / `opt -passes=verify` 继续通过。
 
 ### 阶段 4：补完整 lazy SSA finalize
 
@@ -1474,20 +1582,37 @@ cmake --build /tmp/notdec-bin2llvm-build \
 
 ### 1. 跨 block call input candidate
 
-当前 register SSA 只记录同 block、且支配 call 的 input candidate。原因是：
+当前 register SSA 只记录同 block、且支配 call 的 input candidate。这个限制来自旧实现，不是 SSA 语义要求。
+
+正确方向是：把 call input 当成 register use，让 `readRegister(callBlock, unit, call)` 走统一 SSA 构建。多前驱时是否建 PHI，完全按 Braun SSA 算法决定：
+
+- 单前驱：递归查 predecessor exit。
+- 多前驱：创建 PHI，按 predecessor 补 incoming。
+- 循环：先建 incomplete PHI，finalize 时补齐。
+- trivial PHI：删除并同步缓存。
+
+旧实现不能直接放宽的原因是：
 
 - 直接用 `readRegister()` 会在找不到本地定义时创建 function entry external input。
 - 对 call input 来说，这会把每个 call 都变成“可能读所有 ABI input register”，制造假参数。
 - 直接把跨 block value 插到 call 前 helper，又会遇到 LLVM dominance 问题。
 
-要继续做，需要先决定一个新的 current-value resolver：
+所以这里不应该单独设计一个和 SSA 并行的 current-value resolver，而应该重构 `attachCallInputCandidates()`：
 
-- 是否允许沿唯一 predecessor 追踪。
-- 多 predecessor 时是要求所有 predecessor 等价，还是在 call block 前插 PHI。
-- 如果 value 来自 call effect，是传递 candidate，还是阻断。
-- 查不到值时是“不记录 candidate”，还是记录一个 unknown candidate。
+- 先有 call input fact。
+- fact 作为 register SSA use 查询 current value。
+- metadata 记录 SSA 查询结果和 strength。
+- prototype recovery 根据 strength 决定是否消费。
 
-在这些规则定下来前，不应该继续扩大 candidate 范围。
+剩下需要定的是 candidate 语义，不是 PHI 语义：
+
+- function entry input 是 weak candidate 还是直接阻断。
+- PHI incoming 全部 strong 时是否把 PHI 标成 strong。
+- PHI 混合 strong / entry input 时怎么标。
+- 值来自 `kind=return` 时算 weak transfer 还是阻断。
+- 值来自 `unknown_effect` / `clobber_unknown` 时默认阻断还是记录审计 metadata。
+
+在这些规则定下来前，不应该让 prototype recovery 消费跨 block / entry-derived candidate 去改 signature。但 Register SSA 层建 PHI 这件事本身不需要再犹豫。
 
 ### 2. shared-successor return call effect
 
