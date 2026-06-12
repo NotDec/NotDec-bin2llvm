@@ -150,7 +150,7 @@ native 侧不一定马上改真实 LLVM call signature，但要达到同样语�
 call input 推荐形态：
 
 ```llvm
-%rdi.before.call = ...
+%rdi.before.call = load i64, ptr @RDI
 call void @notdec.register.call_input.i64(i64 %rdi.before.call),
   !notdec.register.call_input_candidate !{...}
 call void @target(...)
@@ -161,9 +161,17 @@ call effect / return 推荐形态：
 ```llvm
 %rax.after.call = call i64 @notdec.register.call_return.i64(),
   !notdec.register.call_effect !{...}
+store i64 %rax.after.call, ptr @RAX
 %rbx.after.call = call i64 @notdec.register.call_effect.i64(),
   !notdec.register.call_effect !{...}
+store i64 %rbx.after.call, ptr @RBX
 ```
+
+也就是同时保留 register `load` / `store` 和 helper call：
+
+- input side：`load register` 紧跟 `call_input` helper，然后才是真实 call。
+- output side：真实 call 后紧跟 `call_return` / `call_effect` helper，再紧跟写回 register 的 `store`。
+- 不要把 load/store 拉到很远的位置。`load` 是 call 点看到的 register 值，`store` 是 call 后 register state 的新定义，二者都应该作为 Register SSA 的普通读写点。
 
 metadata 只记录解释信息，例如：
 
@@ -178,8 +186,8 @@ metadata 只记录解释信息，例如：
 生成时机：
 
 1. 扫描函数和 ABI model，给每个非 intrinsic call 建 callsite id。
-2. 对 ABI input pentry，在 call 前通过 `readRegister(callBlock, unit, call)` 取 SSA value，再插入 `call_input` helper。
-3. 对 ABI output / killedbycall / unknown effect，在 call 后插入 `call_return` / `call_effect` helper。
+2. 对 ABI input pentry，在 call 前保留对应 register load，并紧跟插入 `call_input` helper。
+3. 对 ABI output / killedbycall / unknown effect，在 call 后插入 `call_return` / `call_effect` helper，并紧跟 store 回对应 register。
 4. direct callee 已有 recovered prototype / preserves / clobbers 时，覆盖 ABI fallback。
 
 这样更接近 Ghidra 的 `opInsertInput()`：Ghidra 是把 input varnode 直接插进 CALL p-code op；LLVM 侧暂时不改真实 call signature，所以用紧邻 call 的 helper 代表这个 use。
@@ -222,7 +230,7 @@ callEffectValue(call, register, kind)
 - `clobber_unknown`
 - `unknown_effect`
 
-实现形式优先换成 LLVM intrinsic-like helper declaration。当前 `freeze undef` 只能算过渡表示，能挂 metadata，但不是理想的数据流节点，后续不应该继续扩大这种用法。
+实现形式优先换成 LLVM intrinsic-like helper declaration，并把返回值 store 回对应 register backing global。当前 `freeze undef` 只能算过渡表示，能挂 metadata，但不是理想的数据流节点，后续不应该继续扩大这种用法。
 
 建议 metadata：
 
@@ -237,6 +245,8 @@ notdec.register.call_effect = {
 ```
 
 注意：这里不建议直接继续用裸 `undef`。`undef` 只对 LLVM 合法性有用，对 NotDec 后续恢复没有语义信息。
+
+这里也不建议跳过 store 去匹配后面的 register load。call effect helper 是新值来源，store 是 register state 的定义点；后面的 load 交给 Register SSA 按普通规则消掉或接到这个定义上。
 
 ### 2. 把 call effect 接入 readBlockExit
 
@@ -284,13 +294,14 @@ notdec.register.call_input_candidate
 触发条件：
 
 - ABI / callee prototype 认为该 callsite 可能读取某个 input register。
-- Register SSA 在 call 点为该 register 查询 current value。
-- current value 分类为 strong / weak / blocked。
+- call 前插入对应 register load，并紧跟 `call_input` helper。
+- Register SSA 把这个 load rename 成 call 点的 current value。
+- rename 后的 value 分类为 strong / weak / blocked。
 
 短期改造目标：
 
 - 对每个 call，查 ABI input pentries。
-- 对这些 register 调 `readRegister(callBlock, unit, call)`，不要再只扫同 block。
+- 对这些 register 在 call 前插入 load + `call_input` helper，load 不能离 helper 太远。
 - 如果 SSA 查询产生 PHI，就让现有 pending PHI / finalize / trivial PHI 逻辑处理。
 - metadata 记录 candidate strength，prototype recovery 只消费 strong candidate。
 
@@ -367,7 +378,7 @@ LLVM 侧：
 ### 阶段 3b：重构 call input 为 SSA use
 
 - 按 ABI input / callee metadata 构造 call input helper，不维护长期并行 fact 表。
-- helper operand 通过 `readRegister(callBlock, unit, call)` 进入 Register SSA。
+- helper operand 来自 call 前对应 register load，后续由 Register SSA 把这个 load 接到正确 SSA value。
 - 删除 `attachCallInputCandidates()` 里只扫同 block 的 current-value 逻辑。
 - candidate helper 只承载 SSA 查询返回的合法 value；不要继续用 `freeze value` 当临时标记。
 - helper 使用 dedicated intrinsic-like declaration，例如 `@notdec.register.call_input.*`。
@@ -1600,7 +1611,7 @@ cmake --build /tmp/notdec-bin2llvm-build \
 
 当前 register SSA 只记录同 block、且支配 call 的 input candidate。这个限制来自旧实现，不是 SSA 语义要求。
 
-正确方向是：把 call input 当成 register use，让 `readRegister(callBlock, unit, call)` 走统一 SSA 构建。多前驱时是否建 PHI，完全按 Braun SSA 算法决定：
+正确方向是：把 call input 当成 register use：call 前插入 register load，紧跟 `call_input` helper，Register SSA 再把这个 load rename 成 call 点 current value。多前驱时是否建 PHI，完全按 Braun SSA 算法决定：
 
 - 单前驱：递归查 predecessor exit。
 - 多前驱：创建 PHI，按 predecessor 补 incoming。
@@ -1616,8 +1627,9 @@ cmake --build /tmp/notdec-bin2llvm-build \
 所以这里不应该单独设计一个和 SSA 并行的 current-value resolver，也不应该维护一个长期独立的 call input fact 表。应该重构 `attachCallInputCandidates()`：
 
 - 先按 ABI / callee metadata 决定这个 callsite 有哪些 input candidate。
-- 每个 candidate 作为 register SSA use 查询 current value。
-- 用 dedicated helper call 承载这个 SSA value。
+- 每个 candidate 都先表现成 call 前 register load。
+- 用 dedicated helper call 消费这个 load。
+- Register SSA 负责把 helper operand 接到正确 SSA value。
 - metadata 只记录 callsite、register、slot、source 和 strength。
 - prototype recovery 根据 strength 决定是否消费。
 
