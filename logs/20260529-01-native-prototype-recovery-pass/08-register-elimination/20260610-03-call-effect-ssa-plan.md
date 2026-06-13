@@ -2260,3 +2260,63 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：5/10。summary 能直接看 reason 分布，但 trial-use 规则仍未改变。
 - 复杂度：3/10。新增 5 个计数字段和打印项，结构直接。
 - 维护成本：3/10。字段数量增加，但这是后续对照 Ghidra 需要的可观测性。
+
+## 2026-06-13 实现记录：call input candidate active 判断收口
+
+本次不改判定语义，只把 prototype recovery 里“candidate 是否可消费”的判断集中到一个函数，避免后续真实 trial-use 规则落地时继续散在 declaration rewrite 逻辑里。
+
+### 改动
+
+- `lib/passes/NativePrototypeRecovery.cpp:927`
+  - 新增 `callInputCandidateIsActive()`。
+  - 优先看 `trial_state=active`。
+  - 没有 `trial_state` 时，兼容旧 metadata：无 `strength` 或 `strength=strong_local_def|strong_phi` 仍视作 active。
+- `lib/passes/NativePrototypeRecovery.cpp:939`
+  - `declarationInputParamForCandidate()` 改为调用 `callInputCandidateIsActive()`。
+- `tests/native_prototype_recovery_test.cpp:1211`
+  - `createCallInputHelperCallerFunction()` 支持省略 `trial_state`，用于构造旧 metadata。
+- `tests/native_prototype_recovery_test.cpp:7096`
+  - 新增 legacy helper 测试：只有旧 `strength=strong_local_def`、没有 `trial_state` 时，declaration call input rewrite 仍能工作。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_prototype_recovery_test native_register_effects_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-call-input-active-helper %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-call-input-active-helper.ll \
+  > /tmp/hexx64-1156e0-call-input-active-helper.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-input-active-helper.ll \
+  -o /tmp/hexx64-1156e0-call-input-active-helper.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-input-active-helper.bc \
+  -o /tmp/hexx64-1156e0-call-input-active-helper.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.13s`。
+- summary 分布不变：
+  - `call input trials active: 685`
+  - `call input trials inactive: 1199`
+  - `call input trials no use: 2490`
+  - `call input trials blocked: 0`
+
+### 判断
+
+- 实现效果：5/10。active 判断入口收口了，但实际规则仍是当前 trial_state/strength 兼容逻辑。
+- 复杂度：2/10。只是函数抽取和一个兼容测试。
+- 维护成本：2/10。后续切换真实 trial-use 规则时只改 `callInputCandidateIsActive()` 的调用链上游或 metadata 来源。

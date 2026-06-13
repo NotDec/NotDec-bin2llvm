@@ -1210,8 +1210,8 @@ llvm::Function *createInputStoreCallerFunction(llvm::Module &module,
 
 llvm::Function *createCallInputHelperCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
-    const std::string &registerName, const std::string &trialState,
-    llvm::CallInst **callOut) {
+    const std::string &registerName,
+    const std::optional<std::string> &trialState, llvm::CallInst **callOut) {
   llvm::LLVMContext &context = module.getContext();
   auto *i64 = llvm::Type::getInt64Ty(context);
   auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
@@ -1224,14 +1224,17 @@ llvm::Function *createCallInputHelperCallerFunction(
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), {i64}, false);
   llvm::FunctionCallee helper =
       module.getOrInsertFunction("notdec.register.call_input.i64", helperType);
-  llvm::Metadata *fields[] = {
+  std::vector<llvm::Metadata *> fields = {
       llvm::MDString::get(context, "callsite_id=" + name),
       llvm::MDString::get(context, "slot=0"),
       llvm::MDString::get(context, "register=" + registerName),
       llvm::MDString::get(context, "strength=strong_local_def"),
-      llvm::MDString::get(context, "trial_state=" + trialState),
       llvm::MDString::get(context, "trial_reason=local_def"),
   };
+  if (trialState) {
+    fields.push_back(llvm::MDString::get(context,
+                                         "trial_state=" + *trialState));
+  }
   llvm::MDNode *candidateMetadata = llvm::MDNode::get(context, fields);
   llvm::CallInst *candidate = builder.CreateCall(
       helper, {llvm::ConstantInt::get(i64, 0x4567)});
@@ -7087,6 +7090,43 @@ int main() {
                "active call input helper did not rewrite declaration input");
   if (llvm::verifyModule(declarationCallInputHelperModule, &llvm::errs())) {
     std::cerr << "declaration call input helper module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputLegacyHelperModule(
+      "native-prototype-declaration-call-input-legacy-helper-test", context);
+  attachTestAbi(declarationCallInputLegacyHelperModule);
+  auto *declarationCallInputLegacyHelperCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputLegacyHelperCallee =
+      llvm::Function::Create(declarationCallInputLegacyHelperCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_legacy_helper_callee",
+                             declarationCallInputLegacyHelperModule);
+  llvm::CallInst *declarationCallInputLegacyHelperOldCall = nullptr;
+  createCallInputHelperCallerFunction(
+      declarationCallInputLegacyHelperModule,
+      "declaration_call_input_legacy_helper_user",
+      declarationCallInputLegacyHelperCallee, "RDI", std::nullopt,
+      &declarationCallInputLegacyHelperOldCall);
+  notdec::bin2llvm::NativePrototypeRecoveryOptions legacyHelperInputOptions;
+  legacyHelperInputOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputLegacyHelperModule, legacyHelperInputOptions);
+  llvm::Function *legacyHelperInputCalleeAfterRewrite =
+      declarationCallInputLegacyHelperModule.getFunction(
+          "declaration_call_input_legacy_helper_callee");
+  ok &= expect(legacyHelperInputCalleeAfterRewrite != nullptr &&
+                   functionTypeShape(
+                       *legacyHelperInputCalleeAfterRewrite->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef<llvm::Type *>{i64Param}),
+               "legacy strong call input helper did not rewrite declaration "
+               "input");
+  if (llvm::verifyModule(declarationCallInputLegacyHelperModule,
+                         &llvm::errs())) {
+    std::cerr
+        << "declaration call input legacy helper module verification failed\n";
     return EXIT_FAILURE;
   }
 
