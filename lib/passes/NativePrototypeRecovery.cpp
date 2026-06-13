@@ -630,6 +630,12 @@ bool isDeclarationCallOutputLoad(llvm::LoadInst &load) {
   return false;
 }
 
+bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
+  llvm::Function *callee = call.getCalledFunction();
+  return callee != nullptr &&
+         callee->getName().starts_with("notdec.register.");
+}
+
 llvm::CallInst *declarationCallOutputSource(llvm::LoadInst &load) {
   std::optional<std::string> registerBase = registerStorageBase(load);
   if (!registerBase) {
@@ -921,6 +927,11 @@ std::optional<NativeRecoveredPrototypeParam> declarationInputParamForStore(
 std::optional<NativeRecoveredPrototypeParam>
 declarationInputParamForCandidate(llvm::MDNode &candidate,
                                   const NativePrototypeModel &model) {
+  std::optional<std::string> strength = metadataField(candidate, "strength");
+  if (strength && *strength != "strong_local_def" &&
+      *strength != "strong_phi") {
+    return std::nullopt;
+  }
   std::optional<std::string> registerName = metadataField(candidate, "register");
   if (!registerName) {
     return std::nullopt;
@@ -961,6 +972,9 @@ std::vector<NativeRecoveredPrototypeParam> declarationInputParamsBeforeCall(
             end = call.getParent()->rend();
        iter != end; ++iter) {
     if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
+      if (isNotDecRegisterHelperCall(*previousCall)) {
+        continue;
+      }
       llvm::Function *callee = previousCall->getCalledFunction();
       if (callee == nullptr || !callee->isIntrinsic()) {
         break;
@@ -1542,6 +1556,9 @@ std::optional<llvm::Value *> callInputCandidateValueBeforeCall(
       continue;
     }
     if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(inst)) {
+      if (isNotDecRegisterHelperCall(*previousCall)) {
+        continue;
+      }
       llvm::Function *callee = previousCall->getCalledFunction();
       if (callee == nullptr || !callee->isIntrinsic()) {
         return std::nullopt;
@@ -1555,10 +1572,17 @@ std::optional<llvm::Value *> callInputCandidateValueBeforeCall(
         metadataField(*metadata, "register") != input.RegisterName) {
       continue;
     }
-    if (inst->getType() != paramType) {
+    llvm::Value *value = inst;
+    if (auto *candidateCall = llvm::dyn_cast<llvm::CallBase>(inst)) {
+      if (isNotDecRegisterHelperCall(*candidateCall) &&
+          candidateCall->arg_size() == 1) {
+        value = candidateCall->getArgOperand(0);
+      }
+    }
+    if (value->getType() != paramType) {
       return std::nullopt;
     }
-    return inst;
+    return value;
   }
   return std::nullopt;
 }
@@ -1624,6 +1648,9 @@ llvm::StoreInst *localCallsiteInputStoreBeforeCall(
         return {false, store};
       }
       if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
+        if (isNotDecRegisterHelperCall(*previousCall)) {
+          continue;
+        }
         llvm::Function *callee = previousCall->getCalledFunction();
         if (callee == nullptr || !callee->isIntrinsic()) {
           return {true, nullptr};
@@ -2081,6 +2108,9 @@ std::optional<llvm::LoadInst *> stackInputLoadInReverseRange(
   llvm::LoadInst *result = nullptr;
   for (; iter != end; ++iter) {
     if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(&*iter)) {
+      if (isNotDecRegisterHelperCall(*previousCall)) {
+        continue;
+      }
       llvm::Function *callee = previousCall->getCalledFunction();
       if (callee == nullptr || !callee->isIntrinsic()) {
         return std::nullopt;
@@ -2474,6 +2504,9 @@ bool functionMayTouchRegisterName(llvm::Function &function,
 
 bool callMayReadRegisterName(llvm::CallBase &call,
                              llvm::StringRef registerName) {
+  if (isNotDecRegisterHelperCall(call)) {
+    return false;
+  }
   if (registerName != "RSP" && !isFramePointerRegisterName(registerName)) {
     return true;
   }
@@ -2537,6 +2570,9 @@ bool callMayReadRegisterAccess(
 
 bool callInvalidatesKnownFrameRegisterValue(llvm::CallBase &call,
                                             llvm::StringRef registerName) {
+  if (isNotDecRegisterHelperCall(call)) {
+    return false;
+  }
   llvm::Function *callee = call.getCalledFunction();
   if (callee == nullptr) {
     return true;
@@ -5073,6 +5109,9 @@ std::set<std::string> collectAbiUnaffectedRegisters(llvm::Module &module) {
 }
 
 bool callClobbersRegister(llvm::CallBase &call, llvm::StringRef registerName) {
+  if (isNotDecRegisterHelperCall(call)) {
+    return false;
+  }
   llvm::Function *callee = call.getCalledFunction();
   if (callee != nullptr && callee->isIntrinsic()) {
     return false;

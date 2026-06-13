@@ -1666,3 +1666,96 @@ join:           phi
 - 或者暂时禁止 shared-successor call effect rewrite。
 
 这里如果选错，会把不同路径上的返回寄存器值混掉，所以需要先定语义。
+
+## 2026-06-13 实现记录：call helper load/store 形态和 PHI 缺边收紧
+
+本次按上面的新规划推进，不再把 call input 当成 SSA 后的同 block store 回看补丁，也不再用 `freeze undef` 表示 call effect。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:111`
+  - 新增 `isNotDecRegisterHelperCall()`，让 `notdec.register.*` helper 不再被当成真实 clobber call。
+- `lib/passes/NativeRegisterSSA.cpp:485`
+  - 调整 `FunctionPromoter::run()` 顺序：先 `attachCallInputCandidates()` 插 call input load/helper，再 `rewriteLoads()`，最后 `annotateCallInputCandidateStrengths()`。
+- `lib/passes/NativeRegisterSSA.cpp:1042`
+  - 重写 `attachCallInputCandidates()`：
+    - 对 ABI input register 在真实 call 前插入 register load。
+    - 紧跟插入 `@notdec.register.call_input.*` helper call。
+    - 不再调用旧的 `localValueBeforeCallInput()` 回看 call 前 store。
+- `lib/passes/NativeRegisterSSA.cpp:1114`
+  - 新增 `annotateCallInputCandidateStrengths()` / `refreshCallInputCandidateList()`。
+  - helper operand 经 `rewriteLoads()` 后再分类 strength：
+    - `strong_local_def`
+    - `strong_phi`
+    - `weak_entry_input`
+    - `blocked_call_effect`
+    - `return_forward`
+- `lib/passes/NativeRegisterSSA.cpp:1514`
+  - `completePhiIncoming()` 找不到 incoming 时不再造 `phi_missing_incoming` / `undef` fallback；缺边保留给 verifier 暴露。
+- `lib/passes/NativeRegisterSSA.cpp:1563`
+  - `callEffectValue()` 改成：
+    - call 后插入 `@notdec.register.call_return.*` 或 `@notdec.register.call_effect.*`。
+    - helper 返回值紧跟 `store` 回对应 register backing global。
+- `lib/passes/NativePrototypeRecovery.cpp:633`
+  - 新增同名 helper 识别，prototype recovery 的回看逻辑跳过 `notdec.register.*` helper。
+- `lib/passes/NativePrototypeRecovery.cpp:927`
+  - `declarationInputParamForCandidate()` 只消费 `strong_local_def` / `strong_phi` candidate；无 `strength` 的旧 metadata 仍兼容。
+- `lib/passes/NativePrototypeRecovery.cpp:1548`
+  - `callInputCandidateValueBeforeCall()` 对 helper call 读取第 0 个参数作为真实 candidate value，不再把 void helper instruction 当 value。
+- `tests/native_register_effects_test.cpp:1126`
+  - 新增 helper 形态、call effect store、`phi_missing_incoming` 消失等断言。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-call-helper-strength %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  -o /tmp/hexx64-1156e0-call-helper-strength.ll \
+  > /tmp/hexx64-1156e0-call-helper-strength.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-helper-strength.ll \
+  -o /tmp/hexx64-1156e0-call-helper-strength.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-helper-strength.bc \
+  -o /tmp/hexx64-1156e0-call-helper-strength.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`68.22s`。
+- 上一轮同用例记录为 `58.62s`，本次慢约 `9.60s`。
+- `/tmp/hexx64-1156e0-call-helper-strength.ll` 统计：
+  - `call_input` helper：`4374`
+  - `call_return` helper：`928`
+  - `call_effect` helper：`3130`
+  - `strength=strong_local_def`：`665`
+  - `strength=strong_phi`：`20`
+  - `strength=weak_entry_input`：`801`
+  - `strength=blocked_call_effect`：`2490`
+  - `strength=return_forward`：`398`
+  - `source=phi_missing_incoming`：`0`
+  - `freeze undef`：`0`
+
+### 判断
+
+- 实现效果：7/10。call input/output 已变成显式 helper 数据流，call effect 也 store 回 register state；PHI 缺边不再被 fake unknown 掩盖。
+- 复杂度：6/10。新增 strength 分类和 helper skip，理解成本比旧 metadata 补丁高，但比并行 Fact 表更贴近 IR。
+- 维护成本：6/10。后续要继续收敛 strength 规则，尤其是 PHI 混合来源、return forward 是否可消费。
+
+性能上有明显回退。主要原因是现在每个 ABI input register 都显式插 helper，不再只保留同 block strong candidate。语义方向是对的，但后续需要优化：
+
+- 对明显不会被消费的 weak / blocked candidate，是否只保留审计 metadata，或者延后 materialize helper。
+- 缓存 helper declaration 和常用 metadata，减少字符串和 IR 节点构造成本。
+- prototype recovery 当前只消费 strong candidate，避免了全量 ABI input 误改 signature。

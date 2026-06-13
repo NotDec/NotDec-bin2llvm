@@ -1123,6 +1123,120 @@ bool callInputCandidateHasCallsiteId(const llvm::Function &function,
   return false;
 }
 
+bool callInputCandidateHasField(const llvm::Function &function,
+                                llvm::StringRef name,
+                                llvm::StringRef expectedField) {
+  std::string expectedRegister = ("register=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      llvm::MDNode *node =
+          inst.getMetadata("notdec.register.call_input_candidate");
+      if (node == nullptr) {
+        continue;
+      }
+      bool hasRegister = false;
+      bool hasField = false;
+      for (const llvm::MDOperand &operand : node->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (field == nullptr) {
+          continue;
+        }
+        hasRegister |= field->getString() == expectedRegister;
+        hasField |= field->getString() == expectedField;
+      }
+      if (hasRegister) {
+        return hasField;
+      }
+    }
+  }
+  return false;
+}
+
+bool callInputCandidateUsesHelper(const llvm::Function &function,
+                                  llvm::StringRef name) {
+  std::string expectedRegister = ("register=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      llvm::MDNode *node =
+          inst.getMetadata("notdec.register.call_input_candidate");
+      if (node == nullptr) {
+        continue;
+      }
+      bool hasRegister = false;
+      for (const llvm::MDOperand &operand : node->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        hasRegister |= field != nullptr && field->getString() == expectedRegister;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      llvm::Function *callee = call == nullptr ? nullptr : call->getCalledFunction();
+      if (hasRegister && callee != nullptr &&
+          callee->getName().starts_with("notdec.register.call_input.")) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool callEffectStoresToRegister(const llvm::Function &function,
+                                llvm::StringRef kind,
+                                llvm::StringRef name,
+                                const llvm::GlobalVariable *global) {
+  std::string expectedKind = ("kind=" + kind).str();
+  std::string expectedRegister = ("register=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      llvm::MDNode *node = inst.getMetadata("notdec.register.call_effect");
+      if (node == nullptr) {
+        continue;
+      }
+      bool hasKind = false;
+      bool hasRegister = false;
+      for (const llvm::MDOperand &operand : node->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (field == nullptr) {
+          continue;
+        }
+        hasKind |= field->getString() == expectedKind;
+        hasRegister |= field->getString() == expectedRegister;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      const llvm::Instruction *next = inst.getNextNode();
+      auto *store = llvm::dyn_cast_or_null<llvm::StoreInst>(next);
+      if (hasKind && hasRegister && call != nullptr &&
+          call->getCalledFunction() != nullptr &&
+          call->getCalledFunction()->getName().starts_with(
+              "notdec.register.") &&
+          store != nullptr && store->getValueOperand() == &inst &&
+          store->getPointerOperand()->stripPointerCasts() == global) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool moduleHasPhiMissingIncomingEffect(const llvm::Module &module) {
+  for (const llvm::Function &function : module) {
+    for (const llvm::BasicBlock &block : function) {
+      for (const llvm::Instruction &inst : block) {
+        llvm::MDNode *node = inst.getMetadata("notdec.register.call_effect");
+        if (node == nullptr) {
+          continue;
+        }
+        for (const llvm::MDOperand &operand : node->operands()) {
+          auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+          if (field != nullptr &&
+              field->getString() == "source=phi_missing_incoming") {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
 bool functionReturnsConstant(const llvm::Function &function, uint64_t expected) {
   for (const llvm::BasicBlock &block : function) {
     for (const llvm::Instruction &inst : block) {
@@ -1262,12 +1376,19 @@ int main() {
   ok &= expect(callEffectHasField(*callEffects, "return", "RAX",
                                   "source=abi_output"),
                "RAX call return did not record ABI output source");
+  ok &= expect(callEffectStoresToRegister(*callEffects, "return", "RAX", rax),
+               "RAX call return was not stored back to register state");
   ok &= expect(countCallInputCandidates(*callInputCandidate, "RDI") == 1,
                "RDI call input candidate value was not made explicit");
+  ok &= expect(callInputCandidateUsesHelper(*callInputCandidate, "RDI"),
+               "RDI call input candidate was not represented by helper call");
   ok &= expect(hasCallInputCandidateMetadata(*callInputCandidate, "RDI"),
                "RDI call input candidate metadata was not attached to call");
   ok &= expect(callInputCandidateHasCallsiteId(*callInputCandidate, "RDI"),
                "RDI call input candidate did not record a callsite id");
+  ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
+                                          "strength=strong_local_def"),
+               "RDI call input candidate was not marked strong");
   ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
                "RSP load after call was not propagated");
   ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 0,
@@ -1298,6 +1419,11 @@ int main() {
                                   "clobber_unknown", "RBX",
                                   "source=callee_clobbers"),
                "direct callee RBX clobber did not record callee source");
+  ok &= expect(callEffectStoresToRegister(*callerBeforeClobberingCallee,
+                                          "clobber_unknown", "RBX", rbx),
+               "direct callee RBX clobber was not stored back to register state");
+  ok &= expect(!moduleHasPhiMissingIncomingEffect(module),
+               "register SSA still created phi_missing_incoming fallback effect");
   ok &= expect(staleMetadata->getMetadata("notdec.register.external_inputs") ==
                    nullptr,
                "stale external input metadata was not cleared");
