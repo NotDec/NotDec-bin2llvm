@@ -40,6 +40,11 @@ struct NativeRegisterSSAFunctionSummary {
   uint64_t InactiveCallInputTrials = 0;
   uint64_t NoUseCallInputTrials = 0;
   uint64_t BlockedCallInputTrials = 0;
+  uint64_t LocalDefCallInputTrials = 0;
+  uint64_t PhiCallInputTrials = 0;
+  uint64_t EntryInputCallInputTrials = 0;
+  uint64_t CallEffectCallInputTrials = 0;
+  uint64_t ReturnForwardCallInputTrials = 0;
 };
 
 struct NativeRegisterSSASummary {
@@ -66,6 +71,11 @@ struct NativeRegisterSSASummary {
   uint64_t InactiveCallInputTrials = 0;
   uint64_t NoUseCallInputTrials = 0;
   uint64_t BlockedCallInputTrials = 0;
+  uint64_t LocalDefCallInputTrials = 0;
+  uint64_t PhiCallInputTrials = 0;
+  uint64_t EntryInputCallInputTrials = 0;
+  uint64_t CallEffectCallInputTrials = 0;
+  uint64_t ReturnForwardCallInputTrials = 0;
   std::vector<NativeRegisterSSAFunctionSummary> Functions;
 };
 

@@ -2184,3 +2184,79 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：5/10。trial metadata 更完整，但还没有改变 trial-use 判定逻辑。
 - 复杂度：2/10。只增加一个解释字段和测试断言。
 - 维护成本：2/10。后续真实 use 检查可以继续复用这个字段记录原因。
+
+## 2026-06-13 实现记录：call input trial reason summary
+
+`trial_reason` 已经写进 metadata，但 summary 只能看 state 分布。为了后续和 Ghidra/Java 链路对照，补 reason 计数，直接看 active 里有多少来自 local def / PHI，inactive 里有多少来自 entry input / return forward。
+
+### 改动
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:43`
+  - `NativeRegisterSSAFunctionSummary` 增加：
+    - `LocalDefCallInputTrials`
+    - `PhiCallInputTrials`
+    - `EntryInputCallInputTrials`
+    - `CallEffectCallInputTrials`
+    - `ReturnForwardCallInputTrials`
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:74`
+  - `NativeRegisterSSASummary` 增加同样的 module 级 reason 计数。
+- `lib/passes/NativeRegisterSSA.cpp:1150`
+  - `annotateCallInputTrials()` 在统计 state 后同步统计 reason。
+- `lib/passes/NativeRegisterSSA.cpp:1339`
+  - 新增 `countCallInputTrialReason()`。
+- `lib/passes/NativeRegisterSSA.cpp:1989`
+  - `addFunctionSummary()` 汇总 reason 计数。
+- `lib/passes/NativeRegisterSSA.cpp:2108`
+  - `printNativeRegisterSSASummary()` 打印 module/function 两级 reason 计数。
+- `tests/native_register_effects_test.cpp:1539`
+  - 增加 local-def、phi、entry-input、call-effect reason summary 断言。
+- `tests/native_register_effects_test.cpp:1764`
+  - 增加 return-forward reason summary 断言。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-call-input-trial-reason-summary %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-call-input-trial-reason-summary.ll \
+  > /tmp/hexx64-1156e0-call-input-trial-reason-summary.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-input-trial-reason-summary.ll \
+  -o /tmp/hexx64-1156e0-call-input-trial-reason-summary.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-input-trial-reason-summary.bc \
+  -o /tmp/hexx64-1156e0-call-input-trial-reason-summary.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.85s`。
+- summary 输出：
+  - `call input trials active: 685`
+  - `call input trials inactive: 1199`
+  - `call input trials no use: 2490`
+  - `call input trials blocked: 0`
+  - `call input trial reasons local def: 665`
+  - `call input trial reasons phi: 20`
+  - `call input trial reasons entry input: 801`
+  - `call input trial reasons call effect: 2490`
+  - `call input trial reasons return forward: 398`
+
+### 判断
+
+- 实现效果：5/10。summary 能直接看 reason 分布，但 trial-use 规则仍未改变。
+- 复杂度：3/10。新增 5 个计数字段和打印项，结构直接。
+- 维护成本：3/10。字段数量增加，但这是后续对照 Ghidra 需要的可观测性。

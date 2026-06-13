@@ -1147,6 +1147,7 @@ private:
                              "trial_reason", trial.Reason));
         countCallInputStrength(trial.Strength);
         countCallInputTrialState(trial.State);
+        countCallInputTrialReason(trial.Reason);
       }
     }
 
@@ -1333,6 +1334,29 @@ private:
       return;
     }
     ++Summary.BlockedCallInputTrials;
+  }
+
+  void countCallInputTrialReason(llvm::StringRef reason) {
+    if (reason == "local_def") {
+      ++Summary.LocalDefCallInputTrials;
+      return;
+    }
+    if (reason == "phi") {
+      ++Summary.PhiCallInputTrials;
+      return;
+    }
+    if (reason == "entry_input") {
+      ++Summary.EntryInputCallInputTrials;
+      return;
+    }
+    if (reason == "call_effect") {
+      ++Summary.CallEffectCallInputTrials;
+      return;
+    }
+    if (reason == "return_forward") {
+      ++Summary.ReturnForwardCallInputTrials;
+      return;
+    }
   }
 
   llvm::Value *resolveValue(llvm::Value *value) {
@@ -1965,6 +1989,11 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.InactiveCallInputTrials += function.InactiveCallInputTrials;
   total.NoUseCallInputTrials += function.NoUseCallInputTrials;
   total.BlockedCallInputTrials += function.BlockedCallInputTrials;
+  total.LocalDefCallInputTrials += function.LocalDefCallInputTrials;
+  total.PhiCallInputTrials += function.PhiCallInputTrials;
+  total.EntryInputCallInputTrials += function.EntryInputCallInputTrials;
+  total.CallEffectCallInputTrials += function.CallEffectCallInputTrials;
+  total.ReturnForwardCallInputTrials += function.ReturnForwardCallInputTrials;
   total.Functions.push_back(function);
 }
 
@@ -2076,6 +2105,16 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
      << '\n';
   os << "  call input trials blocked: " << summary.BlockedCallInputTrials
      << '\n';
+  os << "  call input trial reasons local def: "
+     << summary.LocalDefCallInputTrials << '\n';
+  os << "  call input trial reasons phi: " << summary.PhiCallInputTrials
+     << '\n';
+  os << "  call input trial reasons entry input: "
+     << summary.EntryInputCallInputTrials << '\n';
+  os << "  call input trial reasons call effect: "
+     << summary.CallEffectCallInputTrials << '\n';
+  os << "  call input trial reasons return forward: "
+     << summary.ReturnForwardCallInputTrials << '\n';
   for (const NativeRegisterSSAFunctionSummary &function : summary.Functions) {
     os << "  function " << function.FunctionName << ": loads="
        << function.LoadsSeen << " stores=" << function.StoresSeen
@@ -2097,6 +2136,15 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
        << " call_input_trials_inactive=" << function.InactiveCallInputTrials
        << " call_input_trials_no_use=" << function.NoUseCallInputTrials
        << " call_input_trials_blocked=" << function.BlockedCallInputTrials
+       << " call_input_trial_reasons_local_def="
+       << function.LocalDefCallInputTrials
+       << " call_input_trial_reasons_phi=" << function.PhiCallInputTrials
+       << " call_input_trial_reasons_entry_input="
+       << function.EntryInputCallInputTrials
+       << " call_input_trial_reasons_call_effect="
+       << function.CallEffectCallInputTrials
+       << " call_input_trial_reasons_return_forward="
+       << function.ReturnForwardCallInputTrials
        << '\n';
   }
 }

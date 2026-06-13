@@ -1536,6 +1536,14 @@ int main() {
                "register SSA summary missed inactive call input trials");
   ok &= expect(summary.NoUseCallInputTrials >= 1,
                "register SSA summary missed no-use call input trials");
+  ok &= expect(summary.LocalDefCallInputTrials >= 1,
+               "register SSA summary missed local-def call input trials");
+  ok &= expect(summary.PhiCallInputTrials >= 1,
+               "register SSA summary missed phi call input trials");
+  ok &= expect(summary.EntryInputCallInputTrials >= 1,
+               "register SSA summary missed entry-input call input trials");
+  ok &= expect(summary.CallEffectCallInputTrials >= 1,
+               "register SSA summary missed call-effect call input trials");
   ok &= expect(summary.DeadStoresRemoved >= 1,
                "register SSA did not remove the expected overwritten store");
   ok &= expect(summary.UnreadFlagStoresRemoved == 6,
@@ -1753,5 +1761,7 @@ int main() {
                "RAX call input forwarding prior return reason was missing");
   ok &= expect(returnForwardSummary.WeakCallInputs >= 1,
                "return-forward summary missed non-strong call input");
+  ok &= expect(returnForwardSummary.ReturnForwardCallInputTrials >= 1,
+               "return-forward summary missed return-forward trial reason");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
