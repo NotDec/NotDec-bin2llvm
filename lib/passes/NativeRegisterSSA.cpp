@@ -98,6 +98,14 @@ struct CallsiteInfo {
   std::string Id;
 };
 
+// Call input trial annotation is still conservative: `Strength` records the
+// old local evidence for audit, while `State` is the Ghidra-style decision that
+// later prototype recovery consumes.
+struct CallInputTrialInfo {
+  std::string Strength;
+  std::string State;
+};
+
 bool isFlagRegisterName(llvm::StringRef name) {
   return name == "CF" || name == "PF" || name == "AF" || name == "ZF" ||
          name == "SF" || name == "TF" || name == "IF" || name == "DF" ||
@@ -486,7 +494,7 @@ public:
       rewritePartialStores();
       attachCallInputCandidates();
       rewriteLoads();
-      annotateCallInputCandidateStrengths();
+      annotateCallInputTrials();
       removeLocalDeadStores();
       removeUnreadFlagStores();
       removeUnreadRipStores();
@@ -498,7 +506,7 @@ public:
     } else {
       attachCallInputCandidates();
       collectExternalInputsOnly();
-      annotateCallInputCandidateStrengths();
+      annotateCallInputTrials();
       attachRegisterEffectMetadata();
       finalizePendingPhis();
       eraseUnusedPendingPhis();
@@ -1112,7 +1120,7 @@ private:
                      llvm::MDNode::get(context, entries));
   }
 
-  void annotateCallInputCandidateStrengths() {
+  void annotateCallInputTrials() {
     for (llvm::BasicBlock &block : Function) {
       for (llvm::Instruction &inst : block) {
         llvm::MDNode *metadata =
@@ -1127,15 +1135,14 @@ private:
           }
         }
         std::set<llvm::Value *> visiting;
-        std::string strength = callInputStrength(candidateValue, visiting);
-        std::string trialState = callInputTrialState(strength);
+        CallInputTrialInfo trial = callInputTrialInfo(candidateValue, visiting);
         inst.setMetadata("notdec.register.call_input_candidate",
                          withMetadataField(
                              *withMetadataField(*metadata, "strength",
-                                                strength),
-                             "trial_state", trialState));
-        countCallInputStrength(strength);
-        countCallInputTrialState(trialState);
+                                                trial.Strength),
+                             "trial_state", trial.State));
+        countCallInputStrength(trial.Strength);
+        countCallInputTrialState(trial.State);
       }
     }
 
@@ -1191,6 +1198,12 @@ private:
     fields.push_back(llvm::MDString::get(context,
                                          prefix + value.str()));
     return llvm::MDNode::get(context, fields);
+  }
+
+  CallInputTrialInfo callInputTrialInfo(
+      llvm::Value *value, std::set<llvm::Value *> &visiting) {
+    std::string strength = callInputStrength(value, visiting);
+    return CallInputTrialInfo{strength, callInputTrialState(strength)};
   }
 
   std::string callInputStrength(llvm::Value *value,

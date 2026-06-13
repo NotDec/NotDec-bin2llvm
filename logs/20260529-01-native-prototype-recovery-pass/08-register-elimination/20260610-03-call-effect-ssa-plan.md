@@ -2058,3 +2058,62 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：7/10。prototype recovery 已从直接看 `strength` 迁到优先看 `trial_state=active`，但 trial-use 检查本身还是复用 strength 结果，还没做真正的 ancestor/use 分析。
 - 复杂度：4/10。新增字段和兼容分支较少，IR helper 形态没有变化。
 - 维护成本：4/10。后续要把 `callInputTrialState()` 从简单映射替换成真实 trial-use 检查；这次把入口和统计先固定下来。
+
+## 2026-06-13 实现记录：call input trial annotation 收口
+
+本次不改行为，只把 Register SSA 里 call input candidate 的标注入口从 strength 命名收口到 trial 命名。这样后续替换成真正 trial-use 检查时，改动点集中在 `callInputTrialInfo()`。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:101`
+  - 新增 `CallInputTrialInfo`，同时保存旧审计字段 `Strength` 和 prototype recovery 消费的 `State`。
+- `lib/passes/NativeRegisterSSA.cpp:497`
+  - `run()` 改调用 `annotateCallInputTrials()`。
+- `lib/passes/NativeRegisterSSA.cpp:1123`
+  - `annotateCallInputCandidateStrengths()` 改名为 `annotateCallInputTrials()`。
+  - metadata 仍写 `strength` 和 `trial_state` 两个字段，行为不变。
+- `lib/passes/NativeRegisterSSA.cpp:1203`
+  - 新增 `callInputTrialInfo()`，集中从 value 生成 trial annotation。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-call-input-trial-info %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-call-input-trial-info.ll \
+  > /tmp/hexx64-1156e0-call-input-trial-info.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-input-trial-info.ll \
+  -o /tmp/hexx64-1156e0-call-input-trial-info.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-input-trial-info.bc \
+  -o /tmp/hexx64-1156e0-call-input-trial-info.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.05s`。
+- summary 分布不变：
+  - `call input trials active: 685`
+  - `call input trials inactive: 1199`
+  - `call input trials no use: 2490`
+  - `call input trials blocked: 0`
+
+### 判断
+
+- 实现效果：5/10。只是把入口整理成 trial info，方便继续替换判定逻辑。
+- 复杂度：2/10。新增一个小结构和一次函数改名。
+- 维护成本：2/10。行为不变，风险主要是后续真实 trial-use 规则仍未落地。
