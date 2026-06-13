@@ -2117,3 +2117,70 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：5/10。只是把入口整理成 trial info，方便继续替换判定逻辑。
 - 复杂度：2/10。新增一个小结构和一次函数改名。
 - 维护成本：2/10。行为不变，风险主要是后续真实 trial-use 规则仍未落地。
+
+## 2026-06-13 实现记录：call input trial reason metadata
+
+本次继续补齐 trial metadata。`trial_state` 只说最终状态，不说明为什么；新增 `trial_reason`，让后续对照 Ghidra active/inactive/no-use 时不用反查旧 `strength`。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:101`
+  - `CallInputTrialInfo` 增加 `Reason` 字段。
+- `lib/passes/NativeRegisterSSA.cpp:1140`
+  - `annotateCallInputTrials()` 写入 `trial_reason` metadata。
+- `lib/passes/NativeRegisterSSA.cpp:1206`
+  - `callInputTrialInfo()` 同时生成 `Strength`、`State`、`Reason`。
+- `lib/passes/NativeRegisterSSA.cpp:1263`
+  - 新增 `callInputTrialReason()`：
+    - `strong_local_def` -> `local_def`
+    - `strong_phi` -> `phi`
+    - `weak_entry_input` -> `entry_input`
+    - `blocked_call_effect` -> `call_effect`
+    - `return_forward` -> `return_forward`
+- `tests/native_register_effects_test.cpp:1572`
+  - 增加 local def、entry input、call effect、PHI、return forward 的 `trial_reason` 断言。
+- `tests/native_prototype_recovery_test.cpp:1230`
+  - 手写 call input helper 测试 metadata 增加 `trial_reason=local_def`，保持测试 IR 和 Register SSA 输出一致。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-call-input-trial-reason %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-call-input-trial-reason.ll \
+  > /tmp/hexx64-1156e0-call-input-trial-reason.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-input-trial-reason.ll \
+  -o /tmp/hexx64-1156e0-call-input-trial-reason.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-input-trial-reason.bc \
+  -o /tmp/hexx64-1156e0-call-input-trial-reason.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.34s`。
+- summary 分布不变：
+  - `call input trials active: 685`
+  - `call input trials inactive: 1199`
+  - `call input trials no use: 2490`
+  - `call input trials blocked: 0`
+
+### 判断
+
+- 实现效果：5/10。trial metadata 更完整，但还没有改变 trial-use 判定逻辑。
+- 复杂度：2/10。只增加一个解释字段和测试断言。
+- 维护成本：2/10。后续真实 use 检查可以继续复用这个字段记录原因。

@@ -99,11 +99,13 @@ struct CallsiteInfo {
 };
 
 // Call input trial annotation is still conservative: `Strength` records the
-// old local evidence for audit, while `State` is the Ghidra-style decision that
-// later prototype recovery consumes.
+// old local evidence for audit, `State` is the Ghidra-style decision that later
+// prototype recovery consumes, and `Reason` keeps the current explanation
+// stable when the evidence field is replaced.
 struct CallInputTrialInfo {
   std::string Strength;
   std::string State;
+  std::string Reason;
 };
 
 bool isFlagRegisterName(llvm::StringRef name) {
@@ -1138,9 +1140,11 @@ private:
         CallInputTrialInfo trial = callInputTrialInfo(candidateValue, visiting);
         inst.setMetadata("notdec.register.call_input_candidate",
                          withMetadataField(
-                             *withMetadataField(*metadata, "strength",
-                                                trial.Strength),
-                             "trial_state", trial.State));
+                             *withMetadataField(
+                                 *withMetadataField(*metadata, "strength",
+                                                    trial.Strength),
+                                 "trial_state", trial.State),
+                             "trial_reason", trial.Reason));
         countCallInputStrength(trial.Strength);
         countCallInputTrialState(trial.State);
       }
@@ -1203,7 +1207,8 @@ private:
   CallInputTrialInfo callInputTrialInfo(
       llvm::Value *value, std::set<llvm::Value *> &visiting) {
     std::string strength = callInputStrength(value, visiting);
-    return CallInputTrialInfo{strength, callInputTrialState(strength)};
+    return CallInputTrialInfo{strength, callInputTrialState(strength),
+                              callInputTrialReason(strength)};
   }
 
   std::string callInputStrength(llvm::Value *value,
@@ -1254,6 +1259,22 @@ private:
       return "inactive";
     }
     return "inactive";
+  }
+
+  std::string callInputTrialReason(llvm::StringRef strength) const {
+    if (strength == "strong_local_def") {
+      return "local_def";
+    }
+    if (strength == "strong_phi") {
+      return "phi";
+    }
+    if (strength == "blocked_call_effect") {
+      return "call_effect";
+    }
+    if (strength == "return_forward") {
+      return "return_forward";
+    }
+    return "entry_input";
   }
 
   std::string phiInputStrength(llvm::PHINode &phi,

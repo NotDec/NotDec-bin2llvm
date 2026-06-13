@@ -1230,6 +1230,7 @@ llvm::Function *createCallInputHelperCallerFunction(
       llvm::MDString::get(context, "register=" + registerName),
       llvm::MDString::get(context, "strength=strong_local_def"),
       llvm::MDString::get(context, "trial_state=" + trialState),
+      llvm::MDString::get(context, "trial_reason=local_def"),
   };
   llvm::MDNode *candidateMetadata = llvm::MDNode::get(context, fields);
   llvm::CallInst *candidate = builder.CreateCall(

@@ -1569,24 +1569,37 @@ int main() {
   ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
                                           "trial_state=active"),
                "RDI call input candidate was not marked active");
+  ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
+                                          "trial_reason=local_def"),
+               "RDI call input candidate did not record local_def reason");
   ok &= expect(callInputCandidateHasField(*weakCallInput, "RDI",
                                           "strength=weak_entry_input"),
                "RDI entry-derived call input was not marked weak");
   ok &= expect(callInputCandidateHasField(*weakCallInput, "RDI",
                                           "trial_state=inactive"),
                "RDI entry-derived call input was not marked inactive");
+  ok &= expect(callInputCandidateHasField(*weakCallInput, "RDI",
+                                          "trial_reason=entry_input"),
+               "RDI entry-derived call input did not record entry reason");
   ok &= expect(callInputCandidateHasField(*blockedCallInput, "RDI",
                                           "strength=blocked_call_effect"),
                "RDI call-effect-derived input was not blocked");
   ok &= expect(callInputCandidateHasField(*blockedCallInput, "RDI",
                                           "trial_state=no_use"),
                "RDI call-effect-derived input was not marked no_use");
+  ok &= expect(callInputCandidateHasField(*blockedCallInput, "RDI",
+                                          "trial_reason=call_effect"),
+               "RDI call-effect-derived input did not record call effect "
+               "reason");
   ok &= expect(callInputCandidateHasField(*strongPhiCallInput, "RDI",
                                           "strength=strong_phi"),
                "RDI PHI call input was not marked strong_phi");
   ok &= expect(callInputCandidateHasField(*strongPhiCallInput, "RDI",
                                           "trial_state=active"),
                "RDI PHI call input was not marked active");
+  ok &= expect(callInputCandidateHasField(*strongPhiCallInput, "RDI",
+                                          "trial_reason=phi"),
+               "RDI PHI call input did not record phi reason");
   ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
                "RSP load after call was not propagated");
   ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 0,
@@ -1735,6 +1748,9 @@ int main() {
   ok &= expect(callInputCandidateHasField(*returnForwardCallInput, "RAX",
                                           "trial_state=inactive"),
                "RAX call input forwarding prior return was not inactive");
+  ok &= expect(callInputCandidateHasField(*returnForwardCallInput, "RAX",
+                                          "trial_reason=return_forward"),
+               "RAX call input forwarding prior return reason was missing");
   ok &= expect(returnForwardSummary.WeakCallInputs >= 1,
                "return-forward summary missed non-strong call input");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
