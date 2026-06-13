@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 
 namespace {
@@ -102,6 +103,35 @@ void attachTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachRaxInputOutputAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__test_rax";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+
+  notdec::bin2llvm::NativeAbiParamEntry input;
+  input.MinSize = 1;
+  input.MaxSize = 8;
+  input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  input.Storage.Name = "RAX";
+  abi.Inputs.push_back(std::move(input));
+
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "RAX";
+  abi.Outputs.push_back(std::move(output));
+
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = "RAX";
+  abi.Effects.push_back(std::move(killed));
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 llvm::Function *createFunction(llvm::Module &module, const std::string &name,
                                llvm::GlobalVariable *rbx,
                                bool restoreRbx) {
@@ -185,6 +215,135 @@ llvm::Function *createCallInputCandidateFunction(llvm::Module &module,
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
   return function;
+}
+
+llvm::Function *createWeakCallInputFunction(llvm::Module &module,
+                                            llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "weak_call_input_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "weak_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  (void)rdi;
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createBlockedCallInputFunction(llvm::Module &module,
+                                               llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *first =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "blocked_call_input_first", module);
+  llvm::Function *second =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "blocked_call_input_second", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "blocked_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  (void)rdi;
+  builder.CreateCall(calleeType, first);
+  builder.CreateCall(calleeType, second);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createStrongPhiCallInputFunction(llvm::Module &module,
+                                                 llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "strong_phi_call_input_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "strong_phi_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RDI");
+
+  builder.CreateCondBr(llvm::ConstantInt::getFalse(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(
+      llvm::ConstantInt::get(rdi->getValueType(), 0x1111), rdi);
+  leftStore->setMetadata("notdec.register.access", metadata);
+  builder.CreateBr(join);
+
+  builder.SetInsertPoint(right);
+  llvm::StoreInst *rightStore = builder.CreateStore(
+      llvm::ConstantInt::get(rdi->getValueType(), 0x2222), rdi);
+  rightStore->setMetadata("notdec.register.access", metadata);
+  builder.CreateBr(join);
+
+  builder.SetInsertPoint(join);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createReturnForwardCallInputFunction(
+    llvm::Module &module, llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *first =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "return_forward_first", module);
+  llvm::Function *second =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "return_forward_second", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "return_forward_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  (void)rax;
+  builder.CreateCall(calleeType, first);
+  builder.CreateCall(calleeType, second);
+  builder.CreateRetVoid();
+  return function;
+}
+
+std::unique_ptr<llvm::Module> createMissingPhiIncomingModule(
+    llvm::LLVMContext &context) {
+  auto module = std::make_unique<llvm::Module>("missing-phi-incoming", context);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "bad_phi", *module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getFalse(context), left, right);
+  builder.SetInsertPoint(left);
+  builder.CreateBr(join);
+  builder.SetInsertPoint(right);
+  builder.CreateBr(join);
+  builder.SetInsertPoint(join);
+  llvm::PHINode *phi =
+      builder.CreatePHI(llvm::Type::getInt64Ty(context), 2, "missing");
+  phi->addIncoming(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1),
+                   left);
+  builder.CreateRet(phi);
+  return module;
 }
 
 llvm::Function *createStackPointerCallEffectFunction(
@@ -1144,8 +1303,8 @@ bool callInputCandidateHasField(const llvm::Function &function,
         hasRegister |= field->getString() == expectedRegister;
         hasField |= field->getString() == expectedField;
       }
-      if (hasRegister) {
-        return hasField;
+      if (hasRegister && hasField) {
+        return true;
       }
     }
   }
@@ -1283,6 +1442,10 @@ int main() {
   llvm::Function *callEffects = createCallEffectFunction(module, rbx, rax);
   llvm::Function *callInputCandidate =
       createCallInputCandidateFunction(module, rdi);
+  llvm::Function *weakCallInput = createWeakCallInputFunction(module, rdi);
+  llvm::Function *blockedCallInput = createBlockedCallInputFunction(module, rdi);
+  llvm::Function *strongPhiCallInput =
+      createStrongPhiCallInputFunction(module, rdi);
   llvm::Function *stackPointerCallEffects =
       createStackPointerCallEffectFunction(module, rsp);
   llvm::Function *repeatedLoadAfterCall =
@@ -1397,6 +1560,15 @@ int main() {
   ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
                                           "strength=strong_local_def"),
                "RDI call input candidate was not marked strong");
+  ok &= expect(callInputCandidateHasField(*weakCallInput, "RDI",
+                                          "strength=weak_entry_input"),
+               "RDI entry-derived call input was not marked weak");
+  ok &= expect(callInputCandidateHasField(*blockedCallInput, "RDI",
+                                          "strength=blocked_call_effect"),
+               "RDI call-effect-derived input was not blocked");
+  ok &= expect(callInputCandidateHasField(*strongPhiCallInput, "RDI",
+                                          "strength=strong_phi"),
+               "RDI PHI call input was not marked strong_phi");
   ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
                "RSP load after call was not propagated");
   ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 0,
@@ -1491,6 +1663,10 @@ int main() {
                "cascaded trivial RAX PHIs were not removed");
   ok &= expect(functionReturnsConstant(*cascadedTrivialRegisterPhi, 0x5151),
                "cascaded trivial RAX value was not preserved");
+  std::unique_ptr<llvm::Module> missingPhiIncomingModule =
+      createMissingPhiIncomingModule(context);
+  ok &= expect(llvm::verifyModule(*missingPhiIncomingModule, &llvm::nulls()),
+               "LLVM verifier accepted PHI with missing incoming edge");
   ok &= expect(unreachableRegisterLoad->size() == 1 &&
                    countRegisterLoads(*unreachableRegisterLoad, rax) == 0,
                "unreachable register load block was not removed");
@@ -1520,5 +1696,25 @@ int main() {
                "unread RIP store was not removed");
   ok &= expect(countRegisterStores(*readRip, rip) == 1,
                "read RIP store was removed");
+
+  llvm::Module returnForwardModule("native-register-return-forward-test",
+                                   context);
+  llvm::GlobalVariable *returnForwardRax =
+      createRegisterGlobal(returnForwardModule, "RAX");
+  attachRaxInputOutputAbi(returnForwardModule);
+  llvm::Function *returnForwardCallInput =
+      createReturnForwardCallInputFunction(returnForwardModule,
+                                           returnForwardRax);
+  notdec::bin2llvm::NativeRegisterSSASummary returnForwardSummary =
+      notdec::bin2llvm::runNativeRegisterSSA(returnForwardModule, options);
+  if (llvm::verifyModule(returnForwardModule, &llvm::errs())) {
+    std::cerr << "return-forward module verification failed after register SSA\n";
+    return EXIT_FAILURE;
+  }
+  ok &= expect(callInputCandidateHasField(*returnForwardCallInput, "RAX",
+                                          "strength=return_forward"),
+               "RAX call input forwarding prior return was not marked");
+  ok &= expect(returnForwardSummary.WeakCallInputs >= 1,
+               "return-forward summary missed non-strong call input");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

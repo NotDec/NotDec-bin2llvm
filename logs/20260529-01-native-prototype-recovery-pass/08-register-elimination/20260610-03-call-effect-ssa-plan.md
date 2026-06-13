@@ -1829,3 +1829,69 @@ cmake --build /tmp/notdec-bin2llvm-build \
 ### 判断
 
 这一步没有改变 IR 策略，只是让性能排查有稳定计数。当前最明显的问题仍是 `weak + blocked = 3689` 个 candidate 被 materialize 成 helper，但 prototype recovery 不消费它们。下一步应该试一个开关或策略：只 materialize strong candidate，weak/blocked 先只保留在审计统计里，再比较 IR 验证、signature rewrite 和 `hexx64.so` 时间。
+
+## 2026-06-13 实现记录：call input strength 语义测试
+
+本次先不优化速度，按“功能要一直对”的方向补测试，锁住 call input strength 和 PHI 缺边策略。
+
+### 改动
+
+- `tests/native_register_effects_test.cpp:65`
+  - 新增 `attachRaxInputOutputAbi()`，只给单独测试模块使用，用来覆盖 input/output 都是 `RAX` 的 return-forward 场景。
+- `tests/native_register_effects_test.cpp:223`
+  - 新增 `createWeakCallInputFunction()`，覆盖无本地定义时的 `weak_entry_input`。
+- `tests/native_register_effects_test.cpp:242`
+  - 新增 `createBlockedCallInputFunction()`，覆盖前一个 call effect 作为输入来源时的 `blocked_call_effect`。
+- `tests/native_register_effects_test.cpp:264`
+  - 新增 `createStrongPhiCallInputFunction()`，覆盖两条 predecessor 都有本地定义时的 `strong_phi`。
+- `tests/native_register_effects_test.cpp:307`
+  - 新增 `createReturnForwardCallInputFunction()`，覆盖前一个 call return 继续作为下一个 call input 的 `return_forward`。
+- `tests/native_register_effects_test.cpp:329`
+  - 新增 `createMissingPhiIncomingModule()`，确认缺 incoming 的 PHI 应被 LLVM verifier 拒绝，而不是被 pass 补洞。
+- `tests/native_register_effects_test.cpp:1511`
+  - main 里新增对应断言。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-call-helper-semantics %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-call-helper-semantics.ll \
+  > /tmp/hexx64-1156e0-call-helper-semantics.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-helper-semantics.ll \
+  -o /tmp/hexx64-1156e0-call-helper-semantics.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-helper-semantics.bc \
+  -o /tmp/hexx64-1156e0-call-helper-semantics.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`72.97s`。
+- summary 分布和上一轮一致：
+  - `call input helpers: 4374`
+  - `call return helpers: 929`
+  - `call effect helpers: 3159`
+  - `call input strong: 685`
+  - `call input weak: 1199`
+  - `call input blocked: 2490`
+
+### 判断
+
+- 实现效果：8/10。五类 strength 已有 focused 覆盖；PHI 缺 incoming 的策略也有 verifier 负例。
+- 复杂度：3/10。只加测试构造，没有改主逻辑。
+- 维护成本：3/10。后续调整 strength 规则时，测试会直接指出语义变化。
