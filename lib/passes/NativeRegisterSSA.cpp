@@ -1099,6 +1099,7 @@ private:
           builder.CreateCall(callInputHelper(unit), {load});
       candidate->setMetadata("notdec.register.call_input_candidate",
                              llvm::MDNode::get(context, fields));
+      ++Summary.CallInputHelpers;
       entries.push_back(llvm::MDNode::get(context, fields));
       ++slot;
     }
@@ -1126,10 +1127,11 @@ private:
           }
         }
         std::set<llvm::Value *> visiting;
+        std::string strength = callInputStrength(candidateValue, visiting);
         inst.setMetadata("notdec.register.call_input_candidate",
                          withMetadataField(*metadata, "strength",
-                                           callInputStrength(candidateValue,
-                                                             visiting)));
+                                           strength));
+        countCallInputStrength(strength);
       }
     }
 
@@ -1252,6 +1254,18 @@ private:
       return "return_forward";
     }
     return sawStrong ? "strong_phi" : "weak_entry_input";
+  }
+
+  void countCallInputStrength(llvm::StringRef strength) {
+    if (strength == "strong_local_def" || strength == "strong_phi") {
+      ++Summary.StrongCallInputs;
+      return;
+    }
+    if (strength == "blocked_call_effect") {
+      ++Summary.BlockedCallInputs;
+      return;
+    }
+    ++Summary.WeakCallInputs;
   }
 
   llvm::Value *resolveValue(llvm::Value *value) {
@@ -1588,6 +1602,11 @@ private:
     store->setMetadata("notdec.register.access",
                        fullRegisterAccessMetadata(Function.getContext(), unit));
     StoredFullUnits.insert(unit.Global);
+    if (effectInfo.Kind == "return") {
+      ++Summary.CallReturnHelpers;
+    } else {
+      ++Summary.CallEffectHelpers;
+    }
     CallEffectValue.emplace(key, effect);
     return effect;
   }
@@ -1869,6 +1888,12 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.CallsSeen += function.CallsSeen;
   total.PreservedRegisters += function.PreservedRegisters;
   total.ClobberedRegisters += function.ClobberedRegisters;
+  total.CallInputHelpers += function.CallInputHelpers;
+  total.CallReturnHelpers += function.CallReturnHelpers;
+  total.CallEffectHelpers += function.CallEffectHelpers;
+  total.StrongCallInputs += function.StrongCallInputs;
+  total.WeakCallInputs += function.WeakCallInputs;
+  total.BlockedCallInputs += function.BlockedCallInputs;
   total.Functions.push_back(function);
 }
 
@@ -1966,6 +1991,12 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
   os << "  calls: " << summary.CallsSeen << '\n';
   os << "  preserved registers: " << summary.PreservedRegisters << '\n';
   os << "  clobbered registers: " << summary.ClobberedRegisters << '\n';
+  os << "  call input helpers: " << summary.CallInputHelpers << '\n';
+  os << "  call return helpers: " << summary.CallReturnHelpers << '\n';
+  os << "  call effect helpers: " << summary.CallEffectHelpers << '\n';
+  os << "  call input strong: " << summary.StrongCallInputs << '\n';
+  os << "  call input weak: " << summary.WeakCallInputs << '\n';
+  os << "  call input blocked: " << summary.BlockedCallInputs << '\n';
   for (const NativeRegisterSSAFunctionSummary &function : summary.Functions) {
     os << "  function " << function.FunctionName << ": loads="
        << function.LoadsSeen << " stores=" << function.StoresSeen
@@ -1976,7 +2007,13 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
        << " external_inputs=" << function.ExternalInputs
        << " calls=" << function.CallsSeen
        << " preserved=" << function.PreservedRegisters
-       << " clobbered=" << function.ClobberedRegisters << '\n';
+       << " clobbered=" << function.ClobberedRegisters
+       << " call_input_helpers=" << function.CallInputHelpers
+       << " call_return_helpers=" << function.CallReturnHelpers
+       << " call_effect_helpers=" << function.CallEffectHelpers
+       << " call_input_strong=" << function.StrongCallInputs
+       << " call_input_weak=" << function.WeakCallInputs
+       << " call_input_blocked=" << function.BlockedCallInputs << '\n';
   }
 }
 

@@ -1759,3 +1759,73 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 对明显不会被消费的 weak / blocked candidate，是否只保留审计 metadata，或者延后 materialize helper。
 - 缓存 helper declaration 和常用 metadata，减少字符串和 IR 节点构造成本。
 - prototype recovery 当前只消费 strong candidate，避免了全量 ABI input 误改 signature。
+
+## 2026-06-13 实现记录：call input helper 统计接入 summary
+
+上一段实现后，helper/strength 分布只能靠 `rg` 扫 IR。为了继续排查性能，先把统计接进 `NativeRegisterSSASummary`，方便每次用 `--register-ssa-summary` 直接看。
+
+### 改动
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:19`
+  - `NativeRegisterSSAFunctionSummary` / `NativeRegisterSSASummary` 增加：
+    - `CallInputHelpers`
+    - `CallReturnHelpers`
+    - `CallEffectHelpers`
+    - `StrongCallInputs`
+    - `WeakCallInputs`
+    - `BlockedCallInputs`
+- `lib/passes/NativeRegisterSSA.cpp:1098`
+  - 插入 `@notdec.register.call_input.*` 时累计 `CallInputHelpers`。
+- `lib/passes/NativeRegisterSSA.cpp:1128`
+  - strength 分类后累计 strong / weak / blocked 数量。
+- `lib/passes/NativeRegisterSSA.cpp:1582`
+  - 插入 `call_return` / `call_effect` helper 时累计对应计数。
+- `lib/passes/NativeRegisterSSA.cpp:1857`
+  - `addFunctionSummary()` 汇总新增字段。
+- `lib/passes/NativeRegisterSSA.cpp:1951`
+  - `printNativeRegisterSSASummary()` 打印新增统计。
+- `tests/native_register_effects_test.cpp:1360`
+  - 增加 summary 计数非零断言。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-call-helper-summary %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-call-helper-summary.ll \
+  > /tmp/hexx64-1156e0-call-helper-summary.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-helper-summary.ll \
+  -o /tmp/hexx64-1156e0-call-helper-summary.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-helper-summary.bc \
+  -o /tmp/hexx64-1156e0-call-helper-summary.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 带 summary 本次时间：`69.47s`。
+- summary 输出：
+  - `call input helpers: 4374`
+  - `call return helpers: 929`
+  - `call effect helpers: 3159`
+  - `call input strong: 685`
+  - `call input weak: 1199`
+  - `call input blocked: 2490`
+
+### 判断
+
+这一步没有改变 IR 策略，只是让性能排查有稳定计数。当前最明显的问题仍是 `weak + blocked = 3689` 个 candidate 被 materialize 成 helper，但 prototype recovery 不消费它们。下一步应该试一个开关或策略：只 materialize strong candidate，weak/blocked 先只保留在审计统计里，再比较 IR 验证、signature rewrite 和 `hexx64.so` 时间。

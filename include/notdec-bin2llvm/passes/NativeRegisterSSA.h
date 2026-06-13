@@ -30,6 +30,12 @@ struct NativeRegisterSSAFunctionSummary {
   uint64_t CallsSeen = 0;
   uint64_t PreservedRegisters = 0;
   uint64_t ClobberedRegisters = 0;
+  uint64_t CallInputHelpers = 0;
+  uint64_t CallReturnHelpers = 0;
+  uint64_t CallEffectHelpers = 0;
+  uint64_t StrongCallInputs = 0;
+  uint64_t WeakCallInputs = 0;
+  uint64_t BlockedCallInputs = 0;
 };
 
 struct NativeRegisterSSASummary {
@@ -46,6 +52,12 @@ struct NativeRegisterSSASummary {
   uint64_t CallsSeen = 0;
   uint64_t PreservedRegisters = 0;
   uint64_t ClobberedRegisters = 0;
+  uint64_t CallInputHelpers = 0;
+  uint64_t CallReturnHelpers = 0;
+  uint64_t CallEffectHelpers = 0;
+  uint64_t StrongCallInputs = 0;
+  uint64_t WeakCallInputs = 0;
+  uint64_t BlockedCallInputs = 0;
   std::vector<NativeRegisterSSAFunctionSummary> Functions;
 };
 

@@ -1359,6 +1359,14 @@ int main() {
                "register effect summary had unexpected preserved count");
   ok &= expect(summary.ClobberedRegisters >= 7,
                "register effect summary missed expected clobbers");
+  ok &= expect(summary.CallInputHelpers >= 1,
+               "register SSA summary missed call input helpers");
+  ok &= expect(summary.CallReturnHelpers >= 1,
+               "register SSA summary missed call return helpers");
+  ok &= expect(summary.CallEffectHelpers >= 1,
+               "register SSA summary missed call effect helpers");
+  ok &= expect(summary.StrongCallInputs >= 1,
+               "register SSA summary missed strong call inputs");
   ok &= expect(summary.DeadStoresRemoved >= 1,
                "register SSA did not remove the expected overwritten store");
   ok &= expect(summary.UnreadFlagStoresRemoved == 6,
