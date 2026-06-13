@@ -6,7 +6,7 @@
 
 ## 背景
 
-当前 `NativeRegisterSSA` 已经修掉了 pending PHI incoming 不全的问题，但修法是 pass 结束补齐 missing incoming，未知边用 `undef`。这只能保证 IR 结构合法，不能完整表达 call 对寄存器值的影响。
+当前 `NativeRegisterSSA` 曾经通过 pass 结束补齐 missing incoming、未知边用 `undef` 来修 PHI 结构。这只能保证 IR 结构合法，不能说明 SSA 构建是对的，也不能完整表达 call 对寄存器值的影响。
 
 真正要做好这一块，需要同时解决两件事：
 
@@ -99,7 +99,7 @@ Ghidra 的 call effect 模型不是简单“遇到 call 就断开”，而是把
 
 - `NativeRegisterSSA` 不再因为 call clobber 返回裸 `nullptr`。
 - call effect 以带 metadata 的 LLVM value 表达。
-- PHI incoming 缺失时优先来自明确 call effect value，而不是 fallback `undef`。
+- PHI incoming 不应该靠 pass 末尾补洞。正确的 SSA 构建应该在 seal/finalize 时按 CFG 补齐每条 predecessor incoming；如果仍缺 incoming，应该让 verifier 暴露问题，而不是补 `undef` 或随手补 unknown。
 - prototype recovery 可以区分：
   - function entry input
   - call input
@@ -318,14 +318,15 @@ LLVM 侧：
 
 ### 5. 重整 pending PHI
 
-保留当前 pass-end finalize，但把它从“补 `undef`”升级成：
+pass-end finalize 不能作为“补洞兜底”。它只应该完成 Braun SSA 里的 seal / `addPhiOperands` 工作：
 
-1. 对每个 missing incoming edge，重新查询 edge predecessor 的 exit value。
-2. 如果失败是 call effect，生成 call effect value。
-3. 只有真正无法定位来源时，才用 `unknown_effect` value。
-4. 最后再 `tryRemoveTrivialPhi`。
+1. 对每个 incomplete PHI，按 CFG predecessor 调统一的 `addPhiOperands`。
+2. 每条 incoming 都必须来自正常 SSA 查询结果：entry input、local def、call return、call clobber 或明确的 unknown effect。
+3. `unknown_effect` 只能来自明确的 call/storage effect，不能用来掩盖 SSA 算法没有补到某条边。
+4. finalize 后如果 PHI incoming 数量仍不等于 predecessor 数，不再补 `undef`，也不再补 fake unknown；直接保留错误 IR，让 verifier fail。
+5. 最后再 `tryRemoveTrivialPhi`。
 
-这更接近 Braun 的 `addPhiOperands`，也更接近 Ghidra 的 explicit indirect effect。
+这更接近 Braun 的 `addPhiOperands`：PHI 完整性是算法保证的，不是 pass 结束靠默认值补出来的。
 
 ### 6. trivial PHI 删除要完整
 
@@ -348,7 +349,7 @@ LLVM 侧：
 - 增加 `notdec.register.call_effect` metadata。
 - `blockHasClobberingCall` 不直接返回 `nullptr`。
 - 在明确 killedbycall 时生成 `clobber_unknown` value。
-- pending PHI missing incoming 不再补裸 `undef`，改补 `clobber_unknown` 或 `unknown_effect`。
+- pending PHI missing incoming 不再补裸 `undef`，也不补 fake `unknown_effect`。缺 incoming 说明 SSA 构建仍有 bug，应让 verifier 暴露。
 
 判断标准：
 
@@ -408,6 +409,7 @@ LLVM 侧：
 
 - 不再需要结构性 fallback。
 - 每个 PHI 都能追到 entry input、local def、call return、call clobber unknown 或 unknown effect。
+- 如果某个 PHI 仍缺 incoming，验证应失败；不要为了让 IR 通过而补 `undef` / fake unknown。
 
 ## 风险
 
