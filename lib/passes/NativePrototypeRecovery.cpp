@@ -927,10 +927,18 @@ std::optional<NativeRecoveredPrototypeParam> declarationInputParamForStore(
 std::optional<NativeRecoveredPrototypeParam>
 declarationInputParamForCandidate(llvm::MDNode &candidate,
                                   const NativePrototypeModel &model) {
-  std::optional<std::string> strength = metadataField(candidate, "strength");
-  if (strength && *strength != "strong_local_def" &&
-      *strength != "strong_phi") {
-    return std::nullopt;
+  std::optional<std::string> trialState =
+      metadataField(candidate, "trial_state");
+  if (trialState) {
+    if (*trialState != "active") {
+      return std::nullopt;
+    }
+  } else {
+    std::optional<std::string> strength = metadataField(candidate, "strength");
+    if (strength && *strength != "strong_local_def" &&
+        *strength != "strong_phi") {
+      return std::nullopt;
+    }
   }
   std::optional<std::string> registerName = metadataField(candidate, "register");
   if (!registerName) {

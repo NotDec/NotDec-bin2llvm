@@ -1530,6 +1530,12 @@ int main() {
                "register SSA summary missed call effect helpers");
   ok &= expect(summary.StrongCallInputs >= 1,
                "register SSA summary missed strong call inputs");
+  ok &= expect(summary.ActiveCallInputTrials >= 1,
+               "register SSA summary missed active call input trials");
+  ok &= expect(summary.InactiveCallInputTrials >= 1,
+               "register SSA summary missed inactive call input trials");
+  ok &= expect(summary.NoUseCallInputTrials >= 1,
+               "register SSA summary missed no-use call input trials");
   ok &= expect(summary.DeadStoresRemoved >= 1,
                "register SSA did not remove the expected overwritten store");
   ok &= expect(summary.UnreadFlagStoresRemoved == 6,
@@ -1560,15 +1566,27 @@ int main() {
   ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
                                           "strength=strong_local_def"),
                "RDI call input candidate was not marked strong");
+  ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
+                                          "trial_state=active"),
+               "RDI call input candidate was not marked active");
   ok &= expect(callInputCandidateHasField(*weakCallInput, "RDI",
                                           "strength=weak_entry_input"),
                "RDI entry-derived call input was not marked weak");
+  ok &= expect(callInputCandidateHasField(*weakCallInput, "RDI",
+                                          "trial_state=inactive"),
+               "RDI entry-derived call input was not marked inactive");
   ok &= expect(callInputCandidateHasField(*blockedCallInput, "RDI",
                                           "strength=blocked_call_effect"),
                "RDI call-effect-derived input was not blocked");
+  ok &= expect(callInputCandidateHasField(*blockedCallInput, "RDI",
+                                          "trial_state=no_use"),
+               "RDI call-effect-derived input was not marked no_use");
   ok &= expect(callInputCandidateHasField(*strongPhiCallInput, "RDI",
                                           "strength=strong_phi"),
                "RDI PHI call input was not marked strong_phi");
+  ok &= expect(callInputCandidateHasField(*strongPhiCallInput, "RDI",
+                                          "trial_state=active"),
+               "RDI PHI call input was not marked active");
   ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
                "RSP load after call was not propagated");
   ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 0,
@@ -1714,6 +1732,9 @@ int main() {
   ok &= expect(callInputCandidateHasField(*returnForwardCallInput, "RAX",
                                           "strength=return_forward"),
                "RAX call input forwarding prior return was not marked");
+  ok &= expect(callInputCandidateHasField(*returnForwardCallInput, "RAX",
+                                          "trial_state=inactive"),
+               "RAX call input forwarding prior return was not inactive");
   ok &= expect(returnForwardSummary.WeakCallInputs >= 1,
                "return-forward summary missed non-strong call input");
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;

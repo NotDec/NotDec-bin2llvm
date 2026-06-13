@@ -1968,3 +1968,84 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：8/10。五类 strength 已有 focused 覆盖；PHI 缺 incoming 的策略也有 verifier 负例。
 - 复杂度：3/10。只加测试构造，没有改主逻辑。
 - 维护成本：3/10。后续调整 strength 规则时，测试会直接指出语义变化。
+
+## 2026-06-13 实现记录：call input trial state 过渡层
+
+本次开始把 call input 从 `strength` 迁到 Ghidra 风格 trial/use。先不改变 helper IR，也不删除 `strength`，而是在现有 candidate 上增加 `trial_state`，让 prototype recovery 优先消费 `active`。
+
+### 改动
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:39`
+  - `NativeRegisterSSAFunctionSummary` 增加 `ActiveCallInputTrials`、`InactiveCallInputTrials`、`NoUseCallInputTrials`、`BlockedCallInputTrials`。
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:65`
+  - `NativeRegisterSSASummary` 增加同样的 module 级 trial state 计数。
+- `lib/passes/NativeRegisterSSA.cpp:1115`
+  - `annotateCallInputCandidateStrengths()` 在写 `strength` 后同步写 `trial_state`。
+  - 当前映射：
+    - `strong_local_def` / `strong_phi` -> `active`
+    - `weak_entry_input` / `return_forward` -> `inactive`
+    - `blocked_call_effect` -> `no_use`
+- `lib/passes/NativeRegisterSSA.cpp:1233`
+  - 新增 `callInputTrialState()`，集中保存这个过渡映射。
+- `lib/passes/NativeRegisterSSA.cpp:1287`
+  - 新增 `countCallInputTrialState()`，累计 trial state summary。
+- `lib/passes/NativeRegisterSSA.cpp:1909`
+  - `addFunctionSummary()` 汇总新增 trial state 计数。
+- `lib/passes/NativeRegisterSSA.cpp:2013`
+  - `printNativeRegisterSSASummary()` 打印 module/function 两级 trial state 统计。
+- `lib/passes/NativePrototypeRecovery.cpp:927`
+  - `declarationInputParamForCandidate()` 优先读取 `trial_state`。
+  - 有 `trial_state` 时只接受 `active`；没有该字段时兼容旧 `strength=strong_local_def|strong_phi`。
+- `tests/native_register_effects_test.cpp:1533`
+  - 增加 active/inactive/no-use summary 断言。
+- `tests/native_register_effects_test.cpp:1569`
+  - 增加 `trial_state=active/inactive/no_use` metadata 断言，覆盖 local def、entry input、call effect、PHI、return forward。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-call-input-trial-state %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-call-input-trial-state.ll \
+  > /tmp/hexx64-1156e0-call-input-trial-state.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-call-input-trial-state.ll \
+  -o /tmp/hexx64-1156e0-call-input-trial-state.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-call-input-trial-state.bc \
+  -o /tmp/hexx64-1156e0-call-input-trial-state.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`71.02s`。
+- summary 输出：
+  - `call input helpers: 4374`
+  - `call return helpers: 929`
+  - `call effect helpers: 3159`
+  - `call input strong: 685`
+  - `call input weak: 1199`
+  - `call input blocked: 2490`
+  - `call input trials active: 685`
+  - `call input trials inactive: 1199`
+  - `call input trials no use: 2490`
+  - `call input trials blocked: 0`
+
+### 判断
+
+- 实现效果：7/10。prototype recovery 已从直接看 `strength` 迁到优先看 `trial_state=active`，但 trial-use 检查本身还是复用 strength 结果，还没做真正的 ancestor/use 分析。
+- 复杂度：4/10。新增字段和兼容分支较少，IR helper 形态没有变化。
+- 维护成本：4/10。后续要把 `callInputTrialState()` 从简单映射替换成真实 trial-use 检查；这次把入口和统计先固定下来。

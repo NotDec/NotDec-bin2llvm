@@ -36,6 +36,10 @@ struct NativeRegisterSSAFunctionSummary {
   uint64_t StrongCallInputs = 0;
   uint64_t WeakCallInputs = 0;
   uint64_t BlockedCallInputs = 0;
+  uint64_t ActiveCallInputTrials = 0;
+  uint64_t InactiveCallInputTrials = 0;
+  uint64_t NoUseCallInputTrials = 0;
+  uint64_t BlockedCallInputTrials = 0;
 };
 
 struct NativeRegisterSSASummary {
@@ -58,6 +62,10 @@ struct NativeRegisterSSASummary {
   uint64_t StrongCallInputs = 0;
   uint64_t WeakCallInputs = 0;
   uint64_t BlockedCallInputs = 0;
+  uint64_t ActiveCallInputTrials = 0;
+  uint64_t InactiveCallInputTrials = 0;
+  uint64_t NoUseCallInputTrials = 0;
+  uint64_t BlockedCallInputTrials = 0;
   std::vector<NativeRegisterSSAFunctionSummary> Functions;
 };
 

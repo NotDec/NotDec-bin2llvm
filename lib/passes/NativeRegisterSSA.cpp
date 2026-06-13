@@ -1128,10 +1128,14 @@ private:
         }
         std::set<llvm::Value *> visiting;
         std::string strength = callInputStrength(candidateValue, visiting);
+        std::string trialState = callInputTrialState(strength);
         inst.setMetadata("notdec.register.call_input_candidate",
-                         withMetadataField(*metadata, "strength",
-                                           strength));
+                         withMetadataField(
+                             *withMetadataField(*metadata, "strength",
+                                                strength),
+                             "trial_state", trialState));
         countCallInputStrength(strength);
+        countCallInputTrialState(trialState);
       }
     }
 
@@ -1226,6 +1230,19 @@ private:
     return "weak_entry_input";
   }
 
+  std::string callInputTrialState(llvm::StringRef strength) const {
+    if (strength == "strong_local_def" || strength == "strong_phi") {
+      return "active";
+    }
+    if (strength == "blocked_call_effect") {
+      return "no_use";
+    }
+    if (strength == "return_forward") {
+      return "inactive";
+    }
+    return "inactive";
+  }
+
   std::string phiInputStrength(llvm::PHINode &phi,
                                std::set<llvm::Value *> &visiting) {
     bool sawWeak = false;
@@ -1266,6 +1283,22 @@ private:
       return;
     }
     ++Summary.WeakCallInputs;
+  }
+
+  void countCallInputTrialState(llvm::StringRef state) {
+    if (state == "active") {
+      ++Summary.ActiveCallInputTrials;
+      return;
+    }
+    if (state == "inactive") {
+      ++Summary.InactiveCallInputTrials;
+      return;
+    }
+    if (state == "no_use") {
+      ++Summary.NoUseCallInputTrials;
+      return;
+    }
+    ++Summary.BlockedCallInputTrials;
   }
 
   llvm::Value *resolveValue(llvm::Value *value) {
@@ -1894,6 +1927,10 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.StrongCallInputs += function.StrongCallInputs;
   total.WeakCallInputs += function.WeakCallInputs;
   total.BlockedCallInputs += function.BlockedCallInputs;
+  total.ActiveCallInputTrials += function.ActiveCallInputTrials;
+  total.InactiveCallInputTrials += function.InactiveCallInputTrials;
+  total.NoUseCallInputTrials += function.NoUseCallInputTrials;
+  total.BlockedCallInputTrials += function.BlockedCallInputTrials;
   total.Functions.push_back(function);
 }
 
@@ -1997,6 +2034,14 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
   os << "  call input strong: " << summary.StrongCallInputs << '\n';
   os << "  call input weak: " << summary.WeakCallInputs << '\n';
   os << "  call input blocked: " << summary.BlockedCallInputs << '\n';
+  os << "  call input trials active: " << summary.ActiveCallInputTrials
+     << '\n';
+  os << "  call input trials inactive: " << summary.InactiveCallInputTrials
+     << '\n';
+  os << "  call input trials no use: " << summary.NoUseCallInputTrials
+     << '\n';
+  os << "  call input trials blocked: " << summary.BlockedCallInputTrials
+     << '\n';
   for (const NativeRegisterSSAFunctionSummary &function : summary.Functions) {
     os << "  function " << function.FunctionName << ": loads="
        << function.LoadsSeen << " stores=" << function.StoresSeen
@@ -2013,7 +2058,12 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
        << " call_effect_helpers=" << function.CallEffectHelpers
        << " call_input_strong=" << function.StrongCallInputs
        << " call_input_weak=" << function.WeakCallInputs
-       << " call_input_blocked=" << function.BlockedCallInputs << '\n';
+       << " call_input_blocked=" << function.BlockedCallInputs
+       << " call_input_trials_active=" << function.ActiveCallInputTrials
+       << " call_input_trials_inactive=" << function.InactiveCallInputTrials
+       << " call_input_trials_no_use=" << function.NoUseCallInputTrials
+       << " call_input_trials_blocked=" << function.BlockedCallInputTrials
+       << '\n';
   }
 }
 
