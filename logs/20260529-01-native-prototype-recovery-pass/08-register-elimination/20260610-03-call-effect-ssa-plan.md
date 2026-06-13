@@ -53,6 +53,51 @@ Ghidra 的 call effect 模型不是简单“遇到 call 就断开”，而是把
 - killed-by-call register 使用 call-created unknown value。
 - possible input/output 应该记录为 callsite candidate，后续给 prototype recovery 用。
 
+### Ghidra trial/use 到 native 的对应
+
+当前 native 的 `strength` 不应该成为最终模型。它只是临时保护：
+
+- 防止 prototype recovery 误吃 entry input、call clobber、默认 ABI input。
+- 给日志和统计用，方便看现在哪些 candidate 还不可靠。
+
+长期应该改成 Ghidra 风格：
+
+```text
+ABI/callee 发现可能 input
+  -> 创建 call input trial
+  -> 把 trial 显式插到 call 附近的 IR use
+  -> Register SSA 只负责给这个 use 接上正确 reaching definition
+  -> trial-use 检查决定 active / inactive / no_use / blocked
+  -> prototype recovery 只消费 active trial
+```
+
+native 侧不需要照搬 Ghidra 的 p-code CALL operand 结构。可以继续用现在的 helper IR：
+
+- `load @REG` 表示 call 点读 register。
+- `@notdec.register.call_input.*(value)` 表示这个 call 可能使用该 register。
+- call 后的 `@notdec.register.call_return.*()` / `@notdec.register.call_effect.*()` 加 `store @REG` 表示返回值或 clobber。
+
+但判定层要从 `strength` 迁到 trial state：
+
+- `trial`：ABI/callee 认为该 storage 可能是参数，IR 中已有 helper use。
+- `active`：SSA value 能追到 call 前明确准备，或者 PHI 的所有有效 incoming 都能解释为准备路径。
+- `inactive`：有候选，但证据不够，例如只来自 function entry input、前一个 call return、或者跨 call 保留下来的 register。
+- `no_use`：能证明不是参数，例如 value 来自明确 clobber/unknown effect，或者 ancestor/use 检查失败。
+- `blocked`：当前分析还不会判断，例如 stack alias、部分寄存器重叠、条件执行 effect。先不改 signature。
+
+这里有两个边界：
+
+- Register SSA 不看 `active/inactive`。它只保证 value/use/def/PHI 正确。
+- Prototype recovery 不直接看 ABI input，也不直接看 `strength`。它最终看 trial state，第一版只消费 `active`。
+
+`strength` 可以暂时保留为 metadata/stat：
+
+- `strong_local_def` / `strong_phi` 先映射成 `active` 的候选证据。
+- `weak_entry_input` / `return_forward` 先映射成 `inactive`。
+- `blocked_call_effect` 先映射成 `no_use` 或 `blocked`，具体看能否证明来源是 call clobber。
+
+这样做比继续扩大 `strength` 更稳。`strength` 是按当前 native 代码的局部来源分类；Ghidra 的 trial/use 是按“这个候选最后能不能成为参数”分类，后者才是 prototype recovery 需要的结果。
+
 ## Braun lazy SSA 参考
 
 参考文档：
@@ -118,8 +163,8 @@ Ghidra 的 call effect 模型不是简单“遇到 call 就断开”，而是把
 扫描 register storage access
   -> 给 call 插入显式 register input helper / output effect helper
   -> Register SSA 统一处理 load/store/call-use/call-effect
-  -> candidate metadata 消费 SSA 结果
-  -> prototype recovery 消费 strong/weak candidate
+  -> trial/use 检查消费 SSA 结果
+  -> prototype recovery 消费 active trial
 ```
 
 关键变化：
@@ -135,6 +180,22 @@ Ghidra 对应点：
   - `guardCalls()` 发现可能 input 时注册 input trial。
   - 创建对应 `Varnode`。
   - `fd->opInsertInput(op, vn, op->numInput())` 把它插成 CALL 的 input。
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.hh:210`
+  - `ParamTrial` 记录一个候选 storage。
+  - 关键状态包括 `active`、`used`、`defnouse`、`killedbycall`、`unref`。
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc:1963`
+  - `ParamActive::registerTrial()` 创建 trial。
+  - register trial 默认 `markKilledByCall()`，意思是跨 call 保留下来的寄存器值通常不适合直接当参数证据。
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc:5585`
+  - `FuncCallSpecs::checkInputTrialUse()` 检查 trial 对应 varnode 的祖先和 use。
+  - 能证明是 call 前有效准备的值，标 `active`。
+  - 明确不是参数的，标 `defnouse` 并把 CALL input 换成常量，释放数据流。
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc:5685`
+  - `FuncCallSpecs::buildInputFromTrials()` 只保留最终 `isUsed()` 的 trial，重建 CALL input 列表。
 - 后续 heritage SSA 把这个 CALL input 当普通 use rename，不需要单独处理跨 block dominance。
 
 native 侧不一定马上改真实 LLVM call signature，但要达到同样语义：
@@ -195,22 +256,22 @@ metadata 只记录解释信息，例如：
 
 helper 不能被当成普通可删的纯函数。不要标 `readnone`、`speculatable` 这类属性；必要时用保守 side-effect 属性，保证优化不会随便删除、合并或移动它。metadata 只能说明来源，不能替代 helper operand，因为 metadata 本身不会形成 SSA use，本地 SSA value 也不能安全塞进全局 metadata。
 
-#### candidate 强弱分类
+#### candidate 强弱分类到 trial state 的过渡
 
-把 call input 作为 SSA use 后，会自然拿到跨 block PHI，也会自然拿到 function entry input。这里不能再用“是否跨 block”当安全边界，应该给 candidate 分级：
+把 call input 作为 SSA use 后，会自然拿到跨 block PHI，也会自然拿到 function entry input。短期仍可保留 candidate `strength`，但它只是 trial state 的输入证据，不是最终结论：
 
 - `strong_local_def`
-  - call 前本函数内明确写入该 register。
+  - call 前本函数内明确写入该 register，可作为 `active` 证据。
 - `strong_phi`
-  - PHI 的 incoming 都能追到本函数内明确写入或其它 strong candidate。
+  - PHI 的 incoming 都能追到本函数内明确写入或其它 strong candidate，可作为 `active` 证据。
 - `weak_entry_input`
-  - 值只来自 function entry external input。可能是真参数转发，也可能只是寄存器仍然活着。
+  - 值只来自 function entry external input。可能是真参数转发，也可能只是寄存器仍然活着，先归 `inactive`。
 - `blocked_call_effect`
-  - 值来自 `unknown_effect` 或 `clobber_unknown`，默认不作为参数 candidate。
+  - 值来自 `unknown_effect` 或 `clobber_unknown`，先归 `no_use` 或 `blocked`。
 - `return_forward`
-  - 值来自前一个 call 的 `kind=return`。是否当参数转发，要单独规则，第一版可以先记 weak 或阻断。
+  - 值来自前一个 call 的 `kind=return`。是否当参数转发，要单独规则，第一版先归 `inactive`。
 
-prototype recovery 第一版只用 strong candidate 推 signature rewrite；weak candidate 可以进审计 metadata，不直接改 signature。
+prototype recovery 第一版只用 `active` trial 推 signature rewrite；`inactive/no_use/blocked` 可以进审计 metadata，不直接改 signature。
 
 这样可以同时满足两点：
 
@@ -297,14 +358,14 @@ notdec.register.call_input_candidate
 - ABI / callee prototype 认为该 callsite 可能读取某个 input register。
 - call 前插入对应 register load，并紧跟 `call_input` helper。
 - Register SSA 把这个 load rename 成 call 点的 current value。
-- rename 后的 value 分类为 strong / weak / blocked。
+- rename 后进入 trial/use 检查；现有 strong / weak / blocked 只作为过渡证据。
 
 短期改造目标：
 
 - 对每个 call，查 ABI input pentries。
 - 对这些 register 在 call 前插入 load + `call_input` helper，load 不能离 helper 太远。
 - 如果 SSA 查询产生 PHI，就让现有 pending PHI / finalize / trivial PHI 逻辑处理。
-- metadata 记录 candidate strength，prototype recovery 只消费 strong candidate。
+- metadata 暂时记录 candidate strength；后续 prototype recovery 应改成消费 `active` trial。
 
 ### 4. 明确 call output candidate
 
@@ -367,11 +428,12 @@ pass-end finalize 不能作为“补洞兜底”。它只应该完成 Braun SSA 
 
 - 典型 `call; mov ..., rax` 不再表现成 unknown clobber，而是 call return。
 
-### 阶段 3：显式化 call input
+### 阶段 3：显式化 call input helper
 
 - 对 ABI input pentry 读取 call 前值。
-- 给 callsite 写 input candidate metadata。
-- prototype recovery 消费这些 callsite candidates。
+- 在 call 前插入 `load @REG` 和紧邻真实 call 的 `@notdec.register.call_input.*` helper。
+- 给 helper 写 input candidate metadata。
+- prototype recovery 暂时仍可消费 strong candidate，但这只是过渡保护，不是最终方案。
 
 判断标准：
 
@@ -384,13 +446,7 @@ pass-end finalize 不能作为“补洞兜底”。它只应该完成 Braun SSA 
 - 删除 `attachCallInputCandidates()` 里只扫同 block 的 current-value 逻辑；如果还有类似“匹配 call 前 store / call 后 load”的补丁逻辑，也随这次重构去掉。
 - candidate helper 只承载 SSA 查询返回的合法 value；不要继续用 `freeze value` 当临时标记。
 - helper 使用 dedicated intrinsic-like declaration，例如 `@notdec.register.call_input.*`。
-- candidate metadata 增加 strength：
-  - `strong_local_def`
-  - `strong_phi`
-  - `weak_entry_input`
-  - `blocked_call_effect`
-  - `return_forward`
-- prototype recovery 第一版只用 strong candidate 推 signature rewrite。
+- candidate metadata 暂时保留 `strength`，但只作为 trial/use 检查的输入证据。
 
 判断标准：
 
@@ -398,6 +454,23 @@ pass-end finalize 不能作为“补洞兜底”。它只应该完成 Braun SSA 
 - 多前驱时由 Register SSA 建 PHI，PHI incoming 仍满足阶段 4 的 verifier 要求。
 - entry input 不会直接导致 declaration / direct call 被误改 signature。
 - `hexx64.so -f 0x1156e0` 的 `llvm-as` / `opt -passes=verify` 继续通过。
+
+### 阶段 3c：引入 Ghidra 风格 trial state
+
+- 为每个 call input helper 创建 trial 记录，字段至少包括 callsite、register、slot、SSA value、effect 来源、当前 state。
+- 第一版 state 使用 `trial / active / inactive / no_use / blocked`。
+- `strength` 只作为迁移期输入：
+  - `strong_local_def` / `strong_phi` 倾向 `active`。
+  - `weak_entry_input` / `return_forward` 倾向 `inactive`。
+  - `blocked_call_effect` 倾向 `no_use` 或 `blocked`。
+- 增加 trial-use 检查，不再让 prototype recovery 直接按 `strength` 改 signature。
+- prototype recovery 改成只消费 `active` trial。
+
+判断标准：
+
+- 当前 summary 同时输出 trial state 统计和旧 `strength` 统计，方便对照。
+- `active` 数量应小于等于现有 strong 数量，不应突然把 weak entry input 改成真实参数。
+- Ghidra/Java 链路已经完全消除寄存器访问的函数，可以作为对照样本，比较 callsite active input。
 
 ### 阶段 4：补完整 lazy SSA finalize
 
@@ -1754,11 +1827,11 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 复杂度：6/10。新增 strength 分类和 helper skip，理解成本比旧 metadata 补丁高，但比并行 Fact 表更贴近 IR。
 - 维护成本：6/10。后续要继续收敛 strength 规则，尤其是 PHI 混合来源、return forward 是否可消费。
 
-性能上有明显回退。主要原因是现在每个 ABI input register 都显式插 helper，不再只保留同 block strong candidate。语义方向是对的，但后续需要优化：
+性能上有明显回退。主要原因是现在每个 ABI input register 都显式插 helper，不再只保留同 block strong candidate。语义方向是对的，后续优化不能把 call use 重新藏回审计数据里：
 
-- 对明显不会被消费的 weak / blocked candidate，是否只保留审计 metadata，或者延后 materialize helper。
+- 先引入 trial state，把 weak / blocked 显式判成 `inactive/no_use/blocked`，让 prototype recovery 不消费。
 - 缓存 helper declaration 和常用 metadata，减少字符串和 IR 节点构造成本。
-- prototype recovery 当前只消费 strong candidate，避免了全量 ABI input 误改 signature。
+- prototype recovery 当前只消费 strong candidate；迁移后应只消费 `active` trial，避免全量 ABI input 误改 signature。
 
 ## 2026-06-13 实现记录：call input helper 统计接入 summary
 
@@ -1828,7 +1901,7 @@ cmake --build /tmp/notdec-bin2llvm-build \
 
 ### 判断
 
-这一步没有改变 IR 策略，只是让性能排查有稳定计数。当前最明显的问题仍是 `weak + blocked = 3689` 个 candidate 被 materialize 成 helper，但 prototype recovery 不消费它们。下一步应该试一个开关或策略：只 materialize strong candidate，weak/blocked 先只保留在审计统计里，再比较 IR 验证、signature rewrite 和 `hexx64.so` 时间。
+这一步没有改变 IR 策略，只是让性能排查有稳定计数。当前最明显的问题仍是 `weak + blocked = 3689` 个 candidate 已经显式进入 IR，但 prototype recovery 不消费它们。下一步不应改回“只 materialize strong candidate”；应该先加 Ghidra 风格 trial state，把这些 helper 判成 `inactive/no_use/blocked`，再看是否有纯性能层面的缓存或批量构造优化。
 
 ## 2026-06-13 实现记录：call input strength 语义测试
 
