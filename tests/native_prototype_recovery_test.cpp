@@ -1208,6 +1208,42 @@ llvm::Function *createInputStoreCallerFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createCallInputHelperCallerFunction(
+    llvm::Module &module, const std::string &name, llvm::Function *callee,
+    const std::string &registerName, const std::string &trialState,
+    llvm::CallInst **callOut) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *i64 = llvm::Type::getInt64Ty(context);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage, name,
+                             module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *helperType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {i64}, false);
+  llvm::FunctionCallee helper =
+      module.getOrInsertFunction("notdec.register.call_input.i64", helperType);
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "callsite_id=" + name),
+      llvm::MDString::get(context, "slot=0"),
+      llvm::MDString::get(context, "register=" + registerName),
+      llvm::MDString::get(context, "strength=strong_local_def"),
+      llvm::MDString::get(context, "trial_state=" + trialState),
+  };
+  llvm::MDNode *candidateMetadata = llvm::MDNode::get(context, fields);
+  llvm::CallInst *candidate = builder.CreateCall(
+      helper, {llvm::ConstantInt::get(i64, 0x4567)});
+  candidate->setMetadata("notdec.register.call_input_candidate",
+                         candidateMetadata);
+  llvm::CallInst *call = builder.CreateCall(callee->getFunctionType(), callee);
+  call->setMetadata("notdec.register.call_input_candidates",
+                    llvm::MDNode::get(context, {candidateMetadata}));
+  builder.CreateRetVoid();
+  *callOut = call;
+  return function;
+}
+
 llvm::Function *createInputStoreUniquePredecessorCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     llvm::GlobalVariable *input, const std::string &registerName,
@@ -7017,6 +7053,75 @@ int main() {
                "declaration call input rewrite kept old register store");
   if (llvm::verifyModule(declarationCallInputRewriteModule, &llvm::errs())) {
     std::cerr << "declaration call input rewrite module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputHelperModule(
+      "native-prototype-declaration-call-input-helper-test", context);
+  attachTestAbi(declarationCallInputHelperModule);
+  auto *declarationCallInputHelperCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputHelperCallee =
+      llvm::Function::Create(declarationCallInputHelperCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_helper_callee",
+                             declarationCallInputHelperModule);
+  llvm::CallInst *declarationCallInputHelperOldCall = nullptr;
+  createCallInputHelperCallerFunction(
+      declarationCallInputHelperModule, "declaration_call_input_helper_user",
+      declarationCallInputHelperCallee, "RDI", "active",
+      &declarationCallInputHelperOldCall);
+  notdec::bin2llvm::NativePrototypeRecoveryOptions helperInputOptions;
+  helperInputOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputHelperModule, helperInputOptions);
+  llvm::Function *helperInputCalleeAfterRewrite =
+      declarationCallInputHelperModule.getFunction(
+          "declaration_call_input_helper_callee");
+  ok &= expect(helperInputCalleeAfterRewrite != nullptr &&
+                   functionTypeShape(
+                       *helperInputCalleeAfterRewrite->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef<llvm::Type *>{i64Param}),
+               "active call input helper did not rewrite declaration input");
+  if (llvm::verifyModule(declarationCallInputHelperModule, &llvm::errs())) {
+    std::cerr << "declaration call input helper module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputInactiveHelperModule(
+      "native-prototype-declaration-call-input-inactive-helper-test", context);
+  attachTestAbi(declarationCallInputInactiveHelperModule);
+  auto *declarationCallInputInactiveHelperCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputInactiveHelperCallee =
+      llvm::Function::Create(declarationCallInputInactiveHelperCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_inactive_helper_callee",
+                             declarationCallInputInactiveHelperModule);
+  llvm::CallInst *declarationCallInputInactiveHelperOldCall = nullptr;
+  createCallInputHelperCallerFunction(
+      declarationCallInputInactiveHelperModule,
+      "declaration_call_input_inactive_helper_user",
+      declarationCallInputInactiveHelperCallee, "RDI", "inactive",
+      &declarationCallInputInactiveHelperOldCall);
+  notdec::bin2llvm::NativePrototypeRecoveryOptions inactiveHelperInputOptions;
+  inactiveHelperInputOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputInactiveHelperModule, inactiveHelperInputOptions);
+  llvm::Function *inactiveHelperInputCalleeAfterRewrite =
+      declarationCallInputInactiveHelperModule.getFunction(
+          "declaration_call_input_inactive_helper_callee");
+  ok &= expect(inactiveHelperInputCalleeAfterRewrite != nullptr &&
+                   functionTypeShape(
+                       *inactiveHelperInputCalleeAfterRewrite->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef<llvm::Type *>{}),
+               "inactive call input helper rewrote declaration input");
+  if (llvm::verifyModule(declarationCallInputInactiveHelperModule,
+                         &llvm::errs())) {
+    std::cerr
+        << "declaration call input inactive helper module verification failed\n";
     return EXIT_FAILURE;
   }
 

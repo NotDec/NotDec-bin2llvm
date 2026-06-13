@@ -1996,10 +1996,19 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - `lib/passes/NativePrototypeRecovery.cpp:927`
   - `declarationInputParamForCandidate()` 优先读取 `trial_state`。
   - 有 `trial_state` 时只接受 `active`；没有该字段时兼容旧 `strength=strong_local_def|strong_phi`。
+- `lib/passes/NativePrototypeRecovery.cpp:1556`
+  - `callInputCandidateValueBeforeCall()` 先检查当前 instruction 的 `notdec.register.call_input_candidate` metadata，再按普通 call barrier 处理。
+  - 修复之前把 `notdec.register.call_input.*` helper call 提前跳过的问题，让 helper operand 能真正作为 declaration call rewrite 的参数值。
 - `tests/native_register_effects_test.cpp:1533`
   - 增加 active/inactive/no-use summary 断言。
 - `tests/native_register_effects_test.cpp:1569`
   - 增加 `trial_state=active/inactive/no_use` metadata 断言，覆盖 local def、entry input、call effect、PHI、return forward。
+- `tests/native_prototype_recovery_test.cpp:1211`
+  - 新增 `createCallInputHelperCallerFunction()`，构造只有 call input helper、没有 register store fallback 的 declaration call input 测试。
+- `tests/native_prototype_recovery_test.cpp:7059`
+  - 新增 active helper 正例：`trial_state=active` 时 declaration callee 被改成 `void(i64)`。
+- `tests/native_prototype_recovery_test.cpp:7092`
+  - 新增 inactive helper 负例：即使 metadata 里仍有 `strength=strong_local_def`，`trial_state=inactive` 也不能触发 signature rewrite。
 
 ### 验证
 
@@ -2010,28 +2019,28 @@ cmake --build /tmp/notdec-bin2llvm-build \
 /tmp/notdec-bin2llvm-build/bin/native_register_effects_test
 /tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
 
-/usr/bin/time -f 'TIME native-llvm-call-input-trial-state %e' \
+/usr/bin/time -f 'TIME native-llvm-call-input-trial-helper %e' \
   /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
   /sn640/NotDec-Exp/Bench2/hexx64.so \
   -f 0x1156e0 \
   --register-ssa-summary \
-  -o /tmp/hexx64-1156e0-call-input-trial-state.ll \
-  > /tmp/hexx64-1156e0-call-input-trial-state.log 2>&1
+  -o /tmp/hexx64-1156e0-call-input-trial-helper.ll \
+  > /tmp/hexx64-1156e0-call-input-trial-helper.log 2>&1
 
 /sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
-  /tmp/hexx64-1156e0-call-input-trial-state.ll \
-  -o /tmp/hexx64-1156e0-call-input-trial-state.bc
+  /tmp/hexx64-1156e0-call-input-trial-helper.ll \
+  -o /tmp/hexx64-1156e0-call-input-trial-helper.bc
 
 /sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
-  /tmp/hexx64-1156e0-call-input-trial-state.bc \
-  -o /tmp/hexx64-1156e0-call-input-trial-state.verified.bc
+  /tmp/hexx64-1156e0-call-input-trial-helper.bc \
+  -o /tmp/hexx64-1156e0-call-input-trial-helper.verified.bc
 ```
 
 结果：
 
 - 两个单测通过。
 - `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
-- 本次时间：`71.02s`。
+- 本次时间：`73.11s`。
 - summary 输出：
   - `call input helpers: 4374`
   - `call return helpers: 929`

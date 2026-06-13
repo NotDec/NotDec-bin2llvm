@@ -1563,6 +1563,23 @@ std::optional<llvm::Value *> callInputCandidateValueBeforeCall(
     if (inst == nullptr) {
       continue;
     }
+    llvm::MDNode *metadata =
+        inst->getMetadata("notdec.register.call_input_candidate");
+    if (metadata != nullptr &&
+        metadataField(*metadata, "register") == input.RegisterName) {
+      llvm::Value *value = inst;
+      if (auto *candidateCall = llvm::dyn_cast<llvm::CallBase>(inst)) {
+        if (isNotDecRegisterHelperCall(*candidateCall) &&
+            candidateCall->arg_size() == 1) {
+          value = candidateCall->getArgOperand(0);
+        }
+      }
+      if (value->getType() != paramType) {
+        return std::nullopt;
+      }
+      return value;
+    }
+
     if (auto *previousCall = llvm::dyn_cast<llvm::CallBase>(inst)) {
       if (isNotDecRegisterHelperCall(*previousCall)) {
         continue;
@@ -1573,24 +1590,6 @@ std::optional<llvm::Value *> callInputCandidateValueBeforeCall(
       }
       continue;
     }
-
-    llvm::MDNode *metadata =
-        inst->getMetadata("notdec.register.call_input_candidate");
-    if (metadata == nullptr ||
-        metadataField(*metadata, "register") != input.RegisterName) {
-      continue;
-    }
-    llvm::Value *value = inst;
-    if (auto *candidateCall = llvm::dyn_cast<llvm::CallBase>(inst)) {
-      if (isNotDecRegisterHelperCall(*candidateCall) &&
-          candidateCall->arg_size() == 1) {
-        value = candidateCall->getArgOperand(0);
-      }
-    }
-    if (value->getType() != paramType) {
-      return std::nullopt;
-    }
-    return value;
   }
   return std::nullopt;
 }
