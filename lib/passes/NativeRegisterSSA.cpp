@@ -1207,105 +1207,116 @@ private:
 
   CallInputTrialInfo callInputTrialInfo(
       llvm::Value *value, std::set<llvm::Value *> &visiting) {
-    std::string strength = callInputStrength(value, visiting);
-    return CallInputTrialInfo{strength, callInputTrialState(strength),
-                              callInputTrialReason(strength)};
-  }
-
-  std::string callInputStrength(llvm::Value *value,
-                                std::set<llvm::Value *> &visiting) {
     value = resolveValue(value);
     if (value == nullptr || !visiting.insert(value).second) {
-      return "weak_entry_input";
+      return CallInputTrialInfo{"weak_entry_input", "inactive",
+                                "entry_input"};
     }
     if (llvm::isa<llvm::Constant>(value)) {
-      return "strong_local_def";
+      return CallInputTrialInfo{"strong_local_def", "active", "local_const"};
     }
     if (llvm::isa<llvm::Argument>(value)) {
-      return "weak_entry_input";
+      return CallInputTrialInfo{"weak_entry_input", "inactive",
+                                "entry_input"};
     }
     if (auto *load = llvm::dyn_cast<llvm::LoadInst>(value)) {
       if (load->getMetadata("notdec.register.external_input") != nullptr) {
-        return "weak_entry_input";
+        return CallInputTrialInfo{"weak_entry_input", "inactive",
+                                  "entry_input"};
       }
-      return "weak_entry_input";
+      return CallInputTrialInfo{"weak_entry_input", "inactive", "local_load"};
     }
     if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
-      return phiInputStrength(*phi, visiting);
+      return phiInputTrialInfo(*phi, visiting);
     }
     if (auto *inst = llvm::dyn_cast<llvm::Instruction>(value)) {
       if (llvm::MDNode *effect =
               inst->getMetadata("notdec.register.call_effect")) {
         std::optional<std::string> kind = mdField(effect, "kind");
         if (kind == std::optional<std::string>("return")) {
-          return "return_forward";
+          return CallInputTrialInfo{"return_forward", "inactive",
+                                    "return_forward"};
         }
-        return "blocked_call_effect";
+        return CallInputTrialInfo{"blocked_call_effect", "no_use",
+                                  "call_effect"};
       }
       if (inst->getFunction() == &Function) {
-        return "strong_local_def";
+        if (isSafeCallInputArithmetic(*inst)) {
+          return CallInputTrialInfo{"strong_local_def", "active",
+                                    "local_arith"};
+        }
+        if (isSafeCallInputCastOrAddress(*inst)) {
+          return CallInputTrialInfo{"strong_local_def", "active",
+                                    "local_cast"};
+        }
+        return CallInputTrialInfo{"weak_entry_input", "inactive",
+                                  "local_unknown_inst"};
       }
     }
-    return "weak_entry_input";
+    return CallInputTrialInfo{"weak_entry_input", "inactive", "entry_input"};
   }
 
-  std::string callInputTrialState(llvm::StringRef strength) const {
-    if (strength == "strong_local_def" || strength == "strong_phi") {
-      return "active";
+  bool isSafeCallInputArithmetic(const llvm::Instruction &inst) const {
+    switch (inst.getOpcode()) {
+    case llvm::Instruction::Add:
+    case llvm::Instruction::Sub:
+    case llvm::Instruction::Mul:
+    case llvm::Instruction::Shl:
+    case llvm::Instruction::LShr:
+    case llvm::Instruction::AShr:
+    case llvm::Instruction::And:
+    case llvm::Instruction::Or:
+    case llvm::Instruction::Xor:
+      return true;
+    default:
+      return false;
     }
-    if (strength == "blocked_call_effect") {
-      return "no_use";
-    }
-    if (strength == "return_forward") {
-      return "inactive";
-    }
-    return "inactive";
   }
 
-  std::string callInputTrialReason(llvm::StringRef strength) const {
-    if (strength == "strong_local_def") {
-      return "local_def";
-    }
-    if (strength == "strong_phi") {
-      return "phi";
-    }
-    if (strength == "blocked_call_effect") {
-      return "call_effect";
-    }
-    if (strength == "return_forward") {
-      return "return_forward";
-    }
-    return "entry_input";
+  bool isSafeCallInputCastOrAddress(const llvm::Instruction &inst) const {
+    return llvm::isa<llvm::CastInst>(inst) ||
+           llvm::isa<llvm::GetElementPtrInst>(inst) ||
+           llvm::isa<llvm::ExtractValueInst>(inst) ||
+           llvm::isa<llvm::InsertValueInst>(inst);
   }
 
-  std::string phiInputStrength(llvm::PHINode &phi,
-                               std::set<llvm::Value *> &visiting) {
-    bool sawWeak = false;
+  CallInputTrialInfo phiInputTrialInfo(
+      llvm::PHINode &phi, std::set<llvm::Value *> &visiting) {
+    bool sawInactive = false;
     bool sawReturn = false;
     bool sawStrong = false;
+    std::string inactiveReason = "entry_input";
     for (llvm::Value *incoming : phi.incoming_values()) {
       if (incoming == &phi) {
         continue;
       }
-      std::string strength = callInputStrength(incoming, visiting);
-      if (strength == "blocked_call_effect") {
-        return strength;
+      CallInputTrialInfo trial = callInputTrialInfo(incoming, visiting);
+      if (trial.State == "no_use") {
+        return trial;
       }
-      if (strength == "weak_entry_input") {
-        sawWeak = true;
-      } else if (strength == "return_forward") {
-        sawReturn = true;
+      if (trial.State == "inactive") {
+        sawInactive = true;
+        if (trial.Reason == "return_forward") {
+          sawReturn = true;
+        } else if (inactiveReason == "entry_input") {
+          inactiveReason = trial.Reason;
+        }
       } else {
         sawStrong = true;
       }
     }
-    if (sawWeak) {
-      return "weak_entry_input";
+    if (sawInactive) {
+      if (sawReturn) {
+        return CallInputTrialInfo{"return_forward", "inactive",
+                                  "return_forward"};
+      }
+      return CallInputTrialInfo{"weak_entry_input", "inactive",
+                                inactiveReason};
     }
-    if (sawReturn) {
-      return "return_forward";
+    if (sawStrong) {
+      return CallInputTrialInfo{"strong_phi", "active", "phi"};
     }
-    return sawStrong ? "strong_phi" : "weak_entry_input";
+    return CallInputTrialInfo{"weak_entry_input", "inactive", "entry_input"};
   }
 
   void countCallInputStrength(llvm::StringRef strength) {
@@ -1339,6 +1350,26 @@ private:
   void countCallInputTrialReason(llvm::StringRef reason) {
     if (reason == "local_def") {
       ++Summary.LocalDefCallInputTrials;
+      return;
+    }
+    if (reason == "local_const") {
+      ++Summary.LocalConstCallInputTrials;
+      return;
+    }
+    if (reason == "local_arith") {
+      ++Summary.LocalArithCallInputTrials;
+      return;
+    }
+    if (reason == "local_cast") {
+      ++Summary.LocalCastCallInputTrials;
+      return;
+    }
+    if (reason == "local_load") {
+      ++Summary.LocalLoadCallInputTrials;
+      return;
+    }
+    if (reason == "local_unknown_inst") {
+      ++Summary.LocalUnknownCallInputTrials;
       return;
     }
     if (reason == "phi") {
@@ -1990,6 +2021,11 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.NoUseCallInputTrials += function.NoUseCallInputTrials;
   total.BlockedCallInputTrials += function.BlockedCallInputTrials;
   total.LocalDefCallInputTrials += function.LocalDefCallInputTrials;
+  total.LocalConstCallInputTrials += function.LocalConstCallInputTrials;
+  total.LocalArithCallInputTrials += function.LocalArithCallInputTrials;
+  total.LocalCastCallInputTrials += function.LocalCastCallInputTrials;
+  total.LocalLoadCallInputTrials += function.LocalLoadCallInputTrials;
+  total.LocalUnknownCallInputTrials += function.LocalUnknownCallInputTrials;
   total.PhiCallInputTrials += function.PhiCallInputTrials;
   total.EntryInputCallInputTrials += function.EntryInputCallInputTrials;
   total.CallEffectCallInputTrials += function.CallEffectCallInputTrials;
@@ -2107,6 +2143,16 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
      << '\n';
   os << "  call input trial reasons local def: "
      << summary.LocalDefCallInputTrials << '\n';
+  os << "  call input trial reasons local const: "
+     << summary.LocalConstCallInputTrials << '\n';
+  os << "  call input trial reasons local arith: "
+     << summary.LocalArithCallInputTrials << '\n';
+  os << "  call input trial reasons local cast: "
+     << summary.LocalCastCallInputTrials << '\n';
+  os << "  call input trial reasons local load: "
+     << summary.LocalLoadCallInputTrials << '\n';
+  os << "  call input trial reasons local unknown inst: "
+     << summary.LocalUnknownCallInputTrials << '\n';
   os << "  call input trial reasons phi: " << summary.PhiCallInputTrials
      << '\n';
   os << "  call input trial reasons entry input: "
@@ -2138,6 +2184,16 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
        << " call_input_trials_blocked=" << function.BlockedCallInputTrials
        << " call_input_trial_reasons_local_def="
        << function.LocalDefCallInputTrials
+       << " call_input_trial_reasons_local_const="
+       << function.LocalConstCallInputTrials
+       << " call_input_trial_reasons_local_arith="
+       << function.LocalArithCallInputTrials
+       << " call_input_trial_reasons_local_cast="
+       << function.LocalCastCallInputTrials
+       << " call_input_trial_reasons_local_load="
+       << function.LocalLoadCallInputTrials
+       << " call_input_trial_reasons_local_unknown_inst="
+       << function.LocalUnknownCallInputTrials
        << " call_input_trial_reasons_phi=" << function.PhiCallInputTrials
        << " call_input_trial_reasons_entry_input="
        << function.EntryInputCallInputTrials

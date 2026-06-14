@@ -217,6 +217,112 @@ llvm::Function *createCallInputCandidateFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createArithmeticCallInputFunction(llvm::Module &module,
+                                                  llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "arith_call_input_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "arith_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RDI");
+  llvm::AllocaInst *slot = builder.CreateAlloca(rdi->getValueType());
+  builder.CreateStore(llvm::ConstantInt::get(rdi->getValueType(), 1), slot);
+  llvm::Value *base = builder.CreateLoad(rdi->getValueType(), slot);
+  llvm::Value *value =
+      builder.CreateAdd(base, llvm::ConstantInt::get(rdi->getValueType(), 2));
+  llvm::StoreInst *store = builder.CreateStore(value, rdi);
+  store->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createCastCallInputFunction(llvm::Module &module,
+                                            llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "cast_call_input_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "cast_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RDI");
+  llvm::AllocaInst *slot = builder.CreateAlloca(llvm::Type::getInt32Ty(context));
+  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),
+                                             0x1234),
+                      slot);
+  llvm::Value *small = builder.CreateLoad(llvm::Type::getInt32Ty(context), slot);
+  llvm::Value *value = builder.CreateZExt(small, rdi->getValueType());
+  llvm::StoreInst *store = builder.CreateStore(value, rdi);
+  store->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createLocalLoadCallInputFunction(llvm::Module &module,
+                                                 llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "local_load_call_input_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "local_load_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RDI");
+  llvm::AllocaInst *slot = builder.CreateAlloca(rdi->getValueType());
+  builder.CreateStore(llvm::ConstantInt::get(rdi->getValueType(), 7), slot);
+  llvm::Value *value = builder.CreateLoad(rdi->getValueType(), slot);
+  llvm::StoreInst *store = builder.CreateStore(value, rdi);
+  store->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
+llvm::Function *createUnknownInstCallInputFunction(llvm::Module &module,
+                                                   llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_inst_call_input_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_inst_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RDI");
+  llvm::AllocaInst *conditionSlot =
+      builder.CreateAlloca(llvm::Type::getInt1Ty(context));
+  builder.CreateStore(llvm::ConstantInt::getFalse(context), conditionSlot);
+  llvm::Value *condition =
+      builder.CreateLoad(llvm::Type::getInt1Ty(context), conditionSlot);
+  llvm::Value *value = builder.CreateSelect(
+      condition, llvm::ConstantInt::get(rdi->getValueType(), 1),
+      llvm::ConstantInt::get(rdi->getValueType(), 2));
+  llvm::StoreInst *store = builder.CreateStore(value, rdi);
+  store->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createWeakCallInputFunction(llvm::Module &module,
                                             llvm::GlobalVariable *rdi) {
   llvm::LLVMContext &context = module.getContext();
@@ -1442,6 +1548,13 @@ int main() {
   llvm::Function *callEffects = createCallEffectFunction(module, rbx, rax);
   llvm::Function *callInputCandidate =
       createCallInputCandidateFunction(module, rdi);
+  llvm::Function *arithCallInput =
+      createArithmeticCallInputFunction(module, rdi);
+  llvm::Function *castCallInput = createCastCallInputFunction(module, rdi);
+  llvm::Function *localLoadCallInput =
+      createLocalLoadCallInputFunction(module, rdi);
+  llvm::Function *unknownInstCallInput =
+      createUnknownInstCallInputFunction(module, rdi);
   llvm::Function *weakCallInput = createWeakCallInputFunction(module, rdi);
   llvm::Function *blockedCallInput = createBlockedCallInputFunction(module, rdi);
   llvm::Function *strongPhiCallInput =
@@ -1536,8 +1649,16 @@ int main() {
                "register SSA summary missed inactive call input trials");
   ok &= expect(summary.NoUseCallInputTrials >= 1,
                "register SSA summary missed no-use call input trials");
-  ok &= expect(summary.LocalDefCallInputTrials >= 1,
-               "register SSA summary missed local-def call input trials");
+  ok &= expect(summary.LocalConstCallInputTrials >= 1,
+               "register SSA summary missed local-const call input trials");
+  ok &= expect(summary.LocalArithCallInputTrials >= 1,
+               "register SSA summary missed local-arith call input trials");
+  ok &= expect(summary.LocalCastCallInputTrials >= 1,
+               "register SSA summary missed local-cast call input trials");
+  ok &= expect(summary.LocalLoadCallInputTrials >= 1,
+               "register SSA summary missed local-load call input trials");
+  ok &= expect(summary.LocalUnknownCallInputTrials >= 1,
+               "register SSA summary missed local-unknown call input trials");
   ok &= expect(summary.PhiCallInputTrials >= 1,
                "register SSA summary missed phi call input trials");
   ok &= expect(summary.EntryInputCallInputTrials >= 1,
@@ -1578,8 +1699,32 @@ int main() {
                                           "trial_state=active"),
                "RDI call input candidate was not marked active");
   ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
-                                          "trial_reason=local_def"),
-               "RDI call input candidate did not record local_def reason");
+                                          "trial_reason=local_const"),
+               "RDI call input candidate did not record local_const reason");
+  ok &= expect(callInputCandidateHasField(*arithCallInput, "RDI",
+                                          "trial_state=active"),
+               "RDI arithmetic call input was not active");
+  ok &= expect(callInputCandidateHasField(*arithCallInput, "RDI",
+                                          "trial_reason=local_arith"),
+               "RDI arithmetic call input did not record local_arith reason");
+  ok &= expect(callInputCandidateHasField(*castCallInput, "RDI",
+                                          "trial_state=active"),
+               "RDI cast call input was not active");
+  ok &= expect(callInputCandidateHasField(*castCallInput, "RDI",
+                                          "trial_reason=local_cast"),
+               "RDI cast call input did not record local_cast reason");
+  ok &= expect(callInputCandidateHasField(*localLoadCallInput, "RDI",
+                                          "trial_state=inactive"),
+               "RDI local-load call input was not inactive");
+  ok &= expect(callInputCandidateHasField(*localLoadCallInput, "RDI",
+                                          "trial_reason=local_load"),
+               "RDI local-load call input did not record local_load reason");
+  ok &= expect(callInputCandidateHasField(*unknownInstCallInput, "RDI",
+                                          "trial_state=inactive"),
+               "RDI unknown instruction call input was not inactive");
+  ok &= expect(callInputCandidateHasField(*unknownInstCallInput, "RDI",
+                                          "trial_reason=local_unknown_inst"),
+               "RDI unknown instruction call input reason was missing");
   ok &= expect(callInputCandidateHasField(*weakCallInput, "RDI",
                                           "strength=weak_entry_input"),
                "RDI entry-derived call input was not marked weak");

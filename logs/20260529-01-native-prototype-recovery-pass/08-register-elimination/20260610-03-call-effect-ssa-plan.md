@@ -2320,3 +2320,107 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：5/10。active 判断入口收口了，但实际规则仍是当前 trial_state/strength 兼容逻辑。
 - 复杂度：2/10。只是函数抽取和一个兼容测试。
 - 维护成本：2/10。后续切换真实 trial-use 规则时只改 `callInputCandidateIsActive()` 的调用链上游或 metadata 来源。
+
+## 2026-06-14 实现记录：ancestorRealisticLite
+
+本次开始替换“本函数内任意 instruction 都算 active”的宽松规则，先做一个 native 版轻量 ancestor 检查。它还不是完整 Ghidra `ancestorReal / ancestorOpUse`，但已经把本地来源分成几类，并只让确定安全的来源保持 active。
+
+当前规则：
+
+- `Constant` -> `active` / `local_const`
+- 简单整数运算 `add/sub/mul/shl/lshr/ashr/and/or/xor` -> `active` / `local_arith`
+- cast / GEP / aggregate insert/extract -> `active` / `local_cast`
+- PHI 的 incoming 全部 active -> `active` / `phi`
+- 普通 local load -> `inactive` / `local_load`
+- 其它本地 instruction -> `inactive` / `local_unknown_inst`
+- function argument / external input -> `inactive` / `entry_input`
+- previous call return -> `inactive` / `return_forward`
+- call clobber / unknown effect -> `no_use` / `call_effect`
+
+### 改动
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:44`
+  - summary 增加细分 reason：
+    - `LocalConstCallInputTrials`
+    - `LocalArithCallInputTrials`
+    - `LocalCastCallInputTrials`
+    - `LocalLoadCallInputTrials`
+    - `LocalUnknownCallInputTrials`
+- `lib/passes/NativeRegisterSSA.cpp:1208`
+  - `callInputTrialInfo()` 改成直接生成 `Strength/State/Reason`，不再通过旧 strength 映射。
+- `lib/passes/NativeRegisterSSA.cpp:1259`
+  - 新增 `isSafeCallInputArithmetic()`。
+- `lib/passes/NativeRegisterSSA.cpp:1276`
+  - 新增 `isSafeCallInputCastOrAddress()`。
+- `lib/passes/NativeRegisterSSA.cpp:1283`
+  - 新增 `phiInputTrialInfo()`，递归合并 incoming 的 trial state。
+- `lib/passes/NativeRegisterSSA.cpp:1350`
+  - `countCallInputTrialReason()` 增加细分 reason 计数。
+- `lib/passes/NativeRegisterSSA.cpp:2117`
+  - `addFunctionSummary()` 汇总新增 reason 字段。
+- `lib/passes/NativeRegisterSSA.cpp:2239`
+  - `printNativeRegisterSSASummary()` 打印新增 reason 字段。
+- `tests/native_register_effects_test.cpp:220`
+  - 新增 arithmetic call input 用例，期望 `active/local_arith`。
+- `tests/native_register_effects_test.cpp:246`
+  - 新增 cast call input 用例，期望 `active/local_cast`。
+- `tests/native_register_effects_test.cpp:273`
+  - 新增 local load call input 用例，期望 `inactive/local_load`。
+- `tests/native_register_effects_test.cpp:297`
+  - 新增 unknown instruction call input 用例，期望 `inactive/local_unknown_inst`。
+- `tests/native_register_effects_test.cpp:1648`
+  - summary 增加 local const/arith/cast/load/unknown reason 断言。
+- `tests/native_register_effects_test.cpp:1701`
+  - metadata 断言从 `local_def` 调整为 `local_const`，并覆盖新增四类 reason。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-ancestor-lite %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-ancestor-lite.ll \
+  > /tmp/hexx64-1156e0-ancestor-lite.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-ancestor-lite.ll \
+  -o /tmp/hexx64-1156e0-ancestor-lite.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-ancestor-lite.bc \
+  -o /tmp/hexx64-1156e0-ancestor-lite.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.18s`。
+- summary 输出：
+  - `call input trials active: 685`
+  - `call input trials inactive: 1199`
+  - `call input trials no use: 2490`
+  - `call input trial reasons local def: 0`
+  - `call input trial reasons local const: 246`
+  - `call input trial reasons local arith: 336`
+  - `call input trial reasons local cast: 83`
+  - `call input trial reasons local load: 710`
+  - `call input trial reasons local unknown inst: 0`
+  - `call input trial reasons phi: 20`
+  - `call input trial reasons entry input: 4`
+  - `call input trial reasons call effect: 2490`
+  - `call input trial reasons return forward: 485`
+
+### 判断
+
+- 实现效果：7/10。已经不再把所有本地 instruction 都当 active；local load 被明确降成 inactive。active 总数暂时没变，因为 Bench2 当前 active 正好都落在 const/arith/cast/phi。
+- 复杂度：5/10。新增一层递归分类和多个 reason 计数，但仍局限在 RegisterSSA。
+- 维护成本：5/10。opcode 白名单需要后续随 Ghidra oracle 对比继续调整；完整 `ancestorOpUse` 还没做。
