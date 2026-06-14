@@ -1421,7 +1421,9 @@ private:
   }
 
   bool isTransparentCallInputDescendant(const llvm::Instruction &inst) const {
-    return llvm::isa<llvm::CastInst>(inst) || llvm::isa<llvm::PHINode>(inst);
+    return llvm::isa<llvm::CastInst>(inst) || llvm::isa<llvm::PHINode>(inst) ||
+           llvm::isa<llvm::ExtractValueInst>(inst) ||
+           llvm::isa<llvm::InsertValueInst>(inst);
   }
 
   bool isSameCallsiteInputHelper(llvm::Instruction &user,

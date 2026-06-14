@@ -3207,3 +3207,70 @@ cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm -j2
 - 实现效果：6/10。RegisterSSA 已经产出最终态，conditional active 不再漏给 PrototypeRecovery；但 final check 还不是完整 Ghidra ancestor 复查。
 - 复杂度：2/10。只是在 trial metadata 写出前加一次状态收口和 summary 统计。
 - 维护成本：3/10。后续实现完整 `AncestorRealistic(... allowFail=false)` 时，可以替换 `applyConditionalCallInputFinalCheck()` 内部规则，不需要改 metadata 格式。
+
+## 2026-06-14 实现记录：aggregate piece 透明 use
+
+本次继续补阶段 3e 的 descendant only-use 递归。Ghidra `onlyOpUse()` 会把 `CPUI_PIECE` / `CPUI_SUBPIECE` 当成可继续追的派生 use，并用 flag 记录截断/拼接路径。LLVM 侧先做保守对应：`insertvalue` / `extractvalue` 只要最终仍然只服务当前 call input helper，就不算普通 shared use。
+
+这一步不放宽普通算术、load/store、return 或真实 call use，也不处理寄存器宽度 overlap。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:1423`
+  - `isTransparentCallInputDescendant()` 增加 `ExtractValueInst` / `InsertValueInst`。
+  - 这样 aggregate 派生链会继续递归检查 use，而不是直接判 `local_shared_use`。
+
+- `tests/native_register_effects_test.cpp:300`
+  - 新增 `createAggregateTransparentUseCallInputFunction()`。
+  - 构造 `RDI` prepared value，同时经过 `insertvalue` / `extractvalue` 派生 use。
+
+- `tests/native_register_effects_test.cpp:1708`
+  - main 中加入 aggregate transparent use 测试函数。
+
+- `tests/native_register_effects_test.cpp:1909`
+  - 断言该 call input 仍是 `trial_state=active`，reason 仍是 `local_arith`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-aggregate-use %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-aggregate-use.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-aggregate-use.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-aggregate-use.ll \
+  -o /tmp/hexx64-1156e0-aggregate-use.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-aggregate-use.bc \
+  -o /tmp/hexx64-1156e0-aggregate-use.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`70.98s`。
+- hexx64 summary 和上一轮一致：
+  - `call input trials active: 455`
+  - `call input trials inactive: 1425`
+  - `call input trials no use: 2494`
+  - `call input trial reasons local shared use: 231`
+  - `call input trial reasons local double call use: 152`
+
+### 判断
+
+- 实现效果：5/10。补上了 Ghidra `PIECE/SUBPIECE` 在 LLVM aggregate IR 上的一个明确对应点。
+- 复杂度：1/10。只扩展透明 descendant opcode 集合。
+- 维护成本：3/10。后续处理真正的 sub-register overlap 时，不能只靠 `extractvalue`，还要结合 register storage range。

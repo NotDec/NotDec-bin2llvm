@@ -297,6 +297,39 @@ llvm::Function *createTransparentUseCallInputFunction(
   return function;
 }
 
+llvm::Function *createAggregateTransparentUseCallInputFunction(
+    llvm::Module &module, llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "aggregate_transparent_use_call_input_callee",
+                             module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "aggregate_transparent_use_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RDI");
+  llvm::AllocaInst *slot = builder.CreateAlloca(rdi->getValueType());
+  builder.CreateStore(llvm::ConstantInt::get(rdi->getValueType(), 11), slot);
+  llvm::Value *base = builder.CreateLoad(rdi->getValueType(), slot);
+  llvm::Value *value =
+      builder.CreateAdd(base, llvm::ConstantInt::get(rdi->getValueType(), 12));
+  llvm::Type *fields[] = {rdi->getValueType()};
+  auto *aggregateType =
+      llvm::StructType::get(context, llvm::ArrayRef<llvm::Type *>(fields));
+  llvm::Value *aggregate =
+      builder.CreateInsertValue(llvm::UndefValue::get(aggregateType), value, 0);
+  (void)builder.CreateExtractValue(aggregate, 0);
+  llvm::StoreInst *store = builder.CreateStore(value, rdi);
+  store->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createDoubleCallUseCallInputFunction(
     llvm::Module &module, llvm::GlobalVariable *rdi) {
   llvm::LLVMContext &context = module.getContext();
@@ -1675,6 +1708,8 @@ int main() {
       createSharedUseCallInputFunction(module, rdi);
   llvm::Function *transparentUseCallInput =
       createTransparentUseCallInputFunction(module, rdi);
+  llvm::Function *aggregateTransparentUseCallInput =
+      createAggregateTransparentUseCallInputFunction(module, rdi);
   llvm::Function *doubleCallUseCallInput =
       createDoubleCallUseCallInputFunction(module, rdi);
   llvm::Function *castCallInput = createCastCallInputFunction(module, rdi);
@@ -1874,6 +1909,13 @@ int main() {
   ok &= expect(callInputCandidateHasField(*transparentUseCallInput, "RDI",
                                           "trial_reason=local_arith"),
                "RDI transparent-use call input did not stay local_arith");
+  ok &= expect(callInputCandidateHasField(*aggregateTransparentUseCallInput,
+                                          "RDI", "trial_state=active"),
+               "RDI aggregate transparent-use call input was not active");
+  ok &= expect(callInputCandidateHasField(*aggregateTransparentUseCallInput,
+                                          "RDI", "trial_reason=local_arith"),
+               "RDI aggregate transparent-use call input did not stay "
+               "local_arith");
   ok &= expect(callInputCandidateHasField(*doubleCallUseCallInput, "RDI",
                                           "trial_state=inactive"),
                "RDI double-call-use call input was not inactive");
