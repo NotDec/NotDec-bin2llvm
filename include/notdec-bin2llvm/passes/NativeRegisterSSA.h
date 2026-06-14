@@ -40,6 +40,8 @@ struct NativeRegisterSSAFunctionSummary {
   uint64_t InactiveCallInputTrials = 0;
   uint64_t NoUseCallInputTrials = 0;
   uint64_t BlockedCallInputTrials = 0;
+  uint64_t DefinitelyNotUsedCallInputTrials = 0;
+  uint64_t KilledByCallInputTrials = 0;
   uint64_t LocalDefCallInputTrials = 0;
   uint64_t LocalConstCallInputTrials = 0;
   uint64_t LocalArithCallInputTrials = 0;
@@ -78,6 +80,8 @@ struct NativeRegisterSSASummary {
   uint64_t InactiveCallInputTrials = 0;
   uint64_t NoUseCallInputTrials = 0;
   uint64_t BlockedCallInputTrials = 0;
+  uint64_t DefinitelyNotUsedCallInputTrials = 0;
+  uint64_t KilledByCallInputTrials = 0;
   uint64_t LocalDefCallInputTrials = 0;
   uint64_t LocalConstCallInputTrials = 0;
   uint64_t LocalArithCallInputTrials = 0;

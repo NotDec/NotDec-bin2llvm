@@ -1712,6 +1712,11 @@ int main() {
                "register SSA summary missed inactive call input trials");
   ok &= expect(summary.NoUseCallInputTrials >= 1,
                "register SSA summary missed no-use call input trials");
+  ok &= expect(summary.DefinitelyNotUsedCallInputTrials >= 1,
+               "register SSA summary missed definitely-not-used call input "
+               "flags");
+  ok &= expect(summary.KilledByCallInputTrials >= 1,
+               "register SSA summary missed killed-by-call call input flags");
   ok &= expect(summary.LocalConstCallInputTrials >= 1,
                "register SSA summary missed local-const call input trials");
   ok &= expect(summary.LocalArithCallInputTrials >= 1,
@@ -1825,6 +1830,10 @@ int main() {
                                           "trial_reason=call_effect"),
                "RDI call-effect-derived input did not record call effect "
                "reason");
+  ok &= expect(callInputCandidateHasField(
+                   *blockedCallInput, "RDI",
+                   "trial_flags=definitely_not_used,killed_by_call"),
+               "RDI call-effect-derived input did not record trial flags");
   ok &= expect(callInputCandidateHasField(*strongPhiCallInput, "RDI",
                                           "strength=strong_phi"),
                "RDI PHI call input was not marked strong_phi");

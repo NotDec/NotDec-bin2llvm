@@ -106,6 +106,7 @@ struct CallInputTrialInfo {
   std::string Strength;
   std::string State;
   std::string Reason;
+  std::vector<std::string> Flags;
 };
 
 // CallInputTrialContext identifies the helper that is currently being checked.
@@ -1159,16 +1160,22 @@ private:
         std::set<llvm::Value *> visiting;
         CallInputTrialInfo trial =
             callInputTrialInfo(candidateValue, trialContext, visiting);
+        llvm::MDNode *trialMetadata = withMetadataField(
+            *withMetadataField(
+                *withMetadataField(*metadata, "strength", trial.Strength),
+                "trial_state", trial.State),
+            "trial_reason", trial.Reason);
+        if (!trial.Flags.empty()) {
+          trialMetadata =
+              withMetadataField(*trialMetadata, "trial_flags",
+                                callInputTrialFlagsText(trial.Flags));
+        }
         inst.setMetadata("notdec.register.call_input_candidate",
-                         withMetadataField(
-                             *withMetadataField(
-                                 *withMetadataField(*metadata, "strength",
-                                                    trial.Strength),
-                                 "trial_state", trial.State),
-                             "trial_reason", trial.Reason));
+                         trialMetadata);
         countCallInputStrength(trial.Strength);
         countCallInputTrialState(trial.State);
         countCallInputTrialReason(trial.Reason);
+        countCallInputTrialFlags(trial.Flags);
       }
     }
 
@@ -1226,6 +1233,18 @@ private:
     return llvm::MDNode::get(context, fields);
   }
 
+  std::string
+  callInputTrialFlagsText(const std::vector<std::string> &flags) const {
+    std::string text;
+    for (llvm::StringRef flag : flags) {
+      if (!text.empty()) {
+        text += ",";
+      }
+      text += flag.str();
+    }
+    return text;
+  }
+
   CallInputTrialInfo callInputTrialInfo(
       llvm::Value *value, const CallInputTrialContext &context,
       std::set<llvm::Value *> &visiting) {
@@ -1266,8 +1285,9 @@ private:
           return CallInputTrialInfo{"return_forward", "inactive",
                                     "return_forward"};
         }
-        return CallInputTrialInfo{"blocked_call_effect", "no_use",
-                                  "call_effect"};
+        return CallInputTrialInfo{
+            "blocked_call_effect", "no_use", "call_effect",
+            {"definitely_not_used", "killed_by_call"}};
       }
       if (inst->getFunction() == &Function) {
         if (isSafeCallInputArithmetic(*inst)) {
@@ -1518,6 +1538,16 @@ private:
     if (reason == "return_forward") {
       ++Summary.ReturnForwardCallInputTrials;
       return;
+    }
+  }
+
+  void countCallInputTrialFlags(const std::vector<std::string> &flags) {
+    for (llvm::StringRef flag : flags) {
+      if (flag == "definitely_not_used") {
+        ++Summary.DefinitelyNotUsedCallInputTrials;
+      } else if (flag == "killed_by_call") {
+        ++Summary.KilledByCallInputTrials;
+      }
     }
   }
 
@@ -2151,6 +2181,9 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.InactiveCallInputTrials += function.InactiveCallInputTrials;
   total.NoUseCallInputTrials += function.NoUseCallInputTrials;
   total.BlockedCallInputTrials += function.BlockedCallInputTrials;
+  total.DefinitelyNotUsedCallInputTrials +=
+      function.DefinitelyNotUsedCallInputTrials;
+  total.KilledByCallInputTrials += function.KilledByCallInputTrials;
   total.LocalDefCallInputTrials += function.LocalDefCallInputTrials;
   total.LocalConstCallInputTrials += function.LocalConstCallInputTrials;
   total.LocalArithCallInputTrials += function.LocalArithCallInputTrials;
@@ -2276,6 +2309,10 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
      << '\n';
   os << "  call input trials blocked: " << summary.BlockedCallInputTrials
      << '\n';
+  os << "  call input trial flags definitely not used: "
+     << summary.DefinitelyNotUsedCallInputTrials << '\n';
+  os << "  call input trial flags killed by call: "
+     << summary.KilledByCallInputTrials << '\n';
   os << "  call input trial reasons local def: "
      << summary.LocalDefCallInputTrials << '\n';
   os << "  call input trial reasons local const: "
@@ -2321,6 +2358,10 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
        << " call_input_trials_inactive=" << function.InactiveCallInputTrials
        << " call_input_trials_no_use=" << function.NoUseCallInputTrials
        << " call_input_trials_blocked=" << function.BlockedCallInputTrials
+       << " call_input_trial_flags_definitely_not_used="
+       << function.DefinitelyNotUsedCallInputTrials
+       << " call_input_trial_flags_killed_by_call="
+       << function.KilledByCallInputTrials
        << " call_input_trial_reasons_local_def="
        << function.LocalDefCallInputTrials
        << " call_input_trial_reasons_local_const="

@@ -2640,3 +2640,74 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test
 - 实现效果：6/10。没有放宽 double-call-use，只是把它从普通 shared use 中拆出来；这符合阶段 3d 先留出 `checkCallDoubleUse()` 入口的目标。
 - 复杂度：4/10。只是把 bool use check 改成三态结果。
 - 维护成本：4/10。后续真正实现 Ghidra 式 double-use 规则时，入口已经明确，不需要再从 `local_shared_use` 里反推。
+
+## 2026-06-14 实现记录：trial auxiliary flags
+
+本次补阶段 3d 里的 trial 辅助标记。Ghidra 的 trial 不只有 active/inactive/no_use 主状态，还会记录 killed-by-call、definitely-not-used 等辅助信息。native 侧先只给 call-effect no-use 场景写两个 flag：`definitely_not_used` 和 `killed_by_call`。这一步不改变 prototype recovery 行为，只增加 metadata 和 summary，给后续清理 no-use helper、对照 Ghidra oracle 留稳定入口。
+
+### 改动
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:43`
+  - summary 增加 `DefinitelyNotUsedCallInputTrials` / `KilledByCallInputTrials`。
+- `lib/passes/NativeRegisterSSA.cpp:1170`
+  - `annotateCallInputTrials()` 在 trial 有辅助标记时写 `trial_flags` metadata。
+- `lib/passes/NativeRegisterSSA.cpp:1237`
+  - 新增 `callInputTrialFlagsText()`，把 flags 写成逗号分隔字符串。
+- `lib/passes/NativeRegisterSSA.cpp:1290`
+  - call effect no-use trial 增加 `definitely_not_used,killed_by_call`。
+- `lib/passes/NativeRegisterSSA.cpp:1544`
+  - 新增 `countCallInputTrialFlags()`。
+- `lib/passes/NativeRegisterSSA.cpp:2184`
+  - `addFunctionSummary()` 汇总新增 flag 计数。
+- `lib/passes/NativeRegisterSSA.cpp:2313`
+  - summary 打印新增 flag 计数。
+- `tests/native_register_effects_test.cpp:1715`
+  - summary 增加 definitely-not-used / killed-by-call flag 断言。
+- `tests/native_register_effects_test.cpp:1835`
+  - call-effect-derived input 增加 `trial_flags=definitely_not_used,killed_by_call` 断言。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-trial-flags %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-trial-flags.ll
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-trial-flags.ll \
+  -o /tmp/hexx64-1156e0-trial-flags.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-trial-flags.bc \
+  -o /tmp/hexx64-1156e0-trial-flags.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.63s`。
+- summary 输出：
+  - `call input trials active: 453`
+  - `call input trials inactive: 1431`
+  - `call input trials no use: 2490`
+  - `call input trial flags definitely not used: 2490`
+  - `call input trial flags killed by call: 2490`
+  - `call input trial reasons local shared use: 308`
+  - `call input trial reasons local double call use: 79`
+  - `call input trial reasons call effect: 2490`
+
+### 判断
+
+- 实现效果：6/10。辅助标记已经进入 metadata/summary，但目前只覆盖 call effect no-use。
+- 复杂度：4/10。`CallInputTrialInfo` 多了 flags，metadata 写入多一步。
+- 维护成本：4/10。后续扩展 `conditional_effect`、`unreferenced` 时可以复用这个字段，不需要再改 metadata 结构。
