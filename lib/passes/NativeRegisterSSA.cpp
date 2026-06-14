@@ -1119,6 +1119,11 @@ private:
           llvm::MDString::get(context,
                               "callsite_id=" + callsiteId(call)),
           llvm::MDString::get(context, "slot=" + std::to_string(slot)),
+          llvm::MDString::get(context, "storage=register"),
+          llvm::MDString::get(context, "base=" + unit.Name),
+          llvm::MDString::get(context, "space=register"),
+          llvm::MDString::get(context, "offset=" + std::to_string(unit.Offset)),
+          llvm::MDString::get(context, "size=" + std::to_string(unit.Size)),
           llvm::MDString::get(context, "register=" + unit.Name),
           llvm::ValueAsMetadata::get(unit.Global),
       };

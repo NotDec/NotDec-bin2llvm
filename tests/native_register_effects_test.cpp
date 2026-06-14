@@ -1891,6 +1891,21 @@ int main() {
   ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
                                           "trial_flags=path_realistic"),
                "RDI active call input did not record path_realistic flag");
+  ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
+                                          "storage=register"),
+               "RDI call input candidate did not record register storage kind");
+  ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
+                                          "base=RDI"),
+               "RDI call input candidate did not record storage base");
+  ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
+                                          "space=register"),
+               "RDI call input candidate did not record storage space");
+  ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
+                                          "offset=0"),
+               "RDI call input candidate did not record storage offset");
+  ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
+                                          "size=8"),
+               "RDI call input candidate did not record storage size");
   ok &= expect(callInputCandidateHasField(*arithCallInput, "RDI",
                                           "trial_state=active"),
                "RDI arithmetic call input was not active");

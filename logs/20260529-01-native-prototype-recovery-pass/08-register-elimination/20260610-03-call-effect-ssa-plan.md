@@ -3274,3 +3274,68 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 实现效果：5/10。补上了 Ghidra `PIECE/SUBPIECE` 在 LLVM aggregate IR 上的一个明确对应点。
 - 复杂度：1/10。只扩展透明 descendant opcode 集合。
 - 维护成本：3/10。后续处理真正的 sub-register overlap 时，不能只靠 `extractvalue`，还要结合 register storage range。
+
+## 2026-06-14 实现记录：call input storage range metadata
+
+本次推进阶段 3e 的 storage overlap 准备工作。`RegisterStorage` 和 `NativeRegisterSSA` 已经按 backing global 处理 RAX/EAX/AX 这类 overlap，但 call input candidate metadata 之前只写 `register=<base>`，没有写 storage range。后续要和 Ghidra storage 对照，或者处理子寄存器 trial，必须能从 helper metadata 看到具体 storage。
+
+这一步只补 metadata，不改变 trial state 判定。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:1122`
+  - `attachCallInputCandidates()` 给 `notdec.register.call_input_candidate` 增加：
+    - `storage=register`
+    - `base=<unit name>`
+    - `space=register`
+    - `offset=<unit offset>`
+    - `size=<unit size>`
+  - 字段来自现有 `RegisterUnit`，没有新增并行 fact 结构。
+
+- `tests/native_register_effects_test.cpp:1894`
+  - 增加 focused 断言，确认 RDI call input candidate 写出 storage kind/base/space/offset/size。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-storage-range %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-storage-range.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-storage-range.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-storage-range.ll \
+  -o /tmp/hexx64-1156e0-storage-range.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-storage-range.bc \
+  -o /tmp/hexx64-1156e0-storage-range.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.95s`。
+- hexx64 summary 和上一轮一致：
+  - `call input trials active: 455`
+  - `call input trials inactive: 1425`
+  - `call input trials no use: 2494`
+  - `call input trial reasons local shared use: 231`
+  - `call input trial reasons local double call use: 152`
+
+### 判断
+
+- 实现效果：4/10。只是把后续 overlap 判断需要的信息显式写到 helper metadata，尚未实现子寄存器 trial 规则。
+- 复杂度：1/10。metadata 扩字段，不改变数据流。
+- 维护成本：2/10。字段和现有 `notdec.register.access` 风格一致，后续 consumer 可以直接复用。
