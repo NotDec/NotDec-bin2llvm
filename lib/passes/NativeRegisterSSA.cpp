@@ -1160,6 +1160,7 @@ private:
         std::set<llvm::Value *> visiting;
         CallInputTrialInfo trial =
             callInputTrialInfo(candidateValue, trialContext, visiting);
+        addCallInputPathFlag(trial);
         llvm::MDNode *trialMetadata = withMetadataField(
             *withMetadataField(
                 *withMetadataField(*metadata, "strength", trial.Strength),
@@ -1243,6 +1244,14 @@ private:
       text += flag.str();
     }
     return text;
+  }
+
+  void addCallInputPathFlag(CallInputTrialInfo &trial) const {
+    if (trial.State == "active") {
+      trial.Flags.push_back("path_realistic");
+      return;
+    }
+    trial.Flags.push_back("path_blocked");
   }
 
   CallInputTrialInfo callInputTrialInfo(
@@ -1547,6 +1556,10 @@ private:
         ++Summary.DefinitelyNotUsedCallInputTrials;
       } else if (flag == "killed_by_call") {
         ++Summary.KilledByCallInputTrials;
+      } else if (flag == "path_realistic") {
+        ++Summary.PathRealisticCallInputTrials;
+      } else if (flag == "path_blocked") {
+        ++Summary.PathBlockedCallInputTrials;
       }
     }
   }
@@ -2184,6 +2197,8 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.DefinitelyNotUsedCallInputTrials +=
       function.DefinitelyNotUsedCallInputTrials;
   total.KilledByCallInputTrials += function.KilledByCallInputTrials;
+  total.PathRealisticCallInputTrials += function.PathRealisticCallInputTrials;
+  total.PathBlockedCallInputTrials += function.PathBlockedCallInputTrials;
   total.LocalDefCallInputTrials += function.LocalDefCallInputTrials;
   total.LocalConstCallInputTrials += function.LocalConstCallInputTrials;
   total.LocalArithCallInputTrials += function.LocalArithCallInputTrials;
@@ -2313,6 +2328,10 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
      << summary.DefinitelyNotUsedCallInputTrials << '\n';
   os << "  call input trial flags killed by call: "
      << summary.KilledByCallInputTrials << '\n';
+  os << "  call input trial flags path realistic: "
+     << summary.PathRealisticCallInputTrials << '\n';
+  os << "  call input trial flags path blocked: "
+     << summary.PathBlockedCallInputTrials << '\n';
   os << "  call input trial reasons local def: "
      << summary.LocalDefCallInputTrials << '\n';
   os << "  call input trial reasons local const: "
@@ -2362,6 +2381,10 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
        << function.DefinitelyNotUsedCallInputTrials
        << " call_input_trial_flags_killed_by_call="
        << function.KilledByCallInputTrials
+       << " call_input_trial_flags_path_realistic="
+       << function.PathRealisticCallInputTrials
+       << " call_input_trial_flags_path_blocked="
+       << function.PathBlockedCallInputTrials
        << " call_input_trial_reasons_local_def="
        << function.LocalDefCallInputTrials
        << " call_input_trial_reasons_local_const="

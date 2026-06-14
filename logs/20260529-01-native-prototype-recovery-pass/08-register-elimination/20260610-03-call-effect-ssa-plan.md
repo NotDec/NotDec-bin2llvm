@@ -2711,3 +2711,77 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test
 - 实现效果：6/10。辅助标记已经进入 metadata/summary，但目前只覆盖 call effect no-use。
 - 复杂度：4/10。`CallInputTrialInfo` 多了 flags，metadata 写入多一步。
 - 维护成本：4/10。后续扩展 `conditional_effect`、`unreferenced` 时可以复用这个字段，不需要再改 metadata 结构。
+
+## 2026-06-14 实现记录：path realistic flags
+
+本次继续补阶段 3d 的 `AncestorRealistic` 入口。Ghidra 的 `AncestorRealistic::execute()` 是在 `ancestorOpUse()` 前面做路径合理性检查；native 侧这次先不直接复刻完整 DFS，只先把路径检查结果作为 trial flag 暴露出来：当前 `active` 的 trial 标 `path_realistic`，其它 trial 标 `path_blocked`。
+
+这一步不改变 `trial_state`，只是让后续真正实现路径遍历时有稳定 metadata/summary 入口。后续应该替换 `addCallInputPathFlag()` 的规则，而不是继续把 path 语义藏在 reason 里。
+
+### 改动
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:45`
+  - summary 增加 `PathRealisticCallInputTrials` / `PathBlockedCallInputTrials`。
+- `lib/passes/NativeRegisterSSA.cpp:1163`
+  - `annotateCallInputTrials()` 写 metadata 前调用 `addCallInputPathFlag()`。
+- `lib/passes/NativeRegisterSSA.cpp:1249`
+  - 新增 `addCallInputPathFlag()`。
+- `lib/passes/NativeRegisterSSA.cpp:1559`
+  - `countCallInputTrialFlags()` 增加 `path_realistic` / `path_blocked` 计数。
+- `lib/passes/NativeRegisterSSA.cpp:2200`
+  - `addFunctionSummary()` 汇总新增 path flag。
+- `lib/passes/NativeRegisterSSA.cpp:2332`
+  - summary 打印新增 path flag。
+- `tests/native_register_effects_test.cpp:1720`
+  - summary 增加 path flag 断言。
+- `tests/native_register_effects_test.cpp:1783`
+  - active local const candidate 增加 `trial_flags=path_realistic` 断言。
+- `tests/native_register_effects_test.cpp:1831`
+  - entry-derived candidate 增加 `trial_flags=path_blocked` 断言。
+- `tests/native_register_effects_test.cpp:1845`
+  - call-effect-derived candidate 的 `trial_flags` 更新为 `definitely_not_used,killed_by_call,path_blocked`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-path-flags %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-path-flags.ll
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-path-flags.ll \
+  -o /tmp/hexx64-1156e0-path-flags.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-path-flags.bc \
+  -o /tmp/hexx64-1156e0-path-flags.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.77s`。
+- summary 输出：
+  - `call input trials active: 453`
+  - `call input trials inactive: 1431`
+  - `call input trials no use: 2490`
+  - `call input trial flags path realistic: 453`
+  - `call input trial flags path blocked: 3921`
+  - `call input trial flags definitely not used: 2490`
+  - `call input trial flags killed by call: 2490`
+
+### 判断
+
+- 实现效果：5/10。路径合理性已经进入 metadata/summary，但还只是按当前 state 映射，不是完整 Ghidra DFS。
+- 复杂度：3/10。只新增 path flag 和统计。
+- 维护成本：3/10。后续完整 `AncestorRealistic` 可以集中替换 `addCallInputPathFlag()`，不会影响 prototype recovery 消费路径。

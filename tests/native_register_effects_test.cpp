@@ -1717,6 +1717,10 @@ int main() {
                "flags");
   ok &= expect(summary.KilledByCallInputTrials >= 1,
                "register SSA summary missed killed-by-call call input flags");
+  ok &= expect(summary.PathRealisticCallInputTrials >= 1,
+               "register SSA summary missed path-realistic call input flags");
+  ok &= expect(summary.PathBlockedCallInputTrials >= 1,
+               "register SSA summary missed path-blocked call input flags");
   ok &= expect(summary.LocalConstCallInputTrials >= 1,
                "register SSA summary missed local-const call input trials");
   ok &= expect(summary.LocalArithCallInputTrials >= 1,
@@ -1775,6 +1779,9 @@ int main() {
   ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
                                           "trial_reason=local_const"),
                "RDI call input candidate did not record local_const reason");
+  ok &= expect(callInputCandidateHasField(*callInputCandidate, "RDI",
+                                          "trial_flags=path_realistic"),
+               "RDI active call input did not record path_realistic flag");
   ok &= expect(callInputCandidateHasField(*arithCallInput, "RDI",
                                           "trial_state=active"),
                "RDI arithmetic call input was not active");
@@ -1820,6 +1827,9 @@ int main() {
   ok &= expect(callInputCandidateHasField(*weakCallInput, "RDI",
                                           "trial_reason=entry_input"),
                "RDI entry-derived call input did not record entry reason");
+  ok &= expect(callInputCandidateHasField(*weakCallInput, "RDI",
+                                          "trial_flags=path_blocked"),
+               "RDI entry-derived call input did not record path_blocked flag");
   ok &= expect(callInputCandidateHasField(*blockedCallInput, "RDI",
                                           "strength=blocked_call_effect"),
                "RDI call-effect-derived input was not blocked");
@@ -1832,7 +1842,7 @@ int main() {
                "reason");
   ok &= expect(callInputCandidateHasField(
                    *blockedCallInput, "RDI",
-                   "trial_flags=definitely_not_used,killed_by_call"),
+                   "trial_flags=definitely_not_used,killed_by_call,path_blocked"),
                "RDI call-effect-derived input did not record trial flags");
   ok &= expect(callInputCandidateHasField(*strongPhiCallInput, "RDI",
                                           "strength=strong_phi"),
