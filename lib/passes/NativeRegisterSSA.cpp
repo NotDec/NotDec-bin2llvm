@@ -1247,12 +1247,12 @@ private:
   }
 
   void addCallInputPathFlag(CallInputTrialInfo &trial) const {
-    if (trial.State == "active") {
-      trial.Flags.push_back("path_realistic");
-      return;
-    }
     if (callInputTrialHasFlag(trial, "conditional_effect")) {
       trial.Flags.push_back("path_conditional");
+      return;
+    }
+    if (trial.State == "active") {
+      trial.Flags.push_back("path_realistic");
       return;
     }
     trial.Flags.push_back("path_blocked");
@@ -1494,8 +1494,8 @@ private:
                                   "return_forward"};
       }
       if (sawStrong) {
-        return CallInputTrialInfo{"weak_entry_input", "inactive",
-                                  inactiveReason, {"conditional_effect"}};
+        return CallInputTrialInfo{"strong_phi", "active", "phi",
+                                  {"conditional_effect"}};
       }
       return CallInputTrialInfo{"weak_entry_input", "inactive",
                                 inactiveReason};

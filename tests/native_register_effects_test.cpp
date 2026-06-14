@@ -1931,11 +1931,11 @@ int main() {
                                           "trial_reason=phi"),
                "RDI PHI call input did not record phi reason");
   ok &= expect(callInputCandidateHasField(*conditionalPhiCallInput, "RDI",
-                                          "trial_state=inactive"),
-               "RDI conditional PHI call input was not inactive");
+                                          "trial_state=active"),
+               "RDI conditional PHI call input was not active");
   ok &= expect(callInputCandidateHasField(*conditionalPhiCallInput, "RDI",
-                                          "trial_reason=entry_input"),
-               "RDI conditional PHI call input did not keep entry reason");
+                                          "trial_reason=phi"),
+               "RDI conditional PHI call input did not record phi reason");
   ok &= expect(callInputCandidateHasField(
                    *conditionalPhiCallInput, "RDI",
                    "trial_flags=conditional_effect,path_conditional"),

@@ -2990,3 +2990,58 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 实现效果：6/10。consumer 侧已有 conditional guard，为后续更接近 Ghidra 的 PHI active/final-check 铺路。
 - 复杂度：3/10。只增加一个 metadata list 匹配和 focused 测试。
 - 维护成本：3/10。后续如果实现真正 final check，只需要把 guard 从“直接拒绝”改成“final check 通过后消费”。
+
+## 2026-06-14 实现记录：conditional PHI active trial
+
+有了 consumer guard 后，本次把 mixed PHI 的 trial state 调整得更接近 Ghidra：如果 PHI 同时看到 active path 和 inactive path，不再把它整体压成 inactive，而是标成 `active/phi`，同时保留 `conditional_effect,path_conditional`。prototype recovery 仍然不会消费它，因为上一节已经加了 `conditional_effect` guard。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:1247`
+  - `addCallInputPathFlag()` 改成先检查 `conditional_effect`，保证 active+conditional 写 `path_conditional`，不是 `path_realistic`。
+- `lib/passes/NativeRegisterSSA.cpp:1494`
+  - `phiInputTrialInfo()` 对 mixed strong/inactive PHI 返回 `strong_phi/active/phi`，并带 `conditional_effect`。
+- `tests/native_register_effects_test.cpp:1931`
+  - conditional PHI 测试期望从 `inactive/entry_input` 改成 `active/phi`，仍要求 `trial_flags=conditional_effect,path_conditional`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-conditional-active %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-conditional-active.ll
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-conditional-active.ll \
+  -o /tmp/hexx64-1156e0-conditional-active.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-conditional-active.bc \
+  -o /tmp/hexx64-1156e0-conditional-active.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.61s`。
+- summary 输出：
+  - `call input trials active: 459`
+  - `call input trials inactive: 1425`
+  - `call input trial flags conditional effect: 4`
+  - `call input trial flags path realistic: 455`
+  - `call input trial flags path conditional: 4`
+  - `call input trial reasons phi: 5`
+
+### 判断
+
+- 实现效果：7/10。mixed PHI 的 trial state 已更接近 Ghidra，且 consumer guard 保证不会提前 rewrite signature。
+- 复杂度：3/10。只调整 PHI 合并状态和 path flag 优先级。
+- 维护成本：4/10。后续还需要真正 final check；当前 `active` 已不等于“prototype recovery 可消费”，消费方必须继续看 flags。
