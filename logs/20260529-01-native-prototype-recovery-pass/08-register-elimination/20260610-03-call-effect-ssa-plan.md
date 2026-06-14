@@ -3551,3 +3551,83 @@ native 当前结构做不到完整复刻，因为：
 - 这个 trial table 是只存在于 `NativeRegisterSSA.cpp` 内部，还是要暴露到 summary/API，供 PrototypeRecovery 或 Ghidra oracle 对照使用。
 - double-use 的跨 block “same function different basic blocks, assume legit doubleuse” 是否直接照搬。LLVM 这里还要考虑 dominance 和 helper 插入顺序，不能只看 basic block 不同。
 - indirect call 的“同目标”判断要不要依赖 call target SSA value；当前 metadata 只有 direct callee name，不能安全判断 indirect same-target。
+
+## 2026-06-14 实现记录：内部 trial table 骨架
+
+本次先落地上面决策点里的第一步：建立 RegisterSSA 内部 trial table，但不暴露 API、不改变 PrototypeRecovery，也不改变输出 metadata 语义。
+
+目标是把原来“边扫 helper、边计算、边写 metadata”的流程改成：
+
+```text
+收集本函数全部 call input helper
+  -> 逐条计算初始 trial info
+  -> 统一 finalize
+  -> 写回 metadata 和 summary
+```
+
+当前 finalize 仍只做原来的 conditional final check 和 path flag，所以这一步是结构准备，不改变 hexx64 summary。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:123`
+  - 新增 `CallInputTrialRecord`。
+  - 字段包含 helper instruction、helper operand value、原 metadata、context、trial info 和 checked 状态。
+  - 结构只在 RegisterSSA 内部使用。
+
+- `lib/passes/NativeRegisterSSA.cpp:1190`
+  - `annotateCallInputTrials()` 先收集所有 call input helper 到 `std::vector<CallInputTrialRecord>`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1215`
+  - 第二阶段逐条调用 `callInputTrialInfo()`，填入 `record.Info` 并标记 `Checked=true`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1222`
+  - 调用新的 `finalizeCallInputTrials()`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1224`
+  - 第三阶段统一写回 `strength/trial_state/trial_reason/trial_flags` metadata 和 summary 计数。
+
+- `lib/passes/NativeRegisterSSA.cpp:1252`
+  - 新增 `finalizeCallInputTrials()`。
+  - 当前只搬运原有逻辑：`applyConditionalCallInputFinalCheck()` 和 `addCallInputPathFlag()`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-trial-table %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-trial-table.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-trial-table.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-trial-table.ll \
+  -o /tmp/hexx64-1156e0-trial-table.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-trial-table.bc \
+  -o /tmp/hexx64-1156e0-trial-table.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`76.48s`。
+- hexx64 summary 和上一轮一致：
+  - `call input trials active: 260`
+  - `call input trials inactive: 1619`
+  - `call input trials no use: 2495`
+  - `call input trial reasons local double call use: 2`
+  - `call input trial reasons entry input: 406`
+
+### 判断
+
+- 实现效果：5/10。完成 trial table 骨架，为完整 double-use / conditional finalize 迭代准备了结构，但还没有实现跨 trial 依赖。
+- 复杂度：3/10。流程多了一层 record，但行为不变。
+- 维护成本：4/10。后续如果要暴露 oracle 对照信息，需要再决定 summary/API 形态；当前先保持内部实现。

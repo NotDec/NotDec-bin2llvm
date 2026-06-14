@@ -120,6 +120,19 @@ struct CallInputTrialContext {
   std::string CalleeName;
 };
 
+// Internal table row for call input trial finalization.  This is deliberately
+// kept inside RegisterSSA for now: PrototypeRecovery should keep consuming the
+// finalized metadata, while double-use/final-check rules can later look across
+// rows before metadata is written back.
+struct CallInputTrialRecord {
+  llvm::Instruction *Candidate = nullptr;
+  llvm::Value *CandidateValue = nullptr;
+  llvm::MDNode *Metadata = nullptr;
+  CallInputTrialContext Context;
+  CallInputTrialInfo Info;
+  bool Checked = false;
+};
+
 enum class CallInputUseCheckResult {
   OnlyCurrentCall,
   SharedUse,
@@ -1175,6 +1188,7 @@ private:
   }
 
   void annotateCallInputTrials() {
+    std::vector<CallInputTrialRecord> trials;
     for (llvm::BasicBlock &block : Function) {
       for (llvm::Instruction &inst : block) {
         llvm::MDNode *metadata =
@@ -1193,28 +1207,38 @@ private:
         trialContext.CallsiteId = mdField(metadata, "callsite_id").value_or("");
         trialContext.RegisterName = mdField(metadata, "register").value_or("");
         trialContext.CalleeName = mdField(metadata, "callee").value_or("");
-        std::set<llvm::Value *> visiting;
-        CallInputTrialInfo trial =
-            callInputTrialInfo(candidateValue, trialContext, visiting);
-        applyConditionalCallInputFinalCheck(trial);
-        addCallInputPathFlag(trial);
-        llvm::MDNode *trialMetadata = withMetadataField(
-            *withMetadataField(
-                *withMetadataField(*metadata, "strength", trial.Strength),
-                "trial_state", trial.State),
-            "trial_reason", trial.Reason);
-        if (!trial.Flags.empty()) {
+        trials.push_back(
+            CallInputTrialRecord{&inst, candidateValue, metadata, trialContext});
+      }
+    }
+
+    for (CallInputTrialRecord &record : trials) {
+      std::set<llvm::Value *> visiting;
+      record.Info =
+          callInputTrialInfo(record.CandidateValue, record.Context, visiting);
+      record.Checked = true;
+    }
+
+    finalizeCallInputTrials(trials);
+
+    for (CallInputTrialRecord &record : trials) {
+      llvm::MDNode *trialMetadata = withMetadataField(
+          *withMetadataField(
+              *withMetadataField(*record.Metadata, "strength",
+                                 record.Info.Strength),
+              "trial_state", record.Info.State),
+          "trial_reason", record.Info.Reason);
+      if (!record.Info.Flags.empty()) {
           trialMetadata =
               withMetadataField(*trialMetadata, "trial_flags",
-                                callInputTrialFlagsText(trial.Flags));
-        }
-        inst.setMetadata("notdec.register.call_input_candidate",
-                         trialMetadata);
-        countCallInputStrength(trial.Strength);
-        countCallInputTrialState(trial.State);
-        countCallInputTrialReason(trial.Reason);
-        countCallInputTrialFlags(trial.Flags);
+                                callInputTrialFlagsText(record.Info.Flags));
       }
+      record.Candidate->setMetadata("notdec.register.call_input_candidate",
+                                    trialMetadata);
+      countCallInputStrength(record.Info.Strength);
+      countCallInputTrialState(record.Info.State);
+      countCallInputTrialReason(record.Info.Reason);
+      countCallInputTrialFlags(record.Info.Flags);
     }
 
     for (llvm::BasicBlock &block : Function) {
@@ -1225,6 +1249,16 @@ private:
         }
         refreshCallInputCandidateList(*call);
       }
+    }
+  }
+
+  void finalizeCallInputTrials(std::vector<CallInputTrialRecord> &trials) {
+    for (CallInputTrialRecord &record : trials) {
+      if (!record.Checked) {
+        continue;
+      }
+      applyConditionalCallInputFinalCheck(record.Info);
+      addCallInputPathFlag(record.Info);
     }
   }
 
