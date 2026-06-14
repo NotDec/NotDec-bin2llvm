@@ -528,57 +528,131 @@ pass-end finalize 不能作为“补洞兜底”。它只应该完成 Braun SSA 
 
 ### 阶段 3e：补齐 Ghidra trial/use 相关机制
 
-阶段 3d 是第一批 ancestor/use 检查。还需要补这些 Ghidra 风格机制，避免只靠 ancestor 一条链判断：
+阶段 3d 是第一批 ancestor/use 检查。只补 ancestor 不够，还需要把 Ghidra trial/use 周围的几个配套机制补上。否则 native 会出现两类问题：一类是把本来只是“看起来能追到来源”的值误判成参数；另一类是遇到 PHI、循环、double-use 后只能保守挡住，没法说明为什么挡住。
 
-- final check 放在 RegisterSSA。
-  - RegisterSSA 产出的 `trial_state` 应该就是 PrototypeRecovery 可消费的结论。
-  - PrototypeRecovery 只读 `active`，不再自己理解 SSA value/use 链。
-  - 带 `conditional_effect` 的 active trial 要在 RegisterSSA 里二次检查；失败直接改成 `no_use` 并写 `final_checked`。
-- active trial 的整体收口。
-  - 对一个 callsite 的所有 active input 做完 use/path 检查后，再允许 prototype recovery 消费。
-  - 这对应 Ghidra `ActionActiveParam::apply()` 中 active input fully checked 之后才进入模型解析。
-  - native 侧可以先用 per-function summary flag 表示“本函数 trial state 已 finalize”，防止后续 pass 消费半成品。
-- no-use 的数据流语义。
-  - `no_use` helper 第一版可以保留在 IR 里，但 metadata 必须明确 `trial_state=no_use`。
-  - 后续如果删除 helper，只能在 PrototypeRecovery 之后做清理，不能影响 RegisterSSA 的验证和审计。
-  - 不要用删除 helper 来掩盖错误判断；先让 summary 能稳定统计 no-use 原因。
-- descendant use 要继续补完整。
-  - 已有透明 use 递归只是子集。
-  - 还要明确哪些 LLVM op 等价于 Ghidra 的 `COPY` / `CAST` / `MULTIEQUAL` / `SUBPIECE` / `PIECE`。
-  - 不认识的 op 默认不是透明传播，先归 inactive 或 shared use。
-- double-call-use 单独决策。
-  - 目前只单独记录 `local_double_call_use`。
-  - 后续需要实现类似 Ghidra `checkCallDoubleUse()` 的规则：同一个 prepared value 被多个 call 使用时，哪些是合法复用，哪些说明不是当前 call 的独占参数准备。
-  - 第一版继续保守，不把 double-call-use 当 active 证据。
-- unreferenced / definitely-not-used 标记。
-  - 如果一个 trial 没有实际 use，或者 use 检查能证明它不是参数，要显式写辅助 flag。
-  - 这些 flag 不直接等于主状态，但会影响 prototype recovery 是否消费、后续是否清理 helper。
-- ABI / callee model 反馈。
-  - Ghidra trial 最后会反过来影响 input map / prototype model。
-  - native 侧第一版不直接重建完整 prototype model，但需要把 active/no-use/block 原因保留下来，供后续 signature rewrite 或 Ghidra oracle 对照。
-- storage overlap。
-  - 当前先按完整 register 处理。
-  - 后续要处理 `RAX/EAX/AX/AL`、vector 子寄存器这类 overlap，否则 ancestor/use 检查可能把不同宽度的值误认为同一个或无关值。
-  - 这部分应复用现有 register storage 描述，不另造并行 fact 表。
-- stack trial 单独阶段。
-  - stack 参数需要 alias、local stack range、callee-pop、SP 调整检查。
-  - 不要把 register-only ancestor 逻辑硬套到 stack。
-  - 等 register trial state 稳定后再加 stack input trial。
+#### 3e.1 trial table / finalize 成为唯一出口
+
+- RegisterSSA 先收集本函数所有 call input trial，再统一 finalize。
+- `callInputTrialInfo()` 只产出初判和证据，不直接代表最终可消费结论。
+- `finalizeCallInputTrials()` 负责处理需要看其它 trial 的规则，例如 double-use、conditional final check、互相依赖的 checked/active 状态。
+- 写入 metadata / summary 的只能是 finalize 后状态。
+- PrototypeRecovery 只读 `active`，不重新理解 SSA value/use 链。
 
 判断标准：
+
+- 每个 helper 都有明确 `trial_state`、`trial_reason`、`trial_flags`。
+- summary 能看出 trial 是否经过 finalize。
+- 后续不再出现某个 pass 消费半成品 trial state。
+
+#### 3e.2 final check 放在 RegisterSSA
+
+- RegisterSSA 产出的 `trial_state` 应该就是 PrototypeRecovery 可消费的结论。
+- PrototypeRecovery 只读 `active`，不再自己理解 SSA value/use 链。
+- 带 `conditional_effect` 的 active trial 要在 RegisterSSA 里二次检查；失败直接改成 `no_use` 并写 `final_checked`。
+
+Ghidra 对应点：
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc:5567`
+  - `FuncCallSpecs::finalInputCheck()`
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc:1740`
+  - `ActionActiveParam::apply()`
+
+#### 3e.3 active trial 的整体收口
+
+- 对一个 callsite 的所有 active input 做完 use/path 检查后，再允许 prototype recovery 消费。
+- 这对应 Ghidra `ActionActiveParam::apply()` 中 active input fully checked 之后才进入模型解析。
+- native 侧可以先用 per-function summary flag 表示“本函数 trial state 已 finalize”，防止后续 pass 消费半成品。
+
+#### 3e.4 descendant only-use 继续补完整
+
+- 已有透明 use 递归只是子集。
+- 还要明确哪些 LLVM op 等价于 Ghidra 的 `COPY` / `CAST` / `MULTIEQUAL` / `SUBPIECE` / `PIECE`。
+- PHI / cast / aggregate / extract / insert 这种透明派生，需要继续向后追 use。
+- 不认识的 op 默认不是透明传播，先归 inactive 或 shared use。
+- 递归必须有 visited 集合和深度上限；到上限只能保守停，不能直接判 active。
+
+Ghidra 对应点：
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc:1805`
+  - `Funcdata::onlyOpUse()`
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc:1917`
+  - `Funcdata::ancestorOpUse()`
+
+#### 3e.5 double-call-use 按 trial 状态决策
+
+- 目前只单独记录 `local_double_call_use`。
+- 后续需要实现类似 Ghidra `checkCallDoubleUse()` 的规则：同一个 prepared value 被多个 call 使用时，哪些是合法复用，哪些说明不是当前 call 的独占参数准备。
+- use 检查遇到另一个 call input helper 时，要记录目标 helper / 目标 trial，而不是只返回一个 reason。
+- finalize 时再看目标 trial 是否 checked、是否 active、是否 no_use / inactive / blocked。
+- 如果目标 trial 已 checked 且不是 active，可以恢复当前 trial 被 double-use 拦住前的结论。
+- 如果目标 trial active，当前 trial 继续保持 blocked/inactive，除非后续实现了更完整的 alternate path 证明。
+- 第一版不把 double-call-use 当 active 证据，只允许在安全条件下解除误拦。
+
+Ghidra 对应点：
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc:1756`
+  - `Funcdata::checkCallDoubleUse()`
+
+#### 3e.6 mark / alternate path / loop-aware path 检查
+
+这是 ancestor 之外最容易漏的一块。Ghidra 在追 ancestor/use 时不是简单 DFS，它会用 mark 避免重复遍历，并在 PHI / MULTIEQUAL / loop 场景里区分主路径和 alternate path。
+
+native 侧需要补的内容：
+
+- 给一次 trial 检查建立局部 visited/mark，不把全局状态写进 IR。
+- PHI 不能只看所有 incoming 是否 active；要记录哪条 incoming 是可证明准备路径，哪条是失败路径。
+- 对 mixed PHI 先写 `conditional_effect` / `path_conditional`，再交 final check。
+- 对循环 PHI，visited 命中后不能直接当 shared use，也不能直接当 active；需要返回“循环路径未证明”。
+- 对 same-callee 不同 block 的 double-use，要补 dominance/path 判断，不能只看 IR 出现顺序。
+- 这一步先做 register-only；stack path/alias 暂不放进来。
+
+判断标准：
+
+- 剩余 double-use 如果仍不能放过，metadata 能说明是 target active、target unresolved、alternate path blocked，还是 loop path blocked。
+- PHI mixed path 不再只显示成普通 `local_shared_use`。
+
+#### 3e.7 no-use 的数据流语义
+
+- `no_use` helper 第一版可以保留在 IR 里，但 metadata 必须明确 `trial_state=no_use`。
+- 后续如果删除 helper，只能在 PrototypeRecovery 之后做清理，不能影响 RegisterSSA 的验证和审计。
+- 不要用删除 helper 来掩盖错误判断；先让 summary 能稳定统计 no-use 原因。
+
+#### 3e.8 unreferenced / definitely-not-used 标记
+
+- 如果一个 trial 没有实际 use，或者 use 检查能证明它不是参数，要显式写辅助 flag。
+- 这些 flag 不直接等于主状态，但会影响 prototype recovery 是否消费、后续是否清理 helper。
+
+Ghidra 对应点：
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.hh:210`
+  - `ParamTrial`
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc:1963`
+  - `ParamActive::registerTrial()`
+
+#### 3e.9 ABI / callee model 反馈
+
+- Ghidra trial 最后会反过来影响 input map / prototype model。
+- native 侧第一版不直接重建完整 prototype model，但需要把 active/no-use/block 原因保留下来，供后续 signature rewrite 或 Ghidra oracle 对照。
+
+#### 3e.10 storage overlap
+
+- 当前先按完整 register 处理。
+- 后续要处理 `RAX/EAX/AX/AL`、vector 子寄存器这类 overlap，否则 ancestor/use 检查可能把不同宽度的值误认为同一个或无关值。
+- 这部分应复用现有 register storage 描述，不另造并行 fact 表。
+
+#### 3e.11 stack trial 单独阶段
+
+- stack 参数需要 alias、local stack range、callee-pop、SP 调整检查。
+- 不要把 register-only ancestor 逻辑硬套到 stack。
+- 等 register trial state 稳定后再加 stack input trial。
+
+阶段 3e 总判断标准：
 
 - RegisterSSA summary 能区分：active、inactive、no_use、blocked、conditional_final_check、double_call_use、unreferenced、definitely_not_used。
 - PrototypeRecovery 不需要重新追 SSA use 链；只消费 RegisterSSA 最终 trial state。
 - `hexx64.so -f 0x1156e0` 继续通过 LLVM 22 `llvm-as` / `opt -passes=verify`。
 - 和 Ghidra/Java oracle 对照时，差异能落到明确原因：storage overlap、stack alias、double-call-use 策略、或暂不支持的 op。
-
-判断标准：
-
 - focused 测试覆盖 PHI、copy/cast 链、shared use、double call use、call return、call effect。
-- `hexx64.so -f 0x1156e0` 继续通过 LLVM 22 `llvm-as` / `opt -passes=verify`。
-- summary 能看出 `active`、`local_shared_use`、`phi`、`return_forward`、`call_effect` 的变化。
-- summary 能单独看出 path-blocked、double-call-use、definitely-not-used 等新增原因，不和 `local_shared_use` 混在一起。
-- 和 Ghidra/Java oracle 对照时，差异能归因到明确的不支持项，而不是“strength 分类太粗”。
 
 ### 阶段 4：补完整 lazy SSA finalize
 
