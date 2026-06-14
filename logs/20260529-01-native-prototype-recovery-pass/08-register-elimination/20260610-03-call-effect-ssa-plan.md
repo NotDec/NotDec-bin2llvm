@@ -472,6 +472,26 @@ pass-end finalize 不能作为“补洞兜底”。它只应该完成 Braun SSA 
 - `active` 数量应小于等于现有 strong 数量，不应突然把 weak entry input 改成真实参数。
 - Ghidra/Java 链路已经完全消除寄存器访问的函数，可以作为对照样本，比较 callsite active input。
 
+### 阶段 3d：补 Ghidra 式 ancestor/use 检查
+
+`ancestor` 指 call input helper 当前使用的 SSA value 往前追到的来源链。比如 `call f(%x)` 这里，`%x` 可能来自常量、算术、cast、PHI、entry input、前一个 call return 或 call clobber effect。Ghidra 的思路不是只看 `%x` 这一点，而是沿这条来源链判断这个值是不是合理地只服务当前 call 参数。
+
+这一阶段把 `trial_state` 的判定从“来源分类”推进到“来源链 + use 检查”：
+
+- 从 call input helper 的 operand 出发，递归穿过 PHI、copy-like op、cast、简单地址/整数变换。
+- 遇到 call return、call clobber、entry input、未知 local instruction 时停止，并按现有 reason 保守分类。
+- 对每个可能 ancestor 做 only-use 检查：除了当前 call input helper、写回同一个 register state 的 store、必要的 copy/cast 传播外，不能有普通真实 use。
+- PHI 不再简单要求所有 incoming 都 active；先按 Ghidra `ancestorOpUse()` 的方向，尝试找到能证明只服务当前 call 的 ancestor 路径。
+- 仍然保留递归深度上限和 visited 集合，循环或不确定路径一律 inactive / no_use，不硬判 active。
+- 现有 `ancestorRealisticLite` 和 `local_shared_use` 可以作为第一版实现基础，但后续要避免继续堆 opcode 白名单。
+
+判断标准：
+
+- focused 测试覆盖 PHI、copy/cast 链、shared use、call return、call effect。
+- `hexx64.so -f 0x1156e0` 继续通过 LLVM 22 `llvm-as` / `opt -passes=verify`。
+- summary 能看出 `active`、`local_shared_use`、`phi`、`return_forward`、`call_effect` 的变化。
+- 和 Ghidra/Java oracle 对照时，差异能归因到明确的不支持项，而不是“strength 分类太粗”。
+
 ### 阶段 4：补完整 lazy SSA finalize
 
 - `PendingPhi` 改成状态对象。
