@@ -98,6 +98,37 @@ native 侧不需要照搬 Ghidra 的 p-code CALL operand 结构。可以继续�
 
 这样做比继续扩大 `strength` 更稳。`strength` 是按当前 native 代码的局部来源分类；Ghidra 的 trial/use 是按“这个候选最后能不能成为参数”分类，后者才是 prototype recovery 需要的结果。
 
+### Ghidra trial/use 还要补的机制
+
+只做 ancestor 不够。Ghidra 这块至少有几层判断，native 后续也应该分层实现：
+
+- `AncestorRealistic::execute()`
+  - 先判断参数来源路径在控制流上是否合理。
+  - 这不是 SSA value 祖先链本身，而是检查这个 call input trial 有没有现实的准备路径。
+  - native 侧第一版可以先做 register-only、callsite-local 的保守版本；stack alias、条件执行 effect 先标 `blocked`。
+- `Funcdata::ancestorOpUse()`
+  - 从 trial value 往前追 ancestor。
+  - 支持穿过 PHI、copy-like op、cast、piece/subpiece 类变换。
+  - 遇到 CALL / CALLIND、call effect、entry input、未知 instruction 时按边界处理，不随便穿透。
+- `Funcdata::onlyOpUse()`
+  - ancestor 找到候选来源后，还要往后看该 value 及派生 value 是否只服务当前 call。
+  - native 现在只有很轻的 `local_shared_use` 检查，还没完整追 descendant use。
+  - 后续要区分可忽略 use：当前 call input helper、写回同一 register state 的 store、copy/cast 传播。
+  - 普通运算、内存访问、返回、其它 call use 默认不能忽略。
+- `checkCallDoubleUse()`
+  - Ghidra 遇到另一个 CALL use 时不是一律失败，会判断是否是允许的重复参数使用。
+  - native 第一版可以先保守判 inactive，但计划里要留出这个步骤，避免以后把所有 cross-call double use 都误杀。
+- 更细的 trial 标记
+  - 当前 `active/inactive/no_use/blocked` 是主状态。
+  - 后续至少要补 `definitely_not_used`、`killed_by_call`、`conditional_effect`、`unreferenced` 这类辅助标记。
+  - 这些标记不一定都影响第一版 signature rewrite，但必须进 metadata / summary，方便和 Ghidra oracle 对照。
+- no-use 后的数据流清理
+  - Ghidra 对 definitely-not-used trial 会释放 CALL input 数据流。
+  - LLVM 侧不一定马上删除 helper，但 `no_use` helper 不能再参与 prototype recovery；后续可以有清理阶段删除或降级为审计信息。
+- stack 参数检查
+  - Ghidra 对 stack trial 会额外做 alias、local range、callee-pop 检查。
+  - 当前 native 先做 register input；stack trial 后续单独阶段处理，不能靠 register ancestor 逻辑硬套。
+
 ## Braun lazy SSA 参考
 
 参考文档：
@@ -472,24 +503,30 @@ pass-end finalize 不能作为“补洞兜底”。它只应该完成 Braun SSA 
 - `active` 数量应小于等于现有 strong 数量，不应突然把 weak entry input 改成真实参数。
 - Ghidra/Java 链路已经完全消除寄存器访问的函数，可以作为对照样本，比较 callsite active input。
 
-### 阶段 3d：补 Ghidra 式 ancestor/use 检查
+### 阶段 3d：补 Ghidra 式 trial/use 机制
 
 `ancestor` 指 call input helper 当前使用的 SSA value 往前追到的来源链。比如 `call f(%x)` 这里，`%x` 可能来自常量、算术、cast、PHI、entry input、前一个 call return 或 call clobber effect。Ghidra 的思路不是只看 `%x` 这一点，而是沿这条来源链判断这个值是不是合理地只服务当前 call 参数。
 
-这一阶段把 `trial_state` 的判定从“来源分类”推进到“来源链 + use 检查”：
+这一阶段把 `trial_state` 的判定从“来源分类”推进到“路径合理性 + 来源链 + use 检查”：
 
+- 先实现 register-only 的 `AncestorRealistic` 轻量检查，判断 call input trial 的准备路径是否合理；不确定路径先 `blocked` 或 `inactive`。
 - 从 call input helper 的 operand 出发，递归穿过 PHI、copy-like op、cast、简单地址/整数变换。
 - 遇到 call return、call clobber、entry input、未知 local instruction 时停止，并按现有 reason 保守分类。
-- 对每个可能 ancestor 做 only-use 检查：除了当前 call input helper、写回同一个 register state 的 store、必要的 copy/cast 传播外，不能有普通真实 use。
+- 对每个可能 ancestor 做完整 only-use 检查：除了当前 call input helper、写回同一个 register state 的 store、必要的 copy/cast 传播外，不能有普通真实 use。
 - PHI 不再简单要求所有 incoming 都 active；先按 Ghidra `ancestorOpUse()` 的方向，尝试找到能证明只服务当前 call 的 ancestor 路径。
+- 遇到另一个 call 使用同一 value 时，先按 `checkCallDoubleUse()` 留出独立判断入口；第一版可以保守判 inactive，但不能和普通 shared use 混在一起。
+- 补 trial 辅助标记：至少记录 `definitely_not_used`、`killed_by_call`、`conditional_effect`、`unreferenced` 的可观测 metadata / summary。
+- `no_use` / `definitely_not_used` helper 后续不参与 prototype recovery；清理阶段可以再决定是删除 helper 还是保留审计信息。
 - 仍然保留递归深度上限和 visited 集合，循环或不确定路径一律 inactive / no_use，不硬判 active。
 - 现有 `ancestorRealisticLite` 和 `local_shared_use` 可以作为第一版实现基础，但后续要避免继续堆 opcode 白名单。
+- stack 参数不放进这一阶段；后续需要 alias/local-range/callee-pop 检查后再做。
 
 判断标准：
 
-- focused 测试覆盖 PHI、copy/cast 链、shared use、call return、call effect。
+- focused 测试覆盖 PHI、copy/cast 链、shared use、double call use、call return、call effect。
 - `hexx64.so -f 0x1156e0` 继续通过 LLVM 22 `llvm-as` / `opt -passes=verify`。
 - summary 能看出 `active`、`local_shared_use`、`phi`、`return_forward`、`call_effect` 的变化。
+- summary 能单独看出 path-blocked、double-call-use、definitely-not-used 等新增原因，不和 `local_shared_use` 混在一起。
 - 和 Ghidra/Java oracle 对照时，差异能归因到明确的不支持项，而不是“strength 分类太粗”。
 
 ### 阶段 4：补完整 lazy SSA finalize
