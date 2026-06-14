@@ -107,6 +107,7 @@ struct CallInputTrialInfo {
   std::string State;
   std::string Reason;
   std::vector<std::string> Flags;
+  llvm::Instruction *DoubleUseCandidate = nullptr;
 };
 
 // CallInputTrialContext identifies the helper that is currently being checked.
@@ -130,6 +131,7 @@ struct CallInputTrialRecord {
   llvm::MDNode *Metadata = nullptr;
   CallInputTrialContext Context;
   CallInputTrialInfo Info;
+  CallInputTrialRecord *DoubleUseRecord = nullptr;
   bool Checked = false;
 };
 
@@ -137,6 +139,14 @@ enum class CallInputUseCheckResult {
   OnlyCurrentCall,
   SharedUse,
   DoubleCallUse,
+};
+
+// Result of descendant-use checking.  The enum keeps the current decision
+// stable, while DoubleUseCandidate preserves the other helper for later
+// trial-table finalization.
+struct CallInputUseCheckInfo {
+  CallInputUseCheckResult Result = CallInputUseCheckResult::OnlyCurrentCall;
+  llvm::Instruction *DoubleUseCandidate = nullptr;
 };
 
 bool isFlagRegisterName(llvm::StringRef name) {
@@ -1229,9 +1239,9 @@ private:
               "trial_state", record.Info.State),
           "trial_reason", record.Info.Reason);
       if (!record.Info.Flags.empty()) {
-          trialMetadata =
-              withMetadataField(*trialMetadata, "trial_flags",
-                                callInputTrialFlagsText(record.Info.Flags));
+        trialMetadata =
+            withMetadataField(*trialMetadata, "trial_flags",
+                              callInputTrialFlagsText(record.Info.Flags));
       }
       record.Candidate->setMetadata("notdec.register.call_input_candidate",
                                     trialMetadata);
@@ -1253,9 +1263,22 @@ private:
   }
 
   void finalizeCallInputTrials(std::vector<CallInputTrialRecord> &trials) {
+    std::map<llvm::Instruction *, CallInputTrialRecord *> trialByCandidate;
+    for (CallInputTrialRecord &record : trials) {
+      if (record.Candidate != nullptr) {
+        trialByCandidate.emplace(record.Candidate, &record);
+      }
+    }
+
     for (CallInputTrialRecord &record : trials) {
       if (!record.Checked) {
         continue;
+      }
+      if (record.Info.DoubleUseCandidate != nullptr) {
+        auto found = trialByCandidate.find(record.Info.DoubleUseCandidate);
+        if (found != trialByCandidate.end()) {
+          record.DoubleUseRecord = found->second;
+        }
       }
       applyConditionalCallInputFinalCheck(record.Info);
       addCallInputPathFlag(record.Info);
@@ -1445,12 +1468,14 @@ private:
 
   CallInputTrialInfo callInputUseTrialInfo(
       llvm::Instruction &value, const CallInputTrialContext &context) {
-    switch (checkCallInputUses(value, context)) {
+    CallInputUseCheckInfo useInfo = checkCallInputUses(value, context);
+    switch (useInfo.Result) {
     case CallInputUseCheckResult::OnlyCurrentCall:
       return CallInputTrialInfo{"strong_local_def", "active", "only_use"};
     case CallInputUseCheckResult::DoubleCallUse:
-      return CallInputTrialInfo{"weak_entry_input", "inactive",
-                                "local_double_call_use"};
+      return CallInputTrialInfo{
+          "weak_entry_input", "inactive", "local_double_call_use", {},
+          useInfo.DoubleUseCandidate};
     case CallInputUseCheckResult::SharedUse:
       return CallInputTrialInfo{"weak_entry_input", "inactive",
                                 "local_shared_use"};
@@ -1459,22 +1484,22 @@ private:
                               "local_shared_use"};
   }
 
-  CallInputUseCheckResult checkCallInputUses(
+  CallInputUseCheckInfo checkCallInputUses(
       llvm::Instruction &value, const CallInputTrialContext &context) {
     std::set<llvm::Instruction *> visiting;
     return checkCallInputUses(value, context, visiting);
   }
 
-  CallInputUseCheckResult checkCallInputUses(
+  CallInputUseCheckInfo checkCallInputUses(
       llvm::Instruction &value, const CallInputTrialContext &context,
       std::set<llvm::Instruction *> &visiting) {
     if (!visiting.insert(&value).second) {
-      return CallInputUseCheckResult::OnlyCurrentCall;
+      return {CallInputUseCheckResult::OnlyCurrentCall};
     }
     for (const llvm::Use &use : value.uses()) {
       auto *userInst = llvm::dyn_cast<llvm::Instruction>(use.getUser());
       if (userInst == nullptr) {
-        return CallInputUseCheckResult::SharedUse;
+        return {CallInputUseCheckResult::SharedUse};
       }
       if (isSameCallsiteInputHelper(*userInst, context)) {
         continue;
@@ -1483,22 +1508,22 @@ private:
         if (isAllowedDoubleCallInputUse(*userInst, context)) {
           continue;
         }
-        return CallInputUseCheckResult::DoubleCallUse;
+        return {CallInputUseCheckResult::DoubleCallUse, userInst};
       }
       if (isSameRegisterDefinitionStore(*userInst, value, context)) {
         continue;
       }
       if (isTransparentCallInputDescendant(*userInst)) {
-        CallInputUseCheckResult result =
+        CallInputUseCheckInfo result =
             checkCallInputUses(*userInst, context, visiting);
-        if (result != CallInputUseCheckResult::OnlyCurrentCall) {
+        if (result.Result != CallInputUseCheckResult::OnlyCurrentCall) {
           return result;
         }
         continue;
       }
-      return CallInputUseCheckResult::SharedUse;
+      return {CallInputUseCheckResult::SharedUse};
     }
-    return CallInputUseCheckResult::OnlyCurrentCall;
+    return {CallInputUseCheckResult::OnlyCurrentCall};
   }
 
   bool isTransparentCallInputDescendant(const llvm::Instruction &inst) const {

@@ -3709,3 +3709,74 @@ call void @notdec_native_e6870(), !notdec.register.call_input_candidates !6456
 - 对同 callee 不同 block 的情况还要补 dominance/path 判断。
 
 因此下一步不能再在 `isAllowedDoubleCallInputUse()` 里堆局部条件。应先扩展 `CallInputTrialRecord`，让 use 检查返回“double-use 指向哪个 candidate”，再在 `finalizeCallInputTrials()` 里按 Ghidra 顺序处理。
+
+## 2026-06-14 实现记录：double-use 目标 trial 记录
+
+本次落实上一节结论的第一步：use 检查遇到 double-use 时，不只返回 `DoubleCallUse`，还把命中的另一个 helper instruction 记录下来。`finalizeCallInputTrials()` 再把它解析成 `CallInputTrialRecord *`。当前不改变 trial state，不改变 metadata，不改变 summary。
+
+这一步的目的很窄：让后续 finalizer 能查到“另一个 trial 是否 checked/active”，而不是只能知道发生了 double-use。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:110`
+  - `CallInputTrialInfo` 增加 `DoubleUseCandidate`。
+
+- `lib/passes/NativeRegisterSSA.cpp:134`
+  - `CallInputTrialRecord` 增加 `DoubleUseRecord`。
+
+- `lib/passes/NativeRegisterSSA.cpp:144`
+  - 新增 `CallInputUseCheckInfo`，包含原有 result enum 和 `DoubleUseCandidate`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1265`
+  - `finalizeCallInputTrials()` 建立 candidate instruction 到 trial record 的索引。
+
+- `lib/passes/NativeRegisterSSA.cpp:1277`
+  - 如果 trial info 里有 `DoubleUseCandidate`，解析成 `DoubleUseRecord`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1469`
+  - `callInputUseTrialInfo()` 改为读取 `CallInputUseCheckInfo`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1487`
+  - `checkCallInputUses()` 返回 `CallInputUseCheckInfo`。
+  - 遇到不允许的其它 call input helper 时，返回 `{DoubleCallUse, userInst}`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-double-use-target %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-double-use-target.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-double-use-target.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-double-use-target.ll \
+  -o /tmp/hexx64-1156e0-double-use-target.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-double-use-target.bc \
+  -o /tmp/hexx64-1156e0-double-use-target.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`78.14s`。
+- hexx64 summary 和上一轮一致：
+  - `call input trials active: 260`
+  - `call input trials inactive: 1619`
+  - `call input trials no use: 2495`
+  - `call input trial reasons local double call use: 2`
+
+### 判断
+
+- 实现效果：4/10。完成 double-use 目标 trial 的内部连接，但还没利用它改变 final state。
+- 复杂度：2/10。只是把 enum 返回值扩成结构体，并在 trial table 里建索引。
+- 维护成本：3/10。后续要按 Ghidra 放宽 double-use，还需要保留 double-use 覆盖前的原始 trial 结论。
