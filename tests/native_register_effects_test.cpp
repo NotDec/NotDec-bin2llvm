@@ -243,6 +243,33 @@ llvm::Function *createArithmeticCallInputFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createSharedUseCallInputFunction(llvm::Module &module,
+                                                 llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "shared_use_call_input_callee", module);
+  auto *funcType =
+      llvm::FunctionType::get(rdi->getValueType(), {}, false);
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "shared_use_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RDI");
+  llvm::AllocaInst *slot = builder.CreateAlloca(rdi->getValueType());
+  builder.CreateStore(llvm::ConstantInt::get(rdi->getValueType(), 3), slot);
+  llvm::Value *base = builder.CreateLoad(rdi->getValueType(), slot);
+  llvm::Value *value =
+      builder.CreateAdd(base, llvm::ConstantInt::get(rdi->getValueType(), 4));
+  llvm::StoreInst *store = builder.CreateStore(value, rdi);
+  store->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRet(value);
+  return function;
+}
+
 llvm::Function *createCastCallInputFunction(llvm::Module &module,
                                             llvm::GlobalVariable *rdi) {
   llvm::LLVMContext &context = module.getContext();
@@ -1550,6 +1577,8 @@ int main() {
       createCallInputCandidateFunction(module, rdi);
   llvm::Function *arithCallInput =
       createArithmeticCallInputFunction(module, rdi);
+  llvm::Function *sharedUseCallInput =
+      createSharedUseCallInputFunction(module, rdi);
   llvm::Function *castCallInput = createCastCallInputFunction(module, rdi);
   llvm::Function *localLoadCallInput =
       createLocalLoadCallInputFunction(module, rdi);
@@ -1659,6 +1688,9 @@ int main() {
                "register SSA summary missed local-load call input trials");
   ok &= expect(summary.LocalUnknownCallInputTrials >= 1,
                "register SSA summary missed local-unknown call input trials");
+  ok &= expect(summary.LocalSharedUseCallInputTrials >= 1,
+               "register SSA summary missed local-shared-use call input "
+               "trials");
   ok &= expect(summary.PhiCallInputTrials >= 1,
                "register SSA summary missed phi call input trials");
   ok &= expect(summary.EntryInputCallInputTrials >= 1,
@@ -1707,6 +1739,12 @@ int main() {
   ok &= expect(callInputCandidateHasField(*arithCallInput, "RDI",
                                           "trial_reason=local_arith"),
                "RDI arithmetic call input did not record local_arith reason");
+  ok &= expect(callInputCandidateHasField(*sharedUseCallInput, "RDI",
+                                          "trial_state=inactive"),
+               "RDI shared-use call input was not inactive");
+  ok &= expect(callInputCandidateHasField(*sharedUseCallInput, "RDI",
+                                          "trial_reason=local_shared_use"),
+               "RDI shared-use call input reason was missing");
   ok &= expect(callInputCandidateHasField(*castCallInput, "RDI",
                                           "trial_state=active"),
                "RDI cast call input was not active");

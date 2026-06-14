@@ -2424,3 +2424,81 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：7/10。已经不再把所有本地 instruction 都当 active；local load 被明确降成 inactive。active 总数暂时没变，因为 Bench2 当前 active 正好都落在 const/arith/cast/phi。
 - 复杂度：5/10。新增一层递归分类和多个 reason 计数，但仍局限在 RegisterSSA。
 - 维护成本：5/10。opcode 白名单需要后续随 Ghidra oracle 对比继续调整；完整 `ancestorOpUse` 还没做。
+
+## 2026-06-14 实现记录：local shared use check
+
+本次在 `ancestorRealisticLite` 上再补一层最小 use 检查。思路不是把 native 侧完整改成 Ghidra `ancestorOpUse`，而是先挡住最明显的一类误判：一个本地值虽然来源安全，但它还被别的普通 IR use 消费了，这时就不该直接当 active 参数。
+
+### 改动
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:49`
+  - summary 增加 `LocalSharedUseCallInputTrials`。
+- `lib/passes/NativeRegisterSSA.cpp:111`.
+  - 新增 `CallInputTrialContext`，把当前 helper 的 `callsite_id` 和 `register` 一起带进 trial 检查。
+- `lib/passes/NativeRegisterSSA.cpp:1221`
+  - `callInputTrialInfo()` 在 `local_arith` / `local_cast` / `phi` 之前增加 `hasOnlyCallInputUses()`。
+- `lib/passes/NativeRegisterSSA.cpp:1312`
+  - 新增 `hasOnlyCallInputUses()` / `isSameCallsiteInputHelper()` / `isSameRegisterDefinitionStore()`。
+- `lib/passes/NativeRegisterSSA.cpp:1455`
+  - `countCallInputTrialReason()` 增加 `local_shared_use`。
+- `lib/passes/NativeRegisterSSA.cpp:2110`
+  - `addFunctionSummary()` 汇总新增 reason。
+- `lib/passes/NativeRegisterSSA.cpp:2239`
+  - summary 打印新增 reason。
+- `tests/native_register_effects_test.cpp:246`
+  - 新增 `shared_use_call_input` 用例，value 同时被 call helper 和普通 `ret` 使用。
+- `tests/native_register_effects_test.cpp:1580`
+  - 新增 shared-use 函数实例化。
+- `tests/native_register_effects_test.cpp:1691`
+  - 新增 `local_shared_use` summary 断言。
+- `tests/native_register_effects_test.cpp:1710`
+  - 新增 shared-use metadata 断言。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-local-shared-use %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-local-shared-use.ll
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-local-shared-use.ll \
+  -o /tmp/hexx64-1156e0-local-shared-use.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-local-shared-use.bc \
+  -o /tmp/hexx64-1156e0-local-shared-use.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`73.07s`。
+- summary 输出：
+  - `call input trials active: 453`
+  - `call input trials inactive: 1431`
+  - `call input trials no use: 2490`
+  - `call input trial reasons local const: 246`
+  - `call input trial reasons local arith: 154`
+  - `call input trial reasons local cast: 53`
+  - `call input trial reasons local load: 558`
+  - `call input trial reasons local shared use: 387`
+  - `call input trial reasons entry input: 1`
+  - `call input trial reasons call effect: 2490`
+  - `call input trial reasons return forward: 485`
+
+### 判断
+
+- 实现效果：7/10。active 进一步收紧了，说明 use 检查有效；同时也证明当前 native 结果还和 Ghidra 的完整 `ancestorOpUse` 有差距。
+- 复杂度：6/10。多了上下文和一次 use 遍历，但还是局部逻辑。
+- 维护成本：5/10。后续如果要更贴近 Ghidra，下一步该把 PHI / copy / cast 的祖先追踪做完整，而不是继续堆新的 reason。
