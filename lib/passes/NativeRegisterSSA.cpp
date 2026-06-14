@@ -1251,7 +1251,16 @@ private:
       trial.Flags.push_back("path_realistic");
       return;
     }
+    if (callInputTrialHasFlag(trial, "conditional_effect")) {
+      trial.Flags.push_back("path_conditional");
+      return;
+    }
     trial.Flags.push_back("path_blocked");
+  }
+
+  bool callInputTrialHasFlag(const CallInputTrialInfo &trial,
+                             llvm::StringRef expected) const {
+    return llvm::is_contained(trial.Flags, expected);
   }
 
   CallInputTrialInfo callInputTrialInfo(
@@ -1484,6 +1493,10 @@ private:
         return CallInputTrialInfo{"return_forward", "inactive",
                                   "return_forward"};
       }
+      if (sawStrong) {
+        return CallInputTrialInfo{"weak_entry_input", "inactive",
+                                  inactiveReason, {"conditional_effect"}};
+      }
       return CallInputTrialInfo{"weak_entry_input", "inactive",
                                 inactiveReason};
     }
@@ -1578,8 +1591,12 @@ private:
         ++Summary.DefinitelyNotUsedCallInputTrials;
       } else if (flag == "killed_by_call") {
         ++Summary.KilledByCallInputTrials;
+      } else if (flag == "conditional_effect") {
+        ++Summary.ConditionalEffectCallInputTrials;
       } else if (flag == "path_realistic") {
         ++Summary.PathRealisticCallInputTrials;
+      } else if (flag == "path_conditional") {
+        ++Summary.PathConditionalCallInputTrials;
       } else if (flag == "path_blocked") {
         ++Summary.PathBlockedCallInputTrials;
       }
@@ -2219,7 +2236,11 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.DefinitelyNotUsedCallInputTrials +=
       function.DefinitelyNotUsedCallInputTrials;
   total.KilledByCallInputTrials += function.KilledByCallInputTrials;
+  total.ConditionalEffectCallInputTrials +=
+      function.ConditionalEffectCallInputTrials;
   total.PathRealisticCallInputTrials += function.PathRealisticCallInputTrials;
+  total.PathConditionalCallInputTrials +=
+      function.PathConditionalCallInputTrials;
   total.PathBlockedCallInputTrials += function.PathBlockedCallInputTrials;
   total.LocalDefCallInputTrials += function.LocalDefCallInputTrials;
   total.LocalConstCallInputTrials += function.LocalConstCallInputTrials;
@@ -2350,8 +2371,12 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
      << summary.DefinitelyNotUsedCallInputTrials << '\n';
   os << "  call input trial flags killed by call: "
      << summary.KilledByCallInputTrials << '\n';
+  os << "  call input trial flags conditional effect: "
+     << summary.ConditionalEffectCallInputTrials << '\n';
   os << "  call input trial flags path realistic: "
      << summary.PathRealisticCallInputTrials << '\n';
+  os << "  call input trial flags path conditional: "
+     << summary.PathConditionalCallInputTrials << '\n';
   os << "  call input trial flags path blocked: "
      << summary.PathBlockedCallInputTrials << '\n';
   os << "  call input trial reasons local def: "
@@ -2403,8 +2428,12 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
        << function.DefinitelyNotUsedCallInputTrials
        << " call_input_trial_flags_killed_by_call="
        << function.KilledByCallInputTrials
+       << " call_input_trial_flags_conditional_effect="
+       << function.ConditionalEffectCallInputTrials
        << " call_input_trial_flags_path_realistic="
        << function.PathRealisticCallInputTrials
+       << " call_input_trial_flags_path_conditional="
+       << function.PathConditionalCallInputTrials
        << " call_input_trial_flags_path_blocked="
        << function.PathBlockedCallInputTrials
        << " call_input_trial_reasons_local_def="

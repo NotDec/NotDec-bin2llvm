@@ -489,6 +489,41 @@ llvm::Function *createStrongPhiCallInputFunction(llvm::Module &module,
   return function;
 }
 
+llvm::Function *createConditionalPhiCallInputFunction(
+    llvm::Module &module, llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "conditional_phi_call_input_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "conditional_phi_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RDI");
+
+  builder.CreateCondBr(llvm::ConstantInt::getFalse(context), left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::StoreInst *leftStore = builder.CreateStore(
+      llvm::ConstantInt::get(rdi->getValueType(), 0x3333), rdi);
+  leftStore->setMetadata("notdec.register.access", metadata);
+  builder.CreateBr(join);
+
+  builder.SetInsertPoint(right);
+  builder.CreateBr(join);
+
+  builder.SetInsertPoint(join);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createReturnForwardCallInputFunction(
     llvm::Module &module, llvm::GlobalVariable *rax) {
   llvm::LLVMContext &context = module.getContext();
@@ -1651,6 +1686,8 @@ int main() {
   llvm::Function *blockedCallInput = createBlockedCallInputFunction(module, rdi);
   llvm::Function *strongPhiCallInput =
       createStrongPhiCallInputFunction(module, rdi);
+  llvm::Function *conditionalPhiCallInput =
+      createConditionalPhiCallInputFunction(module, rdi);
   llvm::Function *stackPointerCallEffects =
       createStackPointerCallEffectFunction(module, rsp);
   llvm::Function *repeatedLoadAfterCall =
@@ -1746,8 +1783,13 @@ int main() {
                "flags");
   ok &= expect(summary.KilledByCallInputTrials >= 1,
                "register SSA summary missed killed-by-call call input flags");
+  ok &= expect(summary.ConditionalEffectCallInputTrials >= 1,
+               "register SSA summary missed conditional-effect call input "
+               "flags");
   ok &= expect(summary.PathRealisticCallInputTrials >= 1,
                "register SSA summary missed path-realistic call input flags");
+  ok &= expect(summary.PathConditionalCallInputTrials >= 1,
+               "register SSA summary missed path-conditional call input flags");
   ok &= expect(summary.PathBlockedCallInputTrials >= 1,
                "register SSA summary missed path-blocked call input flags");
   ok &= expect(summary.LocalConstCallInputTrials >= 1,
@@ -1888,6 +1930,16 @@ int main() {
   ok &= expect(callInputCandidateHasField(*strongPhiCallInput, "RDI",
                                           "trial_reason=phi"),
                "RDI PHI call input did not record phi reason");
+  ok &= expect(callInputCandidateHasField(*conditionalPhiCallInput, "RDI",
+                                          "trial_state=inactive"),
+               "RDI conditional PHI call input was not inactive");
+  ok &= expect(callInputCandidateHasField(*conditionalPhiCallInput, "RDI",
+                                          "trial_reason=entry_input"),
+               "RDI conditional PHI call input did not keep entry reason");
+  ok &= expect(callInputCandidateHasField(
+                   *conditionalPhiCallInput, "RDI",
+                   "trial_flags=conditional_effect,path_conditional"),
+               "RDI conditional PHI call input did not record flags");
   ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
                "RSP load after call was not propagated");
   ok &= expect(countRegisterLoads(*repeatedLoadAfterCall, rax) == 0,

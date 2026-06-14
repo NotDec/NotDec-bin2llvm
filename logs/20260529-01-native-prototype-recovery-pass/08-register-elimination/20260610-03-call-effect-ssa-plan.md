@@ -2853,3 +2853,81 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test
 - 实现效果：7/10。descendant use 递归开始影响真实样本，active 增加 2，shared-use 明显减少；但目前只覆盖 cast / PHI。
 - 复杂度：5/10。递归带 visited，范围仍局限在 use check。
 - 维护成本：5/10。后续要补 Ghidra 的 `PIECE/SUBPIECE` 对应逻辑时，可以扩展 `isTransparentCallInputDescendant()`，但不能把普通运算也塞进去。
+
+## 2026-06-14 实现记录：conditional PHI trial flags
+
+本次继续推进阶段 3d 里 Ghidra `AncestorRealistic` 对 PHI / `MULTIEQUAL` 的处理。Ghidra 遇到一条 solid path 和一条 killed/failing path 时，会给 trial 设置 `condExeEffect`，后续再 final check。native 侧目前还没有 final check，也没有让 prototype recovery 跳过带 conditional effect 的 active trial，所以这次采取保守策略：mixed PHI 仍保持 `inactive`，但写入 `conditional_effect` 和 `path_conditional` flag。
+
+这一步的目标是把条件路径风险显式化，不提前扩大 active。
+
+### 改动
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:45`
+  - summary 增加 `ConditionalEffectCallInputTrials`。
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:47`
+  - summary 增加 `PathConditionalCallInputTrials`。
+- `lib/passes/NativeRegisterSSA.cpp:1254`
+  - `addCallInputPathFlag()` 遇到 `conditional_effect` 时写 `path_conditional`。
+- `lib/passes/NativeRegisterSSA.cpp:1261`
+  - 新增 `callInputTrialHasFlag()`。
+- `lib/passes/NativeRegisterSSA.cpp:1498`
+  - `phiInputTrialInfo()` 发现 mixed strong/inactive PHI 时返回 inactive，并写 `conditional_effect`。
+- `lib/passes/NativeRegisterSSA.cpp:1594`
+  - `countCallInputTrialFlags()` 增加 `conditional_effect` / `path_conditional` 计数。
+- `lib/passes/NativeRegisterSSA.cpp:2239`
+  - `addFunctionSummary()` 汇总新增 flag 计数。
+- `lib/passes/NativeRegisterSSA.cpp:2375`
+  - summary 打印新增 flag 计数。
+- `tests/native_register_effects_test.cpp:492`
+  - 新增 `createConditionalPhiCallInputFunction()`，构造一条路径写 RDI、另一条路径不写 RDI 的 PHI。
+- `tests/native_register_effects_test.cpp:1689`
+  - main 中加入 conditional PHI 测试函数。
+- `tests/native_register_effects_test.cpp:1786`
+  - summary 增加 conditional/path-conditional flag 断言。
+- `tests/native_register_effects_test.cpp:1933`
+  - metadata 断言 conditional PHI 是 `inactive/entry_input`，并带 `trial_flags=conditional_effect,path_conditional`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-conditional-phi %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-conditional-phi.ll
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-conditional-phi.ll \
+  -o /tmp/hexx64-1156e0-conditional-phi.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-conditional-phi.bc \
+  -o /tmp/hexx64-1156e0-conditional-phi.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.76s`。
+- summary 输出：
+  - `call input trials active: 455`
+  - `call input trials inactive: 1429`
+  - `call input trials no use: 2490`
+  - `call input trial flags conditional effect: 5`
+  - `call input trial flags path conditional: 5`
+  - `call input trial flags path realistic: 455`
+  - `call input trial flags path blocked: 3914`
+
+### 判断
+
+- 实现效果：6/10。mixed PHI 风险已经可观测，真实样本里有 5 个；但还没有做 Ghidra 的 final check。
+- 复杂度：4/10。只在 PHI 合并处加 flags，没改 prototype recovery。
+- 维护成本：4/10。后续如果要把 conditional trial 改成 active，需要先让 prototype recovery 跳过或二次确认 `conditional_effect`。
