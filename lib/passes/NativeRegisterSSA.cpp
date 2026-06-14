@@ -117,6 +117,7 @@ struct CallInputTrialContext {
   llvm::Instruction *Candidate = nullptr;
   std::string CallsiteId;
   std::string RegisterName;
+  std::string CalleeName;
 };
 
 enum class CallInputUseCheckResult {
@@ -1147,6 +1148,7 @@ private:
           llvm::MDString::get(context,
                               "callsite_id=" + callsiteId(call)),
           llvm::MDString::get(context, "slot=" + std::to_string(slot)),
+          llvm::MDString::get(context, "callee=" + directCalleeName(call)),
           llvm::MDString::get(context, "storage=register"),
           llvm::MDString::get(context, "base=" + unit.Name),
           llvm::MDString::get(context, "space=register"),
@@ -1190,6 +1192,7 @@ private:
         trialContext.Candidate = &inst;
         trialContext.CallsiteId = mdField(metadata, "callsite_id").value_or("");
         trialContext.RegisterName = mdField(metadata, "register").value_or("");
+        trialContext.CalleeName = mdField(metadata, "callee").value_or("");
         std::set<llvm::Value *> visiting;
         CallInputTrialInfo trial =
             callInputTrialInfo(candidateValue, trialContext, visiting);
@@ -1443,6 +1446,9 @@ private:
         continue;
       }
       if (isOtherCallsiteInputHelper(*userInst, context)) {
+        if (isAllowedDoubleCallInputUse(*userInst, context)) {
+          continue;
+        }
         return CallInputUseCheckResult::DoubleCallUse;
       }
       if (isSameRegisterDefinitionStore(*userInst, value, context)) {
@@ -1465,6 +1471,40 @@ private:
     return llvm::isa<llvm::CastInst>(inst) || llvm::isa<llvm::PHINode>(inst) ||
            llvm::isa<llvm::ExtractValueInst>(inst) ||
            llvm::isa<llvm::InsertValueInst>(inst);
+  }
+
+  bool instructionComesBefore(const llvm::Instruction &first,
+                              const llvm::Instruction &second) const {
+    if (first.getParent() != second.getParent()) {
+      return false;
+    }
+    for (auto iter = first.getIterator(), end = first.getParent()->end();
+         iter != end; ++iter) {
+      if (&*iter == &second) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool isAllowedDoubleCallInputUse(
+      llvm::Instruction &user, const CallInputTrialContext &context) const {
+    if (context.Candidate == nullptr || context.CalleeName.empty()) {
+      return false;
+    }
+    llvm::MDNode *metadata =
+        user.getMetadata("notdec.register.call_input_candidate");
+    if (metadata == nullptr ||
+        mdField(metadata, "register") !=
+            std::optional<std::string>(context.RegisterName) ||
+        mdField(metadata, "callee") !=
+            std::optional<std::string>(context.CalleeName)) {
+      return false;
+    }
+    if (user.getParent() != context.Candidate->getParent()) {
+      return true;
+    }
+    return instructionComesBefore(*context.Candidate, user);
   }
 
   bool isSameCallsiteInputHelper(llvm::Instruction &user,
@@ -2074,6 +2114,14 @@ private:
       return "";
     }
     return found->second.Id;
+  }
+
+  std::string directCalleeName(const llvm::CallBase &call) const {
+    llvm::Function *callee = call.getCalledFunction();
+    if (callee == nullptr) {
+      return "";
+    }
+    return callee->getName().str();
   }
 
   void eraseUnusedPendingPhis() {

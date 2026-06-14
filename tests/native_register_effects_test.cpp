@@ -362,6 +362,35 @@ llvm::Function *createDoubleCallUseCallInputFunction(
   return function;
 }
 
+llvm::Function *createSameCalleeDoubleCallUseCallInputFunction(
+    llvm::Module &module, llvm::GlobalVariable *rdi) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "same_callee_double_call_use_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "same_callee_double_call_use_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *metadata = registerAccessMetadata(context, "RDI");
+  llvm::AllocaInst *slot = builder.CreateAlloca(rdi->getValueType());
+  builder.CreateStore(llvm::ConstantInt::get(rdi->getValueType(), 13), slot);
+  llvm::Value *base = builder.CreateLoad(rdi->getValueType(), slot);
+  llvm::Value *value =
+      builder.CreateAdd(base, llvm::ConstantInt::get(rdi->getValueType(), 14));
+  llvm::StoreInst *firstStore = builder.CreateStore(value, rdi);
+  firstStore->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  llvm::StoreInst *secondStore = builder.CreateStore(value, rdi);
+  secondStore->setMetadata("notdec.register.access", metadata);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
 llvm::Function *createCastCallInputFunction(llvm::Module &module,
                                             llvm::GlobalVariable *rdi) {
   llvm::LLVMContext &context = module.getContext();
@@ -1504,6 +1533,36 @@ unsigned countCallInputCandidates(const llvm::Function &function,
   return count;
 }
 
+unsigned countCallInputCandidatesWithField(const llvm::Function &function,
+                                           llvm::StringRef name,
+                                           llvm::StringRef expectedField) {
+  unsigned count = 0;
+  std::string expectedRegister = ("register=" + name).str();
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      llvm::MDNode *node =
+          inst.getMetadata("notdec.register.call_input_candidate");
+      if (node == nullptr) {
+        continue;
+      }
+      bool hasRegister = false;
+      bool hasField = false;
+      for (const llvm::MDOperand &operand : node->operands()) {
+        auto *field = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (field == nullptr) {
+          continue;
+        }
+        hasRegister |= field->getString() == expectedRegister;
+        hasField |= field->getString() == expectedField;
+      }
+      if (hasRegister && hasField) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
 bool hasCallInputCandidateMetadata(const llvm::Function &function,
                                    llvm::StringRef name) {
   std::string expectedRegister = ("register=" + name).str();
@@ -1734,6 +1793,8 @@ int main() {
       createAggregateTransparentUseCallInputFunction(module, rdi);
   llvm::Function *doubleCallUseCallInput =
       createDoubleCallUseCallInputFunction(module, rdi);
+  llvm::Function *sameCalleeDoubleCallUseCallInput =
+      createSameCalleeDoubleCallUseCallInputFunction(module, rdi);
   llvm::Function *castCallInput = createCastCallInputFunction(module, rdi);
   llvm::Function *localLoadCallInput =
       createLocalLoadCallInputFunction(module, rdi);
@@ -1959,6 +2020,14 @@ int main() {
   ok &= expect(callInputCandidateHasField(*doubleCallUseCallInput, "RDI",
                                           "trial_reason=local_double_call_use"),
                "RDI double-call-use call input reason was missing");
+  ok &= expect(countCallInputCandidatesWithField(
+                   *sameCalleeDoubleCallUseCallInput, "RDI",
+                   "trial_state=active") == 1,
+               "same-callee double-call-use did not keep first RDI input active");
+  ok &= expect(countCallInputCandidatesWithField(
+                   *sameCalleeDoubleCallUseCallInput, "RDI",
+                   "trial_reason=local_double_call_use") == 1,
+               "same-callee double-call-use did not reject the later RDI input");
   ok &= expect(callInputCandidateHasField(*castCallInput, "RDI",
                                           "trial_state=active"),
                "RDI cast call input was not active");

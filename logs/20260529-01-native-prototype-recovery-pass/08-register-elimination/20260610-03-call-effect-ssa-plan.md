@@ -3417,3 +3417,80 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 实现效果：7/10。修掉了“本地表达式包着 entry register input 仍被当 active”的明显问题，尤其覆盖 partial register write 保留旧 bits 的场景。
 - 复杂度：3/10。递归 operand 检查很直接，但会影响 trial 分类数量。
 - 维护成本：4/10。后续完整 ancestor 需要区分更多来源；这个函数可以继续作为 entry-input 边界判断。
+
+## 2026-06-14 实现记录：same-callee double-use 子集
+
+本次推进 Ghidra `checkCallDoubleUse()` 的一个保守子集。Ghidra 对同一个 value 被另一个 CALL 使用时，不是直接按普通 shared use 拒绝；如果两个 call 是同一个目标、同一个 storage，并且当前 call 更早，它会认为当前 call 先使用这个参数，不拒绝当前 trial。
+
+native 侧这次只做 direct call、同 callee、同 register、同 block 中当前 candidate 在另一个 candidate 前面的情况。不同 callee、indirect call、较晚 call 仍按 `local_double_call_use` 保守处理。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:1151`
+  - call input candidate metadata 增加 `callee=<direct callee name>`。
+  - indirect call 写空字符串，不进入允许规则。
+
+- `lib/passes/NativeRegisterSSA.cpp:1195`
+  - `CallInputTrialContext` 读取 `callee` 字段。
+
+- `lib/passes/NativeRegisterSSA.cpp:1448`
+  - `checkCallInputUses()` 遇到其它 call input helper 时，先调用 `isAllowedDoubleCallInputUse()`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1476`
+  - 新增 `instructionComesBefore()`，用于同 block 顺序判断。
+
+- `lib/passes/NativeRegisterSSA.cpp:1490`
+  - 新增 `isAllowedDoubleCallInputUse()`。
+  - 当前只允许同 direct callee、同 register，且当前 candidate 早于另一个 candidate；不同 block 暂按 Ghidra 注释保守允许。
+
+- `lib/passes/NativeRegisterSSA.cpp:2119`
+  - 新增 `directCalleeName()`。
+
+- `tests/native_register_effects_test.cpp:366`
+  - 新增 same-callee double-use 测试函数。
+
+- `tests/native_register_effects_test.cpp:1536`
+  - 新增 `countCallInputCandidatesWithField()`，用于统计同一函数里多个 candidate 的状态。
+
+- `tests/native_register_effects_test.cpp:1796`
+  - main 中加入 same-callee double-use 测试函数。
+
+- `tests/native_register_effects_test.cpp:2023`
+  - 断言同 callee 两次使用同一 prepared value 时，较早 call 保持一个 active，较晚 call 保留一个 `local_double_call_use`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-double-use-check %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-double-use-check.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-double-use-check.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-double-use-check.ll \
+  -o /tmp/hexx64-1156e0-double-use-check.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-double-use-check.bc \
+  -o /tmp/hexx64-1156e0-double-use-check.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`77.06s`。
+- hexx64 summary 和上一轮一致，说明真实样本剩余 2 个 `local_double_call_use` 不属于 direct same-callee 允许子集。
+
+### 判断
+
+- 实现效果：5/10。补上了 Ghidra double-use 的一个明确安全子集，但还没处理 indirect call、跨 block dominance、已检查 trial 的互斥关系。
+- 复杂度：3/10。多了 callee metadata 和顺序判断，但仍局部。
+- 维护成本：4/10。后续如果要完整复刻 Ghidra，需要把 callsite model 和 trial checked/active 状态纳入判断。
