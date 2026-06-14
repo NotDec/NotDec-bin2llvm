@@ -2785,3 +2785,71 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test
 - 实现效果：5/10。路径合理性已经进入 metadata/summary，但还只是按当前 state 映射，不是完整 Ghidra DFS。
 - 复杂度：3/10。只新增 path flag 和统计。
 - 维护成本：3/10。后续完整 `AncestorRealistic` 可以集中替换 `addCallInputPathFlag()`，不会影响 prototype recovery 消费路径。
+
+## 2026-06-14 实现记录：descendant only-use recursion
+
+本次推进阶段 3d 的 `onlyOpUse()` 方向。Ghidra 的 `onlyOpUse()` 不只看当前 varnode 的直接 use；遇到 `COPY`、`MULTIEQUAL`、`INT_ZEXT`、`INT_SEXT`、`CAST` 这类透明派生时，会继续往后追派生 varnode 的 use。native 侧这次先做 LLVM 版保守子集：`checkCallInputUses()` 遇到 cast / PHI user 时递归检查派生 instruction；如果派生链最终仍只服务当前 call input helper，就不算普通 shared use。
+
+这一步会影响 trial 判定，但只放宽透明派生 use，不放宽普通运算、load/store、return 或 double-call-use。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:1365`
+  - `checkCallInputUses()` 增加 visited 集合入口，避免透明 use 递归遇到环。
+- `lib/passes/NativeRegisterSSA.cpp:1371`
+  - 新增递归版 `checkCallInputUses()`。
+- `lib/passes/NativeRegisterSSA.cpp:1391`
+  - 直接 use 不是当前 call helper、不是同 register store、不是其它 call helper 时，先判断是否是透明派生 use。
+- `lib/passes/NativeRegisterSSA.cpp:1404`
+  - 新增 `isTransparentCallInputDescendant()`，第一版只认 LLVM `CastInst` 和 `PHINode`。
+- `tests/native_register_effects_test.cpp:273`
+  - 新增 `createTransparentUseCallInputFunction()`，构造一个额外 dead cast use。
+- `tests/native_register_effects_test.cpp:1641`
+  - main 中加入 transparent-use 测试函数。
+- `tests/native_register_effects_test.cpp:1826`
+  - 断言 transparent-use candidate 仍是 `active/local_arith`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-descendant-use %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-descendant-use.ll
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-descendant-use.ll \
+  -o /tmp/hexx64-1156e0-descendant-use.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-descendant-use.bc \
+  -o /tmp/hexx64-1156e0-descendant-use.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`72.26s`。
+- summary 输出：
+  - `call input trials active: 455`
+  - `call input trials inactive: 1429`
+  - `call input trials no use: 2490`
+  - `call input trial reasons local cast: 54`
+  - `call input trial reasons local shared use: 230`
+  - `call input trial reasons local double call use: 155`
+  - `call input trial reasons phi: 1`
+
+### 判断
+
+- 实现效果：7/10。descendant use 递归开始影响真实样本，active 增加 2，shared-use 明显减少；但目前只覆盖 cast / PHI。
+- 复杂度：5/10。递归带 visited，范围仍局限在 use check。
+- 维护成本：5/10。后续要补 Ghidra 的 `PIECE/SUBPIECE` 对应逻辑时，可以扩展 `isTransparentCallInputDescendant()`，但不能把普通运算也塞进去。

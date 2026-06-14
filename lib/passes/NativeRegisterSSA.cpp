@@ -1364,6 +1364,16 @@ private:
 
   CallInputUseCheckResult checkCallInputUses(
       llvm::Instruction &value, const CallInputTrialContext &context) {
+    std::set<llvm::Instruction *> visiting;
+    return checkCallInputUses(value, context, visiting);
+  }
+
+  CallInputUseCheckResult checkCallInputUses(
+      llvm::Instruction &value, const CallInputTrialContext &context,
+      std::set<llvm::Instruction *> &visiting) {
+    if (!visiting.insert(&value).second) {
+      return CallInputUseCheckResult::OnlyCurrentCall;
+    }
     for (const llvm::Use &use : value.uses()) {
       auto *userInst = llvm::dyn_cast<llvm::Instruction>(use.getUser());
       if (userInst == nullptr) {
@@ -1378,9 +1388,21 @@ private:
       if (isSameRegisterDefinitionStore(*userInst, value, context)) {
         continue;
       }
+      if (isTransparentCallInputDescendant(*userInst)) {
+        CallInputUseCheckResult result =
+            checkCallInputUses(*userInst, context, visiting);
+        if (result != CallInputUseCheckResult::OnlyCurrentCall) {
+          return result;
+        }
+        continue;
+      }
       return CallInputUseCheckResult::SharedUse;
     }
     return CallInputUseCheckResult::OnlyCurrentCall;
+  }
+
+  bool isTransparentCallInputDescendant(const llvm::Instruction &inst) const {
+    return llvm::isa<llvm::CastInst>(inst) || llvm::isa<llvm::PHINode>(inst);
   }
 
   bool isSameCallsiteInputHelper(llvm::Instruction &user,
