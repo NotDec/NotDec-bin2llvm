@@ -908,6 +908,34 @@ private:
     return false;
   }
 
+  bool valueDependsOnRegisterExternalInput(llvm::Value &value) {
+    std::set<llvm::Value *> seen;
+    return valueDependsOnRegisterExternalInput(value, seen);
+  }
+
+  bool valueDependsOnRegisterExternalInput(llvm::Value &value,
+                                           std::set<llvm::Value *> &seen) {
+    if (!seen.insert(&value).second) {
+      return false;
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&value)) {
+      if (load->getMetadata("notdec.register.external_input") != nullptr) {
+        AccessInfo access = registerLoad(*load, Units);
+        return access.Unit != nullptr;
+      }
+    }
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(&value);
+    if (inst == nullptr) {
+      return false;
+    }
+    for (llvm::Value *operand : inst->operands()) {
+      if (valueDependsOnRegisterExternalInput(*operand, seen)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   llvm::Value *resizeInteger(llvm::IRBuilder<> &builder, llvm::Value *value,
                              llvm::IntegerType *targetType) {
     auto *valueType = llvm::dyn_cast<llvm::IntegerType>(value->getType());
@@ -1324,6 +1352,10 @@ private:
       }
       if (inst->getFunction() == &Function) {
         if (isSafeCallInputArithmetic(*inst)) {
+          if (valueDependsOnRegisterExternalInput(*inst)) {
+            return CallInputTrialInfo{"weak_entry_input", "inactive",
+                                      "entry_input"};
+          }
           CallInputTrialInfo useTrial = callInputUseTrialInfo(*inst, context);
           if (useTrial.State != "active") {
             return useTrial;
@@ -1332,6 +1364,10 @@ private:
                                     "local_arith"};
         }
         if (isSafeCallInputCastOrAddress(*inst)) {
+          if (valueDependsOnRegisterExternalInput(*inst)) {
+            return CallInputTrialInfo{"weak_entry_input", "inactive",
+                                      "entry_input"};
+          }
           CallInputTrialInfo useTrial = callInputUseTrialInfo(*inst, context);
           if (useTrial.State != "active") {
             return useTrial;

@@ -3339,3 +3339,81 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 实现效果：4/10。只是把后续 overlap 判断需要的信息显式写到 helper metadata，尚未实现子寄存器 trial 规则。
 - 复杂度：1/10。metadata 扩字段，不改变数据流。
 - 维护成本：2/10。字段和现有 `notdec.register.access` 风格一致，后续 consumer 可以直接复用。
+
+## 2026-06-14 实现记录：local expression 依赖 entry input 时降级
+
+本次继续收紧 ancestor/use 判定。之前本地 `add/and/or/trunc` 这类表达式只要 use 检查通过，就会被标成 `active`。但部分寄存器写会生成类似：
+
+```text
+new_full = (old_full & keep_mask) | new_low_bits
+```
+
+其中 `old_full` 可能是 function entry register input。Ghidra 的 ancestor 思路遇到 input varnode 会停住并保守判断，native 侧也不能把这种值当成完全由本函数准备出来的 active 参数。
+
+这一步规则是：本地 arithmetic / cast / address 表达式如果 operand 链依赖 `notdec.register.external_input`，就降为 `inactive / entry_input`。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:911`
+  - 新增 `valueDependsOnRegisterExternalInput()`，递归检查 value operand 链是否读到 register external input。
+
+- `lib/passes/NativeRegisterSSA.cpp:1355`
+  - `callInputTrialInfo()` 对 safe arithmetic 先检查 entry register input 依赖；命中则返回 `weak_entry_input / inactive / entry_input`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1367`
+  - safe cast/address 走同样检查。
+
+- `tests/native_register_effects_test.cpp:583`
+  - 新增 `createPartialEntryInputCallInputFunction()`。
+  - 构造只写 `AL` 后立刻 call 的场景，full `RAX` call input 仍依赖旧 high bits。
+
+- `tests/native_register_effects_test.cpp:2161`
+  - 把该函数加入 RAX ABI 测试模块。
+
+- `tests/native_register_effects_test.cpp:2179`
+  - 断言该 call input 是 `inactive`，reason 是 `entry_input`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-entry-dep %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-entry-dep.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-entry-dep.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-entry-dep.ll \
+  -o /tmp/hexx64-1156e0-entry-dep.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-entry-dep.bc \
+  -o /tmp/hexx64-1156e0-entry-dep.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`77.26s`。
+- hexx64 summary 明显收紧：
+  - `call input trials active: 455 -> 260`
+  - `call input trials inactive: 1425 -> 1619`
+  - `call input trials no use: 2494 -> 2495`
+  - `call input trial reasons entry input: 0 -> 406`
+  - `call input trial reasons local arith: 154 -> 12`
+  - `call input trial reasons local cast: 54 -> 2`
+  - `call input trial reasons local shared use: 231 -> 39`
+  - `call input trial reasons local double call use: 152 -> 2`
+
+### 判断
+
+- 实现效果：7/10。修掉了“本地表达式包着 entry register input 仍被当 active”的明显问题，尤其覆盖 partial register write 保留旧 bits 的场景。
+- 复杂度：3/10。递归 operand 检查很直接，但会影响 trial 分类数量。
+- 维护成本：4/10。后续完整 ancestor 需要区分更多来源；这个函数可以继续作为 entry-input 边界判断。

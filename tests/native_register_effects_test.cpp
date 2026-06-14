@@ -580,6 +580,28 @@ llvm::Function *createReturnForwardCallInputFunction(
   return function;
 }
 
+llvm::Function *createPartialEntryInputCallInputFunction(
+    llvm::Module &module, llvm::GlobalVariable *rax) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "partial_entry_input_call_input_callee", module);
+  auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(funcType, llvm::GlobalValue::ExternalLinkage,
+                             "partial_entry_input_call_input", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::MDNode *alMetadata = registerAccessMetadata(context, "RAX", "AL", 0, 1);
+  llvm::StoreInst *partial = builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0x7f), rax);
+  partial->setMetadata("notdec.register.access", alMetadata);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+  return function;
+}
+
 std::unique_ptr<llvm::Module> createMissingPhiIncomingModule(
     llvm::LLVMContext &context) {
   auto module = std::make_unique<llvm::Module>("missing-phi-incoming", context);
@@ -2136,6 +2158,9 @@ int main() {
   llvm::Function *returnForwardCallInput =
       createReturnForwardCallInputFunction(returnForwardModule,
                                            returnForwardRax);
+  llvm::Function *partialEntryInputCallInput =
+      createPartialEntryInputCallInputFunction(returnForwardModule,
+                                               returnForwardRax);
   notdec::bin2llvm::NativeRegisterSSASummary returnForwardSummary =
       notdec::bin2llvm::runNativeRegisterSSA(returnForwardModule, options);
   if (llvm::verifyModule(returnForwardModule, &llvm::errs())) {
@@ -2151,6 +2176,14 @@ int main() {
   ok &= expect(callInputCandidateHasField(*returnForwardCallInput, "RAX",
                                           "trial_reason=return_forward"),
                "RAX call input forwarding prior return reason was missing");
+  ok &= expect(callInputCandidateHasField(*partialEntryInputCallInput, "RAX",
+                                          "trial_state=inactive"),
+               "partial RAX call input depending on entry input was not "
+               "inactive");
+  ok &= expect(callInputCandidateHasField(*partialEntryInputCallInput, "RAX",
+                                          "trial_reason=entry_input"),
+               "partial RAX call input depending on entry input did not record "
+               "entry_input reason");
   ok &= expect(returnForwardSummary.WeakCallInputs >= 1,
                "return-forward summary missed non-strong call input");
   ok &= expect(returnForwardSummary.ReturnForwardCallInputTrials >= 1,
