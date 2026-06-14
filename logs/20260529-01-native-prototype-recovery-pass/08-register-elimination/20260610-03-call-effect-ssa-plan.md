@@ -2559,3 +2559,84 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test
 - 实现效果：7/10。active 进一步收紧了，说明 use 检查有效；同时也证明当前 native 结果还和 Ghidra 的完整 `ancestorOpUse` 有差距。
 - 复杂度：6/10。多了上下文和一次 use 遍历，但还是局部逻辑。
 - 维护成本：5/10。后续如果要更贴近 Ghidra，下一步该把 PHI / copy / cast 的祖先追踪做完整，而不是继续堆新的 reason。
+
+## 2026-06-14 实现记录：double call use reason
+
+本次继续推进阶段 3d 的 `checkCallDoubleUse()` 入口。Ghidra 遇到另一个 CALL use 时不是直接和普通 shared use 混在一起，而是留出独立判断。native 侧这次先保守处理：double-call-use 仍是 `inactive`，但 reason 单独记录为 `local_double_call_use`，后续可以在这个入口上实现真正的允许/拒绝规则。
+
+### 改动
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:50`
+  - summary 增加 `LocalDoubleCallUseCallInputTrials`。
+- `lib/passes/NativeRegisterSSA.cpp:121`
+  - 新增 `CallInputUseCheckResult`，区分 `OnlyCurrentCall` / `SharedUse` / `DoubleCallUse`。
+- `lib/passes/NativeRegisterSSA.cpp:1320`
+  - 新增 `callInputUseTrialInfo()`，把 use 检查结果转成 trial state/reason。
+- `lib/passes/NativeRegisterSSA.cpp:1336`
+  - `checkCallInputUses()` 发现另一个 call input helper 使用同一 value 时返回 `DoubleCallUse`。
+- `lib/passes/NativeRegisterSSA.cpp:1376`
+  - 新增 `isOtherCallsiteInputHelper()`。
+- `lib/passes/NativeRegisterSSA.cpp:1502`
+  - `countCallInputTrialReason()` 增加 `local_double_call_use`。
+- `lib/passes/NativeRegisterSSA.cpp:2162`
+  - `addFunctionSummary()` 汇总新增 reason。
+- `lib/passes/NativeRegisterSSA.cpp:2294`
+  - summary 打印新增 reason。
+- `tests/native_register_effects_test.cpp:273`
+  - 新增 `createDoubleCallUseCallInputFunction()`，同一个本地 value 分别喂给两个 callsite。
+- `tests/native_register_effects_test.cpp:1615`
+  - main 中加入 double-call-use 测试函数。
+- `tests/native_register_effects_test.cpp:1728`
+  - summary 增加 `LocalDoubleCallUseCallInputTrials` 断言。
+- `tests/native_register_effects_test.cpp:1789`
+  - metadata 增加 `trial_reason=local_double_call_use` 断言。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-double-call-use %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-double-call-use.ll
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-double-call-use.ll \
+  -o /tmp/hexx64-1156e0-double-call-use.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-double-call-use.bc \
+  -o /tmp/hexx64-1156e0-double-call-use.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`68.91s`。
+- summary 输出：
+  - `call input trials active: 453`
+  - `call input trials inactive: 1431`
+  - `call input trials no use: 2490`
+  - `call input trial reasons local const: 246`
+  - `call input trial reasons local arith: 154`
+  - `call input trial reasons local cast: 53`
+  - `call input trial reasons local load: 558`
+  - `call input trial reasons local shared use: 308`
+  - `call input trial reasons local double call use: 79`
+  - `call input trial reasons entry input: 1`
+  - `call input trial reasons call effect: 2490`
+  - `call input trial reasons return forward: 485`
+
+### 判断
+
+- 实现效果：6/10。没有放宽 double-call-use，只是把它从普通 shared use 中拆出来；这符合阶段 3d 先留出 `checkCallDoubleUse()` 入口的目标。
+- 复杂度：4/10。只是把 bool use check 改成三态结果。
+- 维护成本：4/10。后续真正实现 Ghidra 式 double-use 规则时，入口已经明确，不需要再从 `local_shared_use` 里反推。

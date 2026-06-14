@@ -118,6 +118,12 @@ struct CallInputTrialContext {
   std::string RegisterName;
 };
 
+enum class CallInputUseCheckResult {
+  OnlyCurrentCall,
+  SharedUse,
+  DoubleCallUse,
+};
+
 bool isFlagRegisterName(llvm::StringRef name) {
   return name == "CF" || name == "PF" || name == "AF" || name == "ZF" ||
          name == "SF" || name == "TF" || name == "IF" || name == "DF" ||
@@ -1244,9 +1250,11 @@ private:
     }
     if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
       CallInputTrialInfo trial = phiInputTrialInfo(*phi, context, visiting);
-      if (trial.State == "active" && !hasOnlyCallInputUses(*phi, context)) {
-        return CallInputTrialInfo{"weak_entry_input", "inactive",
-                                  "local_shared_use"};
+      if (trial.State == "active") {
+        CallInputTrialInfo useTrial = callInputUseTrialInfo(*phi, context);
+        if (useTrial.State != "active") {
+          return useTrial;
+        }
       }
       return trial;
     }
@@ -1263,17 +1271,17 @@ private:
       }
       if (inst->getFunction() == &Function) {
         if (isSafeCallInputArithmetic(*inst)) {
-          if (!hasOnlyCallInputUses(*inst, context)) {
-            return CallInputTrialInfo{"weak_entry_input", "inactive",
-                                      "local_shared_use"};
+          CallInputTrialInfo useTrial = callInputUseTrialInfo(*inst, context);
+          if (useTrial.State != "active") {
+            return useTrial;
           }
           return CallInputTrialInfo{"strong_local_def", "active",
                                     "local_arith"};
         }
         if (isSafeCallInputCastOrAddress(*inst)) {
-          if (!hasOnlyCallInputUses(*inst, context)) {
-            return CallInputTrialInfo{"weak_entry_input", "inactive",
-                                      "local_shared_use"};
+          CallInputTrialInfo useTrial = callInputUseTrialInfo(*inst, context);
+          if (useTrial.State != "active") {
+            return useTrial;
           }
           return CallInputTrialInfo{"strong_local_def", "active",
                                     "local_cast"};
@@ -1309,22 +1317,41 @@ private:
            llvm::isa<llvm::InsertValueInst>(inst);
   }
 
-  bool hasOnlyCallInputUses(llvm::Instruction &value,
-                            const CallInputTrialContext &context) {
+  CallInputTrialInfo callInputUseTrialInfo(
+      llvm::Instruction &value, const CallInputTrialContext &context) {
+    switch (checkCallInputUses(value, context)) {
+    case CallInputUseCheckResult::OnlyCurrentCall:
+      return CallInputTrialInfo{"strong_local_def", "active", "only_use"};
+    case CallInputUseCheckResult::DoubleCallUse:
+      return CallInputTrialInfo{"weak_entry_input", "inactive",
+                                "local_double_call_use"};
+    case CallInputUseCheckResult::SharedUse:
+      return CallInputTrialInfo{"weak_entry_input", "inactive",
+                                "local_shared_use"};
+    }
+    return CallInputTrialInfo{"weak_entry_input", "inactive",
+                              "local_shared_use"};
+  }
+
+  CallInputUseCheckResult checkCallInputUses(
+      llvm::Instruction &value, const CallInputTrialContext &context) {
     for (const llvm::Use &use : value.uses()) {
       auto *userInst = llvm::dyn_cast<llvm::Instruction>(use.getUser());
       if (userInst == nullptr) {
-        return false;
+        return CallInputUseCheckResult::SharedUse;
       }
       if (isSameCallsiteInputHelper(*userInst, context)) {
         continue;
       }
+      if (isOtherCallsiteInputHelper(*userInst, context)) {
+        return CallInputUseCheckResult::DoubleCallUse;
+      }
       if (isSameRegisterDefinitionStore(*userInst, value, context)) {
         continue;
       }
-      return false;
+      return CallInputUseCheckResult::SharedUse;
     }
-    return true;
+    return CallInputUseCheckResult::OnlyCurrentCall;
   }
 
   bool isSameCallsiteInputHelper(llvm::Instruction &user,
@@ -1344,6 +1371,22 @@ private:
     return !context.CallsiteId.empty() &&
            mdField(metadata, "callsite_id") ==
                std::optional<std::string>(context.CallsiteId);
+  }
+
+  bool isOtherCallsiteInputHelper(llvm::Instruction &user,
+                                  const CallInputTrialContext &context) const {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&user);
+    if (call == nullptr || !isNotDecRegisterHelperCall(*call)) {
+      return false;
+    }
+    llvm::MDNode *metadata =
+        call->getMetadata("notdec.register.call_input_candidate");
+    if (metadata == nullptr || &user == context.Candidate) {
+      return false;
+    }
+    std::optional<std::string> callsiteId = mdField(metadata, "callsite_id");
+    return !context.CallsiteId.empty() && callsiteId.has_value() &&
+           *callsiteId != context.CallsiteId;
   }
 
   bool isSameRegisterDefinitionStore(
@@ -1454,6 +1497,10 @@ private:
     }
     if (reason == "local_shared_use") {
       ++Summary.LocalSharedUseCallInputTrials;
+      return;
+    }
+    if (reason == "local_double_call_use") {
+      ++Summary.LocalDoubleCallUseCallInputTrials;
       return;
     }
     if (reason == "phi") {
@@ -2112,6 +2159,8 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.LocalUnknownCallInputTrials += function.LocalUnknownCallInputTrials;
   total.LocalSharedUseCallInputTrials +=
       function.LocalSharedUseCallInputTrials;
+  total.LocalDoubleCallUseCallInputTrials +=
+      function.LocalDoubleCallUseCallInputTrials;
   total.PhiCallInputTrials += function.PhiCallInputTrials;
   total.EntryInputCallInputTrials += function.EntryInputCallInputTrials;
   total.CallEffectCallInputTrials += function.CallEffectCallInputTrials;
@@ -2241,6 +2290,8 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
      << summary.LocalUnknownCallInputTrials << '\n';
   os << "  call input trial reasons local shared use: "
      << summary.LocalSharedUseCallInputTrials << '\n';
+  os << "  call input trial reasons local double call use: "
+     << summary.LocalDoubleCallUseCallInputTrials << '\n';
   os << "  call input trial reasons phi: " << summary.PhiCallInputTrials
      << '\n';
   os << "  call input trial reasons entry input: "
@@ -2284,6 +2335,8 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
        << function.LocalUnknownCallInputTrials
        << " call_input_trial_reasons_local_shared_use="
        << function.LocalSharedUseCallInputTrials
+       << " call_input_trial_reasons_local_double_call_use="
+       << function.LocalDoubleCallUseCallInputTrials
        << " call_input_trial_reasons_phi=" << function.PhiCallInputTrials
        << " call_input_trial_reasons_entry_input="
        << function.EntryInputCallInputTrials
