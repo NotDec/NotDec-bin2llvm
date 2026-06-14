@@ -3494,3 +3494,60 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 实现效果：5/10。补上了 Ghidra double-use 的一个明确安全子集，但还没处理 indirect call、跨 block dominance、已检查 trial 的互斥关系。
 - 复杂度：3/10。多了 callee metadata 和顺序判断，但仍局部。
 - 维护成本：4/10。后续如果要完整复刻 Ghidra，需要把 callsite model 和 trial checked/active 状态纳入判断。
+
+## 2026-06-14 决策点：完整 double-use 需要 trial 级迭代
+
+same-callee double-use 子集之后，`hexx64.so -f 0x1156e0` 仍剩 2 个 `local_double_call_use`。继续照 Ghidra 做完整 `checkCallDoubleUse()` 时，遇到一个计划里还没写清楚的边界：它不是单个 helper 局部判断。
+
+Ghidra 关键逻辑在：
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc:1756`
+  - `Funcdata::checkCallDoubleUse()`
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc:1838`
+  - `onlyOpUse()` 遇到另一个 CALL use 时调用 `checkCallDoubleUse()`。
+
+Ghidra 的判断分两层：
+
+- 如果两个 CALL 是同一个目标、同一个 storage，当前 CALL 更早，当前 trial 可以继续。
+- 否则要看另一个 callsite 的 active input 状态：
+  - 另一个 trial 已 checked 且 active，当前 trial 不能继续。
+  - 另一个 trial 未 checked 时，还要看 alternate path 是否有效。
+  - 某些情况下才允许把 double-use 当成合法复用。
+
+native 当前结构做不到完整复刻，因为：
+
+- `annotateCallInputTrials()` 现在逐个 helper 写 metadata。
+- `callInputTrialInfo()` / `checkCallInputUses()` 只拿当前 `CallInputTrialContext`。
+- 没有“同一函数所有 callsite trial 已创建、已检查、active/no-use 状态可互查”的结构。
+- `trial_state` 是一次写出，不是 Ghidra 那种 active input fully checked 后再统一 resolve。
+
+如果继续实现完整 double-use，需要先改阶段边界：
+
+```text
+收集本函数全部 call input helper
+  -> 创建 trial table：callsite/register/storage/value/state/checked
+  -> 先跑局部 ancestor/use 初判
+  -> 对 double-use、conditional final check 这类依赖其它 trial 的规则做迭代收敛
+  -> 全部 checked 后再写 metadata 和 summary
+  -> PrototypeRecovery 只消费最终 active
+```
+
+这会影响的不只是 double-use：
+
+- conditional final check 也应该接到同一个 finalize 阶段。
+- `active trial 的整体收口` 需要从 summary flag 变成真实状态。
+- PrototypeRecovery 继续保持只读最终 metadata，不应该参与 SSA use 链判断。
+
+当前不能继续把剩下 double-use 用更多局部条件硬判 active。下一步要先明确是否接受这个 RegisterSSA 内的 trial table / finalize 阶段。如果接受，再把阶段 3e 拆成：
+
+1. 建 trial table，只改变内部结构，不改变输出。
+2. 把现有 `callInputTrialInfo()` 迁到 trial table 上。
+3. 把 conditional final check 移到统一 finalize。
+4. 把完整 double-use 依赖 checked/active 的规则放进 finalize。
+5. 最后再考虑清理 no-use helper。
+
+不确定点：
+
+- 这个 trial table 是只存在于 `NativeRegisterSSA.cpp` 内部，还是要暴露到 summary/API，供 PrototypeRecovery 或 Ghidra oracle 对照使用。
+- double-use 的跨 block “same function different basic blocks, assume legit doubleuse” 是否直接照搬。LLVM 这里还要考虑 dominance 和 helper 插入顺序，不能只看 basic block 不同。
+- indirect call 的“同目标”判断要不要依赖 call target SSA value；当前 metadata 只有 direct callee name，不能安全判断 indirect same-target。
