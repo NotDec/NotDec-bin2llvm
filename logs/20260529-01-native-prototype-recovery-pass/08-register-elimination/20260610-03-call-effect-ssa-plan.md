@@ -516,6 +516,12 @@ pass-end finalize 不能作为“补洞兜底”。它只应该完成 Braun SSA 
 - PHI 不再简单要求所有 incoming 都 active；先按 Ghidra `ancestorOpUse()` 的方向，尝试找到能证明只服务当前 call 的 ancestor 路径。
 - 遇到另一个 call 使用同一 value 时，先按 `checkCallDoubleUse()` 留出独立判断入口；第一版可以保守判 inactive，但不能和普通 shared use 混在一起。
 - 补 trial 辅助标记：至少记录 `definitely_not_used`、`killed_by_call`、`conditional_effect`、`unreferenced` 的可观测 metadata / summary。
+- conditional trial 需要单独 final check。Ghidra 对应是：
+  - `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc:5567` 的 `FuncCallSpecs::finalInputCheck()`。
+  - `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc:1740` 的 `ActionActiveParam::apply()`。
+  - Ghidra 先允许 `active + condExeEffect`，等 active input fully checked 后再用 `AncestorRealistic(... allowFail=false)` 复查，不通过则 `markNoUse()`。
+  - native 目前已有 `conditional_effect` metadata 和 prototype recovery consumer guard，但还没有真正 final check。
+  - 这里必须先定 pass 边界：final check 放在 RegisterSSA 里产出最终 `trial_state`，还是放在 PrototypeRecovery 消费前做。
 - `no_use` / `definitely_not_used` helper 后续不参与 prototype recovery；清理阶段可以再决定是删除 helper 还是保留审计信息。
 - 仍然保留递归深度上限和 visited 集合，循环或不确定路径一律 inactive / no_use，不硬判 active。
 - 现有 `ancestorRealisticLite` 和 `local_shared_use` 可以作为第一版实现基础，但后续要避免继续堆 opcode 白名单。
@@ -3045,3 +3051,29 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 实现效果：7/10。mixed PHI 的 trial state 已更接近 Ghidra，且 consumer guard 保证不会提前 rewrite signature。
 - 复杂度：3/10。只调整 PHI 合并状态和 path flag 优先级。
 - 维护成本：4/10。后续还需要真正 final check；当前 `active` 已不等于“prototype recovery 可消费”，消费方必须继续看 flags。
+
+## 2026-06-14 决策点：conditional final check 放在哪里
+
+当前已经做到：
+
+- RegisterSSA 会产生 `active + conditional_effect + path_conditional`。
+- PrototypeRecovery 不消费带 `conditional_effect` 的 call input。
+- hexx64 当前有 4 个 conditional active trial。
+
+但 Ghidra 的完整流程还有 final check：
+
+- `FuncCallSpecs::finalInputCheck()` 只复查 active 且有 `condExeEffect` 的 trial。
+- 复查逻辑是重新跑 `AncestorRealistic(... allowFail=false)`。
+- 复查失败则 `markNoUse()`。
+- 之后才 `resolveModel()` / `deriveInputMap()` / `buildInputFromTrials()`。
+
+native 这里还没定边界：
+
+- 方案 A：在 RegisterSSA 内完成 final check，metadata 输出时就把失败 trial 改成 `no_use`。
+  - 好处：PrototypeRecovery 只消费稳定结果。
+  - 问题：RegisterSSA 需要实现更完整的 `AncestorRealistic`，而且要知道 final check 所需的 callsite 上下文。
+- 方案 B：在 PrototypeRecovery 消费前做 final check。
+  - 好处：更贴近“消费前确认”，能结合 prototype recovery 的 callsite / ABI 信息。
+  - 问题：PrototypeRecovery 需要理解 SSA value/use 链，可能把 RegisterSSA 的分析逻辑搬过去。
+
+目前不能继续默默实现，因为这会决定 pass 边界和 metadata 是否表示“最终判定”。在决策前，保守做法是继续保留 consumer guard，不消费 `conditional_effect`。
