@@ -2931,3 +2931,62 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test
 - 实现效果：6/10。mixed PHI 风险已经可观测，真实样本里有 5 个；但还没有做 Ghidra 的 final check。
 - 复杂度：4/10。只在 PHI 合并处加 flags，没改 prototype recovery。
 - 维护成本：4/10。后续如果要把 conditional trial 改成 active，需要先让 prototype recovery 跳过或二次确认 `conditional_effect`。
+
+## 2026-06-14 实现记录：conditional trial consumer guard
+
+上一步已经把 mixed PHI 标成 `conditional_effect`，但当前 prototype recovery 只看 `trial_state=active`。为了后续能更接近 Ghidra，把 conditional trial 临时标 active 后再 final check，本次先补 consumer 侧护栏：只要 call input candidate 带 `trial_flags` 的 `conditional_effect`，即使 `trial_state=active`，prototype recovery 也暂时不消费。
+
+当前 RegisterSSA 还没有产生 active+conditional 的 candidate，所以这一步不改变 hexx64 行为，只防止后续放宽 PHI 规则时提前改 signature。
+
+### 改动
+
+- `lib/passes/NativePrototypeRecovery.cpp:52`
+  - 新增 `metadataListFieldContains()`，按逗号分隔匹配 metadata list 字段。
+- `lib/passes/NativePrototypeRecovery.cpp:944`
+  - `callInputCandidateIsActive()` 增加 `conditional_effect` guard。
+- `tests/native_prototype_recovery_test.cpp:1241`
+  - `createCallInputHelperCallerFunction()` 支持写 `trial_flags`。
+- `tests/native_prototype_recovery_test.cpp:7183`
+  - 新增 active+conditional helper 测试，确认 declaration callee 不被 rewrite。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/usr/bin/time -f 'TIME native-llvm-conditional-consumer %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-conditional-consumer.ll
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-conditional-consumer.ll \
+  -o /tmp/hexx64-1156e0-conditional-consumer.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-conditional-consumer.bc \
+  -o /tmp/hexx64-1156e0-conditional-consumer.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`68.98s`。
+- summary 与上一轮一致：
+  - `call input trials active: 455`
+  - `call input trials inactive: 1429`
+  - `call input trial flags conditional effect: 5`
+  - `call input trial flags path conditional: 5`
+
+### 判断
+
+- 实现效果：6/10。consumer 侧已有 conditional guard，为后续更接近 Ghidra 的 PHI active/final-check 铺路。
+- 复杂度：3/10。只增加一个 metadata list 匹配和 focused 测试。
+- 维护成本：3/10。后续如果实现真正 final check，只需要把 guard 从“直接拒绝”改成“final check 通过后消费”。

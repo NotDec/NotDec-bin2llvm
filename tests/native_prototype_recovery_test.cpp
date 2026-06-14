@@ -1211,7 +1211,8 @@ llvm::Function *createInputStoreCallerFunction(llvm::Module &module,
 llvm::Function *createCallInputHelperCallerFunction(
     llvm::Module &module, const std::string &name, llvm::Function *callee,
     const std::string &registerName,
-    const std::optional<std::string> &trialState, llvm::CallInst **callOut) {
+    const std::optional<std::string> &trialState, llvm::CallInst **callOut,
+    const std::optional<std::string> &trialFlags = std::nullopt) {
   llvm::LLVMContext &context = module.getContext();
   auto *i64 = llvm::Type::getInt64Ty(context);
   auto *funcType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
@@ -1234,6 +1235,10 @@ llvm::Function *createCallInputHelperCallerFunction(
   if (trialState) {
     fields.push_back(llvm::MDString::get(context,
                                          "trial_state=" + *trialState));
+  }
+  if (trialFlags) {
+    fields.push_back(llvm::MDString::get(context,
+                                         "trial_flags=" + *trialFlags));
   }
   llvm::MDNode *candidateMetadata = llvm::MDNode::get(context, fields);
   llvm::CallInst *candidate = builder.CreateCall(
@@ -7163,6 +7168,47 @@ int main() {
                          &llvm::errs())) {
     std::cerr
         << "declaration call input inactive helper module verification failed\n";
+    return EXIT_FAILURE;
+  }
+
+  llvm::Module declarationCallInputConditionalHelperModule(
+      "native-prototype-declaration-call-input-conditional-helper-test",
+      context);
+  attachTestAbi(declarationCallInputConditionalHelperModule);
+  auto *declarationCallInputConditionalHelperCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *declarationCallInputConditionalHelperCallee =
+      llvm::Function::Create(declarationCallInputConditionalHelperCalleeType,
+                             llvm::GlobalValue::ExternalLinkage,
+                             "declaration_call_input_conditional_helper_callee",
+                             declarationCallInputConditionalHelperModule);
+  llvm::CallInst *declarationCallInputConditionalHelperOldCall = nullptr;
+  createCallInputHelperCallerFunction(
+      declarationCallInputConditionalHelperModule,
+      "declaration_call_input_conditional_helper_user",
+      declarationCallInputConditionalHelperCallee, "RDI", "active",
+      &declarationCallInputConditionalHelperOldCall,
+      "conditional_effect,path_conditional");
+  notdec::bin2llvm::NativePrototypeRecoveryOptions
+      conditionalHelperInputOptions;
+  conditionalHelperInputOptions.RewriteSignatures = true;
+  notdec::bin2llvm::runNativePrototypeRecovery(
+      declarationCallInputConditionalHelperModule,
+      conditionalHelperInputOptions);
+  llvm::Function *conditionalHelperInputCalleeAfterRewrite =
+      declarationCallInputConditionalHelperModule.getFunction(
+          "declaration_call_input_conditional_helper_callee");
+  ok &= expect(conditionalHelperInputCalleeAfterRewrite != nullptr &&
+                   functionTypeShape(
+                       *conditionalHelperInputCalleeAfterRewrite
+                            ->getFunctionType(),
+                       llvm::Type::getVoidTy(context),
+                       llvm::ArrayRef<llvm::Type *>{}),
+               "conditional call input helper rewrote declaration input");
+  if (llvm::verifyModule(declarationCallInputConditionalHelperModule,
+                         &llvm::errs())) {
+    std::cerr << "declaration call input conditional helper module "
+                 "verification failed\n";
     return EXIT_FAILURE;
   }
 

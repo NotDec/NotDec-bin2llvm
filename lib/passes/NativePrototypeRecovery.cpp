@@ -49,6 +49,23 @@ std::optional<std::string> metadataField(const llvm::MDNode &node,
   return std::nullopt;
 }
 
+bool metadataListFieldContains(const llvm::MDNode &node, llvm::StringRef key,
+                               llvm::StringRef expected) {
+  std::optional<std::string> text = metadataField(node, key);
+  if (!text) {
+    return false;
+  }
+  llvm::StringRef rest(*text);
+  while (!rest.empty()) {
+    auto [field, tail] = rest.split(',');
+    if (field == expected) {
+      return true;
+    }
+    rest = tail;
+  }
+  return false;
+}
+
 std::optional<uint64_t> parseUint64Field(const llvm::MDNode &node,
                                          llvm::StringRef key);
 
@@ -928,7 +945,11 @@ bool callInputCandidateIsActive(const llvm::MDNode &candidate) {
   std::optional<std::string> trialState =
       metadataField(candidate, "trial_state");
   if (trialState) {
-    return *trialState == "active";
+    if (*trialState != "active") {
+      return false;
+    }
+    return !metadataListFieldContains(candidate, "trial_flags",
+                                      "conditional_effect");
   }
 
   std::optional<std::string> strength = metadataField(candidate, "strength");
