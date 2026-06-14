@@ -3631,3 +3631,81 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 实现效果：5/10。完成 trial table 骨架，为完整 double-use / conditional finalize 迭代准备了结构，但还没有实现跨 trial 依赖。
 - 复杂度：3/10。流程多了一层 record，但行为不变。
 - 维护成本：4/10。后续如果要暴露 oracle 对照信息，需要再决定 summary/API 形态；当前先保持内部实现。
+
+## 2026-06-14 调研记录：hexx64 剩余 double-use 形态
+
+在 `Stage call input trials before finalizing` 后，`hexx64.so -f 0x1156e0` 仍有 2 个 `local_double_call_use`。检查 `/tmp/hexx64-1156e0-trial-table.ll` 后，两个都不是可以靠局部规则继续放宽的简单场景。
+
+### 剩余点 1：same callee 但前一个 trial 不是 active
+
+metadata：
+
+- `!7785`
+  - `callsite_id=notdec_native_1156e0:602`
+  - `callee=qvector_reserve`
+  - `register=RDX`
+  - `trial_reason=local_double_call_use`
+
+对应 IR：
+
+```llvm
+%RDX.regssa93490 = phi i64 [ %unique_4700_815945, %bb_11d11d ],
+                         [ %RDX.regssa92818, %bb_11d150 ]
+call void @notdec.register.call_input.i64(i64 %RDX.regssa93490), !notdec.register.call_input_candidate !7785
+call void @qvector_reserve(), !notdec.register.call_input_candidates !7789
+```
+
+同一个来源 `%unique_4700_815945` 之前也作为 `qvector_reserve` 的 RDX input：
+
+```llvm
+call void @notdec.register.call_input.i64(i64 %unique_4700_815945), !notdec.register.call_input_candidate !2069
+call void @qvector_reserve(), !notdec.register.call_input_candidates !2073
+```
+
+但 `!2069` 的状态是：
+
+```text
+trial_state=inactive
+trial_reason=entry_input
+```
+
+这正好落到 Ghidra `checkCallDoubleUse()` 后半段：要看另一个 callsite 的 trial 是否 checked/active，以及 alternate path 是否有效。当前 native 的 same-callee 子集只看 callee/register/order，不看另一个 trial 的最终状态，所以不能继续硬判。
+
+### 剩余点 2：循环 PHI 派生链
+
+metadata：
+
+- `!6451`
+  - `callsite_id=notdec_native_1156e0:493`
+  - `callee=notdec_native_e6870`
+  - `register=RSI`
+  - `trial_reason=local_double_call_use`
+
+对应 IR：
+
+```llvm
+%R13.regssa88324 = phi i64 [ 2, %bb_124581 ], [ 2, %bb_124374 ]
+store i64 %R13.regssa88324, ptr @RSI, !notdec.register.access !130
+call void @notdec.register.call_input.i64(i64 %R13.regssa88324), !notdec.register.call_input_candidate !6451
+call void @notdec_native_e6870(), !notdec.register.call_input_candidates !6456
+```
+
+同一个值还进入后续循环 PHI：
+
+```llvm
+%R13.regssa83900 = phi i64 [ %R13.regssa88324, %bb_12441a ],
+                         [ %R13.regssa83899, %bb_124421 ]
+```
+
+这里 `only-use` 递归穿过 PHI 后命中另一个 call input use，才形成 `local_double_call_use`。这不是简单“两个相邻 CALL 读同一个 prepared value”，需要结合 PHI 路径、loop mark、以及另一个 trial 的 checked/active 状态。Ghidra 的 `ancestorOpUse()` / `onlyOpUse()` 里有 mark 和 alternate path 逻辑，native 目前还没有。
+
+### 结论
+
+剩余 2 个 double-use 都需要 trial table 上的跨 trial finalize：
+
+- 查另一个 candidate 的 `checked/state/reason`。
+- 区分另一个 trial 已 active、inactive、no_use、blocked。
+- 对 PHI 派生链记录 alternate path，而不是只返回 `DoubleCallUse`。
+- 对同 callee 不同 block 的情况还要补 dominance/path 判断。
+
+因此下一步不能再在 `isAllowedDoubleCallInputUse()` 里堆局部条件。应先扩展 `CallInputTrialRecord`，让 use 检查返回“double-use 指向哪个 candidate”，再在 `finalizeCallInputTrials()` 里按 Ghidra 顺序处理。
