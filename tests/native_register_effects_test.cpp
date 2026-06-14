@@ -1786,6 +1786,9 @@ int main() {
   ok &= expect(summary.ConditionalEffectCallInputTrials >= 1,
                "register SSA summary missed conditional-effect call input "
                "flags");
+  ok &= expect(summary.ConditionalFinalCheckCallInputTrials >= 1,
+               "register SSA summary missed conditional final-check call "
+               "input flags");
   ok &= expect(summary.PathRealisticCallInputTrials >= 1,
                "register SSA summary missed path-realistic call input flags");
   ok &= expect(summary.PathConditionalCallInputTrials >= 1,
@@ -1931,14 +1934,14 @@ int main() {
                                           "trial_reason=phi"),
                "RDI PHI call input did not record phi reason");
   ok &= expect(callInputCandidateHasField(*conditionalPhiCallInput, "RDI",
-                                          "trial_state=active"),
-               "RDI conditional PHI call input was not active");
+                                          "trial_state=no_use"),
+               "RDI conditional PHI call input was not no_use");
   ok &= expect(callInputCandidateHasField(*conditionalPhiCallInput, "RDI",
                                           "trial_reason=phi"),
                "RDI conditional PHI call input did not record phi reason");
   ok &= expect(callInputCandidateHasField(
                    *conditionalPhiCallInput, "RDI",
-                   "trial_flags=conditional_effect,path_conditional"),
+                   "trial_flags=conditional_effect,final_checked,path_conditional"),
                "RDI conditional PHI call input did not record flags");
   ok &= expect(countRegisterLoads(*stackPointerCallEffects, rsp) == 0,
                "RSP load after call was not propagated");

@@ -1160,6 +1160,7 @@ private:
         std::set<llvm::Value *> visiting;
         CallInputTrialInfo trial =
             callInputTrialInfo(candidateValue, trialContext, visiting);
+        applyConditionalCallInputFinalCheck(trial);
         addCallInputPathFlag(trial);
         llvm::MDNode *trialMetadata = withMetadataField(
             *withMetadataField(
@@ -1261,6 +1262,15 @@ private:
   bool callInputTrialHasFlag(const CallInputTrialInfo &trial,
                              llvm::StringRef expected) const {
     return llvm::is_contained(trial.Flags, expected);
+  }
+
+  void applyConditionalCallInputFinalCheck(CallInputTrialInfo &trial) const {
+    if (trial.State != "active" ||
+        !callInputTrialHasFlag(trial, "conditional_effect")) {
+      return;
+    }
+    trial.State = "no_use";
+    trial.Flags.push_back("final_checked");
   }
 
   CallInputTrialInfo callInputTrialInfo(
@@ -1593,6 +1603,8 @@ private:
         ++Summary.KilledByCallInputTrials;
       } else if (flag == "conditional_effect") {
         ++Summary.ConditionalEffectCallInputTrials;
+      } else if (flag == "final_checked") {
+        ++Summary.ConditionalFinalCheckCallInputTrials;
       } else if (flag == "path_realistic") {
         ++Summary.PathRealisticCallInputTrials;
       } else if (flag == "path_conditional") {
@@ -2238,6 +2250,8 @@ void addFunctionSummary(NativeRegisterSSASummary &total,
   total.KilledByCallInputTrials += function.KilledByCallInputTrials;
   total.ConditionalEffectCallInputTrials +=
       function.ConditionalEffectCallInputTrials;
+  total.ConditionalFinalCheckCallInputTrials +=
+      function.ConditionalFinalCheckCallInputTrials;
   total.PathRealisticCallInputTrials += function.PathRealisticCallInputTrials;
   total.PathConditionalCallInputTrials +=
       function.PathConditionalCallInputTrials;
@@ -2373,6 +2387,8 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
      << summary.KilledByCallInputTrials << '\n';
   os << "  call input trial flags conditional effect: "
      << summary.ConditionalEffectCallInputTrials << '\n';
+  os << "  call input trial flags conditional final check: "
+     << summary.ConditionalFinalCheckCallInputTrials << '\n';
   os << "  call input trial flags path realistic: "
      << summary.PathRealisticCallInputTrials << '\n';
   os << "  call input trial flags path conditional: "
@@ -2430,6 +2446,8 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
        << function.KilledByCallInputTrials
        << " call_input_trial_flags_conditional_effect="
        << function.ConditionalEffectCallInputTrials
+       << " call_input_trial_flags_conditional_final_check="
+       << function.ConditionalFinalCheckCallInputTrials
        << " call_input_trial_flags_path_realistic="
        << function.PathRealisticCallInputTrials
        << " call_input_trial_flags_path_conditional="

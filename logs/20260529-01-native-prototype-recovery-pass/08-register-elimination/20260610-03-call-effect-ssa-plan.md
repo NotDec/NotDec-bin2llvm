@@ -520,12 +520,57 @@ pass-end finalize 不能作为“补洞兜底”。它只应该完成 Braun SSA 
   - `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/fspec.cc:5567` 的 `FuncCallSpecs::finalInputCheck()`。
   - `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/coreaction.cc:1740` 的 `ActionActiveParam::apply()`。
   - Ghidra 先允许 `active + condExeEffect`，等 active input fully checked 后再用 `AncestorRealistic(... allowFail=false)` 复查，不通过则 `markNoUse()`。
-  - native 目前已有 `conditional_effect` metadata 和 prototype recovery consumer guard，但还没有真正 final check。
-  - 这里必须先定 pass 边界：final check 放在 RegisterSSA 里产出最终 `trial_state`，还是放在 PrototypeRecovery 消费前做。
+  - native 目前已有 `conditional_effect` metadata 和 prototype recovery consumer guard，下一步应在 RegisterSSA 内完成 final check，让输出的 `trial_state` 表示最终可消费状态。
 - `no_use` / `definitely_not_used` helper 后续不参与 prototype recovery；清理阶段可以再决定是删除 helper 还是保留审计信息。
 - 仍然保留递归深度上限和 visited 集合，循环或不确定路径一律 inactive / no_use，不硬判 active。
 - 现有 `ancestorRealisticLite` 和 `local_shared_use` 可以作为第一版实现基础，但后续要避免继续堆 opcode 白名单。
 - stack 参数不放进这一阶段；后续需要 alias/local-range/callee-pop 检查后再做。
+
+### 阶段 3e：补齐 Ghidra trial/use 相关机制
+
+阶段 3d 是第一批 ancestor/use 检查。还需要补这些 Ghidra 风格机制，避免只靠 ancestor 一条链判断：
+
+- final check 放在 RegisterSSA。
+  - RegisterSSA 产出的 `trial_state` 应该就是 PrototypeRecovery 可消费的结论。
+  - PrototypeRecovery 只读 `active`，不再自己理解 SSA value/use 链。
+  - 带 `conditional_effect` 的 active trial 要在 RegisterSSA 里二次检查；失败直接改成 `no_use` 并写 `final_checked`。
+- active trial 的整体收口。
+  - 对一个 callsite 的所有 active input 做完 use/path 检查后，再允许 prototype recovery 消费。
+  - 这对应 Ghidra `ActionActiveParam::apply()` 中 active input fully checked 之后才进入模型解析。
+  - native 侧可以先用 per-function summary flag 表示“本函数 trial state 已 finalize”，防止后续 pass 消费半成品。
+- no-use 的数据流语义。
+  - `no_use` helper 第一版可以保留在 IR 里，但 metadata 必须明确 `trial_state=no_use`。
+  - 后续如果删除 helper，只能在 PrototypeRecovery 之后做清理，不能影响 RegisterSSA 的验证和审计。
+  - 不要用删除 helper 来掩盖错误判断；先让 summary 能稳定统计 no-use 原因。
+- descendant use 要继续补完整。
+  - 已有透明 use 递归只是子集。
+  - 还要明确哪些 LLVM op 等价于 Ghidra 的 `COPY` / `CAST` / `MULTIEQUAL` / `SUBPIECE` / `PIECE`。
+  - 不认识的 op 默认不是透明传播，先归 inactive 或 shared use。
+- double-call-use 单独决策。
+  - 目前只单独记录 `local_double_call_use`。
+  - 后续需要实现类似 Ghidra `checkCallDoubleUse()` 的规则：同一个 prepared value 被多个 call 使用时，哪些是合法复用，哪些说明不是当前 call 的独占参数准备。
+  - 第一版继续保守，不把 double-call-use 当 active 证据。
+- unreferenced / definitely-not-used 标记。
+  - 如果一个 trial 没有实际 use，或者 use 检查能证明它不是参数，要显式写辅助 flag。
+  - 这些 flag 不直接等于主状态，但会影响 prototype recovery 是否消费、后续是否清理 helper。
+- ABI / callee model 反馈。
+  - Ghidra trial 最后会反过来影响 input map / prototype model。
+  - native 侧第一版不直接重建完整 prototype model，但需要把 active/no-use/block 原因保留下来，供后续 signature rewrite 或 Ghidra oracle 对照。
+- storage overlap。
+  - 当前先按完整 register 处理。
+  - 后续要处理 `RAX/EAX/AX/AL`、vector 子寄存器这类 overlap，否则 ancestor/use 检查可能把不同宽度的值误认为同一个或无关值。
+  - 这部分应复用现有 register storage 描述，不另造并行 fact 表。
+- stack trial 单独阶段。
+  - stack 参数需要 alias、local stack range、callee-pop、SP 调整检查。
+  - 不要把 register-only ancestor 逻辑硬套到 stack。
+  - 等 register trial state 稳定后再加 stack input trial。
+
+判断标准：
+
+- RegisterSSA summary 能区分：active、inactive、no_use、blocked、conditional_final_check、double_call_use、unreferenced、definitely_not_used。
+- PrototypeRecovery 不需要重新追 SSA use 链；只消费 RegisterSSA 最终 trial state。
+- `hexx64.so -f 0x1156e0` 继续通过 LLVM 22 `llvm-as` / `opt -passes=verify`。
+- 和 Ghidra/Java oracle 对照时，差异能落到明确原因：storage overlap、stack alias、double-call-use 策略、或暂不支持的 op。
 
 判断标准：
 
@@ -3052,7 +3097,7 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 复杂度：3/10。只调整 PHI 合并状态和 path flag 优先级。
 - 维护成本：4/10。后续还需要真正 final check；当前 `active` 已不等于“prototype recovery 可消费”，消费方必须继续看 flags。
 
-## 2026-06-14 决策点：conditional final check 放在哪里
+## 2026-06-14 决策：conditional final check 放在 RegisterSSA
 
 当前已经做到：
 
@@ -3067,13 +3112,98 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 复查失败则 `markNoUse()`。
 - 之后才 `resolveModel()` / `deriveInputMap()` / `buildInputFromTrials()`。
 
-native 这里还没定边界：
+native 侧决定放在 RegisterSSA：
 
-- 方案 A：在 RegisterSSA 内完成 final check，metadata 输出时就把失败 trial 改成 `no_use`。
-  - 好处：PrototypeRecovery 只消费稳定结果。
-  - 问题：RegisterSSA 需要实现更完整的 `AncestorRealistic`，而且要知道 final check 所需的 callsite 上下文。
-- 方案 B：在 PrototypeRecovery 消费前做 final check。
-  - 好处：更贴近“消费前确认”，能结合 prototype recovery 的 callsite / ABI 信息。
-  - 问题：PrototypeRecovery 需要理解 SSA value/use 链，可能把 RegisterSSA 的分析逻辑搬过去。
+- RegisterSSA 已经拥有 helper operand、PHI、ancestor/use、path flag，是最适合产出最终 trial state 的位置。
+- PrototypeRecovery 不应该重新追 SSA value/use 链，否则会把 RegisterSSA 的判定逻辑复制一份。
+- metadata 输出时，`trial_state=active` 应该表示已经通过 RegisterSSA 的最终检查，可以被后续消费。
+- 带 `conditional_effect` 的 trial 如果 final check 失败，直接改成 `no_use`，并保留 `final_checked` / `conditional_effect` flag 方便审计。
+- 第一版 final check 可以保守：只处理当前已经能识别的 conditional PHI；判断不了的路径不要维持可消费 active，可以降为 `no_use` 或 `blocked`。
 
-目前不能继续默默实现，因为这会决定 pass 边界和 metadata 是否表示“最终判定”。在决策前，保守做法是继续保留 consumer guard，不消费 `conditional_effect`。
+这样做的代价是 RegisterSSA 会继续变重，但边界更清楚：RegisterSSA 负责数据流和 trial 判定，PrototypeRecovery 负责按最终 trial state 改 signature。
+
+## 2026-06-14 实现记录：conditional final check 保守落地
+
+本次按上面的边界决策，把 conditional final check 放进 RegisterSSA。实现先保守处理：只要 trial 是 `active` 且带 `conditional_effect`，就认为当前 native 还不能证明它安全可消费，改成 `no_use`，同时保留 `conditional_effect` 并追加 `final_checked`。
+
+这不是完整 Ghidra `AncestorRealistic(... allowFail=false)`。它先保证 metadata 输出语义稳定：`trial_state=active` 不再包含需要二次确认的 conditional trial，PrototypeRecovery 后续可以继续只消费 active。
+
+### 改动
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:46`
+  - `NativeRegisterSSAFunctionSummary` 新增 `ConditionalFinalCheckCallInputTrials`。
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSSA.h:91`
+  - `NativeRegisterSSASummary` 新增同名汇总字段。
+
+- `lib/passes/NativeRegisterSSA.cpp:1163`
+  - `annotateCallInputTrials()` 在写 metadata 前调用 `applyConditionalCallInputFinalCheck()`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1267`
+  - 新增 `applyConditionalCallInputFinalCheck()`。
+  - 当前规则：`active + conditional_effect` 直接变成 `no_use`，并追加 `final_checked` flag。
+
+- `lib/passes/NativeRegisterSSA.cpp:1606`
+  - `countCallInputTrialFlags()` 统计 `final_checked`。
+
+- `lib/passes/NativeRegisterSSA.cpp:2253`
+  - `addFunctionSummary()` 汇总 conditional final check 计数。
+
+- `lib/passes/NativeRegisterSSA.cpp:2390`
+  - summary 文本输出 `call input trial flags conditional final check`。
+
+- `lib/passes/NativeRegisterSSA.cpp:2449`
+  - per-function summary 输出 `call_input_trial_flags_conditional_final_check`。
+
+- `tests/native_register_effects_test.cpp:1789`
+  - 增加 summary 断言，确认能看到 conditional final check flag。
+
+- `tests/native_register_effects_test.cpp:1936`
+  - conditional PHI 测试从 `trial_state=active` 改成 `trial_state=no_use`。
+
+- `tests/native_register_effects_test.cpp:1944`
+  - conditional PHI 预期 flags 改成 `conditional_effect,final_checked,path_conditional`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm -j2
+/usr/bin/time -f 'TIME native-llvm-final-check %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-final-check.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-final-check.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-final-check.ll \
+  -o /tmp/hexx64-1156e0-final-check.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-final-check.bc \
+  -o /tmp/hexx64-1156e0-final-check.verified.bc
+```
+
+结果：
+
+- 两个单测通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`69.25s`。
+- summary 输出：
+  - `call input trials active: 455`
+  - `call input trials inactive: 1425`
+  - `call input trials no use: 2494`
+  - `call input trial flags conditional effect: 4`
+  - `call input trial flags conditional final check: 4`
+  - `call input trial flags path conditional: 4`
+
+### 判断
+
+- 实现效果：6/10。RegisterSSA 已经产出最终态，conditional active 不再漏给 PrototypeRecovery；但 final check 还不是完整 Ghidra ancestor 复查。
+- 复杂度：2/10。只是在 trial metadata 写出前加一次状态收口和 summary 统计。
+- 维护成本：3/10。后续实现完整 `AncestorRealistic(... allowFail=false)` 时，可以替换 `applyConditionalCallInputFinalCheck()` 内部规则，不需要改 metadata 格式。
