@@ -3780,3 +3780,89 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 实现效果：4/10。完成 double-use 目标 trial 的内部连接，但还没利用它改变 final state。
 - 复杂度：2/10。只是把 enum 返回值扩成结构体，并在 trial table 里建索引。
 - 维护成本：3/10。后续要按 Ghidra 放宽 double-use，还需要保留 double-use 覆盖前的原始 trial 结论。
+
+## 2026-06-14 实现记录：target inactive double-use final check
+
+本次继续推进 Ghidra `checkCallDoubleUse()` 的后半段。Ghidra 对另一个 callsite 的 trial 已 checked 时，会看它是否 active：如果另一个 trial active，当前 trial 不能继续；如果另一个 trial checked 但不是 active，当前 double-use 可以放过。
+
+native 侧这次只实现这个保守子集：
+
+- use 检查仍先把 double-use 判成 `inactive/local_double_call_use`。
+- 同时保存“被 double-use 拦住前”的 trial 结论。
+- finalize 时如果 double-use 目标 trial 已 checked 且不是 active，就恢复原结论。
+- 如果目标 trial 是 active，或者没解析到目标 record，仍保持 `local_double_call_use`。
+
+这一步仍不处理 alternate path，也不处理 indirect call same-target。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:111`
+  - `CallInputTrialInfo` 增加 `HasBeforeDoubleUseInfo` 和 `BeforeDoubleUse*` 字段。
+
+- `lib/passes/NativeRegisterSSA.cpp:1288`
+  - `finalizeCallInputTrials()` 在 conditional final check 前调用 `applyDoubleUseFinalCheck()`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1293`
+  - 新增 `applyDoubleUseFinalCheck()`。
+  - 目标 trial 已 checked 且 `State != active` 时，恢复 pre-double-use 的 strength/state/reason/flags。
+
+- `lib/passes/NativeRegisterSSA.cpp:1414`
+  - PHI active 后如果被 use-check 拦成 double-use，保留 PHI 原结论。
+
+- `lib/passes/NativeRegisterSSA.cpp:1439`
+  - arithmetic active 后如果被 use-check 拦成 double-use，保留 `local_arith` 原结论。
+
+- `lib/passes/NativeRegisterSSA.cpp:1452`
+  - cast/address active 后如果被 use-check 拦成 double-use，保留 `local_cast` 原结论。
+
+- `lib/passes/NativeRegisterSSA.cpp:1469`
+  - 新增 `withBeforeDoubleUseInfo()`。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-double-use-final %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-double-use-final.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-double-use-final.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-double-use-final.ll \
+  -o /tmp/hexx64-1156e0-double-use-final.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-double-use-final.bc \
+  -o /tmp/hexx64-1156e0-double-use-final.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`78.52s`。
+- hexx64 summary 变化：
+  - `call input trial reasons local double call use: 2 -> 1`
+  - `call input trial reasons phi: 5 -> 6`
+  - `call input trial flags conditional effect: 5 -> 6`
+  - `call input trial flags conditional final check: 5 -> 6`
+  - `call input trials active: 260 -> 260`
+  - `call input trials no use: 2495 -> 2496`
+
+解释：
+
+- `!6451` 从 `inactive/local_double_call_use` 恢复成 `strong_phi/phi`。
+- 但它带 `conditional_effect`，随后被现有 conditional final check 降成 `no_use`。
+- 剩余 `!7785` 仍是 `inactive/local_double_call_use`，需要继续看它的 double-use target 为什么没有解析成可恢复路径。
+
+### 判断
+
+- 实现效果：6/10。按 Ghidra 的 checked/non-active 规则放宽了一个真实 double-use，但最终被 conditional final check 保守挡住。
+- 复杂度：4/10。开始出现 finalize 内跨 trial 状态读取，但仍是单轮、保守处理。
+- 维护成本：5/10。后续需要把 double-use target 解析失败或不可恢复的原因写进 metadata/summary，否则调试剩余 1 个 case 仍要查 IR。

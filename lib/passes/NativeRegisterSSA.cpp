@@ -108,6 +108,11 @@ struct CallInputTrialInfo {
   std::string Reason;
   std::vector<std::string> Flags;
   llvm::Instruction *DoubleUseCandidate = nullptr;
+  bool HasBeforeDoubleUseInfo = false;
+  std::string BeforeDoubleUseStrength;
+  std::string BeforeDoubleUseState;
+  std::string BeforeDoubleUseReason;
+  std::vector<std::string> BeforeDoubleUseFlags;
 };
 
 // CallInputTrialContext identifies the helper that is currently being checked.
@@ -1280,9 +1285,22 @@ private:
           record.DoubleUseRecord = found->second;
         }
       }
+      applyDoubleUseFinalCheck(record);
       applyConditionalCallInputFinalCheck(record.Info);
       addCallInputPathFlag(record.Info);
     }
+  }
+
+  void applyDoubleUseFinalCheck(CallInputTrialRecord &record) const {
+    if (!record.Info.HasBeforeDoubleUseInfo ||
+        record.DoubleUseRecord == nullptr || !record.DoubleUseRecord->Checked ||
+        record.DoubleUseRecord->Info.State == "active") {
+      return;
+    }
+    record.Info.Strength = record.Info.BeforeDoubleUseStrength;
+    record.Info.State = record.Info.BeforeDoubleUseState;
+    record.Info.Reason = record.Info.BeforeDoubleUseReason;
+    record.Info.Flags = record.Info.BeforeDoubleUseFlags;
   }
 
   void refreshCallInputCandidateList(llvm::CallBase &call) {
@@ -1393,7 +1411,7 @@ private:
       if (trial.State == "active") {
         CallInputTrialInfo useTrial = callInputUseTrialInfo(*phi, context);
         if (useTrial.State != "active") {
-          return useTrial;
+          return withBeforeDoubleUseInfo(useTrial, trial);
         }
       }
       return trial;
@@ -1418,7 +1436,10 @@ private:
           }
           CallInputTrialInfo useTrial = callInputUseTrialInfo(*inst, context);
           if (useTrial.State != "active") {
-            return useTrial;
+            return withBeforeDoubleUseInfo(
+                useTrial,
+                CallInputTrialInfo{"strong_local_def", "active",
+                                   "local_arith"});
           }
           return CallInputTrialInfo{"strong_local_def", "active",
                                     "local_arith"};
@@ -1430,7 +1451,10 @@ private:
           }
           CallInputTrialInfo useTrial = callInputUseTrialInfo(*inst, context);
           if (useTrial.State != "active") {
-            return useTrial;
+            return withBeforeDoubleUseInfo(
+                useTrial,
+                CallInputTrialInfo{"strong_local_def", "active",
+                                   "local_cast"});
           }
           return CallInputTrialInfo{"strong_local_def", "active",
                                     "local_cast"};
@@ -1440,6 +1464,20 @@ private:
       }
     }
     return CallInputTrialInfo{"weak_entry_input", "inactive", "entry_input"};
+  }
+
+  CallInputTrialInfo withBeforeDoubleUseInfo(CallInputTrialInfo blocked,
+                                             const CallInputTrialInfo &source)
+      const {
+    if (blocked.Reason != "local_double_call_use") {
+      return blocked;
+    }
+    blocked.HasBeforeDoubleUseInfo = true;
+    blocked.BeforeDoubleUseStrength = source.Strength;
+    blocked.BeforeDoubleUseState = source.State;
+    blocked.BeforeDoubleUseReason = source.Reason;
+    blocked.BeforeDoubleUseFlags = source.Flags;
+    return blocked;
   }
 
   bool isSafeCallInputArithmetic(const llvm::Instruction &inst) const {
