@@ -4400,3 +4400,95 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 实现效果：7/10。真实 hexx64 剩余 double-use 归零，finalizer 不再读中间态。
 - 复杂度：6/10。引入 bounded fixpoint，但仍只在 trial table 内部。
 - 维护成本：6/10。后续要注意新增 final check 规则必须保持收敛，必要时把 state transition 写成显式枚举。
+
+## 2026-06-15 实现记录：按 Ghidra 层次移动 double-use 判断
+
+本次继续把 native 侧往 Ghidra 的判断层次靠。核心变化是：`checkCallInputUses()` 只做 `onlyOpUse()` 那一层的事情，负责扫描 use、记录 descendant path、发现另一个 call input helper；它不再提前判断这个 double-use 是否“可以接受”。真正的 double-use 判断移到 finalizer，对应 Ghidra 的 `checkCallDoubleUse()`。
+
+这样做的原因：
+
+- use 扫描阶段只看当前 value 的局部 use，不应该直接决定另一个 callsite 的 trial 是否有效。
+- finalizer 里有完整 trial table，能看到 target trial 最终 state，比在 use 扫描里用局部顺序判断更接近 Ghidra。
+- 后续要补 `isAlternatePathValid()` 时，也需要 path 信息和 target trial state 同时可见。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:101`
+  - 新增 `CallInputPathInfo`，先保存 Ghidra `TraverseNode` 的 native 子集字段。
+  - 当前已保存 `ActionAlt`、`Indirect`、`IndirectAlt`、`LsbTruncated`、`ConcatHigh` 这些后续判断位，以及现有审计用的 `AuditFlags`。
+
+- `lib/passes/NativeRegisterSSA.cpp:125`
+  - `CallInputTrialInfo` 增加结构化 `Path` 和 `BeforeDoubleUsePath`。
+  - 原来的 `PathFlags` 继续保留，用于 metadata 和日志可读性。
+
+- `lib/passes/NativeRegisterSSA.cpp:1398`
+  - `applyDoubleUseFinalCheck()` 改成按 Ghidra 顺序做判断：
+    - 先记录 target helper 字段。
+    - 再判断 same callee + same register + 当前 helper 更早的情况。
+    - 再看 target trial 是否 checked / active。
+    - target 非 active 时恢复 before-double-use state。
+
+- `lib/passes/NativeRegisterSSA.cpp:1433`
+  - 新增 `restoreBeforeDoubleUseState()`，统一恢复被 double-use 临时挡住前的 trial 结果。
+
+- `lib/passes/NativeRegisterSSA.cpp:1445`
+  - 新增 `isSameTargetEarlierDoubleUse()`，对应 Ghidra `checkCallDoubleUse()` 里“同一个函数、同一个 trial storage，当前 call 有优先权”的分支。
+  - native 当前用 `callee` 和 `register` 近似 Ghidra 的 entry address 和 ParamTrial address。
+
+- `lib/passes/NativeRegisterSSA.cpp:1466`
+  - 新增 `isNativeAlternatePathValid()`。
+  - 目前只实现 Ghidra `TraverseNode::isAlternatePathValid()` 的保守子集：`indirect` / `indirectalt` / `actionalt` 的比较。
+  - Ghidra 里依赖 `loneDescend()`、incidental copy、marker op 的后半段 native 还没有等价信息，所以这里暂不硬判。
+
+- `lib/passes/NativeRegisterSSA.cpp:1707`
+  - `callInputUseTrialInfo()` 改为把 `CallInputPathInfo` 同时保存进 trial 和 `trial_path_flags`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1736`
+  - `checkCallInputUses()` 遇到其它 call input helper 时不再调用旧的 `isAllowedDoubleCallInputUse()`。
+  - 现在只记录 `DoubleUseCandidate` 和 `path_double_call_use`，后续交给 finalizer。
+  - 删除旧的 `isAllowedDoubleCallInputUse()`，避免判断散在两层。
+
+### 验证
+
+```bash
+cmake --build build --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+./build/bin/native_register_effects_test
+./build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME hexx64-1156e0-ghidra-layer %e' \
+  ./build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-ghidra-layer.ll \
+  > /tmp/hexx64-1156e0-ghidra-layer.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-ghidra-layer.ll \
+  -o /tmp/hexx64-1156e0-ghidra-layer.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-ghidra-layer.bc \
+  -o /tmp/hexx64-1156e0-ghidra-layer.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 通过。
+- `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`79.00s`。
+- summary 和上一节保持一致：
+  - `call input trial reasons local double call use: 0`
+  - `call input strong: 266`
+  - `call input weak: 1618`
+  - `call input trials active: 260`
+  - `call input trials no use: 2496`
+  - `call input trial reasons phi: 6`
+- 输出中仍保留 `trial_path_flags`，例如 `path_phi,path_realistic,path_double_call_use,path_blocked`。
+
+### 当前判断
+
+- 实现效果：7/10。判断层次更接近 Ghidra，结果没有回退。
+- 复杂度：6/10。多了结构化 path 和 finalizer helper，但去掉了 use 扫描里的局部放宽逻辑。
+- 维护成本：6/10。`isNativeAlternatePathValid()` 还只是保守子集；后续如果要更接近 Ghidra，需要补 native 的 lone-use / incidental-copy / marker 信息。

@@ -98,6 +98,26 @@ struct CallsiteInfo {
   std::string Id;
 };
 
+// CallInputPathInfo is the native-side counterpart of Ghidra's TraverseNode
+// flags.  The booleans are kept as decision data; `AuditFlags` preserves the
+// current human-readable metadata while this is being migrated.
+struct CallInputPathInfo {
+  bool ActionAlt = false;
+  bool Indirect = false;
+  bool IndirectAlt = false;
+  bool LsbTruncated = false;
+  bool ConcatHigh = false;
+  bool SawPhi = false;
+  bool SawLoop = false;
+  bool SawUnknown = false;
+  bool SawDoubleCallUse = false;
+  bool SawExternalUse = false;
+  bool SawBlockedUse = false;
+  bool SawAggregate = false;
+  bool SawCast = false;
+  std::vector<std::string> AuditFlags;
+};
+
 // Call input trial annotation is still conservative: `Strength` records the
 // old local evidence for audit, `State` is the Ghidra-style decision that later
 // prototype recovery consumes, and `Reason` keeps the current explanation
@@ -107,18 +127,20 @@ struct CallInputTrialInfo {
   std::string State;
   std::string Reason;
   std::vector<std::string> Flags;
-  std::vector<std::string> PathFlags;
   llvm::Instruction *DoubleUseCandidate = nullptr;
   bool HasBeforeDoubleUseInfo = false;
   std::string BeforeDoubleUseStrength;
   std::string BeforeDoubleUseState;
   std::string BeforeDoubleUseReason;
   std::vector<std::string> BeforeDoubleUseFlags;
-  std::vector<std::string> BeforeDoubleUsePathFlags;
   std::string DoubleUseTargetCallsiteId;
   std::string DoubleUseTargetCallee;
   std::string DoubleUseTargetRegister;
   std::string DoubleUseTargetState;
+  std::vector<std::string> PathFlags;
+  std::vector<std::string> BeforeDoubleUsePathFlags;
+  CallInputPathInfo Path;
+  CallInputPathInfo BeforeDoubleUsePath;
 };
 
 // CallInputTrialContext identifies the helper that is currently being checked.
@@ -158,7 +180,7 @@ enum class CallInputUseCheckResult {
 struct CallInputUseCheckInfo {
   CallInputUseCheckResult Result = CallInputUseCheckResult::OnlyCurrentCall;
   llvm::Instruction *DoubleUseCandidate = nullptr;
-  std::vector<std::string> PathFlags;
+  CallInputPathInfo Path;
 };
 
 bool isFlagRegisterName(llvm::StringRef name) {
@@ -1388,7 +1410,15 @@ private:
     }
     recordDoubleUseTargetFields(record.Info, record.DoubleUseRecord->Candidate,
                                 record.DoubleUseRecord->Info.State);
+    if (isSameTargetEarlierDoubleUse(record)) {
+      addCallInputTrialFlag(record.Info, "double_use_same_target_earlier");
+      restoreBeforeDoubleUseState(record.Info);
+      return;
+    }
     if (!record.DoubleUseRecord->Checked) {
+      if (isNativeAlternatePathValid(record.Info.Path)) {
+        addCallInputTrialFlag(record.Info, "double_use_alternate_path_valid");
+      }
       addCallInputTrialFlag(record.Info, "double_use_target_unchecked");
       return;
     }
@@ -1397,14 +1427,53 @@ private:
       return;
     }
     addCallInputTrialFlag(record.Info, "double_use_target_non_active");
-    if (!record.Info.HasBeforeDoubleUseInfo) {
+    restoreBeforeDoubleUseState(record.Info);
+  }
+
+  void restoreBeforeDoubleUseState(CallInputTrialInfo &info) const {
+    if (!info.HasBeforeDoubleUseInfo) {
       return;
     }
-    record.Info.Strength = record.Info.BeforeDoubleUseStrength;
-    record.Info.State = record.Info.BeforeDoubleUseState;
-    record.Info.Reason = record.Info.BeforeDoubleUseReason;
-    record.Info.Flags = record.Info.BeforeDoubleUseFlags;
-    record.Info.PathFlags = record.Info.BeforeDoubleUsePathFlags;
+    info.Strength = info.BeforeDoubleUseStrength;
+    info.State = info.BeforeDoubleUseState;
+    info.Reason = info.BeforeDoubleUseReason;
+    info.Flags = info.BeforeDoubleUseFlags;
+    info.PathFlags = info.BeforeDoubleUsePathFlags;
+    info.Path = info.BeforeDoubleUsePath;
+  }
+
+  bool isSameTargetEarlierDoubleUse(const CallInputTrialRecord &record) const {
+    if (record.Context.Candidate == nullptr ||
+        record.DoubleUseRecord == nullptr ||
+        record.DoubleUseRecord->Candidate == nullptr ||
+        record.Context.CalleeName.empty() ||
+        record.Context.RegisterName.empty()) {
+      return false;
+    }
+    const CallInputTrialContext &other = record.DoubleUseRecord->Context;
+    if (other.CalleeName != record.Context.CalleeName ||
+        other.RegisterName != record.Context.RegisterName) {
+      return false;
+    }
+    if (record.Context.Candidate->getParent() !=
+        record.DoubleUseRecord->Candidate->getParent()) {
+      return true;
+    }
+    return instructionComesBefore(*record.Context.Candidate,
+                                  *record.DoubleUseRecord->Candidate);
+  }
+
+  bool isNativeAlternatePathValid(const CallInputPathInfo &path) const {
+    if (path.Indirect && !path.IndirectAlt) {
+      return true;
+    }
+    if (!path.Indirect && path.IndirectAlt) {
+      return false;
+    }
+    if (path.ActionAlt) {
+      return true;
+    }
+    return false;
   }
 
   void recordDoubleUseTargetFields(CallInputTrialInfo &info,
@@ -1607,6 +1676,7 @@ private:
     blocked.BeforeDoubleUseReason = source.Reason;
     blocked.BeforeDoubleUseFlags = source.Flags;
     blocked.BeforeDoubleUsePathFlags = source.PathFlags;
+    blocked.BeforeDoubleUsePath = source.Path;
     return blocked;
   }
 
@@ -1637,21 +1707,24 @@ private:
   CallInputTrialInfo callInputUseTrialInfo(
       llvm::Instruction &value, const CallInputTrialContext &context) {
     CallInputUseCheckInfo useInfo = checkCallInputUses(value, context);
+    CallInputTrialInfo trial;
     switch (useInfo.Result) {
     case CallInputUseCheckResult::OnlyCurrentCall:
-      return CallInputTrialInfo{"strong_local_def", "active", "only_use",
-                                {}, {}, nullptr, false, "", "", "", {}, {},
-                                "", "", "", ""};
+      trial = CallInputTrialInfo{"strong_local_def", "active", "only_use"};
+      break;
     case CallInputUseCheckResult::DoubleCallUse:
-      return CallInputTrialInfo{
-          "weak_entry_input", "inactive", "local_double_call_use", {},
-          useInfo.PathFlags, useInfo.DoubleUseCandidate};
+      trial = CallInputTrialInfo{"weak_entry_input", "inactive",
+                                 "local_double_call_use"};
+      trial.DoubleUseCandidate = useInfo.DoubleUseCandidate;
+      break;
     case CallInputUseCheckResult::SharedUse:
-      return CallInputTrialInfo{"weak_entry_input", "inactive",
-                                "local_shared_use", {}, useInfo.PathFlags};
+      trial = CallInputTrialInfo{"weak_entry_input", "inactive",
+                                 "local_shared_use"};
+      break;
     }
-    return CallInputTrialInfo{"weak_entry_input", "inactive",
-                              "local_shared_use", {}, useInfo.PathFlags};
+    trial.Path = useInfo.Path;
+    trial.PathFlags = pathInfoFlags(useInfo.Path);
+    return trial;
   }
 
   CallInputUseCheckInfo checkCallInputUses(
@@ -1664,64 +1737,64 @@ private:
       llvm::Instruction &value, const CallInputTrialContext &context,
       std::set<llvm::Instruction *> &visiting) {
     if (!visiting.insert(&value).second) {
-      return {CallInputUseCheckResult::OnlyCurrentCall, nullptr, {"path_loop"}};
+      CallInputPathInfo path;
+      path.SawLoop = true;
+      addCallInputPathAuditFlag(path, "path_loop");
+      return {CallInputUseCheckResult::OnlyCurrentCall, nullptr, path};
     }
     llvm::Instruction *doubleUseCandidate = nullptr;
-    std::vector<std::string> pathFlags;
+    CallInputPathInfo path;
     for (const llvm::Use &use : value.uses()) {
       auto *userInst = llvm::dyn_cast<llvm::Instruction>(use.getUser());
       if (userInst == nullptr) {
-        return {CallInputUseCheckResult::SharedUse, nullptr,
-                appendCallInputPathFlag(pathFlags, "path_external_use")};
+        path.SawExternalUse = true;
+        addCallInputPathAuditFlag(path, "path_external_use");
+        return {CallInputUseCheckResult::SharedUse, nullptr, path};
       }
       if (isSameCallsiteInputHelper(*userInst, context)) {
         continue;
       }
       if (isOtherCallsiteInputHelper(*userInst, context)) {
-        if (isAllowedDoubleCallInputUse(*userInst, context)) {
-          continue;
-        }
         if (doubleUseCandidate == nullptr) {
           doubleUseCandidate = userInst;
         }
-        pathFlags =
-            appendCallInputPathFlag(pathFlags, "path_double_call_use");
+        path.SawDoubleCallUse = true;
+        addCallInputPathAuditFlag(path, "path_double_call_use");
         continue;
       }
       if (isSameRegisterDefinitionStore(*userInst, value, context)) {
         continue;
       }
       if (isTransparentCallInputDescendant(*userInst)) {
-        pathFlags =
-            appendCallInputPathFlag(pathFlags, pathFlagForInstruction(*userInst));
+        addInstructionPathInfo(path, *userInst);
         CallInputUseCheckInfo result =
             checkCallInputUses(*userInst, context, visiting);
         if (result.Result == CallInputUseCheckResult::SharedUse) {
-          mergeCallInputPathFlags(pathFlags, result.PathFlags);
-          return {CallInputUseCheckResult::SharedUse, nullptr, pathFlags};
+          mergeCallInputPathInfo(path, result.Path);
+          return {CallInputUseCheckResult::SharedUse, nullptr, path};
         }
         if (result.Result == CallInputUseCheckResult::DoubleCallUse &&
             doubleUseCandidate == nullptr) {
           doubleUseCandidate = result.DoubleUseCandidate;
         }
-        mergeCallInputPathFlags(pathFlags, result.PathFlags);
+        mergeCallInputPathInfo(path, result.Path);
         continue;
       }
-      pathFlags = appendCallInputPathFlag(pathFlags, "path_blocked");
-      return {CallInputUseCheckResult::SharedUse, nullptr, pathFlags};
+      path.SawBlockedUse = true;
+      addCallInputPathAuditFlag(path, "path_blocked");
+      return {CallInputUseCheckResult::SharedUse, nullptr, path};
     }
     // A real non-call use beats double-use as the reason.  Only report
     // double-use after the full descendant scan has found no ordinary use.
     if (doubleUseCandidate != nullptr) {
-      pathFlags =
-          appendCallInputPathFlag(pathFlags, "path_double_call_use");
-      return {CallInputUseCheckResult::DoubleCallUse, doubleUseCandidate,
-              pathFlags};
+      path.SawDoubleCallUse = true;
+      addCallInputPathAuditFlag(path, "path_double_call_use");
+      return {CallInputUseCheckResult::DoubleCallUse, doubleUseCandidate, path};
     }
-    if (pathFlags.empty()) {
-      pathFlags = appendCallInputPathFlag(pathFlags, "path_realistic");
+    if (path.AuditFlags.empty()) {
+      addCallInputPathAuditFlag(path, "path_realistic");
     }
-    return {CallInputUseCheckResult::OnlyCurrentCall, nullptr, pathFlags};
+    return {CallInputUseCheckResult::OnlyCurrentCall, nullptr, path};
   }
 
   bool isTransparentCallInputDescendant(const llvm::Instruction &inst) const {
@@ -1730,35 +1803,56 @@ private:
            llvm::isa<llvm::InsertValueInst>(inst);
   }
 
-  std::string pathFlagForInstruction(const llvm::Instruction &inst) const {
+  void addInstructionPathInfo(CallInputPathInfo &path,
+                              const llvm::Instruction &inst) const {
     if (llvm::isa<llvm::PHINode>(inst)) {
-      return "path_phi";
+      path.SawPhi = true;
+      addCallInputPathAuditFlag(path, "path_phi");
+      return;
     }
     if (llvm::isa<llvm::CastInst>(inst)) {
-      return "path_cast";
+      path.SawCast = true;
+      addCallInputPathAuditFlag(path, "path_cast");
+      return;
     }
     if (llvm::isa<llvm::ExtractValueInst>(inst) ||
         llvm::isa<llvm::InsertValueInst>(inst)) {
-      return "path_aggregate";
+      path.SawAggregate = true;
+      addCallInputPathAuditFlag(path, "path_aggregate");
+      return;
     }
-    return "path_transparent";
+    addCallInputPathAuditFlag(path, "path_transparent");
   }
 
-  std::vector<std::string> appendCallInputPathFlag(std::vector<std::string> flags,
-                                                   llvm::StringRef flag) const {
-    if (!llvm::is_contained(flags, flag)) {
-      flags.push_back(flag.str());
+  void addCallInputPathAuditFlag(CallInputPathInfo &path,
+                                 llvm::StringRef flag) const {
+    if (!llvm::is_contained(path.AuditFlags, flag)) {
+      path.AuditFlags.push_back(flag.str());
     }
-    return flags;
   }
 
-  void mergeCallInputPathFlags(std::vector<std::string> &into,
-                               const std::vector<std::string> &from) const {
-    for (llvm::StringRef flag : from) {
-      if (!llvm::is_contained(into, flag)) {
-        into.push_back(flag.str());
-      }
+  void mergeCallInputPathInfo(CallInputPathInfo &into,
+                              const CallInputPathInfo &from) const {
+    into.ActionAlt = into.ActionAlt || from.ActionAlt;
+    into.Indirect = into.Indirect || from.Indirect;
+    into.IndirectAlt = into.IndirectAlt || from.IndirectAlt;
+    into.LsbTruncated = into.LsbTruncated || from.LsbTruncated;
+    into.ConcatHigh = into.ConcatHigh || from.ConcatHigh;
+    into.SawPhi = into.SawPhi || from.SawPhi;
+    into.SawLoop = into.SawLoop || from.SawLoop;
+    into.SawUnknown = into.SawUnknown || from.SawUnknown;
+    into.SawDoubleCallUse = into.SawDoubleCallUse || from.SawDoubleCallUse;
+    into.SawExternalUse = into.SawExternalUse || from.SawExternalUse;
+    into.SawBlockedUse = into.SawBlockedUse || from.SawBlockedUse;
+    into.SawAggregate = into.SawAggregate || from.SawAggregate;
+    into.SawCast = into.SawCast || from.SawCast;
+    for (llvm::StringRef flag : from.AuditFlags) {
+      addCallInputPathAuditFlag(into, flag);
     }
+  }
+
+  std::vector<std::string> pathInfoFlags(const CallInputPathInfo &path) const {
+    return path.AuditFlags;
   }
 
   bool instructionComesBefore(const llvm::Instruction &first,
@@ -1773,26 +1867,6 @@ private:
       }
     }
     return false;
-  }
-
-  bool isAllowedDoubleCallInputUse(
-      llvm::Instruction &user, const CallInputTrialContext &context) const {
-    if (context.Candidate == nullptr || context.CalleeName.empty()) {
-      return false;
-    }
-    llvm::MDNode *metadata =
-        user.getMetadata("notdec.register.call_input_candidate");
-    if (metadata == nullptr ||
-        mdField(metadata, "register") !=
-            std::optional<std::string>(context.RegisterName) ||
-        mdField(metadata, "callee") !=
-            std::optional<std::string>(context.CalleeName)) {
-      return false;
-    }
-    if (user.getParent() != context.Candidate->getParent()) {
-      return true;
-    }
-    return instructionComesBefore(*context.Candidate, user);
   }
 
   bool isSameCallsiteInputHelper(llvm::Instruction &user,
