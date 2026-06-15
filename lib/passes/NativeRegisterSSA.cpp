@@ -107,12 +107,18 @@ struct CallInputTrialInfo {
   std::string State;
   std::string Reason;
   std::vector<std::string> Flags;
+  std::vector<std::string> PathFlags;
   llvm::Instruction *DoubleUseCandidate = nullptr;
   bool HasBeforeDoubleUseInfo = false;
   std::string BeforeDoubleUseStrength;
   std::string BeforeDoubleUseState;
   std::string BeforeDoubleUseReason;
   std::vector<std::string> BeforeDoubleUseFlags;
+  std::vector<std::string> BeforeDoubleUsePathFlags;
+  std::string DoubleUseTargetCallsiteId;
+  std::string DoubleUseTargetCallee;
+  std::string DoubleUseTargetRegister;
+  std::string DoubleUseTargetState;
 };
 
 // CallInputTrialContext identifies the helper that is currently being checked.
@@ -152,6 +158,7 @@ enum class CallInputUseCheckResult {
 struct CallInputUseCheckInfo {
   CallInputUseCheckResult Result = CallInputUseCheckResult::OnlyCurrentCall;
   llvm::Instruction *DoubleUseCandidate = nullptr;
+  std::vector<std::string> PathFlags;
 };
 
 bool isFlagRegisterName(llvm::StringRef name) {
@@ -1243,6 +1250,31 @@ private:
                                  record.Info.Strength),
               "trial_state", record.Info.State),
           "trial_reason", record.Info.Reason);
+      if (!record.Info.DoubleUseTargetCallsiteId.empty()) {
+        trialMetadata =
+            withMetadataField(*trialMetadata, "double_use_target_callsite_id",
+                              record.Info.DoubleUseTargetCallsiteId);
+      }
+      if (!record.Info.DoubleUseTargetCallee.empty()) {
+        trialMetadata =
+            withMetadataField(*trialMetadata, "double_use_target_callee",
+                              record.Info.DoubleUseTargetCallee);
+      }
+      if (!record.Info.DoubleUseTargetRegister.empty()) {
+        trialMetadata =
+            withMetadataField(*trialMetadata, "double_use_target_register",
+                              record.Info.DoubleUseTargetRegister);
+      }
+      if (!record.Info.DoubleUseTargetState.empty()) {
+        trialMetadata =
+            withMetadataField(*trialMetadata, "double_use_target_state",
+                              record.Info.DoubleUseTargetState);
+      }
+      if (!record.Info.PathFlags.empty()) {
+        trialMetadata =
+            withMetadataField(*trialMetadata, "trial_path_flags",
+                              callInputTrialFlagsText(record.Info.PathFlags));
+      }
       if (!record.Info.Flags.empty()) {
         trialMetadata =
             withMetadataField(*trialMetadata, "trial_flags",
@@ -1285,22 +1317,112 @@ private:
           record.DoubleUseRecord = found->second;
         }
       }
-      applyDoubleUseFinalCheck(record);
+    }
+
+    // Finalization has cross-trial dependencies.  Conditional checks can
+    // downgrade a trial that another double-use check just read, while a
+    // double-use check can restore a conditional trial.  Keep this bounded:
+    // current rules are monotonic toward inactive/no_use after the before-state
+    // restore has fired once, so a small fixed limit exposes bugs without
+    // risking an unbounded pass.
+    for (unsigned iteration = 0; iteration < 4; ++iteration) {
+      std::vector<std::string> before = callInputTrialSignatures(trials);
+      for (CallInputTrialRecord &record : trials) {
+        if (!record.Checked) {
+          continue;
+        }
+        applyConditionalCallInputFinalCheck(record.Info);
+      }
+      for (CallInputTrialRecord &record : trials) {
+        if (!record.Checked) {
+          continue;
+        }
+        applyDoubleUseFinalCheck(record);
+      }
+      if (before == callInputTrialSignatures(trials)) {
+        break;
+      }
+    }
+
+    for (CallInputTrialRecord &record : trials) {
+      if (!record.Checked) {
+        continue;
+      }
       applyConditionalCallInputFinalCheck(record.Info);
       addCallInputPathFlag(record.Info);
     }
   }
 
+  std::vector<std::string>
+  callInputTrialSignatures(const std::vector<CallInputTrialRecord> &trials)
+      const {
+    std::vector<std::string> signatures;
+    signatures.reserve(trials.size());
+    for (const CallInputTrialRecord &record : trials) {
+      signatures.push_back(callInputTrialSignature(record.Info));
+    }
+    return signatures;
+  }
+
+  std::string callInputTrialSignature(const CallInputTrialInfo &info) const {
+    return info.Strength + "|" + info.State + "|" + info.Reason + "|" +
+           callInputTrialFlagsText(info.Flags) + "|" +
+           callInputTrialFlagsText(info.PathFlags) + "|" +
+           info.DoubleUseTargetCallsiteId + "|" + info.DoubleUseTargetCallee +
+           "|" + info.DoubleUseTargetRegister + "|" +
+           info.DoubleUseTargetState;
+  }
+
   void applyDoubleUseFinalCheck(CallInputTrialRecord &record) const {
-    if (!record.Info.HasBeforeDoubleUseInfo ||
-        record.DoubleUseRecord == nullptr || !record.DoubleUseRecord->Checked ||
-        record.DoubleUseRecord->Info.State == "active") {
+    if (record.Info.Reason != "local_double_call_use") {
+      return;
+    }
+    if (!record.Info.HasBeforeDoubleUseInfo) {
+      addCallInputTrialFlag(record.Info, "double_use_no_before_state");
+    }
+    if (record.DoubleUseRecord == nullptr) {
+      recordDoubleUseTargetFields(record.Info, record.Info.DoubleUseCandidate,
+                                  "");
+      addCallInputTrialFlag(record.Info, "double_use_target_unresolved");
+      return;
+    }
+    recordDoubleUseTargetFields(record.Info, record.DoubleUseRecord->Candidate,
+                                record.DoubleUseRecord->Info.State);
+    if (!record.DoubleUseRecord->Checked) {
+      addCallInputTrialFlag(record.Info, "double_use_target_unchecked");
+      return;
+    }
+    if (record.DoubleUseRecord->Info.State == "active") {
+      addCallInputTrialFlag(record.Info, "double_use_target_active");
+      return;
+    }
+    addCallInputTrialFlag(record.Info, "double_use_target_non_active");
+    if (!record.Info.HasBeforeDoubleUseInfo) {
       return;
     }
     record.Info.Strength = record.Info.BeforeDoubleUseStrength;
     record.Info.State = record.Info.BeforeDoubleUseState;
     record.Info.Reason = record.Info.BeforeDoubleUseReason;
     record.Info.Flags = record.Info.BeforeDoubleUseFlags;
+    record.Info.PathFlags = record.Info.BeforeDoubleUsePathFlags;
+  }
+
+  void recordDoubleUseTargetFields(CallInputTrialInfo &info,
+                                   llvm::Instruction *target,
+                                   llvm::StringRef state) const {
+    if (target == nullptr) {
+      return;
+    }
+    llvm::MDNode *metadata =
+        target->getMetadata("notdec.register.call_input_candidate");
+    if (metadata == nullptr) {
+      return;
+    }
+    info.DoubleUseTargetCallsiteId =
+        mdField(metadata, "callsite_id").value_or("");
+    info.DoubleUseTargetCallee = mdField(metadata, "callee").value_or("");
+    info.DoubleUseTargetRegister = mdField(metadata, "register").value_or("");
+    info.DoubleUseTargetState = state.str();
   }
 
   void refreshCallInputCandidateList(llvm::CallBase &call) {
@@ -1360,19 +1482,26 @@ private:
 
   void addCallInputPathFlag(CallInputTrialInfo &trial) const {
     if (callInputTrialHasFlag(trial, "conditional_effect")) {
-      trial.Flags.push_back("path_conditional");
+      addCallInputTrialFlag(trial, "path_conditional");
       return;
     }
     if (trial.State == "active") {
-      trial.Flags.push_back("path_realistic");
+      addCallInputTrialFlag(trial, "path_realistic");
       return;
     }
-    trial.Flags.push_back("path_blocked");
+    addCallInputTrialFlag(trial, "path_blocked");
   }
 
   bool callInputTrialHasFlag(const CallInputTrialInfo &trial,
                              llvm::StringRef expected) const {
     return llvm::is_contained(trial.Flags, expected);
+  }
+
+  void addCallInputTrialFlag(CallInputTrialInfo &trial,
+                             llvm::StringRef flag) const {
+    if (!callInputTrialHasFlag(trial, flag)) {
+      trial.Flags.push_back(flag.str());
+    }
   }
 
   void applyConditionalCallInputFinalCheck(CallInputTrialInfo &trial) const {
@@ -1381,7 +1510,7 @@ private:
       return;
     }
     trial.State = "no_use";
-    trial.Flags.push_back("final_checked");
+    addCallInputTrialFlag(trial, "final_checked");
   }
 
   CallInputTrialInfo callInputTrialInfo(
@@ -1477,6 +1606,7 @@ private:
     blocked.BeforeDoubleUseState = source.State;
     blocked.BeforeDoubleUseReason = source.Reason;
     blocked.BeforeDoubleUseFlags = source.Flags;
+    blocked.BeforeDoubleUsePathFlags = source.PathFlags;
     return blocked;
   }
 
@@ -1509,17 +1639,19 @@ private:
     CallInputUseCheckInfo useInfo = checkCallInputUses(value, context);
     switch (useInfo.Result) {
     case CallInputUseCheckResult::OnlyCurrentCall:
-      return CallInputTrialInfo{"strong_local_def", "active", "only_use"};
+      return CallInputTrialInfo{"strong_local_def", "active", "only_use",
+                                {}, {}, nullptr, false, "", "", "", {}, {},
+                                "", "", "", ""};
     case CallInputUseCheckResult::DoubleCallUse:
       return CallInputTrialInfo{
           "weak_entry_input", "inactive", "local_double_call_use", {},
-          useInfo.DoubleUseCandidate};
+          useInfo.PathFlags, useInfo.DoubleUseCandidate};
     case CallInputUseCheckResult::SharedUse:
       return CallInputTrialInfo{"weak_entry_input", "inactive",
-                                "local_shared_use"};
+                                "local_shared_use", {}, useInfo.PathFlags};
     }
     return CallInputTrialInfo{"weak_entry_input", "inactive",
-                              "local_shared_use"};
+                              "local_shared_use", {}, useInfo.PathFlags};
   }
 
   CallInputUseCheckInfo checkCallInputUses(
@@ -1532,12 +1664,15 @@ private:
       llvm::Instruction &value, const CallInputTrialContext &context,
       std::set<llvm::Instruction *> &visiting) {
     if (!visiting.insert(&value).second) {
-      return {CallInputUseCheckResult::OnlyCurrentCall};
+      return {CallInputUseCheckResult::OnlyCurrentCall, nullptr, {"path_loop"}};
     }
+    llvm::Instruction *doubleUseCandidate = nullptr;
+    std::vector<std::string> pathFlags;
     for (const llvm::Use &use : value.uses()) {
       auto *userInst = llvm::dyn_cast<llvm::Instruction>(use.getUser());
       if (userInst == nullptr) {
-        return {CallInputUseCheckResult::SharedUse};
+        return {CallInputUseCheckResult::SharedUse, nullptr,
+                appendCallInputPathFlag(pathFlags, "path_external_use")};
       }
       if (isSameCallsiteInputHelper(*userInst, context)) {
         continue;
@@ -1546,28 +1681,84 @@ private:
         if (isAllowedDoubleCallInputUse(*userInst, context)) {
           continue;
         }
-        return {CallInputUseCheckResult::DoubleCallUse, userInst};
+        if (doubleUseCandidate == nullptr) {
+          doubleUseCandidate = userInst;
+        }
+        pathFlags =
+            appendCallInputPathFlag(pathFlags, "path_double_call_use");
+        continue;
       }
       if (isSameRegisterDefinitionStore(*userInst, value, context)) {
         continue;
       }
       if (isTransparentCallInputDescendant(*userInst)) {
+        pathFlags =
+            appendCallInputPathFlag(pathFlags, pathFlagForInstruction(*userInst));
         CallInputUseCheckInfo result =
             checkCallInputUses(*userInst, context, visiting);
-        if (result.Result != CallInputUseCheckResult::OnlyCurrentCall) {
-          return result;
+        if (result.Result == CallInputUseCheckResult::SharedUse) {
+          mergeCallInputPathFlags(pathFlags, result.PathFlags);
+          return {CallInputUseCheckResult::SharedUse, nullptr, pathFlags};
         }
+        if (result.Result == CallInputUseCheckResult::DoubleCallUse &&
+            doubleUseCandidate == nullptr) {
+          doubleUseCandidate = result.DoubleUseCandidate;
+        }
+        mergeCallInputPathFlags(pathFlags, result.PathFlags);
         continue;
       }
-      return {CallInputUseCheckResult::SharedUse};
+      pathFlags = appendCallInputPathFlag(pathFlags, "path_blocked");
+      return {CallInputUseCheckResult::SharedUse, nullptr, pathFlags};
     }
-    return {CallInputUseCheckResult::OnlyCurrentCall};
+    // A real non-call use beats double-use as the reason.  Only report
+    // double-use after the full descendant scan has found no ordinary use.
+    if (doubleUseCandidate != nullptr) {
+      pathFlags =
+          appendCallInputPathFlag(pathFlags, "path_double_call_use");
+      return {CallInputUseCheckResult::DoubleCallUse, doubleUseCandidate,
+              pathFlags};
+    }
+    if (pathFlags.empty()) {
+      pathFlags = appendCallInputPathFlag(pathFlags, "path_realistic");
+    }
+    return {CallInputUseCheckResult::OnlyCurrentCall, nullptr, pathFlags};
   }
 
   bool isTransparentCallInputDescendant(const llvm::Instruction &inst) const {
     return llvm::isa<llvm::CastInst>(inst) || llvm::isa<llvm::PHINode>(inst) ||
            llvm::isa<llvm::ExtractValueInst>(inst) ||
            llvm::isa<llvm::InsertValueInst>(inst);
+  }
+
+  std::string pathFlagForInstruction(const llvm::Instruction &inst) const {
+    if (llvm::isa<llvm::PHINode>(inst)) {
+      return "path_phi";
+    }
+    if (llvm::isa<llvm::CastInst>(inst)) {
+      return "path_cast";
+    }
+    if (llvm::isa<llvm::ExtractValueInst>(inst) ||
+        llvm::isa<llvm::InsertValueInst>(inst)) {
+      return "path_aggregate";
+    }
+    return "path_transparent";
+  }
+
+  std::vector<std::string> appendCallInputPathFlag(std::vector<std::string> flags,
+                                                   llvm::StringRef flag) const {
+    if (!llvm::is_contained(flags, flag)) {
+      flags.push_back(flag.str());
+    }
+    return flags;
+  }
+
+  void mergeCallInputPathFlags(std::vector<std::string> &into,
+                               const std::vector<std::string> &from) const {
+    for (llvm::StringRef flag : from) {
+      if (!llvm::is_contained(into, flag)) {
+        into.push_back(flag.str());
+      }
+    }
   }
 
   bool instructionComesBefore(const llvm::Instruction &first,
@@ -1659,6 +1850,7 @@ private:
     bool sawReturn = false;
     bool sawStrong = false;
     std::string inactiveReason = "entry_input";
+    std::optional<CallInputTrialInfo> doubleUseTrial;
     for (llvm::Value *incoming : phi.incoming_values()) {
       if (incoming == &phi) {
         continue;
@@ -1674,6 +1866,10 @@ private:
         } else if (inactiveReason == "entry_input") {
           inactiveReason = trial.Reason;
         }
+        if (trial.Reason == "local_double_call_use" &&
+            trial.DoubleUseCandidate != nullptr && !doubleUseTrial.has_value()) {
+          doubleUseTrial = trial;
+        }
       } else {
         sawStrong = true;
       }
@@ -1684,8 +1880,19 @@ private:
                                   "return_forward"};
       }
       if (sawStrong) {
-        return CallInputTrialInfo{"strong_phi", "active", "phi",
-                                  {"conditional_effect"}};
+        CallInputTrialInfo phiTrial{"strong_phi", "active", "phi",
+                                    {"conditional_effect"}};
+        // Ghidra's MULTIEQUAL handling can keep following a useful incoming,
+        // but double-use is decided later against the other call's trial state.
+        // Preserve that incoming-level block here so finalize can make the
+        // checked/non-active decision instead of losing the target helper.
+        if (doubleUseTrial.has_value()) {
+          return withBeforeDoubleUseInfo(*doubleUseTrial, phiTrial);
+        }
+        return phiTrial;
+      }
+      if (doubleUseTrial.has_value()) {
+        return *doubleUseTrial;
       }
       return CallInputTrialInfo{"weak_entry_input", "inactive",
                                 inactiveReason};

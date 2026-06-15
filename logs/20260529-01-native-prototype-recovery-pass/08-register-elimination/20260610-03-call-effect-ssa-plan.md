@@ -3940,3 +3940,463 @@ cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test n
 - 实现效果：6/10。按 Ghidra 的 checked/non-active 规则放宽了一个真实 double-use，但最终被 conditional final check 保守挡住。
 - 复杂度：4/10。开始出现 finalize 内跨 trial 状态读取，但仍是单轮、保守处理。
 - 维护成本：5/10。后续需要把 double-use target 解析失败或不可恢复的原因写进 metadata/summary，否则调试剩余 1 个 case 仍要查 IR。
+
+## 2026-06-15 实现记录：double-use finalize 分阶段和剩余原因 metadata
+
+本次继续推进阶段 3e。对照 Ghidra `onlyOpUse()` / `checkCallDoubleUse()` 后，补了三个小点：
+
+- finalizer 不再逐条做 `double-use -> conditional final check`，而是先统一解析 target，再统一做 conditional final check，再做 double-use final check，最后再处理被恢复出来的 conditional trial。
+- use 检查遇到其它 call helper 时先记录 double-use target，继续扫剩余 descendant use；如果发现普通真实 use，优先返回 `local_shared_use`。
+- 剩余 `local_double_call_use` 写出不可恢复原因 flag，避免每次都手查 IR。
+
+这仍不是完整 Ghidra alternate path。当前只是让顺序和 metadata 更接近 Ghidra 的 checked/finalize 模型。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:1270`
+  - `finalizeCallInputTrials()` 拆成几段：
+    - 先解析 `DoubleUseCandidate -> DoubleUseRecord`。
+    - 再统一执行 conditional final check。
+    - 再执行 double-use final check。
+    - 最后对恢复出来的 conditional trial 再 final check，并补 path flag。
+
+- `lib/passes/NativeRegisterSSA.cpp:1315`
+  - `applyDoubleUseFinalCheck()` 给无法恢复的 double-use 写 flag：
+    - `double_use_no_before_state`
+    - `double_use_target_unresolved`
+    - `double_use_target_unchecked`
+    - `double_use_target_active`
+    - `double_use_target_non_active`
+
+- `lib/passes/NativeRegisterSSA.cpp:1399`
+  - `addCallInputPathFlag()` 改用 `addCallInputTrialFlag()`，避免重复 flag。
+
+- `lib/passes/NativeRegisterSSA.cpp:1416`
+  - 新增 `addCallInputTrialFlag()`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1576`
+  - `checkCallInputUses()` 不再遇到第一个不允许的 other call helper 就立即返回。
+  - 先记住 double-use target，继续检查其它 descendant use。
+  - 如果后续发现普通真实 use，返回 `local_shared_use`；只有没有普通 use 时才返回 `local_double_call_use`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1715`
+  - `phiInputTrialInfo()` 记录 incoming 里的 double-use trial。
+  - 如果 PHI 同时有 strong incoming 和 double-use incoming，保留 PHI 被 double-use 拦住前的 `strong_phi/phi` 结论，交给 finalizer 看 target trial 状态。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm -j2
+
+/usr/bin/time -f 'TIME native-llvm-double-use-flags %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-double-use-flags.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-double-use-flags.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-double-use-flags.ll \
+  -o /tmp/hexx64-1156e0-double-use-flags.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-double-use-flags.bc \
+  -o /tmp/hexx64-1156e0-double-use-flags.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`76.77s`。
+- 和上一轮 `target inactive double-use final check` 比：
+  - `call input strong: 266 -> 265`
+  - `call input weak: 1618 -> 1619`
+  - `call input trials inactive: 1618 -> 1619`
+  - `call input trials no use: 2496 -> 2495`
+  - `call input trial flags conditional effect: 6 -> 5`
+  - `call input trial flags conditional final check: 6 -> 5`
+  - `call input trial reasons local shared use: 39 -> 40`
+  - `call input trial reasons phi: 6 -> 5`
+  - `call input trial reasons local double call use: 1 -> 1`
+
+关键 metadata：
+
+```text
+!7785 = !{!"callsite_id=notdec_native_1156e0:602", ..., !"trial_state=inactive", !"trial_reason=local_double_call_use", !"trial_flags=double_use_no_before_state,double_use_target_unresolved,path_blocked"}
+```
+
+解释：
+
+- 之前一个 PHI/conditional case 被重新归类为 `local_shared_use`，因为 descendant 链上有真实非 call use；这比只报 double-use 更符合 Ghidra `onlyOpUse()`。
+- 剩余 `!7785` 不是 target active 导致不能恢复，而是当前 native 没保留下可恢复的 before-state，也没有解析到 target record。
+- 这说明下一步不是继续放宽 double-use，而是要补 Ghidra 的 mark / alternate path / loop-aware path 信息，让 PHI 派生链能带着目标 helper 和路径原因走到 finalizer。
+
+### 判断
+
+- 实现效果：6/10。finalize 顺序更接近 Ghidra，剩余 double-use 也能直接从 metadata 看出卡在哪里。
+- 复杂度：5/10。finalizer 阶段变多了，但仍局限在 `NativeRegisterSSA.cpp` 内部，没有外扩 API。
+- 维护成本：5/10。后续需要把 `double_use_*` flag 是否进入 summary 作为单独小步考虑；当前先保留在 metadata，避免改 summary 结构。
+
+## 2026-06-15 实现记录：double-use target 字段和当前决策点
+
+上一节只写了 `double_use_target_unresolved`，还不够定位。这里再补 target 字段，让 unresolved/checked/non-active 这类结果能看到目标 callsite。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:116`
+  - `CallInputTrialInfo` 增加：
+    - `DoubleUseTargetCallsiteId`
+    - `DoubleUseTargetCallee`
+    - `DoubleUseTargetRegister`
+    - `DoubleUseTargetState`
+
+- `lib/passes/NativeRegisterSSA.cpp:1250`
+  - 写回 call input metadata 时输出：
+    - `double_use_target_callsite_id`
+    - `double_use_target_callee`
+    - `double_use_target_register`
+    - `double_use_target_state`
+
+- `lib/passes/NativeRegisterSSA.cpp:1347`
+  - `applyDoubleUseFinalCheck()` 在 unresolved / resolved 两种情况下都尝试记录 target 字段。
+
+- `lib/passes/NativeRegisterSSA.cpp:1372`
+  - 新增 `recordDoubleUseTargetFields()`，从目标 helper metadata 读取 callsite/callee/register。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-double-use-target-fields %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-double-use-target-fields.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-double-use-target-fields.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-double-use-target-fields.ll \
+  -o /tmp/hexx64-1156e0-double-use-target-fields.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-double-use-target-fields.bc \
+  -o /tmp/hexx64-1156e0-double-use-target-fields.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`77.82s`。
+- summary 和上一节一致。
+
+关键 metadata：
+
+```text
+!5912 = !{!"callsite_id=notdec_native_1156e0:450", ..., !"trial_state=no_use", !"trial_reason=phi", !"double_use_target_callsite_id=notdec_native_1156e0:602", !"double_use_target_callee=qvector_reserve", !"double_use_target_register=RDX", !"double_use_target_state=inactive", !"trial_flags=conditional_effect,final_checked,path_conditional"}
+
+!7785 = !{!"callsite_id=notdec_native_1156e0:602", ..., !"trial_state=inactive", !"trial_reason=local_double_call_use", !"trial_flags=double_use_no_before_state,double_use_target_unresolved,path_blocked"}
+```
+
+### 当前决策点
+
+剩余 case 不是简单的“target trial inactive 所以可以恢复”。现在能看到：
+
+- `!5912` 的 double-use target 是 `!7785`，而 `!5912` 最终被 conditional final check 降成 `no_use`。
+- `!7785` 自己仍是 `local_double_call_use`，但没有 before-state，也解析不到 target record。
+- 这说明 native 当前只保存了“命中另一个 helper”这个局部事实，没有保存 Ghidra `TraverseNode` 那种 path flags / alternate path / mark 信息。
+
+如果继续做，需要先决定 native 侧怎么表达 Ghidra 的这部分语义：
+
+- 方案 A：在 `CallInputUseCheckInfo` 里扩展 path 信息，记录 target helper、经过的 PHI/cast/indirect/loop，以及是否 alternate path valid。finalizer 根据这些信息处理环。
+- 方案 B：保持当前保守策略，把这种双向/环形 double-use 留在 inactive，只把 metadata 做清楚，等更完整的 ancestor/path 重构再处理。
+
+目前不建议继续靠局部条件放宽 `!7785`。没有 path 信息时，无法证明这个值只服务当前 call，也无法判断 PHI 循环里的 alternate path 是否安全。
+
+### Ghidra 具体依据
+
+Ghidra 这块不是只看“另一个 trial 是否 active”。它把从同一个 varnode 到不同 call/return 的路径分成 main path 和 alternate path，然后用 flags 比较哪条更像真正的参数路径。
+
+关键源码：
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/expression.hh:61`
+  - `TraverseNode`
+  - flags 包括：
+    - `actionalt`
+    - `indirect`
+    - `indirectalt`
+    - `lsb_truncated`
+    - `concat_high`
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/expression.cc:28`
+  - `TraverseNode::isAlternatePathValid()`
+  - 判断逻辑不是 dominance，也不是 CFG reachability，而是路径形态：
+    - main path 过 `INDIRECT`、alternate 没过时，alternate 更可信。
+    - alternate path 过 solid action / non-incidental copy 时，alternate 更可信。
+    - 如果 varnode 只有一个 descend，或者 def 不是 marker，也会影响判断。
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc:1756`
+  - `Funcdata::checkCallDoubleUse()`
+  - 当另一个 call 的 trial 未 checked 时，会调用 `TraverseNode::isAlternatePathValid(vn, fl)`；如果 alternate path 更可信，就拒绝当前 trial。
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc:1805`
+  - `Funcdata::onlyOpUse()`
+  - 往 descendant 方向追 use 时维护 `TraverseNode` flags。
+  - 遇到 `CALL/CALLIND` 时把 flags 交给 `checkCallDoubleUse()`。
+  - 遇到 `INDIRECT`、`COPY`、`PIECE`、`SUBPIECE` 会更新 flags。
+
+- `/sn640/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp/funcdata_varnode.cc:1917`
+  - `Funcdata::ancestorOpUse()`
+  - 遇到 `MULTIEQUAL` 会用 mark 防止循环，并逐个 incoming 尝试 ancestor path。
+
+对 native 的含义：
+
+- 只记录 `DoubleUseCandidate` 不够；还要记录这条路径是怎么到达 target helper 的。
+- 当前 `std::set<Instruction *> visiting` 只能防止无限递归，不能表达 Ghidra 的 mark / path flags。
+- `isAllowedDoubleCallInputUse()` 现在按 callee/register/block/order 放宽，只是很小的子集；它没有 `TraverseNode::isAlternatePathValid()` 的信息。
+- 剩余 `!5912 <-> !7785` 这种环，如果没有 path flags，不能判断哪条路径更可信。
+
+建议下一步：
+
+- 先不要继续放宽 `local_double_call_use`。
+- 先把 `CallInputUseCheckInfo` 扩展成类似 `TraverseNode` 的轻量结构：
+  - target helper
+  - descendant path flags
+  - 是否穿过 PHI
+  - 是否穿过 call effect / indirect
+  - 是否遇到 loop/visited 截断
+- 再把 `isAllowedDoubleCallInputUse()` 的局部规则迁到 finalizer，结合 target trial state 和 path flags 决策。
+
+## 2026-06-15 实现记录：trial path flags 第一版
+
+本次按上一节建议先补一个轻量版 path 信息，不改变 `trial_state` 判定。目标是先把 Ghidra `TraverseNode` 的一部分事实暴露出来，后续再决定是否用它放宽 double-use。
+
+当前只记录 LLVM 侧已有的透明 descendant 路径：
+
+- `path_phi`
+- `path_cast`
+- `path_aggregate`
+- `path_loop`
+- `path_double_call_use`
+- `path_blocked`
+- `path_external_use`
+- `path_realistic`
+
+这些 flag 不是完整 Ghidra `TraverseNode`。还没有建 `indirect` / `indirectalt` / `actionalt` 的等价物，也没有实现 `isAlternatePathValid()`。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:110`
+  - `CallInputTrialInfo` 增加 `PathFlags`。
+  - before-double-use 状态增加 `BeforeDoubleUsePathFlags`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1253`
+  - metadata 写回新增 `trial_path_flags`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1580`
+  - `withBeforeDoubleUseInfo()` 保存 before-state 的 path flags。
+
+- `lib/passes/NativeRegisterSSA.cpp:1608`
+  - `callInputUseTrialInfo()` 把 use-check 得到的 path flags 写进 trial info。
+
+- `lib/passes/NativeRegisterSSA.cpp:1634`
+  - `checkCallInputUses()` 维护 path flags。
+  - 遇到 transparent descendant 时记录路径类型，并合并递归结果。
+  - 遇到 visited 截断时记录 `path_loop`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1704`
+  - 新增 `pathFlagForInstruction()`，先区分 PHI / cast / aggregate。
+
+- `lib/passes/NativeRegisterSSA.cpp:1718`
+  - 新增 `appendCallInputPathFlag()`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1726`
+  - 新增 `mergeCallInputPathFlags()`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1760`
+  - `phiInputTrialInfo()` 对“全部 incoming inactive，但其中有 double-use”的情况，不再只保留 reason 字符串，而是保留 incoming trial 的 target/path 信息。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-phi-double-use-path %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-phi-double-use-path.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-phi-double-use-path.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-phi-double-use-path.ll \
+  -o /tmp/hexx64-1156e0-phi-double-use-path.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-phi-double-use-path.bc \
+  -o /tmp/hexx64-1156e0-phi-double-use-path.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`76.62s`。
+- summary 和上一节一致，没有改变 active/no-use 数量。
+
+关键 metadata：
+
+```text
+!7785 = !{!"callsite_id=notdec_native_1156e0:602", ..., !"trial_state=inactive", !"trial_reason=local_double_call_use", !"double_use_target_callsite_id=notdec_native_1156e0:450", !"double_use_target_callee=notdec_native_e2580", !"double_use_target_register=RDX", !"double_use_target_state=active", !"trial_path_flags=path_phi,path_realistic,path_double_call_use", !"trial_flags=double_use_target_active,path_blocked"}
+```
+
+这比上一节更清楚：
+
+- `!7785` 的 target 已能解析到 `!5912`。
+- 路径确实穿过 PHI，并且命中 double-call-use。
+- `!7785` 看到 target 时，target state 是 `active`，所以它保持 inactive。
+
+但最终 IR 里 `!5912` 自己又是：
+
+```text
+trial_state=no_use
+trial_reason=phi
+trial_flags=conditional_effect,final_checked,path_conditional
+```
+
+这暴露出新的顺序问题：
+
+- 当前 finalizer 是单轮阶段式处理。
+- `!5912` 可以在 double-use final check 阶段恢复成 active。
+- `!7785` 随后看到 `!5912` active，于是保持 inactive。
+- 最后一轮 conditional final check 又把 `!5912` 降成 no_use。
+
+所以剩余问题已经不是“target 解析不到”，而是 finalizer 需要收敛语义：double-use final check 和 conditional final check 会互相影响。
+
+### 当前决策点
+
+如果继续按 Ghidra 做，需要决定 finalizer 的状态模型：
+
+- 方案 A：做迭代收敛。每轮先 conditional final check，再 double-use final check，直到 trial state 不再变化。需要定义恢复、降级、flag 清理的优先级。
+- 方案 B：拆出 pre-final / final 两套状态。double-use 只能读取 final state，不能读取中间 active 状态。
+- 方案 C：保持当前保守状态，不继续恢复这类环形 double-use，只把 path/target metadata 作为审计信息。
+
+不建议在当前单轮 finalizer 上继续加局部条件。否则会出现 target state 读取的是中间状态，而不是最终状态。
+
+### 判断
+
+- 实现效果：6/10。path 信息已经落到 IR，定位能力明显更好，但还没用于真正放宽/拒绝。
+- 复杂度：5/10。新增 path flags 仍在 `NativeRegisterSSA.cpp` 内部，没有改 PrototypeRecovery。
+- 维护成本：6/10。下一步如果要实现迭代 finalizer，需要明确状态优先级；否则容易出现 active/no_use 来回切换。
+
+## 2026-06-15 实现记录：bounded finalizer 收敛
+
+上一节暴露的问题是 finalizer 单轮处理读到了中间态：`!7785` 看到 `!5912` active，但 `!5912` 最后一轮又被 conditional final check 降成 `no_use`。这次先实现 bounded 收敛，不改变 use-check 规则。
+
+思路：
+
+- 每轮先跑 conditional final check。
+- 再跑 double-use final check。
+- 用 trial signature 判断是否稳定。
+- 最多 4 轮，避免规则错误时无限循环。
+- 收敛后再补最终 path flag。
+
+这比单轮更接近 Ghidra 的 checked/final 状态分阶段，也避免 double-use 读取中间 active 状态。
+
+### 改动
+
+- `lib/passes/NativeRegisterSSA.cpp:1302`
+  - `finalizeCallInputTrials()` 改成 bounded fixpoint：
+    - 建立 double-use target record。
+    - 最多 4 轮执行 conditional final check + double-use final check。
+    - trial signature 不变时停止。
+    - 最后统一补 path flag。
+
+- `lib/passes/NativeRegisterSSA.cpp:1356`
+  - 新增 `callInputTrialSignatures()`。
+
+- `lib/passes/NativeRegisterSSA.cpp:1367`
+  - 新增 `callInputTrialSignature()`。
+  - signature 包含 strength/state/reason/flags/path flags/double-use target 字段。
+
+### 验证
+
+```bash
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+
+/usr/bin/time -f 'TIME native-llvm-finalizer-fixpoint %e' \
+  /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/hexx64.so \
+  -f 0x1156e0 \
+  --register-ssa-summary \
+  -o /tmp/hexx64-1156e0-finalizer-fixpoint.ll \
+  > /tmp/notdec-native-logs/hexx64-1156e0-finalizer-fixpoint.log 2>&1
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/hexx64-1156e0-finalizer-fixpoint.ll \
+  -o /tmp/hexx64-1156e0-finalizer-fixpoint.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/hexx64-1156e0-finalizer-fixpoint.bc \
+  -o /tmp/hexx64-1156e0-finalizer-fixpoint.verified.bc
+```
+
+结果：
+
+- `native_register_effects_test` 和 `native_prototype_recovery_test` 通过。
+- `hexx64.so -f 0x1156e0` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 本次时间：`77.04s`。
+- 和上一节比：
+  - `call input trial reasons local double call use: 1 -> 0`
+  - `call input strong: 265 -> 266`
+  - `call input weak: 1619 -> 1618`
+  - `call input trials inactive: 1619 -> 1618`
+  - `call input trials no use: 2495 -> 2496`
+  - `call input trial flags conditional effect: 5 -> 6`
+  - `call input trial flags conditional final check: 5 -> 6`
+  - `call input trial flags path conditional: 5 -> 6`
+  - `call input trial flags path blocked: 4109 -> 4108`
+  - `call input trial reasons phi: 5 -> 6`
+
+关键 metadata：
+
+```text
+!7785 = !{!"callsite_id=notdec_native_1156e0:602", ..., !"strength=strong_phi", !"trial_state=no_use", !"trial_reason=phi", !"double_use_target_callsite_id=notdec_native_1156e0:450", !"double_use_target_callee=notdec_native_e2580", !"double_use_target_register=RDX", !"double_use_target_state=no_use", !"trial_flags=conditional_effect,final_checked,path_conditional"}
+```
+
+解释：
+
+- `!7785` 不再停在 `local_double_call_use`。
+- fixpoint 后它恢复成 PHI 结论，再被 conditional final check 降成 `no_use`。
+- target state 也不再是中间 active，而是最终 `no_use`。
+
+### 当前剩余问题
+
+本次解决的是 finalizer 顺序问题。剩下的不是这个 case 是否应该 active，而是完整 Ghidra `TraverseNode` 语义还没实现：
+
+- 还没有 `actionalt`。
+- 还没有 `indirect` / `indirectalt`。
+- 还没有 `PIECE/SUBPIECE` 的 truncation/concat 语义。
+- 还没有 `isAlternatePathValid()` 的真正 native 对应。
+
+下一步如果继续放宽 trial，需要先补这些 path 语义；否则应该保持当前 conservative `no_use`。
+
+### 判断
+
+- 实现效果：7/10。真实 hexx64 剩余 double-use 归零，finalizer 不再读中间态。
+- 复杂度：6/10。引入 bounded fixpoint，但仍只在 trial table 内部。
+- 维护成本：6/10。后续要注意新增 final check 规则必须保持收敛，必要时把 state transition 写成显式枚举。
