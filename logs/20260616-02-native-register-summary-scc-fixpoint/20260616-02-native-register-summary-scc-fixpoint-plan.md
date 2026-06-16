@@ -16,6 +16,12 @@
 >
 > 你这个说的完全不对，再去复习一下docs/analysis/abstract-interpretation-register-summary.md文档，或者搜一下网上关于抽象解释这方面的介绍再补充进去，不可能提到的是指令前后的读写交换，而是指控制流那边。如果join和meet运算符之间满足交换律，就意味着所有可能路径组合后再合并，等价于在每个控制流汇聚的地方提前合并，极大减少算力消耗。
 
+用户继续补充：
+
+> summary 算完后，可以考虑再top-down进一步确认一些不确定的寄存器信息？比如，部分函数在结尾修改了多个寄存器，但是真正的返回值可能只有RAX，可以通过分析所有的caller看修改的寄存器真正被用的有多少。因为顶层的寄存器调用情况是已知的，即假设需要遵守调用约定，所以从顶层不断确定下来。按照这个思路进一步拓展想想
+>
+> 是的，按照这个思路改一下，在logs/20260616-02-native-register-summary-scc-fixpoint/20260616-02-native-register-summary-scc-fixpoint-plan.md计划的技术路线后面补充top-down部分
+
 ## 背景
 
 这是 native prototype recovery / register elimination 的新版独立链路。
@@ -394,29 +400,229 @@ readEntry: bool
 transfer function 仍然是 monotone，worklist 里的 in-state 通过 join 增长；domain 有限，所以仍然收敛。
 保存/恢复这类精化放在 fixpoint 后的 postpass，避免破坏单调迭代。
 
-### 8. Prototype recovery 消费
+### 8. Top-down demand analysis
+
+bottom-up summary 解决“函数本身可能做什么”：
+
+```text
+readEntry
+exit mayEntry / mayNonEntry
+callee 对 caller 的 register effect
+```
+
+但它不能单独判断“哪些 changed register 真正是返回值”。
+例如某个函数同时修改 `RAX/RDX/RCX`，bottom-up 只能说它们都可能是 non-entry。
+真正的返回值更应该看所有 caller 在 call 后读取了哪些 register。
+
+因此在 bottom-up SCC fixpoint 收敛后，再加一个 top-down demand analysis。
+它不修改 `EffectSummary`，只产出第二套结果：
+
+```text
+DemandSummary = {
+  exitDemand[R]: 函数返回时 R 是否被 caller / 顶层 ABI 观察,
+  entryDemand[R]: 函数入口 R 是否影响被观察结果
+}
+```
+
+callsite 也记录：
+
+```text
+CallsiteDemand = {
+  demandedOutputs: call 后哪些 register 的 callee 新值被读取,
+  demandedInputs: call 前哪些 register 作为 callee 输入被需要
+}
+```
+
+#### 8.1 Demand 种子
+
+顶层函数、exported function、外部可调用入口按 ABI 加初始需求：
+
+```text
+ABI return registers -> exitDemand
+```
+
+第一版可以先只放常规返回寄存器，例如 x86-64 SysV 下的 `RAX`。
+callee-saved register 不是返回值 demand，它是 ABI preservation obligation，仍由 bottom-up preserved 判断处理。
+
+internal function 的需求来自所有 caller：
+
+```text
+caller 在 call 后读取 R
+callee summary 显示 R 可能是 non-entry
+  -> callee.exitDemand[R] = true
+```
+
+如果某个 changed register 从来没有被 caller 读取，也不是顶层 ABI return register，它就只是 dead changed register，不应作为强返回值证据。
+
+#### 8.2 函数内 backward demand
+
+top-down 进入某个函数后，用 `exitDemand` 在函数 CFG 上做 backward analysis。
+这个阶段仍然只追 register，不引入 stack/memory alias。
+
+普通指令规则：
+
+```text
+如果指令写 R，且 R 在 demand_after 中:
+  指令读取的 register 加入 demand_before
+
+如果指令写 R，但 R 不在 demand_after 中:
+  这个写出的 register 值对当前需求无贡献
+
+如果指令只读 R，且这个 read 本身是控制流或可观察副作用需要:
+  R 加入 demand_before
+```
+
+对当前第一版，分支条件读取的 register 应该保守加入 demand。
+一般内存/栈暂不追；后续如果加内存输出，只处理明确的占空间 frame-local 内存，不做全局 alias。
+
+函数入口处得到：
+
+```text
+entryDemand[R]
+```
+
+它表示入口 register `R` 的值不只是“可能被读过”，而且可能影响当前程序上下文里被观察到的结果。
+
+#### 8.3 Call 指令的 demand 传播
+
+call 是 top-down 的核心。
+设 caller 在 call 后 demand `R`：
+
+```text
+callee exit mayEntry=true
+  -> caller call 前 R 继续 demand
+
+callee exit mayNonEntry=true
+  -> callee.exitDemand[R] = true
+```
+
+如果 callee 的出口是混合状态：
+
+```text
+mayEntry=true, mayNonEntry=true
+```
+
+两边都传播：
+
+```text
+caller call 前 R 继续 demand
+callee.exitDemand[R] = true
+```
+
+参数需求从 callee 的 `entryDemand` 回传到 caller：
+
+```text
+callee.entryDemand[R] = true
+  -> caller call 前 R 被 demand
+```
+
+如果第一版还没有稳定的 `entryDemand`，可以先用 `callee.readEntry` 作为保守近似：
+
+```text
+callee.readEntry[R] = true
+  -> caller call 前 R 被 demand
+```
+
+等 top-down fixpoint 跑通后，再用 `entryDemand` 精化参数证据。
+
+#### 8.4 Top-down SCC fixpoint
+
+demand 沿 call graph 从 caller 传向 callee。
+递归和互递归仍然需要 SCC fixpoint：
+
+```text
+先跑 bottom-up SCC，得到稳定 EffectSummary
+再按 call graph 从 roots / exports 向下传播 demand
+
+for each SCC:
+  初始化 SCC 内函数 DemandSummary
+  repeat:
+    用当前 demand 分析 SCC 内每个函数
+    通过 callsite 把 demand 传给 callee
+  until DemandSummary 不变
+```
+
+这个 fixpoint 的 lattice 也是有限的：
+
+```text
+exitDemand[R]: false -> true
+entryDemand[R]: false -> true
+```
+
+CFG backward 合流使用 OR。
+只要 demand bit 增加，不删除，最终会收敛。
+
+#### 8.5 消费规则
+
+最终 prototype / residue 删除不只看 bottom-up changed，还看 top-down demand：
+
+```text
+EffectSummary.exit mayNonEntry[R] = true
+DemandSummary.exitDemand[R] = true
+R 属于 ABI return register
+  -> 强返回值候选
+```
+
+如果：
+
+```text
+EffectSummary.exit mayNonEntry[R] = true
+DemandSummary.exitDemand[R] = false
+```
+
+则 `R` 只是函数可能写过的 dead changed register。
+它可以用于 clobber/residue 判断，但不应直接当返回值。
+
+参数也类似：
+
+```text
+EffectSummary.readEntry[R] = true
+DemandSummary.entryDemand[R] = true
+  -> 强输入参数候选
+```
+
+如果只有 `readEntry=true`，但 `entryDemand=false`，说明入口值可能被读过，但在当前程序上下文里没有影响被观察结果。
+第一版可以保守记录为 weak input，不直接改 prototype。
+
+### 9. Prototype recovery 消费
 
 新版链路不再需要 caller-side trial/use 作为主判据。
 
-函数输入来自 callee summary：
+函数输入先来自 bottom-up 的 `readEntry`：
 
 ```text
-callee summary: reads RDI
+callee summary: readEntry[RDI] = true
 callsite: 当前 RDI 抽象状态
-  -> RDI 是这个 callsite 的参数来源
+  -> RDI 是这个 callsite 的 weak 参数来源
 ```
 
-函数返回来自 callee exit summary：
+如果 top-down 后还有：
+
+```text
+DemandSummary.entryDemand[RDI] = true
+```
+
+则 `RDI` 升级为 strong 参数候选。
+
+函数返回也分两层。
+bottom-up 只产出 weak return candidate：
 
 ```text
 callee summary: RAX 是 ABI output register
 callee exit mayNonEntry[RAX] = true
-  -> RAX 是返回值来源
+  -> RAX 是 weak 返回值候选
+```
+
+top-down 确认 caller / root 真的观察这个寄存器后，再升级：
+
+```text
+DemandSummary.exitDemand[RAX] = true
+  -> RAX 是 strong 返回值候选
 ```
 
 如果 callee 没读某个 ABI input register，则 caller 对该 register 的写入不应该被当成参数证据。
 
-### 9. Register residue 删除
+### 10. Register residue 删除
 
 summary 可用于更系统地删除 residue：
 
@@ -451,10 +657,14 @@ summary 可用于更系统地删除 residue：
 - direct call graph 不完整时，部分 internal call 会退到 ABI。
 - SCC fixpoint 如果 lattice 设计太细，容易震荡或实现复杂。
 - `mayEntry=true, mayNonEntry=true` 的混合状态如果消费侧处理不严，可能误当 precise value。
+- top-down demand 如果 root/export 的 ABI seed 不准，会把真实返回值误判为未使用。
+- 只看 caller 读取寄存器时，未建模的内存/异常/间接调用可能隐藏真实观察点。
 
 风险处理：
 
 - 第一版宁可保守，不从混合状态生成 signature rewrite。
+- top-down 结果只用于增强返回值/参数置信度，不删除 bottom-up effect summary。
+- root/export 使用 ABI return register 作为 demand seed；不确定入口先保守保留 weak candidate。
 - summary 先写 metadata / 日志，不直接大规模删 IR。
 - 删除 register residue 必须作为后续阶段，等 summary 稳定后再做。
 
@@ -469,10 +679,14 @@ summary 可用于更系统地删除 residue：
 - external / indirect call 使用 ABI fallback。
 - 简单递归 SCC 能收敛。
 - `mayEntry=true, mayNonEntry=true` 不参与 prototype rewrite。
+- 修改 `RAX/RDX` 但 caller 只读取 `RAX` 的函数：top-down 标记 `RAX` 为 demanded output，`RDX` 不作为强返回值。
+- caller call 后读取 preserved register：demand 继续传到 call 前，不误传成 callee return。
+- 递归 SCC 内 demand 能收敛。
 
 Bench2 判断标准：
 
 - summary pass 能跑完当前 Bench2 native IR。
 - 输出每个函数的 register read / preserved / modified / return 统计。
+- 输出 demanded output / weak output 统计，检查多返回寄存器候选是否减少。
 - 不引入 `llvm-as` / `opt verify` 回归。
 - 在不开启 residue 删除时，IR 行为不变。
