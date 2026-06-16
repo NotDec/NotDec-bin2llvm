@@ -8,6 +8,14 @@
 
 > 每个 register 当前值用少量抽象值表示，这一块感觉不太系统。初始值就是entry，如果改动了就变成改动了的，为什么还要单独分什么Call Clobber，Call Return。对某个函数的调用，目标函数的所有基本块在transfer function的合并下得到的结果就是函数的结果，根据函数的结果去分析call 的效应就可以了，没必要分什么clobber return。栈指针相关可以单独由专门的pass匹配和处理，当前这个pass可以不考虑，搞一个不考虑的寄存器集合作为pass的参数。另外3-5节重写一下按照transfer function的思路去描述，定义抽象域，join函数，meet函数，然后证明join和meet操作满足交换律，然后函数的summary就直接定义为整个函数CFG的整体效应即可。最好先网上搜一下且复习一下相关的抽象解释框架，将相关基础知识也总结到一个docs/下合适位置的文档，然后再去改。抽象域这一块稍微处理一下，比如用一个什么map去存，如果map里面不存在的值就是默认值，表示untouched。如果仅读取了就是read，被改过就是modified？但是，函数的summary可以在计算完毕后，单独去匹配保存和恢复callee saved register的模式，然后将对应的值从modified改成别的值？这一块深入思考一下
 
+用户进一步澄清：
+
+> write比较明确，即关系寄存器是否被改动。函数识别参数（read）的话，其实主要关心函数开头的值是否可能被读取，可能存在use，所以read这部分是Or运算。但是，一旦某个值已经被覆盖，类似被killed，则此时后续指令再读取就不管了。这个逻辑可以表示吗？
+>
+> 如果转换函数用了if规则表达了这种情况的话，它是否还满足交换律？
+>
+> 你这个说的完全不对，再去复习一下docs/analysis/abstract-interpretation-register-summary.md文档，或者搜一下网上关于抽象解释这方面的介绍再补充进去，不可能提到的是指令前后的读写交换，而是指控制流那边。如果join和meet运算符之间满足交换律，就意味着所有可能路径组合后再合并，等价于在每个控制流汇聚的地方提前合并，极大减少算力消耗。
+
 ## 背景
 
 这是 native prototype recovery / register elimination 的新版独立链路。
@@ -43,8 +51,8 @@
 ```text
 register -> {
   是否读取过函数入口值,
-  正常返回时是否仍等于入口值,
-  是否被本函数写成新值,
+  正常返回时是否仍可能等于入口值,
+  正常返回时是否可能是非入口值,
   是否作为返回值,
   遇到 call 时如何传递和更新
 }
@@ -91,8 +99,9 @@ register -> {
 
 ```text
 Cell = {
-  evidence: bitset { Read, Modified },
-  relation: bitset { SameAsEntry, DifferentFromEntry }
+  mayEntry: bool,
+  mayNonEntry: bool,
+  readEntry: bool
 }
 ```
 
@@ -105,20 +114,33 @@ Map<Register, Cell>
 map 里不存在某个 register，表示默认 untouched：
 
 ```text
-evidence = {}
-relation = { SameAsEntry }
+mayEntry = true
+mayNonEntry = false
+readEntry = false
 ```
+
+这个默认值只适用于已经可达的 block 状态。
+worklist 需要单独记录 block 是否可达：
+
+```text
+unreachable
+reachable(Map<Register, Cell>)
+```
+
+未访问 block 是 `unreachable`，不是“所有 register 都 missing”。
 
 常见解释：
 
-- missing：没有读也没有改。
-- `Read`：读过入口值。
-- `Modified`：写过该 register，或者当前值可能不是入口值。
-- `Read + Modified`：读过入口值，也改过该 register。
-- 所有 return path 都是 `SameAsEntry`：函数 preserved 该 register。
-- 任一 return path 有 `DifferentFromEntry`：函数 modified 该 register。
+- missing：没有读，也没有 caller 可见的改动。
+- `readEntry=true`：函数入口值可能被读过，可作为参数证据。
+- `mayEntry=false, mayNonEntry=true`：入口值在当前路径已经被 killed。
+- `mayEntry=true, mayNonEntry=true`：路径混合，可能没变也可能变了。
+- 函数出口 `mayEntry=true, mayNonEntry=false`：函数 preserved 该 register。
+- 函数出口 `mayNonEntry=true`：函数可能 changed 该 register，consumer 保守处理。
 
-`preserved` 是从函数出口关系派生出来的，不是核心域里的原子值。
+`preserved` 是从函数出口状态派生出来的，不是核心域里的原子值。
+`writeEvent` 不放在核心判断里。
+如果后续为了调试想记录“函数体里是否出现过写寄存器指令”，可以加 audit bit，但它不能用于判断 caller 可见 clobber。
 
 ### 3. Transfer function
 
@@ -131,35 +153,41 @@ F_inst : State -> State
 普通指令：
 
 - 读 register `R`
-  - 如果 `R` 不在 ignored set，且 `relation(R)` 包含 `SameAsEntry`，给 `R` 加 `Read`。
-  - 不改变 `relation(R)`。
+  - 如果 `R` 不在 ignored set，执行 `readEntry[R] |= mayEntry[R]`。
+  - 不改变 `mayEntry/mayNonEntry`。
 - 写 register `R`
-  - 如果 `R` 不在 ignored set，给 `R` 加 `Modified`。
-  - `relation(R)` 变成 `{ DifferentFromEntry }`。
+  - 如果 `R` 不在 ignored set，执行 `mayEntry[R] = false, mayNonEntry[R] = true`。
 - 读写同一 register
   - 先按读处理，再按写处理。
+
+这能表达 killed 后不再算入口读取：
+
+```asm
+mov rdi, 0
+use rdi
+```
+
+`mov` 后 `mayEntry=false`，所以后面的 `use rdi` 不会设置 `readEntry`。
 
 call 指令：
 
 - direct internal call 用 callee summary 转换 caller state。
 - external / indirect call 用 ABI fallback 转换 caller state。
-- callsite 参数证据来自 callee summary 的 `Read`，不是来自 caller 侧有没有准备指令。
+- callsite 参数证据来自 callee summary 的 `readEntry`，不是来自 caller 侧有没有准备指令。
 
 callee summary 套到 caller state 时：
 
 ```text
-if callee reads R:
+if callee.readEntry[R]:
   当前 caller state[R] 是 callsite 参数来源
-  if caller relation[R] 包含 SameAsEntry:
-    caller evidence[R] 加 Read
+  caller.readEntry[R] |= caller.mayEntry[R]
 
-post relation[R] =
-  callee exit relation 包含 SameAsEntry      ? pre relation[R] : {}
-  union
-  callee exit relation 包含 DifferentFromEntry ? {DifferentFromEntry} : {}
+post.mayEntry[R] =
+  callee.mayEntry[R] ? pre.mayEntry[R] : false
 
-if callee exit relation 包含 DifferentFromEntry:
-  caller evidence[R] 加 Modified
+post.mayNonEntry[R] =
+  (callee.mayEntry[R] ? pre.mayNonEntry[R] : false)
+  OR callee.mayNonEntry[R]
 ```
 
 如果 callee summary 说它读取 `RDI`，那么 caller 在 callsite 处的当前 `RDI` 值就是参数来源。
@@ -171,19 +199,31 @@ CFG 合流使用 join。
 对单个 register：
 
 ```text
-join evidence = bitset union
-join relation = bitset union
+join mayEntry    = OR
+join mayNonEntry = OR
+join readEntry   = OR
 ```
 
 meet 是对应的交集：
 
 ```text
-meet evidence = bitset intersection
-meet relation = bitset intersection
+meet mayEntry    = AND
+meet mayNonEntry = AND
+meet readEntry   = AND
 ```
 
 对 map 做 pointwise join / meet。
 missing register 使用默认 untouched cell。
+
+对 block state：
+
+```text
+join(unreachable, s) = s
+join(s, unreachable) = s
+join(unreachable, unreachable) = unreachable
+```
+
+两个 reachable state 再做 pointwise join / meet。
 
 交换律来自集合 union / intersection：
 
@@ -202,6 +242,42 @@ meet(s1, s2) = meet(s2, s1)
 这保证 predecessor 枚举顺序不影响 CFG 合流结果。
 本分析是 may-style forward analysis，fixpoint 里主要用 join。
 
+更关键的是，提前在 CFG 合流点 join 之后继续分析，应该等价于枚举所有路径再 join。
+这个等价不只靠交换律，还要求当前 transfer function 对 join 可分配：
+
+```text
+F(join(a, b)) = join(F(a), F(b))
+```
+
+当前读规则满足这个条件：
+
+```text
+F_read(s).readEntry = s.readEntry OR s.mayEntry
+
+F_read(join(a, b)).readEntry
+= (a.readEntry OR b.readEntry) OR (a.mayEntry OR b.mayEntry)
+= (a.readEntry OR a.mayEntry) OR (b.readEntry OR b.mayEntry)
+= join(F_read(a), F_read(b)).readEntry
+```
+
+写规则也满足：
+
+```text
+F_write(s).mayEntry = false
+F_write(s).mayNonEntry = true
+F_write(s).readEntry = s.readEntry
+```
+
+所以：
+
+```text
+F_write(join(a, b)) = join(F_write(a), F_write(b))
+```
+
+block transfer 是指令 transfer 的组合。
+每条指令都对 join 可分配时，block transfer 也可分配。
+这就是不枚举所有控制流路径也能得到同样 summary 的原因。
+
 ### 5. Function summary
 
 一个函数的 summary 定义为整个 CFG transfer function 的 fixpoint 结果。
@@ -209,7 +285,8 @@ meet(s1, s2) = meet(s2, s1)
 计算方式：
 
 ```text
-in[entry] = default state
+in[entry] = reachable(default state)
+其他 block 初始为 unreachable
 out[bb] = F_block(in[bb])
 in[bb] = join(out[pred1], out[pred2], ...)
 重复直到不变
@@ -220,20 +297,20 @@ in[bb] = join(out[pred1], out[pred2], ...)
 对每个 register：
 
 ```text
-evidence 无 Read / Modified
+readEntry=false, mayEntry=true, mayNonEntry=false
   -> untouched
 
-evidence 有 Read，relation 在出口仍只有 SameAsEntry
+readEntry=true, mayEntry=true, mayNonEntry=false
   -> read + preserved
 
-evidence 有 Modified，出口 relation 有 DifferentFromEntry
+mayNonEntry=true
   -> modified
 
-出口 relation 同时有 SameAsEntry / DifferentFromEntry
+mayEntry=true, mayNonEntry=true
   -> mixed，consumer 保守处理
 ```
 
-如果 register 是 ABI return register，且函数出口 relation 有 `DifferentFromEntry`，可以派生为 return candidate。
+如果 register 是 ABI return register，且函数出口 `mayNonEntry=true`，可以派生为 return candidate。
 这仍然不是核心域里的 `CallReturn` 值，只是 summary 消费阶段的解释。
 
 ### 5b. 保存/恢复精化
@@ -247,7 +324,8 @@ evidence 有 Modified，出口 relation 有 DifferentFromEntry
 先得到普通 register summary
 再运行 frame-local save/restore matcher
 如果证明 R 在所有 return path 恢复入口值
-  -> 将 R 的出口 relation 精化为 SameAsEntry
+  -> 将 R 的出口精化为 mayEntry=true, mayNonEntry=false
+  -> 不把纯保存用途的读计入 readEntry
   -> summary 标记 preserved
 ```
 
@@ -264,17 +342,16 @@ callee reads R
   -> 当前 caller state[R] 是 callsite argument source
 
 callee preserves R
-  -> caller call 后 relation[R] 继承 call 前 relation[R]
+  -> caller call 后 mayEntry/mayNonEntry 继承 call 前状态
 
 callee modifies R
-  -> caller call 后 relation[R] 加 { DifferentFromEntry }
-  -> caller state[R].evidence 加 Modified
+  -> caller call 后 mayNonEntry=true
 ```
 
 external / indirect call 没有 callee summary，直接用 ABI：
 
 - ABI unaffected：state 不变。
-- ABI output / killed-by-call：relation 变成 `{ DifferentFromEntry }`，加 `Modified`。
+- ABI output / killed-by-call：`mayEntry=false, mayNonEntry=true`。
 
 ### 7. Call graph SCC fixpoint
 
@@ -297,14 +374,24 @@ for each SCC:
 ```
 
 递归和互递归只在 SCC 内 fixpoint。
-summary lattice 必须有限，避免来回震荡：
+summary lattice 必须有限，避免来回震荡。
+每个 block state 只有两类：
 
 ```text
-evidence: {} -> {Read} / {Modified} -> {Read, Modified}
-relation: {SameAsEntry} / {DifferentFromEntry} -> {SameAsEntry, DifferentFromEntry}
+unreachable
+reachable(register map)
 ```
 
-一旦某个 register 的 evidence bit 或 relation bit 被加入，fixpoint 内不再删除。
+每个 register cell 只有 3 个 bit：
+
+```text
+mayEntry: bool
+mayNonEntry: bool
+readEntry: bool
+```
+
+`mayEntry` 在写入时会从 true 变 false，但合流时仍用 OR。
+transfer function 仍然是 monotone，worklist 里的 in-state 通过 join 增长；domain 有限，所以仍然收敛。
 保存/恢复这类精化放在 fixpoint 后的 postpass，避免破坏单调迭代。
 
 ### 8. Prototype recovery 消费
@@ -323,7 +410,7 @@ callsite: 当前 RDI 抽象状态
 
 ```text
 callee summary: RAX 是 ABI output register
-callee exit relation[RAX] 有 DifferentFromEntry
+callee exit mayNonEntry[RAX] = true
   -> RAX 是返回值来源
 ```
 
@@ -363,11 +450,11 @@ summary 可用于更系统地删除 residue：
 - whole-register 粗粒度会把 partial write 放大成 whole write，可能让 summary 偏保守。
 - direct call graph 不完整时，部分 internal call 会退到 ABI。
 - SCC fixpoint 如果 lattice 设计太细，容易震荡或实现复杂。
-- `Mixed` 状态如果消费侧处理不严，可能误当 precise value。
+- `mayEntry=true, mayNonEntry=true` 的混合状态如果消费侧处理不严，可能误当 precise value。
 
 风险处理：
 
-- 第一版宁可保守，不从 mixed relation 生成 signature rewrite。
+- 第一版宁可保守，不从混合状态生成 signature rewrite。
 - summary 先写 metadata / 日志，不直接大规模删 IR。
 - 删除 register residue 必须作为后续阶段，等 summary 稳定后再做。
 
@@ -381,7 +468,7 @@ summary 可用于更系统地删除 residue：
 - direct caller 调用该函数时，当前 `RDI` state 被记录为 callsite 参数来源，即使它来自 caller entry。
 - external / indirect call 使用 ABI fallback。
 - 简单递归 SCC 能收敛。
-- `Mixed` 不参与 prototype rewrite。
+- `mayEntry=true, mayNonEntry=true` 不参与 prototype rewrite。
 
 Bench2 判断标准：
 

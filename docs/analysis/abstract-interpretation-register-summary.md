@@ -1,7 +1,7 @@
 # Abstract interpretation notes for register summaries
 
 本文只总结 native register summary 这条链路需要的抽象解释基础。
-目标不是完整介绍抽象解释，而是给后续实现里的 domain、transfer function、join、meet、fixpoint 一个清楚的说法。
+目标不是完整介绍抽象解释，而是把 domain、transfer function、join、meet、fixpoint 讲清楚。
 
 ## 基本模型
 
@@ -14,34 +14,34 @@
 ```
 
 这个太细，不适合跨函数 summary。
-我们只保留和参数/返回/寄存器消除有关的信息：
+这条链路只关心三件事：
 
 ```text
-某个 register 的入口值是否被读过
-某个 register 是否被改过
-某个 register 在函数出口是否还等于入口值
+当前 register 的值是否可能还是函数入口值
+当前 register 的值是否可能是函数内部产生的新值
+函数入口值是否可能被真正读取过
 ```
 
-也就是不要在 domain 里区分 `CallReturn`、`CallClobber` 这种来源名。
-这些是调用点解释结果，不是核心抽象域。
+`CallReturn`、`CallClobber`、`ABIKilled` 这类名字不放进核心抽象域。
+它们是调用点消费 summary 后得到的解释，不是 register 当前值本身。
 
 ## 抽象域
 
-第一版可以把每个 register 的抽象 cell 写成：
+每个 register 的 cell：
 
 ```text
 Cell = {
-  evidence: bitset { Read, Modified },
-  relation: bitset { SameAsEntry, DifferentFromEntry }
+  mayEntry: bool,
+  mayNonEntry: bool,
+  readEntry: bool
 }
 ```
 
 含义：
 
-- `Read`：入口值被用过。
-- `Modified`：这个 register 被写过，或者当前值可能已经不是入口值。
-- `SameAsEntry`：当前值可能等于函数入口值。
-- `DifferentFromEntry`：当前值可能不是函数入口值。
+- `mayEntry`：当前值可能还是函数入口时的值。
+- `mayNonEntry`：当前值可能是函数内部写出来的值，或者被调用函数写出来的值。
+- `readEntry`：函数入口值可能被真正读取过。
 
 实现时用 map 存：
 
@@ -49,40 +49,55 @@ Cell = {
 Map<Register, Cell>
 ```
 
-map 里没有某个 register，表示默认值：
+map 里没有某个 register，表示默认 untouched：
 
 ```text
-evidence = {}
-relation = { SameAsEntry }
+mayEntry = true
+mayNonEntry = false
+readEntry = false
 ```
 
-也就是 untouched。
-
-常见状态可以读成：
+这个默认值只适用于已经可达的程序点。
+CFG worklist 还需要一个单独的 block 状态：
 
 ```text
-missing                 -> untouched
-{Read}, Same            -> read-only
-{Modified}, Different   -> modified
-{Read, Modified}, ...   -> read and modified
-Same at all exits       -> preserved
-Same/Different mixed    -> conditional or unknown enough, consumer 保守处理
+unreachable
+reachable(Map<Register, Cell>)
 ```
 
-`preserved` 不是 domain 里的原子值。
-它是函数出口 summary 的派生结果：所有 return path 上这个 register 的 relation 都只有 `SameAsEntry`。
+未访问 block 是 `unreachable`，不是“所有 register 都 missing”。
+否则稀疏 map 的默认 untouched 会把未到达路径误当成真实入口值路径。
+
+常见状态：
+
+```text
+missing / default                         -> untouched
+mayEntry=true, readEntry=true             -> read-only input
+mayEntry=false, mayNonEntry=true          -> entry value killed
+mayEntry=true, mayNonEntry=true           -> path mixed，可能没变也可能变了
+函数出口 mayEntry=true, mayNonEntry=false -> caller 可见 preserved
+函数出口 mayNonEntry=true                 -> caller 可见可能 changed
+```
+
+`writeEvent` 不放在核心域里。
+如果后续为了日志想记录“函数体里是否出现过写寄存器指令”，可以加一个 audit bit，例如 `writtenSeen`。
+但它不能用于判断 caller 可见 clobber。
+callee-saved register 的典型情况是“函数内部写过，但出口恢复了”，caller 只应该看到 preserved。
 
 ## Join 和 meet
 
-这个 domain 可以看成有限 powerset lattice 的 product。
+这个 domain 可以看成几个 bool bit 的 product lattice。
 
 对一个 register：
 
 ```text
-join evidence  = bitset union
-meet evidence  = bitset intersection
-join relation  = bitset union
-meet relation  = bitset intersection
+join mayEntry    = OR
+join mayNonEntry = OR
+join readEntry   = OR
+
+meet mayEntry    = AND
+meet mayNonEntry = AND
+meet readEntry   = AND
 ```
 
 对整个 map：
@@ -92,25 +107,38 @@ join(m1, m2)[r] = join(m1.getOrDefault(r), m2.getOrDefault(r))
 meet(m1, m2)[r] = meet(m1.getOrDefault(r), m2.getOrDefault(r))
 ```
 
-union 和 intersection 都满足交换律：
+对 block state：
 
 ```text
-A ∪ B = B ∪ A
-A ∩ B = B ∩ A
+join(unreachable, s) = s
+join(s, unreachable) = s
+join(unreachable, unreachable) = unreachable
 ```
 
-所以 pointwise join / meet 也满足交换律：
+两个 reachable state 再做上面的 pointwise join。
+
+`join` 和 `meet` 各自满足交换律、结合律、幂等律：
 
 ```text
-join(m1, m2) = join(m2, m1)
-meet(m1, m2) = meet(m2, m1)
+a join b = b join a
+(a join b) join c = a join (b join c)
+a join a = a
 ```
 
-它们也满足结合律和幂等律。
-这对 CFG 合流很重要：basic block predecessor 的枚举顺序不应该影响结果。
+`meet` 同理。
 
-本分析是 may-style forward analysis，CFG 合流点主要用 join。
-meet 主要用于说明 lattice 完整性，或者后续如果需要“所有路径共同成立”的判定，可以在派生 summary 时使用。
+这保证 CFG 合流时 predecessor 枚举顺序不影响结果。
+但“提前在控制流汇聚点合并”和“枚举所有路径后再合并”等价，不只依赖交换律。
+还需要相关 transfer function 对 join 可分配：
+
+```text
+F(a join b) = F(a) join F(b)
+```
+
+如果只有 monotone，没有 distributive，迭代算法仍然能得到安全 fixpoint，但不一定等于 meet-over-all-paths / join-over-all-paths 的精确结果。
+
+本分析使用 may-style forward analysis，CFG 合流点用 `join`。
+`meet` 主要用于说明 lattice 完整性，或者以后派生 must 结论。
 
 ## Transfer function
 
@@ -120,66 +148,164 @@ meet 主要用于说明 lattice 完整性，或者后续如果需要“所有路
 F_inst : State -> State
 ```
 
-规则保持简单：
-
-- 读 register `R`
-  - 如果 `relation(R)` 包含 `SameAsEntry`，标记 `Read`。
-  - 状态里的当前值 relation 不变。
-- 写 register `R`
-  - 标记 `Modified`。
-  - `relation(R)` 变成 `{ DifferentFromEntry }`。
-- 不考虑的 register
-  - 直接跳过，不读不写。
-- direct call
-  - 把 callee summary 实例化到 caller 当前 state。
-- external / indirect call
-  - 用 ABI fallback 构造一个 synthetic summary，再按同样规则实例化。
-
-call 的实例化规则：
+读 register `R`：
 
 ```text
-如果 callee reads R:
-  当前 caller state[R] 是 callsite 参数来源
-  如果 caller relation(R) 包含 SameAsEntry，标记 caller 的 Read
-
-如果 callee exit relation(R) 包含 SameAsEntry:
-  caller call 后 relation(R) 包含 call 前 relation(R)
-
-如果 callee exit relation(R) 包含 DifferentFromEntry:
-  caller call 后 relation(R) 包含 DifferentFromEntry
-  caller evidence(R) 加 Modified
+readEntry[R] = readEntry[R] OR mayEntry[R]
 ```
 
-这样 `SameAsEntry` 始终是相对当前函数入口解释的。
-callee 的 preserved register 套到 caller 后，就是保持 caller call 前的 relation。
+也就是：只有当前值仍可能来自函数入口时，这次 read 才算“可能读取入口值”。
+如果入口值已经被覆盖，后续再读这个 register，不会再增加参数证据。
 
-transfer function 必须 monotone：
+写 register `R`：
 
 ```text
-s1 <= s2  =>  F(s1) <= F(s2)
+mayEntry[R] = false
+mayNonEntry[R] = true
 ```
 
-这里的 `<=` 就是 pointwise subset。
-因为 transfer 只会加 bit 或把 relation 往更保守的集合推进，所以满足 monotone。
+读写同一个 register 的指令，按机器语义先读后写。
+
+例子：
+
+```asm
+mov rdi, 0
+use rdi
+```
+
+`mov` 之后：
+
+```text
+mayEntry=false
+mayNonEntry=true
+readEntry=false
+```
+
+所以后面的 `use rdi` 不会把 `rdi` 标成入口参数。
+
+分支例子：
+
+```asm
+if cond:
+  mov rdi, 0
+
+use rdi
+```
+
+合流点：
+
+```text
+mayEntry = true OR false = true
+mayNonEntry = false OR true = true
+```
+
+后面的 `use rdi` 会设置：
+
+```text
+readEntry = true
+```
+
+这是对的，因为没走 `if` 的路径上确实读了入口 `rdi`。
+
+## 为什么提前合并是对的
+
+对当前 domain，读写 transfer 都对 `join` 可分配。
+
+读规则：
+
+```text
+F_read(s).readEntry = s.readEntry OR s.mayEntry
+```
+
+所以：
+
+```text
+F_read(a join b).readEntry
+= (a.readEntry OR b.readEntry) OR (a.mayEntry OR b.mayEntry)
+= (a.readEntry OR a.mayEntry) OR (b.readEntry OR b.mayEntry)
+= join(F_read(a), F_read(b)).readEntry
+```
+
+其他 bit 不变，也满足同样关系。
+
+写规则：
+
+```text
+F_write(s).mayEntry = false
+F_write(s).mayNonEntry = true
+F_write(s).readEntry = s.readEntry
+```
+
+所以：
+
+```text
+F_write(a join b)
+= F_write(a) join F_write(b)
+```
+
+block transfer 是多条指令 transfer 的组合。
+如果每条指令都对 join 可分配，组合后仍然可分配。
+
+因此，这个初版 register summary 可以在每个 CFG 合流点提前 join，而不用枚举所有路径。
+这正是它能比显式路径枚举便宜的原因。
+
+## Call transfer
+
+direct internal call 使用 callee summary。
+external / indirect call 使用 ABI fallback 构造 synthetic summary。
+
+设 callee 对 register `R` 的出口 summary 是：
+
+```text
+callee.mayEntry
+callee.mayNonEntry
+callee.readEntry
+```
+
+套到 caller 的 callsite：
+
+```text
+if callee.readEntry:
+  caller.readEntry[R] = caller.readEntry[R] OR caller.mayEntry[R]
+
+post.mayEntry[R] =
+  callee.mayEntry ? pre.mayEntry[R] : false
+
+post.mayNonEntry[R] =
+  (callee.mayEntry ? pre.mayNonEntry[R] : false)
+  OR callee.mayNonEntry
+```
+
+含义：
+
+- 如果 callee 会读入口 `R`，那么 callsite 当前 `R` 就是参数来源。
+- 如果 callee 可能 preserved `R`，caller call 后仍保留 call 前来源。
+- 如果 callee 可能写出新 `R`，caller call 后 `R` 可能是 non-entry。
+
+这个 call transfer 也是用 OR、条件选择和常量组成的。
+在 callee summary 固定时，它对 caller state 的 `join` 仍然可分配。
 
 ## Fixpoint
 
 对一个函数，按 CFG 做 forward fixpoint：
 
 ```text
-in[entry] = default state
+in[entry] = reachable(default state)
+其他 block 初始为 unreachable
 out[bb] = transfer_bb(in[bb])
 in[bb] = join(out[pred1], out[pred2], ...)
 重复直到不变
 ```
 
 domain 有限，所以不需要 widening。
-最坏情况只是每个 register 的几个 bit 从空集合逐步加到稳定。
+每个 register 只有 3 个 bit，block 还有一个 `unreachable/reachable` 标记，状态空间有限。
+`mayEntry` 在某条路径上会被写操作置 false，但 transfer function 仍然是 monotone。
+worklist 里的 in-state 通过 join 增长，最终会稳定。
 
 对跨函数分析，call graph SCC 也是同一个思想：
 
 ```text
-SCC 内函数 summary 初始化为保守默认
+SCC 内函数 summary 初始化为当前可用值
 反复分析 SCC 内函数
 直到所有 summary 不再变化
 ```
@@ -192,23 +318,33 @@ SCC 内函数 summary 初始化为保守默认
 
 - 它通常依赖 stack/frame slot。
 - 第一版不做 stack / memory alias。
-- 如果强行在核心域里猜，会把抽象域搞复杂，也容易误判。
+- 如果强行在核心域里猜，会影响 `readEntry`，把保存动作误当参数读取。
 
-更好的处理是 postpass refinement：
+更好的处理是单独 refinement：
 
 ```text
 先用核心分析得到 summary
 再由专门 pass 匹配 frame-local save/restore
 如果证明 R 在所有 return path 恢复入口值
-  -> 把 R 的 exit relation 精化为 SameAsEntry
-  -> summary 标记 preserved
+  -> 把出口精化为 mayEntry=true, mayNonEntry=false
+  -> 不把纯保存用途的读计入 readEntry
 ```
 
-这一步可以只处理确定的 frame-local slot。
+这一步只处理确定的 frame-local slot。
 不要扩展到一般内存。
+
+如果为了审计保留 `writtenSeen`，callee-saved register 可以是：
+
+```text
+writtenSeen=true
+mayEntry=true
+mayNonEntry=false
+```
+
+但 caller 可见效果只看 `mayEntry/mayNonEntry`，不是看 `writtenSeen`。
 
 ## 参考资料
 
 - Patrick Cousot, Radhia Cousot, [Abstract Interpretation: A Unified Lattice Model for Static Analysis of Programs by Construction or Approximation of Fixpoints](https://www.di.ens.fr/~cousot/publications.www/CousotCousot-POPL-77-ACM-p238--252-1977.pdf), POPL 1977.
-- Jonni Kanerva, lecture notes, [Abstract Interpretation](https://www.cs.cmu.edu/~aldrich/courses/17-355-18sp/notes/notes14-abstractinterpretation.pdf), CMU course material.
-- J. B. Kam, J. D. Ullman, [Monotone Data Flow Analysis Frameworks](https://www.cs.utexas.edu/~pingali/CS380C/2023/papers/Monotone%20data%20flow%20analysis%20frameworks.pdf), Acta Informatica 1977.
+- Gary A. Kildall, [A Unified Approach to Global Program Optimization](https://haoxintu.github.io/files/1-A%20Unified%20Approach%20to%20Global%20Program%20Optimization.pdf), POPL 1973.
+- J. B. Kam, J. D. Ullman, [Monotone Data Flow Analysis Frameworks](https://link.springer.com/article/10.1007/BF00290339), Acta Informatica 1977.
