@@ -22,6 +22,14 @@
 >
 > 是的，按照这个思路改一下，在logs/20260616-02-native-register-summary-scc-fixpoint/20260616-02-native-register-summary-scc-fixpoint-plan.md计划的技术路线后面补充top-down部分
 
+用户最新补充：
+
+> 第八节开头强调一下，是对每个函数，从所有的caller角度观察call的效果中，真正起作用的有哪些。
+>
+> 每个callsite的感觉不一定要保存，就top-down遍历的过程中，对每个函数的所有caller（callsite）分析就可以了。顶层就按照ABI调用约定来就行。直接根据作为参数的寄存器中，之前bottom up的结果中，使用了entry进来的值的情况来确定真正的参数数量。确定之后就可以top-down一路传播下来。比如说，如果entry恰好有call，则几乎所有的参数寄存器都传递给callee了，此时难以确定到底传了几个参数。根据callee的使用可以分析得到一定存在的参数，根据top-down分析，此时caller的参数数量已经确定了，则不存在的参数（那些调用约定里面可以是参数，但是不一定有参数的地方）一定没有被传递给callee。此时也算是函数的参数数量有个上界和下界的约束，函数的参数数量在这两个之间。这个思路的问题是，顶层如果按照上界的思路（即仅从所有caller的角度黑盒观察目标函数，允许出现那种完全没有被用到的函数）那其实上界就是当做所有寄存器都存了参数，只不过没用上。上界的意义可能不大？（即entryDemand信息）
+>
+> exitDemand是主要的，分析返回值真正被use的有多少。这个肯定非常有意义，top-down主要计算这个，同时可以顺带根据所有信息综合确定每个函数的参数和返回值情况
+
 ## 背景
 
 这是 native prototype recovery / register elimination 的新版独立链路。
@@ -410,9 +418,9 @@ exit mayEntry / mayNonEntry
 callee 对 caller 的 register effect
 ```
 
-但它不能单独判断“哪些 changed register 真正是返回值”。
-例如某个函数同时修改 `RAX/RDX/RCX`，bottom-up 只能说它们都可能是 non-entry。
-真正的返回值更应该看所有 caller 在 call 后读取了哪些 register。
+top-down demand analysis 解决另一个问题：对每个函数，从它所有 caller 的 call 效果里看，哪些寄存器效果真正起作用。
+最重要的是返回值：如果某个函数同时修改 `RAX/RDX/RCX`，bottom-up 只能说这些 register 都可能是 non-entry。
+但如果所有 caller 在 call 后只读取 `RAX`，那么 `RAX` 才是强返回值证据，`RDX/RCX` 更像 dead changed register。
 
 因此在 bottom-up SCC fixpoint 收敛后，再加一个 top-down demand analysis。
 它不修改 `EffectSummary`，只产出第二套结果：
@@ -420,22 +428,19 @@ callee 对 caller 的 register effect
 ```text
 DemandSummary = {
   exitDemand[R]: 函数返回时 R 是否被 caller / 顶层 ABI 观察,
-  entryDemand[R]: 函数入口 R 是否影响被观察结果
+  entryDemand[R]: 函数入口 R 是否影响被观察结果，第一版只作为辅助信息,
+  paramLower: ABI register 参数数量下界,
+  paramUpper: ABI register 参数数量上界
 }
 ```
 
-callsite 也记录：
-
-```text
-CallsiteDemand = {
-  demandedOutputs: call 后哪些 register 的 callee 新值被读取,
-  demandedInputs: call 前哪些 register 作为 callee 输入被需要
-}
-```
+`callsite` 不一定需要保存成长期 metadata。
+top-down 遍历 caller 时，可以临时分析每个 callsite 的 call 前后状态，把结果直接合并到 callee 的 `DemandSummary`。
+后续如果要调试，再选择性输出 callsite audit。
 
 #### 8.1 Demand 种子
 
-顶层函数、exported function、外部可调用入口按 ABI 加初始需求：
+顶层函数、exported function、外部可调用入口按 ABI 加初始返回值需求：
 
 ```text
 ABI return registers -> exitDemand
@@ -444,7 +449,24 @@ ABI return registers -> exitDemand
 第一版可以先只放常规返回寄存器，例如 x86-64 SysV 下的 `RAX`。
 callee-saved register 不是返回值 demand，它是 ABI preservation obligation，仍由 bottom-up preserved 判断处理。
 
-internal function 的需求来自所有 caller：
+顶层参数按 ABI 初始化参数边界：
+
+```text
+paramLower = max index of ABI input register with readEntry
+paramUpper = ABI register argument count
+```
+
+这里的 `paramUpper` 很弱。
+如果只从“外部可以传入任意 ABI 参数寄存器，但函数可以不用”这个黑盒角度看，顶层函数的上界几乎就是所有 ABI 参数寄存器。
+所以上界本身意义不大，不能单独作为强参数证据。
+
+top-down 的主收益仍然是 `exitDemand`，也就是确认哪些返回寄存器真的被使用。
+参数部分只顺带维护上下界和 weak/strong 证据。
+
+#### 8.2 从所有 caller 观察函数效果
+
+internal function 的返回值需求来自所有 caller。
+遍历 caller 时，对每个 direct callsite 临时计算：
 
 ```text
 caller 在 call 后读取 R
@@ -452,9 +474,76 @@ callee summary 显示 R 可能是 non-entry
   -> callee.exitDemand[R] = true
 ```
 
+如果 callee 的出口是混合状态：
+
+```text
+mayEntry=true, mayNonEntry=true
+```
+
+则 call 后对 `R` 的需求要拆成两部分：
+
+```text
+callee.exitDemand[R] = true
+caller call 前 R 继续 demand
+```
+
 如果某个 changed register 从来没有被 caller 读取，也不是顶层 ABI return register，它就只是 dead changed register，不应作为强返回值证据。
 
-#### 8.2 函数内 backward demand
+#### 8.3 参数上下界
+
+参数判断比返回值弱，因为“没被读到”不等于“外部没有传”。
+第一版不要把 top-down 参数分析写成绝对精确，只维护上下界：
+
+```text
+paramLower:
+  bottom-up readEntry 命中的最高 ABI 参数寄存器位置
+
+paramUpper:
+  从 caller 已知参数数量和 callsite 数据流能排除的最高位置
+```
+
+例子：
+
+```text
+wrapper_entry:
+  call callee
+```
+
+如果 wrapper 入口立刻 call callee，所有 ABI 参数寄存器看起来都可能直接传给 callee。
+这时只看 callsite 很难知道 callee 到底有几个参数。
+但是如果 top-down 已经确认 wrapper 只有 2 个 ABI register 参数，那么从 wrapper entry 直接透传给 callee 的第 3、4、5、6 个 ABI 参数位置就不能作为强参数。
+
+所以参数传播规则是：
+
+```text
+callee.readEntry[R_i] = true
+callsite 的 R_i 来源是 caller entry R_i
+caller.paramUpper < i
+  -> callee 的第 i 个参数不能作为 strong 参数
+
+callee.readEntry[R_i] = true
+callsite 的 R_i 来源是 caller entry R_i
+caller.paramLower >= i
+  -> callee 的第 i 个参数有 caller 参数支持
+
+callee.readEntry[R_i] = true
+callsite 的 R_i 是 caller 本地计算出来的值
+  -> callee 的第 i 个参数有 callsite 准备证据
+```
+
+这个规则只给约束，不强行精确恢复。
+最终可以得到：
+
+```text
+paramLower <= 参数数量 <= paramUpper
+```
+
+顶层函数的 `paramUpper` 通常过大，所以主要靠 `readEntry` 给下界。
+internal function 的 `paramUpper` 才可能被所有 caller 收紧。
+只有明确来源的 callsite 才生成上界约束。
+如果多个 caller 给出的约束冲突，例如 `paramLower > paramUpper`，说明至少有一个观察不可靠，consumer 应回退到 weak 参数结论，不用这个区间改 prototype。
+
+#### 8.4 函数内 backward demand
 
 top-down 进入某个函数后，用 `exitDemand` 在函数 CFG 上做 backward analysis。
 这个阶段仍然只追 register，不引入 stack/memory alias。
@@ -475,15 +564,16 @@ top-down 进入某个函数后，用 `exitDemand` 在函数 CFG 上做 backward 
 对当前第一版，分支条件读取的 register 应该保守加入 demand。
 一般内存/栈暂不追；后续如果加内存输出，只处理明确的占空间 frame-local 内存，不做全局 alias。
 
-函数入口处得到：
+函数入口处可以得到辅助信息：
 
 ```text
 entryDemand[R]
 ```
 
-它表示入口 register `R` 的值不只是“可能被读过”，而且可能影响当前程序上下文里被观察到的结果。
+它表示入口 register `R` 的值可能影响被观察结果。
+但它不是 top-down 第一版的主要产物；参数恢复仍然优先用 `readEntry + paramLower/paramUpper + caller 约束` 综合判断。
 
-#### 8.3 Call 指令的 demand 传播
+#### 8.5 Call 指令的 demand 传播
 
 call 是 top-down 的核心。
 设 caller 在 call 后 demand `R`：
@@ -496,36 +586,17 @@ callee exit mayNonEntry=true
   -> callee.exitDemand[R] = true
 ```
 
-如果 callee 的出口是混合状态：
+参数方向则用 callee 的 `readEntry` 和当前 callsite 的来源关系生成约束：
 
 ```text
-mayEntry=true, mayNonEntry=true
+callee.readEntry[R_i] = true
+  -> 分析 caller call 前 R_i 来源
+  -> 更新 callee.paramLower / callee.paramUpper
 ```
 
-两边都传播：
+如果后续 `entryDemand` 稳定，也可以作为参数置信度加分项，但第一版不把它作为唯一判据。
 
-```text
-caller call 前 R 继续 demand
-callee.exitDemand[R] = true
-```
-
-参数需求从 callee 的 `entryDemand` 回传到 caller：
-
-```text
-callee.entryDemand[R] = true
-  -> caller call 前 R 被 demand
-```
-
-如果第一版还没有稳定的 `entryDemand`，可以先用 `callee.readEntry` 作为保守近似：
-
-```text
-callee.readEntry[R] = true
-  -> caller call 前 R 被 demand
-```
-
-等 top-down fixpoint 跑通后，再用 `entryDemand` 精化参数证据。
-
-#### 8.4 Top-down SCC fixpoint
+#### 8.6 Top-down SCC fixpoint
 
 demand 沿 call graph 从 caller 传向 callee。
 递归和互递归仍然需要 SCC fixpoint：
@@ -538,23 +609,27 @@ for each SCC:
   初始化 SCC 内函数 DemandSummary
   repeat:
     用当前 demand 分析 SCC 内每个函数
-    通过 callsite 把 demand 传给 callee
+    遍历这些函数内的 callsite，临时计算 observation
+    把 observation 合并到 callee DemandSummary
   until DemandSummary 不变
 ```
 
-这个 fixpoint 的 lattice 也是有限的：
+这个 fixpoint 的 lattice 是有限的：
 
 ```text
 exitDemand[R]: false -> true
 entryDemand[R]: false -> true
+paramLower: 0 -> ABI register argument count
+paramUpper: ABI register argument count -> 0
 ```
 
 CFG backward 合流使用 OR。
-只要 demand bit 增加，不删除，最终会收敛。
+`exitDemand/entryDemand` 只增不减，`paramLower` 单调增，`paramUpper` 单调减，最终会收敛。
 
-#### 8.5 消费规则
+#### 8.7 消费规则
 
-最终 prototype / residue 删除不只看 bottom-up changed，还看 top-down demand：
+最终 prototype / residue 删除不只看 bottom-up changed，还看 top-down demand。
+返回值优先级最高：
 
 ```text
 EffectSummary.exit mayNonEntry[R] = true
@@ -573,16 +648,23 @@ DemandSummary.exitDemand[R] = false
 则 `R` 只是函数可能写过的 dead changed register。
 它可以用于 clobber/residue 判断，但不应直接当返回值。
 
-参数也类似：
+参数用区间和证据综合判断：
 
 ```text
+index(R) <= paramLower
 EffectSummary.readEntry[R] = true
-DemandSummary.entryDemand[R] = true
   -> 强输入参数候选
+
+paramLower < index(R) <= paramUpper
+EffectSummary.readEntry[R] = true
+  -> weak 输入参数候选
+
+index(R) > paramUpper
+  -> 不作为参数
 ```
 
-如果只有 `readEntry=true`，但 `entryDemand=false`，说明入口值可能被读过，但在当前程序上下文里没有影响被观察结果。
-第一版可以保守记录为 weak input，不直接改 prototype。
+这里的 `paramUpper` 如果来自顶层 ABI 默认值，意义较弱。
+只有被 caller 约束收紧后，才适合用来排除参数。
 
 ### 9. Prototype recovery 消费
 
@@ -596,13 +678,20 @@ callsite: 当前 RDI 抽象状态
   -> RDI 是这个 callsite 的 weak 参数来源
 ```
 
-如果 top-down 后还有：
+top-down 后再看参数上下界：
 
 ```text
-DemandSummary.entryDemand[RDI] = true
+index(RDI) <= DemandSummary.paramLower
+  -> strong 参数候选
+
+DemandSummary.paramLower < index(RDI) <= DemandSummary.paramUpper
+  -> weak 参数候选
+
+index(RDI) > DemandSummary.paramUpper
+  -> 不作为参数
 ```
 
-则 `RDI` 升级为 strong 参数候选。
+`entryDemand` 只作为辅助置信度，不单独决定参数数量。
 
 函数返回也分两层。
 bottom-up 只产出 weak return candidate：
@@ -658,6 +747,8 @@ summary 可用于更系统地删除 residue：
 - SCC fixpoint 如果 lattice 设计太细，容易震荡或实现复杂。
 - `mayEntry=true, mayNonEntry=true` 的混合状态如果消费侧处理不严，可能误当 precise value。
 - top-down demand 如果 root/export 的 ABI seed 不准，会把真实返回值误判为未使用。
+- 顶层 `paramUpper` 默认等于 ABI 参数寄存器数量，基本不能用来排除参数。
+- internal function 的 `paramUpper` 只有在 callsite 来源明确且没有冲突时才可信。
 - 只看 caller 读取寄存器时，未建模的内存/异常/间接调用可能隐藏真实观察点。
 
 风险处理：
@@ -665,6 +756,7 @@ summary 可用于更系统地删除 residue：
 - 第一版宁可保守，不从混合状态生成 signature rewrite。
 - top-down 结果只用于增强返回值/参数置信度，不删除 bottom-up effect summary。
 - root/export 使用 ABI return register 作为 demand seed；不确定入口先保守保留 weak candidate。
+- 参数上界只作为排除证据使用；遇到上下界冲突，回退到 weak 参数结论。
 - summary 先写 metadata / 日志，不直接大规模删 IR。
 - 删除 register residue 必须作为后续阶段，等 summary 稳定后再做。
 
@@ -681,6 +773,8 @@ summary 可用于更系统地删除 residue：
 - `mayEntry=true, mayNonEntry=true` 不参与 prototype rewrite。
 - 修改 `RAX/RDX` 但 caller 只读取 `RAX` 的函数：top-down 标记 `RAX` 为 demanded output，`RDX` 不作为强返回值。
 - caller call 后读取 preserved register：demand 继续传到 call 前，不误传成 callee return。
+- wrapper 入口直接 call callee，且 wrapper 参数上界已知为 2：callee 的第 3 个透传 ABI 参数不能作为 strong 参数。
+- 顶层函数没有 caller 时，参数上界保持 ABI 默认值，不用它排除参数。
 - 递归 SCC 内 demand 能收敛。
 
 Bench2 判断标准：
