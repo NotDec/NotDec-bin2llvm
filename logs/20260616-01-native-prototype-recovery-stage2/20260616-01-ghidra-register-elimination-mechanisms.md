@@ -56,6 +56,57 @@ heritage 的作用是建 SSA。
 
 所以 heritage 不是“只做 renaming”，它先把 call 语义变成 SSA 可见的东西。
 
+一个简单例子：
+
+```text
+RAX = 1
+RBX = 2
+call foo
+RCX = RAX
+RDX = RBX
+```
+
+如果直接“消除寄存器”，很容易写成：
+
+```text
+rax0 = 1
+rbx0 = 2
+call foo
+rcx0 = rax0
+rdx0 = rbx0
+```
+
+这就是错的。`call foo` 之后的 `RAX` 不一定还是 `1`。
+在 x86-64 SysV 里，`RAX` 通常是返回寄存器，也是 caller-saved。
+但 `RBX` 是 callee-saved，默认应该认为 call 后还保持旧值。
+
+Ghidra 的处理更接近这样：
+
+```text
+rax0 = 1
+rbx0 = 2
+call foo
+rax1 = INDIRECT_CREATE(call foo, RAX)   ; call 创建的新值，可能是返回值或 clobber
+rcx0 = rax1
+rdx0 = rbx0                             ; RBX unaffected，继续用 call 前的值
+```
+
+如果 call effect 更明确，比如 `RAX` 是返回值，可以理解成：
+
+```text
+rax1 = CALL_RETURN(call foo, RAX)
+```
+
+如果只是 killed-by-call，不能当返回值，就只能理解成：
+
+```text
+rax1 = CALL_CLOBBER_UNKNOWN(call foo, RAX)
+```
+
+重点是：Ghidra 不会直接把 call 后的 `RAX` 接到 call 前的 `rax0`。
+它会先插一个解释 call effect 的数据流节点，再让 SSA 去连接后面的 use。
+这样后面的参数恢复、返回值恢复、dead code 和 type recovery 才知道这个值到底是“call 返回值”、“call 杀掉后的未知值”，还是“preserved register 的旧值”。
+
 ## 2. trial/use 不是独立前处理，是 heritage 结果上的判定层
 
 `ParamTrial` / `FuncCallSpecs` 这块是判断：
