@@ -60,6 +60,14 @@ notdec-heritage-module-llvm /tmp/module.json -o /tmp/module.ll
 llvm-as /tmp/module.ll -o /tmp/module.bc
 ```
 
+Java 链路需要把 High P-Code 里的 register input 只当来源标记时，lowering
+加 `--register-inputs-as-temps`。这个选项只在 heritage JSON lowering 工具上提供，
+native 链路不使用：
+
+```bash
+notdec-heritage-module-llvm /tmp/module.json -o /tmp/module.ll --register-inputs-as-temps
+```
+
 `notdec-heritage-module-llvm` 默认会尝试填入 `status == "ok"` 的函数体。单个函数
 lowering 或 verifier 失败时，会恢复成 declaration，并继续处理其他函数。
 

@@ -336,11 +336,13 @@ class HeritageLowerer {
 public:
   HeritageLowerer(llvm::LLVMContext &context, llvm::Module &module,
                   const HeritageProgram &program,
+                  const HeritageLoweringConfig &config,
                   const HeritageModuleSymbolPlan *symbols = nullptr,
                   llvm::Function *function = nullptr,
                   RegisterStorage *registers = nullptr)
-      : Context(context), Module(module), Program(program), Symbols(symbols),
-        Builder(context), Function(function), Registers(registers) {
+      : Context(context), Module(module), Program(program), Config(config),
+        Symbols(symbols), Builder(context), Function(function),
+        Registers(registers) {
     if (Registers == nullptr) {
       OwnedRegisters = std::make_unique<RegisterStorage>(
           context, module, registerInfosForHeritageProgram(program), false);
@@ -603,10 +605,51 @@ private:
   }
 
   bool canReadRegisterFallback(const HeritageVarnode &varnode) const {
+    if (Config.RegisterInputsAsTemps) {
+      return false;
+    }
     if (!varnode.IsInput || !varnode.IsRegister || !varnode.RegisterName) {
       return false;
     }
     return true;
+  }
+
+  bool canCreateRegisterInputTemp(const HeritageVarnode &varnode) const {
+    return Config.RegisterInputsAsTemps && varnode.IsInput &&
+           varnode.IsRegister;
+  }
+
+  llvm::MDNode *registerSourceMetadata(const HeritageVarnode &varnode) {
+    std::vector<llvm::Metadata *> fields = {
+        llvm::MDString::get(Context, "space=" + varnode.Space),
+        llvm::MDString::get(Context,
+                            "offset=" + std::to_string(varnode.Offset)),
+        llvm::MDString::get(Context, "size=" + std::to_string(varnode.Size)),
+    };
+    if (varnode.RegisterName) {
+      fields.push_back(
+          llvm::MDString::get(Context, "register=" + *varnode.RegisterName));
+    }
+    return llvm::MDNode::get(Context, fields);
+  }
+
+  llvm::Value *registerInputTemp(const HeritageVarnode &varnode) {
+    if (auto it = Values.find(varnode.Id); it != Values.end()) {
+      return resize(it->second, varnode.Size);
+    }
+
+    llvm::IRBuilder<> entryBuilder(&Function->getEntryBlock(),
+                                   Function->getEntryBlock().begin());
+    llvm::Value *tempValue = entryBuilder.CreateFreeze(
+        llvm::PoisonValue::get(intType(varnode.Size)),
+        varnode.Id + ".register_input");
+    if (llvm::Instruction *tempInst =
+            llvm::dyn_cast<llvm::Instruction>(tempValue)) {
+      tempInst->setMetadata("notdec.register.source",
+                            registerSourceMetadata(varnode));
+    }
+    Values[varnode.Id] = tempValue;
+    return tempValue;
   }
 
   llvm::Value *read(const std::string &id) {
@@ -621,6 +664,9 @@ private:
     }
     if (varnode->IsConstant) {
       return llvm::ConstantInt::get(intType(varnode->Size), varnode->Offset);
+    }
+    if (canCreateRegisterInputTemp(*varnode)) {
+      return registerInputTemp(*varnode);
     }
     if (canReadRegisterFallback(*varnode)) {
       RegisterAccess access{varnode->Space, varnode->Offset, varnode->Size,
@@ -1586,6 +1632,10 @@ private:
     if (varnode != nullptr && varnode->IsConstant) {
       return llvm::ConstantInt::get(intType(byteSize), varnode->Offset);
     }
+    if (varnode != nullptr && canCreateRegisterInputTemp(*varnode)) {
+      return resizeForPhiIncoming(registerInputTemp(*varnode), byteSize,
+                                  incomingBlock);
+    }
     if (varnode != nullptr && canReadRegisterFallback(*varnode)) {
       llvm::Instruction *terminator = incomingBlock->getTerminator();
       if (terminator != nullptr) {
@@ -2078,6 +2128,7 @@ private:
   llvm::LLVMContext &Context;
   llvm::Module &Module;
   const HeritageProgram &Program;
+  const HeritageLoweringConfig &Config;
   const HeritageModuleSymbolPlan *Symbols = nullptr;
   llvm::IRBuilder<> Builder;
   llvm::Function *Function = nullptr;
@@ -2107,7 +2158,7 @@ buildHeritageModule(llvm::LLVMContext &context, const HeritageProgram &program,
                     const HeritageLoweringConfig &config,
                     std::string &errorMessage) {
   auto module = std::make_unique<llvm::Module>(config.ModuleName, context);
-  HeritageLowerer lowerer(context, *module, program);
+  HeritageLowerer lowerer(context, *module, program, config);
   if (!lowerer.lower(errorMessage)) {
     return nullptr;
   }
@@ -2181,7 +2232,7 @@ std::unique_ptr<llvm::Module> buildHeritageModuleWithBodies(
     llvm::Function *llvmFunction =
         module->getFunction(symbols.InternalNames[index]);
     std::string functionError;
-    HeritageLowerer lowerer(context, *module, function.Program, &symbols,
+    HeritageLowerer lowerer(context, *module, function.Program, config, &symbols,
                             llvmFunction, &registers);
     if (!lowerer.lower(functionError)) {
       restoreDeclaration(index);

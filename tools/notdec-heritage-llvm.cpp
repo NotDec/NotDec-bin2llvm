@@ -16,15 +16,17 @@ namespace {
 struct CliOptions {
   std::string InputPath;
   std::string OutputPath;
+  bool RegisterInputsAsTemps = false;
 };
 
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0
-            << " <heritage-pcode.json> -o <output.ll>\n";
+            << " <heritage-pcode.json> -o <output.ll> "
+               "[--register-inputs-as-temps]\n";
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
-  if (argc != 4) {
+  if (argc < 4) {
     return std::nullopt;
   }
   CliOptions options;
@@ -35,6 +37,15 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     return std::nullopt;
   }
   options.OutputPath = argv[3];
+  for (int index = 4; index < argc; ++index) {
+    std::string option = argv[index];
+    if (option == "--register-inputs-as-temps") {
+      options.RegisterInputsAsTemps = true;
+    } else {
+      std::cerr << "unknown flag: " << option << '\n';
+      return std::nullopt;
+    }
+  }
   return options;
 }
 
@@ -70,6 +81,7 @@ int main(int argc, char **argv) {
 
   llvm::LLVMContext context;
   notdec::bin2llvm::HeritageLoweringConfig config;
+  config.RegisterInputsAsTemps = options->RegisterInputsAsTemps;
   auto module = notdec::bin2llvm::buildHeritageModule(context, program, config,
                                                       errorMessage);
   if (!module) {

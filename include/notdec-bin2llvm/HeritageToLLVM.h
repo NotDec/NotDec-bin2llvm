@@ -15,6 +15,10 @@ namespace notdec::bin2llvm {
 
 struct HeritageLoweringConfig {
   std::string ModuleName = "notdec.bin2llvm.heritage";
+  // Java High P-Code keeps machine registers as provenance for SSA values.
+  // When this is true, register input varnodes with no local def are lowered
+  // as function-local unknown temporaries instead of RegisterStorage globals.
+  bool RegisterInputsAsTemps = false;
 };
 
 struct HeritageModuleLoweringFailure {

@@ -17,16 +17,20 @@ struct CliOptions {
   std::string InputPath;
   std::string OutputPath;
   bool DeclarationsOnly = false;
+  bool RegisterInputsAsTemps = false;
 };
 
 void printUsage(const char *argv0) {
-  std::cerr << "usage: " << argv0 << " <heritage-module.json> -o <output.ll>\n";
+  std::cerr << "usage: " << argv0
+            << " <heritage-module.json> -o <output.ll> "
+               "[--register-inputs-as-temps]\n";
   std::cerr << "       " << argv0
-            << " <heritage-module.json> -o <output.ll> --declarations-only\n";
+            << " <heritage-module.json> -o <output.ll> "
+               "--declarations-only [--register-inputs-as-temps]\n";
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
-  if (argc != 4 && argc != 5) {
+  if (argc < 4) {
     return std::nullopt;
   }
   CliOptions options;
@@ -37,13 +41,16 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     return std::nullopt;
   }
   options.OutputPath = argv[3];
-  if (argc == 5) {
-    std::string mode = argv[4];
-    if (mode != "--declarations-only") {
-      std::cerr << "unknown flag: " << mode << '\n';
+  for (int index = 4; index < argc; ++index) {
+    std::string option = argv[index];
+    if (option == "--declarations-only") {
+      options.DeclarationsOnly = true;
+    } else if (option == "--register-inputs-as-temps") {
+      options.RegisterInputsAsTemps = true;
+    } else {
+      std::cerr << "unknown flag: " << option << '\n';
       return std::nullopt;
     }
-    options.DeclarationsOnly = true;
   }
   return options;
 }
@@ -81,6 +88,7 @@ int main(int argc, char **argv) {
   llvm::LLVMContext context;
   notdec::bin2llvm::HeritageLoweringConfig config;
   config.ModuleName = "notdec.bin2llvm.heritage.module";
+  config.RegisterInputsAsTemps = options->RegisterInputsAsTemps;
   std::unique_ptr<llvm::Module> module;
   if (options->DeclarationsOnly) {
     module = notdec::bin2llvm::buildHeritageDeclarationModule(
