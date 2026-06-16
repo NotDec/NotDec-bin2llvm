@@ -273,6 +273,134 @@ Cover 解决的是“这个高层变量在代码里到底覆盖了哪些位置�
 
 所以 cover 不是一遍算完就不动，它是会在 merge、split、type 推进后重新参与判断的。
 
+可以把 `Cover` 先理解成一个 SSA varnode 的活跃范围：
+
+```text
+从这个 varnode 被定义的位置开始，
+到所有使用它的位置结束，
+中间经过哪些 basic block / p-code op。
+```
+
+Ghidra 里一个 `Varnode` 是 SSA 值，一个 `HighVariable` 是更高层的“源码变量”。
+一个源码变量通常会有多个 SSA 实例。
+比如：
+
+```text
+x0 = 1
+use x0
+x1 = 2
+use x1
+```
+
+`x0` 和 `x1` 的活跃范围不重叠。
+这时把它们合成同一个 HighVariable 是合理的：
+
+```c
+x = 1;
+use(x);
+x = 2;
+use(x);
+```
+
+如果不合并，反编译结果可能变成两个没必要的临时变量：
+
+```c
+x_1 = 1;
+use(x_1);
+x_2 = 2;
+use(x_2);
+```
+
+但如果两个 SSA 值的活跃范围重叠，就不能直接合并。
+例如：
+
+```text
+a0 = load A
+b0 = load B
+use a0
+use b0
+```
+
+在 `use a0` 到 `use b0` 之间，`a0` 和 `b0` 都还活着。
+如果强行把它们合成一个 HighVariable，就等价于说同一个源码变量在同一个程序点同时有两个不同值。
+这会造成错误：
+
+```c
+v = load_A();
+v = load_B();
+use(v);   // 本来应该用 A，现在可能被改成 B
+use(v);
+```
+
+所以 Cover 的核心问题是：
+
+```text
+如果把这两个 varnode 当成同一个变量，会不会在某个程序点需要同时保存两个不同值？
+```
+
+如果会，就不能合并。
+如果不会，就可以合并，反编译结果更像人写的代码。
+
+控制流上也一样。
+比如两个分支各自定义一个值，然后在合流点用 PHI：
+
+```text
+if cond:
+  x1 = 1
+else:
+  x2 = 2
+x3 = PHI(x1, x2)
+use x3
+```
+
+`x1` 和 `x2` 分别只活在各自分支。
+它们的 cover 不会在同一条实际路径上冲突，所以可以属于同一个 HighVariable。
+这就是源码里的：
+
+```c
+if (cond)
+  x = 1;
+else
+  x = 2;
+use(x);
+```
+
+但下面这种不行：
+
+```text
+x1 = 1
+x2 = 2
+use x1
+use x2
+```
+
+这两个值在同一条直线路径上同时活着。
+把它们合并会丢掉一个值。
+
+Ghidra 做 Cover 检查，就是为了在这两类情况中间划线：
+
+- 不重叠：可以合并，变量更自然。
+- 重叠：不能合并，否则语义错。
+- 部分重叠或 piece/subpiece 重叠：需要更细的 `VariablePiece` / `HighIntersectTest` 判断。
+
+这和寄存器消除也有关。
+寄存器经常被复用：
+
+```text
+RAX = value_for_call
+call foo(RAX)
+RAX = return_value
+use RAX
+```
+
+这两个 `RAX` 不是同一个源码变量。
+第一个是参数准备值，第二个是返回值。
+它们 storage 一样，但 cover 和定义来源不同。
+如果只按寄存器名合并，就会把参数和返回值混成一个变量。
+
+所以 Ghidra 不能只看 storage 名字，也不能只看类型名字。
+它必须看 SSA def-use 和 cover，判断这些值能不能真的作为同一个 HighVariable。
+
 ## 6. symbol 和 use 是结果层，不是起点
 
 `symbol` 是把 SSA / HighVariable 和“函数里有名字的东西”连起来。
