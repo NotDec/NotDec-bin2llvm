@@ -4,6 +4,10 @@
 
 > 外部函数/间接调用暂时就看ABI，是没问题的。stack 参数可能后续再拓展覆盖吧，初版先不考虑，不过确实是一个值得考虑的点。partial register感觉也没必要。就直接当做存放了整个寄存器吧。条件路径没必要啊，直接就当做两边路径都被改了就行了。内存和栈一样，都先不考虑。后期的话，也只是考虑占空间上的内存，其他地方的内存完全不考虑。未知clobber应该没啥吧。按这个写一个plan文档吧。文档可以明确说一下，这个是一个新版的单独链路，和之前的模仿Ghidra的做法完全独立，也不用参考那边
 
+用户补充要求：
+
+> 每个 register 当前值用少量抽象值表示，这一块感觉不太系统。初始值就是entry，如果改动了就变成改动了的，为什么还要单独分什么Call Clobber，Call Return。对某个函数的调用，目标函数的所有基本块在transfer function的合并下得到的结果就是函数的结果，根据函数的结果去分析call 的效应就可以了，没必要分什么clobber return。栈指针相关可以单独由专门的pass匹配和处理，当前这个pass可以不考虑，搞一个不考虑的寄存器集合作为pass的参数。另外3-5节重写一下按照transfer function的思路去描述，定义抽象域，join函数，meet函数，然后证明join和meet操作满足交换律，然后函数的summary就直接定义为整个函数CFG的整体效应即可。最好先网上搜一下且复习一下相关的抽象解释框架，将相关基础知识也总结到一个docs/下合适位置的文档，然后再去改。抽象域这一块稍微处理一下，比如用一个什么map去存，如果map里面不存在的值就是默认值，表示untouched。如果仅读取了就是read，被改过就是modified？但是，函数的summary可以在计算完毕后，单独去匹配保存和恢复callee saved register的模式，然后将对应的值从modified改成别的值？这一块深入思考一下
+
 ## 背景
 
 这是 native prototype recovery / register elimination 的新版独立链路。
@@ -29,7 +33,8 @@
 - 不做一般内存/栈 alias 分析。
 - 不做 partial register 精细建模，`AL/EAX/RAX` 先按整个 backing register 处理。
 - 条件路径不单独保留条件语义；路径合并后只做保守 summary。
-- 不把未知 clobber 作为核心状态；不能证明时退到 ABI fallback 或 conservative mixed。
+- 不把 `CallReturn` / `CallClobber` 放进核心抽象域；这些是 callsite 消费 summary 后得到的解释。
+- pass 接收一个忽略 register 集合，栈指针、需要专门 pass 处理的 frame register 先从这条链路排除。
 
 ## 目标
 
@@ -69,92 +74,186 @@ register -> {
 
 这会损失精度，但能先把跨函数 summary 跑通。
 
-### 2. 抽象值
+### 2. 抽象域
 
 函数内部不修改 IR，只做只读数据流。
+抽象解释基础见：
 
-每个 register 当前值用少量抽象值表示：
+- [abstract-interpretation-register-summary.md](/sn640/NotDec/external/NotDec-bin2llvm/docs/analysis/abstract-interpretation-register-summary.md)
 
-```text
-Entry(R)          函数入口时 R 的值
-LocalDef(id)      本函数内普通定义
-CallReturn(c, R)  call c 产生的返回寄存器值
-CallClobber(c, R) call c 后该寄存器被改写
-Mixed             多路径合并后不一致
-Unknown           无法解释，保守
-```
+第一版不把 register 当前值分成 `CallReturn` / `CallClobber`。
+核心状态只描述两件事：
 
-`Unknown` 只作为保守收口，不作为主要语义。
-正常情况下，外部/间接 call 由 ABI fallback 直接产生 preserved / return / clobber 效果。
+- 这个 register 的入口值是否被读过。
+- 这个 register 当前是否还可能等于入口值。
 
-### 3. Basic block summary
-
-先对每个 basic block 生成 transfer summary：
+每个 register 的 cell：
 
 ```text
-block input register state
-  -> block output register state
-  -> block 内读取了哪些 Entry(R)
-  -> block 内写了哪些 register
+Cell = {
+  evidence: bitset { Read, Modified },
+  relation: bitset { SameAsEntry, DifferentFromEntry }
+}
 ```
 
-普通指令按寄存器读写更新：
-
-- 读 register：
-  - 读取当前抽象值。
-  - 如果当前值是 `Entry(R)`，标记本函数 read entry `R`。
-- 写 register：
-  - 当前 register state 变成 `LocalDef(id)`。
-- call：
-  - direct internal call 用 callee summary。
-  - external / indirect call 用 ABI fallback。
-
-这里不判断 caller 有没有“准备参数”。
-只要 callee summary 说它读取某个 register，当前 reaching value 就是这个 callsite 的参数来源。
-
-### 4. CFG 合并
-
-在 CFG join 点合并 register state：
+实现上用 map 存：
 
 ```text
-Entry(R) + Entry(R)        -> Entry(R)
-LocalDef(a) + LocalDef(a)  -> LocalDef(a)
-相同 CallReturn           -> CallReturn
-其它不一致                -> Mixed
-Unknown 参与              -> Unknown
+Map<Register, Cell>
 ```
 
-条件路径不单独保留。
-只要不同路径给同一个 register 产生不同值，就进入 `Mixed`，后续按保守效果处理。
+map 里不存在某个 register，表示默认 untouched：
 
-函数 exit summary 从所有 return block 合并得到：
+```text
+evidence = {}
+relation = { SameAsEntry }
+```
 
-- 所有 return 都是 `Entry(R)`：`R` preserved。
-- 任一路径是 `LocalDef` / `CallReturn` / `CallClobber` / `Mixed`：`R` modified。
-- 如果 modified register 是 ABI return register，并且值不是 entry value，可作为 return 候选。
+常见解释：
+
+- missing：没有读也没有改。
+- `Read`：读过入口值。
+- `Modified`：写过该 register，或者当前值可能不是入口值。
+- `Read + Modified`：读过入口值，也改过该 register。
+- 所有 return path 都是 `SameAsEntry`：函数 preserved 该 register。
+- 任一 return path 有 `DifferentFromEntry`：函数 modified 该 register。
+
+`preserved` 是从函数出口关系派生出来的，不是核心域里的原子值。
+
+### 3. Transfer function
+
+每条指令定义一个 transfer function：
+
+```text
+F_inst : State -> State
+```
+
+普通指令：
+
+- 读 register `R`
+  - 如果 `R` 不在 ignored set，且 `relation(R)` 包含 `SameAsEntry`，给 `R` 加 `Read`。
+  - 不改变 `relation(R)`。
+- 写 register `R`
+  - 如果 `R` 不在 ignored set，给 `R` 加 `Modified`。
+  - `relation(R)` 变成 `{ DifferentFromEntry }`。
+- 读写同一 register
+  - 先按读处理，再按写处理。
+
+call 指令：
+
+- direct internal call 用 callee summary 转换 caller state。
+- external / indirect call 用 ABI fallback 转换 caller state。
+- callsite 参数证据来自 callee summary 的 `Read`，不是来自 caller 侧有没有准备指令。
+
+callee summary 套到 caller state 时：
+
+```text
+if callee reads R:
+  当前 caller state[R] 是 callsite 参数来源
+  if caller relation[R] 包含 SameAsEntry:
+    caller evidence[R] 加 Read
+
+post relation[R] =
+  callee exit relation 包含 SameAsEntry      ? pre relation[R] : {}
+  union
+  callee exit relation 包含 DifferentFromEntry ? {DifferentFromEntry} : {}
+
+if callee exit relation 包含 DifferentFromEntry:
+  caller evidence[R] 加 Modified
+```
+
+如果 callee summary 说它读取 `RDI`，那么 caller 在 callsite 处的当前 `RDI` 值就是参数来源。
+这个值可以来自本地定义，也可以直接来自 caller 函数入口。
+
+### 4. Join / meet
+
+CFG 合流使用 join。
+对单个 register：
+
+```text
+join evidence = bitset union
+join relation = bitset union
+```
+
+meet 是对应的交集：
+
+```text
+meet evidence = bitset intersection
+meet relation = bitset intersection
+```
+
+对 map 做 pointwise join / meet。
+missing register 使用默认 untouched cell。
+
+交换律来自集合 union / intersection：
+
+```text
+A ∪ B = B ∪ A
+A ∩ B = B ∩ A
+```
+
+所以：
+
+```text
+join(s1, s2) = join(s2, s1)
+meet(s1, s2) = meet(s2, s1)
+```
+
+这保证 predecessor 枚举顺序不影响 CFG 合流结果。
+本分析是 may-style forward analysis，fixpoint 里主要用 join。
 
 ### 5. Function summary
 
-每个函数对每个 register 输出：
+一个函数的 summary 定义为整个 CFG transfer function 的 fixpoint 结果。
+
+计算方式：
 
 ```text
-ReadEntry:
-  no
-  yes
-
-ExitEffect:
-  preserved
-  modified
-  return_candidate
-  mixed
-
-CallUse:
-  这个函数是否会把入口 R 作为内部 call 参数继续传递
+in[entry] = default state
+out[bb] = F_block(in[bb])
+in[bb] = join(out[pred1], out[pred2], ...)
+重复直到不变
 ```
 
-第一版先不区分 preserve-only read 和 semantic read。
-原因是 stack/memory 保存恢复不在范围内；没有栈建模时，强行区分容易制造假精度。
-如果后续加入 frame-slot 分析，再补这个维度。
+然后合并所有 return block 的 `out` state，得到函数出口状态。
+
+对每个 register：
+
+```text
+evidence 无 Read / Modified
+  -> untouched
+
+evidence 有 Read，relation 在出口仍只有 SameAsEntry
+  -> read + preserved
+
+evidence 有 Modified，出口 relation 有 DifferentFromEntry
+  -> modified
+
+出口 relation 同时有 SameAsEntry / DifferentFromEntry
+  -> mixed，consumer 保守处理
+```
+
+如果 register 是 ABI return register，且函数出口 relation 有 `DifferentFromEntry`，可以派生为 return candidate。
+这仍然不是核心域里的 `CallReturn` 值，只是 summary 消费阶段的解释。
+
+### 5b. 保存/恢复精化
+
+第一版 core pass 不处理 stack/memory。
+保存/恢复 callee-saved register 后续用单独 postpass 做。
+
+流程：
+
+```text
+先得到普通 register summary
+再运行 frame-local save/restore matcher
+如果证明 R 在所有 return path 恢复入口值
+  -> 将 R 的出口 relation 精化为 SameAsEntry
+  -> summary 标记 preserved
+```
+
+这一步只能处理确定的 frame-local slot。
+不要扩展到一般内存 alias。
+它也不改变 core domain 的 join/meet 设计。
 
 ### 6. Callsite 应用
 
@@ -165,20 +264,17 @@ callee reads R
   -> 当前 caller state[R] 是 callsite argument source
 
 callee preserves R
-  -> caller state[R] 不变
-
-callee returns R
-  -> caller state[R] = CallReturn(call, R)
+  -> caller call 后 relation[R] 继承 call 前 relation[R]
 
 callee modifies R
-  -> caller state[R] = CallClobber(call, R)
+  -> caller call 后 relation[R] 加 { DifferentFromEntry }
+  -> caller state[R].evidence 加 Modified
 ```
 
 external / indirect call 没有 callee summary，直接用 ABI：
 
 - ABI unaffected：state 不变。
-- ABI output：`CallReturn`。
-- ABI killed-by-call：`CallClobber`。
+- ABI output / killed-by-call：relation 变成 `{ DifferentFromEntry }`，加 `Modified`。
 
 ### 7. Call graph SCC fixpoint
 
@@ -204,12 +300,12 @@ for each SCC:
 summary lattice 必须有限，避免来回震荡：
 
 ```text
-preserved -> modified -> mixed/unknown
-no read   -> read
-no return -> return_candidate -> mixed
+evidence: {} -> {Read} / {Modified} -> {Read, Modified}
+relation: {SameAsEntry} / {DifferentFromEntry} -> {SameAsEntry, DifferentFromEntry}
 ```
 
-一旦某个寄存器效果升级为更保守状态，不再降级。
+一旦某个 register 的 evidence bit 或 relation bit 被加入，fixpoint 内不再删除。
+保存/恢复这类精化放在 fixpoint 后的 postpass，避免破坏单调迭代。
 
 ### 8. Prototype recovery 消费
 
@@ -219,15 +315,15 @@ no return -> return_candidate -> mixed
 
 ```text
 callee summary: reads RDI
-callsite: current state[RDI] = Entry(RDI) 或 LocalDef(...)
+callsite: 当前 RDI 抽象状态
   -> RDI 是这个 callsite 的参数来源
 ```
 
 函数返回来自 callee exit summary：
 
 ```text
-callee summary: RAX return_candidate
-caller call 后 state[RAX] = CallReturn(call, RAX)
+callee summary: RAX 是 ABI output register
+callee exit relation[RAX] 有 DifferentFromEntry
   -> RAX 是返回值来源
 ```
 
@@ -238,9 +334,9 @@ caller call 后 state[RAX] = CallReturn(call, RAX)
 summary 可用于更系统地删除 residue：
 
 - caller call 前写了 `RDI`，但 callee summary 不读 `RDI`：这类 store 可以进入删除候选。
-- caller call 后读 `RAX`，且 callee summary 返回 `RAX`：接到 call return value。
+- caller call 后读 `RAX`，且 callee summary 显示 `RAX` 是 ABI output 上的 changed exit value：接到 call result。
 - caller call 后继续读 `RBX`，且 callee summary preserved `RBX`：继续使用 call 前 state。
-- caller call 后读 caller-saved register，callee summary modified：使用 call clobber value。
+- caller call 后读 caller-saved register，callee summary modified：不能沿用 call 前 state。
 
 第一版先只做 summary 和 metadata / audit。
 真正删除 residue 可以单独接在验证稳定之后。
@@ -271,7 +367,7 @@ summary 可用于更系统地删除 residue：
 
 风险处理：
 
-- 第一版宁可保守，不从 `Mixed/Unknown` 生成 signature rewrite。
+- 第一版宁可保守，不从 mixed relation 生成 signature rewrite。
 - summary 先写 metadata / 日志，不直接大规模删 IR。
 - 删除 register residue 必须作为后续阶段，等 summary 稳定后再做。
 
