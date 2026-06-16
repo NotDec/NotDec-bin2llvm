@@ -134,6 +134,83 @@ rax1 = CALL_CLOBBER_UNKNOWN(call foo, RAX)
 
 这说明 trial/use 是建立在 heritage 之后，但它本身也是一套递归分析。
 
+这里 `Trial` 这个词很重要。
+它不是“已经确定的参数”，而是“疑似参数位置”。
+Ghidra 源码注释里说它是 putative parameter passing storage location，也就是暂时登记一个 storage：
+
+```text
+这个 call 可能把 RDI 当第 1 个参数。
+这个 call 可能把 RSI 当第 2 个参数。
+这个 call 后的 RAX 可能是返回值。
+```
+
+先登记 trial，而不是马上改 prototype，是因为 ABI 只能说明“这里可以传参”，不能说明“这次 call 真的用了它”。
+比如：
+
+```text
+RDI = old_live_value
+call foo
+```
+
+`RDI` 是 ABI input register，但如果它只是从函数入口一路活下来，没有本地准备动作，就不能马上断定 `foo(RDI)`。
+所以 Ghidra 先把它放进 trial，后面再检查 use 链和 ancestor。
+
+`ParamTrial` 和 `FuncCallSpecs` 的关系可以简单理解成：
+
+```text
+一个 CALL/CALLIND
+  -> 一个 FuncCallSpecs
+    -> activeinput: 一组输入 ParamTrial
+    -> activeoutput: 一组输出 ParamTrial
+```
+
+`FuncCallSpecs` 是 callsite 级别的对象。
+它知道这个 call 的 callee、prototype model、active input/output trial、call effect。
+`ParamTrial` 是其中一个候选 storage，比如某个 register 或 stack slot。
+
+`ParamTrial` 里会记录：
+
+- storage 地址和大小。
+- 当前 slot。
+- 是否 checked。
+- 是否 active。
+- 是否 used。
+- 是否 definitely not used。
+- 是否 killed-by-call。
+- 是否受 conditional execution 影响。
+
+这些状态是逐步推进的：
+
+```text
+registerTrial()
+  -> checkInputTrialUse()
+  -> markActive / markInactive / markNoUse
+  -> deriveInputMap()
+  -> buildInputFromTrials()
+```
+
+结果会影响 p-code。
+这点很关键。
+
+在 `guardCalls()` 里，如果某个 storage 可能是 input，Ghidra 会：
+
+```text
+active->registerTrial(...)
+vn = newVarnode(...)
+opInsertInput(CALL, vn, CALL.numInput())
+```
+
+也就是先真的给 CALL p-code 加一个 input varnode。
+这使得后续 heritage/SSA 可以把这个参数候选当成普通 use 来 rename。
+
+后面如果 trial 被判定不是参数，`checkInputTrialUse()` 可能会把 CALL 对应 input 改成常量 0，释放这条数据流。
+如果最终只有部分 trial 被确认使用，`buildInputFromTrials()` 会重建 CALL input 列表，只保留 `isUsed()` 的 trial。
+
+所以 trial 不是只存在于旁路表里。
+它一开始就会通过 `opInsertInput()` 影响 P-Code。
+最终 `buildInputFromTrials()` 又会通过 `opSetAllInput()` 把 CALL 的输入列表收成最终结果。
+这也是 Ghidra 这套方案比“额外 metadata 记录一下候选”更稳的地方：候选直接进入 SSA/use 链，后续删除、保留、改 prototype 都有真实数据流依据。
+
 ## 3. copy propagation 是配套机制，不是单独一层
 
 Ghidra 里很多判断都默认 copy propagation 已经参与了。
