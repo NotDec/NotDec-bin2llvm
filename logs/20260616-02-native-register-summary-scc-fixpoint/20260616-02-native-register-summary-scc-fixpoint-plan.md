@@ -1178,3 +1178,72 @@ summary SSA, residue removal enabled:
 - 实现效果：7/10。补齐了 native CLI 层的 residue removal 对照 gate。
 - 理解成本：2/10。只是一个显式开关，默认路径不变。
 - 维护成本：2/10。后续 Bench2 audit 可以直接用这个开关区分 SSA rewrite 和 residue 删除效果。
+
+## 实现记录：summary SSA Bench2 audit 脚本
+
+之前 Bench2 结果主要靠手写命令。
+这次新增一个 register-SSA 专用 audit 脚本，避免继续复用 prototype recovery audit 时混入签名恢复逻辑。
+
+新增文件：
+
+- `scripts/bench2-native-summary-ssa-audit.sh`
+  - 第 4-11 行定义默认 build / Bench2 / LLVM 路径和参数状态。
+  - 第 13-26 行 usage，说明这是 register SSA 专用 audit，prototype recovery 默认关闭。
+  - 第 28-79 行解析 `--target`、`--mode`、`--decode-seed-limit` 等参数；默认跑 `summary-no-residue` 和 `summary-residue`。
+  - 第 103-118 行复用 manifest 的 `PROJECT:ROLE` 查找方式。
+  - 第 120-142 行定义三种 mode：`old`、`summary-no-residue`、`summary-residue`。
+  - 第 144-161 行从 `--register-ssa-summary` stderr 里解析计数。
+  - 第 171-225 行逐目标生成 IR、用 LLVM 22 `llvm-as` / `opt -passes=verify` 验证，并写 `metrics.tsv`。
+
+验证：
+
+```text
+chmod +x scripts/bench2-native-summary-ssa-audit.sh
+bash -n scripts/bench2-native-summary-ssa-audit.sh
+git diff --check
+```
+
+Bench2 `wrk` 全量：
+
+```text
+scripts/bench2-native-summary-ssa-audit.sh \
+  --target wrk:executable \
+  --out-dir /tmp/notdec-bin2llvm-summary-ssa-audit-wrk
+```
+
+结果：
+
+```text
+wrk:executable summary-no-residue: 47s, 61037 lines, loads_replaced=5307, dead_loads_removed=0, dead_stores_removed=0, phis_created=4894, phis_simplified=1922
+wrk:executable summary-residue:    49s, 47672 lines, loads_replaced=5307, dead_loads_removed=5306, dead_stores_removed=8032, phis_created=4894, phis_simplified=1922
+```
+
+Bench2 三目标 seed50：
+
+```text
+scripts/bench2-native-summary-ssa-audit.sh \
+  --target vsftpd:executable \
+  --target libuv:shared-library \
+  --target memcached:executable \
+  --decode-seed-limit 50 \
+  --out-dir /tmp/notdec-bin2llvm-summary-ssa-audit-seed50
+```
+
+结果：
+
+```text
+vsftpd summary-no-residue:   11s, 3084 lines, loads_replaced=430, dead_loads_removed=0, dead_stores_removed=0
+vsftpd summary-residue:      11s, 2168 lines, loads_replaced=430, dead_loads_removed=430, dead_stores_removed=473
+libuv summary-no-residue:    11s, 2950 lines, loads_replaced=332, dead_loads_removed=0, dead_stores_removed=0
+libuv summary-residue:       11s, 2147 lines, loads_replaced=332, dead_loads_removed=332, dead_stores_removed=447
+memcached summary-no-residue: 10s, 2867 lines, loads_replaced=294, dead_loads_removed=0, dead_stores_removed=0
+memcached summary-residue:    10s, 2146 lines, loads_replaced=294, dead_loads_removed=294, dead_stores_removed=409
+```
+
+所有输出都通过 LLVM 22 `llvm-as` / `opt -passes=verify`。
+
+复杂度评估：
+
+- 实现效果：8/10。Bench2 audit 从手写命令变成可重复脚本，并能直接比较 no-residue / residue。
+- 理解成本：3/10。脚本只关心 register SSA，不和 prototype audit 混在一起。
+- 维护成本：3/10。后续扩大目标或 seed limit 只需要追加 `--target` / `--decode-seed-limit`。
