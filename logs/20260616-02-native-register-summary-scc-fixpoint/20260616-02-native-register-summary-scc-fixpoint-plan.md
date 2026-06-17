@@ -759,3 +759,55 @@ Bench2 判断标准：
 - 输出 demanded output / weak return 统计，检查多返回寄存器候选是否减少。
 - 不引入 `llvm-as` / `opt verify` 回归。
 - 在不开启 residue 删除时，IR 行为不变；开启 register SSA 后也必须通过 verifier。
+
+## 实现记录：第一版 summary pass
+
+本次先实现独立 summary 分析，不接入默认 native pipeline，也不改旧 `RegisterSSA`。
+
+改动文件：
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSummary.h`
+  - 第 15-60 行新增 `NativeRegisterSummaryOptions`、`NativeRegisterSummaryRegister`、`NativeRegisterSummaryFunction`、`NativeRegisterSummary`。
+  - 第 62-67 行新增 `runNativeRegisterSummary()` 和 `printNativeRegisterSummary()`。
+- `lib/passes/NativeRegisterSummary.cpp`
+  - 第 28-88 行新增 register unit、`Cell { mayEntry, mayNonEntry, readEntry }`、`State`、`FunctionEffect`、`FunctionDemand`、ABI fallback 数据。
+  - 第 90-224 行新增 register metadata 识别和 ABI metadata 读取。
+  - 第 247-287 行实现 `joinCell()` / `joinState()` / register read-write transfer，其中 `joinState()` 处理稀疏 map 的默认 untouched 路径。
+  - 第 329-444 行实现 direct call graph、SCC 和 bottom-up fixpoint。
+  - 第 446-540 行 `Analyzer::analyzeFunction()` / `Analyzer::applyFunctionEffect()` 实现 CFG forward fixpoint 和 callee summary 应用。
+  - 第 560-686 行 `Analyzer::runTopDownDemand()` / `Analyzer::applyBackwardCallDemand()` 实现 caller 视角的返回值 demand 聚合。
+  - 第 714-755 行输出 metadata：
+    - `notdec.register.summary`
+    - `notdec.register.summary.read_entry`
+    - `notdec.register.summary.preserves`
+    - `notdec.register.summary.modifies`
+    - `notdec.register.summary.demanded_returns`
+  - 第 758-858 行生成公开 summary 和打印统计。
+- `lib/CMakeLists.txt`
+  - 第 10 行把 `passes/NativeRegisterSummary.cpp` 加入 `notdec-bin2llvm-core`。
+- `CMakeLists.txt`
+  - 第 201-214 行新增 `native_register_summary_test` 和 `notdec.native_register_summary.fixpoint`。
+- `tests/native_register_summary_test.cpp`
+  - 第 130-154 行覆盖 killed 后读取不算入口参数。
+  - 第 156-187 行覆盖 callee `readEntry` 传播到 caller entry。
+  - 第 189-231 行覆盖稀疏 map 合流时 untouched 路径不能被 predecessor 顺序丢掉。
+  - 第 233-275 行覆盖 caller 只读取 `RAX` 时，callee 的 `RDX` 不作为 demanded return。
+
+实现时确认的一点：
+
+- 顶层/root 的 ABI demand seed 第一版只取 ABI outputs 中的第一个 register。否则 `RAX/RDX` 同时作为 ABI output 时，会把没有被 caller 使用的 `RDX` 也误标成 demanded return。这个和计划中“第一版先只放常规返回寄存器”一致。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+git diff --check
+```
+
+复杂度评估：
+
+- 实现效果：7/10。bottom-up summary 和 top-down exit demand 已经能跑通核心用例，但还没有接入 pipeline，也没有处理 stack 保存/恢复。
+- 理解成本：6/10。新增了一条独立分析链路，代码集中在一个文件里，暂时没有影响旧链路。
+- 维护成本：6/10。后续主要风险在 demand seed、间接调用和 frame-local 保存/恢复；当前 metadata 输出先作为审计入口。
