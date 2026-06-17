@@ -13,6 +13,7 @@ namespace notdec::bin2llvm {
 
 struct NativeRegisterSummarySSAOptions {
   bool EnableRewrite = true;
+  bool EnableResidueRemoval = true;
   bool AttachMetadata = true;
   bool PrintSummary = false;
 };
@@ -22,6 +23,8 @@ struct NativeRegisterSummarySSAFunctionSummary {
   uint64_t LoadsSeen = 0;
   uint64_t StoresSeen = 0;
   uint64_t LoadsReplaced = 0;
+  uint64_t DeadLoadsRemoved = 0;
+  uint64_t DeadStoresRemoved = 0;
   uint64_t PhisCreated = 0;
   uint64_t PhisSimplified = 0;
   uint64_t EntryInputs = 0;
@@ -36,6 +39,8 @@ struct NativeRegisterSummarySSASummary {
   uint64_t LoadsSeen = 0;
   uint64_t StoresSeen = 0;
   uint64_t LoadsReplaced = 0;
+  uint64_t DeadLoadsRemoved = 0;
+  uint64_t DeadStoresRemoved = 0;
   uint64_t PhisCreated = 0;
   uint64_t PhisSimplified = 0;
   uint64_t EntryInputs = 0;

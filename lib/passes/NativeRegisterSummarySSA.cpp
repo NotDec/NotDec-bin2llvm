@@ -226,6 +226,10 @@ public:
     if (Options.EnableRewrite) {
       rewriteLoads();
       finalizePendingPhis();
+      if (Options.EnableResidueRemoval) {
+        removeDeadReplacedLoads();
+        removeLocalDeadStores();
+      }
       eraseDeadPhis();
     }
     if (Options.AttachMetadata) {
@@ -241,6 +245,7 @@ private:
   const NativeRegisterSummarySSAOptions &Options;
   NativeRegisterSummarySSAFunctionSummary &Summary;
   std::vector<llvm::LoadInst *> Loads;
+  std::vector<llvm::LoadInst *> ReplacedLoads;
   std::map<BlockRegKey, llvm::Value *> EntryValue;
   std::map<BlockRegKey, llvm::Value *> ExitValue;
   std::map<BlockRegKey, llvm::PHINode *> PendingPhi;
@@ -291,7 +296,63 @@ private:
       load->replaceAllUsesWith(value);
       load->setMetadata("notdec.register.summary_ssa.replaced",
                         markerNode("true"));
+      ReplacedLoads.push_back(load);
       ++Summary.LoadsReplaced;
+    }
+  }
+
+  void removeDeadReplacedLoads() {
+    for (llvm::LoadInst *load : ReplacedLoads) {
+      if (load->getParent() == nullptr || !load->use_empty()) {
+        continue;
+      }
+      load->eraseFromParent();
+      ++Summary.DeadLoadsRemoved;
+    }
+  }
+
+  void removeLocalDeadStores() {
+    std::vector<llvm::StoreInst *> deadStores;
+    for (llvm::BasicBlock &block : Function) {
+      std::map<llvm::GlobalVariable *, llvm::StoreInst *> lastStore;
+      for (llvm::Instruction &inst : block) {
+        if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+          RegisterAccess access = registerLoad(*load, Units);
+          if (access.Unit != nullptr) {
+            lastStore.erase(access.Unit->Global);
+          }
+          continue;
+        }
+        if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+          if (!isNotDecRegisterHelperCall(*call)) {
+            lastStore.clear();
+          }
+          continue;
+        }
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+        if (store == nullptr) {
+          continue;
+        }
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit == nullptr || !access.IsStorageValue) {
+          continue;
+        }
+        auto existing = lastStore.find(access.Unit->Global);
+        if (existing != lastStore.end()) {
+          deadStores.push_back(existing->second);
+        }
+        lastStore[access.Unit->Global] = store;
+      }
+    }
+
+    std::set<llvm::StoreInst *> uniqueDeadStores(deadStores.begin(),
+                                                 deadStores.end());
+    for (llvm::StoreInst *store : uniqueDeadStores) {
+      if (store->getParent() == nullptr) {
+        continue;
+      }
+      store->eraseFromParent();
+      ++Summary.DeadStoresRemoved;
     }
   }
 
@@ -619,6 +680,8 @@ void addFunctionSummary(NativeRegisterSummarySSASummary &total,
   total.LoadsSeen += fn.LoadsSeen;
   total.StoresSeen += fn.StoresSeen;
   total.LoadsReplaced += fn.LoadsReplaced;
+  total.DeadLoadsRemoved += fn.DeadLoadsRemoved;
+  total.DeadStoresRemoved += fn.DeadStoresRemoved;
   total.PhisCreated += fn.PhisCreated;
   total.PhisSimplified += fn.PhisSimplified;
   total.EntryInputs += fn.EntryInputs;
@@ -666,6 +729,8 @@ void printNativeRegisterSummarySSASummary(
   os << "Native register summary SSA: functions=" << summary.FunctionsSeen
      << " loads=" << summary.LoadsSeen << " stores=" << summary.StoresSeen
      << " loads_replaced=" << summary.LoadsReplaced
+     << " dead_loads_removed=" << summary.DeadLoadsRemoved
+     << " dead_stores_removed=" << summary.DeadStoresRemoved
      << " phis_created=" << summary.PhisCreated
      << " phis_simplified=" << summary.PhisSimplified
      << " entry_inputs=" << summary.EntryInputs
@@ -678,6 +743,8 @@ void printNativeRegisterSummarySSASummary(
     os << "  " << function.FunctionName << ": loads=" << function.LoadsSeen
        << " stores=" << function.StoresSeen
        << " loads_replaced=" << function.LoadsReplaced
+       << " dead_loads_removed=" << function.DeadLoadsRemoved
+       << " dead_stores_removed=" << function.DeadStoresRemoved
        << " phis_created=" << function.PhisCreated
        << " phis_simplified=" << function.PhisSimplified
        << " entry_inputs=" << function.EntryInputs

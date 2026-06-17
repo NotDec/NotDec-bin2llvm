@@ -182,7 +182,8 @@ bool testPreservedCallKeepsPreviousValue() {
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   return expect(summary.LoadsReplaced == 1,
                 "preserved call load not replaced") &&
-         expect(loaded->use_empty(), "preserved call load still has uses") &&
+         expect(summary.DeadLoadsRemoved == 1,
+                "preserved call replaced load was not removed") &&
          verifyOk(module, "module failed verifier after preserved call test");
 }
 
@@ -216,8 +217,37 @@ bool testDemandedReturnCreatesCallValue() {
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   return expect(summary.CallReturnValues == 1,
                 "demanded return helper was not created") &&
-         expect(loaded->use_empty(), "return load still has uses") &&
+         expect(summary.DeadLoadsRemoved == 1,
+                "return replaced load was not removed") &&
          verifyOk(module, "module failed verifier after demanded return test");
+}
+
+bool testOverwrittenStoreIsRemoved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-dead-store", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "overwritten_store", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 1),
+                "RAX");
+  storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 2),
+                "RAX");
+  llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "final_rax");
+  builder.CreateRet(loaded);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.LoadsReplaced == 1, "final load was not replaced") &&
+         expect(summary.DeadLoadsRemoved == 1,
+                "final replaced load was not removed") &&
+         expect(summary.DeadStoresRemoved == 1,
+                "overwritten store was not removed") &&
+         verifyOk(module, "module failed verifier after dead store test");
 }
 
 } // namespace
@@ -227,5 +257,6 @@ int main() {
   ok &= testPhiIncomingMatchesPredecessors();
   ok &= testPreservedCallKeepsPreviousValue();
   ok &= testDemandedReturnCreatesCallValue();
+  ok &= testOverwrittenStoreIsRemoved();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

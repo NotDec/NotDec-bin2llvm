@@ -865,3 +865,46 @@ git diff --check
 - 实现效果：6/10。已经能消费 summary/demand、构建 PHI、处理 preserved call 和 demanded return，但还没做 residue 删除。
 - 理解成本：5/10。新 pass 独立，代码比旧 `NativeRegisterSSA` 窄很多；代价是短期存在新旧两套 SSA。
 - 维护成本：5/10。后续需要把 residue 删除和 pipeline 消费点接到新 metadata/helper 上，再决定旧 SSA 是否重命名为 `HeritageSSA`。
+
+## 实现记录：summary SSA 局部 residue 删除
+
+本次只在 `NativeRegisterSummarySSA` 内加最小安全删除，不改默认 pipeline。
+删除范围保持很窄：
+
+- 删除已经被 summary SSA 替换、且已经没有 use 的 register load。
+- 删除同一 basic block 内被后续同 register store 覆盖、期间没有 register load 或普通 call 的完整 register store。
+- 不跨 CFG 删除。
+- 不删除 partial register access。
+- 遇到普通 call 清空局部 store 追踪，避免跨未知副作用删除。
+
+改动文件：
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSummarySSA.h`
+  - 第 14-19 行新增 `EnableResidueRemoval` 开关。
+  - 第 21-35 行、37-51 行新增 `DeadLoadsRemoved` / `DeadStoresRemoved` 计数。
+- `lib/passes/NativeRegisterSummarySSA.cpp`
+  - 第 223-234 行在 SSA rewrite 后、删 PHI 前调用 residue 删除。
+  - 第 247-256 行新增 `ReplacedLoads` 缓存。
+  - 第 283-301 行 `rewriteLoads()` 记录已替换 load。
+  - 第 304-312 行新增 `removeDeadReplacedLoads()`。
+  - 第 314-357 行新增 `removeLocalDeadStores()`。
+  - 第 678-691 行汇总新的删除计数。
+- `tests/native_register_summary_ssa_test.cpp`
+  - 第 156-187 行、190-223 行确认已替换 load 会被删除。
+  - 第 225-251 行新增 overwritten store 删除用例。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_ssa_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+git diff --check
+```
+
+复杂度评估：
+
+- 实现效果：6/10。已经能删掉最明显的 replaced load 和局部 overwritten store，但还没有跨 block residue 删除。
+- 理解成本：4/10。删除规则集中在新 SSA pass 内，且条件比较保守。
+- 维护成本：4/10。后续要接 pipeline/Bench2 后，再根据 audit 结果扩展更强的删除规则。
