@@ -5,6 +5,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -281,6 +282,35 @@ bool testDemandedReturnCreatesCallValue() {
          verifyOk(module, "module failed verifier after demanded return test");
 }
 
+bool testIntrinsicDoesNotCreateCallValue() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-intrinsic-call", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "intrinsic_between_registers",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *stored = llvm::ConstantInt::get(rax->getValueType(), 42);
+  storeRegister(builder, rax, stored, "RAX");
+  llvm::Function *ctpop = llvm::Intrinsic::getOrInsertDeclaration(
+      &module, llvm::Intrinsic::ctpop, {rax->getValueType()});
+  builder.CreateCall(ctpop->getFunctionType(), ctpop, {stored});
+  llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "after_intrinsic");
+  builder.CreateRet(loaded);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.LoadsReplaced == 1,
+                "intrinsic-separated load was not replaced") &&
+         expect(summary.CallReturnValues == 0,
+                "intrinsic call created a register return helper") &&
+         verifyOk(module, "module failed verifier after intrinsic call test");
+}
+
 bool testOverwrittenStoreIsRemoved() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-dead-store", context);
@@ -377,6 +407,7 @@ int main() {
   ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
   ok &= testPreservedCallKeepsPreviousValue();
   ok &= testDemandedReturnCreatesCallValue();
+  ok &= testIntrinsicDoesNotCreateCallValue();
   ok &= testOverwrittenStoreIsRemoved();
   ok &= testCrossBlockDeadStoreIsRemoved();
   ok &= testAbiInputStoreBeforeCallIsKept();

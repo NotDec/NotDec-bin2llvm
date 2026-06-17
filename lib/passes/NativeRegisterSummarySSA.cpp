@@ -156,6 +156,14 @@ bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
   return callee != nullptr && callee->getName().starts_with("notdec.register.");
 }
 
+bool isAnalyzableCall(const llvm::CallBase &call) {
+  if (isNotDecRegisterHelperCall(call)) {
+    return false;
+  }
+  llvm::Function *callee = call.getCalledFunction();
+  return callee == nullptr || !callee->isIntrinsic();
+}
+
 AbiFacts collectAbiFacts(const llvm::Module &module) {
   AbiFacts facts;
   std::optional<NativeAbiSpec> abi = readNativeAbiMetadata(module);
@@ -426,7 +434,7 @@ private:
 
   void transferCallLiveness(llvm::CallBase &call,
                             std::set<llvm::GlobalVariable *> &live) const {
-    if (isNotDecRegisterHelperCall(call)) {
+    if (!isAnalyzableCall(call)) {
       return;
     }
     for (const auto &[global, unit] : Units) {
@@ -473,7 +481,7 @@ private:
         continue;
       }
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
-        if (isNotDecRegisterHelperCall(*call)) {
+        if (!isAnalyzableCall(*call)) {
           continue;
         }
         CallRegisterEffect effect = callEffect(*call, unit);

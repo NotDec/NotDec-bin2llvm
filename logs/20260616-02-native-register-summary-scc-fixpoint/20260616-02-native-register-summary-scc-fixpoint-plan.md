@@ -1406,3 +1406,98 @@ scripts/bench2-native-summary-ssa-audit.sh --target wrk:executable \
 - 实现效果：8/10。默认链路已经切到新版 SummarySSA，旧链路仍可显式回退。
 - 理解成本：4/10。代码里不再有“默认 register SSA”与旧 Ghidra-style 实现同名的问题。
 - 维护成本：3/10。旧链路只保留 fallback 入口，后续主要修 SummarySSA。
+
+## 后续修复：SummarySSA 跳过 LLVM intrinsic call
+
+问题：
+
+`/tmp/wrk-default-summary.ll` 里 `@notdec.register.summary_return.i64()` 出现在
+`llvm.ctpop`、`llvm.ssub.with.overflow` 这类 LLVM intrinsic 后面。这是错误的。
+intrinsic 是 lifted IR 内部计算，不是底层二进制里的函数调用，不应该按 ABI 读写寄存器。
+
+原因：
+
+`NativeRegisterSummary.cpp` 的 bottom-up summary 已经跳过 intrinsic，但
+`NativeRegisterSummarySSA.cpp` 在 `readValueBefore()` 和 store liveness 里只跳过
+`notdec.register.*` helper，没有跳过 LLVM intrinsic。结果是 SummarySSA 在重写寄存器
+load 时，把 intrinsic 当成 external ABI call，并为 ABI output `RAX` 生成了假的
+`summary_return.i64`。
+
+改动文件：
+
+- `lib/passes/NativeRegisterSummarySSA.cpp:159-165` 新增 `isAnalyzableCall()`，统一跳过
+  `notdec.register.*` helper 和 LLVM intrinsic。
+- `lib/passes/NativeRegisterSummarySSA.cpp:435-439` 在 register store liveness 里使用
+  `isAnalyzableCall()`，intrinsic 不再 kill ABI output，也不读取 ABI input。
+- `lib/passes/NativeRegisterSummarySSA.cpp:483-487` 在 `readValueBefore()` 里使用
+  `isAnalyzableCall()`，intrinsic 不再触发 `callEffect()`，也不会生成
+  `summary_return` / `summary_clobber` helper。
+- `tests/native_register_summary_ssa_test.cpp:8` 引入 LLVM intrinsic 头文件。
+- `tests/native_register_summary_ssa_test.cpp:285-311` 增加
+  `testIntrinsicDoesNotCreateCallValue()`：在 store `RAX`、调用 `llvm.ctpop`、再读 `RAX`
+  的场景下，要求 load 能被替换，并且 `CallReturnValues == 0`。
+- `tests/native_register_summary_ssa_test.cpp:410` 接入新测试。
+
+验证命令：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm \
+  native_register_summary_ssa_test native_register_summary_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+```
+
+全部通过。
+
+`wrk -f 0x8300` 默认 SummarySSA 重新验证：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk -f 0x8300 \
+  -o /tmp/wrk-default-summary-fixed.ll --register-ssa-summary \
+  --no-prototype-recovery-pass
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/wrk-default-summary-fixed.ll \
+  -o /tmp/wrk-default-summary-fixed.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/wrk-default-summary-fixed.bc -o /tmp/wrk-default-summary-fixed.verified.bc
+```
+
+结果：
+
+```text
+255 lines
+loads_replaced=11
+dead_loads_removed=11
+dead_stores_removed=24
+call_returns=0
+unknown_call_effects=0
+```
+
+修复前同一函数是 267 lines，`call_returns=2`，并且有假的
+`@notdec.register.summary_return.i64()`。修复后 `rg summary_return` 没有命中。
+
+Bench2 小样本：
+
+```text
+scripts/bench2-native-summary-ssa-audit.sh --target wrk:executable \
+  --decode-seed-limit 50 \
+  --out-dir /tmp/notdec-summary-intrinsic-fix-wrk50
+```
+
+结果：
+
+```text
+summary-no-residue: 10s, 3213 lines
+summary-residue:    10s, 2241 lines
+```
+
+同一 seed50 修复前 residue 结果是 2339 lines。这说明错误的 intrinsic call effect
+消掉后，新链路 IR 变短，并且仍通过 LLVM 22 assemble/verify。
+
+复杂度评估：
+
+- 实现效果：9/10。修掉了一个明确语义错误，intrinsic 不再伪造 ABI 返回寄存器。
+- 理解成本：2/10。和 bottom-up summary 的 call 判定保持一致。
+- 维护成本：2/10。后续如果还有其它“非二进制 call”，可以集中扩展 `isAnalyzableCall()`。
