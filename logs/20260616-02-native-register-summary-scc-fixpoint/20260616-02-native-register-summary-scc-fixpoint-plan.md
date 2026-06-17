@@ -635,17 +635,17 @@ DemandSummary.exitDemand[RAX] = true
 
 如果 callee 没读某个 ABI input register，则 caller 对该 register 的写入不应该被当成参数证据。
 
-### 10. Register SSA 与类型恢复
+### 10. Register SSA 与寄存器消除
 
 summary / demand 标记完成后，下一步不直接大规模删除 register residue。
-更稳的路线是先构建 register SSA，让类型恢复消费 SSA def-use：
+更稳的路线是先构建 register SSA，再基于 SSA def-use 删除确认无用的 register residue：
 
 ```text
 register summary / demand
   -> 标记函数 input / demanded return / preserved / clobbered
   -> register SSA
-  -> 基于 SSA def-use 做类型恢复
-  -> 后续再考虑删除 residue
+  -> 基于 SSA def-use 做 register residue 消除
+  -> 后续如果需要，再让其他 pass 消费这些结果
 ```
 
 现有 `RegisterSSA` 如果和之前模仿 Ghidra heritage 的链路耦合太深，不要继续在里面硬塞新逻辑。
@@ -685,14 +685,15 @@ call transfer:
 这几个机制是硬要求。
 不能留下 operandless PHI，也不能只靠 `replaceAllUsesWith` 删除 PHI 而不更新 SSA 缓存。
 
-类型恢复消费 SSA 时：
+寄存器消除消费 SSA 时：
 
-- `readEntry=true` 的 ABI input register 对应函数参数 SSA value。
-- `exitDemand=true` 且 `mayNonEntry=true` 的 ABI return register 对应函数返回值 SSA value。
+- `readEntry=true` 的 register entry value 不能当成无用 residue 删除。
+- `exitDemand=true` 且 `mayNonEntry=true` 的 ABI return register 不能当成无用 residue 删除。
 - preserved register 在 call 前后的 SSA value 应保持同一条 def-use 链。
 - clobbered register 不应沿用 call 前 SSA value。
+- 没有被 SSA def-use 消费、也不属于 entry input / demanded return / preserved obligation 的 register load/store，才进入删除候选。
 
-真正删除 residue 放在 SSA 和类型恢复验证稳定之后。
+真正删除 residue 放在 SSA 验证稳定之后。
 
 ## 不做什么
 
@@ -704,7 +705,7 @@ call transfer:
 - partial register 精细合并。
 - 条件执行路径标记。
 - Ghidra trial/use 兼容层。
-- 在 register SSA 和类型恢复稳定前直接删除 residue。
+- 在 register SSA 稳定前直接删除 residue。
 
 保存/恢复 callee-saved register 如果依赖 stack slot，第一版可以先不证明。
 后续如果要补，只做 frame-local slot，不做全局内存 alias。
@@ -731,7 +732,7 @@ call transfer:
 - 旧 `RegisterSSA` 难改时先重命名为 `HeritageSSA`，新链路使用独立 `RegisterSSA`。
 - 新 SSA 必须按 Braun 风格实现 incomplete PHI / finalize / trivial PHI 删除。
 - summary 先写 metadata / 日志，不直接大规模删 IR。
-- 删除 register residue 必须作为后续阶段，等 SSA 和类型恢复稳定后再做。
+- 删除 register residue 必须作为后续阶段，等 SSA 稳定后再做。
 
 ## 判断标准
 
@@ -845,7 +846,7 @@ git diff --check
 - 只处理完整 backing register load/store。
 - 不处理 partial register 精度。
 - 不删除 register residue。
-- 不接入类型恢复。
+- 不接入 prototype/type recovery。
 - 不改默认 CLI pipeline。
 - 遇到 unknown call effect 时保守不替换。
 
@@ -861,6 +862,6 @@ git diff --check
 
 复杂度评估：
 
-- 实现效果：6/10。已经能消费 summary/demand、构建 PHI、处理 preserved call 和 demanded return，但还没接类型恢复和 residue 删除。
+- 实现效果：6/10。已经能消费 summary/demand、构建 PHI、处理 preserved call 和 demanded return，但还没做 residue 删除。
 - 理解成本：5/10。新 pass 独立，代码比旧 `NativeRegisterSSA` 窄很多；代价是短期存在新旧两套 SSA。
-- 维护成本：5/10。后续需要把 type recovery 和 pipeline 消费点接到新 metadata/helper 上，再决定旧 SSA 是否重命名为 `HeritageSSA`。
+- 维护成本：5/10。后续需要把 residue 删除和 pipeline 消费点接到新 metadata/helper 上，再决定旧 SSA 是否重命名为 `HeritageSSA`。
