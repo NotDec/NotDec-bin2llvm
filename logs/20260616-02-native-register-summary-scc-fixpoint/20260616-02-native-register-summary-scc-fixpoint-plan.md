@@ -1056,3 +1056,66 @@ memcached summary SSA: 179.46s, 218409 lines, llvm-as/opt verify passed
 - 实现效果：8/10。修掉真实 CFG 上的 PHI incoming verifier blocker，并通过三个 Bench2 all-confirmed summary SSA gate。
 - 理解成本：4/10。修复仍局限在 Braun SSA PHI 完成逻辑里，没有扩散到 summary 分析。
 - 维护成本：4/10。后续要继续扩大 Bench2 audit，但当前 opt-in 链路已有比单函数更强的 verifier 证据。
+
+## 实现记录：CFG 级 register store liveness 删除
+
+这次把 summary SSA 里的 residue 删除从“同一基本块内的覆盖 store”扩到“CFG 级 backward liveness”。
+
+核心还是保守版，只处理完整 backing register：
+
+- `store R*`：如果从后继块和后续指令回看，`R*` 不再活跃，就删掉。
+- `load R*`：把 `R*` 标成活跃。
+- `call`：
+  - 内部 direct call 按 callee summary 看它到底读哪些 input register。
+  - 外部 / 间接 call 按 ABI `Inputs` 处理。
+  - `ReturnValue` / `Clobber` 会杀掉 call 前旧值的活跃性。
+  - `Unknown` 保守保留旧值。
+- 函数出口：只把 summary 里 `ExitDemand=true && MayNonEntry=true` 的 ABI return register 作为 live seed。
+
+改动文件：
+
+- `lib/passes/NativeRegisterSummarySSA.cpp`
+  - 第 52-57 行 `AbiFacts` 增加 `Inputs`。
+  - 第 159-170 行 `collectAbiFacts()` 读取 ABI input registers。
+  - 第 233-239 行 `run()` 改成调用新的 `removeDeadStoresByLiveness()`。
+  - 第 321-459 行新增 CFG backward liveness 删除，包含 `transferBlockLiveness()`、`transferCallLiveness()`、`addExitLiveRegisters()`。
+  - 第 667-715 行新增 `callReadsRegister()`，用 callee summary 或 ABI input 判断 call 是否读某个 register。
+- `tests/native_register_summary_ssa_test.cpp`
+  - 第 47-73 行 `attachTestAbi()` 增加 `RDI` 输入。
+  - 第 312-340 行新增跨 block dead store 测试。
+  - 第 343-370 行新增 call 前 ABI input store 保留测试。
+  - 第 381-382 行把两个新测试接入 main。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_ssa_test notdec-native-llvm native_register_summary_test native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+```
+
+Bench2 结果：
+
+```text
+wrk -f 0x8300, summary SSA, no prototype recovery:
+  dead_stores_removed=23
+  line count 296 -> 267
+  TIME 0.50s
+
+wrk -f 0x8300, default后续 pipeline:
+  dead_stores_removed=23
+  line count 268
+  TIME 0.44s
+
+vsftpd --all-confirmed, summary SSA, no prototype recovery:
+  line count 126067 -> 113980
+  TIME 97.38s
+  llvm-as / opt -passes=verify passed
+```
+
+复杂度评估：
+
+- 实现效果：8/10。比前一版多删了一批真正跨 block 的 register residue，而且没有碰 partial / stack / memory。
+- 理解成本：5/10。新增了一个很小的 backward liveness，但规则还算直接。
+- 维护成本：4/10。后面如果要继续扩大，只需要沿着 register liveness 再补更细的 call/memory 约束，不用重做 SSA。

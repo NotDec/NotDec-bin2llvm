@@ -50,6 +50,13 @@ void attachTestAbi(llvm::Module &module) {
   abi.StackPointerRegister = "RSP";
   abi.StackPointerSpace = "register";
 
+  notdec::bin2llvm::NativeAbiParamEntry input;
+  input.MinSize = 1;
+  input.MaxSize = 8;
+  input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  input.Storage.Name = "RDI";
+  abi.Inputs.push_back(input);
+
   notdec::bin2llvm::NativeAbiParamEntry output;
   output.MinSize = 1;
   output.MaxSize = 8;
@@ -302,6 +309,66 @@ bool testOverwrittenStoreIsRemoved() {
          verifyOk(module, "module failed verifier after dead store test");
 }
 
+bool testCrossBlockDeadStoreIsRemoved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-cross-block-dead-store", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "cross_block_store", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *next = llvm::BasicBlock::Create(context, "next", function);
+
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 1),
+                "RAX");
+  builder.CreateBr(next);
+  builder.SetInsertPoint(next);
+  storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 2),
+                "RAX");
+  llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "final_rax");
+  builder.CreateRet(loaded);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.LoadsReplaced == 1,
+                "cross-block final load was not replaced") &&
+         expect(summary.DeadStoresRemoved == 1,
+                "cross-block dead store was not removed") &&
+         verifyOk(module, "module failed verifier after cross-block test");
+}
+
+bool testAbiInputStoreBeforeCallIsKept() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-call-input-store", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "external_callee",
+      module);
+
+  llvm::Function *function = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "call_input_store",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 42),
+                "RDI");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.DeadStoresRemoved == 0,
+                "ABI input store before call was removed") &&
+         verifyOk(module, "module failed verifier after call input test");
+}
+
 } // namespace
 
 int main() {
@@ -311,5 +378,7 @@ int main() {
   ok &= testPreservedCallKeepsPreviousValue();
   ok &= testDemandedReturnCreatesCallValue();
   ok &= testOverwrittenStoreIsRemoved();
+  ok &= testCrossBlockDeadStoreIsRemoved();
+  ok &= testAbiInputStoreBeforeCallIsKept();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

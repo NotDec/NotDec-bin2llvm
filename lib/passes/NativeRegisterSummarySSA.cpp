@@ -50,6 +50,7 @@ struct FunctionSummaryFacts {
 };
 
 struct AbiFacts {
+  std::set<std::string> Inputs;
   std::set<std::string> Outputs;
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
@@ -161,6 +162,12 @@ AbiFacts collectAbiFacts(const llvm::Module &module) {
   if (!abi) {
     return facts;
   }
+  for (const NativeAbiParamEntry &entry : abi->Inputs) {
+    if (entry.Storage.Kind == NativeAbiStorageKind::Register &&
+        !entry.Storage.Name.empty()) {
+      facts.Inputs.insert(entry.Storage.Name);
+    }
+  }
   for (const NativeAbiParamEntry &entry : abi->Outputs) {
     if (entry.Storage.Kind == NativeAbiStorageKind::Register &&
         !entry.Storage.Name.empty()) {
@@ -228,7 +235,7 @@ public:
       finalizePendingPhis();
       if (Options.EnableResidueRemoval) {
         removeDeadReplacedLoads();
-        removeLocalDeadStores();
+        removeDeadStoresByLiveness();
       }
       eraseDeadPhis();
     }
@@ -311,48 +318,143 @@ private:
     }
   }
 
-  void removeLocalDeadStores() {
-    std::vector<llvm::StoreInst *> deadStores;
+  void removeDeadStoresByLiveness() {
+    std::map<llvm::BasicBlock *, std::set<llvm::GlobalVariable *>> liveIn;
+    std::map<llvm::BasicBlock *, std::set<llvm::GlobalVariable *>> liveOut;
+    std::vector<llvm::BasicBlock *> blocks;
     for (llvm::BasicBlock &block : Function) {
-      std::map<llvm::GlobalVariable *, llvm::StoreInst *> lastStore;
-      for (llvm::Instruction &inst : block) {
-        if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
-          RegisterAccess access = registerLoad(*load, Units);
-          if (access.Unit != nullptr) {
-            lastStore.erase(access.Unit->Global);
+      blocks.push_back(&block);
+    }
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (auto blockIt = blocks.rbegin(); blockIt != blocks.rend();
+           ++blockIt) {
+        llvm::BasicBlock &block = **blockIt;
+        std::set<llvm::GlobalVariable *> out;
+        for (llvm::BasicBlock *succ : llvm::successors(&block)) {
+          auto succLive = liveIn.find(succ);
+          if (succLive != liveIn.end()) {
+            out.insert(succLive->second.begin(), succLive->second.end());
           }
-          continue;
         }
-        if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
-          if (!isNotDecRegisterHelperCall(*call)) {
-            lastStore.clear();
-          }
-          continue;
+        if (llvm::succ_empty(&block)) {
+          addExitLiveRegisters(out);
         }
-        auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
-        if (store == nullptr) {
-          continue;
-        }
-        RegisterAccess access = registerStore(*store, Units);
-        if (access.Unit == nullptr || !access.IsStorageValue) {
-          continue;
-        }
-        auto existing = lastStore.find(access.Unit->Global);
-        if (existing != lastStore.end()) {
-          deadStores.push_back(existing->second);
-        }
-        lastStore[access.Unit->Global] = store;
+
+        std::set<llvm::GlobalVariable *> in = transferBlockLiveness(block, out);
+        changed |= liveOut[&block] != out || liveIn[&block] != in;
+        liveOut[&block] = std::move(out);
+        liveIn[&block] = std::move(in);
       }
     }
 
-    std::set<llvm::StoreInst *> uniqueDeadStores(deadStores.begin(),
-                                                 deadStores.end());
-    for (llvm::StoreInst *store : uniqueDeadStores) {
-      if (store->getParent() == nullptr) {
+    for (llvm::BasicBlock &block : Function) {
+      auto outIt = liveOut.find(&block);
+      std::set<llvm::GlobalVariable *> live =
+          outIt == liveOut.end() ? std::set<llvm::GlobalVariable *>{}
+                                 : outIt->second;
+      eraseDeadStoresInBlock(block, live);
+    }
+  }
+
+  std::set<llvm::GlobalVariable *> transferBlockLiveness(
+      llvm::BasicBlock &block, std::set<llvm::GlobalVariable *> live) {
+    for (auto it = block.rbegin(); it != block.rend(); ++it) {
+      llvm::Instruction &inst = *it;
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        transferStoreLiveness(*store, live);
         continue;
       }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        transferLoadLiveness(*load, live);
+        continue;
+      }
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        transferCallLiveness(*call, live);
+        continue;
+      }
+    }
+    return live;
+  }
+
+  void eraseDeadStoresInBlock(llvm::BasicBlock &block,
+                              std::set<llvm::GlobalVariable *> live) {
+    std::vector<llvm::StoreInst *> deadStores;
+    for (auto it = block.rbegin(); it != block.rend(); ++it) {
+      llvm::Instruction &inst = *it;
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit != nullptr && access.IsStorageValue &&
+            live.count(access.Unit->Global) == 0) {
+          deadStores.push_back(store);
+        }
+        transferStoreLiveness(*store, live);
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        transferLoadLiveness(*load, live);
+        continue;
+      }
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        transferCallLiveness(*call, live);
+        continue;
+      }
+    }
+    for (llvm::StoreInst *store : deadStores) {
       store->eraseFromParent();
       ++Summary.DeadStoresRemoved;
+    }
+  }
+
+  void transferStoreLiveness(llvm::StoreInst &store,
+                             std::set<llvm::GlobalVariable *> &live) const {
+    RegisterAccess access = registerStore(store, Units);
+    if (access.Unit != nullptr && access.IsStorageValue) {
+      live.erase(access.Unit->Global);
+    }
+  }
+
+  void transferLoadLiveness(llvm::LoadInst &load,
+                            std::set<llvm::GlobalVariable *> &live) const {
+    RegisterAccess access = registerLoad(load, Units);
+    if (access.Unit != nullptr && access.IsStorageValue) {
+      live.insert(access.Unit->Global);
+    }
+  }
+
+  void transferCallLiveness(llvm::CallBase &call,
+                            std::set<llvm::GlobalVariable *> &live) const {
+    if (isNotDecRegisterHelperCall(call)) {
+      return;
+    }
+    for (const auto &[global, unit] : Units) {
+      CallRegisterEffect effect = callEffect(call, unit);
+      if (effect == CallRegisterEffect::ReturnValue ||
+          effect == CallRegisterEffect::Clobber) {
+        live.erase(global);
+      }
+      if (callReadsRegister(call, unit)) {
+        live.insert(global);
+      }
+    }
+  }
+
+  void addExitLiveRegisters(std::set<llvm::GlobalVariable *> &live) const {
+    auto functionFacts = SummaryFacts.find(&Function);
+    if (functionFacts == SummaryFacts.end()) {
+      return;
+    }
+    for (const auto &[global, unit] : Units) {
+      auto regIt = functionFacts->second.Registers.find(unit.Name);
+      if (regIt == functionFacts->second.Registers.end()) {
+        continue;
+      }
+      const SummaryRegisterFact &fact = regIt->second;
+      if (fact.ExitDemand && fact.MayNonEntry) {
+        live.insert(global);
+      }
     }
   }
 
@@ -597,6 +699,20 @@ private:
       return CallRegisterEffect::Clobber;
     }
     return CallRegisterEffect::Unknown;
+  }
+
+  bool callReadsRegister(const llvm::CallBase &call,
+                         const RegisterUnit &unit) const {
+    llvm::Function *callee = call.getCalledFunction();
+    if (callee != nullptr && !callee->isDeclaration()) {
+      auto fnIt = SummaryFacts.find(callee);
+      if (fnIt == SummaryFacts.end()) {
+        return Abi.Inputs.count(unit.Name) != 0;
+      }
+      auto regIt = fnIt->second.Registers.find(unit.Name);
+      return regIt != fnIt->second.Registers.end() && regIt->second.ReadEntry;
+    }
+    return Abi.Inputs.count(unit.Name) != 0;
   }
 
   llvm::Value *callValue(llvm::CallBase &call, const RegisterUnit &unit,
