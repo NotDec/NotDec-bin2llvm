@@ -811,3 +811,56 @@ git diff --check
 - 实现效果：7/10。bottom-up summary 和 top-down exit demand 已经能跑通核心用例，但还没有接入 pipeline，也没有处理 stack 保存/恢复。
 - 理解成本：6/10。新增了一条独立分析链路，代码集中在一个文件里，暂时没有影响旧链路。
 - 维护成本：6/10。后续主要风险在 demand seed、间接调用和 frame-local 保存/恢复；当前 metadata 输出先作为审计入口。
+
+## 实现记录：summary-based Register SSA 第一版
+
+本次继续实现独立的新 SSA pass，没有改旧 `NativeRegisterSSA`，也没有接入默认 `notdec-native-llvm` pipeline。
+旧 `NativeRegisterSSA` 仍负责当前默认链路里的 Ghidra-style trial/use 和旧 metadata。
+
+改动文件：
+
+- `include/notdec-bin2llvm/passes/NativeRegisterSummarySSA.h`
+  - 第 14-18 行新增 `NativeRegisterSummarySSAOptions`。
+  - 第 20-47 行新增函数级和模块级 summary 计数。
+  - 第 49-53 行新增 `runNativeRegisterSummarySSA()` 和打印接口。
+- `lib/passes/NativeRegisterSummarySSA.cpp`
+  - 第 30-67 行新增 register unit、summary fact、ABI fact、call effect 和 SSA key 数据结构。
+  - 第 69-210 行新增 metadata 读取、register load/store 识别、ABI fallback 读取、summary fact 映射。
+  - 第 212-615 行新增 `FunctionBuilder`，实现只面向完整 backing register 的 SSA 构建。
+  - 第 278-331 行 `rewriteLoads()` / `readValueBefore()` 替换 load，并按 summary 解释 call 后寄存器值。
+  - 第 334-487 行 `readBlockEntry()` / `readBlockExit()` / `ensurePhi()` / `completePhi()` / `finalizePendingPhis()` 实现 Braun 风格 lazy SSA 和 PHI 收尾。
+  - 第 489-563 行按 callee summary / ABI 判断 preserved、demanded return、clobber、unknown call effect。
+  - 第 633-661 行 `runNativeRegisterSummarySSA()` 先运行 `runNativeRegisterSummary()`，再消费 summary 构建 SSA。
+- `lib/CMakeLists.txt`
+  - 第 11 行把 `passes/NativeRegisterSummarySSA.cpp` 加入 `notdec-bin2llvm-core`。
+- `CMakeLists.txt`
+  - 第 216-229 行新增 `native_register_summary_ssa_test` 和 `notdec.native_register_summary.ssa`。
+- `tests/native_register_summary_ssa_test.cpp`
+  - 第 120-154 行覆盖 join block PHI incoming 数量等于 predecessor 数量，并通过 verifier。
+  - 第 156-187 行覆盖 preserved call 后的 load 沿用 call 前 value。
+  - 第 189-221 行覆盖 demanded return 生成 `notdec.register.summary_return.*` helper，并替换 call 后 load。
+
+这一步只做 SSA 的最小可验证链路：
+
+- 只处理完整 backing register load/store。
+- 不处理 partial register 精度。
+- 不删除 register residue。
+- 不接入类型恢复。
+- 不改默认 CLI pipeline。
+- 遇到 unknown call effect 时保守不替换。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_ssa_test native_register_summary_test native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+git diff --check
+```
+
+复杂度评估：
+
+- 实现效果：6/10。已经能消费 summary/demand、构建 PHI、处理 preserved call 和 demanded return，但还没接类型恢复和 residue 删除。
+- 理解成本：5/10。新 pass 独立，代码比旧 `NativeRegisterSSA` 窄很多；代价是短期存在新旧两套 SSA。
+- 维护成本：5/10。后续需要把 type recovery 和 pipeline 消费点接到新 metadata/helper 上，再决定旧 SSA 是否重命名为 `HeritageSSA`。

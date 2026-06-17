@@ -213,6 +213,21 @@ if (BUILD_TESTING)
       native_register_summary_test
   )
 
+  add_executable(native_register_summary_ssa_test
+    tests/native_register_summary_ssa_test.cpp
+  )
+
+  target_link_libraries(native_register_summary_ssa_test
+    PRIVATE
+      notdec-bin2llvm-core
+  )
+
+  add_test(
+    NAME notdec.native_register_summary.ssa
+    COMMAND
+      native_register_summary_ssa_test
+  )
+
   add_executable(native_instcombine_metadata_test
     tests/native_instcombine_metadata_test.cpp
   )
