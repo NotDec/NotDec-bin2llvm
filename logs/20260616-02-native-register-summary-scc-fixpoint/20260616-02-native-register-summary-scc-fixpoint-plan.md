@@ -466,12 +466,28 @@ top-down 的主收益仍然是 `exitDemand`，也就是确认哪些返回寄存�
 #### 8.2 从所有 caller 观察函数效果
 
 internal function 的返回值需求来自所有 caller。
-遍历 caller 时，对每个 direct callsite 临时计算：
+遍历 caller 时，对每个 direct callsite 重新跑一次局部需求分析。
+分析对象是 callee 可能修改的寄存器：
+
+```text
+callee exit mayNonEntry[R] = true
+```
+
+对每个这样的 `R`，检查 call 后从该 callsite 出发，`R` 的新值是否在被覆盖前被读取。
+多个 caller、多个 callsite 的结果用 OR 聚合：
+
+```text
+callee.exitDemand[R] =
+  OR(callsiteDemand(callsite, R) for all direct callsites to callee)
+  OR root/export ABI seed
+```
+
+其中：
 
 ```text
 caller 在 call 后读取 R
 callee summary 显示 R 可能是 non-entry
-  -> callee.exitDemand[R] = true
+  -> callsiteDemand(callsite, R) = true
 ```
 
 如果 callee 的出口是混合状态：
