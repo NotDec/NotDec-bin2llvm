@@ -228,6 +228,21 @@ if (BUILD_TESTING)
       native_register_summary_ssa_test
   )
 
+  add_executable(native_external_call_signature_rewrite_test
+    tests/native_external_call_signature_rewrite_test.cpp
+  )
+
+  target_link_libraries(native_external_call_signature_rewrite_test
+    PRIVATE
+      notdec-bin2llvm-core
+  )
+
+  add_test(
+    NAME notdec.native_external_call_signature_rewrite.external
+    COMMAND
+      native_external_call_signature_rewrite_test
+  )
+
   add_executable(pcode_to_llvm_test
     tests/pcode_to_llvm_test.cpp
   )

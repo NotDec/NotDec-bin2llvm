@@ -5,6 +5,7 @@
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
 #include "notdec-bin2llvm/passes/NativePrototypeRecovery.h"
+#include "notdec-bin2llvm/passes/NativeExternalCallSignatureRewrite.h"
 #include "notdec-bin2llvm/passes/NativeHeritageSSA.h"
 #include "notdec-bin2llvm/passes/NativeRegisterSummarySSA.h"
 
@@ -879,6 +880,17 @@ bool runPrototypeRecoveryPassIfEnabled(llvm::Module &module,
   return true;
 }
 
+bool runExternalCallSignatureRewriteIfEnabled(llvm::Module &module) {
+  notdec::bin2llvm::NativeExternalCallSignatureRewriteOptions passOptions;
+  notdec::bin2llvm::runNativeExternalCallSignatureRewrite(module, passOptions);
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr
+        << "module verification failed after external call signature rewrite\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -902,6 +914,9 @@ int main(int argc, char **argv) {
         return 1;
       }
       if (!runRegisterSSAPassIfEnabled(*module, *options)) {
+        return 1;
+      }
+      if (!runExternalCallSignatureRewriteIfEnabled(*module)) {
         return 1;
       }
       if (!runInstCombinePassIfEnabled(*module, *options)) {
@@ -1020,6 +1035,9 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (!runRegisterSSAPassIfEnabled(*module, *options)) {
+      return 1;
+    }
+    if (!runExternalCallSignatureRewriteIfEnabled(*module)) {
       return 1;
     }
     if (!runInstCombinePassIfEnabled(*module, *options)) {

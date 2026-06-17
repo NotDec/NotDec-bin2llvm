@@ -10,6 +10,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
@@ -51,6 +52,7 @@ struct FunctionSummaryFacts {
 
 struct AbiFacts {
   std::set<std::string> Inputs;
+  std::vector<std::string> InputsInOrder;
   std::set<std::string> Outputs;
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
@@ -66,6 +68,12 @@ enum class CallRegisterEffect {
 using BlockRegKey = std::pair<llvm::BasicBlock *, llvm::GlobalVariable *>;
 using CallValueKey =
     std::tuple<llvm::Instruction *, llvm::GlobalVariable *, std::string>;
+
+struct CallArgStoreBinding {
+  llvm::StoreInst *Store = nullptr;
+  const RegisterUnit *Unit = nullptr;
+  unsigned Index = 0;
+};
 
 std::optional<std::string> mdField(const llvm::MDNode *node,
                                    llvm::StringRef key) {
@@ -173,7 +181,11 @@ AbiFacts collectAbiFacts(const llvm::Module &module) {
   for (const NativeAbiParamEntry &entry : abi->Inputs) {
     if (entry.Storage.Kind == NativeAbiStorageKind::Register &&
         !entry.Storage.Name.empty()) {
+      if (entry.MetaType == "float") {
+        continue;
+      }
       facts.Inputs.insert(entry.Storage.Name);
+      facts.InputsInOrder.push_back(entry.Storage.Name);
     }
   }
   for (const NativeAbiParamEntry &entry : abi->Outputs) {
@@ -241,6 +253,7 @@ public:
     if (Options.EnableRewrite) {
       rewriteLoads();
       finalizePendingPhis();
+      markExternalCallArgumentStores();
       if (Options.EnableResidueRemoval) {
         removeDeadReplacedLoads();
         removeDeadStoresByLiveness();
@@ -723,6 +736,101 @@ private:
     return Abi.Inputs.count(unit.Name) != 0;
   }
 
+  void markExternalCallArgumentStores() {
+    for (llvm::Instruction &inst : llvm::instructions(Function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr || !isDirectExternalCall(*call)) {
+        continue;
+      }
+
+      std::vector<CallArgStoreBinding> bindings = callArgStoreBindings(*call);
+      if (bindings.empty()) {
+        continue;
+      }
+
+      call->setMetadata("notdec.register.summary_ssa.call_args",
+                        callArgsNode(bindings.size()));
+      for (const CallArgStoreBinding &binding : bindings) {
+        binding.Store->setMetadata(
+            "notdec.register.summary_ssa.call_arg_store",
+            callArgStoreNode(*binding.Unit, binding.Index));
+        ++Summary.CallArgStoresMarked;
+      }
+    }
+  }
+
+  bool isDirectExternalCall(const llvm::CallBase &call) const {
+    llvm::Function *callee = call.getCalledFunction();
+    return callee != nullptr && callee->isDeclaration() &&
+           !callee->isIntrinsic() && isAnalyzableCall(call);
+  }
+
+  const RegisterUnit *unitByName(llvm::StringRef name) const {
+    for (const auto &[global, unit] : Units) {
+      if (unit.Name == name) {
+        return &unit;
+      }
+    }
+    return nullptr;
+  }
+
+  std::vector<CallArgStoreBinding>
+  callArgStoreBindings(llvm::CallBase &call) {
+    std::vector<CallArgStoreBinding> bindings;
+    for (const std::string &name : Abi.InputsInOrder) {
+      const RegisterUnit *unit = unitByName(name);
+      if (unit == nullptr) {
+        break;
+      }
+      llvm::StoreInst *store = findStoreBeforeCall(call, *unit);
+      if (store == nullptr) {
+        break;
+      }
+      bindings.push_back(CallArgStoreBinding{
+          store, unit, static_cast<unsigned>(bindings.size())});
+    }
+    return bindings;
+  }
+
+  llvm::StoreInst *findStoreBeforeCall(llvm::CallBase &call,
+                                       const RegisterUnit &unit) const {
+    for (auto it = call.getIterator(); it != call.getParent()->begin();) {
+      --it;
+      llvm::Instruction &inst = *it;
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit != nullptr && access.Unit->Global == unit.Global &&
+            access.IsStorageValue) {
+          return store;
+        }
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        RegisterAccess access = registerLoad(*load, Units);
+        if (access.Unit != nullptr && access.Unit->Global == unit.Global &&
+            access.IsStorageValue) {
+          if (load->getMetadata("notdec.register.summary_ssa.replaced") ==
+              nullptr) {
+            return nullptr;
+          }
+        }
+        continue;
+      }
+      if (auto *otherCall = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        llvm::Function *callee = otherCall->getCalledFunction();
+        if (isAnalyzableCall(*otherCall) &&
+            (callee == nullptr || !callee->isIntrinsic())) {
+          return nullptr;
+        }
+        continue;
+      }
+      if (inst.mayWriteToMemory()) {
+        return nullptr;
+      }
+    }
+    return nullptr;
+  }
+
   llvm::Value *callValue(llvm::CallBase &call, const RegisterUnit &unit,
                          llvm::StringRef kind) {
     CallValueKey key{&call, unit.Global, kind.str()};
@@ -788,6 +896,24 @@ private:
     return llvm::MDNode::get(Function.getContext(), fields);
   }
 
+  llvm::MDNode *callArgsNode(size_t count) const {
+    llvm::Metadata *fields[] = {
+        llvm::MDString::get(Function.getContext(),
+                            "count=" + std::to_string(count)),
+    };
+    return llvm::MDNode::get(Function.getContext(), fields);
+  }
+
+  llvm::MDNode *callArgStoreNode(const RegisterUnit &unit,
+                                 unsigned index) const {
+    llvm::Metadata *fields[] = {
+        llvm::MDString::get(Function.getContext(), "name=" + unit.Name),
+        llvm::MDString::get(Function.getContext(),
+                            "index=" + std::to_string(index)),
+    };
+    return llvm::MDNode::get(Function.getContext(), fields);
+  }
+
   llvm::MDNode *markerNode(llvm::StringRef value) const {
     llvm::Metadata *fields[] = {
         llvm::MDString::get(Function.getContext(), value),
@@ -826,6 +952,7 @@ void addFunctionSummary(NativeRegisterSummarySSASummary &total,
   total.EntryInputs += fn.EntryInputs;
   total.CallReturnValues += fn.CallReturnValues;
   total.CallClobberValues += fn.CallClobberValues;
+  total.CallArgStoresMarked += fn.CallArgStoresMarked;
   total.PreservedCalls += fn.PreservedCalls;
   total.UnknownCallEffects += fn.UnknownCallEffects;
 }
@@ -875,6 +1002,7 @@ void printNativeRegisterSummarySSASummary(
      << " entry_inputs=" << summary.EntryInputs
      << " call_returns=" << summary.CallReturnValues
      << " call_clobbers=" << summary.CallClobberValues
+     << " call_arg_stores_marked=" << summary.CallArgStoresMarked
      << " preserved_calls=" << summary.PreservedCalls
      << " unknown_call_effects=" << summary.UnknownCallEffects << "\n";
   for (const NativeRegisterSummarySSAFunctionSummary &function :
@@ -889,6 +1017,7 @@ void printNativeRegisterSummarySSASummary(
        << " entry_inputs=" << function.EntryInputs
        << " call_returns=" << function.CallReturnValues
        << " call_clobbers=" << function.CallClobberValues
+       << " call_arg_stores_marked=" << function.CallArgStoresMarked
        << " preserved_calls=" << function.PreservedCalls
        << " unknown_call_effects=" << function.UnknownCallEffects << "\n";
   }

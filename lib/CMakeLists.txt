@@ -7,6 +7,7 @@ add_library(notdec-bin2llvm-core STATIC
   Pcode.cpp
   PcodeToLLVM.cpp
   passes/NativePrototypeRecovery.cpp
+  passes/NativeExternalCallSignatureRewrite.cpp
   passes/NativeRegisterSummary.cpp
   passes/NativeRegisterSummarySSA.cpp
   passes/NativeHeritageSSA.cpp

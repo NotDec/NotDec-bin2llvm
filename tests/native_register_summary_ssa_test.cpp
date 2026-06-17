@@ -388,14 +388,23 @@ bool testAbiInputStoreBeforeCallIsKept() {
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
-  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 42),
-                "RDI");
-  builder.CreateCall(calleeType, callee);
+  llvm::StoreInst *argStore =
+      storeRegister(builder, rdi,
+                    llvm::ConstantInt::get(rdi->getValueType(), 42), "RDI");
+  llvm::CallInst *call = builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   return expect(summary.DeadStoresRemoved == 0,
                 "ABI input store before call was removed") &&
+         expect(summary.CallArgStoresMarked == 1,
+                "ABI input store before call was not marked") &&
+         expect(call->getMetadata("notdec.register.summary_ssa.call_args") !=
+                    nullptr,
+                "ABI input call was not marked") &&
+         expect(argStore->getMetadata(
+                    "notdec.register.summary_ssa.call_arg_store") != nullptr,
+                "ABI input store call-arg metadata missing") &&
          verifyOk(module, "module failed verifier after call input test");
 }
 
