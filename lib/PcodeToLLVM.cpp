@@ -14,6 +14,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include <algorithm>
 #include <map>
@@ -106,6 +107,7 @@ public:
       Builder.CreateRetVoid();
     }
 
+    llvm::EliminateUnreachableBlocks(Function);
     return true;
   }
 

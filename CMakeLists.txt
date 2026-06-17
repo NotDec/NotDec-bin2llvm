@@ -228,6 +228,21 @@ if (BUILD_TESTING)
       native_register_summary_ssa_test
   )
 
+  add_executable(pcode_to_llvm_test
+    tests/pcode_to_llvm_test.cpp
+  )
+
+  target_link_libraries(pcode_to_llvm_test
+    PRIVATE
+      notdec-bin2llvm-core
+  )
+
+  add_test(
+    NAME notdec.pcode_to_llvm.cfg
+    COMMAND
+      pcode_to_llvm_test
+  )
+
   add_executable(native_instcombine_metadata_test
     tests/native_instcombine_metadata_test.cpp
   )

@@ -1501,3 +1501,99 @@ summary-residue:    10s, 2241 lines
 - 实现效果：9/10。修掉了一个明确语义错误，intrinsic 不再伪造 ABI 返回寄存器。
 - 理解成本：2/10。和 bottom-up summary 的 call 判定保持一致。
 - 维护成本：2/10。后续如果还有其它“非二进制 call”，可以集中扩展 `isAnalyzableCall()`。
+
+## 后续修复：Pcode lowering 后清理不可达基本块
+
+问题：
+
+`/tmp/wrk-default-summary-fixed.ll` 里有很多 `; No predecessors!` 的空基本块，例如
+`bb_5456`、`bb_5460`、`bb_5466`。这些块不是 SummarySSA 新引入的控制流，而是
+Pcode lowering 阶段把函数范围内的所有 block 都建出来后，留下的不可达块。SummarySSA
+删除寄存器 load/store 后，IR 更短，这些块更显眼。
+
+处理：
+
+这类块应该在 lifting 输出阶段清理，而不是放到寄存器 SSA pass 里。处理位置改到
+`PcodeLowerer::lower()` 末尾：所有 pcode block 和外部跳转目标都 lower 完成后，调用
+LLVM 的 unreachable block 清理。这样即使禁用寄存器 SSA，lift 出来的 IR 也不会带这些
+无前驱块。
+
+改动文件：
+
+- `lib/PcodeToLLVM.cpp:17` 引入 `llvm/Transforms/Utils/BasicBlockUtils.h`。
+- `lib/PcodeToLLVM.cpp:105-110` 在 `PcodeLowerer::lower()` 末尾处理完
+  `ExternalTargetBlocks` 后调用 `llvm::EliminateUnreachableBlocks(Function)`。
+- `tests/pcode_to_llvm_test.cpp:41-75` 增加
+  `testUnreachablePcodeBlocksAreRemoved()`：构造两个 pcode return block，其中第二个无前驱，
+  要求 lower 后 `bb_2000` 不存在。
+- `CMakeLists.txt:231-244` 增加 `pcode_to_llvm_test` 和 `notdec.pcode_to_llvm.cfg`。
+
+验证命令：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test \
+  native_register_summary_ssa_test notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+```
+
+通过。
+
+`wrk -f 0x8300` 默认 SummarySSA 重新验证：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk -f 0x8300 \
+  -o /tmp/wrk-default-summary-lower-clean.ll --register-ssa-summary \
+  --no-prototype-recovery-pass
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/wrk-default-summary-lower-clean.ll \
+  -o /tmp/wrk-default-summary-lower-clean.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/wrk-default-summary-lower-clean.bc -o /tmp/wrk-default-summary-lower-clean.verified.bc
+```
+
+结果：
+
+```text
+255 lines -> 219 lines
+No predecessors 块全部消失
+loads_replaced=11
+dead_loads_removed=11
+dead_stores_removed=24
+call_returns=0
+```
+
+同时验证禁用寄存器 SSA 后的 lowerer 输出：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk -f 0x8300 \
+  -o /tmp/wrk-no-regssa-lower-clean.ll --no-register-ssa-pass \
+  --no-prototype-recovery-pass
+```
+
+结果：237 lines，`No predecessors` 没有命中，并通过 LLVM 22 assemble/verify。这说明清理
+已经在 lifting 输出层完成，不依赖 SummarySSA。
+
+Bench2 小样本：
+
+```text
+scripts/bench2-native-summary-ssa-audit.sh --target wrk:executable \
+  --decode-seed-limit 50 \
+  --out-dir /tmp/notdec-lower-unreachable-clean-wrk50
+```
+
+结果：
+
+```text
+summary-no-residue: 11s, 3210 lines
+summary-residue:    11s, 2238 lines
+```
+
+复杂度评估：
+
+- 实现效果：8/10。IR 更适合人工检查，也减少无用块。
+- 理解成本：1/10。直接使用 LLVM 现成 CFG 清理。
+- 维护成本：1/10。该清理和 SummarySSA 主逻辑解耦。
