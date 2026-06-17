@@ -30,7 +30,13 @@
 >
 > exitDemand是主要的，分析返回值真正被use的有多少。这个肯定非常有意义，top-down主要计算这个，同时可以顺带根据所有信息综合确定每个函数的参数和返回值情况
 
+用户再次补充：
+
+> 参数那一块还是简化一点吧，先不搞8.3函数上下界吧，然后后面也不用有那个“weak 输入参数候选”。然后第10点那里，标记出来之后就考虑做register SSA，让那边基于当前这个结果去做类型恢复。现在的RegisterSSA可能和之前模仿Ghidra链路模仿得比较深，如果改起来比较复杂，可以考虑把当前的RegisterSSA重命名为HeritageSSA，然后写一个新的SSA（必须要参考logs/20260529-01-native-prototype-recovery-pass/08-register-elimination/20260610-02-braun-ssa-reference.md，使用Simple and Efficient Construction of Static Single Assignment Form）
+
 ## 背景
+
+实现前要复习：docs/analysis/abstract-interpretation-register-summary.md
 
 这是 native prototype recovery / register elimination 的新版独立链路。
 它不沿用之前模仿 Ghidra 的 trial/use 做法，也不以 caller 侧有没有“参数准备指令”作为核心判断。
@@ -428,9 +434,7 @@ top-down demand analysis 解决另一个问题：对每个函数，从它所有 
 ```text
 DemandSummary = {
   exitDemand[R]: 函数返回时 R 是否被 caller / 顶层 ABI 观察,
-  entryDemand[R]: 函数入口 R 是否影响被观察结果，第一版只作为辅助信息,
-  paramLower: ABI register 参数数量下界,
-  paramUpper: ABI register 参数数量上界
+  entryDemand[R]: 函数入口 R 是否影响被观察结果，第一版只作为辅助信息
 }
 ```
 
@@ -449,19 +453,8 @@ ABI return registers -> exitDemand
 第一版可以先只放常规返回寄存器，例如 x86-64 SysV 下的 `RAX`。
 callee-saved register 不是返回值 demand，它是 ABI preservation obligation，仍由 bottom-up preserved 判断处理。
 
-顶层参数按 ABI 初始化参数边界：
-
-```text
-paramLower = max index of ABI input register with readEntry
-paramUpper = ABI register argument count
-```
-
-这里的 `paramUpper` 很弱。
-如果只从“外部可以传入任意 ABI 参数寄存器，但函数可以不用”这个黑盒角度看，顶层函数的上界几乎就是所有 ABI 参数寄存器。
-所以上界本身意义不大，不能单独作为强参数证据。
-
 top-down 的主收益仍然是 `exitDemand`，也就是确认哪些返回寄存器真的被使用。
-参数部分只顺带维护上下界和 weak/strong 证据。
+参数第一版不做 top-down 精化，只使用 bottom-up `readEntry` 作为输入参数证据。
 
 #### 8.2 从所有 caller 观察函数效果
 
@@ -505,61 +498,7 @@ caller call 前 R 继续 demand
 
 如果某个 changed register 从来没有被 caller 读取，也不是顶层 ABI return register，它就只是 dead changed register，不应作为强返回值证据。
 
-#### 8.3 参数上下界
-
-参数判断比返回值弱，因为“没被读到”不等于“外部没有传”。
-第一版不要把 top-down 参数分析写成绝对精确，只维护上下界：
-
-```text
-paramLower:
-  bottom-up readEntry 命中的最高 ABI 参数寄存器位置
-
-paramUpper:
-  从 caller 已知参数数量和 callsite 数据流能排除的最高位置
-```
-
-例子：
-
-```text
-wrapper_entry:
-  call callee
-```
-
-如果 wrapper 入口立刻 call callee，所有 ABI 参数寄存器看起来都可能直接传给 callee。
-这时只看 callsite 很难知道 callee 到底有几个参数。
-但是如果 top-down 已经确认 wrapper 只有 2 个 ABI register 参数，那么从 wrapper entry 直接透传给 callee 的第 3、4、5、6 个 ABI 参数位置就不能作为强参数。
-
-所以参数传播规则是：
-
-```text
-callee.readEntry[R_i] = true
-callsite 的 R_i 来源是 caller entry R_i
-caller.paramUpper < i
-  -> callee 的第 i 个参数不能作为 strong 参数
-
-callee.readEntry[R_i] = true
-callsite 的 R_i 来源是 caller entry R_i
-caller.paramLower >= i
-  -> callee 的第 i 个参数有 caller 参数支持
-
-callee.readEntry[R_i] = true
-callsite 的 R_i 是 caller 本地计算出来的值
-  -> callee 的第 i 个参数有 callsite 准备证据
-```
-
-这个规则只给约束，不强行精确恢复。
-最终可以得到：
-
-```text
-paramLower <= 参数数量 <= paramUpper
-```
-
-顶层函数的 `paramUpper` 通常过大，所以主要靠 `readEntry` 给下界。
-internal function 的 `paramUpper` 才可能被所有 caller 收紧。
-只有明确来源的 callsite 才生成上界约束。
-如果多个 caller 给出的约束冲突，例如 `paramLower > paramUpper`，说明至少有一个观察不可靠，consumer 应回退到 weak 参数结论，不用这个区间改 prototype。
-
-#### 8.4 函数内 backward demand
+#### 8.3 函数内 backward demand
 
 top-down 进入某个函数后，用 `exitDemand` 在函数 CFG 上做 backward analysis。
 这个阶段仍然只追 register，不引入 stack/memory alias。
@@ -587,9 +526,9 @@ entryDemand[R]
 ```
 
 它表示入口 register `R` 的值可能影响被观察结果。
-但它不是 top-down 第一版的主要产物；参数恢复仍然优先用 `readEntry + paramLower/paramUpper + caller 约束` 综合判断。
+但它不是 top-down 第一版的主要产物；参数恢复仍然优先用 bottom-up `readEntry` 判断。
 
-#### 8.5 Call 指令的 demand 传播
+#### 8.4 Call 指令的 demand 传播
 
 call 是 top-down 的核心。
 设 caller 在 call 后 demand `R`：
@@ -602,17 +541,11 @@ callee exit mayNonEntry=true
   -> callee.exitDemand[R] = true
 ```
 
-参数方向则用 callee 的 `readEntry` 和当前 callsite 的来源关系生成约束：
+参数方向第一版不在 top-down 中精化。
+callee 的输入参数仍由 bottom-up `readEntry` 给出。
+如果后续 `entryDemand` 稳定，可以作为审计信息输出，但不用于直接改 prototype。
 
-```text
-callee.readEntry[R_i] = true
-  -> 分析 caller call 前 R_i 来源
-  -> 更新 callee.paramLower / callee.paramUpper
-```
-
-如果后续 `entryDemand` 稳定，也可以作为参数置信度加分项，但第一版不把它作为唯一判据。
-
-#### 8.6 Top-down SCC fixpoint
+#### 8.5 Top-down SCC fixpoint
 
 demand 沿 call graph 从 caller 传向 callee。
 递归和互递归仍然需要 SCC fixpoint：
@@ -635,14 +568,12 @@ for each SCC:
 ```text
 exitDemand[R]: false -> true
 entryDemand[R]: false -> true
-paramLower: 0 -> ABI register argument count
-paramUpper: ABI register argument count -> 0
 ```
 
 CFG backward 合流使用 OR。
-`exitDemand/entryDemand` 只增不减，`paramLower` 单调增，`paramUpper` 单调减，最终会收敛。
+`exitDemand/entryDemand` 只增不减，最终会收敛。
 
-#### 8.7 消费规则
+#### 8.6 消费规则
 
 最终 prototype / residue 删除不只看 bottom-up changed，还看 top-down demand。
 返回值优先级最高：
@@ -664,23 +595,12 @@ DemandSummary.exitDemand[R] = false
 则 `R` 只是函数可能写过的 dead changed register。
 它可以用于 clobber/residue 判断，但不应直接当返回值。
 
-参数用区间和证据综合判断：
+参数第一版只看 bottom-up `readEntry`：
 
 ```text
-index(R) <= paramLower
 EffectSummary.readEntry[R] = true
-  -> 强输入参数候选
-
-paramLower < index(R) <= paramUpper
-EffectSummary.readEntry[R] = true
-  -> weak 输入参数候选
-
-index(R) > paramUpper
-  -> 不作为参数
+  -> 参数候选
 ```
-
-这里的 `paramUpper` 如果来自顶层 ABI 默认值，意义较弱。
-只有被 caller 约束收紧后，才适合用来排除参数。
 
 ### 9. Prototype recovery 消费
 
@@ -691,23 +611,11 @@ index(R) > paramUpper
 ```text
 callee summary: readEntry[RDI] = true
 callsite: 当前 RDI 抽象状态
-  -> RDI 是这个 callsite 的 weak 参数来源
+  -> RDI 是参数候选
 ```
 
-top-down 后再看参数上下界：
-
-```text
-index(RDI) <= DemandSummary.paramLower
-  -> strong 参数候选
-
-DemandSummary.paramLower < index(RDI) <= DemandSummary.paramUpper
-  -> weak 参数候选
-
-index(RDI) > DemandSummary.paramUpper
-  -> 不作为参数
-```
-
-`entryDemand` 只作为辅助置信度，不单独决定参数数量。
+第一版不再维护参数上下界，也不区分参数强弱。
+`entryDemand` 只作为审计信息，不直接决定参数数量。
 
 函数返回也分两层。
 bottom-up 只产出 weak return candidate：
@@ -727,17 +635,64 @@ DemandSummary.exitDemand[RAX] = true
 
 如果 callee 没读某个 ABI input register，则 caller 对该 register 的写入不应该被当成参数证据。
 
-### 10. Register residue 删除
+### 10. Register SSA 与类型恢复
 
-summary 可用于更系统地删除 residue：
+summary / demand 标记完成后，下一步不直接大规模删除 register residue。
+更稳的路线是先构建 register SSA，让类型恢复消费 SSA def-use：
 
-- caller call 前写了 `RDI`，但 callee summary 不读 `RDI`：这类 store 可以进入删除候选。
-- caller call 后读 `RAX`，且 callee summary 显示 `RAX` 是 ABI output 上的 changed exit value：接到 call result。
-- caller call 后继续读 `RBX`，且 callee summary preserved `RBX`：继续使用 call 前 state。
-- caller call 后读 caller-saved register，callee summary modified：不能沿用 call 前 state。
+```text
+register summary / demand
+  -> 标记函数 input / demanded return / preserved / clobbered
+  -> register SSA
+  -> 基于 SSA def-use 做类型恢复
+  -> 后续再考虑删除 residue
+```
 
-第一版先只做 summary 和 metadata / audit。
-真正删除 residue 可以单独接在验证稳定之后。
+现有 `RegisterSSA` 如果和之前模仿 Ghidra heritage 的链路耦合太深，不要继续在里面硬塞新逻辑。
+可以把当前实现重命名为 `HeritageSSA`，保留给旧链路使用。
+然后新写一个独立 `RegisterSSA`，只面向当前 summary/demand 链路。
+
+新的 register SSA 必须参考：
+
+- [20260610-02-braun-ssa-reference.md](/sn640/NotDec/external/NotDec-bin2llvm/logs/20260529-01-native-prototype-recovery-pass/08-register-elimination/20260610-02-braun-ssa-reference.md)
+- Braun et al., `Simple and Efficient Construction of Static Single Assignment Form`
+
+第一版设计：
+
+```text
+variable:
+  backing register unit
+
+readVariable(register, block):
+  查询当前 block 的本地定义
+  没有则递归 predecessor
+  join block 需要 PHI
+
+writeVariable(register, block, value):
+  记录当前 block 的 register SSA definition
+
+call transfer:
+  按 EffectSummary / DemandSummary 解释 preserved、demanded return、clobber
+```
+
+实现上要保留 Braun 算法的关键机制：
+
+- `incompletePhis[block][register]`：递归遇到未完成 join 时先放临时 PHI。
+- `sealed block` / finalize：当前 LLVM CFG 已经完整，可以把 pass 结束当 sealed point，但必须统一补齐 PHI operands。
+- `addPhiOperands`：对每个 predecessor 读取对应 register value。
+- `tryRemoveTrivialPhi`：删除只合并同一个值的 PHI，并更新缓存。
+
+这几个机制是硬要求。
+不能留下 operandless PHI，也不能只靠 `replaceAllUsesWith` 删除 PHI 而不更新 SSA 缓存。
+
+类型恢复消费 SSA 时：
+
+- `readEntry=true` 的 ABI input register 对应函数参数 SSA value。
+- `exitDemand=true` 且 `mayNonEntry=true` 的 ABI return register 对应函数返回值 SSA value。
+- preserved register 在 call 前后的 SSA value 应保持同一条 def-use 链。
+- clobbered register 不应沿用 call 前 SSA value。
+
+真正删除 residue 放在 SSA 和类型恢复验证稳定之后。
 
 ## 不做什么
 
@@ -749,6 +704,7 @@ summary 可用于更系统地删除 residue：
 - partial register 精细合并。
 - 条件执行路径标记。
 - Ghidra trial/use 兼容层。
+- 在 register SSA 和类型恢复稳定前直接删除 residue。
 
 保存/恢复 callee-saved register 如果依赖 stack slot，第一版可以先不证明。
 后续如果要补，只做 frame-local slot，不做全局内存 alias。
@@ -763,18 +719,19 @@ summary 可用于更系统地删除 residue：
 - SCC fixpoint 如果 lattice 设计太细，容易震荡或实现复杂。
 - `mayEntry=true, mayNonEntry=true` 的混合状态如果消费侧处理不严，可能误当 precise value。
 - top-down demand 如果 root/export 的 ABI seed 不准，会把真实返回值误判为未使用。
-- 顶层 `paramUpper` 默认等于 ABI 参数寄存器数量，基本不能用来排除参数。
-- internal function 的 `paramUpper` 只有在 callsite 来源明确且没有冲突时才可信。
 - 只看 caller 读取寄存器时，未建模的内存/异常/间接调用可能隐藏真实观察点。
+- 现有 `RegisterSSA` 如果和 heritage 旧链路耦合太深，直接改可能影响旧路径。
+- 新 register SSA 如果没有完整处理 incomplete PHI / finalize，容易重新出现 PHI incoming 不完整的 verifier 错误。
 
 风险处理：
 
 - 第一版宁可保守，不从混合状态生成 signature rewrite。
-- top-down 结果只用于增强返回值/参数置信度，不删除 bottom-up effect summary。
-- root/export 使用 ABI return register 作为 demand seed；不确定入口先保守保留 weak candidate。
-- 参数上界只作为排除证据使用；遇到上下界冲突，回退到 weak 参数结论。
+- top-down 结果主要用于增强返回值置信度，不删除 bottom-up effect summary。
+- root/export 使用 ABI return register 作为 demand seed；不确定入口先保守保留 weak return candidate。
+- 旧 `RegisterSSA` 难改时先重命名为 `HeritageSSA`，新链路使用独立 `RegisterSSA`。
+- 新 SSA 必须按 Braun 风格实现 incomplete PHI / finalize / trivial PHI 删除。
 - summary 先写 metadata / 日志，不直接大规模删 IR。
-- 删除 register residue 必须作为后续阶段，等 summary 稳定后再做。
+- 删除 register residue 必须作为后续阶段，等 SSA 和类型恢复稳定后再做。
 
 ## 判断标准
 
@@ -789,14 +746,16 @@ summary 可用于更系统地删除 residue：
 - `mayEntry=true, mayNonEntry=true` 不参与 prototype rewrite。
 - 修改 `RAX/RDX` 但 caller 只读取 `RAX` 的函数：top-down 标记 `RAX` 为 demanded output，`RDX` 不作为强返回值。
 - caller call 后读取 preserved register：demand 继续传到 call 前，不误传成 callee return。
-- wrapper 入口直接 call callee，且 wrapper 参数上界已知为 2：callee 的第 3 个透传 ABI 参数不能作为 strong 参数。
-- 顶层函数没有 caller 时，参数上界保持 ABI 默认值，不用它排除参数。
 - 递归 SCC 内 demand 能收敛。
+- register SSA 里保留下来的每个 PHI incoming 数量等于 predecessor 数量。
+- trivial PHI 能被删除或替换，缓存不保留已删除 PHI。
+- preserved register 在 call 前后保持同一条 SSA def-use 链。
+- clobbered register 不沿用 call 前 SSA value。
 
 Bench2 判断标准：
 
 - summary pass 能跑完当前 Bench2 native IR。
 - 输出每个函数的 register read / preserved / modified / return 统计。
-- 输出 demanded output / weak output 统计，检查多返回寄存器候选是否减少。
+- 输出 demanded output / weak return 统计，检查多返回寄存器候选是否减少。
 - 不引入 `llvm-as` / `opt verify` 回归。
-- 在不开启 residue 删除时，IR 行为不变。
+- 在不开启 residue 删除时，IR 行为不变；开启 register SSA 后也必须通过 verifier。
