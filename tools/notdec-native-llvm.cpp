@@ -904,6 +904,9 @@ int main(int argc, char **argv) {
       if (!runRegisterSSAPassIfEnabled(*module, *options)) {
         return 1;
       }
+      if (!runInstCombinePassIfEnabled(*module, *options)) {
+        return 1;
+      }
       if (!runPrototypeRecoveryPassIfEnabled(*module, *options)) {
         return 1;
       }
@@ -1017,6 +1020,9 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (!runRegisterSSAPassIfEnabled(*module, *options)) {
+      return 1;
+    }
+    if (!runInstCombinePassIfEnabled(*module, *options)) {
       return 1;
     }
     if (!runPrototypeRecoveryPassIfEnabled(*module, *options)) {

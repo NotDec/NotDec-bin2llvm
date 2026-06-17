@@ -1705,3 +1705,81 @@ summary-residue:    待重新跑更大样本
   external tail branch 的最终 IR 表达还没完成。
 - 理解成本：3/10。需要知道 PLT entry 是 external target，不是普通函数内 flow。
 - 维护成本：2/10。只改 discovery 的 target 归属，不改 lowerer 语义。
+
+## 后续修复：Register SSA 后再跑一次 InstCombine
+
+问题：
+
+SummarySSA 删除寄存器 load/store 后，会留下很多只为寄存器副作用服务的死计算。例如
+`stats_free` 里删除 `RDI` store 后，围绕 flags、`ctpop`、overflow 的计算已经没有用户，
+但 pipeline 原来只在 RegisterSSA 前跑一次 InstCombine，后面不会再清理这些新死代码。
+
+处理：
+
+默认 pipeline 改成：
+
+```text
+InstCombine -> RegisterSSA -> InstCombine -> PrototypeRecovery
+```
+
+这样 RegisterSSA 删除寄存器访问后，后置 InstCombine 负责清掉新出现的死计算和可简化 CFG。
+
+改动文件：
+
+- `tools/notdec-native-llvm.cpp:901-910`：IR 输入路径在 `runRegisterSSAPassIfEnabled()` 后再调用一次
+  `runInstCombinePassIfEnabled()`。
+- `tools/notdec-native-llvm.cpp:1019-1026`：ELF native lowering 路径同样在 RegisterSSA 后再调用一次
+  `runInstCombinePassIfEnabled()`。
+
+验证命令：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+```
+
+全部通过。
+
+`wrk -f 0x8300` 默认 SummarySSA：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk -f 0x8300 \
+  -o /tmp/wrk-post-ssa-instcombine.ll --register-ssa-summary \
+  --no-prototype-recovery-pass
+```
+
+结果：
+
+```text
+204 lines -> 142 lines
+dead_loads_removed=11
+dead_stores_removed=25
+summary_return=0
+剩余寄存器访问只剩 RDI.entry
+```
+
+Bench2 `wrk` seed50：
+
+```text
+scripts/bench2-native-summary-ssa-audit.sh --target wrk:executable \
+  --decode-seed-limit 50 \
+  --out-dir /tmp/notdec-post-ssa-instcombine-wrk50
+```
+
+结果：
+
+```text
+summary-no-residue: 11s, 2784 lines
+summary-residue:    11s, 1478 lines
+```
+
+对比前一轮 `summary-residue` 约 2242 lines，后置 InstCombine 明显减少了 register SSA 后的死代码。
+
+复杂度评估：
+
+- 实现效果：8/10。明显减少 SummarySSA 后死代码，不改 SummarySSA 核心算法。
+- 理解成本：2/10。pipeline 多跑一次已有清理 pass。
+- 维护成本：2/10。复用现有 `runInstCombinePassIfEnabled()`，受同一个 `--no-instcombine-pass` 控制。
