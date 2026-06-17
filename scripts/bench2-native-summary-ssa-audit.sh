@@ -13,7 +13,7 @@ DECODE_SEED_LIMIT=""
 usage() {
   cat <<'EOF'
 usage: bench2-native-summary-ssa-audit.sh --target PROJECT:ROLE [--target PROJECT:ROLE ...]
-                                         [--mode old|summary-no-residue|summary-residue ...]
+                                         [--mode heritage|old|summary-no-residue|summary-residue ...]
                                          [--decode-seed-limit COUNT]
                                          [--build-dir DIR] [--bench2-root DIR]
                                          [--manifest FILE] [--out-dir DIR]
@@ -120,17 +120,16 @@ manifest_row() {
 mode_args() {
   local mode="$1"
   case "$mode" in
-  old)
+  heritage | old)
+    printf '%s\n' "--heritage-register-ssa-pass"
     printf '%s\n' "--no-prototype-recovery-pass"
     ;;
   summary-no-residue)
-    printf '%s\n' "--summary-register-ssa-pass"
     printf '%s\n' "--no-summary-register-residue-removal"
     printf '%s\n' "--register-ssa-summary"
     printf '%s\n' "--no-prototype-recovery-pass"
     ;;
   summary-residue)
-    printf '%s\n' "--summary-register-ssa-pass"
     printf '%s\n' "--register-ssa-summary"
     printf '%s\n' "--no-prototype-recovery-pass"
     ;;

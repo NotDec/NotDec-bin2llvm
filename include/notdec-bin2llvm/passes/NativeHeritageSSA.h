@@ -11,12 +11,12 @@ class raw_ostream;
 
 namespace notdec::bin2llvm {
 
-struct NativeRegisterSSAOptions {
+struct NativeHeritageSSAOptions {
   bool EnableRewrite = true;
   bool PrintSummary = false;
 };
 
-struct NativeRegisterSSAFunctionSummary {
+struct NativeHeritageSSAFunctionSummary {
   std::string FunctionName;
   uint64_t LoadsSeen = 0;
   uint64_t StoresSeen = 0;
@@ -61,7 +61,7 @@ struct NativeRegisterSSAFunctionSummary {
   uint64_t ReturnForwardCallInputTrials = 0;
 };
 
-struct NativeRegisterSSASummary {
+struct NativeHeritageSSASummary {
   uint64_t FunctionsSeen = 0;
   uint64_t LoadsSeen = 0;
   uint64_t StoresSeen = 0;
@@ -104,17 +104,16 @@ struct NativeRegisterSSASummary {
   uint64_t EntryInputCallInputTrials = 0;
   uint64_t CallEffectCallInputTrials = 0;
   uint64_t ReturnForwardCallInputTrials = 0;
-  std::vector<NativeRegisterSSAFunctionSummary> Functions;
+  std::vector<NativeHeritageSSAFunctionSummary> Functions;
 };
 
-// This pass promotes RegisterStorage-backed globals into SSA values. Integer
-// partial accesses are rewritten through the full backing value, while flags
-// and vector lanes stay conservative.
-NativeRegisterSSASummary
-runNativeRegisterSSA(llvm::Module &module,
-                     const NativeRegisterSSAOptions &options = {});
+// Heritage SSA is the old Ghidra-style register elimination path.  It is kept
+// as an explicit fallback while the summary-based SSA pass is the default path.
+NativeHeritageSSASummary
+runNativeHeritageSSA(llvm::Module &module,
+                     const NativeHeritageSSAOptions &options = {});
 
-void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
+void printNativeHeritageSSASummary(const NativeHeritageSSASummary &summary,
                                    llvm::raw_ostream &os);
 
 } // namespace notdec::bin2llvm

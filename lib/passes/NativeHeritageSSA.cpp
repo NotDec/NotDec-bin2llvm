@@ -1,4 +1,4 @@
-#include "notdec-bin2llvm/passes/NativeRegisterSSA.h"
+#include "notdec-bin2llvm/passes/NativeHeritageSSA.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/STLExtras.h"
@@ -557,7 +557,7 @@ public:
                    std::map<llvm::GlobalVariable *, RegisterUnit> &units,
                    const AbiRegisterEffects &abiEffects,
                    bool enableRewrite,
-                   NativeRegisterSSAFunctionSummary &summary)
+                   NativeHeritageSSAFunctionSummary &summary)
       : Function(function), Units(units), AbiEffects(abiEffects), EnableRewrite(enableRewrite),
         Summary(summary) {}
 
@@ -2670,7 +2670,7 @@ private:
   std::map<llvm::GlobalVariable *, RegisterUnit> &Units;
   const AbiRegisterEffects &AbiEffects;
   bool EnableRewrite = true;
-  NativeRegisterSSAFunctionSummary &Summary;
+  NativeHeritageSSAFunctionSummary &Summary;
   std::vector<llvm::LoadInst *> Loads;
   std::vector<llvm::Instruction *> PendingErase;
   std::vector<llvm::PHINode *> DeadPhis;
@@ -2689,8 +2689,8 @@ private:
   std::set<llvm::GlobalVariable *> ExternalInputs;
 };
 
-void addFunctionSummary(NativeRegisterSSASummary &total,
-                        const NativeRegisterSSAFunctionSummary &function) {
+void addFunctionSummary(NativeHeritageSSASummary &total,
+                        const NativeHeritageSSAFunctionSummary &function) {
   total.FunctionsSeen += 1;
   total.LoadsSeen += function.LoadsSeen;
   total.StoresSeen += function.StoresSeen;
@@ -2787,10 +2787,10 @@ std::vector<llvm::Function *> directCalleeFirstOrder(llvm::Module &module) {
 
 } // namespace
 
-NativeRegisterSSASummary
-runNativeRegisterSSA(llvm::Module &module,
-                     const NativeRegisterSSAOptions &options) {
-  NativeRegisterSSASummary summary;
+NativeHeritageSSASummary
+runNativeHeritageSSA(llvm::Module &module,
+                     const NativeHeritageSSAOptions &options) {
+  NativeHeritageSSASummary summary;
   std::map<llvm::GlobalVariable *, RegisterUnit> units =
       collectRegisterUnits(module);
   if (units.empty()) {
@@ -2805,7 +2805,7 @@ runNativeRegisterSSA(llvm::Module &module,
   }
 
   for (llvm::Function *function : directCalleeFirstOrder(module)) {
-    NativeRegisterSSAFunctionSummary functionSummary;
+    NativeHeritageSSAFunctionSummary functionSummary;
     FunctionPromoter promoter(*function, units, abiEffects,
                               options.EnableRewrite, functionSummary);
     promoter.run();
@@ -2813,14 +2813,14 @@ runNativeRegisterSSA(llvm::Module &module,
   }
 
   if (options.PrintSummary) {
-    printNativeRegisterSSASummary(summary, llvm::errs());
+    printNativeHeritageSSASummary(summary, llvm::errs());
   }
   return summary;
 }
 
-void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
+void printNativeHeritageSSASummary(const NativeHeritageSSASummary &summary,
                                    llvm::raw_ostream &os) {
-  os << "native register ssa summary\n";
+  os << "native heritage ssa summary\n";
   os << "  functions: " << summary.FunctionsSeen << '\n';
   os << "  loads: " << summary.LoadsSeen << '\n';
   os << "  stores: " << summary.StoresSeen << '\n';
@@ -2888,7 +2888,7 @@ void printNativeRegisterSSASummary(const NativeRegisterSSASummary &summary,
      << summary.CallEffectCallInputTrials << '\n';
   os << "  call input trial reasons return forward: "
      << summary.ReturnForwardCallInputTrials << '\n';
-  for (const NativeRegisterSSAFunctionSummary &function : summary.Functions) {
+  for (const NativeHeritageSSAFunctionSummary &function : summary.Functions) {
     os << "  function " << function.FunctionName << ": loads="
        << function.LoadsSeen << " stores=" << function.StoresSeen
        << " replaced=" << function.LoadsReplaced

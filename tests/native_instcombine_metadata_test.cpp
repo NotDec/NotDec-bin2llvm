@@ -1,6 +1,6 @@
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/passes/NativePrototypeRecovery.h"
-#include "notdec-bin2llvm/passes/NativeRegisterSSA.h"
+#include "notdec-bin2llvm/passes/NativeHeritageSSA.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -433,10 +433,10 @@ bool expect(bool condition, const std::string &message) {
 int main() {
   llvm::LLVMContext baselineContext;
   std::unique_ptr<llvm::Module> baselineModule = createModule(baselineContext);
-  notdec::bin2llvm::NativeRegisterSSAOptions options;
+  notdec::bin2llvm::NativeHeritageSSAOptions options;
   options.EnableRewrite = true;
-  notdec::bin2llvm::NativeRegisterSSASummary baseline =
-      notdec::bin2llvm::runNativeRegisterSSA(*baselineModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary baseline =
+      notdec::bin2llvm::runNativeHeritageSSA(*baselineModule, options);
   if (llvm::verifyModule(*baselineModule, &llvm::errs())) {
     std::cerr << "baseline module verification failed\n";
     return EXIT_FAILURE;
@@ -457,8 +457,8 @@ int main() {
   ok &= expect(hasRegisterAccessStore(*combinedFunction),
                "instcombine dropped register store metadata");
 
-  notdec::bin2llvm::NativeRegisterSSASummary combined =
-      notdec::bin2llvm::runNativeRegisterSSA(*combinedModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary combined =
+      notdec::bin2llvm::runNativeHeritageSSA(*combinedModule, options);
   if (llvm::verifyModule(*combinedModule, &llvm::errs())) {
     std::cerr << "combined module verification failed\n";
     return EXIT_FAILURE;
@@ -476,8 +476,8 @@ int main() {
   llvm::LLVMContext callBaselineContext;
   std::unique_ptr<llvm::Module> callBaselineModule =
       createCallBarrierModule(callBaselineContext);
-  notdec::bin2llvm::NativeRegisterSSASummary callBaseline =
-      notdec::bin2llvm::runNativeRegisterSSA(*callBaselineModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary callBaseline =
+      notdec::bin2llvm::runNativeHeritageSSA(*callBaselineModule, options);
   if (llvm::verifyModule(*callBaselineModule, &llvm::errs())) {
     std::cerr << "call baseline module verification failed\n";
     return EXIT_FAILURE;
@@ -493,8 +493,8 @@ int main() {
     return EXIT_FAILURE;
   }
   runInstCombine(*callCombinedFunction);
-  notdec::bin2llvm::NativeRegisterSSASummary callCombined =
-      notdec::bin2llvm::runNativeRegisterSSA(*callCombinedModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary callCombined =
+      notdec::bin2llvm::runNativeHeritageSSA(*callCombinedModule, options);
   if (llvm::verifyModule(*callCombinedModule, &llvm::errs())) {
     std::cerr << "call combined module verification failed\n";
     return EXIT_FAILURE;
@@ -508,8 +508,8 @@ int main() {
   llvm::LLVMContext directBaselineContext;
   std::unique_ptr<llvm::Module> directBaselineModule =
       createDirectPreserveModule(directBaselineContext);
-  notdec::bin2llvm::NativeRegisterSSASummary directBaseline =
-      notdec::bin2llvm::runNativeRegisterSSA(*directBaselineModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary directBaseline =
+      notdec::bin2llvm::runNativeHeritageSSA(*directBaselineModule, options);
   if (llvm::verifyModule(*directBaselineModule, &llvm::errs())) {
     std::cerr << "direct baseline module verification failed\n";
     return EXIT_FAILURE;
@@ -532,8 +532,8 @@ int main() {
                                            "notdec.register.preserves", "RDI"),
                "instcombine dropped direct callee preserves metadata");
 
-  notdec::bin2llvm::NativeRegisterSSASummary directCombined =
-      notdec::bin2llvm::runNativeRegisterSSA(*directCombinedModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary directCombined =
+      notdec::bin2llvm::runNativeHeritageSSA(*directCombinedModule, options);
   if (llvm::verifyModule(*directCombinedModule, &llvm::errs())) {
     std::cerr << "direct combined module verification failed\n";
     return EXIT_FAILURE;
@@ -547,8 +547,8 @@ int main() {
   llvm::LLVMContext clobberBaselineContext;
   std::unique_ptr<llvm::Module> clobberBaselineModule =
       createDirectClobberModule(clobberBaselineContext);
-  notdec::bin2llvm::NativeRegisterSSASummary clobberBaseline =
-      notdec::bin2llvm::runNativeRegisterSSA(*clobberBaselineModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary clobberBaseline =
+      notdec::bin2llvm::runNativeHeritageSSA(*clobberBaselineModule, options);
   if (llvm::verifyModule(*clobberBaselineModule, &llvm::errs())) {
     std::cerr << "clobber baseline module verification failed\n";
     return EXIT_FAILURE;
@@ -571,8 +571,8 @@ int main() {
                                            "notdec.register.clobbers", "RDI"),
                "instcombine dropped direct callee clobbers metadata");
 
-  notdec::bin2llvm::NativeRegisterSSASummary clobberCombined =
-      notdec::bin2llvm::runNativeRegisterSSA(*clobberCombinedModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary clobberCombined =
+      notdec::bin2llvm::runNativeHeritageSSA(*clobberCombinedModule, options);
   if (llvm::verifyModule(*clobberCombinedModule, &llvm::errs())) {
     std::cerr << "clobber combined module verification failed\n";
     return EXIT_FAILURE;
@@ -586,8 +586,8 @@ int main() {
   llvm::LLVMContext indirectBaselineContext;
   std::unique_ptr<llvm::Module> indirectBaselineModule =
       createIndirectCallModule(indirectBaselineContext);
-  notdec::bin2llvm::NativeRegisterSSASummary indirectBaseline =
-      notdec::bin2llvm::runNativeRegisterSSA(*indirectBaselineModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary indirectBaseline =
+      notdec::bin2llvm::runNativeHeritageSSA(*indirectBaselineModule, options);
   if (llvm::verifyModule(*indirectBaselineModule, &llvm::errs())) {
     std::cerr << "indirect baseline module verification failed\n";
     return EXIT_FAILURE;
@@ -603,8 +603,8 @@ int main() {
     return EXIT_FAILURE;
   }
   runInstCombine(*indirectCombinedFunction);
-  notdec::bin2llvm::NativeRegisterSSASummary indirectCombined =
-      notdec::bin2llvm::runNativeRegisterSSA(*indirectCombinedModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary indirectCombined =
+      notdec::bin2llvm::runNativeHeritageSSA(*indirectCombinedModule, options);
   if (llvm::verifyModule(*indirectCombinedModule, &llvm::errs())) {
     std::cerr << "indirect combined module verification failed\n";
     return EXIT_FAILURE;
@@ -625,7 +625,7 @@ int main() {
     return EXIT_FAILURE;
   }
   runInstCombine(*prototypeFunction);
-  notdec::bin2llvm::runNativeRegisterSSA(*prototypeModule, options);
+  notdec::bin2llvm::runNativeHeritageSSA(*prototypeModule, options);
   notdec::bin2llvm::NativePrototypeRecoveryOptions prototypeOptions;
   notdec::bin2llvm::NativePrototypeRecoverySummary prototypeSummary =
       notdec::bin2llvm::runNativePrototypeRecovery(*prototypeModule,
@@ -658,7 +658,7 @@ int main() {
     return EXIT_FAILURE;
   }
   runInstCombine(*multireturnFunction);
-  notdec::bin2llvm::runNativeRegisterSSA(*multireturnModule, options);
+  notdec::bin2llvm::runNativeHeritageSSA(*multireturnModule, options);
   notdec::bin2llvm::NativePrototypeRecoveryOptions multireturnOptions;
   notdec::bin2llvm::NativePrototypeRecoverySummary multireturnSummary =
       notdec::bin2llvm::runNativePrototypeRecovery(*multireturnModule,
@@ -685,7 +685,7 @@ int main() {
     return EXIT_FAILURE;
   }
   runInstCombine(*conflictFunction);
-  notdec::bin2llvm::runNativeRegisterSSA(*conflictModule, options);
+  notdec::bin2llvm::runNativeHeritageSSA(*conflictModule, options);
   notdec::bin2llvm::NativePrototypeRecoveryOptions conflictOptions;
   notdec::bin2llvm::NativePrototypeRecoverySummary conflictSummary =
       notdec::bin2llvm::runNativePrototypeRecovery(*conflictModule,

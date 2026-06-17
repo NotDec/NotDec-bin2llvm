@@ -1300,3 +1300,109 @@ NativeRegisterSummary
 - 计划里的新版独立链路已经实现并有可重复 Bench2 audit。
 - summary SSA 的 residue 删除已经从局部规则扩展到 CFG 级 register liveness。
 - 默认 pipeline 仍保留旧 `NativeRegisterSSA`；是否切默认需要更大 Bench2 audit 后单独决策。
+
+## 后续实现：旧链路改名 HeritageSSA，SummarySSA 切为默认
+
+本节覆盖上一节末尾的旧结论。当前实现已经把旧链路改成 `HeritageSSA`，并把新版
+`NativeRegisterSummarySSA` 设为 `notdec-native-llvm` 默认寄存器消除链路。
+
+改动文件：
+
+- `include/notdec-bin2llvm/passes/NativeHeritageSSA.h:14` 定义旧链路的
+  `NativeHeritageSSAOptions`；第 19 行和第 64 行定义旧链路 summary 结构；第
+  110-117 行说明该 pass 是旧 Ghidra-style fallback，并导出
+  `runNativeHeritageSSA()` / `printNativeHeritageSSASummary()`。
+- `lib/passes/NativeHeritageSSA.cpp:1` 改为包含 `NativeHeritageSSA.h`；第
+  2790-2818 行把旧入口改名为 `runNativeHeritageSSA()`；第 2821-2823 行把
+  summary 标题改成 `native heritage ssa summary`。
+- `lib/CMakeLists.txt:12` 把旧源文件从 `passes/NativeRegisterSSA.cpp` 改为
+  `passes/NativeHeritageSSA.cpp`。
+- `tools/notdec-native-llvm.cpp:63-65` 把 CLI 状态改成
+  `UseHeritageRegisterSSAPass`；第 80-82 行 usage 增加
+  `--heritage-register-ssa-pass`，保留 `--summary-register-ssa-pass` 作为兼容空
+  开关；第 147-152 行解析这两个参数；第 262-270 行校验 Heritage 与
+  `--no-register-ssa-pass` / `--no-summary-register-residue-removal` 的冲突；第
+  802-826 行默认运行 `runNativeRegisterSummarySSA()`，只有显式
+  `--heritage-register-ssa-pass` 时才运行 `runNativeHeritageSSA()`。
+- `tests/native_register_effects_test.cpp:2`、第 1855-1858 行、第 2233-2234 行改
+  用 Heritage 名字，继续覆盖旧链路行为。
+- `tests/native_instcombine_metadata_test.cpp:3`、第 436-461 行、第 628 行等直接调
+  旧 SSA 的位置改用 Heritage 名字，继续覆盖 metadata/prototype 相关旧链路回归。
+- `scripts/bench2-native-summary-ssa-audit.sh:16` 增加 `heritage` mode；第 123-135
+  行让 `heritage|old` 显式加 `--heritage-register-ssa-pass`，summary mode 直接使用
+  默认 SummarySSA，不再依赖 `--summary-register-ssa-pass`。
+
+验证命令：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm \
+  native_register_summary_ssa_test native_register_summary_test \
+  native_register_effects_test native_instcombine_metadata_test \
+  native_prototype_recovery_test -j2
+
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+/tmp/notdec-bin2llvm-build/bin/native_instcombine_metadata_test
+/tmp/notdec-bin2llvm-build/bin/native_prototype_recovery_test
+```
+
+全部通过。
+
+CLI 同口径验证：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk -f 0x8300 \
+  -o /tmp/wrk-default-summary.ll --register-ssa-summary \
+  --no-prototype-recovery-pass
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/wrk-default-summary.ll \
+  -o /tmp/wrk-default-summary.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/wrk-default-summary.bc -o /tmp/wrk-default-summary.verified.bc
+```
+
+默认路径输出 `Native register summary SSA`，说明已经走 SummarySSA。结果：267 行。
+
+显式 Heritage 验证：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk -f 0x8300 \
+  -o /tmp/wrk-heritage.ll --heritage-register-ssa-pass \
+  --register-ssa-summary --no-prototype-recovery-pass
+```
+
+输出 `native heritage ssa summary`，并通过 LLVM 22 assemble/verify。结果：159 行。
+
+Bench2 小样本审计：
+
+```text
+scripts/bench2-native-summary-ssa-audit.sh --target wrk:executable \
+  --decode-seed-limit 50 \
+  --out-dir /tmp/notdec-summary-default-switch-wrk50
+```
+
+结果：
+
+```text
+summary-no-residue: 11s, 3225 lines
+summary-residue:    11s, 2339 lines
+```
+
+Heritage mode 验证：
+
+```text
+scripts/bench2-native-summary-ssa-audit.sh --target wrk:executable \
+  --mode heritage --decode-seed-limit 50 \
+  --out-dir /tmp/notdec-summary-default-switch-wrk50-heritage
+```
+
+结果：10s，1867 lines。
+
+复杂度评估：
+
+- 实现效果：8/10。默认链路已经切到新版 SummarySSA，旧链路仍可显式回退。
+- 理解成本：4/10。代码里不再有“默认 register SSA”与旧 Ghidra-style 实现同名的问题。
+- 维护成本：3/10。旧链路只保留 fallback 入口，后续主要修 SummarySSA。

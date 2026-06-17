@@ -9,7 +9,7 @@ add_library(notdec-bin2llvm-core STATIC
   passes/NativePrototypeRecovery.cpp
   passes/NativeRegisterSummary.cpp
   passes/NativeRegisterSummarySSA.cpp
-  passes/NativeRegisterSSA.cpp
+  passes/NativeHeritageSSA.cpp
   RegisterStorage.cpp
 )
 

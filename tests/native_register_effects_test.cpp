@@ -1,5 +1,5 @@
 #include "notdec-bin2llvm/NativeAbi.h"
-#include "notdec-bin2llvm/passes/NativeRegisterSSA.h"
+#include "notdec-bin2llvm/passes/NativeHeritageSSA.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -1852,10 +1852,10 @@ int main() {
   llvm::Function *unreadRip = createUnreadRipStoresFunction(module, rip);
   llvm::Function *readRip = createReadRipStoresFunction(module, rip);
 
-  notdec::bin2llvm::NativeRegisterSSAOptions options;
+  notdec::bin2llvm::NativeHeritageSSAOptions options;
   options.EnableRewrite = true;
-  notdec::bin2llvm::NativeRegisterSSASummary summary =
-      notdec::bin2llvm::runNativeRegisterSSA(module, options);
+  notdec::bin2llvm::NativeHeritageSSASummary summary =
+      notdec::bin2llvm::runNativeHeritageSSA(module, options);
 
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after register SSA\n";
@@ -2230,8 +2230,8 @@ int main() {
   llvm::Function *partialEntryInputCallInput =
       createPartialEntryInputCallInputFunction(returnForwardModule,
                                                returnForwardRax);
-  notdec::bin2llvm::NativeRegisterSSASummary returnForwardSummary =
-      notdec::bin2llvm::runNativeRegisterSSA(returnForwardModule, options);
+  notdec::bin2llvm::NativeHeritageSSASummary returnForwardSummary =
+      notdec::bin2llvm::runNativeHeritageSSA(returnForwardModule, options);
   if (llvm::verifyModule(returnForwardModule, &llvm::errs())) {
     std::cerr << "return-forward module verification failed after register SSA\n";
     return EXIT_FAILURE;

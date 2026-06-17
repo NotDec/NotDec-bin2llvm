@@ -5,7 +5,7 @@
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
 #include "notdec-bin2llvm/passes/NativePrototypeRecovery.h"
-#include "notdec-bin2llvm/passes/NativeRegisterSSA.h"
+#include "notdec-bin2llvm/passes/NativeHeritageSSA.h"
 #include "notdec-bin2llvm/passes/NativeRegisterSummarySSA.h"
 
 #include "llvm/IR/LLVMContext.h"
@@ -61,7 +61,7 @@ struct CliOptions {
   notdec::bin2llvm::PcodeMemoryModel MemoryModel =
       notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
   bool DisableRegisterSSAPass = false;
-  bool UseSummaryRegisterSSAPass = false;
+  bool UseHeritageRegisterSSAPass = false;
   bool DisableSummaryRegisterResidueRemoval = false;
   bool PrintRegisterSSASummary = false;
   bool DisableInstCombinePass = false;
@@ -77,7 +77,8 @@ void printUsage(const char *argv0) {
                "--all-confirmed) "
                "-o <output.ll> [--summary-json-out <path>] "
                "[--no-instcombine-pass] "
-               "[--no-register-ssa-pass] [--summary-register-ssa-pass] "
+               "[--no-register-ssa-pass] [--heritage-register-ssa-pass] "
+               "[--summary-register-ssa-pass] "
                "[--no-summary-register-residue-removal] "
                "[--register-ssa-summary] "
                "[--no-prototype-recovery-pass] "
@@ -144,7 +145,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       continue;
     }
     if (flag == "--summary-register-ssa-pass") {
-      options.UseSummaryRegisterSSAPass = true;
+      continue;
+    }
+    if (flag == "--heritage-register-ssa-pass") {
+      options.UseHeritageRegisterSSAPass = true;
       continue;
     }
     if (flag == "--no-summary-register-residue-removal") {
@@ -255,15 +259,15 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     std::cerr << "missing -o <output.ll>\n";
     return std::nullopt;
   }
-  if (options.DisableRegisterSSAPass && options.UseSummaryRegisterSSAPass) {
-    std::cerr << "--summary-register-ssa-pass conflicts with "
+  if (options.DisableRegisterSSAPass && options.UseHeritageRegisterSSAPass) {
+    std::cerr << "--heritage-register-ssa-pass conflicts with "
                  "--no-register-ssa-pass\n";
     return std::nullopt;
   }
-  if (options.DisableSummaryRegisterResidueRemoval &&
-      !options.UseSummaryRegisterSSAPass) {
-    std::cerr << "--no-summary-register-residue-removal requires "
-                 "--summary-register-ssa-pass\n";
+  if (options.UseHeritageRegisterSSAPass &&
+      options.DisableSummaryRegisterResidueRemoval) {
+    std::cerr << "--no-summary-register-residue-removal conflicts with "
+                 "--heritage-register-ssa-pass\n";
     return std::nullopt;
   }
   return options;
@@ -800,26 +804,26 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
   if (options.DisableRegisterSSAPass) {
     return true;
   }
-  if (options.UseSummaryRegisterSSAPass) {
-    notdec::bin2llvm::NativeRegisterSummarySSAOptions passOptions;
+  if (options.UseHeritageRegisterSSAPass) {
+    notdec::bin2llvm::NativeHeritageSSAOptions passOptions;
     passOptions.EnableRewrite = true;
-    passOptions.EnableResidueRemoval =
-        !options.DisableSummaryRegisterResidueRemoval;
     passOptions.PrintSummary = options.PrintRegisterSSASummary;
-    notdec::bin2llvm::runNativeRegisterSummarySSA(module, passOptions);
+    notdec::bin2llvm::runNativeHeritageSSA(module, passOptions);
     if (llvm::verifyModule(module, &llvm::errs())) {
-      std::cerr
-          << "module verification failed after summary register SSA pass\n";
+      std::cerr << "module verification failed after heritage SSA pass\n";
       return false;
     }
     return true;
   }
-  notdec::bin2llvm::NativeRegisterSSAOptions passOptions;
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions passOptions;
   passOptions.EnableRewrite = true;
+  passOptions.EnableResidueRemoval =
+      !options.DisableSummaryRegisterResidueRemoval;
   passOptions.PrintSummary = options.PrintRegisterSSASummary;
-  notdec::bin2llvm::runNativeRegisterSSA(module, passOptions);
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module, passOptions);
   if (llvm::verifyModule(module, &llvm::errs())) {
-    std::cerr << "module verification failed after register SSA pass\n";
+    std::cerr << "module verification failed after summary register SSA pass\n";
     return false;
   }
   return true;
