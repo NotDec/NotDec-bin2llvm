@@ -1659,6 +1659,12 @@ private:
           info.HasUnconditionalBranch = true;
         }
         if (target && state.isExecutableAddress(*target)) {
+          if (state.lookupPltExternal(*target)) {
+            addUniqueXref(state, seenXrefs, op.Address, *target,
+                          NativeXrefKind::Flow,
+                          "sleigh-pcode-plt-tail-branch");
+            continue;
+          }
           addUniqueXref(state, seenXrefs, op.Address, *target,
                         NativeXrefKind::Flow, "sleigh-pcode-direct-flow");
           addUniqueAddress(info.BranchTargets, *target);

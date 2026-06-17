@@ -1597,3 +1597,111 @@ summary-residue:    11s, 2238 lines
 - 实现效果：8/10。IR 更适合人工检查，也减少无用块。
 - 理解成本：1/10。直接使用 LLVM 现成 CFG 清理。
 - 维护成本：1/10。该清理和 SummarySSA 主逻辑解耦。
+
+## 后续修复：PLT tail branch 不合并进 caller CFG
+
+问题：
+
+`stats_free` 里有一条真实指令：
+
+```text
+831d: jmp 0x5450 <free@plt>
+```
+
+`0x5450` 属于 `.plt`，不是 `.text`：
+
+```text
+.plt  0x5020 - 0x56f0
+.text 0x5700 - 0xec7a
+```
+
+对应 PLT 代码：
+
+```text
+5450 <free@plt>: jmpq *GOT
+5456:            pushq $0x42
+545b:            jmp 0x5020 <.plt>
+```
+
+之前 discovery 把 `CALL free@plt` 识别成 external call，但把 `BRANCH free@plt`
+当普通控制流，所以会把 `free@plt` body 拉进 `stats_free`。PLT stub 的第一条
+`jmp *GOT` 又被 lowerer 建模成 `call @free(); ret void`，所以 IR 里出现很多看起来像
+`ret void` 的 PLT 块。相邻的 `exit@plt`、`lua_pushfstring@plt` 等块也是同一个 PLT
+线性 decode 窗口里被带进来的，不应该属于 `stats_free`。
+
+处理：
+
+discovery 层 direct `BRANCH` 到已知 PLT entry 时，记录 flow xref，但不把 PLT entry 加入
+当前函数的 branch target worklist。这样 caller 不再合并 PLT body。
+
+这里暂时不在 `PcodeToLLVM` 里特殊处理 direct `BRANCH -> ExternalCallTargets`。去掉 PLT
+body 后，如果仍直接 lower 这种函数外 branch，当前 lowerer 会生成一个外部目标空 block。
+这说明外部 tail branch 的 IR 表达还需要单独设计，不能用 lowering special case 掩盖
+discovery 的 CFG 归属问题。
+
+改动文件：
+
+- `lib/NativeAnalysis.cpp:1661-1666`：direct branch 目标是 `lookupPltExternal()` 时，记录
+  `sleigh-pcode-plt-tail-branch` xref 并 `continue`，不加入 `info.BranchTargets`。
+
+验证命令：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test \
+  notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+```
+
+通过。
+
+`wrk -f 0x8300` 验证：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk -f 0x8300 \
+  -o /tmp/wrk-tailcall-summary.ll --register-ssa-summary \
+  --no-prototype-recovery-pass
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk -f 0x8300 \
+  -o /tmp/wrk-tailcall-no-regssa.ll --no-register-ssa-pass \
+  --no-prototype-recovery-pass
+```
+
+两者都通过 LLVM 22 assemble/verify。结果：
+
+```text
+summary:      204 lines
+basic_blocks: 3
+instructions: 9
+bb_5450:      有一个外部目标空 block
+PLT 相邻块:   不再出现
+summary_return: 无命中
+```
+
+`--summary-json-out` 同口径显示 `stats_free` 现在是 3 个 basic blocks、9 条 instruction，
+不再包含 PLT 相邻块。剩下的 `bb_5450: ret void` 是 lowerer 对函数外 direct branch 的
+当前表达问题，后续需要用明确的 external tail branch IR 方案处理。
+
+Bench2 小样本：
+
+```text
+scripts/bench2-native-summary-ssa-audit.sh --target wrk:executable \
+  --decode-seed-limit 50 \
+  --out-dir /tmp/notdec-tailcall-plt-wrk50
+```
+
+结果：
+
+```text
+summary-no-residue: 待重新跑更大样本
+summary-residue:    待重新跑更大样本
+```
+
+复杂度评估：
+
+- 实现效果：7/10。`stats_free -> free@plt` 这类 external tail jump 不再污染 caller CFG；
+  external tail branch 的最终 IR 表达还没完成。
+- 理解成本：3/10。需要知道 PLT entry 是 external target，不是普通函数内 flow。
+- 维护成本：2/10。只改 discovery 的 target 归属，不改 lowerer 语义。
