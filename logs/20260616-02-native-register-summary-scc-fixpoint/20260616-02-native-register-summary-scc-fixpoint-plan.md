@@ -988,3 +988,71 @@ call_returns=2 call_clobbers=0 preserved_calls=1 unknown_call_effects=4
 - 实现效果：7/10。summary SSA 已可通过 CLI 显式启用，并在 Bench2 小函数上通过 verifier。
 - 理解成本：3/10。只增加一个 opt-in 开关，默认路径不变。
 - 维护成本：4/10。后续如果要替换默认旧 SSA，需要更大范围 Bench2 audit 后再决定。
+
+## 实现记录：修复 summary SSA PHI incoming 和 Bench2 三目标验证
+
+扩大到 Bench2 `--all-confirmed` 后，`vsftpd` 暴露了 summary SSA 的 PHI incoming bug：
+
+```text
+PHINode should have one entry for each predecessor of its parent basic block
+module verification failed after summary register SSA pass
+```
+
+原因是 `completePhi()` 之前按 predecessor basic block 去重。
+但 LLVM PHI 是按 CFG edge 计数的，`switch` 可以从同一个 predecessor block 向同一个目标 block 产生多条边。
+这种情况下 PHI 需要多个 incoming，不能只保留一个。
+
+改动文件：
+
+- `lib/passes/NativeRegisterSummarySSA.cpp`
+  - 第 453-471 行 `completePhi()` 改成按 predecessor block 的出现次数补 incoming，允许同一 block 多条边。
+  - 第 476-508 行 `simplifyPhi()` 只在 PHI incoming 数量等于 `pred_size(parent)` 后才删除 trivial PHI。
+  - 第 510-528 行 `finalizePendingPhis()` 改成迭代补齐未完成 PHI，避免补一个 PHI 时新建的 pending PHI 被漏掉。
+- `tests/native_register_summary_ssa_test.cpp`
+  - 第 120-130 行新增 `hasPhiIncomingCount()`。
+  - 第 168-205 行新增 `testDuplicatePredecessorEdgesKeepPhiComplete()`，构造 `switch` 的重复 predecessor edge，要求 PHI 有 3 个 incoming 并通过 verifier。
+  - 第 310 行把新测试接入 main。
+
+验证：
+
+```text
+git diff --check
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+```
+
+Bench2 summary SSA all-confirmed：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/vsftpd \
+  --all-confirmed -o /tmp/notdec-summary-audit-vsftpd-summary-fix.ll \
+  --no-prototype-recovery-pass --summary-register-ssa-pass --register-ssa-summary
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/notdec-summary-audit-vsftpd-summary-fix.ll \
+  -o /tmp/notdec-summary-audit-vsftpd-summary-fix.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-summary-audit-vsftpd-summary-fix.bc \
+  -o /tmp/notdec-summary-audit-vsftpd-summary-fix.verified.bc
+```
+
+结果：
+
+```text
+vsftpd summary SSA:   87.59s, 126067 lines, llvm-as/opt verify passed
+libuv summary SSA:   141.73s, 167152 lines, llvm-as/opt verify passed
+memcached summary SSA: 179.46s, 218409 lines, llvm-as/opt verify passed
+```
+
+补充：
+
+- 同口径 `vsftpd --all-confirmed` 旧 `NativeRegisterSSA` 当前触发 PHI 类型断言，不能作为全量性能 baseline。
+- 之前单函数 `wrk -f 0x8300` 已记录旧链路 `0.46s`、summary 链路 `0.43s`。
+
+复杂度评估：
+
+- 实现效果：8/10。修掉真实 CFG 上的 PHI incoming verifier blocker，并通过三个 Bench2 all-confirmed summary SSA gate。
+- 理解成本：4/10。修复仍局限在 Braun SSA PHI 完成逻辑里，没有扩散到 summary 分析。
+- 维护成本：4/10。后续要继续扩大 Bench2 audit，但当前 opt-in 链路已有比单函数更强的 verifier 证据。

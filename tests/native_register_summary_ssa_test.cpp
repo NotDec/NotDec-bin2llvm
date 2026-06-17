@@ -117,6 +117,18 @@ bool hasCompletePhi(llvm::Function &function) {
   return false;
 }
 
+bool hasPhiIncomingCount(llvm::Function &function, unsigned count) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &inst : block) {
+      auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
+      if (phi != nullptr && phi->getNumIncomingValues() == count) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool testPhiIncomingMatchesPredecessors() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-phi", context);
@@ -151,6 +163,46 @@ bool testPhiIncomingMatchesPredecessors() {
   return expect(summary.LoadsReplaced == 1, "branch load was not replaced") &&
          expect(hasCompletePhi(*function), "complete PHI was not created") &&
          verifyOk(module, "module failed verifier after summary SSA PHI test");
+}
+
+bool testDuplicatePredecessorEdgesKeepPhiComplete() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-duplicate-edge-phi", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "duplicate_edge_phi", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *other =
+      llvm::BasicBlock::Create(context, "other", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *selector =
+      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0);
+  llvm::SwitchInst *switchInst = builder.CreateSwitch(selector, join, 2);
+  switchInst->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 1),
+                      join);
+  switchInst->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 2),
+                      other);
+  builder.SetInsertPoint(other);
+  storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 3),
+                "RAX");
+  builder.CreateBr(join);
+  builder.SetInsertPoint(join);
+  llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "merged");
+  builder.CreateRet(loaded);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.LoadsReplaced == 1,
+                "duplicate-edge load was not replaced") &&
+         expect(hasPhiIncomingCount(*function, 3),
+                "duplicate predecessor edge PHI was not completed") &&
+         verifyOk(module,
+                  "module failed verifier after duplicate-edge PHI test");
 }
 
 bool testPreservedCallKeepsPreviousValue() {
@@ -255,6 +307,7 @@ bool testOverwrittenStoreIsRemoved() {
 int main() {
   bool ok = true;
   ok &= testPhiIncomingMatchesPredecessors();
+  ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
   ok &= testPreservedCallKeepsPreviousValue();
   ok &= testDemandedReturnCreatesCallValue();
   ok &= testOverwrittenStoreIsRemoved();

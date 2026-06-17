@@ -452,8 +452,16 @@ private:
 
   llvm::Value *completePhi(llvm::BasicBlock &block, const RegisterUnit &unit) {
     llvm::PHINode *phi = ensurePhi(block, unit);
+    // LLVM PHI operands are edge-based. A switch can contribute the same
+    // predecessor block more than once, so count per-block occurrences.
+    std::map<llvm::BasicBlock *, unsigned> existingIncoming;
+    for (unsigned index = 0; index < phi->getNumIncomingValues(); ++index) {
+      ++existingIncoming[phi->getIncomingBlock(index)];
+    }
+    std::map<llvm::BasicBlock *, unsigned> requiredIncoming;
     for (llvm::BasicBlock *pred : llvm::predecessors(&block)) {
-      if (hasIncomingFrom(*phi, pred)) {
+      unsigned requiredCount = ++requiredIncoming[pred];
+      if (existingIncoming[pred] >= requiredCount) {
         continue;
       }
       llvm::Value *incoming = resolve(readBlockExit(*pred, unit));
@@ -465,17 +473,10 @@ private:
     return simplifyPhi(*phi);
   }
 
-  bool hasIncomingFrom(const llvm::PHINode &phi,
-                       const llvm::BasicBlock *pred) const {
-    for (unsigned index = 0; index < phi.getNumIncomingValues(); ++index) {
-      if (phi.getIncomingBlock(index) == pred) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   llvm::Value *simplifyPhi(llvm::PHINode &phi) {
+    if (!isCompletePhi(phi)) {
+      return &phi;
+    }
     llvm::Value *same = nullptr;
     for (llvm::Value *incoming : phi.incoming_values()) {
       incoming = resolve(incoming);
@@ -500,16 +501,30 @@ private:
     return same;
   }
 
+  bool isCompletePhi(const llvm::PHINode &phi) const {
+    const llvm::BasicBlock *block = phi.getParent();
+    return block != nullptr &&
+           phi.getNumIncomingValues() == llvm::pred_size(block);
+  }
+
   void finalizePendingPhis() {
-    std::vector<std::pair<llvm::BasicBlock *, const RegisterUnit *>> work;
-    for (const auto &[key, phi] : PendingPhi) {
-      auto unitIt = Units.find(key.second);
-      if (unitIt != Units.end() && DeadPhis.count(phi) == 0) {
-        work.push_back({key.first, &unitIt->second});
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      std::vector<std::pair<llvm::BasicBlock *, const RegisterUnit *>> work;
+      for (const auto &[key, phi] : PendingPhi) {
+        auto unitIt = Units.find(key.second);
+        if (unitIt != Units.end() && DeadPhis.count(phi) == 0 &&
+            !isCompletePhi(*phi)) {
+          work.push_back({key.first, &unitIt->second});
+        }
       }
-    }
-    for (const auto &[block, unit] : work) {
-      (void)completePhi(*block, *unit);
+      for (const auto &[block, unit] : work) {
+        llvm::PHINode *phi = PendingPhi[{block, unit->Global}];
+        unsigned before = phi->getNumIncomingValues();
+        (void)completePhi(*block, *unit);
+        changed |= phi->getNumIncomingValues() != before;
+      }
     }
   }
 
