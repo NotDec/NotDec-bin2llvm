@@ -1783,3 +1783,95 @@ summary-residue:    11s, 1478 lines
 - 实现效果：8/10。明显减少 SummarySSA 后死代码，不改 SummarySSA 核心算法。
 - 理解成本：2/10。pipeline 多跑一次已有清理 pass。
 - 维护成本：2/10。复用现有 `runInstCombinePassIfEnabled()`，受同一个 `--no-instcombine-pass` 控制。
+
+## 后续修复：函数外 PLT branch lower 成 tail call
+
+问题：
+
+上一节只修了 discovery 层，不再把 `free@plt` body 合进 `stats_free`。但 p-code 里仍有：
+
+```text
+BRANCH ram:0x5450
+```
+
+如果 lowering 不知道这个目标是 PLT external target，就会生成：
+
+```llvm
+br label %bb_5450
+
+bb_5450:
+  ret void
+```
+
+这虽然合法，但丢掉了 `free` 的副作用。这里不需要新增 `ExternalTailBranches` 之类的专门 map。
+只要在 lowering 里判断：direct branch 的目标不在当前函数本地 block 中，并且该地址在
+`ExternalCallTargets` 里，就把它 lower 成 external tail call。
+
+改动文件：
+
+- `lib/PcodeToLLVM.cpp:309-315`：`PcodeOpcode::Branch` direct target 如果不是本地 block，
+  且命中 `Config.ExternalCallTargets`，调用 `lowerKnownVoidTailJump()`。
+- `lib/PcodeToLLVM.cpp:1058-1064`：`lowerKnownVoidCall()` 改成返回 `llvm::CallInst *`。
+- `lib/PcodeToLLVM.cpp:1076-1081`：`lowerKnownVoidTailJump()` 对 call 设置
+  `llvm::CallInst::TCK_Tail`，然后 `ret void`。
+- `tests/pcode_to_llvm_test.cpp:42-52` 增加 `branchOp()` helper。
+- `tests/pcode_to_llvm_test.cpp:92-129` 增加
+  `testExternalTailBranchWithoutLocalBlock()`：program 里只有 `BRANCH 0x5450`，没有
+  `0x5450` 本地 block；`ExternalCallTargets[0x5450] = free`；要求生成 tail call，并且不创建
+  `bb_5450`。
+- `tests/pcode_to_llvm_test.cpp:137` 接入新测试。
+
+验证命令：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test \
+  notdec-native-llvm -j2
+
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+```
+
+通过。
+
+`wrk -f 0x8300` 验证：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk -f 0x8300 \
+  -o /tmp/wrk-external-tail-branch.ll --register-ssa-summary \
+  --no-prototype-recovery-pass
+```
+
+结果通过 LLVM 22 assemble/verify：
+
+```text
+145 lines
+tail call void @free()
+bb_5450 无命中
+summary_return 无命中
+basic_blocks=3
+instructions=9
+```
+
+`store @RDI` 会保留，这是正确的 call 参数准备：`stats_free` 在 tail call `free` 前需要把
+`RDI` 改成 `RDI.entry - 8`。
+
+Bench2 `wrk` seed50：
+
+```text
+scripts/bench2-native-summary-ssa-audit.sh --target wrk:executable \
+  --decode-seed-limit 50 \
+  --out-dir /tmp/notdec-external-tail-branch-wrk50
+```
+
+结果：
+
+```text
+summary-no-residue: 11s, 2785 lines
+summary-residue:    11s, 1485 lines
+```
+
+复杂度评估：
+
+- 实现效果：8/10。PLT body 不进 caller CFG，同时外部 tail call 语义保留下来。
+- 理解成本：3/10。需要理解“目标不是本地 block 且命中 ExternalCallTargets”才是外部 tail branch。
+- 维护成本：3/10。没有新增 map，只复用现有 target 表。

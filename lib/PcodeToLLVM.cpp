@@ -307,6 +307,12 @@ private:
       }
       auto target = directTarget(op, 0);
       if (target) {
+        if (BlockForAddress.count(*target) == 0) {
+          auto externalIt = Config.ExternalCallTargets.find(*target);
+          if (externalIt != Config.ExternalCallTargets.end()) {
+            return lowerKnownVoidTailJump(externalIt->second);
+          }
+        }
         Builder.CreateBr(blockForTarget(*target));
         return true;
       }
@@ -1049,13 +1055,12 @@ private:
     return true;
   }
 
-  bool lowerKnownVoidCall(const std::string &calleeName) {
+  llvm::CallInst *lowerKnownVoidCall(const std::string &calleeName) {
     auto *calleeType =
         llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
     llvm::FunctionCallee callee =
         Module.getOrInsertFunction(calleeName, calleeType);
-    Builder.CreateCall(callee, {});
-    return true;
+    return Builder.CreateCall(callee, {});
   }
 
   bool lowerUnknownVoidIndirectCall(const VarnodeView &target) {
@@ -1071,7 +1076,8 @@ private:
   bool lowerKnownVoidTailJump(const std::string &calleeName) {
     // Current native lowering has no ABI/prototype model.  For proven external
     // tail jumps, preserve the handoff to the external symbol and end this body.
-    lowerKnownVoidCall(calleeName);
+    llvm::CallInst *call = lowerKnownVoidCall(calleeName);
+    call->setTailCallKind(llvm::CallInst::TCK_Tail);
     Builder.CreateRetVoid();
     return true;
   }
@@ -1085,15 +1091,18 @@ private:
       if (auto target = directTarget(op, 0)) {
         auto externalIt = Config.ExternalCallTargets.find(*target);
         if (externalIt != Config.ExternalCallTargets.end()) {
-          return lowerKnownVoidCall(externalIt->second);
+          lowerKnownVoidCall(externalIt->second);
+          return true;
         }
 
         auto it = Config.DirectCallTargets.find(*target);
         if (it != Config.DirectCallTargets.end()) {
-          return lowerKnownVoidCall(it->second);
+          lowerKnownVoidCall(it->second);
+          return true;
         }
 
-        return lowerKnownVoidCall(addressFunctionName(*target));
+        lowerKnownVoidCall(addressFunctionName(*target));
+        return true;
       }
     }
 
@@ -1105,7 +1114,8 @@ private:
       if (auto gotAddress = sourceRam(op.Inputs[0])) {
         auto it = Config.IndirectExternalCallTargets.find(*gotAddress);
         if (it != Config.IndirectExternalCallTargets.end()) {
-          return lowerKnownVoidCall(it->second);
+          lowerKnownVoidCall(it->second);
+          return true;
         }
       }
       return lowerUnknownVoidIndirectCall(op.Inputs[0]);
