@@ -1103,6 +1103,11 @@ wrk -f 0x8300, summary SSA, no prototype recovery:
   line count 296 -> 267
   TIME 0.50s
 
+wrk -f 0x8300, old NativeRegisterSSA, no prototype recovery:
+  line count 159
+  TIME 0.45s
+  llvm-as / opt -passes=verify passed
+
 wrk -f 0x8300, default后续 pipeline:
   dead_stores_removed=23
   line count 268
