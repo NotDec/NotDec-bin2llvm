@@ -6,6 +6,7 @@
 #include "notdec-bin2llvm/SleighLift.h"
 #include "notdec-bin2llvm/passes/NativePrototypeRecovery.h"
 #include "notdec-bin2llvm/passes/NativeRegisterSSA.h"
+#include "notdec-bin2llvm/passes/NativeRegisterSummarySSA.h"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
@@ -60,6 +61,7 @@ struct CliOptions {
   notdec::bin2llvm::PcodeMemoryModel MemoryModel =
       notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
   bool DisableRegisterSSAPass = false;
+  bool UseSummaryRegisterSSAPass = false;
   bool PrintRegisterSSASummary = false;
   bool DisableInstCombinePass = false;
   bool DisablePrototypeRecoveryPass = false;
@@ -74,7 +76,8 @@ void printUsage(const char *argv0) {
                "--all-confirmed) "
                "-o <output.ll> [--summary-json-out <path>] "
                "[--no-instcombine-pass] "
-               "[--no-register-ssa-pass] [--register-ssa-summary] "
+               "[--no-register-ssa-pass] [--summary-register-ssa-pass] "
+               "[--register-ssa-summary] "
                "[--no-prototype-recovery-pass] "
                "[--prototype-recovery-summary] "
                "[--rewrite-prototype-signatures] "
@@ -136,6 +139,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
     if (flag == "--no-register-ssa-pass") {
       options.DisableRegisterSSAPass = true;
+      continue;
+    }
+    if (flag == "--summary-register-ssa-pass") {
+      options.UseSummaryRegisterSSAPass = true;
       continue;
     }
     if (flag == "--no-instcombine-pass") {
@@ -240,6 +247,11 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
   }
   if (options.OutputPath.empty()) {
     std::cerr << "missing -o <output.ll>\n";
+    return std::nullopt;
+  }
+  if (options.DisableRegisterSSAPass && options.UseSummaryRegisterSSAPass) {
+    std::cerr << "--summary-register-ssa-pass conflicts with "
+                 "--no-register-ssa-pass\n";
     return std::nullopt;
   }
   return options;
@@ -774,6 +786,19 @@ std::unique_ptr<llvm::Module> readIRModule(const std::string &inputPath,
 bool runRegisterSSAPassIfEnabled(llvm::Module &module,
                                  const CliOptions &options) {
   if (options.DisableRegisterSSAPass) {
+    return true;
+  }
+  if (options.UseSummaryRegisterSSAPass) {
+    notdec::bin2llvm::NativeRegisterSummarySSAOptions passOptions;
+    passOptions.EnableRewrite = true;
+    passOptions.EnableResidueRemoval = true;
+    passOptions.PrintSummary = options.PrintRegisterSSASummary;
+    notdec::bin2llvm::runNativeRegisterSummarySSA(module, passOptions);
+    if (llvm::verifyModule(module, &llvm::errs())) {
+      std::cerr
+          << "module verification failed after summary register SSA pass\n";
+      return false;
+    }
     return true;
   }
   notdec::bin2llvm::NativeRegisterSSAOptions passOptions;

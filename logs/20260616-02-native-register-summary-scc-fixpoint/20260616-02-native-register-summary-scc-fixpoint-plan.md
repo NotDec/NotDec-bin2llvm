@@ -908,3 +908,83 @@ git diff --check
 - 实现效果：6/10。已经能删掉最明显的 replaced load 和局部 overwritten store，但还没有跨 block residue 删除。
 - 理解成本：4/10。删除规则集中在新 SSA pass 内，且条件比较保守。
 - 维护成本：4/10。后续要接 pipeline/Bench2 后，再根据 audit 结果扩展更强的删除规则。
+
+## 实现记录：summary SSA pipeline opt-in 和 Bench2 小用例验证
+
+本次把 summary-based register SSA 接入 `notdec-native-llvm`，但只做显式 opt-in，不改变默认旧链路。
+
+改动文件：
+
+- `tools/notdec-native-llvm.cpp`
+  - 第 63-64 行新增 `UseSummaryRegisterSSAPass` CLI 状态。
+  - 第 77-80 行 usage 增加 `--summary-register-ssa-pass`。
+  - 第 140-146 行解析 `--summary-register-ssa-pass`。
+  - 第 786-803 行 `runRegisterSSAPassIfEnabled()` 在 opt-in 时运行 `runNativeRegisterSummarySSA()`，否则继续运行旧 `runNativeRegisterSSA()`。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm native_register_summary_ssa_test native_register_summary_test native_register_effects_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /tmp/notdec-summary-ssa-cli.ll \
+  -o /tmp/notdec-summary-ssa-cli.noic.out.ll \
+  --no-instcombine-pass --summary-register-ssa-pass \
+  --register-ssa-summary --no-prototype-recovery-pass
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-summary-ssa-cli.noic.out.ll \
+  -o /tmp/notdec-summary-ssa-cli.noic.out.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-summary-ssa-cli.noic.out.bc \
+  -o /tmp/notdec-summary-ssa-cli.noic.verified.bc
+```
+
+小 IR 结果：
+
+```text
+loads=1 stores=2 loads_replaced=1 dead_loads_removed=1 dead_stores_removed=1
+```
+
+Bench2 小用例：
+
+```text
+/sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk -f 0x8300
+```
+
+同口径关闭 prototype recovery：
+
+```text
+old register SSA:     0.46s, output 159 lines
+summary register SSA: 0.43s, output 296 lines
+```
+
+summary SSA 输出：
+
+```text
+functions=1 loads=11 stores=25 loads_replaced=7 dead_loads_removed=7
+dead_stores_removed=1 phis_created=0 phis_simplified=0 entry_inputs=2
+call_returns=2 call_clobbers=0 preserved_calls=1 unknown_call_effects=4
+```
+
+完整默认后续 pipeline 验证：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk \
+  -f 0x8300 -o /tmp/wrk-8300-summary-default.ll \
+  --summary-register-ssa-pass --register-ssa-summary
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/wrk-8300-summary-default.ll \
+  -o /tmp/wrk-8300-summary-default.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/wrk-8300-summary-default.bc \
+  -o /tmp/wrk-8300-summary-default.verified.bc
+```
+
+结果：通过，时间 `0.46s`。
+
+复杂度评估：
+
+- 实现效果：7/10。summary SSA 已可通过 CLI 显式启用，并在 Bench2 小函数上通过 verifier。
+- 理解成本：3/10。只增加一个 opt-in 开关，默认路径不变。
+- 维护成本：4/10。后续如果要替换默认旧 SSA，需要更大范围 Bench2 audit 后再决定。
