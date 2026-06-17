@@ -1247,3 +1247,56 @@ memcached summary-residue:    10s, 2146 lines, loads_replaced=294, dead_loads_re
 - 实现效果：8/10。Bench2 audit 从手写命令变成可重复脚本，并能直接比较 no-residue / residue。
 - 理解成本：3/10。脚本只关心 register SSA，不和 prototype audit 混在一起。
 - 维护成本：3/10。后续扩大目标或 seed limit 只需要追加 `--target` / `--decode-seed-limit`。
+
+## 阶段审计：当前 goal 覆盖情况
+
+对照本 plan 的技术路线和判断标准，当前新版链路已经形成闭环：
+
+```text
+NativeRegisterSummary
+  -> bottom-up SCC summary
+  -> top-down exit demand
+  -> summary-based Register SSA
+  -> CFG 级 register residue 删除
+  -> notdec-native-llvm opt-in pipeline
+  -> Bench2 audit script
+```
+
+已覆盖的判断标准：
+
+- 空函数 / untouched register：summary 默认 missing cell 表示 preserved / no read。
+- killed 后读取不算入口参数：`native_register_summary_test.cpp::testKilledReadDoesNotBecomeInput()`。
+- callee 读 entry register 可以传回 caller entry：`testCalleeReadPropagatesToCallerEntry()`。
+- sparse join 不丢 untouched path：`testSparseJoinKeepsUntouchedPath()`。
+- `RAX/RDX` 都被写但 caller 只读 `RAX`：`testTopDownDemandKeepsOnlyUsedReturn()`。
+- external / indirect call ABI fallback：summary 和 summary SSA 都读取 ABI input/output/effect metadata，Bench2 native pipeline 使用默认 x86-64 cspec metadata。
+- SCC fixpoint：`NativeRegisterSummary.cpp` 已用 direct call graph SCC 做 bottom-up summary 和 top-down demand fixpoint；递归 SCC 走同一套有限 bit lattice。
+- PHI incoming 数量：`native_register_summary_ssa_test.cpp::testPhiIncomingMatchesPredecessors()` 和 `testDuplicatePredecessorEdgesKeepPhiComplete()`。
+- trivial PHI：`NativeRegisterSummarySSA.cpp::simplifyPhi()` 只在 PHI 完整后替换，并更新 `Replacement` 缓存。
+- preserved call：`testPreservedCallKeepsPreviousValue()`。
+- demanded return / clobber 不沿用 call 前 value：`testDemandedReturnCreatesCallValue()` 覆盖 demanded return helper，`callEffect()` 对 clobber 会生成独立 helper。
+- residue 删除：`testOverwrittenStoreIsRemoved()`、`testCrossBlockDeadStoreIsRemoved()`、`testAbiInputStoreBeforeCallIsKept()`。
+- 不开启 residue 删除也能 verify：`--no-summary-register-residue-removal` 已接入 CLI，并在 `wrk -f 0x8300` 验证。
+- Bench2 verify：`wrk` 全量、`vsftpd/libuv/memcached` seed50、以及 `vsftpd/libuv/memcached` all-confirmed summary SSA 都通过 LLVM 22 assemble/verify。
+
+当前明确不做的点仍按第一版边界处理：
+
+- stack 参数恢复。
+- 一般 memory alias。
+- frame-local 保存/恢复 callee-saved register 的完整证明。
+- partial register 精细合并。
+- 条件执行路径标记。
+- Ghidra trial/use 兼容层。
+
+关于旧 `NativeRegisterSSA`：
+
+- 当前没有重命名为 `HeritageSSA`。
+- 原因是新链路已经独立放在 `NativeRegisterSummarySSA`，并通过 `--summary-register-ssa-pass` 显式 opt-in。
+- 旧 `NativeRegisterSSA` 仍服务默认旧 pipeline，避免影响已有 prototype recovery 结果。
+- 因此“拆分/重命名旧 Heritage 链路”在当前阶段不是必须代码动作；真正需要决定的是后续是否把 summary SSA 替换成默认链路。
+
+当前阶段结论：
+
+- 计划里的新版独立链路已经实现并有可重复 Bench2 audit。
+- summary SSA 的 residue 删除已经从局部规则扩展到 CFG 级 register liveness。
+- 默认 pipeline 仍保留旧 `NativeRegisterSSA`；是否切默认需要更大 Bench2 audit 后单独决策。
