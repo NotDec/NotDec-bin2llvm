@@ -1124,3 +1124,57 @@ vsftpd --all-confirmed, summary SSA, no prototype recovery:
 - 实现效果：8/10。比前一版多删了一批真正跨 block 的 register residue，而且没有碰 partial / stack / memory。
 - 理解成本：5/10。新增了一个很小的 backward liveness，但规则还算直接。
 - 维护成本：4/10。后面如果要继续扩大，只需要沿着 register liveness 再补更细的 call/memory 约束，不用重做 SSA。
+
+## 实现记录：summary SSA residue removal CLI gate
+
+之前 `NativeRegisterSummarySSAOptions` 已有 `EnableResidueRemoval`，但 `notdec-native-llvm` 没有 CLI 入口。
+这会让 plan 里的“不开启 residue 删除时也能 verify”只能从单测覆盖，不能直接用 native pipeline 验证。
+
+本次新增：
+
+```text
+--no-summary-register-residue-removal
+```
+
+它只允许和 `--summary-register-ssa-pass` 一起使用。
+默认行为不变，summary SSA 仍默认开启 residue removal。
+
+改动文件：
+
+- `tools/notdec-native-llvm.cpp`
+  - 第 63-66 行新增 `DisableSummaryRegisterResidueRemoval`。
+  - 第 79-82 行 usage 增加 `--no-summary-register-residue-removal`。
+  - 第 146-152 行解析该 flag。
+  - 第 258-266 行校验该 flag 必须搭配 `--summary-register-ssa-pass`。
+  - 第 803-809 行把该 flag 映射到 `NativeRegisterSummarySSAOptions::EnableResidueRemoval`。
+
+验证：
+
+```text
+git diff --check
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm -j2
+```
+
+Bench2 `wrk -f 0x8300` 对照：
+
+```text
+summary SSA, no residue removal:
+  dead_loads_removed=0
+  dead_stores_removed=0
+  lines=305
+  TIME 0.46s
+  llvm-as / opt -passes=verify passed
+
+summary SSA, residue removal enabled:
+  dead_loads_removed=7
+  dead_stores_removed=23
+  lines=267
+  TIME 0.46s
+  llvm-as / opt -passes=verify passed
+```
+
+复杂度评估：
+
+- 实现效果：7/10。补齐了 native CLI 层的 residue removal 对照 gate。
+- 理解成本：2/10。只是一个显式开关，默认路径不变。
+- 维护成本：2/10。后续 Bench2 audit 可以直接用这个开关区分 SSA rewrite 和 residue 删除效果。

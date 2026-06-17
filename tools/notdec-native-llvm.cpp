@@ -62,6 +62,7 @@ struct CliOptions {
       notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
   bool DisableRegisterSSAPass = false;
   bool UseSummaryRegisterSSAPass = false;
+  bool DisableSummaryRegisterResidueRemoval = false;
   bool PrintRegisterSSASummary = false;
   bool DisableInstCombinePass = false;
   bool DisablePrototypeRecoveryPass = false;
@@ -77,6 +78,7 @@ void printUsage(const char *argv0) {
                "-o <output.ll> [--summary-json-out <path>] "
                "[--no-instcombine-pass] "
                "[--no-register-ssa-pass] [--summary-register-ssa-pass] "
+               "[--no-summary-register-residue-removal] "
                "[--register-ssa-summary] "
                "[--no-prototype-recovery-pass] "
                "[--prototype-recovery-summary] "
@@ -143,6 +145,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
     if (flag == "--summary-register-ssa-pass") {
       options.UseSummaryRegisterSSAPass = true;
+      continue;
+    }
+    if (flag == "--no-summary-register-residue-removal") {
+      options.DisableSummaryRegisterResidueRemoval = true;
       continue;
     }
     if (flag == "--no-instcombine-pass") {
@@ -252,6 +258,12 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
   if (options.DisableRegisterSSAPass && options.UseSummaryRegisterSSAPass) {
     std::cerr << "--summary-register-ssa-pass conflicts with "
                  "--no-register-ssa-pass\n";
+    return std::nullopt;
+  }
+  if (options.DisableSummaryRegisterResidueRemoval &&
+      !options.UseSummaryRegisterSSAPass) {
+    std::cerr << "--no-summary-register-residue-removal requires "
+                 "--summary-register-ssa-pass\n";
     return std::nullopt;
   }
   return options;
@@ -791,7 +803,8 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
   if (options.UseSummaryRegisterSSAPass) {
     notdec::bin2llvm::NativeRegisterSummarySSAOptions passOptions;
     passOptions.EnableRewrite = true;
-    passOptions.EnableResidueRemoval = true;
+    passOptions.EnableResidueRemoval =
+        !options.DisableSummaryRegisterResidueRemoval;
     passOptions.PrintSummary = options.PrintRegisterSSASummary;
     notdec::bin2llvm::runNativeRegisterSummarySSA(module, passOptions);
     if (llvm::verifyModule(module, &llvm::errs())) {
