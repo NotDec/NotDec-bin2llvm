@@ -266,3 +266,100 @@ SummarySSA value binding -> callsite operand
 - internal function signature rewrite。
 - 把旧 Ghidra-style trial/use 链路重新引回来。
 
+## 实现记录：阶段 1 审计和 IR 输入 ABI 修复
+
+阶段 1 先用现有 Bench2 `selected-targets-native` 产物做审计。
+审计时发现一个基础问题：
+
+```text
+notdec-native-llvm 以 .ll/.bc 作为输入时，不会重新 attach notdec.abi metadata。
+```
+
+这会导致 SummarySSA 读不到 ABI input register 顺序，进而不会标记 external call 的参数 store。
+表现是：
+
+```llvm
+store i64 %x, ptr @RDI
+call void @free()
+```
+
+重新跑当前 pipeline 后仍然不会变成：
+
+```llvm
+call void @free(i64 %x)
+```
+
+ELF 输入路径没有这个问题，因为 ELF lowering 后会调用 `attachDefaultAbiMetadata()`。
+
+本次做了一个小修复：
+
+- [tools/notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:702)
+  - 新增 `ensureDefaultAbiMetadata()`。
+  - 如果 module 已经有 `notdec.abi`，不做任何事。
+  - 如果没有，就按默认 x86-64 cspec attach ABI metadata。
+- [tools/notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:922)
+  - IR 输入路径读完 module 后、运行 InstCombine/SummarySSA 前调用 `ensureDefaultAbiMetadata()`。
+
+修复前，用旧 `module-all.ll` 作为输入重新跑当前 pipeline，external call 仍基本没有参数：
+
+```text
+name        noarg external   param external   ABI param stores
+wrk         19               0                3
+memcached   63               0                8
+vsftpd      56               0                31
+libuv       127              0                6
+```
+
+这里 ABI param stores 已经变少，是 SummarySSA 的普通 residue 删除生效了；
+但 external signature rewrite 没有参数证据，所以没有生成带参数 call。
+
+修复后，同样输入重新跑当前 pipeline：
+
+```text
+name        noarg external   param external   ABI param stores   run time
+wrk         12               7                6                  1.15s
+memcached   21               43               19                 2.48s
+vsftpd      50               6                39                 1.70s
+libuv       103              22               20                 3.68s
+```
+
+这次新增了 78 个带参数 external call。
+典型结果：
+
+```llvm
+call void @bind(i64 %2, i64 %addr, i64 %len)
+call void @free(i64 %ptr)
+call void @__assert_fail(i64 ..., i64 ..., i64 ..., i64 ...)
+```
+
+所有四个输出都通过：
+
+```text
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify
+```
+
+剩余问题初步分类：
+
+- `notdec_native_*` 是 internal direct call，当前阶段不改。
+- `free` 这类仍有漏网，多数是跨 basic block 参数准备，例如 store 在前驱块、call 在后继块；这属于阶段 3。
+- `fcntl64` 这类存在同一 external symbol 多个 callsite 参数数量不同：
+  - 一个 callsite 标成 `count=2`。
+  - 另一个 callsite 标成 `count=3`。
+  - 当前 rewrite pass 按保守规则跳过整个 symbol。
+  - 这属于 varargs / known prototype 问题，阶段 1 不修。
+- `open64`、`pthread_*` 等部分无参 external call 需要继续抽样，有些是真没准备连续 ABI 参数，有些可能是跨块准备。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm native_register_summary_ssa_test native_external_call_signature_rewrite_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_external_call_signature_rewrite_test
+```
+
+复杂度评估：
+
+- 实现效果：7/10。修复了 IR 输入路径审计不生效的问题，Bench2 旧产物可以直接复跑新链路。
+- 理解成本：2/10。只是在 CLI 入口补默认 ABI metadata，不改变 pass 内部逻辑。
+- 维护成本：2/10。已有 ABI metadata 时不覆盖，风险很低。

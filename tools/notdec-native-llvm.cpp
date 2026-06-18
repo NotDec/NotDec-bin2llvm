@@ -699,6 +699,15 @@ bool attachDefaultAbiMetadata(
   return true;
 }
 
+bool ensureDefaultAbiMetadata(
+    llvm::Module &module,
+    const notdec::bin2llvm::SleighSpecOptions &specOptions) {
+  if (notdec::bin2llvm::readNativeAbiMetadata(module)) {
+    return true;
+  }
+  return attachDefaultAbiMetadata(module, specOptions);
+}
+
 std::unique_ptr<llvm::Module> buildConfirmedModule(
     llvm::LLVMContext &context,
     const notdec::bin2llvm::NativeProgramState &state,
@@ -908,6 +917,9 @@ int main(int argc, char **argv) {
           readIRModule(options->ElfPath, context, errorMessage);
       if (!module) {
         std::cerr << "failed to parse IR input: " << errorMessage << '\n';
+        return 1;
+      }
+      if (!ensureDefaultAbiMetadata(*module, options->SpecOptions)) {
         return 1;
       }
       if (!runInstCombinePassIfEnabled(*module, *options)) {
