@@ -73,6 +73,15 @@ llvm::StoreInst *storeRegister(llvm::IRBuilder<> &builder,
   return store;
 }
 
+llvm::LoadInst *loadRegister(llvm::IRBuilder<> &builder,
+                             llvm::GlobalVariable *reg,
+                             const std::string &name) {
+  llvm::LoadInst *load = builder.CreateLoad(reg->getValueType(), reg);
+  load->setMetadata("notdec.register.access",
+                    registerAccessMetadata(reg->getContext(), name));
+  return load;
+}
+
 bool expect(bool condition, const char *message) {
   if (!condition) {
     std::cerr << message << '\n';
@@ -290,13 +299,57 @@ bool testCrossBlockPreparedArgIsRewritten() {
          verifyOk(module, "module failed verifier after cross-block rewrite");
 }
 
+bool testExplicitEntryForwardedArgIsRewritten() {
+  llvm::LLVMContext context;
+  llvm::Module module("external-call-entry-forwarded-arg", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *strlenFn = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "strlen", module);
+  llvm::Function *caller = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+
+  llvm::LoadInst *entryArg = loadRegister(builder, rdx, "RDX");
+  llvm::StoreInst *argStore = storeRegister(builder, rdi, entryArg, "RDI");
+  builder.CreateCall(calleeType, strlenFn);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto rewriteSummary =
+      notdec::bin2llvm::runNativeExternalCallSignatureRewrite(module);
+  unsigned oneArgCalls = 0;
+  for (llvm::Instruction &inst : llvm::instructions(caller)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call != nullptr && callsFunctionNamed(*call, "strlen")) {
+      oneArgCalls += call->arg_size() == 1 ? 1 : 0;
+    }
+  }
+
+  return expect(rewriteSummary.CallsRewritten == 1,
+                "entry-forwarded argument was not rewritten") &&
+         expect(oneArgCalls == 1,
+                "entry-forwarded argument did not become call operand") &&
+         expect(argStore->getParent() == nullptr,
+                "entry-forwarded argument store was not removed") &&
+         verifyOk(module,
+                  "module failed verifier after entry-forwarded rewrite");
+}
+
 } // namespace
 
 int main() {
   return testExternalCallSignatureRewrite() &&
                  testUnknownConflictUsesMinimumArgs() &&
                  testKnownFixedPrototypeSkipsIncompleteCallsite() &&
-                 testCrossBlockPreparedArgIsRewritten()
+                 testCrossBlockPreparedArgIsRewritten() &&
+                 testExplicitEntryForwardedArgIsRewritten()
              ? EXIT_SUCCESS
              : EXIT_FAILURE;
 }

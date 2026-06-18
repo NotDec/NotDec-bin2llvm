@@ -823,10 +823,10 @@ private:
       if (value == nullptr || value->getType() != unit->Global->getValueType()) {
         break;
       }
-      if (isEntryInputValue(value)) {
+      llvm::StoreInst *store = findStoreBeforeCall(call, *unit, value);
+      if (isEntryInputValue(value) && store == nullptr) {
         break;
       }
-      llvm::StoreInst *store = findStoreBeforeCall(call, *unit, value);
       bindings.push_back(CallArgStoreBinding{
           store, unit, value, static_cast<unsigned>(bindings.size())});
     }

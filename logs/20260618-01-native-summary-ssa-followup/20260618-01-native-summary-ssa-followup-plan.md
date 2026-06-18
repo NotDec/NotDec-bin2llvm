@@ -470,3 +470,110 @@ call void @epoll_ctl(i64 ..., i64 ..., i64 ..., i64 ...)
 - 实现效果：8/10。解决了同名 external 参数数量冲突直接跳过的问题，也让跨 basic block 参数准备能进入 call operand。
 - 理解成本：5/10。SummarySSA 和 rewrite 之间多了一个内部 operand bundle，但职责比较清楚。
 - 维护成本：4/10。known prototype 表需要后续补充；operand bundle 已在 rewrite 后清理，不会污染最终 IR。
+
+## 实现记录：fortune 样例和 entry 参数显式转发
+
+本次把 Ubuntu noble 的 `fortune-mod` 加到 Bench2 数据集中，并用当前 native 链路跑了 `/usr/games/fortune`。
+Bench2 本身在 `/sn640/NotDec-Exp/Bench2`，不是当前 bin2llvm 仓库的 tracked 文件，这里只记录结果。
+
+新增 Bench2 内容：
+
+- `fortune-mod 1:1.99.1-7.3build1`
+  - `/usr/games/fortune`
+  - `/usr/bin/strfile`
+  - `/usr/bin/unstr`
+- `librecode0 3.6-26`
+  - `/usr/lib/x86_64-linux-gnu/librecode.so.0.0.0`
+- 对应 dbgsym 文件已经解到 `/usr/lib/debug/.build-id/`。
+- `benchmark-targets.tsv` 里新增目标：
+  - `fortune	executable	/usr/games/fortune`
+- `export-bin2llvm-selected-targets.py` 里新增：
+  - `fortune=executable`
+
+第一次跑 fortune 发现一个可修问题：
+
+```llvm
+store i64 %RDX.entry, ptr @RDI
+call void @strlen()
+```
+
+这里 `%RDX.entry` 是函数入口参数，但已经被显式写入 `RDI` 作为 external call 参数。
+旧规则把所有 entry input 都排除，导致这个 `strlen` 没有参数。
+
+本次修复：
+
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSummarySSA.cpp:813)
+  - `callArgStoreBindings()` 先找同 basic block 的显式参数 store。
+  - 如果当前 value 是 entry input，但找到了显式参数 store，就允许作为 active call 参数。
+  - 如果只是裸 entry input，没有显式 store，仍然停止，避免误判满参数。
+- [native_external_call_signature_rewrite_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_external_call_signature_rewrite_test.cpp:76)
+  - 新增 `loadRegister()` 测试 helper。
+- [native_external_call_signature_rewrite_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_external_call_signature_rewrite_test.cpp:302)
+  - 新增 `testExplicitEntryForwardedArgIsRewritten()`。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_ssa_test native_external_call_signature_rewrite_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_external_call_signature_rewrite_test
+```
+
+fortune 重新从二进制跑：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-native-after-entry-forward/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-native-after-entry-forward/summary.json
+```
+
+LLVM 22 验证通过：
+
+```text
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-native-after-entry-forward/fortune.ll -o /tmp/notdec-fortune-native-after-entry-forward/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-native-after-entry-forward/fortune.bc -o /tmp/notdec-fortune-native-after-entry-forward/fortune.verified.bc
+```
+
+效果对比：
+
+```text
+before:
+  external calls with params: 80
+  no-arg external calls: 22
+  stores to register globals: 507
+
+after:
+  external calls with params: 84
+  no-arg external calls: 18
+  stores to register globals: 503
+```
+
+改好的典型结果：
+
+```llvm
+call void @strlen(i64 %RDX.entry)
+call void @strlen(i64 %RSI.entry)
+call void @strrchr(i64 %RSI.entry, i64 45)
+```
+
+fortune 当前仍有明显未消除 register residue：
+
+```text
+register_access_metadata: 508
+loads_from_register_globals: 108
+stores_to_register_globals: 503
+```
+
+主要来源：
+
+- internal `notdec_native_*` call 还没有做 signature rewrite，call 前后仍需要靠 register global 传值。
+- `RSP` 相关 store/load 还没有专门栈指针 pass 消除。
+- 部分 external call 仍无参，例如 `__memcpy_chk()`、`strchr()`、`strncmp()`、`fwrite()`、`strncpy()`、`__snprintf_chk()`，需要继续看是缺少 known prototype、参数准备跨块 store 删除不足，还是前面的值被当前 SummarySSA 判成不可信。
+
+复杂度评估：
+
+- 实现效果：6/10。这个小修能多消除一类真实 external 参数，但 fortune 里剩余 residue 主要已经不是这个点。
+- 理解成本：2/10。规则只是把“entry input 一律排除”改成“显式 store 后允许”。
+- 维护成本：2/10。仍然保留裸 entry input 的保护，误报风险较低。
