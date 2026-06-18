@@ -1,5 +1,5 @@
 #include "notdec-bin2llvm/NativeAbi.h"
-#include "notdec-bin2llvm/passes/NativeHeritageSSA.h"
+#include "notdec-bin2llvm/passes/heritage/NativeHeritageSSA.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"

@@ -4,10 +4,10 @@
 #include "notdec-bin2llvm/NativeAnalysis.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
-#include "notdec-bin2llvm/passes/NativePrototypeRecovery.h"
-#include "notdec-bin2llvm/passes/NativeExternalCallSignatureRewrite.h"
-#include "notdec-bin2llvm/passes/NativeHeritageSSA.h"
-#include "notdec-bin2llvm/passes/NativeRegisterSummarySSA.h"
+#include "notdec-bin2llvm/passes/heritage/NativePrototypeRecovery.h"
+#include "notdec-bin2llvm/passes/summary/NativeExternalCallSignatureRewrite.h"
+#include "notdec-bin2llvm/passes/heritage/NativeHeritageSSA.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
@@ -876,6 +876,9 @@ bool runInstCombinePassIfEnabled(llvm::Module &module,
 bool runPrototypeRecoveryPassIfEnabled(llvm::Module &module,
                                        const CliOptions &options) {
   if (options.DisablePrototypeRecoveryPass) {
+    return true;
+  }
+  if (!options.UseHeritageRegisterSSAPass) {
     return true;
   }
   notdec::bin2llvm::NativePrototypeRecoveryOptions passOptions;

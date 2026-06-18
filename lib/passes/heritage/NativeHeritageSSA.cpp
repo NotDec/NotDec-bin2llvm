@@ -1,4 +1,4 @@
-#include "notdec-bin2llvm/passes/NativeHeritageSSA.h"
+#include "notdec-bin2llvm/passes/heritage/NativeHeritageSSA.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/STLExtras.h"

@@ -64,6 +64,47 @@ The test: Every changed line should trace directly to the user's request.
 bin2LLVM 子项目近期目标：围绕 Bench2 这些真实项目生成 LLVM IR，并且语义要对。
 “能被 `llvm-as` 接受”只是底线，不能代替语义正确。
 
+## 6.1 native 寄存器消除两条链路
+
+当前 native 寄存器消除有两条历史不同的链路，开发时必须先确认自己在改哪一条。
+
+### 新链路：summary
+
+这是当前默认链路，也是后续开发重点。
+
+- 代码目录：
+  - `include/notdec-bin2llvm/passes/summary/`
+  - `lib/passes/summary/`
+- 当前核心 pass：
+  - `NativeRegisterSummary`
+  - `NativeRegisterSummarySSA`
+  - `NativeExternalCallSignatureRewrite`
+- 入口行为：
+  - `notdec-native-llvm` 默认运行 `NativeRegisterSummarySSA`。
+  - 不传 `--heritage-register-ssa-pass` 时，不走旧链路。
+  - 默认 summary 链路不运行 `NativePrototypeRecovery`。
+- 开发要求：
+  - 新的寄存器消除、call signature rewrite、internal function signature rewrite 都应基于 summary 链路的结果。
+  - 不依赖 Ghidra trial/use 风格的 `notdec.prototype.*` metadata。
+  - 计划和实现记录统一放到 `logs/20260616-01-native-prototype-recovery-stage2/`。
+
+### 旧链路：heritage
+
+这是之前模仿 Ghidra heritage/trial/use 思路写出来的链路，保留用于对照和历史测试。
+
+- 代码目录：
+  - `include/notdec-bin2llvm/passes/heritage/`
+  - `lib/passes/heritage/`
+- 当前核心 pass：
+  - `NativeHeritageSSA`
+  - `NativePrototypeRecovery`
+- 入口行为：
+  - 只有显式传 `--heritage-register-ssa-pass` 才运行 `NativeHeritageSSA`。
+  - `NativePrototypeRecovery` 也只在该模式下运行。
+- 开发要求：
+  - 不要把新 summary 链路的新功能写回这里。
+  - `NativePrototypeRecovery` 属于旧链路，不作为新链路 internal signature rewrite 的实现基础。
+
 Bench2 真实项目集合在 `/sn640/NotDec-Exp/Bench2`：
 
 - `rootfs/`：已收集的真实项目二进制和依赖。

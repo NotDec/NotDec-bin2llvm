@@ -1,5 +1,5 @@
 #include "notdec-bin2llvm/NativeAbi.h"
-#include "notdec-bin2llvm/passes/NativePrototypeRecovery.h"
+#include "notdec-bin2llvm/passes/heritage/NativePrototypeRecovery.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/IR/Constants.h"

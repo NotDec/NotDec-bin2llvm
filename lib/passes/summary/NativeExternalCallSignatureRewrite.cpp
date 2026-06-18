@@ -1,4 +1,4 @@
-#include "notdec-bin2llvm/passes/NativeExternalCallSignatureRewrite.h"
+#include "notdec-bin2llvm/passes/summary/NativeExternalCallSignatureRewrite.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/SmallVector.h"

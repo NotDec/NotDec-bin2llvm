@@ -1,5 +1,5 @@
-#include "notdec-bin2llvm/passes/NativeExternalCallSignatureRewrite.h"
-#include "notdec-bin2llvm/passes/NativeRegisterSummarySSA.h"
+#include "notdec-bin2llvm/passes/summary/NativeExternalCallSignatureRewrite.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 #include "notdec-bin2llvm/NativeAbi.h"
 
 #include "llvm/IR/Constants.h"

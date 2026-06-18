@@ -1,5 +1,5 @@
 #include "notdec-bin2llvm/NativeAbi.h"
-#include "notdec-bin2llvm/passes/NativeRegisterSummary.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"

@@ -1,4 +1,4 @@
-#include "notdec-bin2llvm/passes/NativeRegisterSummary.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 
 #include "notdec-bin2llvm/NativeAbi.h"
 

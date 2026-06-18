@@ -1,4 +1,4 @@
-# Native external call signature rewrite plan
+# Native call signature rewrite plan
 
 用户原始要求：
 
@@ -34,7 +34,7 @@ ret void
 
 ## 目标
 
-新增一个独立 pass，暂名：
+新增一个独立 pass，第一版曾暂名：
 
 ```text
 NativeExternalCallSignatureRewrite
@@ -58,6 +58,49 @@ NativeExternalCallSignatureRewrite
 - 不做真实 C 类型恢复。
 - 不根据 printf 这类库函数知识做特殊签名。
 - 不把这个逻辑合进 SummarySSA。
+
+## 当前修订：重写成统一 call signature rewrite
+
+当前 `NativeExternalCallSignatureRewrite` 已经能处理一批 external call，但设计上偏窄：
+
+- 名字限定 external，但新链路真正需要同时处理 external call 和 internal `notdec_native_*` call。
+- internal function signature rewrite 不应该回到旧 `NativePrototypeRecovery`。
+- 继续把 internal 改写塞进现有 external-only 实现，会让 pass 职责变乱。
+
+后续应当在 summary 链路里重写一个统一 pass，建议命名：
+
+```text
+NativeCallSignatureRewrite
+```
+
+代码位置：
+
+```text
+include/notdec-bin2llvm/passes/summary/
+lib/passes/summary/
+```
+
+它消费 `NativeRegisterSummarySSA` 产出的信息，统一负责：
+
+- external declaration call：
+  - 把 ABI register 参数改成 LLVM call operand。
+  - 必要时重建 declaration。
+- internal direct call：
+  - 把 callsite 的 ABI register 参数改成 LLVM call operand。
+  - 重建 callee function type。
+  - 用新 LLVM argument 替换 callee entry register load。
+  - 删除确认只服务于当前 call 的参数 store。
+
+第一版 internal 范围保持保守：
+
+- 只处理 direct call。
+- 只处理 `notdec_native_*` 这类当前 module 内定义的函数。
+- 只处理 register 参数连续前缀。
+- 所有 callsite 都能改，才改 callee。
+- 遇到 address-taken、递归 SCC、indirect call、stack 参数、多返回，先跳过。
+- 返回值 rewrite 可以作为第二步做，不和第一版参数 rewrite 混在一起。
+
+这仍属于本 stage2 计划的一部分，不另开新链路。
 
 ## 为什么不合进 SummarySSA
 
@@ -99,17 +142,15 @@ SummarySSA 先把 register 值整理清楚
 ```text
 InstCombine
   -> NativeRegisterSummarySSA
-  -> NativeExternalCallSignatureRewrite
+  -> NativeCallSignatureRewrite
   -> InstCombine
-  -> PrototypeRecovery
 ```
 
-这里的 PrototypeRecovery 如果还存在旧链路功能，需要后续再收缩职责。
-本计划只关注 external call 的 ABI 参数改写。
+`NativePrototypeRecovery` 属于 heritage 链路。summary 默认链路里不应继续依赖它做 internal signature rewrite。
 
 ### 2. 识别 external call
 
-只处理 direct call：
+external 部分只处理 direct call：
 
 ```llvm
 call void @free()
@@ -117,7 +158,8 @@ tail call void @free()
 ```
 
 callee 必须是 declaration，或者能明确来自 PLT / external relocation 的符号。
-internal function 不在第一版范围内。
+旧 external-only 第一版不处理 internal function。
+统一 rewrite pass 中，internal direct call 应作为同一个 pass 的另一类输入。
 
 遇到 indirect call：
 
@@ -152,8 +194,8 @@ store i64 %v, ptr @RDI
 
 ### 4. 扫描边界
 
-第一版只做同 basic block 反向扫描。
-这样简单，也容易验证。
+旧 external-only 第一版只做同 basic block 反向扫描。
+当前 SummarySSA 已经会在 callsite 上记录 ABI 参数 value，后续统一 pass 应直接消费 SummarySSA 的 value binding，不在 rewrite pass 里重新写跨 basic block 数据流。
 
 扫描遇到这些情况停止：
 
@@ -316,10 +358,10 @@ notdec.register.summary_ssa.call_arg = { register=RDI, value/store id=... }
 
 已完成这条独立链路的最小实现：
 
-- `include/notdec-bin2llvm/passes/NativeExternalCallSignatureRewrite.h`
-- `lib/passes/NativeExternalCallSignatureRewrite.cpp`
-- `include/notdec-bin2llvm/passes/NativeRegisterSummarySSA.h`
-- `lib/passes/NativeRegisterSummarySSA.cpp`
+- `include/notdec-bin2llvm/passes/summary/NativeCallSignatureRewrite.h`
+- `lib/passes/summary/NativeCallSignatureRewrite.cpp`
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
 - `tools/notdec-native-llvm.cpp`
 - `lib/CMakeLists.txt`
 - `CMakeLists.txt`
@@ -330,7 +372,7 @@ notdec.register.summary_ssa.call_arg = { register=RDI, value/store id=... }
 
 - SummarySSA 会给 external ABI 参数 call 标出 `notdec.register.summary_ssa.call_args`。
 - 对应参数准备 store 会标成 `notdec.register.summary_ssa.call_arg_store`。
-- `NativeExternalCallSignatureRewrite` 会把它们改成 LLVM call operand。
+- `NativeCallSignatureRewrite` 会把它们改成 LLVM call operand。
 - external declaration 会改成带参数签名。
 - 已消费的 register store 会删掉。
 

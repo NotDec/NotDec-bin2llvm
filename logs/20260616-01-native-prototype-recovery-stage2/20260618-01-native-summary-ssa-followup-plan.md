@@ -371,31 +371,31 @@ signature rewrite 不再自己只看同一 basic block 里有没有参数 store�
 
 具体改动：
 
-- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSummarySSA.cpp:743)
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:743)
   - `markExternalCallArgumentStores()` 先收集 external call，再给 call 添加 `notdec.register.summary_ssa.call_arg_values` operand bundle。
   - 继续保留 `notdec.register.summary_ssa.call_args` metadata，表示连续 ABI 参数前缀长度。
-- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSummarySSA.cpp:813)
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:813)
   - `callArgStoreBindings()` 按 ABI 参数寄存器顺序调用 `readValueBefore()`。
   - 因为 `readValueBefore()` 会走 `readBlockEntry()` / `readBlockExit()`，所以可以跨 basic block 找 call 前寄存器当前值。
   - 如果值只是函数入口自动 load 出来的 entry input，就停止，避免把所有 external call 都误判成满参数。
-- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSummarySSA.cpp:836)
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:836)
   - `findStoreBeforeCall()` 只负责找同 basic block 且 value 对得上的 store。
   - 找不到 store 时仍然可以改 call operand，但不删除跨块 store。
-- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeExternalCallSignatureRewrite.cpp:57)
+- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeExternalCallSignatureRewrite.cpp:57)
   - 新增常见 external 原型表，只记录参数数量和 vararg，不做 C 类型恢复。
   - 覆盖常见 libc 和 Bench2 里常见的外部符号，例如 `free`、`malloc`、`memcpy`、`strcmp`、`read`、`write`、`fcntl64`、`__printf_chk`。
-- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeExternalCallSignatureRewrite.cpp:221)
+- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeExternalCallSignatureRewrite.cpp:221)
   - `collectCallArgBindings()` 改为从 operand bundle 取参数 value。
   - store 只作为可删除证据；没有 store 不影响 call operand 改写。
-- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeExternalCallSignatureRewrite.cpp:349)
+- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeExternalCallSignatureRewrite.cpp:349)
   - `resolveSymbolPlan()` 对已知 external 使用固定参数数量。
   - 未知 external 如果同名不同 callsite 参数数量不同，打印 warning，取最小参数数量。
   - 取最小时，被截断的额外参数 store 不删除。
-- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeExternalCallSignatureRewrite.cpp:466)
+- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeExternalCallSignatureRewrite.cpp:466)
   - `rewriteCall()` 只保留对外有意义的 operand bundle，内部参数 value bundle 不写入最终 IR。
-- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeExternalCallSignatureRewrite.cpp:498)
+- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeExternalCallSignatureRewrite.cpp:498)
   - `stripCallArgValueBundles()` 清理未被改写 call 上残留的内部 operand bundle。
-- [NativeExternalCallSignatureRewrite.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/NativeExternalCallSignatureRewrite.h:26)
+- [NativeExternalCallSignatureRewrite.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/summary/NativeExternalCallSignatureRewrite.h:26)
   - summary 增加 known prototype、minimum args、known args 不足的计数。
 - [native_external_call_signature_rewrite_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_external_call_signature_rewrite_test.cpp:146)
   - 增加未知 external 冲突取最小参数数量测试。
@@ -502,7 +502,7 @@ call void @strlen()
 
 本次修复：
 
-- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSummarySSA.cpp:813)
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:813)
   - `callArgStoreBindings()` 先找同 basic block 的显式参数 store。
   - 如果当前 value 是 entry input，但找到了显式参数 store，就允许作为 active call 参数。
   - 如果只是裸 entry input，没有显式 store，仍然停止，避免误判满参数。
@@ -577,3 +577,97 @@ stores_to_register_globals: 503
 - 实现效果：6/10。这个小修能多消除一类真实 external 参数，但 fortune 里剩余 residue 主要已经不是这个点。
 - 理解成本：2/10。规则只是把“entry input 一律排除”改成“显式 store 后允许”。
 - 维护成本：2/10。仍然保留裸 entry input 的保护，误报风险较低。
+
+## 实现记录：拆分 heritage / summary 代码目录
+
+本次只做目录和 pipeline 边界整理，不改变 summary pass 内部算法。
+
+目标是防止旧 Ghidra-style 链路和新 summary 链路继续混在同一个 `passes/` 平铺目录里。
+
+具体改动：
+
+- 旧链路移动到 `heritage/`：
+  - [NativeHeritageSSA.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/heritage/NativeHeritageSSA.h:1)
+  - [NativePrototypeRecovery.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/heritage/NativePrototypeRecovery.h:1)
+  - [NativeHeritageSSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/heritage/NativeHeritageSSA.cpp:1)
+  - [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/heritage/NativePrototypeRecovery.cpp:1)
+- 新链路移动到 `summary/`：
+  - [NativeRegisterSummary.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/summary/NativeRegisterSummary.h:1)
+  - [NativeRegisterSummarySSA.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h:1)
+  - [NativeExternalCallSignatureRewrite.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/summary/NativeExternalCallSignatureRewrite.h:1)
+  - [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:1)
+  - [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1)
+  - [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeExternalCallSignatureRewrite.cpp:1)
+- [tools/notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:812)
+  - 默认仍运行 summary 链路。
+  - 只有显式 `--heritage-register-ssa-pass` 才运行 `NativeHeritageSSA`。
+- [tools/notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:876)
+  - `NativePrototypeRecovery` 现在只在 heritage 模式下运行。
+  - 默认 summary 链路不再混入旧 prototype recovery metadata。
+- [AGENTS.md](/sn640/NotDec/external/NotDec-bin2llvm/AGENTS.md:65)
+  - 增加 heritage / summary 两条链路的说明。
+- [README.md](/sn640/NotDec/external/NotDec-bin2llvm/logs/20260616-01-native-prototype-recovery-stage2/README.md:1)
+  - 汇总 stage2 目标、原始 prompt 和文件索引。
+
+同时把原来三个单文件日志目录合并到：
+
+```text
+logs/20260616-01-native-prototype-recovery-stage2/
+```
+
+被合并的文件：
+
+```text
+20260616-02-native-register-summary-scc-fixpoint-plan.md
+20260617-01-native-external-call-signature-rewrite-plan.md
+20260618-01-native-summary-ssa-followup-plan.md
+```
+
+signature rewrite 计划也同步修正：
+
+- 当前 `NativeExternalCallSignatureRewrite` 只是已有阶段实现。
+- 后续应重写成 summary 链路下统一的 `NativeCallSignatureRewrite`。
+- 新 pass 同时处理 external declaration call 和 internal `notdec_native_*` direct call。
+- 不基于旧 `NativePrototypeRecovery` 做 internal function signature rewrite。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test native_external_call_signature_rewrite_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_external_call_signature_rewrite_test
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_effects_test native_prototype_recovery_test native_instcombine_metadata_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_effects_test
+```
+
+fortune 同口径验证：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-chain-split/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-chain-split/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-chain-split/fortune.ll -o /tmp/notdec-fortune-chain-split/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-chain-split/fortune.bc -o /tmp/notdec-fortune-chain-split/fortune.verified.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: 10.21s
+summary_ssa_call_args_metadata: 112
+prototype_recovered_metadata: 0
+register_access_metadata: 508
+loads_from_register_globals: 108
+stores_to_register_globals: 503
+```
+
+`prototype_recovered_metadata: 0` 说明默认 summary 链路已经不再混入旧 `NativePrototypeRecovery` 输出。
+
+复杂度评估：
+
+- 实现效果：8/10。代码目录和默认 pipeline 都明确区分了新旧链路。
+- 理解成本：2/10。只是目录分组和 include 路径变化。
+- 维护成本：2/10。后续新功能可以直接放 summary 目录，旧链路留在 heritage 目录。

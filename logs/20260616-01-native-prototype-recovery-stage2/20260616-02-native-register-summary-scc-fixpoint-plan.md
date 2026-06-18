@@ -767,10 +767,10 @@ Bench2 判断标准：
 
 改动文件：
 
-- `include/notdec-bin2llvm/passes/NativeRegisterSummary.h`
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummary.h`
   - 第 15-60 行新增 `NativeRegisterSummaryOptions`、`NativeRegisterSummaryRegister`、`NativeRegisterSummaryFunction`、`NativeRegisterSummary`。
   - 第 62-67 行新增 `runNativeRegisterSummary()` 和 `printNativeRegisterSummary()`。
-- `lib/passes/NativeRegisterSummary.cpp`
+- `lib/passes/summary/NativeRegisterSummary.cpp`
   - 第 28-88 行新增 register unit、`Cell { mayEntry, mayNonEntry, readEntry }`、`State`、`FunctionEffect`、`FunctionDemand`、ABI fallback 数据。
   - 第 90-224 行新增 register metadata 识别和 ABI metadata 读取。
   - 第 247-287 行实现 `joinCell()` / `joinState()` / register read-write transfer，其中 `joinState()` 处理稀疏 map 的默认 untouched 路径。
@@ -785,7 +785,7 @@ Bench2 判断标准：
     - `notdec.register.summary.demanded_returns`
   - 第 758-858 行生成公开 summary 和打印统计。
 - `lib/CMakeLists.txt`
-  - 第 10 行把 `passes/NativeRegisterSummary.cpp` 加入 `notdec-bin2llvm-core`。
+  - 第 10 行把 `passes/summary/NativeRegisterSummary.cpp` 加入 `notdec-bin2llvm-core`。
 - `CMakeLists.txt`
   - 第 201-214 行新增 `native_register_summary_test` 和 `notdec.native_register_summary.fixpoint`。
 - `tests/native_register_summary_test.cpp`
@@ -820,11 +820,11 @@ git diff --check
 
 改动文件：
 
-- `include/notdec-bin2llvm/passes/NativeRegisterSummarySSA.h`
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h`
   - 第 14-18 行新增 `NativeRegisterSummarySSAOptions`。
   - 第 20-47 行新增函数级和模块级 summary 计数。
   - 第 49-53 行新增 `runNativeRegisterSummarySSA()` 和打印接口。
-- `lib/passes/NativeRegisterSummarySSA.cpp`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
   - 第 30-67 行新增 register unit、summary fact、ABI fact、call effect 和 SSA key 数据结构。
   - 第 69-210 行新增 metadata 读取、register load/store 识别、ABI fallback 读取、summary fact 映射。
   - 第 212-615 行新增 `FunctionBuilder`，实现只面向完整 backing register 的 SSA 构建。
@@ -833,7 +833,7 @@ git diff --check
   - 第 489-563 行按 callee summary / ABI 判断 preserved、demanded return、clobber、unknown call effect。
   - 第 633-661 行 `runNativeRegisterSummarySSA()` 先运行 `runNativeRegisterSummary()`，再消费 summary 构建 SSA。
 - `lib/CMakeLists.txt`
-  - 第 11 行把 `passes/NativeRegisterSummarySSA.cpp` 加入 `notdec-bin2llvm-core`。
+  - 第 11 行把 `passes/summary/NativeRegisterSummarySSA.cpp` 加入 `notdec-bin2llvm-core`。
 - `CMakeLists.txt`
   - 第 216-229 行新增 `native_register_summary_ssa_test` 和 `notdec.native_register_summary.ssa`。
 - `tests/native_register_summary_ssa_test.cpp`
@@ -879,10 +879,10 @@ git diff --check
 
 改动文件：
 
-- `include/notdec-bin2llvm/passes/NativeRegisterSummarySSA.h`
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h`
   - 第 14-19 行新增 `EnableResidueRemoval` 开关。
   - 第 21-35 行、37-51 行新增 `DeadLoadsRemoved` / `DeadStoresRemoved` 计数。
-- `lib/passes/NativeRegisterSummarySSA.cpp`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
   - 第 223-234 行在 SSA rewrite 后、删 PHI 前调用 residue 删除。
   - 第 247-256 行新增 `ReplacedLoads` 缓存。
   - 第 283-301 行 `rewriteLoads()` 记录已替换 load。
@@ -1004,7 +1004,7 @@ module verification failed after summary register SSA pass
 
 改动文件：
 
-- `lib/passes/NativeRegisterSummarySSA.cpp`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
   - 第 453-471 行 `completePhi()` 改成按 predecessor block 的出现次数补 incoming，允许同一 block 多条边。
   - 第 476-508 行 `simplifyPhi()` 只在 PHI incoming 数量等于 `pred_size(parent)` 后才删除 trivial PHI。
   - 第 510-528 行 `finalizePendingPhis()` 改成迭代补齐未完成 PHI，避免补一个 PHI 时新建的 pending PHI 被漏掉。
@@ -1074,7 +1074,7 @@ memcached summary SSA: 179.46s, 218409 lines, llvm-as/opt verify passed
 
 改动文件：
 
-- `lib/passes/NativeRegisterSummarySSA.cpp`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
   - 第 52-57 行 `AbiFacts` 增加 `Inputs`。
   - 第 159-170 行 `collectAbiFacts()` 读取 ABI input registers。
   - 第 233-239 行 `run()` 改成调用新的 `removeDeadStoresByLiveness()`。
@@ -1308,15 +1308,15 @@ NativeRegisterSummary
 
 改动文件：
 
-- `include/notdec-bin2llvm/passes/NativeHeritageSSA.h:14` 定义旧链路的
+- `include/notdec-bin2llvm/passes/heritage/NativeHeritageSSA.h:14` 定义旧链路的
   `NativeHeritageSSAOptions`；第 19 行和第 64 行定义旧链路 summary 结构；第
   110-117 行说明该 pass 是旧 Ghidra-style fallback，并导出
   `runNativeHeritageSSA()` / `printNativeHeritageSSASummary()`。
-- `lib/passes/NativeHeritageSSA.cpp:1` 改为包含 `NativeHeritageSSA.h`；第
+- `lib/passes/heritage/NativeHeritageSSA.cpp:1` 改为包含 `NativeHeritageSSA.h`；第
   2790-2818 行把旧入口改名为 `runNativeHeritageSSA()`；第 2821-2823 行把
   summary 标题改成 `native heritage ssa summary`。
 - `lib/CMakeLists.txt:12` 把旧源文件从 `passes/NativeRegisterSSA.cpp` 改为
-  `passes/NativeHeritageSSA.cpp`。
+  `passes/heritage/NativeHeritageSSA.cpp`。
 - `tools/notdec-native-llvm.cpp:63-65` 把 CLI 状态改成
   `UseHeritageRegisterSSAPass`；第 80-82 行 usage 增加
   `--heritage-register-ssa-pass`，保留 `--summary-register-ssa-pass` 作为兼容空
@@ -1425,11 +1425,11 @@ load 时，把 intrinsic 当成 external ABI call，并为 ABI output `RAX` 生�
 
 改动文件：
 
-- `lib/passes/NativeRegisterSummarySSA.cpp:159-165` 新增 `isAnalyzableCall()`，统一跳过
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:159-165` 新增 `isAnalyzableCall()`，统一跳过
   `notdec.register.*` helper 和 LLVM intrinsic。
-- `lib/passes/NativeRegisterSummarySSA.cpp:435-439` 在 register store liveness 里使用
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:435-439` 在 register store liveness 里使用
   `isAnalyzableCall()`，intrinsic 不再 kill ABI output，也不读取 ABI input。
-- `lib/passes/NativeRegisterSummarySSA.cpp:483-487` 在 `readValueBefore()` 里使用
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:483-487` 在 `readValueBefore()` 里使用
   `isAnalyzableCall()`，intrinsic 不再触发 `callEffect()`，也不会生成
   `summary_return` / `summary_clobber` helper。
 - `tests/native_register_summary_ssa_test.cpp:8` 引入 LLVM intrinsic 头文件。
