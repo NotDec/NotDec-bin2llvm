@@ -85,8 +85,9 @@ RDI, RSI, RDX, RCX, R8, R9
 
 - 只接受连续前缀参数。
 - `RDI` 找不到，就不因为找到 `RSI` 而生成第二个参数。
-- 同一个 external symbol 的可改 callsite 参数个数和类型必须一致。
-- 冲突时跳过该 symbol，不做猜测。
+- 常见 libc / external symbol 优先用已知 fixed 参数数量。
+- 未知 external symbol 如果同名 callsite 参数数量不同，打印 warning，然后取最小参数数量。
+- 取最小时不能删除被截断掉的额外参数 store。
 
 需要补的测试：
 
@@ -260,7 +261,6 @@ SummarySSA value binding -> callsite operand
 
 - stack 参数。
 - varargs 精确恢复。
-- libc known prototype 特判。
 - partial register 精细建模。
 - 一般内存 alias。
 - internal function signature rewrite。
@@ -363,3 +363,110 @@ cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm native_regi
 - 实现效果：7/10。修复了 IR 输入路径审计不生效的问题，Bench2 旧产物可以直接复跑新链路。
 - 理解成本：2/10。只是在 CLI 入口补默认 ABI metadata，不改变 pass 内部逻辑。
 - 维护成本：2/10。已有 ABI metadata 时不覆盖，风险很低。
+
+## 实现记录：阶段 2/3 external 参数绑定和冲突处理
+
+本次把 external 参数数量推理前移到 SummarySSA。
+signature rewrite 不再自己只看同一 basic block 里有没有参数 store，而是消费 SummarySSA 给 callsite 绑定好的 ABI 参数 value。
+
+具体改动：
+
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSummarySSA.cpp:743)
+  - `markExternalCallArgumentStores()` 先收集 external call，再给 call 添加 `notdec.register.summary_ssa.call_arg_values` operand bundle。
+  - 继续保留 `notdec.register.summary_ssa.call_args` metadata，表示连续 ABI 参数前缀长度。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSummarySSA.cpp:813)
+  - `callArgStoreBindings()` 按 ABI 参数寄存器顺序调用 `readValueBefore()`。
+  - 因为 `readValueBefore()` 会走 `readBlockEntry()` / `readBlockExit()`，所以可以跨 basic block 找 call 前寄存器当前值。
+  - 如果值只是函数入口自动 load 出来的 entry input，就停止，避免把所有 external call 都误判成满参数。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeRegisterSummarySSA.cpp:836)
+  - `findStoreBeforeCall()` 只负责找同 basic block 且 value 对得上的 store。
+  - 找不到 store 时仍然可以改 call operand，但不删除跨块 store。
+- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeExternalCallSignatureRewrite.cpp:57)
+  - 新增常见 external 原型表，只记录参数数量和 vararg，不做 C 类型恢复。
+  - 覆盖常见 libc 和 Bench2 里常见的外部符号，例如 `free`、`malloc`、`memcpy`、`strcmp`、`read`、`write`、`fcntl64`、`__printf_chk`。
+- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeExternalCallSignatureRewrite.cpp:221)
+  - `collectCallArgBindings()` 改为从 operand bundle 取参数 value。
+  - store 只作为可删除证据；没有 store 不影响 call operand 改写。
+- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeExternalCallSignatureRewrite.cpp:349)
+  - `resolveSymbolPlan()` 对已知 external 使用固定参数数量。
+  - 未知 external 如果同名不同 callsite 参数数量不同，打印 warning，取最小参数数量。
+  - 取最小时，被截断的额外参数 store 不删除。
+- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeExternalCallSignatureRewrite.cpp:466)
+  - `rewriteCall()` 只保留对外有意义的 operand bundle，内部参数 value bundle 不写入最终 IR。
+- [NativeExternalCallSignatureRewrite.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/NativeExternalCallSignatureRewrite.cpp:498)
+  - `stripCallArgValueBundles()` 清理未被改写 call 上残留的内部 operand bundle。
+- [NativeExternalCallSignatureRewrite.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/NativeExternalCallSignatureRewrite.h:26)
+  - summary 增加 known prototype、minimum args、known args 不足的计数。
+- [native_external_call_signature_rewrite_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_external_call_signature_rewrite_test.cpp:146)
+  - 增加未知 external 冲突取最小参数数量测试。
+- [native_external_call_signature_rewrite_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_external_call_signature_rewrite_test.cpp:197)
+  - 增加已知 fixed prototype 跳过参数不足 callsite 的测试。
+- [native_external_call_signature_rewrite_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_external_call_signature_rewrite_test.cpp:249)
+  - 增加跨 basic block 参数准备的端到端测试。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_ssa_test native_external_call_signature_rewrite_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/native_external_call_signature_rewrite_test
+```
+
+真实样例重新从二进制跑 `/usr/bin/wrk`：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk \
+  --all-confirmed \
+  -o /tmp/notdec-summaryssa-callsite-binding-smoke/wrk.ll \
+  --summary-json-out /tmp/notdec-summaryssa-callsite-binding-smoke/wrk-summary.json
+```
+
+结果：
+
+```text
+wrk native pipeline: 45.36s
+call_arg_values_bundle_leftover: 0
+call_args_metadata: 211
+external_param_calls: 211
+```
+
+LLVM 22 验证通过：
+
+```text
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-summaryssa-callsite-binding-smoke/wrk.ll -o /tmp/notdec-summaryssa-callsite-binding-smoke/wrk.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-summaryssa-callsite-binding-smoke/wrk.bc -o /tmp/notdec-summaryssa-callsite-binding-smoke/wrk.verified.bc
+```
+
+`wrk` 中看到的冲突 warning：
+
+```text
+lua_newuserdata counts={3,6}; using minimum 3
+lua_getfield counts={3,4,6}; using minimum 3
+lua_pushlstring counts={3,6}; using minimum 3
+lua_setfield counts={3,6}; using minimum 3
+lua_pushnil counts={1,6}; using minimum 1
+OPENSSL_init_ssl counts={2,3}; using minimum 2
+lua_settop counts={3,6}; using minimum 3
+epoll_ctl counts={4,6}; using minimum 4
+```
+
+典型改写结果：
+
+```llvm
+call void @memcpy(i64 %RAX.return, i64 %unique_4a00_8, i64 %11)
+call void @free(i64 %RAX.return)
+call void @epoll_ctl(i64 ..., i64 ..., i64 ..., i64 ...)
+```
+
+仍然保守处理的情况：
+
+- 只从 entry input 直接传给 external call 的寄存器暂时不算实参，避免把所有 ABI 参数寄存器都算进去。
+- 跨 basic block 可以改 call operand，但不删除跨块 store。
+- 未知 external 的 vararg 仍不精确，只按当前可证明的连续 ABI 参数前缀处理。
+
+复杂度评估：
+
+- 实现效果：8/10。解决了同名 external 参数数量冲突直接跳过的问题，也让跨 basic block 参数准备能进入 call operand。
+- 理解成本：5/10。SummarySSA 和 rewrite 之间多了一个内部 operand bundle，但职责比较清楚。
+- 维护成本：4/10。known prototype 表需要后续补充；operand bundle 已在 rewrite 后清理，不会污染最终 IR。

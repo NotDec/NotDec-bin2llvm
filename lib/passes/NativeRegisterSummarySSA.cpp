@@ -28,6 +28,9 @@
 namespace notdec::bin2llvm {
 namespace {
 
+constexpr llvm::StringLiteral CallArgValuesBundleTag =
+    "notdec.register.summary_ssa.call_arg_values";
+
 struct RegisterUnit {
   llvm::GlobalVariable *Global = nullptr;
   std::string Name;
@@ -72,6 +75,7 @@ using CallValueKey =
 struct CallArgStoreBinding {
   llvm::StoreInst *Store = nullptr;
   const RegisterUnit *Unit = nullptr;
+  llvm::Value *Value = nullptr;
   unsigned Index = 0;
 };
 
@@ -252,8 +256,8 @@ public:
     collectAccesses();
     if (Options.EnableRewrite) {
       rewriteLoads();
-      finalizePendingPhis();
       markExternalCallArgumentStores();
+      finalizePendingPhis();
       if (Options.EnableResidueRemoval) {
         removeDeadReplacedLoads();
         removeDeadStoresByLiveness();
@@ -482,8 +486,8 @@ private:
   llvm::Value *readValueBefore(llvm::BasicBlock &block,
                                const RegisterUnit &unit,
                                llvm::Instruction *before) {
-    for (auto it = llvm::BasicBlock::reverse_iterator(before);
-         it != block.rend(); ++it) {
+    for (auto it = before->getIterator(); it != block.begin();) {
+      --it;
       llvm::Instruction &inst = *it;
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
         RegisterAccess access = registerStore(*store, Units);
@@ -737,26 +741,58 @@ private:
   }
 
   void markExternalCallArgumentStores() {
+    std::vector<llvm::CallBase *> calls;
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
       auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
       if (call == nullptr || !isDirectExternalCall(*call)) {
         continue;
       }
+      calls.push_back(call);
+    }
 
+    for (llvm::CallBase *call : calls) {
+      if (call->getParent() == nullptr) {
+        continue;
+      }
       std::vector<CallArgStoreBinding> bindings = callArgStoreBindings(*call);
       if (bindings.empty()) {
         continue;
       }
 
+      call = addCallArgValueBundle(*call, bindings);
       call->setMetadata("notdec.register.summary_ssa.call_args",
                         callArgsNode(bindings.size()));
       for (const CallArgStoreBinding &binding : bindings) {
-        binding.Store->setMetadata(
-            "notdec.register.summary_ssa.call_arg_store",
-            callArgStoreNode(*binding.Unit, binding.Index));
-        ++Summary.CallArgStoresMarked;
+        if (binding.Store != nullptr) {
+          binding.Store->setMetadata(
+              "notdec.register.summary_ssa.call_arg_store",
+              callArgStoreNode(*binding.Unit, binding.Index));
+          ++Summary.CallArgStoresMarked;
+        }
       }
     }
+  }
+
+  llvm::CallBase *
+  addCallArgValueBundle(llvm::CallBase &call,
+                        const std::vector<CallArgStoreBinding> &bindings) {
+    std::vector<llvm::Value *> values;
+    values.reserve(bindings.size());
+    for (const CallArgStoreBinding &binding : bindings) {
+      values.push_back(binding.Value);
+    }
+    llvm::OperandBundleDef bundle(CallArgValuesBundleTag.str(), values);
+    uint32_t tag =
+        Function.getContext().getOrInsertBundleTag(CallArgValuesBundleTag)
+            ->getValue();
+    llvm::CallBase *newCall =
+        llvm::CallBase::addOperandBundle(&call, tag, bundle, call.getIterator());
+    if (!call.use_empty()) {
+      call.replaceAllUsesWith(newCall);
+      newCall->takeName(&call);
+    }
+    call.eraseFromParent();
+    return newCall;
   }
 
   bool isDirectExternalCall(const llvm::CallBase &call) const {
@@ -782,18 +818,24 @@ private:
       if (unit == nullptr) {
         break;
       }
-      llvm::StoreInst *store = findStoreBeforeCall(call, *unit);
-      if (store == nullptr) {
+      llvm::Value *value =
+          resolve(readValueBefore(*call.getParent(), *unit, &call));
+      if (value == nullptr || value->getType() != unit->Global->getValueType()) {
         break;
       }
+      if (isEntryInputValue(value)) {
+        break;
+      }
+      llvm::StoreInst *store = findStoreBeforeCall(call, *unit, value);
       bindings.push_back(CallArgStoreBinding{
-          store, unit, static_cast<unsigned>(bindings.size())});
+          store, unit, value, static_cast<unsigned>(bindings.size())});
     }
     return bindings;
   }
 
   llvm::StoreInst *findStoreBeforeCall(llvm::CallBase &call,
-                                       const RegisterUnit &unit) const {
+                                       const RegisterUnit &unit,
+                                       llvm::Value *value) {
     for (auto it = call.getIterator(); it != call.getParent()->begin();) {
       --it;
       llvm::Instruction &inst = *it;
@@ -801,7 +843,7 @@ private:
         RegisterAccess access = registerStore(*store, Units);
         if (access.Unit != nullptr && access.Unit->Global == unit.Global &&
             access.IsStorageValue) {
-          return store;
+          return resolve(store->getValueOperand()) == value ? store : nullptr;
         }
         continue;
       }
@@ -829,6 +871,16 @@ private:
       }
     }
     return nullptr;
+  }
+
+  bool isEntryInputValue(llvm::Value *value) {
+    value = resolve(value);
+    for (const auto &[global, load] : EntryInputs) {
+      if (resolve(load) == value) {
+        return true;
+      }
+    }
+    return false;
   }
 
   llvm::Value *callValue(llvm::CallBase &call, const RegisterUnit &unit,

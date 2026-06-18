@@ -29,6 +29,9 @@ struct NativeExternalCallSignatureRewriteSummary {
   uint64_t CallsRewritten = 0;
   uint64_t StoresRemoved = 0;
   uint64_t SymbolsSkippedForConflict = 0;
+  uint64_t SymbolsResolvedWithKnownPrototype = 0;
+  uint64_t SymbolsResolvedWithMinimumArgs = 0;
+  uint64_t CallsSkippedForMissingKnownArgs = 0;
   std::vector<NativeExternalCallSignatureRewriteFunctionSummary> Functions;
 };
 

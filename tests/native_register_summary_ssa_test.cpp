@@ -5,6 +5,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
@@ -391,17 +392,23 @@ bool testAbiInputStoreBeforeCallIsKept() {
   llvm::StoreInst *argStore =
       storeRegister(builder, rdi,
                     llvm::ConstantInt::get(rdi->getValueType(), 42), "RDI");
-  llvm::CallInst *call = builder.CreateCall(calleeType, callee);
+  builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool callMarked = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call != nullptr &&
+        call->getMetadata("notdec.register.summary_ssa.call_args") != nullptr) {
+      callMarked = true;
+    }
+  }
   return expect(summary.DeadStoresRemoved == 0,
                 "ABI input store before call was removed") &&
          expect(summary.CallArgStoresMarked == 1,
                 "ABI input store before call was not marked") &&
-         expect(call->getMetadata("notdec.register.summary_ssa.call_args") !=
-                    nullptr,
-                "ABI input call was not marked") &&
+         expect(callMarked, "ABI input call was not marked") &&
          expect(argStore->getMetadata(
                     "notdec.register.summary_ssa.call_arg_store") != nullptr,
                 "ABI input store call-arg metadata missing") &&
