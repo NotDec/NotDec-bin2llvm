@@ -2,6 +2,7 @@
 
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
+#include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Attributes.h"
@@ -1618,6 +1619,13 @@ runNativeRegisterSummarySSA(llvm::Module &module,
                             const NativeRegisterSummarySSAOptions &options) {
   NativeRegisterSummaryOptions summaryOptions;
   summaryOptions.AttachMetadata = true;
+  NativeStackFrameRewriteSummary stackFrameSummary =
+      runNativeStackFrameRewrite(module);
+  NativeRegisterSummarySSAOptions effectiveOptions = options;
+  effectiveOptions.IgnoredRegisters.insert(
+      stackFrameSummary.IgnoredRegisters.begin(),
+      stackFrameSummary.IgnoredRegisters.end());
+  summaryOptions.IgnoredRegisters = effectiveOptions.IgnoredRegisters;
   NativeRegisterSummary registerSummary =
       runNativeRegisterSummary(module, summaryOptions);
   std::map<llvm::Function *, FunctionSummaryFacts> facts =

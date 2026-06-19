@@ -1987,3 +1987,94 @@ summary_return_helpers: 55 -> 43
 - 实现效果：6/10。能减少一批 callee-saved 残留，但对函数范围污染无能为力。
 - 理解成本：5/10。多了一个很小的 frame-local 状态，但仍局限在 entry-SP 固定槽。
 - 维护成本：5/10。关键风险是不要把一般内存保存误当 register restore，目前靠固定 entry-SP 和 ABI `Unaffected` 限制范围。
+
+## 后续修复：Summary 链路自己的 RSP/RBP 栈帧预处理
+
+问题：
+
+前一版 saved-register matcher 只看 `RSP.entry + constant`。这能识别保存槽，但 RSP/RBP
+本身仍然会进入 register summary 和 SummarySSA，导致栈指针相关 helper 或 entry value 残留。
+
+旧 Ghidra 模仿链路里对应逻辑在：
+
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/heritage/NativePrototypeRecovery.cpp:3430)
+  - `replaceStoredFramePointerRegisterLoads()`：只传播“RBP 刚被写成 RSP-derived value”的情况。
+- [NativePrototypeRecovery.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/heritage/NativePrototypeRecovery.cpp:3891)
+  - `rewriteStaticStackMemoryAccesses()`：把固定 `RSP + negative constant` 的本地栈访问改成 `notdec_stack.native` alloca。
+
+新链路没有直接复用旧 pass，避免 Summary 链路继续依赖 Heritage/PrototypeRecovery。这里新增一个
+Summary 专用的小 pass，放在 `runNativeRegisterSummarySSA()` 开头、`runNativeRegisterSummary()` 之前。
+
+改动文件：
+
+- [NativeStackFrame.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/summary/NativeStackFrame.h:14)
+  - 新增 `NativeStackFrameRewriteOptions` / `NativeStackFrameRewriteSummary`。
+  - 明确范围：只处理 ABI stack pointer 的固定负偏移，不处理 caller stack 参数、alias、通用内存。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:98)
+  - `valueUsesRegisterLoad()` 判断某个值是否来自指定寄存器 load。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:135)
+  - `stackOffsetFromBase()` 只解析 `base +/- constant`。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:264)
+  - `replaceFramePointerLoads()` 识别 `RBP = RSP-derived` 后替换后续 RBP load。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:333)
+  - `rewriteFunctionStackAccesses()` 把固定负偏移本地栈访问改成 `notdec_stack.native` alloca。
+  - 这里不提前删除 dead stack store，因为 `entry register -> stack slot` 是后续 saved-register matcher 的证据。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:440)
+  - `runNativeStackFrameRewrite()` 返回要从 register summary 里排除的寄存器集合。
+  - `RSP` 总是加入；`RBP` 只有在 frame-pointer load 被替换后才加入。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1622)
+  - 在 SummarySSA 开始先跑 `runNativeStackFrameRewrite()`。
+  - 把返回的 ignore set 传给 `runNativeRegisterSummary()`，让 summary 不再把 RSP/RBP 当普通寄存器效果。
+  - FunctionBuilder 暂时仍会处理这些寄存器的 IR，用来继续做替换和死 store 清理；完全跳过会让原始 register access 残留暴涨。
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:39)
+  - `StackSlotKey::Base` 改为 `llvm::Value *`，支持 alloca slot。
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:676)
+  - `nativeStackAllocaSlot()` 识别 `notdec_stack.native` GEP。
+  - 注意不能先对 pointer 调 `stripPointerCasts()`，否则 0 偏移 GEP 会被折叠成 alloca，matcher 会看不到 slot offset。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:519)
+  - 增加 RSP 栈槽改写后仍能保留 saved RBX 证据的测试。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:563)
+  - 增加 RBP frame-base load 替换和 ignore set 测试。
+
+验证命令：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-stackframe/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-stackframe/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-summary-stackframe/fortune.ll -o /tmp/notdec-fortune-summary-stackframe/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-summary-stackframe/fortune.bc -o /tmp/notdec-fortune-summary-stackframe/fortune.verified.bc
+```
+
+fortune 结果：
+
+```text
+fortune native pipeline: 10.32 s
+register_access_metadata: 82
+summary_return_helpers: 28
+native_stack_allocas: 0
+```
+
+和上一版相比：
+
+```text
+summary_return_helpers: 43 -> 28
+```
+
+注意：
+
+- 最终 IR 没有保留 `notdec_stack.native`，说明局部 alloca 后续被清掉了。
+- 曾尝试让 SummarySSA FunctionBuilder 也完全跳过 RSP/RBP，但 register access metadata 从 82 暴涨到 711。
+  所以当前只让 bottom-up summary 忽略 RSP/RBP；SummarySSA 仍处理 IR，用它现有的替换和清理能力减少残留。
+
+复杂度评估：
+
+- 实现效果：7/10。RSP/RBP 栈帧处理进入新链路，helper 明显减少。
+- 理解成本：5/10。多了一个小预处理 pass，但它只做固定负偏移和简单 RBP frame base。
+- 维护成本：5/10。后续如果要支持 caller stack 参数、动态栈、alias，需要扩展这个 pass，而不是塞进 register summary。

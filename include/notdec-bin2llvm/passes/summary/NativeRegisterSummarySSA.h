@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,7 @@ struct NativeRegisterSummarySSAOptions {
   bool EnableResidueRemoval = true;
   bool AttachMetadata = true;
   bool PrintSummary = false;
+  std::set<std::string> IgnoredRegisters;
 };
 
 struct NativeRegisterSummarySSAFunctionSummary {

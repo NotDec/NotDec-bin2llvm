@@ -1,6 +1,9 @@
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
+#include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -72,6 +75,14 @@ void attachTestAbi(llvm::Module &module) {
   killed.Storage.Name = "RAX";
   abi.Effects.push_back(killed);
 
+  for (llvm::StringRef name : {"RBX", "RBP"}) {
+    notdec::bin2llvm::NativeAbiEffect unaffected;
+    unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
+    unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    unaffected.Storage.Name = name.str();
+    abi.Effects.push_back(unaffected);
+  }
+
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
@@ -111,6 +122,39 @@ bool verifyOk(llvm::Module &module, const char *message) {
   os.flush();
   std::cerr << message << "\n" << error << '\n';
   return false;
+}
+
+bool hasNamedAlloca(llvm::Function &function, llvm::StringRef prefix) {
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&inst);
+    if (alloca != nullptr && alloca->hasName() &&
+        alloca->getName().starts_with(prefix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const notdec::bin2llvm::NativeRegisterSummaryFunction *
+functionSummary(const notdec::bin2llvm::NativeRegisterSummary &summary,
+                llvm::StringRef name) {
+  for (const auto &function : summary.Functions) {
+    if (function.FunctionName == name) {
+      return &function;
+    }
+  }
+  return nullptr;
+}
+
+const notdec::bin2llvm::NativeRegisterSummaryRegister *
+registerSummary(const notdec::bin2llvm::NativeRegisterSummaryFunction &function,
+                llvm::StringRef name) {
+  for (const auto &reg : function.Registers) {
+    if (reg.Name == name) {
+      return &reg;
+    }
+  }
+  return nullptr;
 }
 
 bool hasCompletePhi(llvm::Function &function) {
@@ -472,6 +516,88 @@ bool testInternalSignatureRewriteUsesArgsAndReturn() {
                   "module failed verifier after internal signature rewrite");
 }
 
+bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-stack-saved-register", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "stack_save_rbx", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::LoadInst *rbxEntry = loadRegister(builder, rbx, "RBX", "rbx.entry");
+  llvm::Value *slotAddress = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::Value *slot =
+      builder.CreateIntToPtr(slotAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(rbxEntry, slot);
+  storeRegister(builder, rbx, llvm::ConstantInt::get(rbx->getValueType(), 42),
+                "RBX");
+  builder.CreateRetVoid();
+
+  auto stackSummary = notdec::bin2llvm::runNativeStackFrameRewrite(module);
+  notdec::bin2llvm::NativeRegisterSummaryOptions options;
+  options.IgnoredRegisters = stackSummary.IgnoredRegisters;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module, options);
+  const auto *fn = functionSummary(summary, "stack_save_rbx");
+  const auto *rbxSummary = fn == nullptr ? nullptr : registerSummary(*fn, "RBX");
+
+  return expect(stackSummary.AccessesRewritten == 1,
+                "RSP stack save was not localized") &&
+         expect(stackSummary.IgnoredRegisters.count("RSP") != 0,
+                "RSP was not marked ignored after stack rewrite") &&
+         expect(hasNamedAlloca(*function, "notdec_stack.native"),
+                "native stack alloca was not created") &&
+         expect(rbxSummary != nullptr, "missing RBX summary after stack rewrite") &&
+         expect(rbxSummary->MayEntry && !rbxSummary->MayNonEntry,
+                "saved RBX was not preserved through native stack alloca") &&
+         verifyOk(module, "module failed verifier after stack rewrite test");
+}
+
+bool testFramePointerLoadFeedsStackRewriteAndIgnoredSet() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-frame-pointer-stack", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  llvm::GlobalVariable *rbp = createRegisterGlobal(module, "RBP");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "rbp_frame_stack", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::Value *frameBase = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -32, true));
+  storeRegister(builder, rbp, frameBase, "RBP");
+  llvm::LoadInst *rbpLoad = loadRegister(builder, rbp, "RBP", "rbp.frame");
+  llvm::Value *slotAddress = builder.CreateAdd(
+      rbpLoad, llvm::ConstantInt::get(rbp->getValueType(), -8, true));
+  llvm::Value *slot =
+      builder.CreateIntToPtr(slotAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(rbp->getValueType(), 7), slot);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeStackFrameRewrite(module);
+  return expect(summary.FramePointerLoadsReplaced == 1,
+                "RBP frame load was not replaced") &&
+         expect(summary.AccessesRewritten == 1,
+                "RBP-derived stack access was not localized") &&
+         expect(summary.IgnoredRegisters.count("RBP") != 0,
+                "RBP was not marked ignored after frame-base match") &&
+         expect(hasNamedAlloca(*function, "notdec_stack.native"),
+                "frame-pointer stack alloca was not created") &&
+         verifyOk(module, "module failed verifier after RBP stack rewrite test");
+}
+
 } // namespace
 
 int main() {
@@ -485,5 +611,7 @@ int main() {
   ok &= testCrossBlockDeadStoreIsRemoved();
   ok &= testAbiInputStoreBeforeCallIsKept();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
+  ok &= testStaticRspStackRewriteKeepsSavedRegisterEvidence();
+  ok &= testFramePointerLoadFeedsStackRewriteAndIgnoredSet();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

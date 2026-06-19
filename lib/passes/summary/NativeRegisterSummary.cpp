@@ -37,7 +37,7 @@ struct RegisterAccess {
 };
 
 struct StackSlotKey {
-  llvm::GlobalVariable *Base = nullptr;
+  llvm::Value *Base = nullptr;
   int64_t Offset = 0;
 
   bool operator<(const StackSlotKey &other) const {
@@ -66,7 +66,8 @@ struct State {
   bool Reachable = false;
   std::map<llvm::GlobalVariable *, Cell> Cells;
   // Narrow frame-local model for saved-register recognition.  It only tracks
-  // fixed offsets from the entry stack pointer, not arbitrary memory.
+  // fixed entry-SP offsets or notdec_stack.native alloca offsets, not arbitrary
+  // memory.
   std::map<StackSlotKey, llvm::GlobalVariable *> StackSlots;
   // SSA values known to be exactly one function-entry register value.
   std::map<llvm::Value *, llvm::GlobalVariable *> ValueOrigins;
@@ -657,6 +658,9 @@ private:
 
   std::optional<StackSlotKey> fixedEntryStackSlot(llvm::Value *pointer,
                                                   const State &state) const {
+    if (auto slot = nativeStackAllocaSlot(pointer)) {
+      return slot;
+    }
     auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(pointer);
     if (intToPtr == nullptr) {
       return std::nullopt;
@@ -667,6 +671,24 @@ private:
       return std::nullopt;
     }
     return StackSlotKey{stackPointer, address->second};
+  }
+
+  std::optional<StackSlotKey> nativeStackAllocaSlot(llvm::Value *pointer) const {
+    auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(pointer);
+    if (gep == nullptr || gep->getNumIndices() != 1) {
+      return std::nullopt;
+    }
+    auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(
+        gep->getPointerOperand()->stripPointerCasts());
+    if (alloca == nullptr || !alloca->hasName() ||
+        !alloca->getName().starts_with("notdec_stack.native")) {
+      return std::nullopt;
+    }
+    auto *offset = llvm::dyn_cast<llvm::ConstantInt>(gep->idx_begin()->get());
+    if (offset == nullptr || offset->getBitWidth() > 64) {
+      return std::nullopt;
+    }
+    return StackSlotKey{alloca, offset->getSExtValue()};
   }
 
   bool hasSavedEntryRegister(const State &state,
