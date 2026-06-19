@@ -4,9 +4,11 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -27,9 +29,6 @@
 
 namespace notdec::bin2llvm {
 namespace {
-
-constexpr llvm::StringLiteral CallArgValuesBundleTag =
-    "notdec.register.summary_ssa.call_arg_values";
 
 struct RegisterUnit {
   llvm::GlobalVariable *Global = nullptr;
@@ -57,6 +56,7 @@ struct AbiFacts {
   std::set<std::string> Inputs;
   std::vector<std::string> InputsInOrder;
   std::set<std::string> Outputs;
+  std::vector<std::string> OutputsInOrder;
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
 };
@@ -78,6 +78,150 @@ struct CallArgStoreBinding {
   llvm::Value *Value = nullptr;
   unsigned Index = 0;
 };
+
+struct KnownExternalPrototype {
+  unsigned FixedArgs = 0;
+  bool VarArg = false;
+};
+
+struct SignatureShape {
+  std::vector<const RegisterUnit *> Params;
+  std::vector<const RegisterUnit *> Returns;
+  bool VarArg = false;
+};
+
+struct SignatureRewriteState {
+  std::map<llvm::Function *, SignatureShape> Shapes;
+  std::map<llvm::CallBase *, std::vector<CallArgStoreBinding>> CallArgs;
+  std::map<llvm::CallBase *, std::map<std::string, llvm::CallInst *>>
+      ReturnHelpers;
+  std::map<llvm::Function *,
+           std::map<llvm::ReturnInst *, std::vector<llvm::Value *>>>
+      FunctionReturns;
+  std::map<llvm::Value *, llvm::Value *> ValueMap;
+  std::set<llvm::StoreInst *> StoresToErase;
+};
+
+const std::map<llvm::StringRef, KnownExternalPrototype> &
+knownExternalPrototypes() {
+  static const std::map<llvm::StringRef, KnownExternalPrototype> prototypes = {
+      {"__assert_fail", {4, false}},
+      {"__errno_location", {0, false}},
+      {"__explicit_bzero_chk", {3, false}},
+      {"__fdelt_chk", {1, false}},
+      {"__fprintf_chk", {3, true}},
+      {"__isoc23_strtol", {3, false}},
+      {"__memcpy_chk", {4, false}},
+      {"__memset_chk", {4, false}},
+      {"__printf_chk", {2, true}},
+      {"__snprintf_chk", {4, true}},
+      {"__sprintf_chk", {3, true}},
+      {"__strcat_chk", {3, false}},
+      {"__stack_chk_fail", {0, false}},
+      {"__tls_get_addr", {1, false}},
+      {"__vasprintf_chk", {3, true}},
+      {"abort", {0, false}},
+      {"alarm", {1, false}},
+      {"arc4random_buf", {2, false}},
+      {"bind", {3, false}},
+      {"calloc", {2, false}},
+      {"chdir", {1, false}},
+      {"clock_gettime", {2, false}},
+      {"close", {1, false}},
+      {"connect", {3, false}},
+      {"dcgettext", {3, false}},
+      {"dlsym", {2, false}},
+      {"event_add", {2, false}},
+      {"event_base_set", {2, false}},
+      {"event_del", {1, false}},
+      {"event_initialized", {1, false}},
+      {"event_once", {5, false}},
+      {"event_set", {5, false}},
+      {"exit", {1, false}},
+      {"fclose", {1, false}},
+      {"fcntl", {2, true}},
+      {"fcntl64", {2, true}},
+      {"fflush", {1, false}},
+      {"fgets", {3, false}},
+      {"fopen", {2, false}},
+      {"fprintf", {2, true}},
+      {"fread", {4, false}},
+      {"free", {1, false}},
+      {"freeaddrinfo", {1, false}},
+      {"fseek", {3, false}},
+      {"fstat64", {2, false}},
+      {"ftell", {1, false}},
+      {"fwrite", {4, false}},
+      {"getenv", {1, false}},
+      {"getpwnam", {1, false}},
+      {"getsockname", {3, false}},
+      {"gettimeofday", {2, false}},
+      {"gmtime_r", {2, false}},
+      {"inet_ntop", {4, false}},
+      {"ioctl", {2, true}},
+      {"listen", {2, false}},
+      {"malloc", {1, false}},
+      {"malloc_usable_size", {1, false}},
+      {"memcmp", {3, false}},
+      {"memcpy", {3, false}},
+      {"memmove", {3, false}},
+      {"memset", {3, false}},
+      {"mprotect", {3, false}},
+      {"munmap", {2, false}},
+      {"open", {2, true}},
+      {"open64", {2, true}},
+      {"perror", {1, false}},
+      {"printf", {1, true}},
+      {"pthread_cond_signal", {1, false}},
+      {"pthread_join", {2, false}},
+      {"pthread_key_create", {2, false}},
+      {"pthread_key_delete", {1, false}},
+      {"pthread_mutex_lock", {1, false}},
+      {"pthread_mutex_unlock", {1, false}},
+      {"pthread_setspecific", {2, false}},
+      {"pthread_sigmask", {3, false}},
+      {"puts", {1, false}},
+      {"raise", {1, false}},
+      {"read", {3, false}},
+      {"realloc", {2, false}},
+      {"shutdown", {2, false}},
+      {"sigaction", {3, false}},
+      {"sigdelset", {2, false}},
+      {"signal", {2, false}},
+      {"sigprocmask", {3, false}},
+      {"snprintf", {3, true}},
+      {"socket", {3, false}},
+      {"sscanf", {2, true}},
+      {"stat", {2, false}},
+      {"strcasecmp", {2, false}},
+      {"strcat", {2, false}},
+      {"strchr", {2, false}},
+      {"strcmp", {2, false}},
+      {"strcpy", {2, false}},
+      {"strcspn", {2, false}},
+      {"strdup", {1, false}},
+      {"strerror", {1, false}},
+      {"strftime", {4, false}},
+      {"strlen", {1, false}},
+      {"strlcat", {3, false}},
+      {"strlcpy", {3, false}},
+      {"strncasecmp", {3, false}},
+      {"strncmp", {3, false}},
+      {"strncpy", {3, false}},
+      {"strrchr", {2, false}},
+      {"strsep", {2, false}},
+      {"strstr", {2, false}},
+      {"strtol", {3, false}},
+      {"syscall", {1, true}},
+      {"sysinfo", {1, false}},
+      {"time", {1, false}},
+      {"uname", {1, false}},
+      {"unlink", {1, false}},
+      {"waitpid", {3, false}},
+      {"write", {3, false}},
+  };
+  return prototypes;
+}
 
 std::optional<std::string> mdField(const llvm::MDNode *node,
                                    llvm::StringRef key) {
@@ -196,6 +340,7 @@ AbiFacts collectAbiFacts(const llvm::Module &module) {
     if (entry.Storage.Kind == NativeAbiStorageKind::Register &&
         !entry.Storage.Name.empty()) {
       facts.Outputs.insert(entry.Storage.Name);
+      facts.OutputsInOrder.push_back(entry.Storage.Name);
     }
   }
   for (const NativeAbiEffect &effect : abi->Effects) {
@@ -240,6 +385,170 @@ std::string typeSuffix(llvm::Type &type) {
   return "value";
 }
 
+const RegisterUnit *
+unitByName(const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+           llvm::StringRef name) {
+  for (const auto &[global, unit] : units) {
+    (void)global;
+    if (unit.Name == name) {
+      return &unit;
+    }
+  }
+  return nullptr;
+}
+
+llvm::Type *singleReturnType(const SignatureShape &shape) {
+  if (shape.Returns.empty()) {
+    return nullptr;
+  }
+  return shape.Returns.front()->Global->getValueType();
+}
+
+llvm::Type *returnTypeForShape(llvm::LLVMContext &context,
+                               const SignatureShape &shape) {
+  if (shape.Returns.empty()) {
+    return llvm::Type::getVoidTy(context);
+  }
+  if (shape.Returns.size() == 1) {
+    return singleReturnType(shape);
+  }
+  std::vector<llvm::Type *> fields;
+  fields.reserve(shape.Returns.size());
+  for (const RegisterUnit *unit : shape.Returns) {
+    fields.push_back(unit->Global->getValueType());
+  }
+  return llvm::StructType::get(context, fields);
+}
+
+llvm::FunctionType *functionTypeForShape(llvm::LLVMContext &context,
+                                         const SignatureShape &shape) {
+  std::vector<llvm::Type *> params;
+  params.reserve(shape.Params.size());
+  for (const RegisterUnit *unit : shape.Params) {
+    params.push_back(unit->Global->getValueType());
+  }
+  return llvm::FunctionType::get(returnTypeForShape(context, shape), params,
+                                 shape.VarArg);
+}
+
+SignatureShape shapeForInternalFunction(
+    llvm::Function &function,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const std::map<llvm::Function *, FunctionSummaryFacts> &summaryFacts,
+    const AbiFacts &abi) {
+  SignatureShape shape;
+  auto factsIt = summaryFacts.find(&function);
+  if (factsIt == summaryFacts.end()) {
+    return shape;
+  }
+
+  int maxParamIndex = -1;
+  for (unsigned index = 0; index < abi.InputsInOrder.size(); ++index) {
+    auto regIt = factsIt->second.Registers.find(abi.InputsInOrder[index]);
+    if (regIt != factsIt->second.Registers.end() && regIt->second.ReadEntry) {
+      maxParamIndex = static_cast<int>(index);
+    }
+  }
+  for (int index = 0; index <= maxParamIndex; ++index) {
+    const RegisterUnit *unit = unitByName(units, abi.InputsInOrder[index]);
+    if (unit != nullptr) {
+      shape.Params.push_back(unit);
+    }
+  }
+
+  for (const std::string &name : abi.OutputsInOrder) {
+    auto regIt = factsIt->second.Registers.find(name);
+    if (regIt == factsIt->second.Registers.end() ||
+        !regIt->second.MayNonEntry || !regIt->second.ExitDemand) {
+      continue;
+    }
+    const RegisterUnit *unit = unitByName(units, name);
+    if (unit != nullptr) {
+      shape.Returns.push_back(unit);
+    }
+  }
+  return shape;
+}
+
+SignatureShape shapeForKnownExternal(
+    llvm::Function &function,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi) {
+  SignatureShape shape;
+  auto knownIt = knownExternalPrototypes().find(function.getName());
+  unsigned count = 0;
+  if (knownIt == knownExternalPrototypes().end()) {
+    count = abi.InputsInOrder.size();
+  } else {
+    count =
+        std::min<unsigned>(knownIt->second.FixedArgs, abi.InputsInOrder.size());
+    shape.VarArg = knownIt->second.VarArg;
+  }
+  for (unsigned index = 0; index < count; ++index) {
+    const RegisterUnit *unit = unitByName(units, abi.InputsInOrder[index]);
+    if (unit != nullptr) {
+      shape.Params.push_back(unit);
+    }
+  }
+  return shape;
+}
+
+void addDemandedExternalReturns(
+    SignatureRewriteState &state,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi) {
+  for (const auto &[call, helpers] : state.ReturnHelpers) {
+    llvm::Function *callee = call->getCalledFunction();
+    if (callee == nullptr || !callee->isDeclaration()) {
+      continue;
+    }
+    auto shapeIt = state.Shapes.find(callee);
+    if (shapeIt == state.Shapes.end()) {
+      continue;
+    }
+    if (state.CallArgs.count(call) == 0) {
+      state.CallArgs.emplace(call, std::vector<CallArgStoreBinding>{});
+    }
+    for (const std::string &name : abi.OutputsInOrder) {
+      if (helpers.count(name) == 0) {
+        continue;
+      }
+      bool alreadyPresent = false;
+      for (const RegisterUnit *unit : shapeIt->second.Returns) {
+        alreadyPresent |= unit->Name == name;
+      }
+      if (!alreadyPresent) {
+        const RegisterUnit *unit = unitByName(units, name);
+        if (unit != nullptr) {
+          shapeIt->second.Returns.push_back(unit);
+        }
+      }
+    }
+  }
+}
+
+std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
+    llvm::Module &module,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const std::map<llvm::Function *, FunctionSummaryFacts> &summaryFacts,
+    const AbiFacts &abi) {
+  std::map<llvm::Function *, SignatureShape> shapes;
+  for (llvm::Function &function : module) {
+    if (function.isIntrinsic() ||
+        function.getName().starts_with("notdec.register.")) {
+      continue;
+    }
+    SignatureShape shape =
+        function.isDeclaration()
+            ? shapeForKnownExternal(function, units, abi)
+            : shapeForInternalFunction(function, units, summaryFacts, abi);
+    if (!shape.Params.empty() || !shape.Returns.empty() || shape.VarArg) {
+      shapes.emplace(&function, std::move(shape));
+    }
+  }
+  return shapes;
+}
+
 class FunctionBuilder {
 public:
   FunctionBuilder(
@@ -247,17 +556,20 @@ public:
       const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
       const std::map<llvm::Function *, FunctionSummaryFacts> &summaryFacts,
       const AbiFacts &abiFacts, const NativeRegisterSummarySSAOptions &options,
-      NativeRegisterSummarySSAFunctionSummary &summary)
+      NativeRegisterSummarySSAFunctionSummary &summary,
+      SignatureRewriteState &signatureState)
       : Function(function), Units(units), SummaryFacts(summaryFacts),
-        Abi(abiFacts), Options(options), Summary(summary) {}
+        Abi(abiFacts), Options(options), Summary(summary),
+        SignatureState(signatureState) {}
 
   void run() {
     Summary.FunctionName = Function.getName().str();
     collectAccesses();
     if (Options.EnableRewrite) {
       rewriteLoads();
-      markExternalCallArgumentStores();
+      collectSignatureCallArgs();
       finalizePendingPhis();
+      collectFunctionReturnValues();
       if (Options.EnableResidueRemoval) {
         removeDeadReplacedLoads();
         removeDeadStoresByLiveness();
@@ -276,6 +588,7 @@ private:
   const AbiFacts &Abi;
   const NativeRegisterSummarySSAOptions &Options;
   NativeRegisterSummarySSAFunctionSummary &Summary;
+  SignatureRewriteState &SignatureState;
   std::vector<llvm::LoadInst *> Loads;
   std::vector<llvm::LoadInst *> ReplacedLoads;
   std::map<BlockRegKey, llvm::Value *> EntryValue;
@@ -384,8 +697,9 @@ private:
     }
   }
 
-  std::set<llvm::GlobalVariable *> transferBlockLiveness(
-      llvm::BasicBlock &block, std::set<llvm::GlobalVariable *> live) {
+  std::set<llvm::GlobalVariable *>
+  transferBlockLiveness(llvm::BasicBlock &block,
+                        std::set<llvm::GlobalVariable *> live) {
     for (auto it = block.rbegin(); it != block.rend(); ++it) {
       llvm::Instruction &inst = *it;
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
@@ -740,11 +1054,15 @@ private:
     return Abi.Inputs.count(unit.Name) != 0;
   }
 
-  void markExternalCallArgumentStores() {
+  void collectSignatureCallArgs() {
     std::vector<llvm::CallBase *> calls;
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
       auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
-      if (call == nullptr || !isDirectExternalCall(*call)) {
+      if (call == nullptr || !isAnalyzableCall(*call)) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee == nullptr || SignatureState.Shapes.count(callee) == 0) {
         continue;
       }
       calls.push_back(call);
@@ -754,51 +1072,22 @@ private:
       if (call->getParent() == nullptr) {
         continue;
       }
-      std::vector<CallArgStoreBinding> bindings = callArgStoreBindings(*call);
-      if (bindings.empty()) {
+      llvm::Function *callee = call->getCalledFunction();
+      const SignatureShape &shape = SignatureState.Shapes.at(callee);
+      std::vector<CallArgStoreBinding> bindings =
+          callArgStoreBindings(*call, shape);
+      if (bindings.empty() && shape.Params.empty()) {
         continue;
       }
 
-      call = addCallArgValueBundle(*call, bindings);
-      call->setMetadata("notdec.register.summary_ssa.call_args",
-                        callArgsNode(bindings.size()));
+      SignatureState.CallArgs[call] = bindings;
       for (const CallArgStoreBinding &binding : bindings) {
         if (binding.Store != nullptr) {
-          binding.Store->setMetadata(
-              "notdec.register.summary_ssa.call_arg_store",
-              callArgStoreNode(*binding.Unit, binding.Index));
+          SignatureState.StoresToErase.insert(binding.Store);
           ++Summary.CallArgStoresMarked;
         }
       }
     }
-  }
-
-  llvm::CallBase *
-  addCallArgValueBundle(llvm::CallBase &call,
-                        const std::vector<CallArgStoreBinding> &bindings) {
-    std::vector<llvm::Value *> values;
-    values.reserve(bindings.size());
-    for (const CallArgStoreBinding &binding : bindings) {
-      values.push_back(binding.Value);
-    }
-    llvm::OperandBundleDef bundle(CallArgValuesBundleTag.str(), values);
-    uint32_t tag =
-        Function.getContext().getOrInsertBundleTag(CallArgValuesBundleTag)
-            ->getValue();
-    llvm::CallBase *newCall =
-        llvm::CallBase::addOperandBundle(&call, tag, bundle, call.getIterator());
-    if (!call.use_empty()) {
-      call.replaceAllUsesWith(newCall);
-      newCall->takeName(&call);
-    }
-    call.eraseFromParent();
-    return newCall;
-  }
-
-  bool isDirectExternalCall(const llvm::CallBase &call) const {
-    llvm::Function *callee = call.getCalledFunction();
-    return callee != nullptr && callee->isDeclaration() &&
-           !callee->isIntrinsic() && isAnalyzableCall(call);
   }
 
   const RegisterUnit *unitByName(llvm::StringRef name) const {
@@ -811,24 +1100,24 @@ private:
   }
 
   std::vector<CallArgStoreBinding>
-  callArgStoreBindings(llvm::CallBase &call) {
+  callArgStoreBindings(llvm::CallBase &call, const SignatureShape &shape) {
     std::vector<CallArgStoreBinding> bindings;
-    for (const std::string &name : Abi.InputsInOrder) {
-      const RegisterUnit *unit = unitByName(name);
+    for (unsigned index = 0; index < shape.Params.size(); ++index) {
+      const RegisterUnit *unit = shape.Params[index];
       if (unit == nullptr) {
         break;
       }
       llvm::Value *value =
           resolve(readValueBefore(*call.getParent(), *unit, &call));
-      if (value == nullptr || value->getType() != unit->Global->getValueType()) {
+      if (value == nullptr ||
+          value->getType() != unit->Global->getValueType()) {
         break;
       }
       llvm::StoreInst *store = findStoreBeforeCall(call, *unit, value);
       if (isEntryInputValue(value) && store == nullptr) {
         break;
       }
-      bindings.push_back(CallArgStoreBinding{
-          store, unit, value, static_cast<unsigned>(bindings.size())});
+      bindings.push_back(CallArgStoreBinding{store, unit, value, index});
     }
     return bindings;
   }
@@ -905,6 +1194,9 @@ private:
                        callValueNode(unit, kind, &call));
     CallValues.emplace(key, value);
     if (kind == "return") {
+      SignatureState.ReturnHelpers[&call][unit.Name] = value;
+    }
+    if (kind == "return") {
       ++Summary.CallReturnValues;
     } else {
       ++Summary.CallClobberValues;
@@ -948,22 +1240,30 @@ private:
     return llvm::MDNode::get(Function.getContext(), fields);
   }
 
-  llvm::MDNode *callArgsNode(size_t count) const {
-    llvm::Metadata *fields[] = {
-        llvm::MDString::get(Function.getContext(),
-                            "count=" + std::to_string(count)),
-    };
-    return llvm::MDNode::get(Function.getContext(), fields);
-  }
-
-  llvm::MDNode *callArgStoreNode(const RegisterUnit &unit,
-                                 unsigned index) const {
-    llvm::Metadata *fields[] = {
-        llvm::MDString::get(Function.getContext(), "name=" + unit.Name),
-        llvm::MDString::get(Function.getContext(),
-                            "index=" + std::to_string(index)),
-    };
-    return llvm::MDNode::get(Function.getContext(), fields);
+  void collectFunctionReturnValues() {
+    auto shapeIt = SignatureState.Shapes.find(&Function);
+    if (shapeIt == SignatureState.Shapes.end() ||
+        shapeIt->second.Returns.empty()) {
+      return;
+    }
+    for (llvm::BasicBlock &block : Function) {
+      auto *ret =
+          llvm::dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator());
+      if (ret == nullptr) {
+        continue;
+      }
+      std::vector<llvm::Value *> values;
+      values.reserve(shapeIt->second.Returns.size());
+      for (const RegisterUnit *unit : shapeIt->second.Returns) {
+        llvm::Value *value = resolve(readValueBefore(block, *unit, ret));
+        if (value == nullptr ||
+            value->getType() != unit->Global->getValueType()) {
+          value = llvm::UndefValue::get(unit->Global->getValueType());
+        }
+        values.push_back(value);
+      }
+      SignatureState.FunctionReturns[&Function][ret] = std::move(values);
+    }
   }
 
   llvm::MDNode *markerNode(llvm::StringRef value) const {
@@ -1005,8 +1305,285 @@ void addFunctionSummary(NativeRegisterSummarySSASummary &total,
   total.CallReturnValues += fn.CallReturnValues;
   total.CallClobberValues += fn.CallClobberValues;
   total.CallArgStoresMarked += fn.CallArgStoresMarked;
+  total.CallsRewritten += fn.CallsRewritten;
+  total.FunctionsRewritten += fn.FunctionsRewritten;
   total.PreservedCalls += fn.PreservedCalls;
   total.UnknownCallEffects += fn.UnknownCallEffects;
+}
+
+llvm::AttributeList attributesForNewFunction(llvm::Function &oldFunction,
+                                             llvm::FunctionType &newType) {
+  std::vector<llvm::AttributeSet> argAttrs(newType.getNumParams());
+  return llvm::AttributeList::get(
+      oldFunction.getContext(), oldFunction.getAttributes().getFnAttrs(),
+      oldFunction.getAttributes().getRetAttrs(), argAttrs);
+}
+
+void copyFunctionMetadata(llvm::Function &from, llvm::Function &to) {
+  llvm::SmallVector<std::pair<unsigned, llvm::MDNode *>, 4> metadata;
+  from.getAllMetadata(metadata);
+  for (const auto &[kind, node] : metadata) {
+    to.addMetadata(kind, *node);
+  }
+}
+
+llvm::Function *createReplacementFunction(llvm::Function &oldFunction,
+                                          llvm::FunctionType &newType) {
+  llvm::Function *newFunction = llvm::Function::Create(
+      &newType, oldFunction.getLinkage(), oldFunction.getAddressSpace());
+  newFunction->copyAttributesFrom(&oldFunction);
+  newFunction->setAttributes(attributesForNewFunction(oldFunction, newType));
+  copyFunctionMetadata(oldFunction, *newFunction);
+  newFunction->setComdat(oldFunction.getComdat());
+  newFunction->setCallingConv(oldFunction.getCallingConv());
+  oldFunction.getParent()->getFunctionList().insert(oldFunction.getIterator(),
+                                                    newFunction);
+  newFunction->takeName(&oldFunction);
+  return newFunction;
+}
+
+llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
+                              const SignatureShape &shape,
+                              const std::vector<llvm::Value *> &values) {
+  if (shape.Returns.empty()) {
+    return nullptr;
+  }
+  if (shape.Returns.size() == 1) {
+    return values.empty() ? llvm::UndefValue::get(singleReturnType(shape))
+                          : values.front();
+  }
+  llvm::Type *retTy = returnTypeForShape(builder.getContext(), shape);
+  llvm::Value *result = llvm::UndefValue::get(retTy);
+  for (unsigned index = 0; index < shape.Returns.size(); ++index) {
+    llvm::Value *value =
+        index < values.size()
+            ? values[index]
+            : llvm::UndefValue::get(
+                  shape.Returns[index]->Global->getValueType());
+    result = builder.CreateInsertValue(result, value, {index});
+  }
+  return result;
+}
+
+llvm::Value *extractReturnRegister(llvm::IRBuilder<> &builder,
+                                   const SignatureShape &shape,
+                                   llvm::Value &call,
+                                   llvm::StringRef registerName) {
+  for (unsigned index = 0; index < shape.Returns.size(); ++index) {
+    if (shape.Returns[index]->Name != registerName) {
+      continue;
+    }
+    if (shape.Returns.size() == 1) {
+      return &call;
+    }
+    return builder.CreateExtractValue(&call, {index},
+                                      registerName.str() + ".ret");
+  }
+  return nullptr;
+}
+
+llvm::CallInst *rewriteCallInst(llvm::CallBase &oldCall, llvm::Value &callee,
+                                llvm::FunctionType &newType,
+                                const std::vector<llvm::Value *> &args) {
+  llvm::SmallVector<llvm::OperandBundleDef, 2> bundles;
+  oldCall.getOperandBundlesAsDefs(bundles);
+  llvm::CallInst *newCall = llvm::CallInst::Create(
+      &newType, &callee, args, bundles, "", oldCall.getIterator());
+  if (auto *oldCallInst = llvm::dyn_cast<llvm::CallInst>(&oldCall)) {
+    newCall->setTailCallKind(oldCallInst->getTailCallKind());
+  }
+  newCall->setCallingConv(oldCall.getCallingConv());
+  std::vector<llvm::AttributeSet> argAttrs(args.size());
+  newCall->setAttributes(llvm::AttributeList::get(
+      oldCall.getContext(), oldCall.getAttributes().getFnAttrs(),
+      oldCall.getAttributes().getRetAttrs(), argAttrs));
+  newCall->copyMetadata(oldCall);
+  if (!oldCall.use_empty()) {
+    oldCall.replaceAllUsesWith(newCall);
+    newCall->takeName(&oldCall);
+  }
+  return newCall;
+}
+
+void rewriteInternalFunctionBody(llvm::Function &oldFunction,
+                                 llvm::Function &newFunction,
+                                 const SignatureShape &shape,
+                                 SignatureRewriteState &state) {
+  newFunction.splice(newFunction.end(), &oldFunction);
+  unsigned index = 0;
+  for (llvm::Argument &arg : newFunction.args()) {
+    if (index >= shape.Params.size()) {
+      break;
+    }
+    arg.setName(shape.Params[index]->Name + ".arg");
+    for (llvm::BasicBlock &block : newFunction) {
+      for (auto it = block.begin(); it != block.end();) {
+        llvm::Instruction &inst = *it++;
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+        if (load == nullptr ||
+            load->getMetadata("notdec.register.summary_ssa.entry") == nullptr) {
+          continue;
+        }
+        auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+            load->getPointerOperand()->stripPointerCasts());
+        if (global == shape.Params[index]->Global) {
+          state.ValueMap[load] = &arg;
+          load->replaceAllUsesWith(&arg);
+        }
+      }
+    }
+    ++index;
+  }
+
+  auto returnsIt = state.FunctionReturns.find(&oldFunction);
+  for (llvm::BasicBlock &block : newFunction) {
+    auto *oldRet =
+        llvm::dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator());
+    if (oldRet == nullptr) {
+      continue;
+    }
+    std::vector<llvm::Value *> values;
+    if (returnsIt != state.FunctionReturns.end()) {
+      auto valueIt = returnsIt->second.find(oldRet);
+      if (valueIt != returnsIt->second.end()) {
+        values = valueIt->second;
+      }
+    }
+    for (llvm::Value *&value : values) {
+      while (state.ValueMap.count(value) != 0 &&
+             state.ValueMap[value] != value) {
+        value = state.ValueMap[value];
+      }
+    }
+    llvm::IRBuilder<> builder(oldRet);
+    if (shape.Returns.empty()) {
+      builder.CreateRetVoid();
+    } else {
+      builder.CreateRet(buildReturnValue(builder, shape, values));
+    }
+    oldRet->eraseFromParent();
+  }
+}
+
+void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
+                            NativeRegisterSummarySSASummary &summary) {
+  std::map<llvm::Function *, llvm::Function *> replacements;
+  for (auto &[function, shape] : state.Shapes) {
+    llvm::FunctionType *newType =
+        functionTypeForShape(module.getContext(), shape);
+    if (function->getFunctionType() == newType) {
+      replacements[function] = function;
+      continue;
+    }
+    llvm::Function *newFunction =
+        createReplacementFunction(*function, *newType);
+    replacements[function] = newFunction;
+    if (!function->isDeclaration()) {
+      rewriteInternalFunctionBody(*function, *newFunction, shape, state);
+    }
+    ++summary.FunctionsRewritten;
+  }
+
+  std::vector<llvm::CallBase *> callsToRewrite;
+  for (llvm::Function &function : module) {
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call != nullptr && state.CallArgs.count(call) != 0) {
+        callsToRewrite.push_back(call);
+      }
+    }
+  }
+
+  std::map<llvm::Value *, llvm::Value *> valueMap;
+  valueMap.insert(state.ValueMap.begin(), state.ValueMap.end());
+  std::vector<llvm::CallBase *> oldCallsToErase;
+  std::vector<llvm::CallInst *> helpersToErase;
+  auto remapValue = [&](llvm::Value *value) -> llvm::Value * {
+    while (valueMap.count(value) != 0 && valueMap[value] != value) {
+      value = valueMap[value];
+    }
+    return value;
+  };
+
+  for (llvm::CallBase *oldCall : callsToRewrite) {
+    if (oldCall->getParent() == nullptr) {
+      continue;
+    }
+    std::vector<CallArgStoreBinding> &bindings = state.CallArgs[oldCall];
+    llvm::Function *oldCallee = oldCall->getCalledFunction();
+    if (oldCallee == nullptr || state.Shapes.count(oldCallee) == 0) {
+      continue;
+    }
+    const SignatureShape &shape = state.Shapes.at(oldCallee);
+    llvm::Function *newCallee = replacements[oldCallee];
+    if (newCallee == nullptr) {
+      continue;
+    }
+    std::vector<llvm::Value *> args;
+    args.reserve(shape.Params.size());
+    for (unsigned index = 0; index < shape.Params.size(); ++index) {
+      llvm::Value *value =
+          index < bindings.size() ? bindings[index].Value : nullptr;
+      if (value != nullptr) {
+        value = remapValue(value);
+      }
+      if (value == nullptr ||
+          value->getType() != shape.Params[index]->Global->getValueType()) {
+        value =
+            llvm::UndefValue::get(shape.Params[index]->Global->getValueType());
+      }
+      args.push_back(value);
+    }
+    llvm::CallInst *newCall = rewriteCallInst(
+        *oldCall, *newCallee, *newCallee->getFunctionType(), args);
+    valueMap[oldCall] = newCall;
+    oldCallsToErase.push_back(oldCall);
+    auto helpersIt = state.ReturnHelpers.find(oldCall);
+    if (helpersIt != state.ReturnHelpers.end() && !shape.Returns.empty()) {
+      llvm::IRBuilder<> builder(newCall->getNextNode());
+      for (auto &[name, helper] : helpersIt->second) {
+        if (helper->getParent() == nullptr) {
+          continue;
+        }
+        llvm::Value *value =
+            extractReturnRegister(builder, shape, *newCall, name);
+        if (value == nullptr) {
+          value = llvm::UndefValue::get(helper->getType());
+        }
+        valueMap[helper] = value;
+        helper->replaceAllUsesWith(value);
+        if (helper->use_empty()) {
+          helpersToErase.push_back(helper);
+        }
+      }
+    }
+    ++summary.CallsRewritten;
+  }
+
+  for (llvm::CallInst *helper : helpersToErase) {
+    if (helper->getParent() != nullptr && helper->use_empty()) {
+      helper->eraseFromParent();
+    }
+  }
+  for (llvm::CallBase *call : oldCallsToErase) {
+    if (call->getParent() != nullptr && call->use_empty()) {
+      call->eraseFromParent();
+    }
+  }
+
+  for (llvm::StoreInst *store : state.StoresToErase) {
+    if (store->getParent() != nullptr && store->use_empty()) {
+      store->eraseFromParent();
+      ++summary.DeadStoresRemoved;
+    }
+  }
+
+  for (auto &[oldFunction, newFunction] : replacements) {
+    if (oldFunction != newFunction && oldFunction->use_empty() &&
+        oldFunction->empty()) {
+      oldFunction->eraseFromParent();
+    }
+  }
 }
 
 } // namespace
@@ -1023,6 +1600,11 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   std::map<llvm::GlobalVariable *, RegisterUnit> units =
       collectRegisterUnits(module);
   AbiFacts abi = collectAbiFacts(module);
+  SignatureRewriteState signatureState;
+  if (options.EnableRewrite) {
+    signatureState.Shapes =
+        buildInitialSignatureShapes(module, units, facts, abi);
+  }
 
   NativeRegisterSummarySSASummary summary;
   for (llvm::Function &function : module) {
@@ -1030,10 +1612,15 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       continue;
     }
     NativeRegisterSummarySSAFunctionSummary fn;
-    FunctionBuilder builder(function, units, facts, abi, options, fn);
+    FunctionBuilder builder(function, units, facts, abi, options, fn,
+                            signatureState);
     builder.run();
     addFunctionSummary(summary, fn);
     summary.Functions.push_back(std::move(fn));
+  }
+  if (options.EnableRewrite) {
+    addDemandedExternalReturns(signatureState, units, abi);
+    rewriteSignatureShapes(module, signatureState, summary);
   }
   summary.FunctionsSeen = summary.Functions.size();
   if (options.PrintSummary) {

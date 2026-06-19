@@ -78,7 +78,7 @@ bin2LLVM 子项目近期目标：围绕 Bench2 这些真实项目生成 LLVM IR�
 - 当前核心 pass：
   - `NativeRegisterSummary`
   - `NativeRegisterSummarySSA`
-  - `NativeExternalCallSignatureRewrite`
+- `NativeRegisterSummarySSA` 同时负责 summary 链路的寄存器 SSA、寄存器消除和 native function signature rewrite。
 - 入口行为：
   - `notdec-native-llvm` 默认运行 `NativeRegisterSummarySSA`。
   - 不传 `--heritage-register-ssa-pass` 时，不走旧链路。

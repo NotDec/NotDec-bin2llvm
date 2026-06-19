@@ -1,483 +1,412 @@
-# Native call signature rewrite plan
+# Native signature rewrite in SummarySSA plan
 
 用户原始要求：
 
 > 感觉既然之前都做register消除了，那是不是应该同步也做函数签名的修改。详细规划一下，是合并到前面的registerSSA，还是说怎么做？
 
+> NativeExternalCallSignatureRewrite当前做的很奇怪，考虑完全重新写新的pass，同时处理internal函数和external函数的rewrite，logs/20260617-01-native-external-call-signature-rewrite/20260617-01-native-external-call-signature-rewrite-plan.md这个规划里面，提到了实现前要参考 LLVM 自己的函数复制和函数类型改写代码，避免漏掉属性和 metadata。
+
+> 参数就严格按照read_entry那边使用到的值来，如果出现了跳过某个寄存器的情况，就按数量更多最多的那个值对应的数量处理，就当做前面传过参数，但是没有被用上。当前的理解是对的。返回值的处理是看top down的分析，分析所有call site中caller使用到的callee修改过的寄存器的值，然后是取并集。只要有任何一个caller用了就当做它用过了。对于external的函数，就按ABI假设返回值寄存器都有值即可，然后看用了多少寄存器。当前的理解看着问题不太大。indirect call / address-taken internal function要改问题也不大，没必要太小心，可以按照参数和返回值的数量偏多的角度考虑，反正调用前都要给它强制类型转换为对应的函数指针类型。关于SummarySSA，确实当前可能导出的不太多，思路上就是按需导出额外的信息即可，之前插入的不需要的导出信息可以直接去掉。目前看下来，我严重怀疑反正summary ssa也是要重写IR，而且目前和函数签名重写的耦合非常严重，我严重怀疑这两个步骤应该一起进行，即让summary ssa也负责函数签名的修改
+
+> 名字可能可以不用改。先更新plan吧，然后写一个goal按这个实现吧，之前实现的没用就都清理掉，比如NativeExternalCallSignatureRewrite
+
 ## 背景
 
-当前 native 新链路已经把寄存器 SSA / register residue 清理推进到 SummarySSA 这一层。
-例如外部 tail call 现在可以生成：
+当前 summary 链路已经做了两件事：
+
+- `NativeRegisterSummary` 计算每个函数对寄存器的 read/modify/preserve/return demand。
+- `NativeRegisterSummarySSA` 根据 summary 构建寄存器 SSA，替换 register load，并清理一部分 register residue。
+
+之前单独写过一个 `NativeExternalCallSignatureRewrite`，只处理 external call 参数：
 
 ```llvm
-%RDI.entry = load i64, ptr @RDI
-%0 = add i64 %RDI.entry, -8
-store i64 %0, ptr @RDI
-tail call void @free()
-ret void
+store i64 %x, ptr @RDI
+call void @free()
 ```
 
-这里 `store @RDI` 不是普通残留。
-它表示 x86-64 SysV ABI 下传给 `free` 的第一个参数。
-SummarySSA 只知道 register 当前值和 call effect，不应该把这个 store 直接删掉。
-
-下一步需要把这种 ABI register passing 改成 LLVM call operand：
+改成：
 
 ```llvm
-%0 = add i64 %RDI.entry, -8
-tail call void @free(i64 %0)
-ret void
+call void @free(i64 %x)
 ```
 
-这一步不是类型恢复。
-第一版只把“寄存器传参”机械改成“LLVM call 参数”，参数类型先用 register 宽度对应的整数类型。
+这个 pass 现在不适合作为后续基础。原因很简单：
+
+- 它只处理 external declaration，不处理 internal `notdec_native_*`。
+- 它只处理参数，不处理返回值。
+- 它需要 SummarySSA 额外导出 operand bundle / metadata，实际是在跨 pass 传递 SummarySSA 的内部状态。
+- 函数签名 rewrite 需要替换 entry register load、callsite 参数、return helper、callee return，这些都和 SummarySSA 构建 SSA value 的过程强耦合。
+
+所以后续不再扩展 `NativeExternalCallSignatureRewrite`。
+签名改写并入 `NativeRegisterSummarySSA` 的 rewrite 流程；名字可以先不改。
 
 ## 目标
 
-新增一个独立 pass，第一版曾暂名：
+SummarySSA 直接负责 native register calling convention 到 LLVM function signature 的改写。
 
-```text
-NativeExternalCallSignatureRewrite
+目标 IR 形态：
+
+```llvm
+define i64 @notdec_native_1234(i64 %arg0, i64 %arg1) {
+  ...
+  ret i64 %ret
+}
+
+%r = call i64 @notdec_native_1234(i64 %a0, i64 %a1)
 ```
 
-它放在 SummarySSA 之后运行，负责处理 external direct call / external tail call 的寄存器参数。
+而不是继续保留：
 
-第一版只做这些事：
-
-- 识别 external callee。
-- 按 ABI 参数寄存器顺序读取 call 前的 register store。
-- 把这些值改写成 LLVM call 参数。
-- 必要时替换 external function declaration 的函数类型。
-- 删除已经被消费的参数 register store。
-
-第一版明确不做：
-
-- 不处理 stack 参数。
-- 不处理返回值。
-- 不处理 internal function signature。
-- 不做真实 C 类型恢复。
-- 不根据 printf 这类库函数知识做特殊签名。
-- 不把这个逻辑合进 SummarySSA。
-
-## 当前修订：重写成统一 call signature rewrite
-
-当前 `NativeExternalCallSignatureRewrite` 已经能处理一批 external call，但设计上偏窄：
-
-- 名字限定 external，但新链路真正需要同时处理 external call 和 internal `notdec_native_*` call。
-- internal function signature rewrite 不应该回到旧 `NativePrototypeRecovery`。
-- 继续把 internal 改写塞进现有 external-only 实现，会让 pass 职责变乱。
-
-后续应当在 summary 链路里重写一个统一 pass，建议命名：
-
-```text
-NativeCallSignatureRewrite
+```llvm
+store i64 %a0, ptr @RDI
+store i64 %a1, ptr @RSI
+call void @notdec_native_1234()
+%r = call i64 @notdec.register.summary_return.i64()
 ```
 
-代码位置：
+这一步仍然不是类型恢复。
+参数和返回类型先使用寄存器宽度对应的整数类型；多返回值使用 LLVM struct。
+
+## 总体路线
+
+运行顺序保持 summary 链路：
 
 ```text
-include/notdec-bin2llvm/passes/summary/
-lib/passes/summary/
-```
-
-它消费 `NativeRegisterSummarySSA` 产出的信息，统一负责：
-
-- external declaration call：
-  - 把 ABI register 参数改成 LLVM call operand。
-  - 必要时重建 declaration。
-- internal direct call：
-  - 把 callsite 的 ABI register 参数改成 LLVM call operand。
-  - 重建 callee function type。
-  - 用新 LLVM argument 替换 callee entry register load。
-  - 删除确认只服务于当前 call 的参数 store。
-
-第一版 internal 范围保持保守：
-
-- 只处理 direct call。
-- 只处理 `notdec_native_*` 这类当前 module 内定义的函数。
-- 只处理 register 参数连续前缀。
-- 所有 callsite 都能改，才改 callee。
-- 遇到 address-taken、递归 SCC、indirect call、stack 参数、多返回，先跳过。
-- 返回值 rewrite 可以作为第二步做，不和第一版参数 rewrite 混在一起。
-
-这仍属于本 stage2 计划的一部分，不另开新链路。
-
-## 为什么不合进 SummarySSA
-
-SummarySSA 的职责是寄存器值分析和寄存器消除。
-它回答的是：
-
-```text
-这个 register 的值来自哪里？
-callee 会不会读它？
-callee 会不会改它？
-这个 register residue 能不能删？
-```
-
-函数签名改写回答的是另一个问题：
-
-```text
-LLVM call 指令应该带哪些 operand？
-callee declaration 的 FunctionType 应该是什么？
-```
-
-这两个问题依赖关系很清楚：
-
-```text
-SummarySSA 先把 register 值整理清楚
-  -> signature rewrite 再把 ABI register 参数搬到 call operand
-  -> 后置 InstCombine / DCE 清掉无用 residue
-```
-
-如果把签名改写塞进 SummarySSA，pass 会同时负责数据流分析、IR value 替换、function type 替换。
-后面调 bug 时很难判断是 summary 错了，还是 call 改写错了。
-所以第一版保持成单独 pass。
-
-## 技术路线
-
-### 1. 运行位置
-
-建议 pipeline：
-
-```text
-InstCombine
+NativeRegisterSummary
   -> NativeRegisterSummarySSA
-  -> NativeCallSignatureRewrite
-  -> InstCombine
+       - 构建 register SSA
+       - 确定每个函数的 ABI 参数和返回值形状
+       - 重写 internal/external/direct/indirect callsite
+       - 重写 internal function type、entry input、return
+       - 清理对应 register store/load/helper residue
+  -> InstCombine / DCE
 ```
 
-`NativePrototypeRecovery` 属于 heritage 链路。summary 默认链路里不应继续依赖它做 internal signature rewrite。
+`NativePrototypeRecovery` 属于 heritage 链路，不能参与这里。
+`NativeExternalCallSignatureRewrite` 作为旧 external-only 实现删除。
 
-### 2. 识别 external call
+## 参数规则
 
-external 部分只处理 direct call：
+### internal 函数
 
-```llvm
-call void @free()
-tail call void @free()
-```
+参数严格来自 callee 的 `read_entry`。
 
-callee 必须是 declaration，或者能明确来自 PLT / external relocation 的符号。
-旧 external-only 第一版不处理 internal function。
-统一 rewrite pass 中，internal direct call 应作为同一个 pass 的另一类输入。
-
-遇到 indirect call：
-
-```llvm
-call void %fp()
-```
-
-先跳过。
-
-### 3. 参数来源
-
-从 module ABI 信息拿寄存器参数顺序。
-以 x86-64 SysV 为例：
+按 ABI 参数寄存器顺序，例如 x86-64 SysV：
 
 ```text
 RDI, RSI, RDX, RCX, R8, R9
 ```
 
-对每个 external call，在同一个 basic block 内从 call 往前扫描。
-查找最近的完整 register store：
+如果 callee 的 `read_entry` 使用了 `RDX`，即使 `RDI` / `RSI` 没用，也认为函数有 3 个参数。
+前面未使用的 slot 只是“传了但 callee 没用”。
 
-```llvm
-store i64 %v, ptr @RDI
+规则：
+
+```text
+param_count = max(read_entry ABI input register index) + 1
 ```
 
-如果找到 `RDI`，它就是第一个 call 参数。
-继续找 `RSI`，它就是第二个 call 参数。
+callee body 中：
 
-第一版只接受连续前缀参数。
-也就是找到 `RDI` 和 `RSI` 可以改成两个参数；
-如果没找到 `RDI`，就不因为找到了 `RSI` 而生成第二个参数。
+```llvm
+%RDI.entry = load i64, ptr @RDI
+```
 
-### 4. 扫描边界
+替换为对应 LLVM argument。
 
-旧 external-only 第一版只做同 basic block 反向扫描。
-当前 SummarySSA 已经会在 callsite 上记录 ABI 参数 value，后续统一 pass 应直接消费 SummarySSA 的 value binding，不在 rewrite pass 里重新写跨 basic block 数据流。
+未被 callee 读取的中间参数 slot 可以存在于签名里，但 callee body 不使用它。
 
-扫描遇到这些情况停止：
+### external 函数
 
-- 另一个 non-intrinsic call。
-- terminator。
-- 无法理解的 register memory alias。
+常见 libc / runtime symbol 优先使用已知签名表确定参数数量。
 
-intrinsic call 可以跳过。
-例如 flags 计算可能留下过 `llvm.ctpop`，这不是 ABI 调用。
+未知 external 的参数数量按 callsite 中能确定的 ABI 参数数量合并。
+如果不同 callsite 不统一，按偏多处理，避免少传。
 
-这个策略会漏掉跨 basic block 准备参数的情况，但不会乱改。
-后续如果需要，可以基于 dominator 或 SummarySSA 产出的 value binding 扩展。
+external 的真实 C 类型仍不恢复，参数类型用整数寄存器类型。
 
-### 5. callee 类型改写
+### indirect call / address-taken internal
+
+不因为 indirect call 或 address-taken 自动跳过。
+
+处理原则：
+
+- 函数本体按偏多的统一 signature 改写。
+- direct call 直接按新 FunctionType 创建新 call。
+- indirect call 在创建 call 时使用目标 FunctionType；opaque pointer 下不依赖 callee pointer 类型。
+- 需要时在 call 前插入 cast/bitcast 形态的适配，但 LLVM opaque pointer 下重点是 call 使用的 `FunctionType`。
+
+## 返回值规则
+
+返回值来自 top-down demand。
+
+internal 函数：
+
+```text
+返回寄存器集合 =
+  所有 caller 使用过的、callee 确实会修改的 ABI output 寄存器的并集
+```
+
+也就是只要任何 caller 使用了 callee 修改后的某个返回寄存器，就把这个寄存器放进 callee return shape。
+
+常见规则：
+
+```text
+0 个返回寄存器 -> void
+1 个返回寄存器 -> 对应整数类型
+多个返回寄存器 -> LLVM struct
+```
+
+external 函数：
+
+- 按 ABI 假设 output 寄存器都有值。
+- 仍然用 caller 侧实际 demand 判断用了多少返回寄存器。
+- 多个返回寄存器同样用 struct 表达。
+
+callsite 重写后：
+
+```llvm
+%call = call i64 @foo(...)
+```
+
+替换原来的：
+
+```llvm
+%RAX.return = call i64 @notdec.register.summary_return.i64()
+```
+
+多返回时：
+
+```llvm
+%ret = call { i64, i64 } @foo(...)
+%rax = extractvalue { i64, i64 } %ret, 0
+%rdx = extractvalue { i64, i64 } %ret, 1
+```
+
+callee return 重写时，在每个 `ret void` 前读取对应返回寄存器的当前 SSA value，生成新的 `ret`。
+
+## callsite 不统一的处理
+
+核心原则：同一个 callee 只有一个统一签名。
+
+参数不统一：
+
+- internal 函数按 callee `read_entry` 得到统一参数数量。
+- external known prototype 按已知数量。
+- unknown external / indirect 情况按所有 callsite 可见参数数量取最大。
+- 某个 callsite 缺少未使用 slot 的值，用 `undef`。
+- 某个 callsite 缺少实际使用 slot 的值，也先用 `undef`，但计入 warning / summary，后续用真实用例判断是否要收紧。
+
+返回不统一：
+
+- 返回寄存器集合取所有 caller demand 的并集。
+- 某个 callsite 不使用某个返回 slot，不生成 extract，或生成后交给 DCE。
+- 如果 callsite 原先存在某个 return helper，但统一 return shape 没有这个寄存器，说明 summary/demand 不一致，记录 warning；实现上优先保证 IR 可验证。
+
+这样不会出现同一个 `notdec_native_*` 在不同 callsite 变成多个 LLVM 函数类型。
+
+## 和 SummarySSA 的关系
+
+签名改写不再作为独立 pass 消费 SummarySSA metadata。
+SummarySSA 内部已经能回答这些问题：
+
+- call 前某个 ABI 参数寄存器的 SSA value 是什么。
+- callee 是否读取 entry 寄存器。
+- call 后某个 ABI output 寄存器是否是 return value。
+- 某个参数 store / return helper 是否只是在服务 ABI register passing。
+
+因此实现时应该减少临时导出：
+
+- 可以删除旧 external-only operand bundle / call_arg_store metadata。
+- 如需调试，可以保留统计或 debug metadata，但不能作为两个 pass 之间的硬接口。
+- 之前为了 `NativeExternalCallSignatureRewrite` 加的无用导出信息应清理。
+
+## LLVM 函数复制和类型改写参考
 
 LLVM 不能直接修改 `FunctionType`。
-如果要把：
+改 internal function 或 external declaration 时，需要新建函数，再替换调用点和函数体。
 
-```llvm
-declare void @free()
-```
-
-改成：
-
-```llvm
-declare void @free(i64)
-```
-
-需要新建函数声明，然后替换 call 的 callee。
-实现前要参考 LLVM 自己的函数复制和函数类型改写代码，避免漏掉属性和 metadata。
-重点源码：
+实现前必须参考这些源码，避免漏掉属性和 metadata：
 
 - `/sn640/NotDec/llvm-source/llvm/lib/Transforms/Utils/CloneModule.cpp`
   - `CloneModule` 创建新 `Function` 后调用 `copyAttributesFrom`。
-  - 对 function declaration 还会 `getAllMetadata` 后逐个复制 metadata。
+  - 对 declaration 会 `getAllMetadata` 后逐个复制 metadata。
 - `/sn640/NotDec/llvm-source/llvm/lib/Transforms/Utils/CloneFunction.cpp`
-  - `CloneFunctionAttributesInto` 先用 `copyAttributesFrom` 复制 global/function 级信息，再重建 `AttributeList`。
+  - `CloneFunctionAttributesInto` 复制 global/function 级信息，再重建 `AttributeList`。
   - `CloneFunctionMetadataInto` 用 `getAllMetadata` / `MapMetadata` 复制 function metadata。
 - `/sn640/NotDec/llvm-source/llvm/lib/Transforms/IPO/DeadArgumentElimination.cpp`
-  - 改函数类型时新建 `Function`，复制 attributes、comdat，再重建所有 callsite。
+  - 改函数类型时新建 `Function`，复制 attributes、comdat，再重建 callsite。
   - 重建 callsite 时保留 calling convention、callsite attributes、operand bundles、tail call kind、`prof/dbg` metadata。
 - `/sn640/NotDec/llvm-source/llvm/lib/Transforms/IPO/ArgumentPromotion.cpp`
-  - 同样展示了新建函数、复制 metadata、重建 callsite、保留 tail call kind 的做法。
+  - 展示了新建函数、复制 metadata、重建 callsite、保留 tail call kind 的做法。
 
-第一版采用保守规则：
+需要保留：
 
-- 同一个 external callee 的所有可改 callsite 参数个数必须一致。
-- 参数类型全部用 register 宽度对应的 integer type。
-- 返回类型保持原样。
-- calling convention、attributes、linkage、name 需要保留。
-- function declaration 的 metadata 需要完整保留。
-- callsite 的 operand bundle、tail call kind、calling convention、attributes、`prof/dbg` metadata 需要保留。
+- linkage、visibility、DLL storage、unnamed addr、section、partition。
+- comdat、GC、personality、prefix/prologue data。
+- function attrs、return attrs、calling convention。
+- function metadata。
+- callsite tail kind、calling convention、attributes、operand bundles、`prof/dbg` metadata。
 
-如果同一个 external symbol 在不同 callsite 推出不同参数个数，先跳过这个 symbol。
-这会放过 `printf` 这类变参函数，但第一版不靠库函数知识处理它们。
-
-实现上不能只写一个裸的：
+不能只写裸的：
 
 ```cpp
 Function::Create(NewTy, ExternalLinkage, Name, M)
 ```
 
-然后替换 callee。
-这很容易丢掉 DLL storage class、visibility、unnamed addr、section、partition、comdat、GC、prefix/prologue/personality、function attrs、return attrs、metadata 等信息。
-即使当前 native IR 大概率没有完整 debug info，也应该按 LLVM 现有做法复制，避免后续接真实 bitcode 或更多 metadata 时出问题。
+## 清理旧实现
 
-### 6. tail call
+后续实现时清理：
 
-如果原 call 是：
-
-```llvm
-tail call void @free()
-```
-
-改写后仍保留 `tail`：
-
-```llvm
-tail call void @free(i64 %arg)
-```
-
-不要使用 `musttail`。
-`musttail` 对 caller / callee signature 有额外限制，当前 IR 不需要它。
-
-### 7. 删除参数 store
-
-被成功搬进 call operand 的 register store 可以删除：
-
-```llvm
-store i64 %arg, ptr @RDI
-tail call void @free(i64 %arg)
-```
-
-这里是分 pass 后最需要小心的地方。
-如果 signature rewrite 和 SummarySSA 合在一起做，SummarySSA 在构造 register value 时天然知道：
-
-```text
-这个 call 读取 RDI
-call 前 RDI 当前值来自哪个 store / phi / entry load
-这个 store 后面是否还会被别的 register use 读到
-```
-
-分成独立 pass 后，signature rewrite 只能看到改写后的 IR。
-当前 SummarySSA 公开出来的信息还不够完整：
-
-- `notdec.register.summary_ssa.entry` 标记 entry load。
-- `notdec.register.summary_ssa.replaced` 标记被替换过的 load。
-- `notdec.register.summary_ssa.phi` 标记新建 phi。
-- `notdec.register.summary_ssa.call_value` 标记 call return/clobber helper value。
-- `notdec.register.summary_ssa.call_args` / `notdec.register.summary_ssa.call_arg_store`
-  标记 external call 参数和对应 store。
-- 函数级 `notdec.register.summary_ssa` 只记录统计信息。
-
-这些信息没有直接表达：
-
-```text
-callsite C 的 ABI 参数寄存器 RDI 消费了 store S
-store S 是否只服务于 callsite C
-```
-
-所以第一版实现时可以先保守，但方向不能保守到放弃优化。
-signature rewrite 应该尽量知道 store 的完整用途。
-前面的 pass 也要尽量把“这个 store 最终只是 ABI 参数准备”这件事标出来。
-可接受的最小规则是：
-
-```text
-只删除本 pass 在同一个 basic block 内反向扫描直接选中的 store；
-store 到 call 之间不能出现任何可能读取该 register global 的指令；
-store 到 call 之间不能出现另一个 analyzable call；
-store 到 call 之间不能出现可能 alias register global 的未知内存操作；
-call 改写成功后再删除这些被消费的 store。
-```
-
-如果不能满足这些条件，只改写 call operand，不删除 store。
-这会留下少量 residue，但比误删安全。
-
-如果 store 后到 call 前又出现同 register 的覆盖，扫描本来就应该取最近的一次。
-较早的 store 留给后置 InstCombine / DCE 或后续 pass 处理。
-
-后续如果这个 pass 需要跨 block 或更激进地删除 store，应该让 SummarySSA 显式产出 call-arg binding metadata，而不是在 signature rewrite 里重新猜。
-可以考虑给 call 加类似：
-
-```text
-notdec.register.summary_ssa.call_arg = { register=RDI, value/store id=... }
-```
-
-但第一版先不引入这个机制，避免把两个 pass 重新耦合得太深。
-
-更准确地说，pass 边界只是实现分层，不是优化边界。
-最终目标还是：
-
-```text
-尽可能把 ABI register 上的准备 store
-  -> 变成 call operand
-  -> 再删掉原 store
-```
-
-所以如果后面发现某类 store 其实能安全删，只要前面的 pass 能稳定标出来，就应该补上，不必因为它现在落在 signature rewrite 之后就放弃。
-
-## 实现记录
-
-已完成这条独立链路的最小实现：
-
-- `include/notdec-bin2llvm/passes/summary/NativeCallSignatureRewrite.h`
-- `lib/passes/summary/NativeCallSignatureRewrite.cpp`
-- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h`
-- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
-- `tools/notdec-native-llvm.cpp`
-- `lib/CMakeLists.txt`
-- `CMakeLists.txt`
-- `tests/native_register_summary_ssa_test.cpp`
+- `include/notdec-bin2llvm/passes/summary/NativeExternalCallSignatureRewrite.h`
+- `lib/passes/summary/NativeExternalCallSignatureRewrite.cpp`
 - `tests/native_external_call_signature_rewrite_test.cpp`
+- `tools/notdec-native-llvm.cpp` 中独立调用 external rewrite pass 的入口。
+- `lib/CMakeLists.txt` / 顶层测试目标里的旧 pass 和旧测试。
 
-现在的效果是：
+旧 external-only 的能力不能丢：
 
-- SummarySSA 会给 external ABI 参数 call 标出 `notdec.register.summary_ssa.call_args`。
-- 对应参数准备 store 会标成 `notdec.register.summary_ssa.call_arg_store`。
-- `NativeCallSignatureRewrite` 会把它们改成 LLVM call operand。
-- external declaration 会改成带参数签名。
-- 已消费的 register store 会删掉。
+- external call 参数仍要改成 LLVM call operand。
+- known libc prototype 仍可保留。
+- 已确认只服务于 call 的 register store 仍要删除。
 
-真实样例 `/usr/bin/wrk` 的 `0x8300` 入口已经验证过：
-
-```llvm
-tail call void @free(i64 %0)
-```
-
-`store @RDI` 不再保留。
-生成的 IR 还能通过 `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as` 和 `opt -passes=verify`。
-
-### 8. 和 SummarySSA 的关系
-
-SummarySSA 继续负责这些：
-
-- internal direct call 的 register effect。
-- external / indirect call 的 ABI fallback。
-- 删除普通 register residue。
-- 处理 PLT tail branch lower 成 external tail call 之后的寄存器状态。
-
-Signature rewrite 不重新做 SCC summary。
-它只消费 SummarySSA 整理后的 IR。
-
-当前重点用例是：
-
-```llvm
-store i64 %x, ptr @RDI
-tail call void @free()
-```
-
-改成：
-
-```llvm
-tail call void @free(i64 %x)
-```
-
-这能把外部函数调用从“全局寄存器模拟”推进到更正常的 LLVM IR。
-
-## 风险
-
-1. 参数个数误判。
-
-   同 basic block 反向扫描只能看到局部准备动作。
-   跨 block 准备参数会漏掉。
-   第一版宁可漏掉，不跨 CFG 猜。
-
-2. external symbol 多签名冲突。
-
-   同一个 declaration 在不同 callsite 可能推到不同参数个数。
-   第一版遇到冲突就跳过该 symbol。
-
-3. 变参函数。
-
-   `printf`、`fprintf` 这类函数可能天然有不同参数个数。
-   第一版不做 varargs 推断。
-   之后可以用 dynamic symbol 名字和 ABI 规则单独处理。
-
-4. 参数类型粗糙。
-
-   第一版用 `i64` 这类整数类型，不判断 pointer。
-   这不是类型恢复，只是把寄存器传参转成 call operand。
-
-5. store 删除过早。
-
-   如果某个 store 同时被后续别的逻辑读取，删掉会错。
-   所以第一版只删本 pass 能证明被当前 call 消费的 store。
+但这些能力都应迁移到 SummarySSA rewrite 流程里。
 
 ## 判断标准
 
-最小验收用例：
+最小 internal 用例：
 
 ```llvm
-store i64 %x, ptr @RDI
-tail call void @free()
-ret void
+define void @notdec_native_callee() {
+  %RDI.entry = load i64, ptr @RDI
+  store i64 %RDI.entry, ptr @RAX
+  ret void
+}
+
+define void @notdec_native_caller() {
+  store i64 7, ptr @RDI
+  call void @notdec_native_callee()
+  %r = load i64, ptr @RAX
+  ret void
+}
 ```
 
-改写后：
+改写后应接近：
 
 ```llvm
-tail call void @free(i64 %x)
-ret void
-```
+define i64 @notdec_native_callee(i64 %arg0) {
+  ret i64 %arg0
+}
 
-并且没有残留 `store @RDI`。
+define void @notdec_native_caller() {
+  %r = call i64 @notdec_native_callee(i64 7)
+  ret void
+}
+```
 
 还需要覆盖：
 
-- 普通 external call。
-- external tail call。
-- 同一个 external callee 多个 callsite 参数个数一致。
-- 同一个 external callee 参数个数冲突时跳过。
-- intrinsic call 不参与参数判断。
+- external direct call 参数和返回值。
+- internal direct call 参数和返回值。
+- skipped ABI input slot，例如只读 `RDX` 时生成 3 个参数。
+- 多返回寄存器，生成 struct return。
+- 同一 callee 多 callsite 参数数量不统一时按最大数量统一。
+- 同一 callee 多 callsite 返回 demand 不统一时按并集统一。
+- indirect call / address-taken internal function 按统一 FunctionType 创建 call。
+- tail call 保留 tail kind；不使用 `musttail`。
 
-验证时至少检查：
+验证：
 
-- 新增单元测试。
-- `notdec-native-llvm` 对当前 `wrk -f 0x8300` 的 IR 效果。
-- 使用 `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as` 和 `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify` 验证生成 IR。
-- 对 Bench2 当前关注目标跑同口径 seed audit，记录行数和耗时，确认没有明显性能退化。
+- 新增 / 改写 SummarySSA 单元测试。
+- 删除旧 external-only pass 测试，迁移有效 case 到 SummarySSA 测试。
+- 用 LLVM 22：
+  - `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as`
+  - `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify`
+- 对 Bench2 当前 fortune 用例同口径记录运行时间和 register residue：
+  - `register_access_metadata`
+  - `loads_from_register_globals`
+  - `stores_to_register_globals`
 
-本次验证结果：
+## 实现记录：SummarySSA 内建 signature rewrite
 
-- `tests/native_register_summary_ssa_test.cpp` 通过，确认 SummarySSA 会标注 external call 参数 store。
-- `tests/native_external_call_signature_rewrite_test.cpp` 通过，确认 signature rewrite 会重建 declaration 并删掉已消费 store。
-- `/sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk` 的 `0x8300` 入口已验证：
-  `tail call void @free(i64 %0)` 出现，`store @RDI` 消失，LLVM 22 `llvm-as` / `opt -passes=verify` 通过。
+本次已经按计划把 signature rewrite 并入 SummarySSA，并删除旧 external-only pass。
+
+主要改动：
+
+- [NativeRegisterSummarySSA.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h:22)
+  - 增加 `CallsRewritten`、`FunctionsRewritten` 统计。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:69)
+  - 新增 `SignatureShape` / `SignatureRewriteState`。
+  - internal 参数来自 callee `read_entry`，按 ABI 参数寄存器最大 index 决定参数数量。
+  - internal 返回值来自 `ExitDemand && MayNonEntry` 的 ABI output register。
+  - external 参数使用 known prototype；unknown external 先按 ABI 输入寄存器偏多处理。
+  - external 返回值按实际 `summary_return` helper demand 加入 shape。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1380)
+  - 新建 replacement function，复制 attributes、metadata、comdat、calling convention。
+  - internal function body 移到新函数，entry register load 替换成 LLVM argument。
+  - 函数 `ret void` 根据返回寄存器 SSA value 改成 `ret value` 或 struct return。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1487)
+  - callsite 直接改成带 LLVM operand 的 call。
+  - call return helper 替换为 call result 或 `extractvalue`。
+  - 被消费的 ABI 参数 store 删除。
+- [tools/notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:7)
+  - 删除独立 `NativeExternalCallSignatureRewrite` 调用，默认 summary pipeline 只跑 SummarySSA。
+- 删除旧 external-only 文件：
+  - `include/notdec-bin2llvm/passes/summary/NativeExternalCallSignatureRewrite.h`
+  - `lib/passes/summary/NativeExternalCallSignatureRewrite.cpp`
+  - `tests/native_external_call_signature_rewrite_test.cpp`
+
+测试覆盖：
+
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:386)
+  - external call 参数 store 直接由 SummarySSA 改成 call operand。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:417)
+  - internal function 参数和返回值改写。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-signature/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-signature/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-summary-signature/fortune.ll -o /tmp/notdec-fortune-summary-signature/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-summary-signature/fortune.bc -o /tmp/notdec-fortune-summary-signature/fortune.verified.bc
+```
+
+fortune 结果：
+
+```text
+fortune native pipeline: 10.13 s
+register_access_metadata: 422
+loads_from_register_globals: 82
+stores_to_register_globals: 417
+summary_ssa_call_args_metadata: 0
+native_call_with_args: 29
+summary_return_helpers: 55
+```
+
+和上一版同口径相比：
+
+```text
+register_access_metadata: 508 -> 422
+loads_from_register_globals: 108 -> 82
+stores_to_register_globals: 503 -> 417
+```
+
+剩余问题：
+
+- 还有一部分 `notdec.register.summary_return.*` helper，主要是当前没有纳入 ABI return shape 的寄存器效果。
+- 现在 direct call 已覆盖，indirect call / address-taken 的强制 FunctionType 适配还需要继续补。
+- 当前 external unknown 参数按 ABI 输入偏多处理，会产生一些 `undef` 参数；这是按本阶段“偏多优先”的规则实现的。
+
+复杂度评估：
+
+- 实现效果：7/10。internal/external 参数和 ABI 返回值已经进入 SummarySSA 主链路，fortune residue 明显下降。
+- 理解成本：6/10。SummarySSA 现在同时负责 SSA 和 signature rewrite，逻辑集中但文件更重。
+- 维护成本：5/10。少了跨 pass metadata，但函数类型重写需要持续用真实 Bench2 用例校验。

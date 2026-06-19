@@ -61,6 +61,18 @@
 > 2. 整理当前新链路专用的project log文件夹，现在logs/下面最新的几个log都是单独开一个文件夹的，这样不对，把最新的几个这种只有单文件的文件夹都合并到logs/20260616-01-native-prototype-recovery-stage2里面，而且，放一个README.md，里面简单说明项目目标，以及所有的我的原始prompt。
 > 3. NativeExternalCallSignatureRewrite当前做的很奇怪，考虑完全重新写新的pass，同时处理internal函数和external函数的rewrite，logs/20260617-01-native-external-call-signature-rewrite/20260617-01-native-external-call-signature-rewrite-plan.md这个规划里面，提到了实现前要参考 LLVM 自己的函数复制和函数类型改写代码，避免漏掉属性和 metadata。
 
+### SummarySSA 内建 signature rewrite
+
+> 接下来继续规划一下SignatureRewrite。NativeExternalCallSignatureRewrite这个pass感觉写得太简单，可以直接删掉了。总的来说，应该单独写一个pass，同时负责所有的函数的签名的rewrite，完全基于之前静态分析的结果来rewrite，参考那个LLVM的cloneModule相关的代码。你觉得怎么样？有没有什么没考虑到的技术难点
+
+> 我指的不是让你列举技术难点，而是当前你觉得计划有没有什么没考虑到的问题。另外，不要说什么第一阶段只负责一部分，Rewrite是一开始就要直接做到位的，包括参数和返回值。具体不同call site不统一的情况，或者其他的复杂情况这一块单独考虑一下。你清楚这一块怎么做吗？你先介绍一下当前是怎么判断internal函数的参数和返回值的，以及callsite不统一的情况，还有其他复杂情况怎么处理
+
+> 参数就严格按照read_entry那边使用到的值来，如果出现了跳过某个寄存器的情况，就按数量更多最多的那个值对应的数量处理，就当做前面传过参数，但是没有被用上。当前的理解是对的。返回值的处理是看top down的分析，分析所有call site中caller使用到的callee修改过的寄存器的值，然后是取并集。只要有任何一个caller用了就当做它用过了。对于external的函数，就按ABI假设返回值寄存器都有值即可，然后看用了多少寄存器。当前的理解看着问题不太大。indirect call / address-taken internal function要改问题也不大，没必要太小心，可以按照参数和返回值的数量偏多的角度考虑，反正调用前都要给它强制类型转换为对应的函数指针类型。关于SummarySSA，确实当前可能导出的不太多，思路上就是按需导出额外的信息即可，之前插入的不需要的导出信息可以直接去掉。目前看下来，我严重怀疑反正summary ssa也是要重写IR，而且目前和函数签名重写的耦合非常严重，我严重怀疑这两个步骤应该一起进行，即让summary ssa也负责函数签名的修改
+
+> 名字可能可以不用改。先更新plan吧，然后写一个goal按这个实现吧，之前实现的没用就都清理掉，比如NativeExternalCallSignatureRewrite
+
+> 记得把本次的几个原始prompt也记录到那个logs/20260616-01-native-prototype-recovery-stage2/README.md。
+
 ## 文件索引
 
 - `20260616-01-ghidra-register-elimination-mechanisms.md`：Ghidra heritage、copy propagation、cover、trial/use 等机制梳理。

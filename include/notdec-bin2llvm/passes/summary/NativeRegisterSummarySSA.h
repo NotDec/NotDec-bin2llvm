@@ -31,6 +31,8 @@ struct NativeRegisterSummarySSAFunctionSummary {
   uint64_t CallReturnValues = 0;
   uint64_t CallClobberValues = 0;
   uint64_t CallArgStoresMarked = 0;
+  uint64_t CallsRewritten = 0;
+  uint64_t FunctionsRewritten = 0;
   uint64_t PreservedCalls = 0;
   uint64_t UnknownCallEffects = 0;
 };
@@ -48,6 +50,8 @@ struct NativeRegisterSummarySSASummary {
   uint64_t CallReturnValues = 0;
   uint64_t CallClobberValues = 0;
   uint64_t CallArgStoresMarked = 0;
+  uint64_t CallsRewritten = 0;
+  uint64_t FunctionsRewritten = 0;
   uint64_t PreservedCalls = 0;
   uint64_t UnknownCallEffects = 0;
   std::vector<NativeRegisterSummarySSAFunctionSummary> Functions;

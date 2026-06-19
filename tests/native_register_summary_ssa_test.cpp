@@ -193,10 +193,10 @@ bool testDuplicatePredecessorEdgesKeepPhiComplete() {
   llvm::Value *selector =
       llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0);
   llvm::SwitchInst *switchInst = builder.CreateSwitch(selector, join, 2);
-  switchInst->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 1),
-                      join);
-  switchInst->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 2),
-                      other);
+  switchInst->addCase(
+      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 1), join);
+  switchInst->addCase(
+      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 2), other);
   builder.SetInsertPoint(other);
   storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 3),
                 "RAX");
@@ -290,9 +290,9 @@ bool testIntrinsicDoesNotCreateCallValue() {
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "intrinsic_between_registers",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "intrinsic_between_registers", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -379,40 +379,97 @@ bool testAbiInputStoreBeforeCallIsKept() {
 
   auto *calleeType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *callee = llvm::Function::Create(
-      calleeType, llvm::GlobalValue::ExternalLinkage, "external_callee",
-      module);
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "external_callee", module);
 
-  llvm::Function *function = llvm::Function::Create(
-      calleeType, llvm::GlobalValue::ExternalLinkage, "call_input_store",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "call_input_store", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
-  llvm::StoreInst *argStore =
-      storeRegister(builder, rdi,
-                    llvm::ConstantInt::get(rdi->getValueType(), 42), "RDI");
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 42),
+                "RDI");
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  bool callMarked = false;
+  bool callRewritten = false;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
-    if (call != nullptr &&
-        call->getMetadata("notdec.register.summary_ssa.call_args") != nullptr) {
-      callMarked = true;
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName() == "external_callee" &&
+        call->arg_size() == 1) {
+      callRewritten = true;
     }
   }
-  return expect(summary.DeadStoresRemoved == 0,
-                "ABI input store before call was removed") &&
+  return expect(summary.DeadStoresRemoved == 1,
+                "ABI input store before call was not removed") &&
          expect(summary.CallArgStoresMarked == 1,
-                "ABI input store before call was not marked") &&
-         expect(callMarked, "ABI input call was not marked") &&
-         expect(argStore->getMetadata(
-                    "notdec.register.summary_ssa.call_arg_store") != nullptr,
-                "ABI input store call-arg metadata missing") &&
+                "ABI input store before call was not collected") &&
+         expect(callRewritten, "ABI input call was not rewritten") &&
          verifyOk(module, "module failed verifier after call input test");
+}
+
+bool testInternalSignatureRewriteUsesArgsAndReturn() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-internal-signature", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_callee", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(calleeEntry);
+  llvm::LoadInst *input = loadRegister(builder, rdi, "RDI", "input");
+  storeRegister(builder, rax, input, "RAX");
+  builder.CreateRetVoid();
+
+  llvm::Function *caller =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 7),
+                "RDI");
+  builder.CreateCall(voidType, callee);
+  llvm::LoadInst *result = loadRegister(builder, rax, "RAX", "result");
+  (void)result;
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("notdec_native_callee");
+  llvm::Function *rewrittenCaller = module.getFunction("notdec_native_caller");
+  bool callRewritten = false;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() == rewritten &&
+          call->arg_size() == 1 && call->getType()->isIntegerTy(64)) {
+        callRewritten = true;
+      }
+    }
+  }
+
+  return expect(rewritten != nullptr, "rewritten callee missing") &&
+         expect(rewrittenCaller != nullptr, "rewritten caller missing") &&
+         expect(rewritten->arg_size() == 1,
+                "internal callee argument was not rewritten") &&
+         expect(rewritten->getReturnType()->isIntegerTy(64),
+                "internal callee return was not rewritten") &&
+         expect(callRewritten, "internal callsite was not rewritten") &&
+         expect(summary.FunctionsRewritten >= 1,
+                "internal function rewrite was not counted") &&
+         expect(summary.CallsRewritten >= 1,
+                "internal call rewrite was not counted") &&
+         verifyOk(module,
+                  "module failed verifier after internal signature rewrite");
 }
 
 } // namespace
@@ -427,5 +484,6 @@ int main() {
   ok &= testOverwrittenStoreIsRemoved();
   ok &= testCrossBlockDeadStoreIsRemoved();
   ok &= testAbiInputStoreBeforeCallIsKept();
+  ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
