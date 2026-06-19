@@ -2284,3 +2284,78 @@ summary_return_helpers: 28 -> 28
 - 实现效果：7/10。RSP/RBP entry residue 明显下降，但还没有完全解决 RBP PHI 和 pointer signature rewrite。
 - 理解成本：6/10。比逐个内存访问匹配更贴近真实栈帧，但引入了“指针形态”和“整数形态”两种改写。
 - 维护成本：5/10。边界仍清楚：只处理本地负偏移 stack frame，不处理 caller stack、alias 和泛化内存。
+
+## 实现更新：post-signature cleanup 不再把 LLVM call 当作读取 ABI 寄存器
+
+用户原始 prompt：
+
+> 这个例子不是store rdi没有被消除吗？为什么和stack frame的逻辑有关系
+>
+> 不对吧，和stack frame完全没关系吧，就是单纯的store @RDI 没消掉，再debug一下看看为什么
+
+问题：
+
+`notdec_native_5040` 里 `fgets` 前面的：
+
+```llvm
+store i64 %RBP.summary_ssa, ptr @RDI
+call { i64, i64 } @fgets(i64 %RBP.summary_ssa, i64 8192, i64 %unique_df00_8151)
+```
+
+确实和 stack frame matcher 没有直接关系。这里的 call 已经有显式 LLVM 参数，`store @RDI`
+只是旧 ABI register-call 形式的残留。
+
+debug 结论：
+
+- `callArgStoreBindings()` 只会精确标记同 basic block 内的参数准备 store，所以跨 block 的 store 不一定进入 `StoresToErase`。
+- 但真正阻止删除的是 post-signature cleanup 的 liveness：
+  - 对没有被改窄签名的 external call，旧逻辑仍按 ABI 认为 call 会读取 RDI/RSI/RDX。
+  - fortune 里 `fputs` 仍保留 6 个 ABI 参数形态，于是它把前面路径上的 RDI store 拉活。
+- 这在 SummarySSA 之后不合理，因为 LLVM call 的输入已经是 operand，不再通过 `@RDI` 这种全局寄存器传值。
+
+本次改动：
+
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1059)
+  - `callReadsRegister()` 在 `PostSignatureCleanup` 阶段直接返回 false。
+  - 这个阶段只清理残留 store，不影响前面收集 call 参数的逻辑。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:672)
+  - 新增 `testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall()`。
+  - 覆盖跨 basic block 的 ABI 参数 store，然后接一个未改窄签名 external call 的情况。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-postcleanup-fixed/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-postcleanup-fixed/summary.json \
+  --register-ssa-summary
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/notdec-fortune-summary-postcleanup-fixed/fortune.ll \
+  -o /tmp/notdec-fortune-summary-postcleanup-fixed/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-summary-postcleanup-fixed/fortune.bc \
+  -o /tmp/notdec-fortune-summary-postcleanup-fixed/fortune.verified.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: 10.27 s
+dead_stores_removed: 2488 -> 2572
+register_access_metadata: 82 -> 11
+summary_ssa_rsp_rbp_entry: 14 -> 14
+```
+
+`notdec_native_5040` 里 `fgets` 前的 `store @RDI/@RSI/@RDX` 已经消失。
+
+复杂度评估：
+
+- 实现效果：9/10。直接解决了 ABI 参数 store 残留，fortune register metadata 大幅下降。
+- 理解成本：3/10。规则简单：post-signature cleanup 阶段，call 不再通过寄存器全局变量取参数。
+- 维护成本：3/10。改动只影响 cleanup 阶段，不改变 summary 构建和 signature 推断。

@@ -669,6 +669,52 @@ bool testStackFrameAddressPassedToCallIsLocalized() {
          verifyOk(module, "module failed verifier after stack call arg rewrite");
 }
 
+bool testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-post-cleanup-abi-store", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+
+  auto *calleeType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)},
+      false);
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "unrewritten_external", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "abi_store_before_unrewritten_call", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *arg = llvm::ConstantInt::get(rdi->getValueType(), 123);
+  storeRegister(builder, rdi, arg, "RDI");
+  builder.CreateBr(callBlock);
+  builder.SetInsertPoint(callBlock);
+  builder.CreateCall(callee, {arg});
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  unsigned rdiStores = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      if (store->getPointerOperand()->stripPointerCasts() == rdi) {
+        ++rdiStores;
+      }
+    }
+  }
+
+  return expect(rdiStores == 0,
+                "post-signature cleanup kept a dead ABI argument store") &&
+         expect(summary.DeadStoresRemoved >= 1,
+                "dead ABI argument store was not counted") &&
+         verifyOk(module,
+                  "module failed verifier after post-signature cleanup test");
+}
+
 } // namespace
 
 int main() {
@@ -686,5 +732,6 @@ int main() {
   ok &= testFramePointerLoadFeedsStackRewriteAndIgnoredSet();
   ok &= testSummarySSARemovesDeadStackFrameStore();
   ok &= testStackFrameAddressPassedToCallIsLocalized();
+  ok &= testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

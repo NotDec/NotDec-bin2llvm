@@ -1059,8 +1059,7 @@ private:
   bool callReadsRegister(const llvm::CallBase &call,
                          const RegisterUnit &unit) const {
     llvm::Function *callee = call.getCalledFunction();
-    if (PostSignatureCleanup &&
-        SignatureState.RewrittenCalls.count(&call) != 0) {
+    if (PostSignatureCleanup) {
       return false;
     }
     if (callee != nullptr && !callee->isDeclaration()) {
