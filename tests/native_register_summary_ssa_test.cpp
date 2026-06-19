@@ -548,7 +548,7 @@ bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
   const auto *fn = functionSummary(summary, "stack_save_rbx");
   const auto *rbxSummary = fn == nullptr ? nullptr : registerSummary(*fn, "RBX");
 
-  return expect(stackSummary.AccessesRewritten == 1,
+  return expect(stackSummary.AccessesRewritten >= 1,
                 "RSP stack save was not localized") &&
          expect(stackSummary.IgnoredRegisters.count("RSP") != 0,
                 "RSP was not marked ignored after stack rewrite") &&
@@ -589,7 +589,7 @@ bool testFramePointerLoadFeedsStackRewriteAndIgnoredSet() {
   auto summary = notdec::bin2llvm::runNativeStackFrameRewrite(module);
   return expect(summary.FramePointerLoadsReplaced == 1,
                 "RBP frame load was not replaced") &&
-         expect(summary.AccessesRewritten == 1,
+         expect(summary.AccessesRewritten >= 1,
                 "RBP-derived stack access was not localized") &&
          expect(summary.IgnoredRegisters.count("RBP") != 0,
                 "RBP was not marked ignored after frame-base match") &&
@@ -626,6 +626,49 @@ bool testSummarySSARemovesDeadStackFrameStore() {
                   "module failed verifier after stack-frame cleanup test");
 }
 
+bool testStackFrameAddressPassedToCallIsLocalized() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-stack-frame-call-arg", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+
+  auto *calleeType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)},
+      false);
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "takes_stack_pointer", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "stack_pointer_call_arg", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::Value *frameBase = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -64, true));
+  llvm::Value *buffer = builder.CreateAdd(
+      frameBase, llvm::ConstantInt::get(rsp->getValueType(), 16, true));
+  builder.CreateCall(callee, {buffer});
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeStackFrameRewrite(module);
+  llvm::CallInst *call = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      call = candidate;
+    }
+  }
+
+  return expect(summary.AccessesRewritten >= 2,
+                "stack-derived call argument was not localized") &&
+         expect(call != nullptr, "missing call after stack rewrite") &&
+         expect(llvm::isa<llvm::PtrToIntInst>(call->getArgOperand(0)),
+                "stack call argument was not rewritten through native alloca") &&
+         verifyOk(module, "module failed verifier after stack call arg rewrite");
+}
+
 } // namespace
 
 int main() {
@@ -642,5 +685,6 @@ int main() {
   ok &= testStaticRspStackRewriteKeepsSavedRegisterEvidence();
   ok &= testFramePointerLoadFeedsStackRewriteAndIgnoredSet();
   ok &= testSummarySSARemovesDeadStackFrameStore();
+  ok &= testStackFrameAddressPassedToCallIsLocalized();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

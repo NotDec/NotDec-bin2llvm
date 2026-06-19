@@ -28,11 +28,9 @@
 namespace notdec::bin2llvm {
 namespace {
 
-struct StaticStackAccess {
-  llvm::Instruction *Memory = nullptr;
-  llvm::IntToPtrInst *Pointer = nullptr;
+struct StackFrameAddressValue {
+  llvm::Instruction *Instruction = nullptr;
   int64_t Offset = 0;
-  uint64_t Size = 0;
 };
 
 std::optional<std::string> mdField(const llvm::MDNode *node,
@@ -170,24 +168,40 @@ std::optional<int64_t> stackOffsetFromBase(llvm::Value *value,
   return std::nullopt;
 }
 
-std::optional<uint64_t> fixedTypeStoreSize(const llvm::DataLayout &layout,
-                                           llvm::Type *type) {
-  llvm::TypeSize size = layout.getTypeStoreSize(type);
-  if (size.isScalable()) {
-    return std::nullopt;
+std::optional<int64_t> functionStackLowOffset(llvm::Function &function,
+                                              llvm::Value *stackBase) {
+  std::optional<int64_t> low;
+  for (llvm::Instruction &instruction : llvm::instructions(function)) {
+    std::set<llvm::Value *> seen;
+    std::optional<int64_t> offset =
+        stackOffsetFromBase(&instruction, stackBase, seen);
+    if (!offset || *offset >= 0) {
+      continue;
+    }
+    low = low ? std::min(*low, *offset) : *offset;
   }
-  return size.getFixedValue();
+  return low;
 }
 
-std::optional<uint64_t> memoryAccessSize(const llvm::DataLayout &layout,
-                                         llvm::Instruction &instruction) {
-  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
-    return fixedTypeStoreSize(layout, load->getType());
-  }
-  if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
-    return fixedTypeStoreSize(layout, store->getValueOperand()->getType());
-  }
-  return std::nullopt;
+llvm::Value *createStackFramePointer(llvm::IRBuilder<> &builder,
+                                     llvm::AllocaInst &storage,
+                                     int64_t frameLow, int64_t offset,
+                                     llvm::StringRef name) {
+  llvm::Value *byteOffset = llvm::ConstantInt::get(
+      llvm::Type::getInt64Ty(storage.getContext()),
+      static_cast<uint64_t>(offset - frameLow));
+  return builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(storage.getContext()),
+                                   &storage, byteOffset, name);
+}
+
+llvm::Value *createStackFrameInteger(llvm::IRBuilder<> &builder,
+                                     llvm::AllocaInst &storage,
+                                     int64_t frameLow, int64_t offset,
+                                     llvm::Type *integerType) {
+  llvm::Value *pointer = createStackFramePointer(
+      builder, storage, frameLow, offset, "notdec_stack.native.ptr");
+  return builder.CreatePtrToInt(pointer, integerType,
+                                "notdec_stack.native.int");
 }
 
 bool hasExistingStackAlloca(const llvm::Function &function) {
@@ -346,64 +360,40 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
     return false;
   }
 
-  const llvm::DataLayout &layout = function.getParent()->getDataLayout();
-  std::vector<StaticStackAccess> accesses;
-  int64_t low = 0;
-  int64_t high = 0;
-  bool sawAccess = false;
-  bool failed = false;
+  std::optional<int64_t> low = functionStackLowOffset(function, stackBase);
+  if (!low) {
+    return false;
+  }
+  uint64_t frameSize = static_cast<uint64_t>(-*low);
+  if (frameSize > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+    return false;
+  }
+
+  std::vector<StackFrameAddressValue> integerAddresses;
+  std::vector<StackFrameAddressValue> pointerAddresses;
   for (llvm::BasicBlock &block : function) {
     for (llvm::Instruction &instruction : block) {
-      auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(&instruction);
-      if (pointer == nullptr) {
+      if (auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(&instruction)) {
+        std::set<llvm::Value *> seen;
+        std::optional<int64_t> offset =
+            stackOffsetFromBase(pointer->getOperand(0), stackBase, seen);
+        if (offset && *offset >= *low && *offset < 0) {
+          pointerAddresses.push_back({&instruction, *offset});
+        }
         continue;
       }
       std::set<llvm::Value *> seen;
       std::optional<int64_t> offset =
-          stackOffsetFromBase(pointer->getOperand(0), stackBase, seen);
-      if (!offset || *offset >= 0) {
+          stackOffsetFromBase(&instruction, stackBase, seen);
+      if (!offset || *offset < *low || *offset >= 0) {
         continue;
       }
-
-      for (llvm::User *user : pointer->users()) {
-        auto *memory = llvm::dyn_cast<llvm::Instruction>(user);
-        if (memory == nullptr ||
-            (llvm::isa<llvm::LoadInst>(memory) && memory->getOperand(0) != pointer) ||
-            (llvm::isa<llvm::StoreInst>(memory) && memory->getOperand(1) != pointer) ||
-            (!llvm::isa<llvm::LoadInst>(memory) &&
-             !llvm::isa<llvm::StoreInst>(memory))) {
-          failed = true;
-          break;
-        }
-        std::optional<uint64_t> size = memoryAccessSize(layout, *memory);
-        if (!size || *size == 0) {
-          failed = true;
-          break;
-        }
-        int64_t end = *offset + static_cast<int64_t>(*size);
-        if (end > 0) {
-          failed = true;
-          break;
-        }
-        accesses.push_back({memory, pointer, *offset, *size});
-        low = sawAccess ? std::min(low, *offset) : *offset;
-        high = sawAccess ? std::max(high, end) : end;
-        sawAccess = true;
-      }
-      if (failed) {
-        break;
+      if (instruction.getType()->isIntegerTy()) {
+        integerAddresses.push_back({&instruction, *offset});
       }
     }
-    if (failed) {
-      break;
-    }
   }
-  if (failed || accesses.empty() || high <= low) {
-    return false;
-  }
-
-  uint64_t frameSize = static_cast<uint64_t>(high - low);
-  if (frameSize > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+  if (integerAddresses.empty() && pointerAddresses.empty()) {
     return false;
   }
 
@@ -415,28 +405,50 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
       entryBuilder.CreateAlloca(arrayType, nullptr, "notdec_stack.native");
   storage->setAlignment(llvm::Align(16));
 
-  for (const StaticStackAccess &access : accesses) {
-    llvm::IRBuilder<> builder(access.Memory);
-    llvm::Value *byteOffset = llvm::ConstantInt::get(
-        llvm::Type::getInt64Ty(function.getContext()),
-        static_cast<uint64_t>(access.Offset - low));
-    llvm::Value *localPointer = builder.CreateInBoundsGEP(
-        llvm::Type::getInt8Ty(function.getContext()), storage, byteOffset,
-        "notdec_stack.native.ptr");
-    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(access.Memory)) {
-      load->setOperand(0, localPointer);
-    } else if (auto *store = llvm::dyn_cast<llvm::StoreInst>(access.Memory)) {
-      store->setOperand(1, localPointer);
+  uint64_t rewritten = 0;
+  for (const StackFrameAddressValue &address : pointerAddresses) {
+    if (address.Instruction->getParent() == nullptr) {
+      continue;
     }
+    llvm::IRBuilder<> builder(address.Instruction);
+    llvm::Value *localPointer =
+        createStackFramePointer(builder, *storage, *low, address.Offset,
+                                "notdec_stack.native.ptr");
+    address.Instruction->replaceAllUsesWith(localPointer);
+    ++rewritten;
   }
 
-  std::set<llvm::IntToPtrInst *> pointers;
-  for (const StaticStackAccess &access : accesses) {
-    if (pointers.insert(access.Pointer).second && access.Pointer->use_empty()) {
-      llvm::RecursivelyDeleteTriviallyDeadInstructions(access.Pointer);
+  for (const StackFrameAddressValue &address : integerAddresses) {
+    if (address.Instruction->getParent() == nullptr ||
+        address.Instruction->use_empty()) {
+      continue;
+    }
+    llvm::IRBuilder<> builder(address.Instruction);
+    llvm::Value *localInteger = createStackFrameInteger(
+        builder, *storage, *low, address.Offset, address.Instruction->getType());
+    address.Instruction->replaceAllUsesWith(localInteger);
+    ++rewritten;
+  }
+
+  for (const StackFrameAddressValue &address : pointerAddresses) {
+    if (address.Instruction->getParent() != nullptr &&
+        address.Instruction->use_empty()) {
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(address.Instruction);
     }
   }
-  summary.AccessesRewritten += accesses.size();
+  for (const StackFrameAddressValue &address : integerAddresses) {
+    if (address.Instruction->getParent() != nullptr &&
+        address.Instruction->use_empty()) {
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(address.Instruction);
+    }
+  }
+  if (rewritten == 0) {
+    if (storage->use_empty()) {
+      storage->eraseFromParent();
+    }
+    return false;
+  }
+  summary.AccessesRewritten += rewritten;
   return true;
 }
 

@@ -2203,3 +2203,84 @@ summary_return_helpers: 28 -> 28
 - 实现效果：7/10。RSP/RBP 残留明显下降，summary return 没变坏。
 - 理解成本：6/10。cleanup 分成 register bookkeeping 和 native stack alloca 两块，需要理解它们的运行顺序。
 - 维护成本：5/10。当前仍然只处理固定本地栈，不处理 alias 和 caller stack 参数，边界清楚。
+
+## 实现更新：按整段 native stack frame 改写 RSP 派生地址
+
+用户原始 prompt：
+
+> 不对，只要匹配开头的rsp subtract模式就直接转换为对应范围的alloca就可以了，然后把后续所有的rsp使用都换成对新分配的空间指针的使用即可，需要的时候直接应用inttoptr或者ptrtoint。不需要非要匹配出所有的RSP的模式。如果没有rsp的访问，可能是leaf 函数？此时甚至可以转换为一个alloca 0 表示不知道多大的内存分配
+
+问题：
+
+前一版 `NativeStackFrame` 是从每个 `inttoptr(RSP + negative constant)` 的内存访问反推栈槽范围。
+这会漏掉两类常见情况：
+
+- 栈地址先经过 SSA/PHI，再作为 call 参数传出。
+- 栈地址本身以整数形式继续传播，暂时还不能直接改成 LLVM `ptr` 参数。
+
+本次改动：
+
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:28)
+  - 用 `StackFrameAddressValue` 记录可改写的 RSP-derived 地址值，不再只记录 load/store 访问。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:171)
+  - 新增 `functionStackLowOffset()`，从函数内所有可追踪的 `RSP.entry + constant` 中取最小负偏移，作为整段本地栈 frame 大小。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:188)
+  - 新增 `createStackFramePointer()` / `createStackFrameInteger()`，需要指针时生成 alloca GEP，需要整数时生成 `ptrtoint(GEP)`。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:352)
+  - 重写 `rewriteFunctionStackAccesses()`：先创建整段 `notdec_stack.native` alloca，再把 frame 范围内的 `inttoptr` 和整数栈地址统一改到这段 alloca 上。
+  - 当前仍只处理负偏移本地栈，不改 `RSP.entry + 正偏移`，避免把 caller stack / 返回地址附近访问误当成本地 frame。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:626)
+  - 新增 `testStackFrameAddressPassedToCallIsLocalized()`，覆盖“栈地址作为 call 参数传出”的情况。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+```
+
+fortune：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-framealloca/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-framealloca/summary.json \
+  --register-ssa-summary
+```
+
+结果：
+
+```text
+fortune native pipeline: 10.31 s
+stack_frame_accesses_rewritten=263
+stack_frame_pointer_loads_replaced=0
+stack_frame_register_loads_removed=7
+stack_frame_register_stores_removed=0
+stack_frame_alloca_loads_removed=8
+stack_frame_alloca_stores_removed=109
+stack_frame_allocas_removed=0
+```
+
+同口径对比上一版：
+
+```text
+stack_frame_accesses_rewritten: 129 -> 263
+summary_ssa_rsp_rbp_entry: 56 -> 14
+register_access_metadata: 78 -> 82
+summary_return_helpers: 28 -> 28
+```
+
+说明：
+
+- `notdec_native_3470` 这类函数已经从大量 `RSP.entry - constant` 变成整段 `notdec_stack.native`。
+- `notdec_native_5040` 仍有 `RBP.summary_ssa` 作为 `fgets` 参数，因为它经过 RBP PHI，当前还没有把这类 PHI 整体改成 pointer PHI。
+- `register_access_metadata` 小幅上升，主要是更多栈地址被保留成 `ptrtoint(GEP)` 后继续按当前 i64 call signature 传递。后续要减少这一块，应该让 signature rewrite 支持把这类参数改成 `ptr`，而不是继续在 stack cleanup 里硬删。
+
+复杂度评估：
+
+- 实现效果：7/10。RSP/RBP entry residue 明显下降，但还没有完全解决 RBP PHI 和 pointer signature rewrite。
+- 理解成本：6/10。比逐个内存访问匹配更贴近真实栈帧，但引入了“指针形态”和“整数形态”两种改写。
+- 维护成本：5/10。边界仍清楚：只处理本地负偏移 stack frame，不处理 caller stack、alias 和泛化内存。
