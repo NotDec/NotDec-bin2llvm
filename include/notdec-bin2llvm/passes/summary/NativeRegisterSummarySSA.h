@@ -37,6 +37,13 @@ struct NativeRegisterSummarySSAFunctionSummary {
   uint64_t FunctionsRewritten = 0;
   uint64_t PreservedCalls = 0;
   uint64_t UnknownCallEffects = 0;
+  uint64_t StackFrameAccessesRewritten = 0;
+  uint64_t StackFramePointerLoadsReplaced = 0;
+  uint64_t StackFrameRegisterLoadsRemoved = 0;
+  uint64_t StackFrameRegisterStoresRemoved = 0;
+  uint64_t StackFrameAllocaLoadsRemoved = 0;
+  uint64_t StackFrameAllocaStoresRemoved = 0;
+  uint64_t StackFrameAllocasRemoved = 0;
 };
 
 struct NativeRegisterSummarySSASummary {
@@ -56,6 +63,13 @@ struct NativeRegisterSummarySSASummary {
   uint64_t FunctionsRewritten = 0;
   uint64_t PreservedCalls = 0;
   uint64_t UnknownCallEffects = 0;
+  uint64_t StackFrameAccessesRewritten = 0;
+  uint64_t StackFramePointerLoadsReplaced = 0;
+  uint64_t StackFrameRegisterLoadsRemoved = 0;
+  uint64_t StackFrameRegisterStoresRemoved = 0;
+  uint64_t StackFrameAllocaLoadsRemoved = 0;
+  uint64_t StackFrameAllocaStoresRemoved = 0;
+  uint64_t StackFrameAllocasRemoved = 0;
   std::vector<NativeRegisterSummarySSAFunctionSummary> Functions;
 };
 

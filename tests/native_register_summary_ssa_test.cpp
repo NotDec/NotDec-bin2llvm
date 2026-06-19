@@ -598,6 +598,34 @@ bool testFramePointerLoadFeedsStackRewriteAndIgnoredSet() {
          verifyOk(module, "module failed verifier after RBP stack rewrite test");
 }
 
+bool testSummarySSARemovesDeadStackFrameStore() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-dead-stack-frame-store", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "dead_stack_frame_store", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::Value *slotAddress = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::Value *slot =
+      builder.CreateIntToPtr(slotAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(rsp->getValueType(), 11), slot);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.StackFrameAllocaStoresRemoved == 1,
+                "dead stack-frame alloca store was not removed") &&
+         verifyOk(module,
+                  "module failed verifier after stack-frame cleanup test");
+}
+
 } // namespace
 
 int main() {
@@ -613,5 +641,6 @@ int main() {
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testStaticRspStackRewriteKeepsSavedRegisterEvidence();
   ok &= testFramePointerLoadFeedsStackRewriteAndIgnoredSet();
+  ok &= testSummarySSARemovesDeadStackFrameStore();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

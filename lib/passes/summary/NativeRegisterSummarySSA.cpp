@@ -1329,6 +1329,13 @@ void addFunctionSummary(NativeRegisterSummarySSASummary &total,
   total.FunctionsRewritten += fn.FunctionsRewritten;
   total.PreservedCalls += fn.PreservedCalls;
   total.UnknownCallEffects += fn.UnknownCallEffects;
+  total.StackFrameAccessesRewritten += fn.StackFrameAccessesRewritten;
+  total.StackFramePointerLoadsReplaced += fn.StackFramePointerLoadsReplaced;
+  total.StackFrameRegisterLoadsRemoved += fn.StackFrameRegisterLoadsRemoved;
+  total.StackFrameRegisterStoresRemoved += fn.StackFrameRegisterStoresRemoved;
+  total.StackFrameAllocaLoadsRemoved += fn.StackFrameAllocaLoadsRemoved;
+  total.StackFrameAllocaStoresRemoved += fn.StackFrameAllocaStoresRemoved;
+  total.StackFrameAllocasRemoved += fn.StackFrameAllocasRemoved;
 }
 
 llvm::AttributeList attributesForNewFunction(llvm::Function &oldFunction,
@@ -1665,6 +1672,23 @@ runNativeRegisterSummarySSA(llvm::Module &module,
         cleanup.removeDeadStoresAfterSignatureRewrite();
         summary.DeadStoresRemoved += cleanupFn.DeadStoresRemoved;
       }
+      NativeStackFrameCleanupOptions cleanupOptions;
+      cleanupOptions.StackPointerRegister = stackFrameSummary.StackPointerRegister;
+      cleanupOptions.Registers = effectiveOptions.IgnoredRegisters;
+      NativeStackFrameCleanupSummary cleanupSummary =
+          runNativeStackFrameCleanup(module, cleanupOptions);
+      summary.StackFrameAccessesRewritten += cleanupSummary.AccessesRewritten;
+      summary.StackFramePointerLoadsReplaced +=
+          cleanupSummary.FramePointerLoadsReplaced;
+      summary.StackFrameRegisterLoadsRemoved +=
+          cleanupSummary.RegisterLoadsRemoved;
+      summary.StackFrameRegisterStoresRemoved +=
+          cleanupSummary.RegisterStoresRemoved;
+      summary.StackFrameAllocaLoadsRemoved +=
+          cleanupSummary.StackAllocaLoadsRemoved;
+      summary.StackFrameAllocaStoresRemoved +=
+          cleanupSummary.StackAllocaStoresRemoved;
+      summary.StackFrameAllocasRemoved += cleanupSummary.StackAllocasRemoved;
     }
   }
   summary.FunctionsSeen = summary.Functions.size();
@@ -1688,7 +1712,21 @@ void printNativeRegisterSummarySSASummary(
      << " call_clobbers=" << summary.CallClobberValues
      << " call_arg_stores_marked=" << summary.CallArgStoresMarked
      << " preserved_calls=" << summary.PreservedCalls
-     << " unknown_call_effects=" << summary.UnknownCallEffects << "\n";
+     << " unknown_call_effects=" << summary.UnknownCallEffects
+     << " stack_frame_accesses_rewritten="
+     << summary.StackFrameAccessesRewritten
+     << " stack_frame_pointer_loads_replaced="
+     << summary.StackFramePointerLoadsReplaced
+     << " stack_frame_register_loads_removed="
+     << summary.StackFrameRegisterLoadsRemoved
+     << " stack_frame_register_stores_removed="
+     << summary.StackFrameRegisterStoresRemoved
+     << " stack_frame_alloca_loads_removed="
+     << summary.StackFrameAllocaLoadsRemoved
+     << " stack_frame_alloca_stores_removed="
+     << summary.StackFrameAllocaStoresRemoved
+     << " stack_frame_allocas_removed=" << summary.StackFrameAllocasRemoved
+     << "\n";
   for (const NativeRegisterSummarySSAFunctionSummary &function :
        summary.Functions) {
     os << "  " << function.FunctionName << ": loads=" << function.LoadsSeen

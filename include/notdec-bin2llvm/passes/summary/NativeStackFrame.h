@@ -20,7 +20,25 @@ struct NativeStackFrameRewriteSummary {
   uint64_t FunctionsRewritten = 0;
   uint64_t AccessesRewritten = 0;
   uint64_t FramePointerLoadsReplaced = 0;
+  std::string StackPointerRegister;
   std::set<std::string> IgnoredRegisters;
+};
+
+struct NativeStackFrameCleanupOptions {
+  bool PrintSummary = false;
+  std::string StackPointerRegister;
+  std::set<std::string> Registers;
+};
+
+struct NativeStackFrameCleanupSummary {
+  uint64_t FunctionsSeen = 0;
+  uint64_t AccessesRewritten = 0;
+  uint64_t FramePointerLoadsReplaced = 0;
+  uint64_t RegisterLoadsRemoved = 0;
+  uint64_t RegisterStoresRemoved = 0;
+  uint64_t StackAllocaLoadsRemoved = 0;
+  uint64_t StackAllocaStoresRemoved = 0;
+  uint64_t StackAllocasRemoved = 0;
 };
 
 // Summary chain stack handling.  It only localizes fixed negative offsets from
@@ -29,7 +47,13 @@ struct NativeStackFrameRewriteSummary {
 NativeStackFrameRewriteSummary runNativeStackFrameRewrite(
     llvm::Module &module, const NativeStackFrameRewriteOptions &options = {});
 
+NativeStackFrameCleanupSummary runNativeStackFrameCleanup(
+    llvm::Module &module, const NativeStackFrameCleanupOptions &options = {});
+
 void printNativeStackFrameRewriteSummary(
     const NativeStackFrameRewriteSummary &summary, llvm::raw_ostream &os);
+
+void printNativeStackFrameCleanupSummary(
+    const NativeStackFrameCleanupSummary &summary, llvm::raw_ostream &os);
 
 } // namespace notdec::bin2llvm

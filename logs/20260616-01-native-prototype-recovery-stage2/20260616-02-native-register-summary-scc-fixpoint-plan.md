@@ -2078,3 +2078,128 @@ summary_return_helpers: 43 -> 28
 - 实现效果：7/10。RSP/RBP 栈帧处理进入新链路，helper 明显减少。
 - 理解成本：5/10。多了一个小预处理 pass，但它只做固定负偏移和简单 RBP frame base。
 - 维护成本：5/10。后续如果要支持 caller stack 参数、动态栈、alias，需要扩展这个 pass，而不是塞进 register summary。
+
+## 计划：RSP/RBP 栈帧 rewrite 和 cleanup 分层
+
+原始 prompt：
+
+> 按这个推进吧，先写个plan，然后开始实现
+
+背景：
+
+上一节已经把固定 `RSP.entry + negative constant` 的本地栈访问改成了 `notdec_stack.native`
+alloca，并把 `RBP = RSP-derived` 的简单 frame-base load 替换掉。问题是 RSP/RBP 的处理不能只靠
+register summary ignore：
+
+- summary 层应该忽略 RSP/RBP，不把它们当普通参数、返回值、clobber。
+- IR rewrite/cleanup 层不能直接跳过 RSP/RBP，否则原始 `load/store @RSP/@RBP` 会大量残留。
+- alloca 匹配层最清楚哪些 RSP/RBP 使用只是栈帧 bookkeeping，所以应由它负责主要清理。
+
+目标：
+
+- `NativeStackFrame` 拆成两个阶段：
+  - summary 前：rewrite 本地栈访问，保留 saved-register store 证据。
+  - SummarySSA 后：删除已经没有语义用途的 RSP/RBP bookkeeping 和临时 native stack alloca。
+- 不在 pre-summary 阶段删除 saved-register store，避免破坏 callee-saved preserved 判断。
+- post cleanup 只处理已纳入栈帧寄存器集合的 RSP/RBP，不扩展到通用内存 alias。
+
+技术路线：
+
+1. 保留现有 `runNativeStackFrameRewrite()`，继续在 `runNativeRegisterSummarySSA()` 开头执行。
+2. 新增 `runNativeStackFrameCleanup()`，在 SummarySSA 的 signature rewrite 和 register residue cleanup 之后执行。
+3. cleanup 使用 rewrite 阶段返回的 `IgnoredRegisters`：
+   - 删除 use-empty 的 RSP/RBP load。
+   - 对 RSP/RBP store 做一个小的后向 liveness：后面没有 RSP/RBP load 使用它，就删除。
+   - 清理 `notdec_stack.native` alloca 上 use-empty load 和没有任何 load 覆盖的 dead store。
+4. cleanup 删除 store 后，递归删除只为该 store/load 服务的 add/sub/inttoptr/gep 链。
+5. 不处理 caller stack 参数、动态栈、unknown alias、非固定 offset。
+
+判断标准：
+
+- `native_register_summary_test` 和 `native_register_summary_ssa_test` 通过。
+- fortune 输出能通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- fortune 的 register residue 不应比上一版变差，RSP/RBP metadata 应下降。
+- pipeline 时间不应明显变慢。
+
+风险：
+
+- 如果 cleanup 把仍然参与未识别地址计算的 RSP/RBP load/store 删掉，会破坏语义。
+  所以初版只删 use-empty load 和后向 liveness 明确死掉的 store。
+- 如果 alloca cleanup 太早删 saved-register store，会影响 summary。
+  所以 alloca cleanup 只放在 SummarySSA 后。
+
+实现：
+
+- [NativeStackFrame.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/passes/summary/NativeStackFrame.h:27)
+  - 新增 `NativeStackFrameCleanupOptions` / `NativeStackFrameCleanupSummary`。
+  - cleanup options 显式传入 `StackPointerRegister` 和要清理的栈帧寄存器集合。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:469)
+  - 新增 `cleanupStackAllocaAccesses()`。
+  - 删除 use-empty 的 `notdec_stack.native` load。
+  - 删除没有对应 load 的 `notdec_stack.native` store。
+  - 不递归删除 operand，避免同一轮里其他 store 还引用的 GEP 变成悬空指针；后续 instcombine 会清理死计算链。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:544)
+  - 新增 `cleanupRegisterBookkeeping()`。
+  - 对 RSP/RBP register bookkeeping 做 CFG 后向活跃分析，删除 use-empty load 和没有后续 load 读取的 store。
+- [NativeStackFrame.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeStackFrame.cpp:689)
+  - 新增 `runNativeStackFrameCleanup()`。
+  - SummarySSA 后再跑一次 frame pointer load 替换和本地栈 alloca rewrite，然后做 register/allocation cleanup。
+  - alloca cleanup 后再跑一次 register bookkeeping cleanup，清掉因此变成 use-empty 的 RSP/RBP entry load/store。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1675)
+  - 在 signature rewrite 和 register residue cleanup 后调用 `runNativeStackFrameCleanup()`。
+  - 将 cleanup 统计汇总进 `NativeRegisterSummarySSASummary`。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:601)
+  - 增加 `testSummarySSARemovesDeadStackFrameStore()`，确认 SummarySSA 后的 dead stack-frame store 会被清掉。
+
+验证命令：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-stackcleanup/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-stackcleanup/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-summary-stackcleanup/fortune.ll -o /tmp/notdec-fortune-summary-stackcleanup/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-summary-stackcleanup/fortune.bc -o /tmp/notdec-fortune-summary-stackcleanup/fortune.verified.bc
+```
+
+fortune 结果：
+
+```text
+fortune native pipeline: 10.50 s
+register_access_metadata: 78
+summary_return_helpers: 28
+native_stack_allocas: 0
+rsp_rbp_access_md_refs: 6
+summary_ssa_rsp_rbp_entry: 56
+```
+
+SummarySSA cleanup 统计：
+
+```text
+stack_frame_accesses_rewritten=129
+stack_frame_pointer_loads_replaced=0
+stack_frame_register_loads_removed=7
+stack_frame_register_stores_removed=0
+stack_frame_alloca_loads_removed=8
+stack_frame_alloca_stores_removed=109
+stack_frame_allocas_removed=0
+```
+
+和上一版相比：
+
+```text
+register_access_metadata: 82 -> 78
+summary_ssa_rsp_rbp_entry: 172 -> 56
+summary_return_helpers: 28 -> 28
+```
+
+复杂度评估：
+
+- 实现效果：7/10。RSP/RBP 残留明显下降，summary return 没变坏。
+- 理解成本：6/10。cleanup 分成 register bookkeeping 和 native stack alloca 两块，需要理解它们的运行顺序。
+- 维护成本：5/10。当前仍然只处理固定本地栈，不处理 alias 和 caller stack 参数，边界清楚。

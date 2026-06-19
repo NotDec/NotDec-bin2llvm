@@ -9,12 +9,13 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
-#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 #include <algorithm>
 #include <limits>
@@ -330,6 +331,10 @@ std::vector<std::string> framePointerRegisterNames(const NativeAbiSpec &abi) {
   return names;
 }
 
+bool isFramePointerRegisterName(llvm::StringRef name) {
+  return name == "RBP" || name == "EBP" || name == "BP";
+}
+
 bool rewriteFunctionStackAccesses(llvm::Function &function,
                                   llvm::StringRef stackRegisterName,
                                   NativeStackFrameRewriteSummary &summary) {
@@ -435,6 +440,209 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
   return true;
 }
 
+void eraseInstructionOnly(llvm::Instruction &inst) {
+  inst.eraseFromParent();
+}
+
+bool stackAllocaPointer(llvm::Value *value) {
+  value = value->stripPointerCasts();
+  auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(value);
+  if (alloca != nullptr) {
+    return alloca->hasName() &&
+           alloca->getName().starts_with("notdec_stack.native");
+  }
+  auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value);
+  return gep != nullptr && stackAllocaPointer(gep->getPointerOperand());
+}
+
+bool stackAllocaStoreIsLoaded(
+    llvm::StoreInst &store, const std::vector<llvm::LoadInst *> &loads) {
+  llvm::Value *storePointer = store.getPointerOperand()->stripPointerCasts();
+  for (llvm::LoadInst *load : loads) {
+    if (load->getPointerOperand()->stripPointerCasts() == storePointer) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void cleanupStackAllocaAccesses(llvm::Function &function,
+                                NativeStackFrameCleanupSummary &summary) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    std::vector<llvm::LoadInst *> stackLoads;
+    std::vector<llvm::StoreInst *> stackStores;
+    std::vector<llvm::AllocaInst *> stackAllocas;
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&inst)) {
+        if (alloca->hasName() &&
+            alloca->getName().starts_with("notdec_stack.native")) {
+          stackAllocas.push_back(alloca);
+        }
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (stackAllocaPointer(load->getPointerOperand())) {
+          stackLoads.push_back(load);
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        if (stackAllocaPointer(store->getPointerOperand())) {
+          stackStores.push_back(store);
+        }
+      }
+    }
+
+    for (llvm::LoadInst *load : stackLoads) {
+      if (load->getParent() != nullptr && load->use_empty() &&
+          !load->isVolatile() && !load->isAtomic()) {
+        eraseInstructionOnly(*load);
+        ++summary.StackAllocaLoadsRemoved;
+        changed = true;
+      }
+    }
+    if (changed) {
+      continue;
+    }
+
+    stackLoads.clear();
+    stackStores.clear();
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (stackAllocaPointer(load->getPointerOperand())) {
+          stackLoads.push_back(load);
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        if (stackAllocaPointer(store->getPointerOperand())) {
+          stackStores.push_back(store);
+        }
+      }
+    }
+    for (llvm::StoreInst *store : stackStores) {
+      if (store->getParent() != nullptr && !store->isVolatile() &&
+          !store->isAtomic() && !stackAllocaStoreIsLoaded(*store, stackLoads)) {
+        eraseInstructionOnly(*store);
+        ++summary.StackAllocaStoresRemoved;
+        changed = true;
+      }
+    }
+
+    for (llvm::AllocaInst *alloca : stackAllocas) {
+      if (alloca->getParent() != nullptr && alloca->use_empty()) {
+        alloca->eraseFromParent();
+        ++summary.StackAllocasRemoved;
+        changed = true;
+      }
+    }
+  }
+}
+
+void cleanupRegisterBookkeeping(llvm::Function &function,
+                                const std::set<std::string> &registers,
+                                NativeStackFrameCleanupSummary &summary) {
+  std::map<llvm::BasicBlock *, std::set<std::string>> liveIn;
+  std::map<llvm::BasicBlock *, std::set<std::string>> liveOut;
+  std::vector<llvm::BasicBlock *> blocks;
+  for (llvm::BasicBlock &block : function) {
+    blocks.push_back(&block);
+  }
+
+  auto transferBlock = [&](llvm::BasicBlock &block,
+                           std::set<std::string> live) {
+    for (auto instIt = block.rbegin(); instIt != block.rend(); ++instIt) {
+      llvm::Instruction &inst = *instIt;
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (!load->use_empty()) {
+          for (const std::string &name : registers) {
+            if (loadReadsRegister(*load, name)) {
+              live.insert(name);
+              break;
+            }
+          }
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        for (const std::string &name : registers) {
+          if (isRegisterAccess(*store, name)) {
+            live.erase(name);
+            break;
+          }
+        }
+      }
+    }
+    return live;
+  };
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (auto blockIt = blocks.rbegin(); blockIt != blocks.rend(); ++blockIt) {
+      llvm::BasicBlock &block = **blockIt;
+      std::set<std::string> out;
+      for (llvm::BasicBlock *succ : llvm::successors(&block)) {
+        auto found = liveIn.find(succ);
+        if (found != liveIn.end()) {
+          out.insert(found->second.begin(), found->second.end());
+        }
+      }
+      std::set<std::string> in = transferBlock(block, out);
+      changed |= liveOut[&block] != out || liveIn[&block] != in;
+      liveOut[&block] = std::move(out);
+      liveIn[&block] = std::move(in);
+    }
+  }
+
+  std::vector<llvm::Instruction *> dead;
+  for (llvm::BasicBlock &block : function) {
+    std::set<std::string> live = liveOut[&block];
+    for (auto instIt = block.rbegin(); instIt != block.rend(); ++instIt) {
+      llvm::Instruction &inst = *instIt;
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        for (const std::string &name : registers) {
+          if (loadReadsRegister(*load, name)) {
+            if (load->use_empty()) {
+              dead.push_back(load);
+            } else {
+              live.insert(name);
+            }
+            break;
+          }
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        for (const std::string &name : registers) {
+          if (isRegisterAccess(*store, name)) {
+            if (live.count(name) == 0) {
+              dead.push_back(store);
+            } else {
+              live.erase(name);
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  for (llvm::Instruction *inst : dead) {
+    if (inst->getParent() == nullptr) {
+      continue;
+    }
+    if (llvm::isa<llvm::LoadInst>(inst)) {
+      ++summary.RegisterLoadsRemoved;
+    } else if (llvm::isa<llvm::StoreInst>(inst)) {
+      ++summary.RegisterStoresRemoved;
+    }
+    eraseInstructionOnly(*inst);
+  }
+}
+
 } // namespace
 
 NativeStackFrameRewriteSummary runNativeStackFrameRewrite(
@@ -445,6 +653,7 @@ NativeStackFrameRewriteSummary runNativeStackFrameRewrite(
     return summary;
   }
 
+  summary.StackPointerRegister = abi->StackPointerRegister;
   summary.IgnoredRegisters.insert(abi->StackPointerRegister);
   std::vector<std::string> framePointers = framePointerRegisterNames(*abi);
   for (llvm::Function &function : module) {
@@ -477,6 +686,42 @@ NativeStackFrameRewriteSummary runNativeStackFrameRewrite(
   return summary;
 }
 
+NativeStackFrameCleanupSummary runNativeStackFrameCleanup(
+    llvm::Module &module, const NativeStackFrameCleanupOptions &options) {
+  NativeStackFrameCleanupSummary summary;
+  if (options.Registers.empty()) {
+    return summary;
+  }
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    ++summary.FunctionsSeen;
+    NativeStackFrameRewriteSummary rewriteSummary;
+    for (const std::string &name : options.Registers) {
+      if (isFramePointerRegisterName(name) &&
+          !options.StackPointerRegister.empty()) {
+        rewriteSummary.FramePointerLoadsReplaced += replaceFramePointerLoads(
+            function, name, options.StackPointerRegister);
+      }
+    }
+    if (!options.StackPointerRegister.empty() &&
+        rewriteFunctionStackAccesses(function, options.StackPointerRegister,
+                                     rewriteSummary)) {
+      summary.AccessesRewritten += rewriteSummary.AccessesRewritten;
+    }
+    summary.FramePointerLoadsReplaced +=
+        rewriteSummary.FramePointerLoadsReplaced;
+    cleanupRegisterBookkeeping(function, options.Registers, summary);
+    cleanupStackAllocaAccesses(function, summary);
+    cleanupRegisterBookkeeping(function, options.Registers, summary);
+  }
+  if (options.PrintSummary) {
+    printNativeStackFrameCleanupSummary(summary, llvm::errs());
+  }
+  return summary;
+}
+
 void printNativeStackFrameRewriteSummary(
     const NativeStackFrameRewriteSummary &summary, llvm::raw_ostream &os) {
   os << "Native stack frame rewrite: functions=" << summary.FunctionsSeen
@@ -488,6 +733,18 @@ void printNativeStackFrameRewriteSummary(
     os << name << ' ';
   }
   os << '\n';
+}
+
+void printNativeStackFrameCleanupSummary(
+    const NativeStackFrameCleanupSummary &summary, llvm::raw_ostream &os) {
+  os << "Native stack frame cleanup: functions=" << summary.FunctionsSeen
+     << " accesses=" << summary.AccessesRewritten
+     << " frame_pointer_loads=" << summary.FramePointerLoadsReplaced
+     << " register_loads=" << summary.RegisterLoadsRemoved
+     << " register_stores=" << summary.RegisterStoresRemoved
+     << " alloca_loads=" << summary.StackAllocaLoadsRemoved
+     << " alloca_stores=" << summary.StackAllocaStoresRemoved
+     << " allocas=" << summary.StackAllocasRemoved << '\n';
 }
 
 } // namespace notdec::bin2llvm
