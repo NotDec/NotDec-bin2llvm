@@ -410,3 +410,81 @@ stores_to_register_globals: 503 -> 417
 - 实现效果：7/10。internal/external 参数和 ABI 返回值已经进入 SummarySSA 主链路，fortune residue 明显下降。
 - 理解成本：6/10。SummarySSA 现在同时负责 SSA 和 signature rewrite，逻辑集中但文件更重。
 - 维护成本：5/10。少了跨 pass metadata，但函数类型重写需要持续用真实 Bench2 用例校验。
+
+## 实现记录：signature rewrite 后清理参数 store
+
+本次把 signature rewrite 后的死 store 清理放在 SummarySSA 内部。
+
+原因：
+
+- `instcombine` 不知道 `@RDI` / `@RSI` 这类 register global 的 ABI 含义。
+- 签名改写后，call 参数已经变成 LLVM operand，原来服务于 ABI 传参的 register store 才能被确认删除。
+- 这个判断依赖 SummarySSA 内部的 call rewrite 结果，单独 pass 反而需要额外 metadata。
+
+主要改动：
+
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:93)
+  - `SignatureRewriteState` 增加 `RewrittenCalls`，只记录 SummarySSA 自己重建出来的新 call。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:584)
+  - 增加 `FunctionBuilder::removeDeadStoresAfterSignatureRewrite()`。
+  - 它复用原来的 register-aware liveness 删除逻辑，但进入 post-signature cleanup 模式。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1016)
+  - post-signature cleanup 中，只有 `RewrittenCalls` 里的 call 才不再被视为读取 ABI register global。
+  - 没有改写过的 call 仍按原来的 summary / ABI 规则处理，避免误删参数准备 store。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1647)
+  - `rewriteSignatureShapes()` 后，对所有非 declaration 函数再跑一轮 register store liveness cleanup。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-signature/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-signature/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-summary-signature/fortune.ll -o /tmp/notdec-fortune-summary-signature/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-summary-signature/fortune.bc -o /tmp/notdec-fortune-summary-signature/fortune.verified.bc
+```
+
+fortune 结果：
+
+```text
+fortune native pipeline: 10.07 s
+register_access_metadata: 73
+loads_from_register_globals: 80
+stores_to_register_globals: 66
+summary_return_helpers: 55
+native_call_with_args: 29
+```
+
+和上一版 signature rewrite 后、清理前相比：
+
+```text
+register_access_metadata: 422 -> 73
+loads_from_register_globals: 82 -> 80
+stores_to_register_globals: 417 -> 66
+```
+
+剩余 register store 分布：
+
+```text
+RDI 20
+RSI 13
+RCX 8
+RDX 8
+R8 7
+R9 5
+R13 2
+RSP 2
+RAX 1
+```
+
+复杂度评估：
+
+- 实现效果：8/10。fortune 上 register store residue 从 417 降到 66，主要传参 store 已清掉。
+- 理解成本：5/10。没有新 pass，只是在 SummarySSA rewrite 后复用原有 liveness。
+- 维护成本：5/10。关键约束是 `RewrittenCalls` 必须只包含真实重建过的 call。

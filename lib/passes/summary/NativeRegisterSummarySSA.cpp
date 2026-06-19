@@ -100,6 +100,10 @@ struct SignatureRewriteState {
       FunctionReturns;
   std::map<llvm::Value *, llvm::Value *> ValueMap;
   std::set<llvm::StoreInst *> StoresToErase;
+  // Calls rebuilt by SummarySSA already carry their ABI inputs as LLVM
+  // operands, so the later register-store liveness pass must not treat them as
+  // users of @RDI/@RSI/... globals.
+  std::set<const llvm::CallBase *> RewrittenCalls;
 };
 
 const std::map<llvm::StringRef, KnownExternalPrototype> &
@@ -581,6 +585,12 @@ public:
     }
   }
 
+  void removeDeadStoresAfterSignatureRewrite() {
+    Summary.FunctionName = Function.getName().str();
+    PostSignatureCleanup = true;
+    removeDeadStoresByLiveness();
+  }
+
 private:
   llvm::Function &Function;
   const std::map<llvm::GlobalVariable *, RegisterUnit> &Units;
@@ -599,6 +609,7 @@ private:
   std::set<llvm::PHINode *> DeadPhis;
   std::map<llvm::GlobalVariable *, llvm::LoadInst *> EntryInputs;
   std::map<CallValueKey, llvm::Value *> CallValues;
+  bool PostSignatureCleanup = false;
 
   void collectAccesses() {
     for (llvm::BasicBlock &block : Function) {
@@ -1006,6 +1017,10 @@ private:
   CallRegisterEffect callEffect(const llvm::CallBase &call,
                                 const RegisterUnit &unit) const {
     llvm::Function *callee = call.getCalledFunction();
+    if (PostSignatureCleanup &&
+        SignatureState.RewrittenCalls.count(&call) != 0) {
+      return CallRegisterEffect::Unknown;
+    }
     if (callee != nullptr && !callee->isDeclaration()) {
       auto fnIt = SummaryFacts.find(callee);
       if (fnIt == SummaryFacts.end()) {
@@ -1043,6 +1058,10 @@ private:
   bool callReadsRegister(const llvm::CallBase &call,
                          const RegisterUnit &unit) const {
     llvm::Function *callee = call.getCalledFunction();
+    if (PostSignatureCleanup &&
+        SignatureState.RewrittenCalls.count(&call) != 0) {
+      return false;
+    }
     if (callee != nullptr && !callee->isDeclaration()) {
       auto fnIt = SummaryFacts.find(callee);
       if (fnIt == SummaryFacts.end()) {
@@ -1468,6 +1487,7 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
 void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
                             NativeRegisterSummarySSASummary &summary) {
   std::map<llvm::Function *, llvm::Function *> replacements;
+  std::vector<std::pair<llvm::Function *, SignatureShape>> replacementShapes;
   for (auto &[function, shape] : state.Shapes) {
     llvm::FunctionType *newType =
         functionTypeForShape(module.getContext(), shape);
@@ -1478,6 +1498,7 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
     llvm::Function *newFunction =
         createReplacementFunction(*function, *newType);
     replacements[function] = newFunction;
+    replacementShapes.emplace_back(newFunction, shape);
     if (!function->isDeclaration()) {
       rewriteInternalFunctionBody(*function, *newFunction, shape, state);
     }
@@ -1536,6 +1557,7 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
     }
     llvm::CallInst *newCall = rewriteCallInst(
         *oldCall, *newCallee, *newCallee->getFunctionType(), args);
+    state.RewrittenCalls.insert(newCall);
     valueMap[oldCall] = newCall;
     oldCallsToErase.push_back(oldCall);
     auto helpersIt = state.ReturnHelpers.find(oldCall);
@@ -1584,6 +1606,9 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
       oldFunction->eraseFromParent();
     }
   }
+  for (auto &[function, shape] : replacementShapes) {
+    state.Shapes[function] = std::move(shape);
+  }
 }
 
 } // namespace
@@ -1621,6 +1646,18 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   if (options.EnableRewrite) {
     addDemandedExternalReturns(signatureState, units, abi);
     rewriteSignatureShapes(module, signatureState, summary);
+    if (options.EnableResidueRemoval) {
+      for (llvm::Function &function : module) {
+        if (function.isDeclaration()) {
+          continue;
+        }
+        NativeRegisterSummarySSAFunctionSummary cleanupFn;
+        FunctionBuilder cleanup(function, units, facts, abi, options, cleanupFn,
+                                signatureState);
+        cleanup.removeDeadStoresAfterSignatureRewrite();
+        summary.DeadStoresRemoved += cleanupFn.DeadStoresRemoved;
+      }
+    }
   }
   summary.FunctionsSeen = summary.Functions.size();
   if (options.PrintSummary) {
