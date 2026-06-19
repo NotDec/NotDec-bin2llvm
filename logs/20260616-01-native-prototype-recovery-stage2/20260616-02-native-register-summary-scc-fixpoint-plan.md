@@ -1875,3 +1875,115 @@ summary-residue:    11s, 1485 lines
 - 实现效果：8/10。PLT body 不进 caller CFG，同时外部 tail call 语义保留下来。
 - 理解成本：3/10。需要理解“目标不是本地 block 且命中 ExternalCallTargets”才是外部 tail branch。
 - 维护成本：3/10。没有新增 map，只复用现有 target 表。
+
+## 后续修复：固定 entry-SP 栈槽上的 callee-saved 保存识别
+
+问题：
+
+`fortune` 里 `notdec_native_4750` 这类函数有标准 callee-saved 保存：
+
+```asm
+push %rbp
+push %rbx
+...
+pop %rbx
+pop %rbp
+ret
+```
+
+但当前 lifted IR 里，开头能看到保存：
+
+```llvm
+%0 = add i64 %RSP.entry, -8
+store i64 %RBP.entry, ptr %notdec_ram_ptr2
+%1 = add i64 %RSP.entry, -16
+store i64 %RBX.entry, ptr %notdec_ram_ptr6
+```
+
+正常 `ret` 前没有对应的 `load stack -> store @RBX/@RBP`。这会让 summary 把部分
+callee-saved register 误认为 call 后产生新值，进而留下 `summary_return` helper。
+
+本次先做一个很窄的 frame-local 识别，不做通用内存 alias：
+
+- 只跟踪固定 `RSP.entry + constant` 的栈槽。
+- 只记录“这个栈槽保存了哪个 entry register”。
+- 如果后续从同一栈槽显式 load 并 store 回同一 register，则直接折叠成 preserved。
+- 如果函数出口时某个 ABI `Unaffected` register 被标成 modified，但当前路径上能看到它保存到了固定 entry-SP 栈槽，也按 ABI callee-saved 约定折叠成 preserved。
+- `RSP` 自己不按这个逻辑折叠，仍交给后续 stack pointer 专门处理。
+
+改动文件：
+
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:39)
+  - 新增 `StackSlotKey`。
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:65)
+  - `State` 增加 `StackSlots` 和 `ValueOrigins`。
+  - `StackSlots` 记录固定 entry-SP 栈槽保存的 entry register。
+  - `ValueOrigins` 记录 SSA value 是否精确来自某个 entry register。
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:295)
+  - CFG join 时，对 `StackSlots` / `ValueOrigins` 做交集保留。
+  - 只有所有前驱都同意的保存关系才保留。
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:525)
+  - 合并正常返回路径前调用 `exitStateWithSavedRegisters()`。
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:546)
+  - transfer 阶段识别 register entry load、固定栈槽 store/load、显式 register restore。
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:618)
+  - `entryAddressOrigin()` 只解析 entry register 加减常量。
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:683)
+  - `exitStateWithSavedRegisters()` 对 ABI `Unaffected` register 做出口折叠。
+- [native_register_summary_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_test.cpp:294)
+  - 增加显式保存恢复测试。
+- [native_register_summary_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_test.cpp:330)
+  - 增加保存槽被覆盖时不能误判 preserved 的测试。
+- [native_register_summary_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_test.cpp:366)
+  - 增加 ABI callee-saved 隐式恢复测试。
+
+验证命令：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-savedregs/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-savedregs/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-summary-savedregs/fortune.ll -o /tmp/notdec-fortune-summary-savedregs/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-summary-savedregs/fortune.bc -o /tmp/notdec-fortune-summary-savedregs/fortune.verified.bc
+```
+
+fortune 结果：
+
+```text
+fortune native pipeline: 10.57 s
+register_access_metadata: 73
+loads_from_register_globals: 80
+stores_to_register_globals: 66
+summary_return_helpers: 43
+```
+
+和上一版相比：
+
+```text
+summary_return_helpers: 55 -> 43
+```
+
+剩余问题：
+
+- `notdec_native_4750` 的 RBX helper 仍然存在。
+- 原因不是普通保存/恢复槽没识别，而是 0x4750 内部还有跳到 0x27f0 的路径：
+
+```text
+47d9: js 0x27f0
+```
+
+当前 IR 同时存在 `notdec_native_27f0` 和 `notdec_native_4750` 内部的 `bb_27f0`。
+这条跨函数/错误路径绕过 0x4750 的 epilogue，继续污染 RBX/RSP summary。
+这更像 lifting 边界或 noreturn/错误路径建模问题，后续应单独处理，不在本次 saved-register matcher 里硬修。
+
+复杂度评估：
+
+- 实现效果：6/10。能减少一批 callee-saved 残留，但对函数范围污染无能为力。
+- 理解成本：5/10。多了一个很小的 frame-local 状态，但仍局限在 entry-SP 固定槽。
+- 维护成本：5/10。关键风险是不要把一般内存保存误当 register restore，目前靠固定 entry-SP 和 ABI `Unaffected` 限制范围。

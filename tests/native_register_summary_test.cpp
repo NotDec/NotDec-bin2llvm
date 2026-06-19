@@ -74,6 +74,12 @@ void attachTestAbi(llvm::Module &module) {
   killed.Storage.Name = "RDX";
   abi.Effects.push_back(killed);
 
+  notdec::bin2llvm::NativeAbiEffect unaffected;
+  unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
+  unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  unaffected.Storage.Name = "RBX";
+  abi.Effects.push_back(unaffected);
+
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
@@ -82,6 +88,16 @@ llvm::StoreInst *storeRegister(llvm::IRBuilder<> &builder,
                                const std::string &name) {
   llvm::StoreInst *store = builder.CreateStore(
       llvm::ConstantInt::get(reg->getValueType(), value), reg);
+  store->setMetadata("notdec.register.access",
+                     registerAccessMetadata(reg->getContext(), name));
+  return store;
+}
+
+llvm::StoreInst *storeRegisterValue(llvm::IRBuilder<> &builder,
+                                    llvm::GlobalVariable *reg,
+                                    llvm::Value *value,
+                                    const std::string &name) {
+  llvm::StoreInst *store = builder.CreateStore(value, reg);
   store->setMetadata("notdec.register.access",
                      registerAccessMetadata(reg->getContext(), name));
   return store;
@@ -275,6 +291,112 @@ bool testTopDownDemandKeepsOnlyUsedReturn() {
                 "unused RDX return was incorrectly marked demanded");
 }
 
+bool testSavedRegisterRestoreIsPreserved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-saved-register-restore", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "save_clobber_restore_rbx", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::LoadInst *rbxEntry = loadRegister(builder, rbx, "RBX", "rbx.entry");
+  llvm::Value *slotAddress = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::Value *slot =
+      builder.CreateIntToPtr(slotAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(rbxEntry, slot);
+  storeRegister(builder, rbx, 42, "RBX");
+  llvm::LoadInst *saved = builder.CreateLoad(rbx->getValueType(), slot);
+  storeRegisterValue(builder, rbx, saved, "RBX");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "save_clobber_restore_rbx");
+  const auto *rbxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RBX");
+  return expect(rbxSummary != nullptr, "missing RBX summary") &&
+         expect(rbxSummary->MayEntry, "restored RBX lost entry value") &&
+         expect(!rbxSummary->MayNonEntry,
+                "restored RBX was still marked modified");
+}
+
+bool testOverwrittenSavedRegisterSlotIsNotPreserved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-saved-register-overwritten", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "overwrite_saved_rbx_slot", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::LoadInst *rbxEntry = loadRegister(builder, rbx, "RBX", "rbx.entry");
+  llvm::Value *slotAddress = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::Value *slot =
+      builder.CreateIntToPtr(slotAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(rbxEntry, slot);
+  builder.CreateStore(llvm::ConstantInt::get(rbx->getValueType(), 7), slot);
+  storeRegister(builder, rbx, 42, "RBX");
+  llvm::LoadInst *saved = builder.CreateLoad(rbx->getValueType(), slot);
+  storeRegisterValue(builder, rbx, saved, "RBX");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "overwrite_saved_rbx_slot");
+  const auto *rbxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RBX");
+  return expect(rbxSummary != nullptr, "missing overwritten RBX summary") &&
+         expect(rbxSummary->MayNonEntry,
+                "overwritten saved RBX slot was incorrectly preserved");
+}
+
+bool testImplicitCalleeSavedRestoreIsPreserved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-implicit-callee-saved-restore", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "implicit_restore_rbx", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::LoadInst *rbxEntry = loadRegister(builder, rbx, "RBX", "rbx.entry");
+  llvm::Value *slotAddress = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::Value *slot =
+      builder.CreateIntToPtr(slotAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(rbxEntry, slot);
+  storeRegister(builder, rbx, 42, "RBX");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "implicit_restore_rbx");
+  const auto *rbxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RBX");
+  return expect(rbxSummary != nullptr, "missing implicit RBX summary") &&
+         expect(rbxSummary->MayEntry,
+                "implicit restored RBX lost entry value") &&
+         expect(!rbxSummary->MayNonEntry,
+                "implicit restored RBX was still marked modified");
+}
+
 } // namespace
 
 int main() {
@@ -283,5 +405,8 @@ int main() {
   ok &= testCalleeReadPropagatesToCallerEntry();
   ok &= testSparseJoinKeepsUntouchedPath();
   ok &= testTopDownDemandKeepsOnlyUsedReturn();
+  ok &= testSavedRegisterRestoreIsPreserved();
+  ok &= testOverwrittenSavedRegisterSlotIsNotPreserved();
+  ok &= testImplicitCalleeSavedRestoreIsPreserved();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

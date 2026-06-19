@@ -5,6 +5,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstrTypes.h"
@@ -19,6 +20,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -32,6 +34,19 @@ struct RegisterUnit {
 
 struct RegisterAccess {
   const RegisterUnit *Unit = nullptr;
+};
+
+struct StackSlotKey {
+  llvm::GlobalVariable *Base = nullptr;
+  int64_t Offset = 0;
+
+  bool operator<(const StackSlotKey &other) const {
+    return std::tie(Base, Offset) < std::tie(other.Base, other.Offset);
+  }
+
+  bool operator==(const StackSlotKey &other) const {
+    return Base == other.Base && Offset == other.Offset;
+  }
 };
 
 // Forward abstract state for one backing register. Missing map entries use this
@@ -50,9 +65,15 @@ struct Cell {
 struct State {
   bool Reachable = false;
   std::map<llvm::GlobalVariable *, Cell> Cells;
+  // Narrow frame-local model for saved-register recognition.  It only tracks
+  // fixed offsets from the entry stack pointer, not arbitrary memory.
+  std::map<StackSlotKey, llvm::GlobalVariable *> StackSlots;
+  // SSA values known to be exactly one function-entry register value.
+  std::map<llvm::Value *, llvm::GlobalVariable *> ValueOrigins;
 
   bool operator==(const State &other) const {
-    return Reachable == other.Reachable && Cells == other.Cells;
+    return Reachable == other.Reachable && Cells == other.Cells &&
+           StackSlots == other.StackSlots && ValueOrigins == other.ValueOrigins;
   }
 };
 
@@ -85,6 +106,7 @@ struct AbiFacts {
   std::vector<std::string> OutputOrder;
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
+  std::string StackPointer;
 };
 
 std::optional<std::string> mdField(const llvm::MDNode *node,
@@ -221,6 +243,7 @@ AbiFacts collectAbiFacts(const llvm::Module &module) {
       facts.KilledByCall.insert(effect.Storage.Name);
     }
   }
+  facts.StackPointer = abi->StackPointerRegister;
   return facts;
 }
 
@@ -272,6 +295,26 @@ bool joinState(State &target, const State &source) {
       changed |= joinCell(cell, Cell{});
     }
   }
+  for (auto it = target.StackSlots.begin(); it != target.StackSlots.end();) {
+    auto sourceIt = source.StackSlots.find(it->first);
+    if (sourceIt == source.StackSlots.end() || sourceIt->second != it->second) {
+      it = target.StackSlots.erase(it);
+      changed = true;
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = target.ValueOrigins.begin();
+       it != target.ValueOrigins.end();) {
+    auto sourceIt = source.ValueOrigins.find(it->first);
+    if (sourceIt == source.ValueOrigins.end() ||
+        sourceIt->second != it->second) {
+      it = target.ValueOrigins.erase(it);
+      changed = true;
+    } else {
+      ++it;
+    }
+  }
   return changed;
 }
 
@@ -284,6 +327,12 @@ void writeRegister(State &state, llvm::GlobalVariable *global) {
   Cell &cell = cellFor(state, global);
   cell.MayEntry = false;
   cell.MayNonEntry = true;
+}
+
+void restoreRegister(State &state, llvm::GlobalVariable *global) {
+  Cell &cell = cellFor(state, global);
+  cell.MayEntry = true;
+  cell.MayNonEntry = false;
 }
 
 bool isIgnored(const RegisterUnit &unit,
@@ -473,7 +522,7 @@ private:
     State exits;
     for (llvm::BasicBlock &block : function) {
       if (llvm::isa<llvm::ReturnInst>(block.getTerminator())) {
-        joinState(exits, out[&block]);
+        joinState(exits, exitStateWithSavedRegisters(out[&block]));
       }
     }
     FunctionEffect effect;
@@ -497,20 +546,153 @@ private:
     if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
       RegisterAccess access = registerLoad(*load, Units);
       if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
+        Cell before = cellIn(state, access.Unit->Global);
         readRegister(state, access.Unit->Global);
+        if (before.MayEntry && !before.MayNonEntry) {
+          state.ValueOrigins[load] = access.Unit->Global;
+        } else {
+          state.ValueOrigins.erase(load);
+        }
+        return;
+      }
+      if (std::optional<StackSlotKey> slot =
+              fixedEntryStackSlot(load->getPointerOperand(), state)) {
+        auto saved = state.StackSlots.find(*slot);
+        if (saved != state.StackSlots.end()) {
+          state.ValueOrigins[load] = saved->second;
+        } else {
+          state.ValueOrigins.erase(load);
+        }
       }
       return;
     }
     if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
       RegisterAccess access = registerStore(*store, Units);
       if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
-        writeRegister(state, access.Unit->Global);
+        llvm::GlobalVariable *origin =
+            entryRegisterOrigin(store->getValueOperand(), state);
+        if (origin == access.Unit->Global) {
+          restoreRegister(state, access.Unit->Global);
+        } else {
+          writeRegister(state, access.Unit->Global);
+        }
+        state.ValueOrigins.erase(store);
+        return;
+      }
+      if (std::optional<StackSlotKey> slot =
+              fixedEntryStackSlot(store->getPointerOperand(), state)) {
+        llvm::GlobalVariable *origin =
+            entryRegisterOrigin(store->getValueOperand(), state);
+        if (origin != nullptr) {
+          state.StackSlots[*slot] = origin;
+        } else {
+          state.StackSlots.erase(*slot);
+        }
       }
       return;
     }
     if (isAnalyzableCall(inst)) {
       transferCall(llvm::cast<llvm::CallBase>(inst), state);
     }
+  }
+
+  llvm::GlobalVariable *stackPointerGlobal() const {
+    if (Abi.StackPointer.empty()) {
+      return nullptr;
+    }
+    auto it = UnitsByName.find(Abi.StackPointer);
+    return it == UnitsByName.end() ? nullptr : it->second;
+  }
+
+  llvm::GlobalVariable *entryRegisterOrigin(llvm::Value *value,
+                                            const State &state) const {
+    value = value->stripPointerCasts();
+    auto it = state.ValueOrigins.find(value);
+    if (it != state.ValueOrigins.end()) {
+      return it->second;
+    }
+    return nullptr;
+  }
+
+  std::optional<std::pair<llvm::GlobalVariable *, int64_t>>
+  entryAddressOrigin(llvm::Value *value, const State &state) const {
+    value = value->stripPointerCasts();
+    if (llvm::GlobalVariable *origin = entryRegisterOrigin(value, state)) {
+      return std::make_pair(origin, 0);
+    }
+    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
+    if (binary == nullptr || (binary->getOpcode() != llvm::Instruction::Add &&
+                              binary->getOpcode() != llvm::Instruction::Sub)) {
+      return std::nullopt;
+    }
+
+    auto parseConstantOffset = [](llvm::Value *constant,
+                                  bool negate) -> std::optional<int64_t> {
+      auto *intConstant = llvm::dyn_cast<llvm::ConstantInt>(constant);
+      if (intConstant == nullptr || intConstant->getBitWidth() > 64) {
+        return std::nullopt;
+      }
+      int64_t value = intConstant->getSExtValue();
+      return negate ? -value : value;
+    };
+
+    if (auto base = entryAddressOrigin(binary->getOperand(0), state)) {
+      if (auto offset = parseConstantOffset(binary->getOperand(1),
+                                            binary->getOpcode() ==
+                                                llvm::Instruction::Sub)) {
+        base->second += *offset;
+        return base;
+      }
+    }
+    if (binary->getOpcode() == llvm::Instruction::Add) {
+      if (auto base = entryAddressOrigin(binary->getOperand(1), state)) {
+        if (auto offset = parseConstantOffset(binary->getOperand(0), false)) {
+          base->second += *offset;
+          return base;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<StackSlotKey> fixedEntryStackSlot(llvm::Value *pointer,
+                                                  const State &state) const {
+    auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(pointer);
+    if (intToPtr == nullptr) {
+      return std::nullopt;
+    }
+    auto address = entryAddressOrigin(intToPtr->getOperand(0), state);
+    llvm::GlobalVariable *stackPointer = stackPointerGlobal();
+    if (!address || stackPointer == nullptr || address->first != stackPointer) {
+      return std::nullopt;
+    }
+    return StackSlotKey{stackPointer, address->second};
+  }
+
+  bool hasSavedEntryRegister(const State &state,
+                             llvm::GlobalVariable *global) const {
+    for (const auto &[slot, saved] : state.StackSlots) {
+      (void)slot;
+      if (saved == global) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  State exitStateWithSavedRegisters(const State &state) const {
+    State adjusted = state;
+    for (const auto &[global, unit] : Units) {
+      if (isIgnored(unit, Options) || unit.Name == Abi.StackPointer ||
+          Abi.Unaffected.count(unit.Name) == 0) {
+        continue;
+      }
+      Cell cell = cellIn(adjusted, global);
+      if (cell.MayNonEntry && hasSavedEntryRegister(state, global)) {
+        restoreRegister(adjusted, global);
+      }
+    }
+    return adjusted;
   }
 
   void transferCall(llvm::CallBase &call, State &state) {
