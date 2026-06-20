@@ -18,6 +18,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -87,6 +88,7 @@ struct CallArgStoreBinding {
 struct KnownExternalPrototype {
   unsigned FixedArgs = 0;
   bool VarArg = false;
+  bool NoReturn = false;
 };
 
 struct SignatureShape {
@@ -114,22 +116,22 @@ struct SignatureRewriteState {
 const std::map<llvm::StringRef, KnownExternalPrototype> &
 knownExternalPrototypes() {
   static const std::map<llvm::StringRef, KnownExternalPrototype> prototypes = {
-      {"__assert_fail", {4, false}},
-      {"__errno_location", {0, false}},
-      {"__explicit_bzero_chk", {3, false}},
-      {"__fdelt_chk", {1, false}},
-      {"__fprintf_chk", {3, true}},
-      {"__isoc23_strtol", {3, false}},
-      {"__memcpy_chk", {4, false}},
-      {"__memset_chk", {4, false}},
-      {"__printf_chk", {2, true}},
-      {"__snprintf_chk", {4, true}},
-      {"__sprintf_chk", {3, true}},
-      {"__strcat_chk", {3, false}},
-      {"__stack_chk_fail", {0, false}},
-      {"__tls_get_addr", {1, false}},
-      {"__vasprintf_chk", {3, true}},
-      {"abort", {0, false}},
+      {"__assert_fail", {4, false, true}},
+      {"__errno_location", {0, false, false}},
+      {"__explicit_bzero_chk", {3, false, false}},
+      {"__fdelt_chk", {1, false, false}},
+      {"__fprintf_chk", {3, true, false}},
+      {"__isoc23_strtol", {3, false, false}},
+      {"__memcpy_chk", {4, false, false}},
+      {"__memset_chk", {4, false, false}},
+      {"__printf_chk", {2, true, false}},
+      {"__snprintf_chk", {4, true, false}},
+      {"__sprintf_chk", {3, true, false}},
+      {"__strcat_chk", {3, false, false}},
+      {"__stack_chk_fail", {0, false, true}},
+      {"__tls_get_addr", {1, false, false}},
+      {"__vasprintf_chk", {3, true, false}},
+      {"abort", {0, false, true}},
       {"alarm", {1, false}},
       {"arc4random_buf", {2, false}},
       {"bind", {3, false}},
@@ -146,7 +148,7 @@ knownExternalPrototypes() {
       {"event_initialized", {1, false}},
       {"event_once", {5, false}},
       {"event_set", {5, false}},
-      {"exit", {1, false}},
+      {"exit", {1, false, true}},
       {"fclose", {1, false}},
       {"fcntl", {2, true}},
       {"fcntl64", {2, true}},
@@ -230,6 +232,62 @@ knownExternalPrototypes() {
       {"write", {3, false}},
   };
   return prototypes;
+}
+
+bool isKnownNoReturnExternal(const llvm::Function &function) {
+  if (!function.isDeclaration()) {
+    return false;
+  }
+  if (function.hasFnAttribute(llvm::Attribute::NoReturn)) {
+    return true;
+  }
+  auto knownIt = knownExternalPrototypes().find(function.getName());
+  return knownIt != knownExternalPrototypes().end() && knownIt->second.NoReturn;
+}
+
+void truncateKnownNoReturnExternalCalls(llvm::Module &module) {
+  std::vector<std::pair<llvm::Instruction *, llvm::Function *>> work;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &inst : block) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+        if (call == nullptr || call->getNextNode() == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr || !isKnownNoReturnExternal(*callee)) {
+          continue;
+        }
+        work.push_back({call->getNextNode(), &function});
+        break;
+      }
+    }
+  }
+
+  std::set<llvm::Function *> changedFunctions;
+  for (auto [truncatePoint, function] : work) {
+    llvm::changeToUnreachable(truncatePoint);
+    changedFunctions.insert(function);
+  }
+  for (llvm::Function *function : changedFunctions) {
+    llvm::removeUnreachableBlocks(*function);
+  }
+}
+
+void eraseUnusedSummaryHelperDeclarations(llvm::Module &module) {
+  std::vector<llvm::Function *> deadHelpers;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration() && function.use_empty() &&
+        function.getName().starts_with("notdec.register.summary_")) {
+      deadHelpers.push_back(&function);
+    }
+  }
+  for (llvm::Function *function : deadHelpers) {
+    function->eraseFromParent();
+  }
 }
 
 std::optional<std::string> mdField(const llvm::MDNode *node,
@@ -1667,6 +1725,8 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
 NativeRegisterSummarySSASummary
 runNativeRegisterSummarySSA(llvm::Module &module,
                             const NativeRegisterSummarySSAOptions &options) {
+  truncateKnownNoReturnExternalCalls(module);
+
   NativeRegisterSummaryOptions summaryOptions;
   summaryOptions.AttachMetadata = true;
   NativeStackFrameRewriteSummary stackFrameSummary =
@@ -1704,6 +1764,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   if (options.EnableRewrite) {
     addDemandedExternalReturns(signatureState, units, abi);
     rewriteSignatureShapes(module, signatureState, summary);
+    eraseUnusedSummaryHelperDeclarations(module);
     if (options.EnableResidueRemoval) {
       for (llvm::Function &function : module) {
         if (function.isDeclaration()) {

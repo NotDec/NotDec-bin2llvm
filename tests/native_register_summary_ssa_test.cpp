@@ -775,6 +775,36 @@ bool testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall() {
                   "module failed verifier after post-signature cleanup test");
 }
 
+bool testNoReturnExternalDoesNotCreateSummaryReturn() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-noreturn-external", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *noreturnType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *stackChkFail = llvm::Function::Create(
+      noreturnType, llvm::GlobalValue::ExternalLinkage, "__stack_chk_fail",
+      module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "calls_noreturn", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(stackChkFail->getFunctionType(), stackChkFail, {});
+  llvm::LoadInst *loaded =
+      loadRegister(builder, rax, "RAX", "unreachable_rax");
+  builder.CreateRet(loaded);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.CallReturnValues == 0,
+                "noreturn external path created a summary return helper") &&
+         verifyOk(module, "module failed verifier after noreturn cleanup test");
+}
+
 } // namespace
 
 int main() {
@@ -794,5 +824,6 @@ int main() {
   ok &= testSummarySSARemovesDeadStackFrameStore();
   ok &= testStackFrameAddressPassedToCallIsLocalized();
   ok &= testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall();
+  ok &= testNoReturnExternalDoesNotCreateSummaryReturn();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

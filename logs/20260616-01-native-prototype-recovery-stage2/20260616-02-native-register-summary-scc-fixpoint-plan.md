@@ -2532,3 +2532,76 @@ summary_ssa_rsp_rbp_entry: 12 -> 12
 - 实现效果：7/10。解决了 SummarySSA scaffold load 阻止 store 删除的问题。
 - 理解成本：3/10。规则只在 post-signature cleanup 生效。
 - 维护成本：3/10。没有改变 summary 构建和函数签名推断。
+
+## 实现更新：summary 链路截断 known noreturn 外部调用
+
+用户原始 prompt：
+
+> 继续看剩下的问题吧，优先看helper还是优先看寄存器访问呢
+
+判断：
+
+- 先看 helper。helper 表示 call effect 还没被签名改写或 CFG 语义吃掉，会继续干扰 SSA 和清理。
+- fortune 剩余 3 个实际 `summary_return` 都在 `__stack_chk_fail()` 之后。
+- `__stack_chk_fail()` 是 noreturn，call 后面的 return helper 是假路径造成的，不应该保留。
+
+本次改动：
+
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:88)
+  - `KnownExternalPrototype` 增加 `NoReturn`。
+  - 给 `__assert_fail`、`__stack_chk_fail`、`abort`、`exit` 标记 noreturn。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:237)
+  - 新增 `isKnownNoReturnExternal()`。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:248)
+  - 新增 `truncateKnownNoReturnExternalCalls()`。
+  - 在 summary 分析前把 noreturn call 后面的指令改成 unreachable，并删除不可达块。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:280)
+  - 新增 `eraseUnusedSummaryHelperDeclarations()`，删除已经没有 use 的 `notdec.register.summary_*` 声明。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:778)
+  - 新增 `testNoReturnExternalDoesNotCreateSummaryReturn()`，覆盖 `__stack_chk_fail()` 后不应生成 return helper。
+
+验证：
+
+```text
+git diff --check
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-noreturn-final/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-noreturn-final/summary.json \
+  --register-ssa-summary
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/notdec-fortune-summary-noreturn-final/fortune.ll \
+  -o /tmp/notdec-fortune-summary-noreturn-final/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-summary-noreturn-final/fortune.bc \
+  -o /tmp/notdec-fortune-summary-noreturn-final/fortune.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: 10.56 s -> 9.74 s
+summary_return_helpers: 4 -> 0
+summary_clobber_helpers: 2 -> 0
+register_access_metadata: 9 -> 9
+summary_ssa_rsp_rbp_entry: 12 -> 12
+```
+
+剩余问题：
+
+- `summary_*` helper 已清零。
+- 仍有 9 个 register access：
+  - 2 个 `RAX` replaced load 仍被 PHI 使用，需要继续查 value remap。
+  - 7 个 `R9W/XMM0/XMM1` 子寄存器或宽度不一致访问，属于后续单独问题。
+
+复杂度评估：
+
+- 实现效果：8/10。清掉 helper，并减少不可达假路径带来的 SSA/summary 噪声。
+- 理解成本：4/10。noreturn 截断会改变 CFG，但规则集中在 known external prototype。
+- 维护成本：4/10。需要后续维护 known noreturn 外部函数列表。
