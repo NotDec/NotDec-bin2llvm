@@ -741,6 +741,7 @@ private:
           value->getType() != load->getType()) {
         continue;
       }
+      Replacement[load] = value;
       load->replaceAllUsesWith(value);
       load->setMetadata("notdec.register.summary_ssa.replaced",
                         markerNode("true"));

@@ -182,6 +182,18 @@ bool hasPhiIncomingCount(llvm::Function &function, unsigned count) {
   return false;
 }
 
+bool hasLiveReplacedRegisterLoad(llvm::Function &function) {
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+    if (load != nullptr &&
+        load->getMetadata("notdec.register.summary_ssa.replaced") != nullptr &&
+        !load->use_empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool testPhiIncomingMatchesPredecessors() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-phi", context);
@@ -215,6 +227,8 @@ bool testPhiIncomingMatchesPredecessors() {
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   return expect(summary.LoadsReplaced == 1, "branch load was not replaced") &&
          expect(hasCompletePhi(*function), "complete PHI was not created") &&
+         expect(!hasLiveReplacedRegisterLoad(*function),
+                "replaced load was reused by completed PHI") &&
          verifyOk(module, "module failed verifier after summary SSA PHI test");
 }
 

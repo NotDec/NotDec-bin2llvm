@@ -2605,3 +2605,78 @@ summary_ssa_rsp_rbp_entry: 12 -> 12
 - 实现效果：8/10。清掉 helper，并减少不可达假路径带来的 SSA/summary 噪声。
 - 理解成本：4/10。noreturn 截断会改变 CFG，但规则集中在 known external prototype。
 - 维护成本：4/10。需要后续维护 known noreturn 外部函数列表。
+
+## 实现更新：修复 replaced load 被 PHI 重新引用
+
+用户原始 prompt：
+
+> 继续深入找个寄存器的例子看吧
+
+调研结果：
+
+- 选了剩余 register access 里的 `RAX` 例子，而不是先看 `R9W/XMM`。
+- fortune 里 `notdec_native_3470` 有这种模式：
+
+```llvm
+%4 = call i64 @malloc(i64 %2)
+%RAX73 = load i64, ptr @RAX, !notdec.register.summary_ssa.replaced
+...
+%RBX.summary_ssa = phi i64 [ %RAX73, %bb_35f4 ], ...
+```
+
+- 这里 `%4` 已经是 `malloc` 的显式返回值，`%RAX73` 不应该再活着。
+- 根因是 `rewriteLoads()` 只做了 `load->replaceAllUsesWith(value)`，但没有把 `Replacement[load] = value` 写进 SummarySSA 的内部替换表。
+- 后续 `finalizePendingPhis()` 补 PHI incoming 时，可能从缓存的 `EntryValue/ExitValue` 里重新拿到旧 load，再把它塞回 PHI。
+
+本次改动：
+
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:743)
+  - `rewriteLoads()` 替换 load 前记录 `Replacement[load] = value`。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:185)
+  - 新增 `hasLiveReplacedRegisterLoad()`。
+  - 在 PHI 测试中断言 pass 结束后没有仍被使用的 `summary_ssa.replaced` load。
+
+验证：
+
+```text
+git diff --check
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-replacement-map/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-replacement-map/summary.json \
+  --register-ssa-summary
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/notdec-fortune-summary-replacement-map/fortune.ll \
+  -o /tmp/notdec-fortune-summary-replacement-map/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-summary-replacement-map/fortune.bc \
+  -o /tmp/notdec-fortune-summary-replacement-map/fortune.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: 9.74 s -> 9.78 s
+dead_loads_removed: 1303 -> 1306
+register_access_metadata: 9 -> 7
+summary_return_helpers: 0
+summary_clobber_helpers: 0
+summary_ssa_rsp_rbp_entry: 12
+```
+
+剩余问题：
+
+- `RAX` replaced load 已消失。
+- 剩余 7 个 register access 全是 `R9W/XMM0/XMM1` 子寄存器或宽度不一致访问。
+
+复杂度评估：
+
+- 实现效果：8/10。修掉了完整寄存器 replaced load 残留。
+- 理解成本：2/10。只是让内部 replacement map 和 LLVM use-rewrite 保持一致。
+- 维护成本：2/10。局部修复，风险小。
