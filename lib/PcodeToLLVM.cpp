@@ -80,7 +80,7 @@ public:
       for (size_t opIndex = start; opIndex < end; ++opIndex) {
         const PcodeOpView &op = program.Ops[opIndex];
         if (isTerminator(op.Opcode)) {
-          if (!lowerTerminator(opIndex, op, nextBlock(blockIndex),
+          if (!lowerTerminator(blockIndex, opIndex, op, nextBlock(blockIndex),
                                errorMessage)) {
             return false;
           }
@@ -253,6 +253,27 @@ private:
     return blockForTarget(successorIt->second.front());
   }
 
+  llvm::BasicBlock *nativeConditionalFalseBlock(size_t blockIndex,
+                                                uint64_t trueTarget,
+                                                llvm::BasicBlock *fallback) {
+    uint64_t blockAddress =
+        (*CurrentProgramOps)[BlockStarts[blockIndex]].Address;
+    auto successorIt = Config.BlockSuccessors.find(blockAddress);
+    if (successorIt == Config.BlockSuccessors.end()) {
+      return fallback;
+    }
+
+    // SLEIGH CBRANCH only records the taken target.  Native discovery already
+    // knows the machine-level false edge, which is safer than assuming the next
+    // p-code block is the fallthrough for sparse or out-of-order ranges.
+    for (uint64_t successor : successorIt->second) {
+      if (successor != trueTarget) {
+        return blockForTarget(successor);
+      }
+    }
+    return fallback;
+  }
+
   llvm::BasicBlock *blockForTarget(uint64_t address) {
     auto it = BlockForAddress.find(address);
     if (it != BlockForAddress.end()) {
@@ -297,7 +318,7 @@ private:
                                 llvm::ConstantInt::get(value->getType(), 0));
   }
 
-  bool lowerTerminator(size_t opIndex, const PcodeOpView &op,
+  bool lowerTerminator(size_t blockIndex, size_t opIndex, const PcodeOpView &op,
                        llvm::BasicBlock *fallthrough,
                        std::string &errorMessage) {
     switch (op.Opcode) {
@@ -331,16 +352,30 @@ private:
       }
       auto target = directTarget(op, 0);
       llvm::BasicBlock *trueBlock = nullptr;
+      std::optional<uint64_t> trueAddress;
       if (target) {
+        trueAddress = *target;
         trueBlock = blockForTarget(*target);
       } else {
-        trueBlock = blockForRelativeTarget(opIndex, op, 0);
+        auto targetIndex = relativeTargetIndex(opIndex, op, 0,
+                                               CurrentProgramOps->size());
+        if (targetIndex) {
+          trueAddress = (*CurrentProgramOps)[*targetIndex].Address;
+          auto it = BlockForStart.find(*targetIndex);
+          trueBlock = it != BlockForStart.end()
+                          ? it->second
+                          : blockForTarget(*trueAddress);
+        }
       }
       if (trueBlock == nullptr) {
         errorMessage = "CBRANCH target must be direct ram or relative const";
         return false;
       }
       llvm::BasicBlock *falseBlock = fallthrough ? fallthrough : exitBlock();
+      if (trueAddress) {
+        falseBlock =
+            nativeConditionalFalseBlock(blockIndex, *trueAddress, falseBlock);
+      }
       Builder.CreateCondBr(asCondition(read(op.Inputs[1])), trueBlock,
                            falseBlock);
       return true;

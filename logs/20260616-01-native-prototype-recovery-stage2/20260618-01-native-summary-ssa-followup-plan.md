@@ -671,3 +671,67 @@ stores_to_register_globals: 503
 - 实现效果：8/10。代码目录和默认 pipeline 都明确区分了新旧链路。
 - 理解成本：2/10。只是目录分组和 include 路径变化。
 - 维护成本：2/10。后续新功能可以直接放 summary 目录，旧链路留在 heritage 目录。
+
+## 实现记录：修复 fortune R9 残留的前段根因
+
+这次问题一开始表现为 fortune `add_file` 里还剩两处 `R9` register access，但根因不在 SummarySSA。
+
+真实汇编片段：
+
+```asm
+3748: je     0x3e81
+374e: pxor   xmm0,xmm0
+3752: xor    r9d,r9d
+3763: mov    WORD PTR [rax+0x38],r9w
+```
+
+`xor r9d,r9d` 真实语义是把整个 `R9` 清零。low-pcode 和单独 pcode-to-LLVM 都能看到这个写入，但 native discovery / lowering 后的 IR 曾经让 `bb_3748` 的 false edge 跳到错误的 `bb_36f8`，导致 `0x374e/0x3752` 这段在 LLVM CFG 中不可达，后面的 `load @R9` 就无法被 SummarySSA 消掉。
+
+具体改动：
+
+- [SleighLift.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/SleighLift.cpp:453)
+  - `SleighInstructionDecoder::decode(...)` 改成先调用 `oneInstruction(...)` 收集 pcode，再调用 `printAssembly(...)` 收集文本。
+  - 原因是 Ghidra `oneInstruction()` 会 `applyCommits()` 写回 SLEIGH context；在复用 engine 上先 `printAssembly()` 再 `oneInstruction()`，fortune 这个位置会让后续地址漏解。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:83)
+  - `lowerTerminator(...)` 现在接收当前 block index，方便查询 native CFG。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:256)
+  - 新增 `nativeConditionalFalseBlock(...)`。
+  - SLEIGH `CBRANCH` 只带 taken target，false edge 应优先从 `Config.BlockSuccessors` 里取，而不是默认使用 pcode 顺序里的下一个 block。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:321)
+  - `CBRANCH` lowering 记录 true target address，并用 native CFG 计算 false block。
+  - 找不到 native CFG 信息时才退回原来的 fallthrough。
+
+验证：
+
+```text
+cmake --build build --target notdec-native-discover notdec-native-llvm -j4
+cmake --build build --target native_register_summary_ssa_test native_register_summary_test -j4
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-discover --instructions-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/fortune-3470-raw-cbranch-fix.ll
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-cbranch-fix/fortune.ll --summary-json-out /tmp/notdec-fortune-cbranch-fix/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-cbranch-fix/fortune.ll -o /tmp/notdec-fortune-cbranch-fix/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-cbranch-fix/fortune.bc -o /tmp/notdec-fortune-cbranch-fix/fortune.verified.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: 13.26s
+confirmed_functions: 25
+basic_blocks: 2369
+instructions: 2908
+final !notdec.register.access residue: 1
+remaining register access: FS_OFFSET only
+R9 residue: 0
+llvm-as + opt verify: passed
+```
+
+性能：同口径 fortune 之前约 9.92s，本次约 13.26s。这个差异主要来自本轮本地完整生成波动和额外 CFG 修复后可达 IR 增加，暂时没有看到算法级新增慢路径；后续 Bench2 批量跑时再看是否需要 profile。
+
+复杂度评估：
+
+- 实现效果：9/10。修掉了 fortune 里误残留的 `R9`，也修正了 native sparse CFG 下条件跳转 false edge 的语义。
+- 理解成本：3/10。新增逻辑集中在 `CBRANCH` false edge，不影响 SummarySSA 抽象域。
+- 维护成本：3/10。依赖 discovery 的 `BlockSuccessors`，这正是 native lowering 已经传入的事实；缺失时仍保留旧 fallback。

@@ -450,21 +450,28 @@ SleighInstructionDecoder::decode(uint64_t address, uint64_t maxInstructions,
   ghidra::Address end(Pimpl->Engine.getDefaultCodeSpace(), address + maxBytes);
   while (decode.Instructions.size() < maxInstructions && current < end) {
     try {
+      // Generate p-code before assembly text.  oneInstruction() applies Sleigh
+      // context commits; doing printAssembly() first can leave the reused
+      // parser cache in a stale state for context-sensitive x86 instructions.
       int32_t instructionLength =
-          Pimpl->Engine.printAssembly(collector, current);
+          Pimpl->Engine.oneInstruction(pcodeCollector, current);
       if (instructionLength <= 0 || static_cast<uint64_t>(instructionLength) >
                                         end.getOffset() - current.getOffset()) {
         break;
       }
-      int32_t pcodeLength =
-          Pimpl->Engine.oneInstruction(pcodeCollector, current);
-      if (pcodeLength != instructionLength) {
+      int32_t assemblyLength = Pimpl->Engine.printAssembly(collector, current);
+      if (assemblyLength != instructionLength) {
         errorStream << "Sleigh decode length mismatch @ " << current << ": "
-                    << instructionLength << " vs " << pcodeLength << '\n';
+                    << instructionLength << " vs " << assemblyLength << '\n';
         break;
       }
-      decode.Instructions.push_back(
-          collector.take(static_cast<uint64_t>(instructionLength)));
+      SleighInstructionSummary summary =
+          collector.take(static_cast<uint64_t>(instructionLength));
+      if (summary.Address == 0) {
+        summary.Address = current.getOffset();
+        summary.Size = static_cast<uint64_t>(instructionLength);
+      }
+      decode.Instructions.push_back(std::move(summary));
       current = current + instructionLength;
     } catch (ghidra::UnimplError &error) {
       errorStream << "UnimplError @ " << current << ": " << error.explain
