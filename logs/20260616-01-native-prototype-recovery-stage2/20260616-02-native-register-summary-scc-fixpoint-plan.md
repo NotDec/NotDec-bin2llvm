@@ -2680,3 +2680,77 @@ summary_ssa_rsp_rbp_entry: 12
 - 实现效果：8/10。修掉了完整寄存器 replaced load 残留。
 - 理解成本：2/10。只是让内部 replacement map 和 LLVM use-rewrite 保持一致。
 - 维护成本：2/10。局部修复，风险小。
+
+## 实现更新：lifting 寄存器访问统一到最大 backing register
+
+用户原始 prompt：
+
+> 如果直接在lifting阶段，就不生成这种部分寄存器的名字，而是把所有这种部分寄存器的访问都按底层的语义去改成对完整寄存器的访问，怎么样，比如partial 写等价于保留高位、替换低位的话
+
+> 对，按照这个方向改，让最开始lifting生成的寄存器全局变量就只有那种最大的
+
+本次结论：
+
+- `RegisterStorage` 原本已经把重叠寄存器合并成最大 backing global。
+- partial read 已经是 load 最大寄存器后 shift/trunc。
+- partial write 已经是 load 最大寄存器、mask/or 后 store 回最大寄存器。
+- 主要问题是 `notdec.register.access` metadata 仍记录 partial 名字，summary 侧 ABI facts 也按原始 ABI 名字匹配，导致 `XMM0`/`XMM0_Qa` 和 `ZMM0` 这种 backing global 不一致。
+
+本次改动：
+
+- [RegisterStorage.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/RegisterStorage.cpp:179)
+  - `RegisterStorage::addAccessMetadata()` 改为记录 backing `RegisterUnit` 的 `space/offset/size/name`。
+  - 这样 partial access 生成的 load/store metadata 也指向实际访问的最大寄存器全局变量。
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:29)
+  - `RegisterUnit` 增加 `Space/Offset/Size`。
+  - `collectAbiFacts()` 使用 `NativeAbiStorage` 的 `space/offset` 把 ABI 中的 partial register 名字归一到当前 IR 的 backing register 名字。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:35)
+  - 同步增加 backing register range 信息。
+  - `collectAbiFacts()` 同样归一 ABI register 名字。
+  - `Inputs` 包含 float input 的 backing register，用于外部调用读寄存器；但 `InternalParamRegisters/InputsInOrder` 仍跳过 float input，避免把 SIMD ABI 输入直接塞进当前整数签名 rewrite。
+  - `OutputsInOrder` 去重，避免多个 partial ABI output 归一到同一个 backing register 后重复返回。
+
+验证：
+
+```text
+git diff --check
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-base-register-storage-v2/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-base-register-storage-v2/summary.json \
+  --register-ssa-summary
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/notdec-fortune-summary-base-register-storage-v2/fortune.ll \
+  -o /tmp/notdec-fortune-summary-base-register-storage-v2/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-summary-base-register-storage-v2/fortune.bc \
+  -o /tmp/notdec-fortune-summary-base-register-storage-v2/fortune.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: 9.78 s -> 9.87 s
+register_access_metadata: 7 -> 7
+summary_return_helpers: 0
+summary_clobber_helpers: 0
+summary_ssa_rsp_rbp_entry: 12
+```
+
+剩余问题：
+
+- fortune 里剩余 7 个 register access 已经不是 partial global 变量问题，metadata 也已经指向 `R9/ZMM0/ZMM1` backing register。
+- 典型模式是 partial SIMD 写需要保留高位：先 load `@ZMM0`，mask/or 替换低位，再 store `@ZMM0`。
+- 后续要继续减少这 7 个，需要让 SummarySSA 对“只保留未观察高位”的 partial write 做更强的值化，或者在确认高位无用时把保留高位的 load/store 消掉。
+
+复杂度评估：
+
+- 实现效果：6/10。统一了 lifting metadata 和 summary ABI 匹配口径，但 fortune 残留数量暂时没下降。
+- 理解成本：3/10。规则简单：IR 里只看 backing register，ABI partial 名字按 range 映射过去。
+- 维护成本：3/10。依赖 register metadata 的 `space/offset/size`，后续如果换架构需要保证这些字段完整。

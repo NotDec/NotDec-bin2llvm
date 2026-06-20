@@ -73,6 +73,16 @@
 
 > 记得把本次的几个原始prompt也记录到那个logs/20260616-01-native-prototype-recovery-stage2/README.md。
 
+### 最大 backing register
+
+> partial register会带来哪些问题和困难？
+
+> x86 的特殊清零规则，以及任何清零高位的底层语义都不用考虑，已经在lifting阶段反映在IR中了。partial 写等价于保留高位、替换低位的话，按照这个思路去直接做有什么问题吗
+
+> 如果直接在lifting阶段，就不生成这种部分寄存器的名字，而是把所有这种部分寄存器的访问都按底层的语义去改成对完整寄存器的访问，怎么样，比如partial 写等价于保留高位、替换低位的话
+
+> 对，按照这个方向改，让最开始lifting生成的寄存器全局变量就只有那种最大的
+
 ## 文件索引
 
 - `20260616-01-ghidra-register-elimination-mechanisms.md`：Ghidra heritage、copy propagation、cover、trial/use 等机制梳理。

@@ -182,13 +182,13 @@ void RegisterStorage::addAccessMetadata(llvm::Value *instruction,
   if (inst == nullptr) {
     return;
   }
-  std::string accessName = access.Name.value_or("");
+  (void)access;
   llvm::Metadata *metadata[] = {
       llvm::MDString::get(Context, "base=" + unit.Name),
-      llvm::MDString::get(Context, "space=" + access.Space),
-      llvm::MDString::get(Context, "offset=" + std::to_string(access.Offset)),
-      llvm::MDString::get(Context, "size=" + std::to_string(access.Size)),
-      llvm::MDString::get(Context, "name=" + accessName),
+      llvm::MDString::get(Context, "space=" + unit.Space),
+      llvm::MDString::get(Context, "offset=" + std::to_string(unit.Offset)),
+      llvm::MDString::get(Context, "size=" + std::to_string(unit.Size)),
+      llvm::MDString::get(Context, "name=" + unit.Name),
   };
   inst->setMetadata("notdec.register.access",
                     llvm::MDNode::get(Context, metadata));

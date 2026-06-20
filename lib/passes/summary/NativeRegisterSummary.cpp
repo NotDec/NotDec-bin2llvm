@@ -29,7 +29,10 @@ namespace {
 
 struct RegisterUnit {
   llvm::GlobalVariable *Global = nullptr;
+  std::string Space;
   std::string Name;
+  uint64_t Offset = 0;
+  uint64_t Size = 0;
 };
 
 struct RegisterAccess {
@@ -138,6 +141,33 @@ std::string unitName(const llvm::GlobalVariable &global) {
   return global.getName().str();
 }
 
+std::string unitSpace(const llvm::GlobalVariable &global) {
+  if (auto space = mdField(global.getMetadata("notdec.register"), "space")) {
+    return *space;
+  }
+  return "";
+}
+
+uint64_t unitOffset(const llvm::GlobalVariable &global) {
+  if (auto offset = mdField(global.getMetadata("notdec.register"), "offset")) {
+    uint64_t value = 0;
+    if (!llvm::StringRef(*offset).getAsInteger(10, value)) {
+      return value;
+    }
+  }
+  return 0;
+}
+
+uint64_t unitSize(const llvm::GlobalVariable &global) {
+  if (auto size = mdField(global.getMetadata("notdec.register"), "size")) {
+    uint64_t value = 0;
+    if (!llvm::StringRef(*size).getAsInteger(10, value)) {
+      return value;
+    }
+  }
+  return 0;
+}
+
 std::map<llvm::GlobalVariable *, RegisterUnit>
 collectRegisterUnits(llvm::Module &module) {
   std::map<llvm::GlobalVariable *, RegisterUnit> units;
@@ -147,7 +177,10 @@ collectRegisterUnits(llvm::Module &module) {
     }
     RegisterUnit unit;
     unit.Global = &global;
+    unit.Space = unitSpace(global);
     unit.Name = unitName(global);
+    unit.Offset = unitOffset(global);
+    unit.Size = unitSize(global);
     units.emplace(&global, std::move(unit));
   }
   return units;
@@ -160,6 +193,27 @@ registersByName(const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
     byName.emplace(unit.Name, global);
   }
   return byName;
+}
+
+std::string storageUnitName(
+    const NativeAbiStorage &storage,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  // ABI records may mention partial names such as XMM0_Qa while lifting keeps
+  // only the largest overlapping register global such as ZMM0.
+  for (const auto &[global, unit] : units) {
+    (void)global;
+    if (unit.Name == storage.Name) {
+      return unit.Name;
+    }
+  }
+  for (const auto &[global, unit] : units) {
+    (void)global;
+    if (unit.Space == storage.Space && unit.Offset <= storage.Offset &&
+        storage.Offset < unit.Offset + unit.Size) {
+      return unit.Name;
+    }
+  }
+  return storage.Name;
 }
 
 RegisterAccess
@@ -214,7 +268,9 @@ bool isAnalyzableCall(const llvm::Instruction &inst) {
   return callee == nullptr || !callee->isIntrinsic();
 }
 
-AbiFacts collectAbiFacts(const llvm::Module &module) {
+AbiFacts collectAbiFacts(
+    const llvm::Module &module,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
   AbiFacts facts;
   std::optional<NativeAbiSpec> abi = readNativeAbiMetadata(module);
   if (!abi) {
@@ -223,14 +279,15 @@ AbiFacts collectAbiFacts(const llvm::Module &module) {
   for (const NativeAbiParamEntry &entry : abi->Inputs) {
     if (entry.Storage.Kind == NativeAbiStorageKind::Register &&
         !entry.Storage.Name.empty()) {
-      facts.Inputs.insert(entry.Storage.Name);
+      facts.Inputs.insert(storageUnitName(entry.Storage, units));
     }
   }
   for (const NativeAbiParamEntry &entry : abi->Outputs) {
     if (entry.Storage.Kind == NativeAbiStorageKind::Register &&
         !entry.Storage.Name.empty()) {
-      facts.Outputs.insert(entry.Storage.Name);
-      facts.OutputOrder.push_back(entry.Storage.Name);
+      std::string name = storageUnitName(entry.Storage, units);
+      facts.Outputs.insert(name);
+      facts.OutputOrder.push_back(std::move(name));
     }
   }
   for (const NativeAbiEffect &effect : abi->Effects) {
@@ -239,9 +296,9 @@ AbiFacts collectAbiFacts(const llvm::Module &module) {
       continue;
     }
     if (effect.Kind == NativeAbiEffectKind::Unaffected) {
-      facts.Unaffected.insert(effect.Storage.Name);
+      facts.Unaffected.insert(storageUnitName(effect.Storage, units));
     } else if (effect.Kind == NativeAbiEffectKind::KilledByCall) {
-      facts.KilledByCall.insert(effect.Storage.Name);
+      facts.KilledByCall.insert(storageUnitName(effect.Storage, units));
     }
   }
   facts.StackPointer = abi->StackPointerRegister;
@@ -345,8 +402,8 @@ class Analyzer {
 public:
   Analyzer(llvm::Module &module, NativeRegisterSummaryOptions options)
       : Module(module), Options(std::move(options)),
-        Units(collectRegisterUnits(module)),
-        UnitsByName(registersByName(Units)), Abi(collectAbiFacts(module)) {
+        Units(collectRegisterUnits(module)), UnitsByName(registersByName(Units)),
+        Abi(collectAbiFacts(module, Units)) {
     for (llvm::Function &function : Module) {
       if (!function.isDeclaration()) {
         Functions.push_back(&function);
