@@ -2463,3 +2463,72 @@ define { i64, i64 } @notdec_native_5270(...)
 - 实现效果：8/10。大幅减少 return helper，并解释了 fortune 里的 RBX/R12 现象。
 - 理解成本：6/10。internal signature 不再等同外部 ABI，需要理解 summary facts 和候选寄存器集合。
 - 维护成本：5/10。规则仍集中在 signature shape 构造，边界比“完全不参考 ABI”更稳。
+
+## 实现更新：post-signature 清理不再保留 SummarySSA scaffold load
+
+用户原始 prompt：
+
+> 现在都没有helper了吗,那再找一个没有消除的寄存器访问的例子继续调研
+
+调研结果：
+
+- fortune 最新 IR 里 `notdec_native_2820` 仍有两条 `store @R13`。
+- 这两条 store 没有对应的 raw `load @R13`，值已经通过 SummarySSA phi 传给 `re_comp`。
+- 临时 debug 确认，post-signature store liveness 是被 `notdec.register.summary_ssa.entry` / `notdec.register.summary_ssa.replaced` 这类 SSA 构造用 load 重新加活的，不是真实 IR 还要读寄存器全局变量。
+
+本次改动：
+
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:725)
+  - post-signature cleanup 阶段不再用 summary exit-demand 保活寄存器全局 store。
+  - 原因：函数返回值已经由改写后的 LLVM `ret` 显式携带。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:806)
+  - `transferLoadLiveness()` 在 post-signature cleanup 阶段忽略 `summary_ssa.entry` 和 `summary_ssa.replaced` load。
+  - 原因：这些 load 是 SummarySSA scaffold，不应阻止删除寄存器全局 store。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:378)
+  - 更新 dead-store 测试期望。签名改写后返回值已在 LLVM return 中，最后一次 `store @RAX` 也可以删除。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-postsig-real-load-cleanup/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-postsig-real-load-cleanup/summary.json \
+  --register-ssa-summary
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/notdec-fortune-summary-postsig-real-load-cleanup/fortune.ll \
+  -o /tmp/notdec-fortune-summary-postsig-real-load-cleanup/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-summary-postsig-real-load-cleanup/fortune.bc \
+  -o /tmp/notdec-fortune-summary-postsig-real-load-cleanup/fortune.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: 10.56 s
+dead_stores_removed: 2572 -> 2575
+register_access_metadata: 12 -> 9
+summary_return_helpers: 4 -> 4
+summary_clobber_helpers: 2 -> 2
+summary_ssa_rsp_rbp_entry: 12 -> 12
+```
+
+`notdec_native_2820` 的两条 `store @R13` 已消失。
+
+剩余问题：
+
+- 两条 `load @RAX` 已标记 `summary_ssa.replaced`，但仍被后续 PHI 使用。需要继续查 signature rewrite 后的 value remap。
+- `R9W` / `XMM0` / `XMM1` 属于子寄存器或宽度不一致访问，当前 summary 链路只处理完整寄存器。
+
+复杂度评估：
+
+- 实现效果：7/10。解决了 SummarySSA scaffold load 阻止 store 删除的问题。
+- 理解成本：3/10。规则只在 post-signature cleanup 生效。
+- 维护成本：3/10。没有改变 summary 构建和函数签名推断。

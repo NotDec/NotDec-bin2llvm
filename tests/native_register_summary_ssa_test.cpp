@@ -379,8 +379,8 @@ bool testOverwrittenStoreIsRemoved() {
   return expect(summary.LoadsReplaced == 1, "final load was not replaced") &&
          expect(summary.DeadLoadsRemoved == 1,
                 "final replaced load was not removed") &&
-         expect(summary.DeadStoresRemoved == 1,
-                "overwritten store was not removed") &&
+         expect(summary.DeadStoresRemoved == 2,
+                "overwritten stores were not removed") &&
          verifyOk(module, "module failed verifier after dead store test");
 }
 
@@ -410,8 +410,8 @@ bool testCrossBlockDeadStoreIsRemoved() {
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   return expect(summary.LoadsReplaced == 1,
                 "cross-block final load was not replaced") &&
-         expect(summary.DeadStoresRemoved == 1,
-                "cross-block dead store was not removed") &&
+         expect(summary.DeadStoresRemoved == 2,
+                "cross-block dead stores were not removed") &&
          verifyOk(module, "module failed verifier after cross-block test");
 }
 

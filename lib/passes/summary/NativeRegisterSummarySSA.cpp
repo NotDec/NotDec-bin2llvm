@@ -722,7 +722,10 @@ private:
             out.insert(succLive->second.begin(), succLive->second.end());
           }
         }
-        if (llvm::succ_empty(&block)) {
+        // After signature rewrite, explicit function returns carry these
+        // values.  Register globals should no longer stay live just because a
+        // summary return register exists.
+        if (!PostSignatureCleanup && llvm::succ_empty(&block)) {
           addExitLiveRegisters(out);
         }
 
@@ -804,6 +807,14 @@ private:
                             std::set<llvm::GlobalVariable *> &live) const {
     RegisterAccess access = registerLoad(load, Units);
     if (access.Unit != nullptr && access.IsStorageValue) {
+      // Entry/replaced loads are SummarySSA scaffolding.  After signature
+      // rewrite, only still-raw register loads require keeping global stores.
+      if (PostSignatureCleanup &&
+          (load.getMetadata("notdec.register.summary_ssa.entry") != nullptr ||
+           load.getMetadata("notdec.register.summary_ssa.replaced") !=
+               nullptr)) {
+        return;
+      }
       live.insert(access.Unit->Global);
     }
   }
