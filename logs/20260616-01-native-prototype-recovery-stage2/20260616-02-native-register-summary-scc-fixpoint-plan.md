@@ -2359,3 +2359,107 @@ summary_ssa_rsp_rbp_entry: 14 -> 14
 - 实现效果：9/10。直接解决了 ABI 参数 store 残留，fortune register metadata 大幅下降。
 - 理解成本：3/10。规则简单：post-signature cleanup 阶段，call 不再通过寄存器全局变量取参数。
 - 维护成本：3/10。改动只影响 cleanup 阶段，不改变 summary 构建和 signature 推断。
+
+## 实现更新：internal signature rewrite 支持非 ABI 返回寄存器
+
+用户原始 prompt：
+
+> 当前这个二进制是来自Ubuntu的，他应该用的是什么编译器呢？是不是GCC？搜一下GCC和clang是否都会有这种，对于内部函数，允许改变调用约定，随意地将寄存器作为参数和返回值的情况，如果确实存在的话，就让signature rewrite不要参考ABI
+
+调研：
+
+- 本地 `fortune` 是 Ubuntu 包 `fortune-mod_1:1.99.1-7.3build1_amd64.deb`，二进制 stripped，`.comment` 没保留编译器字符串。
+- Ubuntu/Debian 常规包构建默认更可能是 GCC。
+- GCC 文档里有 `-fipa-ra`（interprocedural register allocation），会在编译单元内部利用 callee 的精确寄存器使用情况，减少保存/恢复开销。这意味着 internal function call 不能简单按外部 ABI 的 caller/callee-saved 边界理解。
+- LLVM/Clang 也有类似 IPRA 方向，但这次 fortune 更应按 GCC 场景处理。
+
+观察到的问题：
+
+`notdec_native_2820` 调用 `notdec_native_5270` 后残留：
+
+```llvm
+call void @notdec_native_5270(...)
+%R12.return = call i64 @notdec.register.summary_return.i64()
+%RBX.return = call i64 @notdec.register.summary_return.i64()
+```
+
+`notdec_native_5270` 的 summary 对 R12/RBX 是：
+
+```text
+read_entry=true
+may_entry=true
+may_non_entry=true
+exit_demand=true
+```
+
+这不是典型 saved-register preserve。它表示函数确实把 R12/RBX 当作跨 call 的状态传递。旧 `shapeForInternalFunction()` 只按 ABI output 寄存器生成返回值，所以这类 helper 无法被 signature rewrite 替换。
+
+本次改动：
+
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:35)
+  - `RegisterUnit` 增加 `Offset`，用于稳定排序 internal signature 的寄存器顺序。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:60)
+  - `AbiFacts` 增加 `InternalParamRegisters` / `InternalReturnRegisters`。
+  - 参数候选：ABI inputs + ABI unaffected registers。
+  - 返回候选：ABI outputs + ABI unaffected registers。
+  - 不把 flags、RIP、ZMM、FS_OFFSET 这类未纳入 ABI register effects 的寄存器塞进 signature。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:460)
+  - `shapeForInternalFunction()` 不再只看 `InputsInOrder` / `OutputsInOrder`。
+  - 对 internal function，在候选寄存器集合内直接用 summary facts 判断真实参数和返回：
+    - `ReadEntry` -> 参数。
+    - `MayNonEntry && ExitDemand` -> 返回。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1127)
+  - call 没有参数但有返回时，也要进入 rewrite 队列。否则无参数 internal return call 会留下 helper。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:516)
+  - 新增 `testInternalSignatureRewriteUsesNonAbiReturn()`，覆盖 internal function 通过 RBX 返回的情况。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-internal-nonabi/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-internal-nonabi/summary.json \
+  --register-ssa-summary
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/notdec-fortune-summary-internal-nonabi/fortune.ll \
+  -o /tmp/notdec-fortune-summary-internal-nonabi/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-summary-internal-nonabi/fortune.bc \
+  -o /tmp/notdec-fortune-summary-internal-nonabi/fortune.verified.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: 10.59 s
+summary_return_helpers: 28 -> 4
+summary_clobber_helpers: 1 -> 1
+register_access_metadata: 11 -> 12
+summary_ssa_rsp_rbp_entry: 14 -> 12
+```
+
+`notdec_native_5270` 现在变成：
+
+```llvm
+define { i64, i64 } @notdec_native_5270(...)
+```
+
+原来 `R12/RBX` 的 return helper 已被 signature return 替换。
+
+风险：
+
+- internal 函数参数数量会增加。比如 `notdec_native_5270` 现在会显式接收多个通用寄存器参数。这更接近 native 优化后的寄存器接口，但 IR 可读性会变重。
+- 当前只把 ABI 描述里的通用寄存器纳入 internal signature，不处理 SIMD/flags/special register。后续如果遇到真实 SIMD internal calling convention，需要单独扩展。
+- `summary_return_helpers` 仍剩 4 个，主要是 RAX 相关路径，后续单独分析。
+
+复杂度评估：
+
+- 实现效果：8/10。大幅减少 return helper，并解释了 fortune 里的 RBX/R12 现象。
+- 理解成本：6/10。internal signature 不再等同外部 ABI，需要理解 summary facts 和候选寄存器集合。
+- 维护成本：5/10。规则仍集中在 signature shape 构造，边界比“完全不参考 ABI”更稳。

@@ -516,6 +516,66 @@ bool testInternalSignatureRewriteUsesArgsAndReturn() {
                   "module failed verifier after internal signature rewrite");
 }
 
+bool testInternalSignatureRewriteUsesNonAbiReturn() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-internal-non-abi-return", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_non_abi_return", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(calleeEntry);
+  storeRegister(builder, rbx, llvm::ConstantInt::get(rbx->getValueType(), 9),
+                "RBX");
+  builder.CreateRetVoid();
+
+  llvm::Function *caller =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_non_abi_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  builder.CreateCall(voidType, callee);
+  llvm::LoadInst *result = loadRegister(builder, rbx, "RBX", "result");
+  (void)result;
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("notdec_native_non_abi_return");
+  bool helperLeft = false;
+  bool callReturnsRBX = false;
+  for (llvm::Function &function : module) {
+    if (function.getName().starts_with("notdec.register.summary_return")) {
+      helperLeft = !function.use_empty();
+    }
+  }
+  if (llvm::Function *rewrittenCaller =
+          module.getFunction("notdec_native_non_abi_caller")) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() == rewritten &&
+          call->getType() == rbx->getValueType()) {
+        callReturnsRBX = true;
+      }
+    }
+  }
+
+  return expect(rewritten != nullptr, "non-ABI return callee missing") &&
+         expect(rewritten->getReturnType() == rbx->getValueType(),
+                "internal non-ABI return was not added to signature") &&
+         expect(callReturnsRBX,
+                "internal non-ABI return callsite was not rewritten") &&
+         expect(!helperLeft, "non-ABI return helper was left in IR") &&
+         expect(summary.CallsRewritten >= 1,
+                "non-ABI return call rewrite was not counted") &&
+         verifyOk(module,
+                  "module failed verifier after non-ABI return rewrite");
+}
+
 bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-stack-saved-register", context);
@@ -728,6 +788,7 @@ int main() {
   ok &= testCrossBlockDeadStoreIsRemoved();
   ok &= testAbiInputStoreBeforeCallIsKept();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
+  ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testStaticRspStackRewriteKeepsSavedRegisterEvidence();
   ok &= testFramePointerLoadFeedsStackRewriteAndIgnoredSet();
   ok &= testSummarySSARemovesDeadStackFrameStore();

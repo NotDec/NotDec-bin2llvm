@@ -20,6 +20,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <map>
 #include <optional>
 #include <set>
@@ -34,6 +35,7 @@ namespace {
 struct RegisterUnit {
   llvm::GlobalVariable *Global = nullptr;
   std::string Name;
+  uint64_t Offset = 0;
 };
 
 struct RegisterAccess {
@@ -58,6 +60,8 @@ struct AbiFacts {
   std::vector<std::string> InputsInOrder;
   std::set<std::string> Outputs;
   std::vector<std::string> OutputsInOrder;
+  std::set<std::string> InternalParamRegisters;
+  std::set<std::string> InternalReturnRegisters;
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
 };
@@ -256,6 +260,16 @@ std::string unitName(const llvm::GlobalVariable &global) {
   return global.getName().str();
 }
 
+uint64_t unitOffset(const llvm::GlobalVariable &global) {
+  if (auto offset = mdField(global.getMetadata("notdec.register"), "offset")) {
+    uint64_t value = 0;
+    if (!llvm::StringRef(*offset).getAsInteger(10, value)) {
+      return value;
+    }
+  }
+  return 0;
+}
+
 std::map<llvm::GlobalVariable *, RegisterUnit>
 collectRegisterUnits(llvm::Module &module) {
   std::map<llvm::GlobalVariable *, RegisterUnit> units;
@@ -266,6 +280,7 @@ collectRegisterUnits(llvm::Module &module) {
     RegisterUnit unit;
     unit.Global = &global;
     unit.Name = unitName(global);
+    unit.Offset = unitOffset(global);
     units.emplace(&global, std::move(unit));
   }
   return units;
@@ -338,6 +353,7 @@ AbiFacts collectAbiFacts(const llvm::Module &module) {
         continue;
       }
       facts.Inputs.insert(entry.Storage.Name);
+      facts.InternalParamRegisters.insert(entry.Storage.Name);
       facts.InputsInOrder.push_back(entry.Storage.Name);
     }
   }
@@ -345,6 +361,7 @@ AbiFacts collectAbiFacts(const llvm::Module &module) {
     if (entry.Storage.Kind == NativeAbiStorageKind::Register &&
         !entry.Storage.Name.empty()) {
       facts.Outputs.insert(entry.Storage.Name);
+      facts.InternalReturnRegisters.insert(entry.Storage.Name);
       facts.OutputsInOrder.push_back(entry.Storage.Name);
     }
   }
@@ -355,6 +372,8 @@ AbiFacts collectAbiFacts(const llvm::Module &module) {
     }
     if (effect.Kind == NativeAbiEffectKind::Unaffected) {
       facts.Unaffected.insert(effect.Storage.Name);
+      facts.InternalParamRegisters.insert(effect.Storage.Name);
+      facts.InternalReturnRegisters.insert(effect.Storage.Name);
     } else if (effect.Kind == NativeAbiEffectKind::KilledByCall) {
       facts.KilledByCall.insert(effect.Storage.Name);
     }
@@ -447,28 +466,42 @@ SignatureShape shapeForInternalFunction(
     return shape;
   }
 
-  int maxParamIndex = -1;
-  for (unsigned index = 0; index < abi.InputsInOrder.size(); ++index) {
-    auto regIt = factsIt->second.Registers.find(abi.InputsInOrder[index]);
-    if (regIt != factsIt->second.Registers.end() && regIt->second.ReadEntry) {
-      maxParamIndex = static_cast<int>(index);
-    }
+  std::vector<const RegisterUnit *> orderedUnits;
+  orderedUnits.reserve(units.size());
+  for (const auto &[global, unit] : units) {
+    (void)global;
+    orderedUnits.push_back(&unit);
   }
-  for (int index = 0; index <= maxParamIndex; ++index) {
-    const RegisterUnit *unit = unitByName(units, abi.InputsInOrder[index]);
-    if (unit != nullptr) {
+  std::sort(orderedUnits.begin(), orderedUnits.end(),
+            [](const RegisterUnit *lhs, const RegisterUnit *rhs) {
+              if (lhs->Offset != rhs->Offset) {
+                return lhs->Offset < rhs->Offset;
+              }
+              return lhs->Name < rhs->Name;
+            });
+
+  // Internal native functions can be compiled with interprocedural register
+  // allocation, so their real interface is not limited to the external ABI
+  // argument and return registers.  Stay within ABI-described general-purpose
+  // registers, but let summary facts decide which of them are real inputs and
+  // demanded outputs.
+  for (const RegisterUnit *unit : orderedUnits) {
+    if (abi.InternalParamRegisters.count(unit->Name) == 0) {
+      continue;
+    }
+    auto regIt = factsIt->second.Registers.find(unit->Name);
+    if (regIt != factsIt->second.Registers.end() && regIt->second.ReadEntry) {
       shape.Params.push_back(unit);
     }
   }
 
-  for (const std::string &name : abi.OutputsInOrder) {
-    auto regIt = factsIt->second.Registers.find(name);
-    if (regIt == factsIt->second.Registers.end() ||
-        !regIt->second.MayNonEntry || !regIt->second.ExitDemand) {
+  for (const RegisterUnit *unit : orderedUnits) {
+    if (abi.InternalReturnRegisters.count(unit->Name) == 0) {
       continue;
     }
-    const RegisterUnit *unit = unitByName(units, name);
-    if (unit != nullptr) {
+    auto regIt = factsIt->second.Registers.find(unit->Name);
+    if (regIt != factsIt->second.Registers.end() &&
+        regIt->second.MayNonEntry && regIt->second.ExitDemand) {
       shape.Returns.push_back(unit);
     }
   }
@@ -1095,7 +1128,7 @@ private:
       const SignatureShape &shape = SignatureState.Shapes.at(callee);
       std::vector<CallArgStoreBinding> bindings =
           callArgStoreBindings(*call, shape);
-      if (bindings.empty() && shape.Params.empty()) {
+      if (bindings.empty() && shape.Params.empty() && shape.Returns.empty()) {
         continue;
       }
 
