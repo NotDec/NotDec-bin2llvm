@@ -18,6 +18,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -419,6 +420,44 @@ bool isAnalyzableCall(const llvm::CallBase &call) {
   return callee == nullptr || !callee->isIntrinsic();
 }
 
+bool isKeepHighPartialLoadUse(llvm::LoadInst &load,
+                              llvm::GlobalVariable *global) {
+  // RegisterStorage lowers partial writes by reading the whole backing
+  // register, preserving the lanes outside the write mask, and storing the
+  // whole register back.  This load is not a real liveness use when it only
+  // feeds that keep-high expression.
+  if (load.getPointerOperand()->stripPointerCasts() != global ||
+      load.user_empty()) {
+    return false;
+  }
+  for (llvm::User *loadUser : load.users()) {
+    auto *andOp = llvm::dyn_cast<llvm::Operator>(loadUser);
+    if (andOp == nullptr || andOp->getOpcode() != llvm::Instruction::And) {
+      return false;
+    }
+    bool hasStore = false;
+    for (llvm::User *andUser : andOp->users()) {
+      auto *orOp = llvm::dyn_cast<llvm::Operator>(andUser);
+      if (orOp == nullptr || orOp->getOpcode() != llvm::Instruction::Or) {
+        return false;
+      }
+      for (llvm::User *orUser : orOp->users()) {
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(orUser);
+        if (store == nullptr ||
+            store->getPointerOperand()->stripPointerCasts() != global ||
+            store->getValueOperand() != orOp) {
+          return false;
+        }
+        hasStore = true;
+      }
+    }
+    if (!hasStore) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::string storageUnitName(
     const NativeAbiStorage &storage,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -428,6 +467,29 @@ std::string storageUnitName(
     (void)global;
     if (unit.Name == storage.Name) {
       return unit.Name;
+    }
+  }
+  for (llvm::StringRef prefix : {llvm::StringRef("XMM"),
+                                llvm::StringRef("YMM")}) {
+    llvm::StringRef name(storage.Name);
+    if (!name.starts_with(prefix)) {
+      continue;
+    }
+    llvm::StringRef rest = name.drop_front(prefix.size());
+    size_t digits = 0;
+    while (digits < rest.size() && rest[digits] >= '0' &&
+           rest[digits] <= '9') {
+      ++digits;
+    }
+    if (digits == 0) {
+      continue;
+    }
+    std::string candidate = ("ZMM" + rest.take_front(digits)).str();
+    for (const auto &[global, unit] : units) {
+      (void)global;
+      if (unit.Name == candidate) {
+        return unit.Name;
+      }
     }
   }
   for (const auto &[global, unit] : units) {
@@ -471,6 +533,9 @@ AbiFacts collectAbiFacts(
         !entry.Storage.Name.empty()) {
       std::string name = storageUnitName(entry.Storage, units);
       facts.Outputs.insert(name);
+      if (entry.MetaType == "float") {
+        continue;
+      }
       facts.InternalReturnRegisters.insert(name);
       pushUnique(facts.OutputsInOrder, name);
     }
@@ -902,7 +967,11 @@ private:
       }
     }
     for (llvm::StoreInst *store : deadStores) {
+      llvm::Value *storedValue = store->getValueOperand();
       store->eraseFromParent();
+      if (auto *storedInst = llvm::dyn_cast<llvm::Instruction>(storedValue)) {
+        llvm::RecursivelyDeleteTriviallyDeadInstructions(storedInst);
+      }
       ++Summary.DeadStoresRemoved;
     }
   }
@@ -919,6 +988,9 @@ private:
                             std::set<llvm::GlobalVariable *> &live) const {
     RegisterAccess access = registerLoad(load, Units);
     if (access.Unit != nullptr && access.IsStorageValue) {
+      if (isKeepHighPartialLoadUse(load, access.Unit->Global)) {
+        return;
+      }
       // Entry/replaced loads are SummarySSA scaffolding.  After signature
       // rewrite, only still-raw register loads require keeping global stores.
       if (PostSignatureCleanup &&
@@ -1349,6 +1421,12 @@ private:
 
   llvm::Value *callValue(llvm::CallBase &call, const RegisterUnit &unit,
                          llvm::StringRef kind) {
+    if (kind == "return" && Abi.OutputsInOrder.end() ==
+                                std::find(Abi.OutputsInOrder.begin(),
+                                          Abi.OutputsInOrder.end(),
+                                          unit.Name)) {
+      return llvm::UndefValue::get(unit.Global->getValueType());
+    }
     CallValueKey key{&call, unit.Global, kind.str()};
     if (auto cached = CallValues.find(key); cached != CallValues.end()) {
       return cached->second;

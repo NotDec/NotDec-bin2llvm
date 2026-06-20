@@ -4,6 +4,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -43,6 +44,23 @@ llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
       llvm::MDString::get(context, "space=register"),
       llvm::MDString::get(context, "offset=0"),
       llvm::MDString::get(context, "size=8"),
+      llvm::MDString::get(context, "name=" + name),
+  };
+  global->setMetadata("notdec.register", llvm::MDNode::get(context, fields));
+  return global;
+}
+
+llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
+                                           const std::string &name,
+                                           llvm::Type *type, uint64_t offset,
+                                           uint64_t size) {
+  llvm::LLVMContext &context = module.getContext();
+  auto *global = new llvm::GlobalVariable(
+      module, type, false, llvm::GlobalValue::ExternalLinkage, nullptr, name);
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "space=register"),
+      llvm::MDString::get(context, "offset=" + std::to_string(offset)),
+      llvm::MDString::get(context, "size=" + std::to_string(size)),
       llvm::MDString::get(context, "name=" + name),
   };
   global->setMetadata("notdec.register", llvm::MDNode::get(context, fields));
@@ -819,6 +837,67 @@ bool testNoReturnExternalDoesNotCreateSummaryReturn() {
          verifyOk(module, "module failed verifier after noreturn cleanup test");
 }
 
+bool testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-zmm-abi-effect", context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_zmm_test";
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MetaType = "float";
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "XMM0_Qa";
+  abi.Outputs.push_back(output);
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = "XMM0";
+  abi.Effects.push_back(killed);
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                                             {}, false);
+  llvm::Function *external =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "external_float_return", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "zmm_partial_after_call", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(external);
+  llvm::Value *old = builder.CreateLoad(zmmType, zmm0);
+  llvm::Value *keep = builder.CreateAnd(
+      old, llvm::ConstantInt::get(
+               zmmType, llvm::APInt::getBitsSet(512, 64, 512)));
+  llvm::Value *low = llvm::ConstantInt::get(zmmType, 7);
+  storeRegister(builder, zmm0, builder.CreateOr(keep, low), "ZMM0");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  unsigned zmmStores = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store != nullptr && store->getPointerOperand()->stripPointerCasts() ==
+                                zmm0) {
+      ++zmmStores;
+    }
+  }
+
+  return expect(function->getReturnType()->isVoidTy(),
+                "float ABI output was rewritten as an i512 return") &&
+         expect(zmmStores == 0,
+                "dead ZMM partial store after external call was not removed") &&
+         expect(summary.CallReturnValues == 0,
+                "float ABI output created a summary return helper") &&
+         verifyOk(module, "module failed verifier after ZMM ABI effect test");
+}
+
 } // namespace
 
 int main() {
@@ -839,5 +918,6 @@ int main() {
   ok &= testStackFrameAddressPassedToCallIsLocalized();
   ok &= testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall();
   ok &= testNoReturnExternalDoesNotCreateSummaryReturn();
+  ok &= testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

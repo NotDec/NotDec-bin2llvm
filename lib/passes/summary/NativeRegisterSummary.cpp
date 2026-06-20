@@ -8,6 +8,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
@@ -206,6 +207,29 @@ std::string storageUnitName(
       return unit.Name;
     }
   }
+  for (llvm::StringRef prefix : {llvm::StringRef("XMM"),
+                                llvm::StringRef("YMM")}) {
+    llvm::StringRef name(storage.Name);
+    if (!name.starts_with(prefix)) {
+      continue;
+    }
+    llvm::StringRef rest = name.drop_front(prefix.size());
+    size_t digits = 0;
+    while (digits < rest.size() && rest[digits] >= '0' &&
+           rest[digits] <= '9') {
+      ++digits;
+    }
+    if (digits == 0) {
+      continue;
+    }
+    std::string candidate = ("ZMM" + rest.take_front(digits)).str();
+    for (const auto &[global, unit] : units) {
+      (void)global;
+      if (unit.Name == candidate) {
+        return unit.Name;
+      }
+    }
+  }
   for (const auto &[global, unit] : units) {
     (void)global;
     if (unit.Space == storage.Space && unit.Offset <= storage.Offset &&
@@ -391,6 +415,69 @@ void restoreRegister(State &state, llvm::GlobalVariable *global) {
   Cell &cell = cellFor(state, global);
   cell.MayEntry = true;
   cell.MayNonEntry = false;
+}
+
+bool isKeepHighPartialStoreValue(llvm::Value *value,
+                                 llvm::GlobalVariable *global) {
+  // RegisterStorage lowers a partial write as:
+  //   old = load @REG
+  //   keep = and old, KEEP_MASK
+  //   insert = and (shl new, shift), WRITE_MASK
+  //   store (or keep, insert), @REG
+  // The old load is not a semantic function input if it only preserves lanes
+  // outside the partial write.
+  auto *orOp = llvm::dyn_cast<llvm::Operator>(value);
+  if (orOp == nullptr || orOp->getOpcode() != llvm::Instruction::Or) {
+    return false;
+  }
+  for (llvm::Value *operand : orOp->operands()) {
+    auto *andOp = llvm::dyn_cast<llvm::Operator>(operand);
+    if (andOp == nullptr || andOp->getOpcode() != llvm::Instruction::And) {
+      continue;
+    }
+    for (llvm::Value *andOperand : andOp->operands()) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(andOperand);
+      if (load != nullptr &&
+          load->getPointerOperand()->stripPointerCasts() == global) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool isKeepHighPartialLoadUse(llvm::LoadInst &load,
+                              llvm::GlobalVariable *global) {
+  if (load.getPointerOperand()->stripPointerCasts() != global ||
+      load.user_empty()) {
+    return false;
+  }
+  for (llvm::User *loadUser : load.users()) {
+    auto *andOp = llvm::dyn_cast<llvm::Operator>(loadUser);
+    if (andOp == nullptr || andOp->getOpcode() != llvm::Instruction::And) {
+      return false;
+    }
+    bool hasStore = false;
+    for (llvm::User *andUser : andOp->users()) {
+      auto *orOp = llvm::dyn_cast<llvm::Operator>(andUser);
+      if (orOp == nullptr || orOp->getOpcode() != llvm::Instruction::Or) {
+        return false;
+      }
+      for (llvm::User *orUser : orOp->users()) {
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(orUser);
+        if (store == nullptr ||
+            store->getPointerOperand()->stripPointerCasts() != global ||
+            store->getValueOperand() != orOp) {
+          return false;
+        }
+        hasStore = true;
+      }
+    }
+    if (!hasStore) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool isIgnored(const RegisterUnit &unit,
@@ -605,7 +692,11 @@ private:
       RegisterAccess access = registerLoad(*load, Units);
       if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
         Cell before = cellIn(state, access.Unit->Global);
-        readRegister(state, access.Unit->Global);
+        bool keepHighUse =
+            isKeepHighPartialLoadUse(*load, access.Unit->Global);
+        if (!keepHighUse) {
+          readRegister(state, access.Unit->Global);
+        }
         if (before.MayEntry && !before.MayNonEntry) {
           state.ValueOrigins[load] = access.Unit->Global;
         } else {
@@ -627,6 +718,12 @@ private:
     if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
       RegisterAccess access = registerStore(*store, Units);
       if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
+        if (isKeepHighPartialStoreValue(store->getValueOperand(),
+                                        access.Unit->Global)) {
+          writeRegister(state, access.Unit->Global);
+          state.ValueOrigins.erase(store);
+          return;
+        }
         llvm::GlobalVariable *origin =
             entryRegisterOrigin(store->getValueOperand(), state);
         if (origin == access.Unit->Global) {

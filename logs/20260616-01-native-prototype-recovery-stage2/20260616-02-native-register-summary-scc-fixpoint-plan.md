@@ -2754,3 +2754,81 @@ summary_ssa_rsp_rbp_entry: 12
 - 实现效果：6/10。统一了 lifting metadata 和 summary ABI 匹配口径，但 fortune 残留数量暂时没下降。
 - 理解成本：3/10。规则简单：IR 里只看 backing register，ABI partial 名字按 range 映射过去。
 - 维护成本：3/10。依赖 register metadata 的 `space/offset/size`，后续如果换架构需要保证这些字段完整。
+
+## 实现更新：partial keep-high 模式和 ZMM ABI fallback
+
+用户原始 prompt：
+
+> 所以其实应该在SSA构建的前面做吗
+
+> 按这个推进试试
+
+本次判断：
+
+- 这类问题不应该塞进 Braun SSA 构建算法本体。
+- 需要在 summary/SSA rewrite 前后识别 `load full register -> and keep mask -> or inserted low value -> store same register`。
+- 这样可以避免把“保留高位”的 old load 当成真实函数输入，也能让 cleanup 不因为这个 old load 把 partial store 保活。
+
+本次改动：
+
+- [NativeRegisterSummary.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummary.cpp:394)
+  - 新增 `isKeepHighPartialStoreValue()` 和 `isKeepHighPartialLoadUse()`。
+  - transfer load 时，如果 load 只服务于 partial write 的 keep-high 表达式，不调用 `readRegister()`。
+  - transfer store 时，如果 store value 是 keep-high partial write，不把它误判成 restore，只按普通 write 处理。
+  - `storageUnitName()` 增加 `XMMn/YMMn -> ZMMn` fallback。原因是当前 ABI metadata 里 `XMM0`/`XMM0_Qa` 没有有效 `space/offset`，不能只靠 range 匹配。
+- [NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:420)
+  - 同步增加 keep-high partial load 识别。
+  - liveness cleanup 遇到这类 old load 时不把 backing register 加入 live 集合。
+  - 删除 dead register store 后调用 `RecursivelyDeleteTriviallyDeadInstructions()`，顺手清掉 dead `or/and/load` 链。
+  - `storageUnitName()` 同步支持 `XMMn/YMMn -> ZMMn` fallback，让 external call effect 能切断 ZMM 旧值依赖。
+  - float ABI output 仍进入 `Abi.Outputs`，用于 call effect；但不进入 `OutputsInOrder/InternalReturnRegisters`，避免把函数签名改成 `i512` 返回。
+  - `callValue()` 对这种非签名返回寄存器返回 `undef`，不生成 `summary_return.i512` helper。
+- [native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:34)
+  - 新增宽寄存器测试 helper。
+  - 新增 `testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn()`，覆盖 `XMM0_Qa` ABI output 映射到 `ZMM0` backing effect，但不能改出 `i512` 函数返回。
+
+验证：
+
+```text
+git diff --check
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-summary-zmm-clean-final/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-summary-zmm-clean-final/summary.json \
+  --register-ssa-summary
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/notdec-fortune-summary-zmm-clean-final/fortune.ll \
+  -o /tmp/notdec-fortune-summary-zmm-clean-final/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-summary-zmm-clean-final/fortune.bc \
+  -o /tmp/notdec-fortune-summary-zmm-clean-final/fortune.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: 9.87 s -> 9.64 s
+register_access_metadata: 7 -> 2
+summary_return_helpers: 0
+summary_clobber_helpers: 0
+i512_signatures: 0
+summary_ssa_rsp_rbp_entry: 12
+```
+
+剩余问题：
+
+- fortune 剩余 register access 只剩 `R9`：一处 load、一处 store。
+- ZMM0/ZMM1 的 raw register access 已经消失。
+- 当前 keep-high 识别仍是模式匹配，不做完整 bit/lane demand；后续如果遇到更复杂的 SIMD lane 组合，仍需要扩展。
+
+复杂度评估：
+
+- 实现效果：9/10。fortune 关注用例的寄存器残留从 7 降到 2，且没有引入 i512 signature rewrite。
+- 理解成本：4/10。新增了 partial keep-high 规则和 ABI 名字 fallback，但范围集中。
+- 维护成本：4/10。`XMMn/YMMn -> ZMMn` fallback 是 x86 相关规则，后续多架构需要隔离或参数化。
