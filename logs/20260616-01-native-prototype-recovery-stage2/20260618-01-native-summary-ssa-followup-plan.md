@@ -2741,3 +2741,76 @@ native pipeline: 10.11s
   `PcodeLoweringConfig` 消费这些事实。
 - 理解成本：2/10。规则和现有 dynamic array thunk tail branch 复用同一字段。
 - 维护成本：2/10。后续如果更多 tail 形态被识别，也只需要扩展同一个判断。
+
+## 已完成：block successor 不再凭 p-code 位置猜边
+
+继续对比 fortune 的 `instructions-json` 和 `blocks-json` 时，发现 198 个 block
+successor 不能从最后一条 instruction fact 推出来。大部分是 seed 窗口被截断后继续解码的
+fallthrough：block 已经连到下一个 seed，但最后一条 instruction 没有记录这个
+fallthrough。
+
+还发现一个真正的 CFG 错边：`0x3250` 里的 guarded indirect tail jump：
+
+```text
+0x327e: JZ 0x3288
+0x3280: JMP RAX
+0x3288: RET
+```
+
+旧逻辑把 `0x3280` block 的 successor 设成 `0x3288`。这是错的，`JMP RAX` 没有
+fallthrough，后面的 `RET` 只是 guard 失败路径。根因是 `buildDecodedBlocks(...)` 和
+`NativeProgramState::addBasicBlock(...)` 在拆块时只看到“下一条指令是 block 起点”，就补了一条
+successor，没有确认 instruction fact 里真的有 fallthrough。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1786)
+  - `SleighSeedInstructionAnalyzer::decodeSeed(...)` 先计算 seed 末尾
+    `FallthroughTarget`，再把它写回 `decodedInstructions.back().Fallthrough`，最后再
+    `state.addInstruction(...)`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2366)
+  - `buildDecodedBlocks(...)` 只有普通指令被切块时才自动补下一块 successor；terminator
+    不再因为 `successors.empty()` 被接到下一块。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3093)
+  - `NativeProgramState::addBasicBlock(...)` 拆已有 block 时，只有 instruction facts 里存在
+    `Fallthrough == splitAddress`，才补 split successor。空 successor 也可能表示 return 或
+    indirect tail exit，不能直接解释成“继续执行下一块”。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-flow-consistency/summary.json -o /tmp/notdec-fortune-flow-consistency/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-flow-consistency/fortune.ll -o /tmp/notdec-fortune-flow-consistency/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-flow-consistency/fortune.bc -o /tmp/notdec-fortune-flow-consistency/fortune.verified.bc
+```
+
+fortune 结果：
+
+```text
+function_seeds: 26
+confirmed_functions: 26
+basic_blocks: 1013
+instructions: 2602
+xrefs total: 868
+unresolved_indirect_flows: 0
+native pipeline: 10.23s
+```
+
+额外一致性检查：从 `instructions-json` 的最后一条 instruction fact 推导 block
+successor，fortune 上 `missing_from_instruction_facts` 从 198 降到 0。
+
+试错结论：不能简单把“跳出当前函数范围的无条件跳转”全部标为 tail branch。这个规则会让
+fortune 从 26 个函数变成 29 个函数，并出现 `native conditional block 0x3884 is missing
+true successor 0x38cd`。tail branch 仍需要 PLT、已知函数入口、thunk 形态等强证据。
+
+复杂度评估：
+
+- 实现效果：7/10。block successor 不再从 p-code 位置硬猜，和 instruction facts 的关系更清楚。
+- 理解成本：3/10。`addBasicBlock(...)` 多了一个小 helper，但它直接表达“拆块必须有
+  fallthrough 证据”。
+- 维护成本：2/10。后续新增 flow analyzer 仍然只需要维护 instruction facts，block facts 从这些事实导出。

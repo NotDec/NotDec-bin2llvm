@@ -1783,12 +1783,15 @@ private:
     rangeStart = decodedInstructions.front().Address;
     rangeEnd =
         decodedInstructions.back().Address + decodedInstructions.back().Size;
-    for (const NativeInstruction &instruction : decodedInstructions) {
-      state.addInstruction(instruction);
-    }
     result.FallthroughTarget = fallthroughTargetForDecodedWindow(
         state, functionEntry, rangeStart, rangeEnd, decodeBytes,
         decodedInstructions);
+    if (result.FallthroughTarget) {
+      decodedInstructions.back().Fallthrough = *result.FallthroughTarget;
+    }
+    for (const NativeInstruction &instruction : decodedInstructions) {
+      state.addInstruction(instruction);
+    }
     addDecodedFunctionBlocks(state, functionEntry, rangeStart, rangeEnd,
                              decodedInstructions, result.FallthroughTarget,
                              result.BranchTargets);
@@ -2362,7 +2365,8 @@ private:
         }
         endBlock = true;
       }
-      if (nextStartsBlock && successors.empty()) {
+      if (nextStartsBlock && successors.empty() &&
+          instruction.FlowKind == NativeInstructionFlowKind::None) {
         addUniqueAddress(successors, instructions[index + 1].Address);
       }
 
@@ -3086,6 +3090,22 @@ bool NativeProgramState::addBasicBlock(uint64_t functionEntry,
     return false;
   }
 
+  // Splitting an already discovered range is only a fallthrough edge when the
+  // decoded instruction facts say so.  Empty successor lists also represent
+  // returns and indirect tail exits, so do not invent a successor just because
+  // another block starts inside the old byte range.
+  auto hasInstructionFallthroughTo = [&](uint64_t start,
+                                         uint64_t target) -> bool {
+    for (auto instruction = Instructions.lower_bound(start);
+         instruction != Instructions.end() && instruction->first < target;
+         ++instruction) {
+      if (instruction->second.Fallthrough == target) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   NativeFunction &function = iterator->second;
   for (NativeBasicBlock &existing : function.Blocks) {
     if (existing.Start != block.Start) {
@@ -3114,12 +3134,16 @@ bool NativeProgramState::addBasicBlock(uint64_t functionEntry,
     if (existing.Start < block.Start && block.Start < existing.End) {
       existing.End = block.Start;
       existing.Successors.clear();
-      existing.Successors.push_back(block.Start);
+      if (hasInstructionFallthroughTo(existing.Start, block.Start)) {
+        existing.Successors.push_back(block.Start);
+      }
     }
     if (block.Start < existing.Start && existing.Start < block.End) {
       block.End = existing.Start;
       block.Successors.clear();
-      block.Successors.push_back(existing.Start);
+      if (hasInstructionFallthroughTo(block.Start, existing.Start)) {
+        block.Successors.push_back(existing.Start);
+      }
     }
   }
   if (block.Start >= block.End) {
