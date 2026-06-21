@@ -3137,8 +3137,7 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 
 已知后续：
 
-- `--no-instcombine-pass` 仍会暴露 summary SSA 对前置 cleanup 的依赖，当前不是默认 native 链路。
-  后续如果要支持这个调试模式，需要单独整理“summary 前最小规范化 pass”。
+- `--no-instcombine-pass` 曾暴露 summary SSA 对前置 cleanup 的依赖，后续已继续收敛，见下一节。
 
 评分：
 
@@ -3146,3 +3145,73 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 理解成本：3/10。unknown 值表达统一为 `freeze poison`，符合 lowering 层已有做法。
 - 维护成本：3/10。`SimplifyCFGPass` 是 LLVM 标准清理，风险低；`freeze poison` 插入点需要后续
   继续注意 dominance。
+
+## 实现记录：修复 signature rewrite 后跨函数 argument 泄漏
+
+背景：
+
+- 继续跑 fortune 的 `--no-instcombine-pass` 调试模式时，summary SSA 不再是 verifier 报
+  `br poison`，而是在 signature rewrite 阶段暴露出更具体的问题：
+  - 先出现 `insertvalue` 字段类型不匹配的 assert。
+  - 用 gdb 复现后，稳定看到 verifier 报 `Referring to an argument in another function!`，
+    例如新函数返回值里还引用旧函数的 `%R8.arg`。
+- 根因是 `rewriteInternalFunctionBody(...)` 用 `splice` 把旧函数 body 移到新函数后，只替换了
+  summary SSA entry load 到新参数的映射，没有处理旧函数已有 argument 在 moved body 和
+  `FunctionReturns` 缓存中的引用。
+
+实现：
+
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1629)
+  `buildReturnValue(...)` 对单返回值和多返回值都增加类型兜底。缓存值类型和目标返回字段不一致时，
+  使用 frozen unknown，而不是继续构造非法 `ret` 或 `insertvalue`。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1672)
+  增加 `foreignArgumentReplacement(...)`。如果 moved body 里还引用别的函数的 argument：
+  - 优先按同名同类型映射到新函数参数。
+  - 找不到就用新函数 entry 里的 frozen unknown 替代。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1694)
+  增加 `replaceForeignArgumentsInBody(...)`，扫描新函数体所有 instruction operand，消除跨函数
+  argument 引用。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1760)
+  `rewriteInternalFunctionBody(...)` 在 splice 和参数 entry-load 替换后调用
+  `replaceForeignArgumentsInBody(...)`。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1776)
+  对 `FunctionReturns` 缓存中的返回值也做同样的 foreign argument remap。
+- [tests/native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:673)
+  增加 `testForeignArgumentInMovedBodyIsReplaced()`，构造旧函数已有 `%R8.arg`，但新 summary
+  signature 不保留该参数的场景，验证 rewrite 后没有跨函数 argument operand。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/native_register_summary_ssa_test
+build/bin/pcode_to_llvm_test
+build/bin/native_analysis_facts_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --no-instcombine-pass \
+  --summary-json-out /tmp/notdec-fortune-noinst-debug/summary.json \
+  -o /tmp/notdec-fortune-noinst-debug/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-noinst-debug/fortune.ll \
+  -o /tmp/notdec-fortune-noinst-debug/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-noinst-debug/fortune.bc \
+  -o /tmp/notdec-fortune-noinst-debug/fortune.verified.bc
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-default-post-foreign/summary.json \
+  -o /tmp/notdec-fortune-default-post-foreign/fortune.ll
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune `--no-instcombine-pass` 通过 `llvm-as` 和 verifier，耗时 `9.16 sec`。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.42 sec`。
+- 默认输出中 `br i1 poison`、`ret ... poison`、`store ... ptr poison` 仍为 0。
+
+评分：
+
+- 实现效果：8/10。no-instcombine 调试模式不再因为 signature rewrite 的跨函数 argument 泄漏失败。
+- 理解成本：4/10。多了一个 moved body 修复步骤，但位置集中在 internal signature rewrite。
+- 维护成本：3/10。逻辑保守：同名同类型才复用新参数，否则降级为 frozen unknown。

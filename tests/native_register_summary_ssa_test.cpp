@@ -670,6 +670,48 @@ bool testInternalSignatureRewriteUsesNonAbiReturn() {
                   "module failed verifier after non-ABI return rewrite");
 }
 
+bool testForeignArgumentInMovedBodyIsReplaced() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-foreign-argument", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                                       {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *callee = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "notdec_native_foreign_arg",
+      module);
+  callee->getArg(0)->setName("R8.arg");
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rax, callee->getArg(0), "RAX");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten =
+      module.getFunction("notdec_native_foreign_arg");
+  bool hasForeignArgumentOperand = false;
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
+      for (llvm::Use &operand : inst.operands()) {
+        auto *argument = llvm::dyn_cast<llvm::Argument>(operand.get());
+        if (argument != nullptr && argument->getParent() != rewritten) {
+          hasForeignArgumentOperand = true;
+        }
+      }
+    }
+  }
+
+  return expect(rewritten != nullptr, "foreign-argument callee missing") &&
+         expect(!hasForeignArgumentOperand,
+                "moved body still referenced foreign argument") &&
+         expect(summary.FunctionsRewritten >= 1,
+                "foreign-argument function was not rewritten") &&
+         verifyOk(module,
+                  "module failed verifier after foreign argument rewrite");
+}
+
 bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-stack-saved-register", context);
@@ -975,6 +1017,7 @@ int main() {
   ok &= testAbiInputStoreBeforeCallIsKept();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
+  ok &= testForeignArgumentInMovedBodyIsReplaced();
   ok &= testStaticRspStackRewriteKeepsSavedRegisterEvidence();
   ok &= testFramePointerLoadFeedsStackRewriteAndIgnoredSet();
   ok &= testSummarySSARemovesDeadStackFrameStore();

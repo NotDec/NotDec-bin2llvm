@@ -1627,10 +1627,11 @@ llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
     return nullptr;
   }
   if (shape.Returns.size() == 1) {
-    return values.empty()
-               ? frozenPoisonAt(builder, singleReturnType(shape),
-                                "notdec.return_unknown")
-               : values.front();
+    llvm::Type *retTy = singleReturnType(shape);
+    if (values.empty() || values.front()->getType() != retTy) {
+      return frozenPoisonAt(builder, retTy, "notdec.return_unknown");
+    }
+    return values.front();
   }
   llvm::Type *retTy = returnTypeForShape(builder.getContext(), shape);
   llvm::Value *result = llvm::UndefValue::get(retTy);
@@ -1641,6 +1642,11 @@ llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
             : frozenPoisonAt(builder,
                              shape.Returns[index]->Global->getValueType(),
                              shape.Returns[index]->Name + ".return_unknown");
+    if (value->getType() != shape.Returns[index]->Global->getValueType()) {
+      value = frozenPoisonAt(builder,
+                             shape.Returns[index]->Global->getValueType(),
+                             shape.Returns[index]->Name + ".return_unknown");
+    }
     result = builder.CreateInsertValue(result, value, {index});
   }
   return result;
@@ -1661,6 +1667,42 @@ llvm::Value *extractReturnRegister(llvm::IRBuilder<> &builder,
                                       registerName.str() + ".ret");
   }
   return nullptr;
+}
+
+llvm::Value *foreignArgumentReplacement(llvm::Function &function,
+                                        llvm::Argument &argument,
+                                        std::map<llvm::Type *, llvm::Value *>
+                                            &unknownByType) {
+  for (llvm::Argument &candidate : function.args()) {
+    if (candidate.getName() == argument.getName() &&
+        candidate.getType() == argument.getType()) {
+      return &candidate;
+    }
+  }
+  auto cached = unknownByType.find(argument.getType());
+  if (cached != unknownByType.end()) {
+    return cached->second;
+  }
+  llvm::IRBuilder<> builder(&function.getEntryBlock(),
+                            function.getEntryBlock().getFirstNonPHIIt());
+  llvm::Value *unknown =
+      frozenPoisonAt(builder, argument.getType(), argument.getName() + ".old");
+  unknownByType.emplace(argument.getType(), unknown);
+  return unknown;
+}
+
+void replaceForeignArgumentsInBody(llvm::Function &function) {
+  std::map<llvm::Type *, llvm::Value *> unknownByType;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    for (llvm::Use &operand : inst.operands()) {
+      auto *argument = llvm::dyn_cast<llvm::Argument>(operand.get());
+      if (argument == nullptr || argument->getParent() == &function) {
+        continue;
+      }
+      operand.set(
+          foreignArgumentReplacement(function, *argument, unknownByType));
+    }
+  }
 }
 
 llvm::CallInst *rewriteCallInst(llvm::CallBase &oldCall, llvm::Value &callee,
@@ -1715,6 +1757,7 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
     }
     ++index;
   }
+  replaceForeignArgumentsInBody(newFunction);
 
   auto returnsIt = state.FunctionReturns.find(&oldFunction);
   for (llvm::BasicBlock &block : newFunction) {
@@ -1734,6 +1777,12 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
       while (state.ValueMap.count(value) != 0 &&
              state.ValueMap[value] != value) {
         value = state.ValueMap[value];
+      }
+      auto *argument = llvm::dyn_cast<llvm::Argument>(value);
+      if (argument != nullptr && argument->getParent() != &newFunction) {
+        std::map<llvm::Type *, llvm::Value *> unknownByType;
+        value = foreignArgumentReplacement(newFunction, *argument,
+                                           unknownByType);
       }
     }
     llvm::IRBuilder<> builder(oldRet);
