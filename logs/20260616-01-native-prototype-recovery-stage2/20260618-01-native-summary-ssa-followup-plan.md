@@ -1727,3 +1727,70 @@ llvm-as + opt verify: passed
 - 实现效果：5/10。不会解决 fortune 里 `0x2879` 的未知 indirect branch，但以后 decode 层如果给出唯一后继，lowering 不再丢掉它。
 - 理解成本：2/10。规则和 direct/conditional 分支一致：native facts 是事实来源；多目标 indirect branch 明确留给 jump table 设计。
 - 维护成本：2/10。只新增一个局部 helper 和三条 synthetic 测试。
+
+## 实现记录：无 terminator / 空 native block 也必须有 successor facts
+
+`CBRANCH` 和 `BRANCHIND` 已经要求 native successor facts，但还有两个旧兜底会生成隐式 `ret void`：
+
+- 有 p-code、但没有 p-code terminator 的 native block。
+- 没有 p-code 的空 native block。
+
+在 native CFG 模式下，这两种 block 的控制流也应该由 decode/block facts 决定。确实无后继时应显式传空 successor list；缺 entry 代表 facts 缺失。
+
+这次收紧：
+
+- `nativeFallthroughBlock(...)` 在 native CFG 模式下缺 `BlockSuccessors` entry 时报错。
+- `nativeEmptyBlockSuccessor(...)` 在 native CFG 模式下缺 `BlockSuccessors` entry 时报错。
+- 已有空 block 正常测试补显式空 successor list。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:424)
+  - `nativeFallthroughBlock(...)` 缺 successor facts 时不再隐式接 `ret void`。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:509)
+  - `nativeEmptyBlockSuccessor(...)` 缺 successor facts 时不再隐式接 `ret void`。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:361)
+  - `testNativeDirectBranchCanTargetEmptyBlock()` 补显式空 successor list。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:480)
+  - 增加无 terminator block 缺 successor facts 报错测试。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:501)
+  - 增加空 native block 缺 successor facts 报错测试。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:568)
+  - conditional tail 测试里的空 false block 补显式空 successor list。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test notdec-native-llvm native_register_summary_test native_register_summary_ssa_test native_analysis_facts_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-missing-fallthrough-successors/fortune.ll --summary-json-out /tmp/notdec-fortune-missing-fallthrough-successors/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-missing-fallthrough-successors-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-missing-fallthrough-successors/fortune.ll -o /tmp/notdec-fortune-missing-fallthrough-successors/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-missing-fallthrough-successors/fortune.bc -o /tmp/notdec-fortune-missing-fallthrough-successors/fortune.verify.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-missing-fallthrough-successors-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-missing-fallthrough-successors-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-missing-fallthrough-successors-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-missing-fallthrough-successors-raw/fortune-3470-raw.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 9.35s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+unresolved_indirect_flows.total: 1
+unresolved_indirect_flows.indirect branch: 1
+final !notdec.register.access residue: 1
+remaining !notdec.register.access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：5/10。继续消除 lowering 层的隐式 `ret void` 兜底，让缺 facts 更早暴露。
+- 理解成本：1/10。规则简单：native CFG 模式下，每个需要 lower 控制流的 block 都必须有 successor entry。
+- 维护成本：1/10。没有新增状态，只收紧两个已有 helper。

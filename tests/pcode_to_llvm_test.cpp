@@ -368,6 +368,7 @@ bool testNativeDirectBranchCanTargetEmptyBlock() {
   config.EntryAddress = 0x1000;
   config.BlockRanges.emplace(0x1000, 0x1001);
   config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockSuccessors.emplace(0x2000, std::vector<uint64_t>{});
 
   std::string errorMessage;
   std::unique_ptr<llvm::Module> module =
@@ -476,6 +477,49 @@ bool testNativeMultipleSuccessorsRequireTerminator() {
                 "missing native terminator error was not reported");
 }
 
+bool testNativeFallthroughRequiresSuccessorFacts() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(copyOp(0x1000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_fallthrough_missing_successors";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native fallthrough without successor facts should fail") &&
+         expect(errorMessage.find("missing successor facts") !=
+                    std::string::npos,
+                "missing fallthrough successor facts error was not reported");
+}
+
+bool testEmptyNativeBlockRequiresSuccessorFacts() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(branchOp(0x1000, 0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_empty_missing_successors";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "empty native block without successor facts should fail") &&
+         expect(errorMessage.find("missing successor facts") !=
+                    std::string::npos,
+                "missing empty block successor facts error was not reported");
+}
+
 bool testNativeConditionalSuccessorsRequireTrueTarget() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -533,6 +577,7 @@ bool testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor() {
   config.BlockRanges.emplace(0x1000, 0x1001);
   config.BlockRanges.emplace(0x3000, 0x3001);
   config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x3000});
+  config.BlockSuccessors.emplace(0x3000, std::vector<uint64_t>{});
 
   std::string errorMessage;
   std::unique_ptr<llvm::Module> module =
@@ -702,6 +747,8 @@ int main() {
   ok &= testNativeEntryAddressCanTargetEmptyBlock();
   ok &= testNativeSuccessorRequiresKnownBlock();
   ok &= testNativeMultipleSuccessorsRequireTerminator();
+  ok &= testNativeFallthroughRequiresSuccessorFacts();
+  ok &= testEmptyNativeBlockRequiresSuccessorFacts();
   ok &= testNativeConditionalSuccessorsRequireTrueTarget();
   ok &= testNativeConditionalRequiresSuccessorFacts();
   ok &= testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor();

@@ -427,7 +427,14 @@ private:
     uint64_t blockAddress = blockAddressForIndex(blockIndex);
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
-      result = usesNativeCfg() ? nullptr : nextBlock(blockIndex);
+      if (usesNativeCfg()) {
+        std::ostringstream os;
+        os << "native block 0x" << std::hex << blockAddress
+           << " is missing successor facts";
+        errorMessage = os.str();
+        return false;
+      }
+      result = nextBlock(blockIndex);
       return true;
     }
     if (successorIt->second.empty()) {
@@ -504,8 +511,17 @@ private:
                                  std::string &errorMessage) {
     result = nullptr;
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
-    if (successorIt == Config.BlockSuccessors.end() ||
-        successorIt->second.empty()) {
+    if (successorIt == Config.BlockSuccessors.end()) {
+      if (usesNativeCfg()) {
+        std::ostringstream os;
+        os << "empty native block 0x" << std::hex << blockAddress
+           << " is missing successor facts";
+        errorMessage = os.str();
+        return false;
+      }
+      return true;
+    }
+    if (successorIt->second.empty()) {
       return true;
     }
     if (successorIt->second.size() != 1) {
