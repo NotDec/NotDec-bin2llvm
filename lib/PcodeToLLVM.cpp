@@ -112,7 +112,9 @@ public:
   }
 
 private:
-  bool usesNativeCfg() const { return !Config.BlockSuccessors.empty(); }
+  bool usesNativeCfg() const {
+    return !Config.BlockRanges.empty() || !Config.BlockSuccessors.empty();
+  }
 
   static bool isTerminator(PcodeOpcode opcode) {
     return opcode == PcodeOpcode::Branch ||
@@ -200,6 +202,12 @@ private:
 
     std::set<size_t> starts;
     starts.insert(0);
+    if (usesNativeCfg()) {
+      for (const auto &[blockAddress, blockEnd] : Config.BlockRanges) {
+        (void)blockEnd;
+        addBlockStart(starts, firstOpForAddress, blockAddress);
+      }
+    }
     for (const auto &[blockAddress, successors] : Config.BlockSuccessors) {
       addBlockStart(starts, firstOpForAddress, blockAddress);
       for (uint64_t successor : successors) {

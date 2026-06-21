@@ -889,3 +889,61 @@ llvm-as + opt verify: passed
 - 实现效果：8/10。native lowering 的 block starts 现在来自 discovery block facts，而不是 pcode branch scan。
 - 理解成本：2/10。只是把 native / generic pcode 分支放得更清楚。
 - 维护成本：2/10。非 native fallback 不变，native 路径更少隐式猜测。
+
+## 实现记录：把 native block ranges 传入 lowering config
+
+这次把 native block facts 从只有 successors 扩成 ranges + successors。
+
+目标是让 lower 层明确知道 native discovery 接受的 block body 和 CFG edges，而不是只靠 successors 推断 native 模式。
+
+具体改动：
+
+- [PcodeToLLVM.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/PcodeToLLVM.h:48)
+  - `PcodeLoweringConfig` 新增 `BlockRanges`，类型是 `block start -> block end`。
+  - 注释明确 `BlockRanges` 表示已接受的 block body，`BlockSuccessors` 表示 CFG edges。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:112)
+  - `usesNativeCfg()` 改为看 `BlockRanges` 或 `BlockSuccessors`。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:202)
+  - native 模式下，`buildBasicBlocks(...)` 会先把 `BlockRanges` 的 block starts 加入 lowering block starts。
+- [notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:545)
+  - 新增 `blockRangesByStart(...)`，从 `NativeFunction.Blocks` 或 CLI resolved block ranges 构造 range map。
+- [notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:763)
+  - `--all-confirmed` 路径把 `NativeFunction.Blocks` 的 ranges 传给 `PcodeLoweringConfig`。
+- [notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:1026)
+  - `-f` / `-n` 路径把 resolved `FunctionBlockRanges` 也传给 lowering。
+
+当前没有做的事：
+
+- lower 层暂时还没有用 `BlockRanges` 的 end 来截断块内 pcode op 范围。
+- 这一步需要把 block start/end 都映射到 op index，再替代现在的 `next BlockStart` 推 end，单独做风险更低。
+
+验证：
+
+```text
+cmake --build build --target notdec-native-llvm native_register_summary_test native_register_summary_ssa_test -j4
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/fortune-blockranges-raw.ll
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-blockranges/fortune.ll --summary-json-out /tmp/notdec-fortune-blockranges/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-blockranges/fortune.ll -o /tmp/notdec-fortune-blockranges/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-blockranges/fortune.bc -o /tmp/notdec-fortune-blockranges/fortune.verified.bc
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+```
+
+结果：
+
+```text
+fortune native pipeline: 12.86s
+confirmed_functions: 25
+basic_blocks: 2369
+instructions: 2908
+0x3470 raw IR still has bb_3748 false edge to bb_374e
+final !notdec.register.access residue: 1
+remaining register access: FS_OFFSET only
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：7/10。block range facts 已经进入 lowering config，为后续按 range 切 pcode block 做准备。
+- 理解成本：2/10。新增字段含义直接，和 `NativeBasicBlock` 一致。
+- 维护成本：2/10。目前只是传递事实和 native-mode 判断，行为风险低。

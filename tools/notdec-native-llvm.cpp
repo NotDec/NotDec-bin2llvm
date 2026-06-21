@@ -542,6 +542,24 @@ std::unordered_map<uint64_t, std::vector<uint64_t>> blockSuccessors(
   return successors;
 }
 
+std::unordered_map<uint64_t, uint64_t> blockRangesByStart(
+    const std::vector<std::pair<uint64_t, uint64_t>> &ranges) {
+  std::unordered_map<uint64_t, uint64_t> result;
+  for (const auto &[start, end] : ranges) {
+    result.emplace(start, end);
+  }
+  return result;
+}
+
+std::unordered_map<uint64_t, uint64_t> blockRangesByStart(
+    const notdec::bin2llvm::NativeFunction &function) {
+  std::unordered_map<uint64_t, uint64_t> ranges;
+  for (const notdec::bin2llvm::NativeBasicBlock &block : function.Blocks) {
+    ranges.emplace(block.Start, block.End);
+  }
+  return ranges;
+}
+
 std::string uniqueFunctionName(const std::string &baseName,
                                std::set<std::string> &usedNames) {
   std::string name = baseName.empty() ? "notdec_native_function" : baseName;
@@ -745,6 +763,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
     config.DirectCallTargets = callTargets.Direct;
     config.ExternalCallTargets = callTargets.External;
     config.IndirectExternalCallTargets = callTargets.IndirectExternal;
+    config.BlockRanges = blockRangesByStart(function);
     config.BlockSuccessors = blockSuccessors(function);
 
     llvm::LLVMContext checkContext;
@@ -1007,6 +1026,7 @@ int main(int argc, char **argv) {
         config.ExternalCallTargets = std::move(callTargets.External);
         config.IndirectExternalCallTargets =
             std::move(callTargets.IndirectExternal);
+        config.BlockRanges = blockRangesByStart(options->FunctionBlockRanges);
         config.BlockSuccessors = options->FunctionBlockSuccessors;
       }
       module = notdec::bin2llvm::buildPcodeModule(context, program, config,
