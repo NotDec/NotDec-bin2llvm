@@ -2744,6 +2744,7 @@ private:
 
     state.addBasicBlockSuccessors(function.Entry, dispatch->BlockStart,
                                   targets);
+    state.addInstructionDirectFlowTargets(branchAddress, targets);
     for (uint64_t target : targets) {
       NativeXref xref;
       xref.From = branchAddress;
@@ -3146,6 +3147,26 @@ bool NativeProgramState::addBasicBlockSuccessors(
     return changed;
   }
   return false;
+}
+
+bool NativeProgramState::addInstructionDirectFlowTargets(
+    uint64_t address, const std::vector<uint64_t> &targets) {
+  auto iterator = Instructions.find(address);
+  if (iterator == Instructions.end()) {
+    return false;
+  }
+
+  bool changed = false;
+  NativeInstruction &instruction = iterator->second;
+  for (uint64_t target : targets) {
+    if (std::find(instruction.DirectFlowTargets.begin(),
+                  instruction.DirectFlowTargets.end(),
+                  target) == instruction.DirectFlowTargets.end()) {
+      instruction.DirectFlowTargets.push_back(target);
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 void NativeProgramState::addXref(NativeXref xref) {

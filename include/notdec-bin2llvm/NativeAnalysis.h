@@ -279,6 +279,8 @@ public:
   bool addBasicBlock(uint64_t functionEntry, NativeBasicBlock block);
   bool addBasicBlockSuccessors(uint64_t functionEntry, uint64_t blockStart,
                                const std::vector<uint64_t> &successors);
+  bool addInstructionDirectFlowTargets(uint64_t address,
+                                       const std::vector<uint64_t> &targets);
   void addXref(NativeXref xref);
   bool addUnresolvedFlow(NativeUnresolvedFlow flow);
   bool removeUnresolvedFlow(uint64_t address, NativeUnresolvedFlowKind kind);

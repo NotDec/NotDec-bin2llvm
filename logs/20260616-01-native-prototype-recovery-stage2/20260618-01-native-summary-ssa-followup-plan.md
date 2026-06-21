@@ -2609,3 +2609,70 @@ fortune 的 instruction facts 现在是：
 - 实现效果：6/10。保持 CFG 语义不变，同时把 instruction facts 补完整。
 - 理解成本：2/10。字段名直接，和 CFG successor 分开。
 - 维护成本：2/10。后续碰到更多 tail thunk 形态时，还是同一套字段。
+
+## 已完成：jump table 目标同步回 instruction facts
+
+继续检查 `notdec_native_2820` 的 switch 时，发现后置 jump table analyzer 已经把
+`0x2879` 的 14 个 targets 写进 block successors，也加了 `x86-jump-table` xrefs，
+但 `--instructions-function-json 0x2820` 里 `0x2879` 这条 `JMP RAX` 的
+`direct_flow_targets` 仍然是空的。
+
+这会造成 instruction facts 和 block facts 不一致。当前目标是
+instruction facts -> block facts -> lowering，所以后置恢复出的控制流也要回填到
+对应 instruction fact。
+
+具体改动：
+
+- [NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:282)
+  - `NativeProgramState` 增加 `addInstructionDirectFlowTargets(...)`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2745)
+  - `X86JumpTableAnalyzer::recoverJumpTableInFunction(...)` 在更新 block successors 后，
+    同步更新 `branchAddress` 对应 instruction 的 `DirectFlowTargets`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3152)
+  - `NativeProgramState::addInstructionDirectFlowTargets(...)` 只追加去重 targets，
+    不覆盖原始 decode 得到的 flow targets。
+
+验证：
+
+```text
+build/bin/notdec-native-discover --instructions-function-json 0x2820 /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --no-register-ssa-pass --no-instcombine-pass --summary-json-out /tmp/notdec-fortune-jumptable-instruction-facts/raw-summary.json -o /tmp/notdec-fortune-jumptable-instruction-facts/fortune.raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-jumptable-instruction-facts/fortune.raw.ll -o /tmp/notdec-fortune-jumptable-instruction-facts/fortune.raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-jumptable-instruction-facts/fortune.raw.bc -o /tmp/notdec-fortune-jumptable-instruction-facts/fortune.raw.verified.bc
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-jumptable-instruction-facts/summary.json -o /tmp/notdec-fortune-jumptable-instruction-facts/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-jumptable-instruction-facts/fortune.ll -o /tmp/notdec-fortune-jumptable-instruction-facts/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-jumptable-instruction-facts/fortune.bc -o /tmp/notdec-fortune-jumptable-instruction-facts/fortune.verified.bc
+```
+
+fortune 的 `0x2879` instruction fact 现在是：
+
+```text
+flow_kind: indirect branch
+direct_flow_targets:
+  0x2970, 0x2efe, 0x2963, 0x2956, 0x2949, 0x2940, 0x292a,
+  0x2913, 0x28f2, 0x28e5, 0x28cf, 0x28c5, 0x2886, 0x287c
+```
+
+fortune 结果：
+
+```text
+function_seeds: 26
+confirmed_functions: 26
+basic_blocks: 1013
+instructions: 2602
+xrefs total: 868
+unresolved_indirect_flows: 0
+native pipeline: 10.20s
+```
+
+复杂度评估：
+
+- 实现效果：7/10。jump table 恢复结果现在同时体现在 instruction facts 和 block
+  facts 中。
+- 理解成本：2/10。只是把后置恢复出的 targets 回填到已有字段。
+- 维护成本：2/10。后续其他后置 flow analyzer 也可以复用同一个 helper。
