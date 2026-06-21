@@ -3851,6 +3851,8 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
   `MOVSXD target,[base + index*4] / ADD target,base / JMP target` 形态。
 - [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1547)
   `matchX86PicI32OffsetDispatch(...)` 改为使用解析出的 base/index register，再复用已有 table base 和 entry count 读取逻辑。
+  同时把 dispatch 的 `BlockStart` 设为包含 indirect branch 的真实 block start，而不是 table load 指令地址；
+  后续 `addBasicBlockSuccessors(...)` 只能接受 block start。
 
 验证：
 

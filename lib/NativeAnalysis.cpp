@@ -1575,7 +1575,15 @@ matchX86PicI32OffsetDispatch(const NativeProgramState &state,
   }
 
   X86PicI32JumpDispatch dispatch;
-  dispatch.BlockStart = load->Address;
+  for (const NativeBasicBlock &block : function.Blocks) {
+    if (branchAddress >= block.Start && branchAddress < block.End) {
+      dispatch.BlockStart = block.Start;
+      break;
+    }
+  }
+  if (dispatch.BlockStart == 0) {
+    return std::nullopt;
+  }
   dispatch.TableBase = *tableBase;
   dispatch.EntryCount = *entryCount;
   return dispatch;
