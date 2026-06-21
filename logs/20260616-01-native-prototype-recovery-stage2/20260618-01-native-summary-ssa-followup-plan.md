@@ -2143,3 +2143,105 @@ latest raw IR: /tmp/notdec-fortune-raw-jumptable/fortune.raw.ll
 - 理解成本：4/10。逻辑仍在 facts 层，只是从 range 命中改为 block 覆盖命中。
 - 维护成本：4/10。重叠函数本身后续还要治理；这次修正避免 jump table 边写错
   函数，但不解决重叠函数来源问题。
+
+## 已完成：同函数 decode 尊重已知函数范围
+
+继续看 fortune 的重叠函数后，确认 `0x27b2`、`0x2820`、`0x3470`
+这些入口的 seed 主要来自 `.eh_frame`。`.eh_frame` 给出的原始范围并不重叠：
+
+```text
+0x27b2: [0x27b2, 0x27f0)
+0x2820: [0x2820, 0x31e3)
+0x3470: [0x3470, 0x3eb0)
+```
+
+重叠是在 Sleigh seed decode 队列里产生的。旧逻辑只用 known range 限制
+一次 seed decode 的字节数，但 direct branch / fallthrough / jump table target
+仍然会作为同函数 seed 入队。如果 target 落在 `.eh_frame` range 外，下一轮
+decode 会退回 `capBytesAtNextFunctionSeed(...)`，于是函数被拖到别的范围里。
+
+这次改成：如果某个 function seed 有明确 `RangeStart/RangeEnd`，那么同函数
+decode 只允许 range 内的 target 入队，block successors 也只保留 range 内
+target。没有明确范围的 seed 暂时保持原行为，比如 fortune 的 `0x32d0` 来自
+init-array / relocation，入口直接跳 `0x3250`，不能用这条规则收紧。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1529)
+  - `SleighSeedInstructionAnalyzer::run(...)` 在入队 direct branch target 和
+    fallthrough target 前调用 `targetBelongsToFunctionRange(...)`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1697)
+  - jump table target 反向驱动 decode 时也使用同一个 range 检查。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1939)
+  - `addDecodedFunctionBlocks(...)` 在写 block successors 前调用
+    `eraseOutOfRangeFunctionSuccessors(...)`，避免 lowering 看到没有 native block
+    的 range 边界 target。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2319)
+  - 新增 `eraseOutOfRangeFunctionSuccessors(...)`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2369)
+  - 新增 `targetBelongsToFunctionRange(...)`，只有 seed 有明确 range 时才生效。
+
+当前 fortune 函数范围：
+
+```text
+0x27b2: range [0x27b2, 0x27c0), block_count 1
+0x2820: range [0x2820, 0x31e3), block_count 234
+0x3470: range [0x3470, 0x3eb0), block_count 199
+unresolved indirect flows: 0
+```
+
+`0x2820` 的 jump table 仍然正确 lower：
+
+```text
+raw IR:
+  define void @notdec_native_2820()
+  bb_2872:
+    switch i64 %RAX83, label %notdec_exit [...]
+
+summary IR:
+  define void @notdec_native_2820(...)
+  bb_2872:
+    switch i32 %unique_de00_4, label %notdec_exit [...]
+```
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-discover notdec-native-llvm native_analysis_facts_test pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --functions-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --cfg-json 0x2820 /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --no-register-ssa-pass --no-instcombine-pass -o /tmp/notdec-fortune-raw-range-bounded/fortune.raw.ll --summary-json-out /tmp/notdec-fortune-raw-range-bounded/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-raw-range-bounded/fortune.raw.ll -o /tmp/notdec-fortune-raw-range-bounded/fortune.raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-raw-range-bounded/fortune.raw.bc -o /tmp/notdec-fortune-raw-range-bounded/fortune.raw.verify.bc
+/usr/bin/time -f 'elapsed=%e' /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-range-bounded/fortune.ll --summary-json-out /tmp/notdec-fortune-range-bounded/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-range-bounded/fortune.ll -o /tmp/notdec-fortune-range-bounded/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-range-bounded/fortune.bc -o /tmp/notdec-fortune-range-bounded/fortune.verify.bc
+```
+
+结果：
+
+```text
+native tests: passed
+fortune unresolved flow count: 0
+fortune native pipeline: 10.13s
+raw IR verify: passed
+summary IR verify: passed
+latest raw IR: /tmp/notdec-fortune-raw-range-bounded/fortune.raw.ll
+latest summary IR: /tmp/notdec-fortune-range-bounded/fortune.ll
+```
+
+性能说明：上一版修 jump table overlap 后 fortune 是 11.55s，这次降到 10.13s。
+主要原因是少 decode 了 `.eh_frame` range 外的错误同函数 block。
+
+复杂度评估：
+
+- 实现效果：8/10。`.eh_frame` 等强范围 seed 不再越界扩张，`0x2820` 的 switch
+  仍然保留。
+- 理解成本：4/10。新增的是单一范围检查，位置在 seed 入队和 successor 写入。
+- 维护成本：4/10。无范围 seed 仍保留旧行为，后续需要单独处理 init-array /
+  relocation 这类入口的函数边界。

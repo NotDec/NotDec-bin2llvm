@@ -1529,12 +1529,17 @@ public:
         enqueueSeed(state, target, target, decodeQueue, queuedSeeds);
       }
       for (uint64_t target : result.BranchTargets) {
-        enqueueSeed(state, item.FunctionEntry, target, decodeQueue,
-                    queuedSeeds);
+        if (targetBelongsToFunctionRange(state, item.FunctionEntry, target)) {
+          enqueueSeed(state, item.FunctionEntry, target, decodeQueue,
+                      queuedSeeds);
+        }
       }
       if (result.FallthroughTarget) {
-        enqueueSeed(state, item.FunctionEntry, *result.FallthroughTarget,
-                    decodeQueue, queuedSeeds);
+        if (targetBelongsToFunctionRange(state, item.FunctionEntry,
+                                         *result.FallthroughTarget)) {
+          enqueueSeed(state, item.FunctionEntry, *result.FallthroughTarget,
+                      decodeQueue, queuedSeeds);
+        }
       }
       enqueueRecoveredJumpTableTargets(state, item.FunctionEntry, decodeQueue,
                                        queuedSeeds);
@@ -1692,7 +1697,9 @@ private:
         continue;
       }
       for (uint64_t target : targets) {
-        enqueueSeed(state, functionEntry, target, decodeQueue, queuedSeeds);
+        if (targetBelongsToFunctionRange(state, functionEntry, target)) {
+          enqueueSeed(state, functionEntry, target, decodeQueue, queuedSeeds);
+        }
       }
     }
   }
@@ -1932,6 +1939,7 @@ private:
           block.Successors.empty()) {
         addUniqueAddress(block.Successors, *fallthroughTarget);
       }
+      eraseOutOfRangeFunctionSuccessors(state, entry, block.Successors);
       eraseKnownOtherFunctionSuccessors(state, entry, block.Successors);
       for (uint64_t successor : block.Successors) {
         if (successor < rangeStart || successor >= rangeEnd) {
@@ -2312,6 +2320,19 @@ private:
   }
 
   static void
+  eraseOutOfRangeFunctionSuccessors(const NativeProgramState &state,
+                                    uint64_t entry,
+                                    std::vector<uint64_t> &successors) {
+    successors.erase(
+        std::remove_if(successors.begin(), successors.end(),
+                       [&](uint64_t successor) {
+                         return !targetBelongsToFunctionRange(state, entry,
+                                                              successor);
+                       }),
+        successors.end());
+  }
+
+  static void
   eraseKnownOtherFunctionSuccessors(NativeProgramState &state, uint64_t entry,
                                     std::vector<uint64_t> &successors) {
     successors.erase(
@@ -2346,6 +2367,21 @@ private:
       return range.Size - (address - range.Start);
     }
     return std::nullopt;
+  }
+
+  static bool targetBelongsToFunctionRange(const NativeProgramState &state,
+                                           uint64_t functionEntry,
+                                           uint64_t target) {
+    auto seedIterator = state.functionSeeds().find(functionEntry);
+    if (seedIterator == state.functionSeeds().end()) {
+      return true;
+    }
+
+    const NativeFunctionSeed &seed = seedIterator->second;
+    if (seed.RangeStart == 0 || seed.RangeEnd <= seed.RangeStart) {
+      return true;
+    }
+    return target >= seed.RangeStart && target < seed.RangeEnd;
   }
 
   static uint64_t boundedBytesForFunctionSeed(const NativeProgramState &state,
