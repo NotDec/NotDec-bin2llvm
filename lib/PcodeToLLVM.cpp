@@ -60,7 +60,7 @@ public:
     Registers = std::make_unique<RegisterStorage>(
         Context, Module, program.Registers, program.IsBigEndian);
 
-    if (program.Ops.empty()) {
+    if (program.Ops.empty() && !usesNativeCfg()) {
       return true;
     }
 
@@ -307,7 +307,7 @@ private:
           EmptyNativeBlockAddresses.push_back(blockAddress);
         }
       }
-      if (starts.empty()) {
+      if (starts.empty() && EmptyNativeBlockAddresses.empty()) {
         errorMessage = "native block ranges do not cover any p-code op";
         return false;
       }

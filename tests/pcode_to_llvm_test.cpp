@@ -429,6 +429,45 @@ bool testNativeEntryAddressCanTargetEmptyBlock() {
                 "module failed verifier after native empty entry lowering");
 }
 
+bool testAllEmptyNativeBlockCanLower() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_all_empty_block";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr, "all-empty native function is missing")) {
+    return false;
+  }
+
+  llvm::BasicBlock *nativeBlock = nullptr;
+  for (llvm::BasicBlock &block : *function) {
+    if (block.getName() == "bb_1000") {
+      nativeBlock = &block;
+      break;
+    }
+  }
+  if (!expect(nativeBlock != nullptr, "all-empty native block was not emitted")) {
+    return false;
+  }
+
+  return expect(llvm::isa<llvm::ReturnInst>(nativeBlock->getTerminator()),
+                "all-empty native block did not lower to ret") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after all-empty native block lowering");
+}
+
 bool testNativeSuccessorRequiresKnownBlock() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -759,6 +798,7 @@ int main() {
   ok &= testNativeDirectBranchOutsideRangesBecomesTailCall();
   ok &= testNativeDirectBranchCanTargetEmptyBlock();
   ok &= testNativeEntryAddressCanTargetEmptyBlock();
+  ok &= testAllEmptyNativeBlockCanLower();
   ok &= testNativeSuccessorRequiresKnownBlock();
   ok &= testNativeMultipleSuccessorsRequireTerminator();
   ok &= testNativeFallthroughRequiresSuccessorFacts();

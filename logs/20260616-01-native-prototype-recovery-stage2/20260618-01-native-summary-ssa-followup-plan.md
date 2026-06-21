@@ -2481,3 +2481,72 @@ latest summary IR: /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/
   增加基本块数量。
 - 理解成本：4/10。新增了一类 tail branch seed，但只在 decode facts 层内部使用。
 - 维护成本：4/10。规则刻意保守，后续如果遇到更多 thunk 形态，再扩展匹配条件。
+
+## 已完成：全空 native block 也按 block facts lowering
+
+继续检查 native lowering 对 block facts 的依赖时，发现还有一个旧兜底：
+
+- `PcodeLowerer::lower(...)` 遇到 `program.Ops.empty()` 直接返回。
+- `buildBasicBlocks(...)` 在 native mode 下要求至少有一个 p-code op 被 block range
+  覆盖。
+- `notdec-native-llvm` 遇到 empty p-code 会跳过 confirmed function。
+
+这和当前方向不一致。native 前端已经有明确的 `NativeBasicBlock` facts，即使某个
+block 没有 SLEIGH p-code，也应该能生成对应 LLVM block，并按 `BlockSuccessors`
+决定是跳转还是 `ret void`。之前只支持“部分 block 没有 p-code”，这次补上
+“整个函数都没有 p-code”的情况。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:63)
+  - `PcodeLowerer::lower(...)` 只在非 native CFG 模式下对空 p-code 直接返回。
+    native CFG 模式继续进入 `buildBasicBlocks(...)`，让 block facts 驱动 lowering。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:310)
+  - `buildBasicBlocks(...)` 允许 `starts` 为空，只要已经收集到
+    `EmptyNativeBlockAddresses`。
+- [notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:750)
+  - `--all-confirmed` 模式下，只有 confirmed function 没有 blocks 时才因为 empty
+    p-code 跳过。
+- [notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:1009)
+  - 单函数 lowering 下，只有没有 native block ranges 时才把 empty p-code 当失败。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:432)
+  - 增加 `testAllEmptyNativeBlockCanLower()`，验证没有任何 p-code op 时，native
+    block facts 仍能生成 `bb_1000` 并通过 LLVM verifier。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --no-register-ssa-pass --no-instcombine-pass --summary-json-out /tmp/notdec-fortune-all-empty-native-block/raw-summary.json -o /tmp/notdec-fortune-all-empty-native-block/fortune.raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-all-empty-native-block/fortune.raw.ll -o /tmp/notdec-fortune-all-empty-native-block/fortune.raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-all-empty-native-block/fortune.raw.bc -o /tmp/notdec-fortune-all-empty-native-block/fortune.raw.verified.bc
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-all-empty-native-block/summary.json -o /tmp/notdec-fortune-all-empty-native-block/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-all-empty-native-block/fortune.ll -o /tmp/notdec-fortune-all-empty-native-block/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-all-empty-native-block/fortune.bc -o /tmp/notdec-fortune-all-empty-native-block/fortune.verified.bc
+```
+
+fortune 结果：
+
+```text
+function_seeds: 26
+confirmed_functions: 26
+basic_blocks: 1013
+instructions: 2602
+xrefs total: 868
+unresolved_indirect_flows: 0
+native pipeline: 10.06s
+```
+
+当前 fortune 没有触发全空函数行为，所以 facts 数量不变。这个改动主要是去掉一个
+lowering 层对 p-code 是否存在的硬依赖。
+
+复杂度评估：
+
+- 实现效果：6/10。补齐了 native block facts 驱动 lowering 的一个边界情况。
+- 理解成本：2/10。沿用已有 empty native block 机制，没有引入新 CFG 规则。
+- 维护成本：2/10。逻辑更一致，后续遇到无 p-code 的真实 block 不会被跳过。

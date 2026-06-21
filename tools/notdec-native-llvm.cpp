@@ -747,7 +747,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
 
     auto program = notdec::bin2llvm::collectSleighPcodeRanges(
         loadImage, specOptions, blockRanges(function), std::cerr);
-    if (program.Ops.empty()) {
+    if (program.Ops.empty() && function.Blocks.empty()) {
       std::cerr << "skip native function 0x" << std::hex << function.Entry
                 << std::dec << ": empty p-code\n";
       continue;
@@ -1006,7 +1006,7 @@ int main(int argc, char **argv) {
             loadImage, options->SpecOptions, options->Address, options->Length,
             std::cerr);
       }
-      if (program.Ops.empty()) {
+      if (program.Ops.empty() && options->FunctionBlockRanges.empty()) {
         return 1;
       }
 
