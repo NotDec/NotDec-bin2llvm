@@ -3,6 +3,7 @@
 #include <LIEF/ELF/Binary.hpp>
 #include <LIEF/ELF/Parser.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -462,6 +463,81 @@ bool testFlowNormalizerSplitsDirectTargetInsideBlock(const char *argv0) {
   return ok;
 }
 
+bool testFlowNormalizerSplitsFallthroughInsideBlock(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base + 0x130;
+  uint64_t fallthrough = entry + 0x02;
+  uint64_t taken = entry + 0x10;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = entry + 0x30;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, fallthrough + 0x02, {taken}});
+  function.Blocks.push_back({taken, taken + 0x02, {}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add test function with mid-block fallthrough\n";
+    return false;
+  }
+
+  auto branch = makeInstruction(
+      entry, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::ConditionalBranch);
+  branch.DirectFlowTargets.push_back(taken);
+  branch.Fallthrough = fallthrough;
+  state.addInstruction(std::move(branch));
+  state.addInstruction(makeInstruction(
+      fallthrough, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::Return));
+  state.addInstruction(makeInstruction(
+      taken, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::Return));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeFunction *normalized = state.functionAt(entry);
+  bool sawSourceBlock = false;
+  bool sawFallthroughBlock = false;
+  if (normalized != nullptr) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block :
+         normalized->Blocks) {
+      if (block.Start == entry && block.End == fallthrough &&
+          block.Successors.size() == 2) {
+        bool hasTaken =
+            std::find(block.Successors.begin(), block.Successors.end(),
+                      taken) != block.Successors.end();
+        bool hasFallthrough =
+            std::find(block.Successors.begin(), block.Successors.end(),
+                      fallthrough) != block.Successors.end();
+        sawSourceBlock = hasTaken && hasFallthrough;
+      }
+      if (block.Start == fallthrough &&
+          block.End == fallthrough + 0x02) {
+        sawFallthroughBlock = true;
+      }
+    }
+  }
+
+  bool ok = true;
+  ok &= expectTrue(sawSourceBlock,
+                   "source block did not keep taken and fallthrough edges");
+  ok &= expectTrue(sawFallthroughBlock,
+                   "fallthrough target block was not created");
+  return ok;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -476,5 +552,6 @@ int main(int argc, char **argv) {
   ok &= testBasicBlockSuccessorsRequireBlockStarts(argv[0]);
   ok &= testFlowNormalizerRemovesInvalidBlockSuccessors(argv[0]);
   ok &= testFlowNormalizerSplitsDirectTargetInsideBlock(argv[0]);
+  ok &= testFlowNormalizerSplitsFallthroughInsideBlock(argv[0]);
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -2812,7 +2812,7 @@ public:
     }
     std::vector<std::pair<uint64_t, NativeBasicBlock>> splitBlocks;
     for (const auto &[entry, function] : state.functions()) {
-      appendDirectTargetSplitBlocks(state, function, splitBlocks);
+      appendFlowBoundarySplitBlocks(state, function, splitBlocks);
     }
     for (auto &[entry, block] : splitBlocks) {
       state.addBasicBlock(entry, std::move(block));
@@ -2867,27 +2867,38 @@ private:
     }
   }
 
-  static void appendDirectTargetSplitBlocks(
+  static void appendFlowBoundarySplitBlocks(
       const NativeProgramState &state, const NativeFunction &function,
       std::vector<std::pair<uint64_t, NativeBasicBlock>> &result) {
     for (const NativeInstruction *instruction :
          state.instructionsInRange(function.RangeStart, function.RangeEnd)) {
       for (uint64_t target : instruction->DirectFlowTargets) {
-        if (functionHasBlockStartingAt(function, target)) {
-          continue;
-        }
-        const NativeBasicBlock *containing =
-            functionBlockContaining(function, target);
-        if (containing == nullptr || target == containing->Start) {
-          continue;
-        }
-        NativeBasicBlock block;
-        block.Start = target;
-        block.End = containing->End;
-        block.Successors = containing->Successors;
-        result.push_back({function.Entry, std::move(block)});
+        appendSplitBlockAt(function, target, result);
+      }
+      if (instruction->FlowKind == NativeInstructionFlowKind::ConditionalBranch &&
+          instruction->Fallthrough &&
+          isInstructionFallthroughTo(*instruction, *instruction->Fallthrough)) {
+        appendSplitBlockAt(function, *instruction->Fallthrough, result);
       }
     }
+  }
+
+  static void appendSplitBlockAt(
+      const NativeFunction &function, uint64_t address,
+      std::vector<std::pair<uint64_t, NativeBasicBlock>> &result) {
+    if (functionHasBlockStartingAt(function, address)) {
+      return;
+    }
+    const NativeBasicBlock *containing =
+        functionBlockContaining(function, address);
+    if (containing == nullptr || address == containing->Start) {
+      return;
+    }
+    NativeBasicBlock block;
+    block.Start = address;
+    block.End = containing->End;
+    block.Successors = containing->Successors;
+    result.push_back({function.Entry, std::move(block)});
   }
 
   static void normalizeBlockSuccessors(NativeProgramState &state,
@@ -2913,6 +2924,10 @@ private:
     for (uint64_t target : terminator->DirectFlowTargets) {
       if (std::find(block.Successors.begin(), block.Successors.end(),
                     target) != block.Successors.end()) {
+        continue;
+      }
+      if (functionHasBlockStartingAt(function, target)) {
+        state.addBasicBlockSuccessors(function.Entry, block.Start, {target});
         continue;
       }
       state.markInstructionTailFlowTarget(terminator->Address, target);

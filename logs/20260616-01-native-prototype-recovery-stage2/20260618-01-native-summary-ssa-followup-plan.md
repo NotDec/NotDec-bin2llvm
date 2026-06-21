@@ -3772,3 +3772,60 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：7/10。把 direct branch target 对 block 边界的影响放回 facts 层，避免误归类为 tail。
 - 理解成本：3/10。多了一个 split 阶段，但它直接对应 CFG 基本块切分规则。
 - 维护成本：3/10。后续如果支持更多 computed target recovery，也应先补 block，再写 successor。
+
+## 实现记录：conditional fallthrough 落在 block 中间时先 split
+
+背景：
+
+- direct target 已经会触发 block split，但条件分支的 fallthrough 也同样是基本块边界。
+- 如果原始 block 覆盖了条件分支和 fallthrough 指令，lowering 会在同一个 LLVM block 里生成条件跳转后继续放后续指令。
+- 正确处理是 facts 层先把 fallthrough 地址切成独立 block，再让 successor normalize 补齐 taken/fallthrough 两条边。
+
+实现：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2813)
+  `FlowFactNormalizer` 把 direct-target split 扩展为 flow-boundary split。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2870)
+  `appendFlowBoundarySplitBlocks(...)` 现在同时处理：
+  - `DirectFlowTargets` 落在已有 block 中间。
+  - `ConditionalBranch` 的真实 fallthrough 落在已有 block 中间。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2904)
+  `normalizeBlockSuccessors(...)` 在 direct target 已经是当前函数 block start 时，把它补回 CFG successor；
+  否则才标成 tail target。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:466)
+  增加 `testFlowNormalizerSplitsFallthroughInsideBlock()`，覆盖条件分支 fallthrough 落在原 block 中间时：
+  source block 被切短，并保留 taken/fallthrough 两条 successor。
+
+验证：
+
+```text
+cmake --build build --target native_analysis_facts_test -j$(nproc)
+build/bin/native_analysis_facts_test
+cmake --build build --target pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-split-flow-boundaries/summary.json \
+  -o /tmp/notdec-fortune-split-flow-boundaries/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-split-flow-boundaries/fortune.ll \
+  -o /tmp/notdec-fortune-split-flow-boundaries/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-split-flow-boundaries/fortune.bc \
+  -o /tmp/notdec-fortune-split-flow-boundaries/fortune.verify.bc
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.47 sec`。
+- `!notdec.register.access` 数量为 0。
+- register global store 数量为 0。
+- register global load 数量为 6，仍是 `summary_ssa.entry` load。
+- `br i1 poison`、`ret ... poison`、`store ... ptr poison` 数量为 0。
+
+评分：
+
+- 实现效果：7/10。把条件分支 fallthrough 也纳入基本块边界，减少 lowering 看到不合法 block 的机会。
+- 理解成本：3/10。逻辑仍集中在 FlowFactNormalizer，只是 split 触发条件更完整。
+- 维护成本：3/10。后续更多 flow fact 也应先在 facts 层形成稳定 block 边界。
