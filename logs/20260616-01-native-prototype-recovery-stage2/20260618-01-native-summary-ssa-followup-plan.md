@@ -4510,3 +4510,64 @@ python3 scripts/bench2-native-discovery-debug-check.py --build-dir build --targe
 - 实现效果：7/10。补掉一类真实结构体字段 switch / jump table。
 - 理解成本：3/10。多了两个字符串 parser，但仍只在上界识别里使用。
 - 维护成本：2/10。没有做 memory alias 推断，后续扩展空间明确。
+
+## 实现记录：补 stack spill compare 的 jump table 上界识别
+
+`lighttpd` 的 `configparser` 里 `0x19eb7` 是另一种真实 switch：
+
+```text
+LEA EAX,[RDX + -0x79]
+MOV dword ptr [RBP + -0x128],EAX
+...
+CMP dword ptr [RBP + -0x128],0x2c
+JA 0x1acd1
+LEA RDX,[0x4b9bc]
+MOVSXD RAX,dword ptr [RDX + RAX*0x4]
+ADD RAX,RDX
+JMP RAX
+```
+
+这里上界比较用的是之前 spill 出去的栈槽，而实际 dispatch 仍然用 live 的
+`RAX`。上一版只支持 `MOV REG,<memory>` 后比较同一个 memory operand；这次补
+`MOV <memory>,REG`，把“索引寄存器被保存到某个内存槽”也纳入 exact memory
+operand compare。
+
+本次改动：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1831)
+  - 新增 `parseX86MovMemoryReg()`，识别 `MOV <memory>,REG`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1912)
+  - `findNearestUpperBound()` 在扫描 compare 候选时，如果发现 index register
+    被 store 到内存槽，就把这个槽加入 `CMP <memory>,imm` 的候选集合。
+
+验证：
+
+```text
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-spill-jt/fortune.ll --summary-json-out /tmp/notdec-fortune-spill-jt/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-spill-jt/fortune.ll -o /tmp/notdec-fortune-spill-jt/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-spill-jt/fortune.bc -o /tmp/notdec-fortune-spill-jt/fortune.verify.bc
+python3 scripts/bench2-native-discovery-debug-check.py --build-dir build --target memcached:executable --target redis:cli --target lighttpd:executable --target wrk:executable --target fortune:executable
+```
+
+结果：
+
+- `lighttpd` indirect branch 从 `8` 降到 `7`，`0x19eb7` 不再 unresolved。
+- `lighttpd` 总 unresolved 从 `102` 变成 `113`，原因是该跳表目标被 decode 后，
+  新暴露出更多 indirect call。剩余 7 个 indirect branch 都是动态 tail jump /
+  callback dispatch，暂不伪造目标。
+- `memcached` 仍剩 `2` 个 indirect branch，`redis-cli` 仍剩 `3` 个，`wrk` 没有
+  indirect branch。
+- `fortune` 完整链路通过 `llvm-as` 和 `opt -passes=verify`，耗时 `10.49 sec`。
+- `memcached`、`redis:cli`、`lighttpd`、`wrk`、`fortune` 的 debug function
+  confirmed coverage 都是 `1.0000`。
+- 实现效果：7/10。补掉一类真实 parser switch / jump table。
+- 理解成本：2/10。只多一个方向相反的 `MOV` parser。
+- 维护成本：2/10。仍然只做 exact operand，不做 alias 推断。

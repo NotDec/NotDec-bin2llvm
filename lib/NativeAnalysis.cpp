@@ -1828,6 +1828,27 @@ parseX86MovRegMemory(const std::string &text) {
   return std::make_pair(std::move(dest), std::move(memory));
 }
 
+std::optional<std::pair<std::string, std::string>>
+parseX86MovMemoryReg(const std::string &text) {
+  const std::string prefix = "MOV ";
+  if (text.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  size_t comma = text.find(',', prefix.size());
+  if (comma == std::string::npos || comma + 1 >= text.size()) {
+    return std::nullopt;
+  }
+  std::string memory = trimAsciiWhitespace(
+      text.substr(prefix.size(), comma - prefix.size()));
+  std::string src = trimAsciiWhitespace(text.substr(comma + 1));
+  if (memory.find(" ptr [") == std::string::npos || src.empty() ||
+      src.find('[') != std::string::npos ||
+      src.find(' ') != std::string::npos) {
+    return std::nullopt;
+  }
+  return std::make_pair(std::move(memory), std::move(src));
+}
+
 std::optional<std::pair<std::string, uint64_t>>
 parseX86MemoryImmediate(const std::string &text, const std::string &mnemonic) {
   const std::string prefix = mnemonic + " ";
@@ -1887,6 +1908,15 @@ findNearestUpperBound(const NativeProgramState &state,
         std::find(compareRegs.begin(), compareRegs.end(),
                   memoryLoad->first) != compareRegs.end()) {
       addUniqueString(compareMemoryOperands, memoryLoad->second);
+    }
+    // Some optimized parsers spill the switch index to a stack slot and later
+    // compare that slot before reusing the live index register for dispatch.
+    std::optional<std::pair<std::string, std::string>> memoryStore =
+        parseX86MovMemoryReg(text);
+    if (memoryStore &&
+        std::find(compareRegs.begin(), compareRegs.end(),
+                  memoryStore->second) != compareRegs.end()) {
+      addUniqueString(compareMemoryOperands, memoryStore->first);
     }
   }
 
