@@ -2676,3 +2676,68 @@ native pipeline: 10.20s
   facts 中。
 - 理解成本：2/10。只是把后置恢复出的 targets 回填到已有字段。
 - 维护成本：2/10。后续其他后置 flow analyzer 也可以复用同一个 helper。
+
+## 已完成：direct tail branch 写入 instruction facts
+
+继续检查 native decode 到 lowering 的边界时，发现 direct branch 到 PLT 时只生成了
+flow xref，没有写入 `DecodedFlowInfo::BranchTargets`。lowering 还能靠
+`ExternalCallTargets` 生成 tail call，但 instruction facts 自己不完整。
+
+这次保持 block CFG 的语义不变：block successor 仍只保留函数内边；跳到 PLT 或已知其他
+函数入口的无条件 direct branch 只标到 instruction 的 `tail_flow_targets`。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1823)
+  - `SleighSeedInstructionAnalyzer::isTailBranchTarget(...)` 增加两类 tail
+    目标：PLT external target、已知其他函数入口。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2097)
+  - `collectDirectControlFlow(...)` 遇到 direct branch 到 PLT 时，也把 target 写入
+    `DecodedFlowInfo::BranchTargets`，后续再由 `collectTailBranchTargets(...)`
+    挪到 `TailFlowTargets`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2412)
+  - `isKnownOtherFunctionEntry(...)` 改为接收 const state；函数本身不修改 state。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-tail-facts/summary.json -o /tmp/notdec-fortune-tail-facts/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-tail-facts/fortune.ll -o /tmp/notdec-fortune-tail-facts/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-tail-facts/fortune.bc -o /tmp/notdec-fortune-tail-facts/fortune.verified.bc
+```
+
+fortune 结果：
+
+```text
+function_seeds: 26
+confirmed_functions: 26
+basic_blocks: 1013
+instructions: 2602
+xrefs total: 868
+unresolved_indirect_flows: 0
+native pipeline: 10.11s
+```
+
+抽查：
+
+```text
+0x32d4: JMP 0x3250
+  direct_flow_targets: []
+  tail_flow_targets: ["0x3250"]
+
+0x5258: JMP 0x280c
+  direct_flow_targets: []
+  tail_flow_targets: ["0x280c"]
+```
+
+复杂度评估：
+
+- 实现效果：6/10。tail branch 的 instruction facts 更完整，但 lowering 仍通过
+  `PcodeLoweringConfig` 消费这些事实。
+- 理解成本：2/10。规则和现有 dynamic array thunk tail branch 复用同一字段。
+- 维护成本：2/10。后续如果更多 tail 形态被识别，也只需要扩展同一个判断。

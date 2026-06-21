@@ -1820,6 +1820,12 @@ private:
     if (instruction.FlowKind != NativeInstructionFlowKind::UnconditionalBranch) {
       return false;
     }
+    if (state.lookupPltExternal(target)) {
+      return true;
+    }
+    if (isKnownOtherFunctionEntry(state, functionEntry, target)) {
+      return true;
+    }
     if (!isDynamicArrayThunkSeed(state, functionEntry)) {
       return false;
     }
@@ -2088,6 +2094,7 @@ private:
             addPendingXref(result.Xrefs, seenXrefs, op.Address, *target,
                            NativeXrefKind::Flow,
                            "sleigh-pcode-plt-tail-branch");
+            addUniqueAddress(info.BranchTargets, *target);
             continue;
           }
           addPendingXref(result.Xrefs, seenXrefs, op.Address, *target,
@@ -2402,7 +2409,7 @@ private:
         successors.end());
   }
 
-  static bool isKnownOtherFunctionEntry(NativeProgramState &state,
+  static bool isKnownOtherFunctionEntry(const NativeProgramState &state,
                                         uint64_t entry, uint64_t address) {
     if (address == entry) {
       return false;
