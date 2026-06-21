@@ -2550,3 +2550,62 @@ lowering 层对 p-code 是否存在的硬依赖。
 - 实现效果：6/10。补齐了 native block facts 驱动 lowering 的一个边界情况。
 - 理解成本：2/10。沿用已有 empty native block 机制，没有引入新 CFG 规则。
 - 维护成本：2/10。逻辑更一致，后续遇到无 p-code 的真实 block 不会被跳过。
+
+## 已完成：tail branch 指令 fact 也单独保留
+
+上一轮把 `.init_array` thunk 的 `JMP 0x3250` 从当前函数 CFG successor 里切掉了，
+这样 block facts 是对的，但 `--instructions-json` 里这条指令会显得像“没有目标”。
+这会让 instruction facts 不完整。
+
+这次只补一个很小的事实字段：
+
+- `NativeInstruction` 新增 `TailFlowTargets`。
+- 当 direct branch 被判成 tail branch 时，目标地址同时保留在
+  `tail_flow_targets`，但不再进入 `direct_flow_targets`。
+- block 构建仍然只看 `direct_flow_targets`，所以 CFG 不受影响。
+- `notdec-native-discover --instructions-*` 现在能直接看出这条机器指令的真实 tail
+  target。
+
+具体改动：
+
+- [NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:205)
+  - `NativeInstruction` 增加 `TailFlowTargets`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1802)
+  - `collectTailBranchTargets(...)` 在切出 tail branch 的同时，把目标写入
+    `instruction.TailFlowTargets`。
+- [notdec-native-discover.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-discover.cpp:1220)
+  - instruction JSON 输出新增 `tail_flow_targets`。
+
+验证：
+
+```text
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-discover --instructions-function-json 0x32d0 /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --no-register-ssa-pass --no-instcombine-pass --summary-json-out /tmp/notdec-fortune-tail-flow-facts/raw-summary.json -o /tmp/notdec-fortune-tail-flow-facts/fortune.raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-tail-flow-facts/fortune.raw.ll -o /tmp/notdec-fortune-tail-flow-facts/fortune.raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-tail-flow-facts/fortune.raw.bc -o /tmp/notdec-fortune-tail-flow-facts/fortune.raw.verified.bc
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-tail-flow-facts/summary.json -o /tmp/notdec-fortune-tail-flow-facts/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-tail-flow-facts/fortune.ll -o /tmp/notdec-fortune-tail-flow-facts/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-tail-flow-facts/fortune.bc -o /tmp/notdec-fortune-tail-flow-facts/fortune.verified.bc
+```
+
+fortune 的 instruction facts 现在是：
+
+```text
+0x32d4:
+  flow_kind: unconditional branch
+  direct_flow_targets: []
+  tail_flow_targets: ["0x3250"]
+```
+
+而 summary / verifier 都仍然通过，fortune 运行时间仍在 10 秒左右。
+
+复杂度评估：
+
+- 实现效果：6/10。保持 CFG 语义不变，同时把 instruction facts 补完整。
+- 理解成本：2/10。字段名直接，和 CFG successor 分开。
+- 维护成本：2/10。后续碰到更多 tail thunk 形态时，还是同一套字段。

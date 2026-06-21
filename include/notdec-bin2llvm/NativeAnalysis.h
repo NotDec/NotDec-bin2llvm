@@ -205,6 +205,10 @@ struct NativeInstruction {
   NativeInstructionFlowKind FlowKind = NativeInstructionFlowKind::None;
   std::vector<uint64_t> DirectFlowTargets;
   std::vector<uint64_t> DirectCallTargets;
+  // Direct branch targets that are real machine targets but are not current
+  // function CFG successors, for example init-array thunks jumping into another
+  // function body.
+  std::vector<uint64_t> TailFlowTargets;
   std::optional<uint64_t> Fallthrough;
   bool HasIndirectCall = false;
 

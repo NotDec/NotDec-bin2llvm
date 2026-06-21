@@ -1804,6 +1804,7 @@ private:
       for (uint64_t target : instruction.DirectFlowTargets) {
         if (isTailBranchTarget(state, functionEntry, instruction, target)) {
           addUniqueAddress(tailBranchTargets, target);
+          addUniqueAddress(instruction.TailFlowTargets, target);
           continue;
         }
         addUniqueAddress(localTargets, target);

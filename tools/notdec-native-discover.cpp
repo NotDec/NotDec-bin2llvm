@@ -1223,6 +1223,9 @@ void printInstructionObject(
   output << indent << "  \"direct_call_targets\": ";
   printAddressArray(output, instruction.DirectCallTargets);
   output << ",\n";
+  output << indent << "  \"tail_flow_targets\": ";
+  printAddressArray(output, instruction.TailFlowTargets);
+  output << ",\n";
   output << indent << "  \"fallthrough\": ";
   if (instruction.Fallthrough) {
     output << "\"" << hexString(*instruction.Fallthrough) << "\"";
