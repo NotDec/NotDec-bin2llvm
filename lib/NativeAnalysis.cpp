@@ -1370,6 +1370,7 @@ private:
   struct DecodedFlowInfo {
     std::vector<uint64_t> BranchTargets;
     std::vector<uint64_t> CallTargets;
+    std::vector<uint64_t> InternalCallTargets;
     bool HasConditionalBranch = false;
     bool HasUnconditionalBranch = false;
     bool HasIndirectBranch = false;
@@ -1379,7 +1380,8 @@ private:
 
   struct DirectControlFlowResult {
     std::map<uint64_t, DecodedFlowInfo> FlowInfos;
-    std::vector<uint64_t> CallTargets;
+    std::vector<NativeXref> Xrefs;
+    std::vector<NativeUnresolvedFlow> UnresolvedFlows;
   };
 
   // A seed decode is intentionally small. If the window ends without a real
@@ -1514,14 +1516,11 @@ private:
       (void)readBytes(state, summary.Address, summary.Size, instruction.Bytes);
       decodedInstructions.push_back(std::move(instruction));
     }
+    DirectControlFlowResult flowResult;
     std::map<uint64_t, DecodedFlowInfo> flowInfos;
     if (rangeStart == address && rangeStart < rangeEnd) {
-      DirectControlFlowResult flowResult =
-          addDirectControlFlow(state, decode.Pcode);
-      flowInfos = std::move(flowResult.FlowInfos);
-      for (uint64_t target : flowResult.CallTargets) {
-        addUniqueAddress(result.CallTargets, target);
-      }
+      flowResult = collectDirectControlFlow(state, decode.Pcode);
+      flowInfos = flowResult.FlowInfos;
     }
     annotateDecodedInstructionFlows(decodedInstructions, flowInfos);
     // A seed is decoded linearly, but only locally reachable instructions should
@@ -1536,6 +1535,16 @@ private:
         decodedInstructions.end());
     if (decodedInstructions.empty()) {
       return result;
+    }
+    for (uint64_t target : reachableCallTargets(flowResult, reachableStarts)) {
+      addUniqueAddress(result.CallTargets, target);
+    }
+    for (const NativeXref &xref : reachableXrefs(flowResult, reachableStarts)) {
+      state.addXref(xref);
+    }
+    for (const NativeUnresolvedFlow &flow :
+         reachableUnresolvedFlows(flowResult, reachableStarts)) {
+      state.addUnresolvedFlow(flow);
     }
     rangeStart = decodedInstructions.front().Address;
     rangeEnd =
@@ -1583,6 +1592,45 @@ private:
       }
     }
     return reachable;
+  }
+
+  static std::vector<uint64_t>
+  reachableCallTargets(const DirectControlFlowResult &flowResult,
+                       const std::set<uint64_t> &reachableStarts) {
+    std::vector<uint64_t> targets;
+    for (const auto &[address, info] : flowResult.FlowInfos) {
+      if (reachableStarts.count(address) == 0) {
+        continue;
+      }
+      for (uint64_t target : info.InternalCallTargets) {
+        addUniqueAddress(targets, target);
+      }
+    }
+    return targets;
+  }
+
+  static std::vector<NativeXref>
+  reachableXrefs(const DirectControlFlowResult &flowResult,
+                 const std::set<uint64_t> &reachableStarts) {
+    std::vector<NativeXref> xrefs;
+    for (const NativeXref &xref : flowResult.Xrefs) {
+      if (reachableStarts.count(xref.From) != 0) {
+        xrefs.push_back(xref);
+      }
+    }
+    return xrefs;
+  }
+
+  static std::vector<NativeUnresolvedFlow>
+  reachableUnresolvedFlows(const DirectControlFlowResult &flowResult,
+                           const std::set<uint64_t> &reachableStarts) {
+    std::vector<NativeUnresolvedFlow> flows;
+    for (const NativeUnresolvedFlow &flow : flowResult.UnresolvedFlows) {
+      if (reachableStarts.count(flow.Address) != 0) {
+        flows.push_back(flow);
+      }
+    }
+    return flows;
   }
 
   static void annotateDecodedInstructionFlows(
@@ -1697,7 +1745,8 @@ private:
   }
 
   static DirectControlFlowResult
-  addDirectControlFlow(NativeProgramState &state, const PcodeProgram &program) {
+  collectDirectControlFlow(NativeProgramState &state,
+                           const PcodeProgram &program) {
     DirectControlFlowResult result;
     std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> seenXrefs;
     // This is intentionally local to one decoded P-Code range.  It only keeps
@@ -1714,23 +1763,23 @@ private:
         if (target && state.isExecutableAddress(*target)) {
           DecodedFlowInfo &info = result.FlowInfos[op.Address];
           if (state.lookupPltExternal(*target)) {
-            addUniqueXref(state, seenXrefs, op.Address, *target,
-                          NativeXrefKind::Call, "sleigh-pcode-plt-call");
+            addPendingXref(result.Xrefs, seenXrefs, op.Address, *target,
+                           NativeXrefKind::Call, "sleigh-pcode-plt-call");
             addUniqueAddress(info.CallTargets, *target);
             continue;
           }
-          addUniqueXref(state, seenXrefs, op.Address, *target,
-                        NativeXrefKind::Call, "sleigh-pcode-direct-flow");
+          addPendingXref(result.Xrefs, seenXrefs, op.Address, *target,
+                         NativeXrefKind::Call, "sleigh-pcode-direct-flow");
           addUniqueAddress(info.CallTargets, *target);
-          addUniqueAddress(result.CallTargets, *target);
+          addUniqueAddress(info.InternalCallTargets, *target);
         }
       } else if (op.Opcode == PcodeOpcode::CallInd) {
         result.FlowInfos[op.Address].HasIndirectCall = true;
         if (auto gotAddress = callIndGotSource(sourceRamByVarnode, op)) {
           if (isExternalGlobDatSymbolAt(state, *gotAddress)) {
-            addUniqueXref(state, seenXrefs, op.Address, *gotAddress,
-                          NativeXrefKind::Call,
-                          "sleigh-pcode-got-indirect-call");
+            addPendingXref(result.Xrefs, seenXrefs, op.Address, *gotAddress,
+                           NativeXrefKind::Call,
+                           "sleigh-pcode-got-indirect-call");
             continue;
           }
         }
@@ -1739,7 +1788,7 @@ private:
         flow.Address = op.Address;
         flow.Kind = NativeUnresolvedFlowKind::IndirectCall;
         flow.Source = "sleigh-pcode-indirect-flow";
-        state.addUnresolvedFlow(std::move(flow));
+        result.UnresolvedFlows.push_back(std::move(flow));
       } else if (op.Opcode == PcodeOpcode::Branch ||
                  op.Opcode == PcodeOpcode::CBranch) {
         DecodedFlowInfo &info = result.FlowInfos[op.Address];
@@ -1750,28 +1799,28 @@ private:
         }
         if (target && state.isExecutableAddress(*target)) {
           if (state.lookupPltExternal(*target)) {
-            addUniqueXref(state, seenXrefs, op.Address, *target,
-                          NativeXrefKind::Flow,
-                          "sleigh-pcode-plt-tail-branch");
+            addPendingXref(result.Xrefs, seenXrefs, op.Address, *target,
+                           NativeXrefKind::Flow,
+                           "sleigh-pcode-plt-tail-branch");
             continue;
           }
-          addUniqueXref(state, seenXrefs, op.Address, *target,
-                        NativeXrefKind::Flow, "sleigh-pcode-direct-flow");
+          addPendingXref(result.Xrefs, seenXrefs, op.Address, *target,
+                         NativeXrefKind::Flow, "sleigh-pcode-direct-flow");
           addUniqueAddress(info.BranchTargets, *target);
         }
       } else if (op.Opcode == PcodeOpcode::BranchInd) {
         result.FlowInfos[op.Address].HasIndirectBranch = true;
         if (auto gotAddress = branchIndGotTarget(op)) {
           if (isPltGotSlot(state, *gotAddress)) {
-            addUniqueXref(state, seenXrefs, op.Address, *gotAddress,
-                          NativeXrefKind::Flow,
-                          "sleigh-pcode-plt-indirect-branch");
+            addPendingXref(result.Xrefs, seenXrefs, op.Address, *gotAddress,
+                           NativeXrefKind::Flow,
+                           "sleigh-pcode-plt-indirect-branch");
             continue;
           }
           if (isPlt0ResolverSlot(state, op.Address, *gotAddress)) {
-            addUniqueXref(state, seenXrefs, op.Address, *gotAddress,
-                          NativeXrefKind::Flow,
-                          "sleigh-pcode-plt0-resolver-branch");
+            addPendingXref(result.Xrefs, seenXrefs, op.Address, *gotAddress,
+                           NativeXrefKind::Flow,
+                           "sleigh-pcode-plt0-resolver-branch");
             continue;
           }
         }
@@ -1779,9 +1828,9 @@ private:
         // BRANCHIND. Only accept slots proven by relocation as external GLOB_DAT.
         if (auto gotAddress = branchIndGotSource(sourceRamByVarnode, op)) {
           if (isExternalGlobDatSymbolAt(state, *gotAddress)) {
-            addUniqueXref(state, seenXrefs, op.Address, *gotAddress,
-                          NativeXrefKind::Flow,
-                          "sleigh-pcode-got-indirect-branch");
+            addPendingXref(result.Xrefs, seenXrefs, op.Address, *gotAddress,
+                           NativeXrefKind::Flow,
+                           "sleigh-pcode-got-indirect-branch");
             continue;
           }
         }
@@ -1790,11 +1839,11 @@ private:
         flow.Address = op.Address;
         flow.Kind = NativeUnresolvedFlowKind::IndirectBranch;
         flow.Source = "sleigh-pcode-indirect-flow";
-        state.addUnresolvedFlow(std::move(flow));
+        result.UnresolvedFlows.push_back(std::move(flow));
       } else if (op.Opcode == PcodeOpcode::Return) {
         result.FlowInfos[op.Address].HasReturn = true;
       } else {
-        addDirectDataXrefs(state, seenXrefs, op);
+        addPendingDirectDataXrefs(state, result.Xrefs, seenXrefs, op);
       }
     }
     return result;
@@ -1907,20 +1956,20 @@ private:
     return branchAddress == plt->Address + 6 && gotAddress == got->Address + 16;
   }
 
-  static void addDirectDataXrefs(
-      NativeProgramState &state,
+  static void addPendingDirectDataXrefs(
+      NativeProgramState &state, std::vector<NativeXref> &xrefs,
       std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> &seenXrefs,
       const PcodeOpView &op) {
     if (op.Output) {
-      addDirectDataXref(state, seenXrefs, op.Address, *op.Output);
+      addPendingDirectDataXref(state, xrefs, seenXrefs, op.Address, *op.Output);
     }
     for (const VarnodeView &input : op.Inputs) {
-      addDirectDataXref(state, seenXrefs, op.Address, input);
+      addPendingDirectDataXref(state, xrefs, seenXrefs, op.Address, input);
     }
   }
 
-  static void addDirectDataXref(
-      NativeProgramState &state,
+  static void addPendingDirectDataXref(
+      NativeProgramState &state, std::vector<NativeXref> &xrefs,
       std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> &seenXrefs,
       uint64_t from, const VarnodeView &varnode) {
     if (varnode.Space != "ram" || state.isExecutableAddress(varnode.Offset)) {
@@ -1932,7 +1981,7 @@ private:
     const char *source = kind == NativeXrefKind::String
                              ? "sleigh-pcode-direct-string"
                              : "sleigh-pcode-direct-data";
-    addUniqueXref(state, seenXrefs, from, varnode.Offset, kind, source);
+    addPendingXref(xrefs, seenXrefs, from, varnode.Offset, kind, source);
   }
 
   static std::optional<uint64_t> directRamTarget(const PcodeOpView &op) {
@@ -1950,8 +1999,8 @@ private:
     return target.Offset;
   }
 
-  static void addUniqueXref(
-      NativeProgramState &state,
+  static void addPendingXref(
+      std::vector<NativeXref> &xrefs,
       std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> &seenXrefs,
       uint64_t from, uint64_t to, NativeXrefKind kind, const char *source) {
     if (!seenXrefs.insert({from, to, kind}).second) {
@@ -1962,7 +2011,7 @@ private:
     xref.To = to;
     xref.Kind = kind;
     xref.Source = source;
-    state.addXref(std::move(xref));
+    xrefs.push_back(std::move(xref));
   }
 
   static std::vector<NativeBasicBlock>

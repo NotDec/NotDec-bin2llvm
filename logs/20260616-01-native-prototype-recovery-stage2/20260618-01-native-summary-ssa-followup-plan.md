@@ -1110,3 +1110,58 @@ llvm-as + opt verify: passed
 - 实现效果：8/10。seed 内 block facts 现在来自 instruction flow 的本地可达性，明显减少线性窗口带来的不可达块。
 - 理解成本：4/10。新增一个小的本地 CFG walk；比直接截断窗口更准确。
 - 维护成本：3/10。逻辑只在 native discovery/lowering 边界，generic pcode 路径不受影响。
+
+## 实现记录：call/xref 也按本地可达 instruction 提交
+
+上一节只过滤了进入 block facts 的 instruction，但 `addDirectControlFlow(...)` 仍然会在过滤前把线性窗口里的 call / flow / data xref 和 unresolved indirect flow 写进全局 state。这样不可达字节虽然不进 block，仍可能生成函数 seed 或 xref。
+
+这次把这部分也收紧：先收集 pending facts，等 seed 内本地可达性算完后，只提交可达 instruction 地址上的 facts。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1539)
+  - `decodeSeed(...)` 在 `reachableInstructionStarts(...)` 之后才提交 call targets、xref、unresolved flow。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1597)
+  - 新增 `reachableCallTargets(...)` / `reachableXrefs(...)` / `reachableUnresolvedFlows(...)`。
+  - 这些函数都按 reachable instruction address 过滤。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1747)
+  - `collectDirectControlFlow(...)` 不再直接写 `NativeProgramState`。
+  - direct internal call target 和 instruction call target 分开记录，避免 PLT/external call 被错误加入 native function seed。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1971)
+  - data/string xref 也改成 pending xref，统一在可达过滤后提交。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm native_register_summary_test native_register_summary_ssa_test pcode_to_llvm_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-reachable-xrefs3/fortune.ll --summary-json-out /tmp/notdec-fortune-reachable-xrefs3/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-reachable-xrefs3-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-reachable-xrefs3/fortune.ll -o /tmp/notdec-fortune-reachable-xrefs3/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-reachable-xrefs3/fortune.bc -o /tmp/notdec-fortune-reachable-xrefs3/fortune.verified.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-reachable-xrefs3-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-reachable-xrefs3-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-reachable-xrefs3-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-reachable-xrefs3-raw/fortune-3470-raw.verified.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 9.38s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 109
+xrefs: total=1830 flow=977 call=580 data=268 string=5
+final !notdec.register.access residue: 1
+remaining register access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：8/10。block facts、call seeds、xref、unresolved flow 都统一受本地可达性约束。
+- 理解成本：4/10。多了 pending fact 提交流程，但比直接写 state 更符合当前分层。
+- 维护成本：3/10。逻辑仍限制在 seed decode 内，summary 链路和 generic pcode lowering 不受影响。
