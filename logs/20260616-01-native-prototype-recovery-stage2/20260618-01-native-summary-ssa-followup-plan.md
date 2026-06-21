@@ -846,3 +846,46 @@ remaining register access: FS_OFFSET only
 - 实现效果：8/10。native CFG 现在更明确地作为 lowering 权威，减少了 pcode 顺序带来的误判机会。
 - 理解成本：3/10。只是把 native / generic 两条路径分开了。
 - 维护成本：3/10。fallback 还保留在非 native 路径里，后续如果要彻底统一，还可以再把 block facts 往前收。
+
+## 实现记录：native block starts 不再从 pcode branch targets 派生
+
+这次继续收紧 native lowering 的 CFG 来源。
+
+前一轮已经让 native 模式下的 fallthrough / conditional false edge 优先使用 `Config.BlockSuccessors`。但 `buildBasicBlocks(...)` 仍然会扫描 pcode branch target，把这些 target 作为 block starts。这样虽然通常正确，但语义上仍然是在 lower 层从 pcode 反推 native CFG。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:206)
+  - `buildBasicBlocks(...)` 在 `usesNativeCfg()` 为 true 时，只使用 native `BlockSuccessors` 的 block start 和 successor 作为 block starts。
+  - 从 pcode branch target 和 terminator 后 `index + 1` 推 block start 的逻辑只保留给非 native / generic pcode 路径。
+
+验证：
+
+```text
+cmake --build build --target notdec-native-llvm native_register_summary_test native_register_summary_ssa_test -j4
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/fortune-native-blockstarts-raw.ll
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-native-blockstarts/fortune.ll --summary-json-out /tmp/notdec-fortune-native-blockstarts/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-native-blockstarts/fortune.ll -o /tmp/notdec-fortune-native-blockstarts/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-native-blockstarts/fortune.bc -o /tmp/notdec-fortune-native-blockstarts/fortune.verified.bc
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+```
+
+结果：
+
+```text
+fortune native pipeline: 12.72s
+confirmed_functions: 25
+basic_blocks: 2369
+instructions: 2908
+0x3470 raw IR still has bb_3748 false edge to bb_374e
+final !notdec.register.access residue: 1
+remaining register access: FS_OFFSET only
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：8/10。native lowering 的 block starts 现在来自 discovery block facts，而不是 pcode branch scan。
+- 理解成本：2/10。只是把 native / generic pcode 分支放得更清楚。
+- 维护成本：2/10。非 native fallback 不变，native 路径更少隐式猜测。

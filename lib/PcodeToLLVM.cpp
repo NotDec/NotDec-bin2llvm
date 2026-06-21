@@ -206,22 +206,23 @@ private:
         addBlockStart(starts, firstOpForAddress, successor);
       }
     }
-    for (size_t index = 0; index < program.Ops.size(); ++index) {
-      const PcodeOpView &op = program.Ops[index];
-      if (op.Opcode == PcodeOpcode::Branch ||
-          op.Opcode == PcodeOpcode::BranchInd ||
-          op.Opcode == PcodeOpcode::CBranch) {
-        if (auto target = directTarget(op, 0)) {
-          addBlockStart(starts, firstOpForAddress, *target);
-        } else if (auto targetIndex =
-                       relativeTargetIndex(index, op, 0, program.Ops.size())) {
-          starts.insert(*targetIndex);
+    if (!usesNativeCfg()) {
+      for (size_t index = 0; index < program.Ops.size(); ++index) {
+        const PcodeOpView &op = program.Ops[index];
+        if (op.Opcode == PcodeOpcode::Branch ||
+            op.Opcode == PcodeOpcode::BranchInd ||
+            op.Opcode == PcodeOpcode::CBranch) {
+          if (auto target = directTarget(op, 0)) {
+            addBlockStart(starts, firstOpForAddress, *target);
+          } else if (auto targetIndex = relativeTargetIndex(
+                         index, op, 0, program.Ops.size())) {
+            starts.insert(*targetIndex);
+          }
         }
-      }
 
-      if (!usesNativeCfg() && isTerminator(op.Opcode) &&
-          index + 1 < program.Ops.size()) {
-        starts.insert(index + 1);
+        if (isTerminator(op.Opcode) && index + 1 < program.Ops.size()) {
+          starts.insert(index + 1);
+        }
       }
     }
 
