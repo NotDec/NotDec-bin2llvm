@@ -2612,15 +2612,28 @@ public:
 private:
   static void recoverJumpTableAt(NativeProgramState &state,
                                  uint64_t branchAddress) {
-    const NativeFunction *function = state.functionContaining(branchAddress);
-    if (function == nullptr) {
-      return;
+    bool completeForAnyFunction = false;
+    for (const auto &[entry, function] : state.functions()) {
+      (void)entry;
+      if (!functionHasBlockContaining(function, branchAddress)) {
+        continue;
+      }
+      completeForAnyFunction |=
+          recoverJumpTableInFunction(state, function, branchAddress);
     }
+    if (completeForAnyFunction) {
+      state.removeUnresolvedFlow(branchAddress,
+                                 NativeUnresolvedFlowKind::IndirectBranch);
+    }
+  }
 
+  static bool recoverJumpTableInFunction(NativeProgramState &state,
+                                         const NativeFunction &function,
+                                         uint64_t branchAddress) {
     std::optional<X86PicI32JumpDispatch> dispatch =
-        matchX86PicI32OffsetDispatch(state, *function, branchAddress);
+        matchX86PicI32OffsetDispatch(state, function, branchAddress);
     if (!dispatch) {
-      return;
+      return false;
     }
 
     std::vector<uint64_t> targets;
@@ -2629,13 +2642,13 @@ private:
                               dispatch->EntryCount,
                               /*onlyExistingBlocks=*/true, targets,
                               complete)) {
-      return;
+      return false;
     }
     if (targets.empty()) {
-      return;
+      return false;
     }
 
-    state.addBasicBlockSuccessors(function->Entry, dispatch->BlockStart,
+    state.addBasicBlockSuccessors(function.Entry, dispatch->BlockStart,
                                   targets);
     for (uint64_t target : targets) {
       NativeXref xref;
@@ -2645,10 +2658,17 @@ private:
       xref.Source = "x86-jump-table";
       state.addXref(std::move(xref));
     }
-    if (complete) {
-      state.removeUnresolvedFlow(branchAddress,
-                                 NativeUnresolvedFlowKind::IndirectBranch);
+    return complete;
+  }
+
+  static bool functionHasBlockContaining(const NativeFunction &function,
+                                         uint64_t address) {
+    for (const NativeBasicBlock &block : function.Blocks) {
+      if (address >= block.Start && address < block.End) {
+        return true;
+      }
     }
+    return false;
   }
 };
 

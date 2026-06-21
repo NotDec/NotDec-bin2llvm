@@ -2063,3 +2063,83 @@ jump table target 被实际 decode 成 block，属于预期成本；后续如果
   仍只消费已确认 CFG，没有新增特殊路径。
 - 维护成本：4/10。当前 matcher 仍偏窄，只覆盖 fortune 里这类 GCC PIC table；
   后续扩展其他 table 形态时应继续复用同一组 helper。
+
+## 已修正：重叠函数下 jump table successors 写错函数
+
+继续检查 raw IR 时发现一个问题：`0x2820` 的 CFG facts 里
+`0x2872` 已经有 14 个 jump table successors，但 raw lowering 里的
+`notdec_native_2820` 仍然从 `bb_2872` 跳到 `notdec_exit`，没有生成
+`switch`。
+
+调试后确认根因不是 P-Code 丢失：
+
+```text
+0x2879: BRANCHIND (register,0x0,8)
+```
+
+真正的问题是 fortune 里当前还有重叠确认函数，比如 `0x27b2`、`0x2820`、
+`0x3470` 的范围互相覆盖。旧的 `X86JumpTableAnalyzer` 用
+`functionContaining(branchAddress)` 按 range 找第一个函数，所以 `0x2879`
+先命中了 `0x27b2`，jump table successors 写到了 `notdec_native_27b2`；
+真正需要的 `notdec_native_2820` 仍然是空 successors。
+
+修正：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2614)
+  - `X86JumpTableAnalyzer::recoverJumpTableAt(...)` 不再只用
+    `functionContaining(...)` 找一个函数。
+  - 改为遍历所有 confirmed functions，只处理实际有 basic block 覆盖
+    `branchAddress` 的函数。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2630)
+  - 新增 `recoverJumpTableInFunction(...)`，把 jump table successors 写回对应
+    `function.Entry`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2665)
+  - 新增 `functionHasBlockContaining(...)`，避免重叠 range 误命中。
+
+当前结果：
+
+```text
+raw IR:
+  define void @notdec_native_2820()
+  bb_2872:
+    switch i64 %RAX83, label %notdec_exit [...]
+
+summary IR:
+  define void @notdec_native_2820(...)
+  bb_2872:
+    switch i32 %unique_de00_4, label %notdec_exit [...]
+```
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-discover notdec-native-llvm native_analysis_facts_test pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --no-register-ssa-pass --no-instcombine-pass -o /tmp/notdec-fortune-raw-jumptable/fortune.raw.ll --summary-json-out /tmp/notdec-fortune-raw-jumptable/summary.json
+/usr/bin/time -f 'elapsed=%e' /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-jumptable-decode/fortune.ll --summary-json-out /tmp/notdec-fortune-jumptable-decode/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-jumptable-decode/fortune.ll -o /tmp/notdec-fortune-jumptable-decode/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-jumptable-decode/fortune.bc -o /tmp/notdec-fortune-jumptable-decode/fortune.verify.bc
+```
+
+结果：
+
+```text
+native tests: passed
+fortune unresolved flow count: 0
+fortune native pipeline: 11.55s
+llvm-as + opt verify: passed
+latest summary IR: /tmp/notdec-fortune-jumptable-decode/fortune.ll
+latest raw IR: /tmp/notdec-fortune-raw-jumptable/fortune.raw.ll
+```
+
+复杂度评估：
+
+- 实现效果：8/10。`notdec_native_2820` 的 jump table 现在真正进入 lowering，
+  raw 和 summary IR 都有 switch。
+- 理解成本：4/10。逻辑仍在 facts 层，只是从 range 命中改为 block 覆盖命中。
+- 维护成本：4/10。重叠函数本身后续还要治理；这次修正避免 jump table 边写错
+  函数，但不解决重叠函数来源问题。
