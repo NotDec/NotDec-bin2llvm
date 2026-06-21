@@ -3095,6 +3095,17 @@ void NativeProgramState::addXref(NativeXref xref) {
     return;
   }
 
+  auto fromIterator = XrefsByFrom.find(xref.From);
+  if (fromIterator != XrefsByFrom.end()) {
+    for (size_t index : fromIterator->second) {
+      const NativeXref &existing = Xrefs[index];
+      if (existing.To == xref.To && existing.Kind == xref.Kind &&
+          existing.Source == xref.Source) {
+        return;
+      }
+    }
+  }
+
   size_t index = Xrefs.size();
   Xrefs.push_back(std::move(xref));
   XrefsByFrom[Xrefs[index].From].push_back(index);

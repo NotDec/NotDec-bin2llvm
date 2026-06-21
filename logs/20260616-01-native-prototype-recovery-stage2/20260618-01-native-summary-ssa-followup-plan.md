@@ -2245,3 +2245,75 @@ latest summary IR: /tmp/notdec-fortune-range-bounded/fortune.ll
 - 理解成本：4/10。新增的是单一范围检查，位置在 seed 入队和 successor 写入。
 - 维护成本：4/10。无范围 seed 仍保留旧行为，后续需要单独处理 init-array /
   relocation 这类入口的函数边界。
+
+## 已完成：Native xref facts 去重
+
+继续看无明确 range 的 seed 时，发现另一个 facts 层噪声：同一条 xref 会因为
+重复 decode 或多个入口覆盖被反复加入。比如 fortune 的 `function-xrefs-json`
+里，同一个 `{from, to, kind, source}` 会重复出现很多次。这会污染 callgraph、
+incoming/outgoing 统计，也让后续基于 xref 的判断更难看。
+
+这次只在 `NativeProgramState::addXref(...)` 做完全相同 xref 去重：
+
+- 比较字段：`From`、`To`、`Kind`、`Source`。
+- 不合并不同 source 的 xref，保留不同 analyzer 的证据。
+- 不改 decode、block、lowering 逻辑。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3095)
+  - `NativeProgramState::addXref(...)` 插入前先查 `XrefsByFrom[xref.From]`，
+    已有完全相同 xref 时直接返回。
+
+当前 fortune 结果：
+
+```text
+before:
+  xrefs total: 1838
+  flow: 985
+  call: 565
+  data: 283
+  string: 5
+
+after:
+  xrefs total: 868
+  flow: 438
+  call: 279
+  data: 146
+  string: 5
+```
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-discover notdec-native-llvm native_analysis_facts_test pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --no-register-ssa-pass --no-instcombine-pass -o /tmp/notdec-fortune-raw-xref-dedup/fortune.raw.ll --summary-json-out /tmp/notdec-fortune-raw-xref-dedup/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-raw-xref-dedup/fortune.raw.ll -o /tmp/notdec-fortune-raw-xref-dedup/fortune.raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-raw-xref-dedup/fortune.raw.bc -o /tmp/notdec-fortune-raw-xref-dedup/fortune.raw.verify.bc
+/usr/bin/time -f 'elapsed=%e' /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-xref-dedup/fortune.ll --summary-json-out /tmp/notdec-fortune-xref-dedup/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-xref-dedup/fortune.ll -o /tmp/notdec-fortune-xref-dedup/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-xref-dedup/fortune.bc -o /tmp/notdec-fortune-xref-dedup/fortune.verify.bc
+```
+
+结果：
+
+```text
+native tests: passed
+fortune unresolved flow count: 0
+fortune native pipeline: 10.15s
+raw IR verify: passed
+summary IR verify: passed
+latest raw IR: /tmp/notdec-fortune-raw-xref-dedup/fortune.raw.ll
+latest summary IR: /tmp/notdec-fortune-xref-dedup/fortune.ll
+```
+
+复杂度评估：
+
+- 实现效果：7/10。xref 噪声明显下降，callgraph / xref 查询更接近 facts 本身。
+- 理解成本：2/10。只是插入前去重。
+- 维护成本：2/10。保留 source 维度，不会把不同来源的证据合并掉。
