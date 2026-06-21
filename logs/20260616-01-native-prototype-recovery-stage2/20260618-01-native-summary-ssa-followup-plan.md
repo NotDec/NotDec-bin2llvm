@@ -1351,3 +1351,97 @@ llvm-as + opt verify: passed
 - 实现效果：5/10。只是稳定 p-code range 拼接顺序，但方向上减少了调用方顺序对 lowering 的影响。
 - 理解成本：1/10。局部排序，行为直观。
 - 维护成本：1/10。没有新增状态。
+
+## 实现记录：native lowering 不再把缺失目标静默变成 ret block
+
+继续收紧 `PcodeToLLVM` 对 native block facts 的使用。之前 `blockForTarget(...)` 在目标地址没有本地 block 时会直接创建一个空 LLVM block，最后补 `ret void`。这对普通 p-code 还可以作为兜底，但 native CFG 下会掩盖两类真实情况：
+
+- NOP / ENDBR 等机器 block 没有任何 SLEIGH p-code，但它仍是 native CFG 的合法 block。
+- direct branch 跳出当前函数 block ranges，可能是 internal/external tail jump，或者单函数 raw 模式下还没发现的跨 chunk 目标。
+
+这次改成：
+
+- 当前函数 range 内的 native target 必须有 block fact；缺失就报错。
+- 当前函数 range 外的 direct target 不再造 `ret void` block，改成 tail call。
+- 没有 p-code 的 native block 也创建 LLVM block，并按 `BlockSuccessors` 接到下一个 block。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:115)
+  - `PcodeLowerer::lower(...)` 在普通 p-code block lowering 后，额外 lower `EmptyNativeBlockAddresses`。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:148)
+  - 新增 `sortedNativeRanges()`，native range 遍历固定按地址顺序。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:161)
+  - 新增 `nativeRangesCoverAddress(...)`，用来区分当前函数内缺 block 和跳出当前 range。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:279)
+  - `buildBasicBlocks(...)` 记录没有 p-code op 的 native block。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:422)
+  - `nativeFallthroughBlock(...)` 改成能返回错误，不再用 `blockForTarget(...)` 静默造块。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:441)
+  - `nativeConditionalFalseBlock(...)` 同样改成 strict native target。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:466)
+  - 新增 `nativeEmptyBlockSuccessor(...)`，给 empty native block 生成 successor branch 或 `ret void`。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:499)
+  - 新增 `blockForNativeTarget(...)`，native CFG 下缺当前 range 内 block 时明确报错。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:513)
+  - 新增 `tailJumpBlockForKnownFunction(...)`，支持 conditional branch 跳到 known/synthetic function 时生成 tail-call block。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:571)
+  - direct `BRANCH` 目标优先匹配本地 block、external target、internal target。
+  - 如果目标不在当前 native ranges 内，降成 `notdec_native_<addr>` tail call。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:606)
+  - direct `CBRANCH` 目标也按同样规则处理；跳出当前 ranges 时生成 conditional tail-call block。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:1634)
+  - 增加 `TailJumpBlockForAddress` 和 `EmptyNativeBlockAddresses`。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:35)
+  - 增加 `uniqueVarnode(...)`、`copyOp(...)`、`cbranchOp(...)` 测试 helper。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:166)
+  - 增加 internal unconditional tail branch 测试。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:207)
+  - 增加 internal conditional tail branch 测试。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:310)
+  - 增加当前 ranges 外 direct branch 降成 synthetic tail call 的测试。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:351)
+  - 增加 branch 目标是 empty native block 的测试。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:384)
+  - 增加 native successor 缺 block 时失败的测试。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test notdec-native-llvm native_register_summary_test native_register_summary_ssa_test native_analysis_facts_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-empty-native-block/fortune.ll --summary-json-out /tmp/notdec-fortune-empty-native-block/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-empty-native-block-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-empty-native-block/fortune.ll -o /tmp/notdec-fortune-empty-native-block/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-empty-native-block/fortune.bc -o /tmp/notdec-fortune-empty-native-block/fortune.verify.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-empty-native-block-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-empty-native-block-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-empty-native-block-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-empty-native-block-raw/fortune-3470-raw.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 9.37s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 109
+final !notdec.register.access residue: 1
+remaining !notdec.register.access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+实现中发现的真实样例：
+
+- `0x367c` 是 `fortune` 里 `0x3470` 函数的 native block，机器指令是 NOP，SLEIGH 没有生成 p-code。现在会生成 `bb_367c` 并接到 successor。
+- `0x3470` 的 p-code 里有 `CBRANCH 0x27b2`。`0x27b2` 是另一个 confirmed function / chunk 的入口，不属于当前函数 ranges。现在会生成 conditional tail-call block，而不是空 `ret void` block。
+
+复杂度评估：
+
+- 实现效果：8/10。消除了 native CFG 下最危险的静默 ret block 兜底，同时覆盖了真实 NOP block 和跨 chunk branch。
+- 理解成本：5/10。`PcodeToLLVM` 多了 empty block 和 tail-call block 两个概念，但都直接对应 native CFG 事实。
+- 维护成本：4/10。后续如果要更精确处理共享 chunk，可能还要把跨 range branch 从 synthetic call 升级成显式 chunk/function 关系。

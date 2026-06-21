@@ -32,6 +32,24 @@ notdec::bin2llvm::VarnodeView constVarnode(uint64_t value, uint32_t size) {
   return varnode;
 }
 
+notdec::bin2llvm::VarnodeView uniqueVarnode(uint64_t offset, uint32_t size) {
+  notdec::bin2llvm::VarnodeView varnode;
+  varnode.Space = "unique";
+  varnode.Offset = offset;
+  varnode.Size = size;
+  return varnode;
+}
+
+notdec::bin2llvm::PcodeOpView copyOp(uint64_t address) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  op.OpcodeName = "COPY";
+  op.Output = uniqueVarnode(0x100, 8);
+  op.Inputs.push_back(constVarnode(0, 8));
+  return op;
+}
+
 notdec::bin2llvm::PcodeOpView returnOp(uint64_t address) {
   notdec::bin2llvm::PcodeOpView op;
   op.Address = address;
@@ -51,6 +69,20 @@ notdec::bin2llvm::PcodeOpView branchOp(uint64_t address, uint64_t target) {
   targetVarnode.Offset = target;
   targetVarnode.Size = 8;
   op.Inputs.push_back(std::move(targetVarnode));
+  return op;
+}
+
+notdec::bin2llvm::PcodeOpView cbranchOp(uint64_t address, uint64_t target) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::CBranch;
+  op.OpcodeName = "CBRANCH";
+  notdec::bin2llvm::VarnodeView targetVarnode;
+  targetVarnode.Space = "ram";
+  targetVarnode.Offset = target;
+  targetVarnode.Size = 8;
+  op.Inputs.push_back(std::move(targetVarnode));
+  op.Inputs.push_back(constVarnode(1, 1));
   return op;
 }
 
@@ -131,6 +163,92 @@ bool testExternalTailBranchWithoutLocalBlock() {
                 "module failed verifier after external tail branch lowering");
 }
 
+bool testInternalTailBranchWithoutLocalBlock() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(branchOp(0x1000, 0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "internal_tail_branch";
+  config.DirectCallTargets.emplace(0x2000, "notdec_native_2000");
+  config.BlockRanges.emplace(0x1000, 0x1001);
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  llvm::Function *callee = module->getFunction("notdec_native_2000");
+  if (!expect(function != nullptr, "tail branch function is missing") ||
+      !expect(callee != nullptr, "internal tail callee is missing")) {
+    return false;
+  }
+
+  bool hasTailCall = false;
+  bool hasTargetBlock = false;
+  for (llvm::BasicBlock &block : *function) {
+    hasTargetBlock |= block.getName() == "bb_2000";
+    for (llvm::Instruction &inst : block) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      hasTailCall |= call != nullptr && call->getCalledFunction() == callee &&
+                     call->isTailCall();
+    }
+  }
+
+  return expect(hasTailCall, "internal tail branch did not emit tail call") &&
+         expect(!hasTargetBlock, "internal tail branch created target block") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after internal tail branch lowering");
+}
+
+bool testInternalConditionalTailBranchWithoutLocalBlock() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(cbranchOp(0x1000, 0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "internal_conditional_tail_branch";
+  config.EntryAddress = 0x1000;
+  config.DirectCallTargets.emplace(0x2000, "notdec_native_2000");
+  config.BlockRanges.emplace(0x1000, 0x1001);
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  llvm::Function *callee = module->getFunction("notdec_native_2000");
+  if (!expect(function != nullptr,
+              "conditional tail branch function is missing") ||
+      !expect(callee != nullptr, "conditional tail callee is missing")) {
+    return false;
+  }
+
+  bool hasTailCall = false;
+  bool hasTargetBlock = false;
+  for (llvm::BasicBlock &block : *function) {
+    hasTargetBlock |= block.getName() == "bb_2000";
+    for (llvm::Instruction &inst : block) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      hasTailCall |= call != nullptr && call->getCalledFunction() == callee &&
+                     call->isTailCall();
+    }
+  }
+
+  return expect(hasTailCall,
+                "internal conditional tail branch did not emit tail call") &&
+         expect(!hasTargetBlock,
+                "internal conditional tail branch created target block") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after conditional tail branch lowering");
+}
+
 bool testNativeBlockRangeIsRequired() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -189,13 +307,114 @@ bool testNativeEntryAddressChoosesEntryBlock() {
                 "module failed verifier after native entry selection");
 }
 
+bool testNativeDirectBranchOutsideRangesBecomesTailCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(branchOp(0x1000, 0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_outside_direct_branch";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  llvm::Function *callee = module->getFunction("notdec_native_2000");
+  if (!expect(function != nullptr, "outside branch function is missing") ||
+      !expect(callee != nullptr, "outside branch callee is missing")) {
+    return false;
+  }
+
+  bool hasTailCall = false;
+  bool hasTargetBlock = false;
+  for (llvm::BasicBlock &block : *function) {
+    hasTargetBlock |= block.getName() == "bb_2000";
+    for (llvm::Instruction &inst : block) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      hasTailCall |= call != nullptr && call->getCalledFunction() == callee &&
+                     call->isTailCall();
+    }
+  }
+
+  return expect(hasTailCall, "outside direct branch did not emit tail call") &&
+         expect(!hasTargetBlock, "outside direct branch created target block") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after outside direct branch lowering");
+}
+
+bool testNativeDirectBranchCanTargetEmptyBlock() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(branchOp(0x1000, 0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_empty_target";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr, "native empty target function is missing")) {
+    return false;
+  }
+
+  bool hasEmptyTarget = false;
+  for (llvm::BasicBlock &block : *function) {
+    hasEmptyTarget |= block.getName() == "bb_2000";
+  }
+
+  return expect(hasEmptyTarget, "native empty target block was not emitted") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after native empty target lowering");
+}
+
+bool testNativeSuccessorRequiresKnownBlock() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(copyOp(0x1000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_missing_successor";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x2000});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native successor to missing block should fail") &&
+         expect(errorMessage.find("missing a native block") !=
+                    std::string::npos,
+                "missing native successor error was not reported");
+}
+
 } // namespace
 
 int main() {
   bool ok = true;
   ok &= testUnreachablePcodeBlocksAreRemoved();
   ok &= testExternalTailBranchWithoutLocalBlock();
+  ok &= testInternalTailBranchWithoutLocalBlock();
+  ok &= testInternalConditionalTailBranchWithoutLocalBlock();
   ok &= testNativeBlockRangeIsRequired();
   ok &= testNativeEntryAddressChoosesEntryBlock();
+  ok &= testNativeDirectBranchOutsideRangesBecomesTailCall();
+  ok &= testNativeDirectBranchCanTargetEmptyBlock();
+  ok &= testNativeSuccessorRequiresKnownBlock();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -100,11 +100,34 @@ public:
       }
 
       if (!ended) {
-        if (llvm::BasicBlock *next = nativeFallthroughBlock(blockIndex)) {
+        llvm::BasicBlock *next = nullptr;
+        if (!nativeFallthroughBlock(blockIndex, next, errorMessage)) {
+          return false;
+        }
+        if (next != nullptr) {
           Builder.CreateBr(next);
         } else {
           Builder.CreateRetVoid();
         }
+      }
+    }
+
+    for (uint64_t blockAddress : EmptyNativeBlockAddresses) {
+      auto blockIt = BlockForAddress.find(blockAddress);
+      if (blockIt == BlockForAddress.end()) {
+        errorMessage = "empty native block is missing an LLVM block";
+        return false;
+      }
+      Builder.SetInsertPoint(blockIt->second);
+
+      llvm::BasicBlock *successor = nullptr;
+      if (!nativeEmptyBlockSuccessor(blockAddress, successor, errorMessage)) {
+        return false;
+      }
+      if (successor != nullptr) {
+        Builder.CreateBr(successor);
+      } else {
+        Builder.CreateRetVoid();
       }
     }
 
@@ -120,6 +143,28 @@ public:
 private:
   bool usesNativeCfg() const {
     return !Config.BlockRanges.empty() || !Config.BlockSuccessors.empty();
+  }
+
+  std::vector<std::pair<uint64_t, uint64_t>> sortedNativeRanges() const {
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    ranges.reserve(Config.BlockRanges.size());
+    for (const auto &[blockAddress, blockEnd] : Config.BlockRanges) {
+      ranges.push_back({blockAddress, blockEnd});
+    }
+    std::sort(ranges.begin(), ranges.end(),
+              [](const auto &lhs, const auto &rhs) {
+                return lhs.first < rhs.first;
+              });
+    return ranges;
+  }
+
+  bool nativeRangesCoverAddress(uint64_t address) const {
+    for (const auto &[blockAddress, blockEnd] : Config.BlockRanges) {
+      if (address >= blockAddress && address < blockEnd) {
+        return true;
+      }
+    }
+    return false;
   }
 
   llvm::BasicBlock *entryBlockForProgram(std::string &errorMessage) {
@@ -240,7 +285,7 @@ private:
 
     std::set<size_t> starts;
     if (usesNativeCfg()) {
-      for (const auto &[blockAddress, blockEnd] : Config.BlockRanges) {
+      for (const auto &[blockAddress, blockEnd] : sortedNativeRanges()) {
         if (blockEnd <= blockAddress) {
           std::ostringstream os;
           os << "native block 0x" << std::hex << blockAddress
@@ -248,14 +293,19 @@ private:
           errorMessage = os.str();
           return false;
         }
+        bool foundPcodeInBlock = false;
         for (size_t index = 0; index < program.Ops.size(); ++index) {
           uint64_t opAddress = program.Ops[index].Address;
           if (opAddress >= blockAddress && opAddress < blockEnd) {
             starts.insert(index);
             NativeBlockAddressForStart[index] = blockAddress;
             NativeBlockEndForStart[index] = blockEnd;
+            foundPcodeInBlock = true;
             break;
           }
+        }
+        if (!foundPcodeInBlock) {
+          EmptyNativeBlockAddresses.push_back(blockAddress);
         }
       }
       if (starts.empty()) {
@@ -286,7 +336,7 @@ private:
     if (usesNativeCfg()) {
       for (const PcodeOpView &op : program.Ops) {
         bool covered = false;
-        for (const auto &[blockAddress, blockEnd] : Config.BlockRanges) {
+        for (const auto &[blockAddress, blockEnd] : sortedNativeRanges()) {
           if (op.Address >= blockAddress && op.Address < blockEnd) {
             covered = true;
             break;
@@ -315,6 +365,11 @@ private:
           llvm::BasicBlock::Create(Context, blockName(address), &Function);
       BlockForStart[start] = block;
       BlockForAddress.try_emplace(address, block);
+    }
+    for (uint64_t blockAddress : EmptyNativeBlockAddresses) {
+      llvm::BasicBlock *block =
+          llvm::BasicBlock::Create(Context, blockName(blockAddress), &Function);
+      BlockForAddress.try_emplace(blockAddress, block);
     }
     return true;
   }
@@ -367,25 +422,32 @@ private:
     return BlockForStart[BlockStarts[blockIndex + 1]];
   }
 
-  llvm::BasicBlock *nativeFallthroughBlock(size_t blockIndex) {
+  bool nativeFallthroughBlock(size_t blockIndex, llvm::BasicBlock *&result,
+                              std::string &errorMessage) {
+    result = nullptr;
     uint64_t blockAddress = blockAddressForIndex(blockIndex);
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
-      return usesNativeCfg() ? nullptr : nextBlock(blockIndex);
+      result = usesNativeCfg() ? nullptr : nextBlock(blockIndex);
+      return true;
     }
     if (successorIt->second.size() != 1) {
-      return nullptr;
+      return true;
     }
-    return blockForTarget(successorIt->second.front());
+    result = blockForNativeTarget(successorIt->second.front(), errorMessage);
+    return result != nullptr;
   }
 
-  llvm::BasicBlock *nativeConditionalFalseBlock(size_t blockIndex,
-                                                uint64_t trueTarget,
-                                                llvm::BasicBlock *fallback) {
+  bool nativeConditionalFalseBlock(size_t blockIndex, uint64_t trueTarget,
+                                   llvm::BasicBlock *fallback,
+                                   llvm::BasicBlock *&result,
+                                   std::string &errorMessage) {
+    result = nullptr;
     uint64_t blockAddress = blockAddressForIndex(blockIndex);
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
-      return usesNativeCfg() ? nullptr : fallback;
+      result = usesNativeCfg() ? nullptr : fallback;
+      return true;
     }
 
     // SLEIGH CBRANCH only records the taken target.  Native discovery already
@@ -393,10 +455,32 @@ private:
     // p-code block is the fallthrough for sparse or out-of-order ranges.
     for (uint64_t successor : successorIt->second) {
       if (successor != trueTarget) {
-        return blockForTarget(successor);
+        result = blockForNativeTarget(successor, errorMessage);
+        return result != nullptr;
       }
     }
-    return usesNativeCfg() ? nullptr : fallback;
+    result = usesNativeCfg() ? nullptr : fallback;
+    return true;
+  }
+
+  bool nativeEmptyBlockSuccessor(uint64_t blockAddress,
+                                 llvm::BasicBlock *&result,
+                                 std::string &errorMessage) {
+    result = nullptr;
+    auto successorIt = Config.BlockSuccessors.find(blockAddress);
+    if (successorIt == Config.BlockSuccessors.end() ||
+        successorIt->second.empty()) {
+      return true;
+    }
+    if (successorIt->second.size() != 1) {
+      std::ostringstream os;
+      os << "empty native block 0x" << std::hex << blockAddress
+         << " has multiple successors";
+      errorMessage = os.str();
+      return false;
+    }
+    result = blockForNativeTarget(successorIt->second.front(), errorMessage);
+    return result != nullptr;
   }
 
   llvm::BasicBlock *blockForTarget(uint64_t address) {
@@ -409,6 +493,40 @@ private:
         llvm::BasicBlock::Create(Context, blockName(address), &Function);
     BlockForAddress[address] = block;
     ExternalTargetBlocks.push_back(block);
+    return block;
+  }
+
+  llvm::BasicBlock *blockForNativeTarget(uint64_t address,
+                                         std::string &errorMessage) {
+    auto it = BlockForAddress.find(address);
+    if (it != BlockForAddress.end()) {
+      return it->second;
+    }
+
+    std::ostringstream os;
+    os << "native branch target 0x" << std::hex << address
+       << " is missing a native block";
+    errorMessage = os.str();
+    return nullptr;
+  }
+
+  llvm::BasicBlock *
+  tailJumpBlockForKnownFunction(uint64_t address,
+                                const std::string &calleeName) {
+    auto it = TailJumpBlockForAddress.find(address);
+    if (it != TailJumpBlockForAddress.end()) {
+      return it->second;
+    }
+
+    llvm::BasicBlock *currentBlock = Builder.GetInsertBlock();
+    auto *block =
+        llvm::BasicBlock::Create(Context, "tail_" + blockName(address),
+                                 &Function);
+    TailJumpBlockForAddress[address] = block;
+
+    Builder.SetInsertPoint(block);
+    lowerKnownVoidTailJump(calleeName);
+    Builder.SetInsertPoint(currentBlock);
     return block;
   }
 
@@ -453,13 +571,27 @@ private:
       }
       auto target = directTarget(op, 0);
       if (target) {
-        if (BlockForAddress.count(*target) == 0) {
+        auto blockIt = BlockForAddress.find(*target);
+        if (blockIt == BlockForAddress.end()) {
           auto externalIt = Config.ExternalCallTargets.find(*target);
           if (externalIt != Config.ExternalCallTargets.end()) {
             return lowerKnownVoidTailJump(externalIt->second);
           }
+          auto directIt = Config.DirectCallTargets.find(*target);
+          if (directIt != Config.DirectCallTargets.end()) {
+            return lowerKnownVoidTailJump(directIt->second);
+          }
+          if (usesNativeCfg()) {
+            if (!nativeRangesCoverAddress(*target)) {
+              return lowerKnownVoidTailJump(addressFunctionName(*target));
+            }
+            (void)blockForNativeTarget(*target, errorMessage);
+            return false;
+          }
         }
-        Builder.CreateBr(blockForTarget(*target));
+        Builder.CreateBr(blockIt != BlockForAddress.end()
+                             ? blockIt->second
+                             : blockForTarget(*target));
         return true;
       }
       llvm::BasicBlock *relativeTarget = blockForRelativeTarget(opIndex, op, 0);
@@ -480,7 +612,30 @@ private:
       std::optional<uint64_t> trueAddress;
       if (target) {
         trueAddress = *target;
-        trueBlock = blockForTarget(*target);
+        if (usesNativeCfg()) {
+          if (auto blockIt = BlockForAddress.find(*target);
+              blockIt != BlockForAddress.end()) {
+            trueBlock = blockIt->second;
+          } else if (auto externalIt = Config.ExternalCallTargets.find(*target);
+                     externalIt != Config.ExternalCallTargets.end()) {
+            trueBlock =
+                tailJumpBlockForKnownFunction(*target, externalIt->second);
+          } else if (auto directIt = Config.DirectCallTargets.find(*target);
+                     directIt != Config.DirectCallTargets.end()) {
+            trueBlock =
+                tailJumpBlockForKnownFunction(*target, directIt->second);
+          } else if (!nativeRangesCoverAddress(*target)) {
+            trueBlock = tailJumpBlockForKnownFunction(
+                *target, addressFunctionName(*target));
+          } else {
+            trueBlock = blockForNativeTarget(*target, errorMessage);
+          }
+        } else {
+          trueBlock = blockForTarget(*target);
+        }
+        if (trueBlock == nullptr) {
+          return false;
+        }
       } else {
         auto targetIndex = relativeTargetIndex(opIndex, op, 0,
                                                CurrentProgramOps->size());
@@ -498,8 +653,11 @@ private:
       }
       llvm::BasicBlock *falseBlock = fallthrough ? fallthrough : exitBlock();
       if (trueAddress) {
-        llvm::BasicBlock *nativeFalseBlock =
-            nativeConditionalFalseBlock(blockIndex, *trueAddress, falseBlock);
+        llvm::BasicBlock *nativeFalseBlock = nullptr;
+        if (!nativeConditionalFalseBlock(blockIndex, *trueAddress, falseBlock,
+                                         nativeFalseBlock, errorMessage)) {
+          return false;
+        }
         falseBlock = nativeFalseBlock != nullptr ? nativeFalseBlock : exitBlock();
       }
       Builder.CreateCondBr(asCondition(read(op.Inputs[1])), trueBlock,
@@ -1473,6 +1631,8 @@ private:
   std::unordered_map<size_t, uint64_t> NativeBlockEndForStart;
   std::unordered_map<size_t, llvm::BasicBlock *> BlockForStart;
   std::unordered_map<uint64_t, llvm::BasicBlock *> BlockForAddress;
+  std::unordered_map<uint64_t, llvm::BasicBlock *> TailJumpBlockForAddress;
+  std::vector<uint64_t> EmptyNativeBlockAddresses;
   std::vector<llvm::BasicBlock *> ExternalTargetBlocks;
   const std::vector<PcodeOpView> *CurrentProgramOps = nullptr;
   llvm::BasicBlock *ExitBlock = nullptr;
