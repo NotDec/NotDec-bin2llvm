@@ -1358,18 +1358,6 @@ struct X86PicI32DispatchPattern {
   std::string IndexReg;
 };
 
-const NativeInstruction *
-previousInstruction(const NativeProgramState &state,
-                    const NativeFunction &function, uint64_t address,
-                    uint64_t distance) {
-  std::vector<const NativeInstruction *> instructions =
-      state.instructionsInRange(function.RangeStart, address);
-  if (instructions.size() < distance) {
-    return nullptr;
-  }
-  return instructions[instructions.size() - distance];
-}
-
 std::optional<uint64_t>
 findNearestLeaBase(const NativeProgramState &state,
                    const NativeFunction &function, uint64_t beforeAddress,
@@ -1437,19 +1425,81 @@ std::string low8RegisterName(const std::string &reg) {
   return "";
 }
 
-std::vector<std::string> compareRegisterNamesForIndex(const std::string &reg) {
+std::vector<std::string> compareRegisterNamesForText(const std::string &reg) {
+  if (reg == "EAX") {
+    return {"EAX", "AL"};
+  }
+  if (reg == "EBX") {
+    return {"EBX", "BL"};
+  }
+  if (reg == "ECX") {
+    return {"ECX", "CL"};
+  }
+  if (reg == "EDX") {
+    return {"EDX", "DL"};
+  }
+  if (reg == "ESI") {
+    return {"ESI"};
+  }
+  if (reg == "EDI") {
+    return {"EDI"};
+  }
+  if (reg.size() >= 3 && reg[0] == 'R' && std::isdigit(reg[1]) &&
+      reg.back() == 'D') {
+    return {reg, reg.substr(0, reg.size() - 1) + "B"};
+  }
+  if (reg.size() >= 3 && reg[0] == 'R' && std::isdigit(reg[1]) &&
+      reg.back() == 'B') {
+    return {reg};
+  }
   std::vector<std::string> names;
   std::string low32 = low32RegisterName(reg);
   if (!low32.empty()) {
     names.push_back(low32);
   }
-  // Small switch dispatches often mask the index and compare the low byte
-  // before using the full register in the table load.
   std::string low8 = low8RegisterName(reg);
   if (!low8.empty()) {
     names.push_back(low8);
   }
   return names;
+}
+
+std::vector<std::string> compareRegisterNamesForIndex(const std::string &reg) {
+  return compareRegisterNamesForText(reg);
+}
+
+void addUniqueString(std::vector<std::string> &values, std::string value) {
+  if (value.empty() ||
+      std::find(values.begin(), values.end(), value) != values.end()) {
+    return;
+  }
+  values.push_back(std::move(value));
+}
+
+void addCompareRegisterNames(std::vector<std::string> &compareRegs,
+                             const std::string &reg) {
+  for (std::string name : compareRegisterNamesForText(reg)) {
+    addUniqueString(compareRegs, std::move(name));
+  }
+}
+
+std::optional<std::pair<std::string, std::string>>
+parseX86MovRegReg(const std::string &text, const std::string &mnemonic) {
+  const std::string prefix = mnemonic + " ";
+  if (text.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  size_t comma = text.find(',', prefix.size());
+  if (comma == std::string::npos || comma + 1 >= text.size()) {
+    return std::nullopt;
+  }
+  std::string dest = text.substr(prefix.size(), comma - prefix.size());
+  std::string src = text.substr(comma + 1);
+  if (dest.find('[') != std::string::npos ||
+      src.find('[') != std::string::npos || src.find(' ') != std::string::npos) {
+    return std::nullopt;
+  }
+  return std::make_pair(std::move(dest), std::move(src));
 }
 
 std::optional<uint64_t>
@@ -1463,9 +1513,28 @@ findNearestUpperBound(const NativeProgramState &state,
   if (compareRegs.empty()) {
     return std::nullopt;
   }
-  for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
-       ++iterator) {
-    const std::string &text = (*iterator)->Mnemonic;
+
+  std::vector<const NativeInstruction *> window;
+  uint64_t scanned = 0;
+  for (auto iterator = instructions.rbegin();
+       iterator != instructions.rend() && scanned < 64; ++iterator, ++scanned) {
+    window.push_back(*iterator);
+  }
+
+  for (const NativeInstruction *instruction : window) {
+    const std::string &text = instruction->Mnemonic;
+    for (const char *mnemonic : {"MOV", "MOVZX"}) {
+      std::optional<std::pair<std::string, std::string>> move =
+          parseX86MovRegReg(text, mnemonic);
+      if (move && std::find(compareRegs.begin(), compareRegs.end(),
+                            move->first) != compareRegs.end()) {
+        addCompareRegisterNames(compareRegs, move->second);
+      }
+    }
+  }
+
+  for (const NativeInstruction *instruction : window) {
+    const std::string &text = instruction->Mnemonic;
     for (const std::string &compareReg : compareRegs) {
       const std::string prefix = "CMP " + compareReg + ",0x";
       if (text.rfind(prefix, 0) == 0) {
@@ -1544,6 +1613,44 @@ parseX86PicI32DispatchPattern(const NativeInstruction &load,
   return pattern;
 }
 
+std::optional<X86PicI32DispatchPattern>
+findX86PicI32DispatchPattern(const NativeProgramState &state,
+                             const NativeFunction &function,
+                             const NativeInstruction &branch,
+                             const std::string &branchReg) {
+  std::vector<const NativeInstruction *> instructions =
+      state.instructionsInRange(function.RangeStart, branch.Address);
+  const NativeInstruction *matchedAdd = nullptr;
+  size_t addIndex = 0;
+  uint64_t scanned = 0;
+  for (size_t index = instructions.size(); index > 0 && scanned < 8;
+       --index, ++scanned) {
+    const NativeInstruction &instruction = *instructions[index - 1];
+    std::optional<std::pair<std::string, std::string>> addRegs =
+        parseX86AddRegReg(instruction.Mnemonic);
+    if (!addRegs || addRegs->first != branchReg) {
+      continue;
+    }
+    matchedAdd = &instruction;
+    addIndex = index - 1;
+    break;
+  }
+  if (matchedAdd == nullptr) {
+    return std::nullopt;
+  }
+
+  for (size_t index = addIndex; index > 0 && addIndex - (index - 1) <= 4;
+       --index) {
+    const NativeInstruction &load = *instructions[index - 1];
+    std::optional<X86PicI32DispatchPattern> pattern =
+        parseX86PicI32DispatchPattern(load, *matchedAdd, branch);
+    if (pattern) {
+      return pattern;
+    }
+  }
+  return std::nullopt;
+}
+
 std::optional<X86PicI32JumpDispatch>
 matchX86PicI32OffsetDispatch(const NativeProgramState &state,
                              const NativeFunction &function,
@@ -1552,24 +1659,21 @@ matchX86PicI32OffsetDispatch(const NativeProgramState &state,
   if (branch == nullptr) {
     return std::nullopt;
   }
-
-  const NativeInstruction *load =
-      previousInstruction(state, function, branchAddress, 2);
-  const NativeInstruction *add =
-      previousInstruction(state, function, branchAddress, 1);
-  if (load == nullptr || add == nullptr) {
+  std::optional<std::string> branchReg =
+      parseX86RegisterAfterPrefix(branch->Mnemonic, "JMP ");
+  if (!branchReg) {
     return std::nullopt;
   }
   std::optional<X86PicI32DispatchPattern> pattern =
-      parseX86PicI32DispatchPattern(*load, *add, *branch);
+      findX86PicI32DispatchPattern(state, function, *branch, *branchReg);
   if (!pattern) {
     return std::nullopt;
   }
 
   std::optional<uint64_t> tableBase =
-      findNearestLeaBase(state, function, load->Address, pattern->BaseReg);
+      findNearestLeaBase(state, function, branchAddress, pattern->BaseReg);
   std::optional<uint64_t> entryCount =
-      findNearestUpperBound(state, function, load->Address, pattern->IndexReg);
+      findNearestUpperBound(state, function, branchAddress, pattern->IndexReg);
   if (!tableBase || !entryCount || *entryCount == 0 || *entryCount > 256) {
     return std::nullopt;
   }
@@ -1936,8 +2040,9 @@ private:
     for (const NativeXref &xref : reachableXrefs(flowResult, reachableStarts)) {
       state.addXref(xref);
     }
+    std::set<uint64_t> trapStarts = trapInstructionStarts(decodedInstructions);
     for (const NativeUnresolvedFlow &flow :
-         reachableUnresolvedFlows(flowResult, reachableStarts)) {
+         reachableUnresolvedFlows(flowResult, reachableStarts, trapStarts)) {
       state.addUnresolvedFlow(flow);
     }
     rangeStart = decodedInstructions.front().Address;
@@ -2072,12 +2177,25 @@ private:
     return xrefs;
   }
 
-  static std::vector<NativeUnresolvedFlow>
-  reachableUnresolvedFlows(const DirectControlFlowResult &flowResult,
-                           const std::set<uint64_t> &reachableStarts) {
+  static std::set<uint64_t>
+  trapInstructionStarts(const std::vector<NativeInstruction> &instructions) {
+    std::set<uint64_t> starts;
+    for (const NativeInstruction &instruction : instructions) {
+      if (instruction.FlowKind == NativeInstructionFlowKind::Trap) {
+        starts.insert(instruction.Address);
+      }
+    }
+    return starts;
+  }
+
+  static std::vector<NativeUnresolvedFlow> reachableUnresolvedFlows(
+      const DirectControlFlowResult &flowResult,
+      const std::set<uint64_t> &reachableStarts,
+      const std::set<uint64_t> &trapStarts) {
     std::vector<NativeUnresolvedFlow> flows;
     for (const NativeUnresolvedFlow &flow : flowResult.UnresolvedFlows) {
-      if (reachableStarts.count(flow.Address) != 0) {
+      if (reachableStarts.count(flow.Address) != 0 &&
+          trapStarts.count(flow.Address) == 0) {
         flows.push_back(flow);
       }
     }
@@ -2105,12 +2223,18 @@ private:
           instruction.FlowKind = NativeInstructionFlowKind::Return;
         }
       }
+      if (instruction.Mnemonic == "UD2") {
+        instruction.FlowKind = NativeInstructionFlowKind::Trap;
+        instruction.DirectFlowTargets.clear();
+        instruction.TailFlowTargets.clear();
+      }
 
       bool hasNextInstruction = index + 1 != instructions.size();
       bool hasFallthrough =
           instruction.FlowKind !=
               NativeInstructionFlowKind::UnconditionalBranch &&
           instruction.FlowKind != NativeInstructionFlowKind::IndirectBranch &&
+          instruction.FlowKind != NativeInstructionFlowKind::Trap &&
           instruction.FlowKind != NativeInstructionFlowKind::Return;
       if (hasNextInstruction && hasFallthrough &&
           instructions[index + 1].Address == instruction.end()) {
@@ -2136,6 +2260,7 @@ private:
     }
     if (last.FlowKind == NativeInstructionFlowKind::UnconditionalBranch ||
         last.FlowKind == NativeInstructionFlowKind::IndirectBranch ||
+        last.FlowKind == NativeInstructionFlowKind::Trap ||
         last.FlowKind == NativeInstructionFlowKind::Return) {
       return std::nullopt;
     }
@@ -2534,6 +2659,8 @@ private:
         } else if (instruction.FlowKind ==
                    NativeInstructionFlowKind::IndirectBranch) {
           successors = instruction.DirectFlowTargets;
+        } else if (instruction.FlowKind == NativeInstructionFlowKind::Trap) {
+          successors.clear();
         }
         endBlock = true;
       }
@@ -2920,7 +3047,7 @@ private:
     bool complete = false;
     if (!readX86PicI32Targets(state, dispatch->TableBase,
                               dispatch->EntryCount,
-                              /*onlyExistingBlocks=*/true, targets,
+                              /*onlyExistingBlocks=*/false, targets,
                               complete)) {
       return false;
     }
@@ -2928,9 +3055,15 @@ private:
       return false;
     }
 
-    state.addBasicBlockSuccessors(function.Entry, dispatch->BlockStart,
-                                  targets);
     state.addInstructionDirectFlowTargets(branchAddress, targets);
+    std::vector<uint64_t> existingBlockTargets;
+    for (uint64_t target : targets) {
+      if (functionContainsBlockStart(state, target)) {
+        existingBlockTargets.push_back(target);
+      }
+    }
+    state.addBasicBlockSuccessors(function.Entry, dispatch->BlockStart,
+                                  existingBlockTargets);
     for (uint64_t target : targets) {
       NativeXref xref;
       xref.From = branchAddress;
@@ -2939,7 +3072,13 @@ private:
       xref.Source = "x86-jump-table";
       state.addXref(std::move(xref));
     }
-    return complete;
+    for (uint64_t target : targets) {
+      if (state.instructionAt(target) == nullptr) {
+        return false;
+      }
+    }
+    (void)complete;
+    return true;
   }
 
   static bool functionHasBlockContaining(const NativeFunction &function,
@@ -3131,6 +3270,9 @@ private:
       addLocalSuccessors(function, instruction.DirectFlowTargets, successors);
       return;
     }
+    if (instruction.FlowKind == NativeInstructionFlowKind::Trap) {
+      return;
+    }
     if (instruction.FlowKind == NativeInstructionFlowKind::None &&
         instruction.Fallthrough &&
         isInstructionFallthroughTo(instruction, *instruction.Fallthrough)) {
@@ -3203,6 +3345,8 @@ std::string toString(NativeInstructionFlowKind kind) {
     return "unconditional branch";
   case NativeInstructionFlowKind::IndirectBranch:
     return "indirect branch";
+  case NativeInstructionFlowKind::Trap:
+    return "trap";
   case NativeInstructionFlowKind::Return:
     return "return";
   }

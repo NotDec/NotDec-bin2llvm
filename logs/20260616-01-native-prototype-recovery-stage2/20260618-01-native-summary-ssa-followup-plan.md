@@ -3892,3 +3892,75 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：7/10。覆盖了 redis 里一批真实 jump table，明显减少 unresolved indirect branch。
 - 理解成本：4/10。多了几个字符串解析 helper，但仍限制在一个很窄的 x86 PIC jump table 模式。
 - 维护成本：3/10。后续如果要支持更多 jump table，应该继续放在 facts 层，避免 lowering 再猜 CFG。
+
+## 实现记录：继续补 PIC jump table 和 trap facts
+
+背景：
+
+- 上一轮后，`redis-cli` decode-only 仍有 49 个 unresolved indirect branch。
+- 抽样发现剩余里仍有真实 CFG jump table，例如：
+  - `MOVSXD RCX,dword ptr [RDI + RCX*0x4] / ADD RCX,RDI / MOV RBP,RSP / JMP RCX`
+  - `CMP ECX,0xe / MOV EAX,ECX / MOVSXD RAX,dword ptr [RDX + RAX*0x4] / ADD RAX,RDX / JMP RAX`
+- 另一个前端问题是 `UD2` 这类 trap 指令不应该被当成普通 fallthrough 指令。
+
+实现：
+
+- [include/notdec-bin2llvm/NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:185)
+  `NativeInstructionFlowKind` 增加 `Trap`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1428)
+  增加 register alias helper，让 jump table 上界识别能跟过简单 `MOV/MOVZX`：
+  - `MOV EAX,ECX` 后可以用 `CMP ECX,0xe` 推出 entry count。
+  - `MOVZX EAX,R14B` 后可以用 `CMP R14B,0x4` 推出 entry count。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1616)
+  `findX86PicI32DispatchPattern(...)` 在 branch 前短窗口内找 `ADD target,base` 和对应 `MOVSXD`，
+  允许中间存在少量不改目标寄存器的指令，比如函数序言里的 `MOV RBP,RSP`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2043)
+  reachable unresolved flow 过滤掉 trap instruction，避免 `UD2` 被留下当 unresolved branch。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2226)
+  decode instruction facts 时把 `UD2` 标成 `Trap`，并清掉普通 flow target。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2250)
+  decoded window fallthrough 判断把 `Trap` 当作终止指令。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3245)
+  block successor 构建时 `Trap` 不产生 successor。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:543)
+  增加 `testFlowNormalizerKeepsTrapTerminal()`，覆盖 trap block 不应获得 fallthrough successor。
+
+验证：
+
+```text
+git diff --check
+cmake --build build --target native_analysis_facts_test notdec-native-discover -j$(nproc)
+./build/bin/native_analysis_facts_test
+cmake --build build --target pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+build/bin/notdec-native-discover --blocks-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-pic-dispatch-gaps/summary.json \
+  -o /tmp/notdec-fortune-pic-dispatch-gaps/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-pic-dispatch-gaps/fortune.ll \
+  -o /tmp/notdec-fortune-pic-dispatch-gaps/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-pic-dispatch-gaps/fortune.bc \
+  -o /tmp/notdec-fortune-pic-dispatch-gaps/fortune.verify.bc
+```
+
+结果：
+
+- 核心 native 测试通过。
+- summary 链路相关测试通过。
+- `redis-cli` decode-only unresolved indirect branch 从 49 降到 40。
+- `redis-cli` decode 后 block facts 仍闭合：555 个函数、15897 个 block，非法 successor 为 0，block overlap 为 0。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.58 sec`。
+- fortune `!notdec.register.access` 数量为 0。
+- fortune register global store 数量为 0。
+- fortune register global load 数量为 6，仍是 `summary_ssa.entry` load。
+- fortune `br i1 poison`、`ret ... poison`、`store ... ptr poison` 数量为 0。
+
+评分：
+
+- 实现效果：6/10。继续恢复一批真实 jump table，并让 trap facts 更准确。
+- 理解成本：4/10。matcher 多了短窗口和 register alias 追踪，但仍限制在明确机器指令形态。
+- 维护成本：3/10。规则仍在 native facts 层，后续可以继续扩展同类 matcher。

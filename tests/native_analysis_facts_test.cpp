@@ -75,6 +75,8 @@ bool testInstructionFlowKindStrings() {
                     "unconditional branch", "unconditional flow kind");
   ok &= expectEqual(toString(NativeInstructionFlowKind::IndirectBranch),
                     "indirect branch", "indirect flow kind");
+  ok &= expectEqual(toString(NativeInstructionFlowKind::Trap), "trap",
+                    "trap flow kind");
   ok &= expectEqual(toString(NativeInstructionFlowKind::Return), "return",
                     "return flow kind");
   return ok;
@@ -538,6 +540,59 @@ bool testFlowNormalizerSplitsFallthroughInsideBlock(const char *argv0) {
   return ok;
 }
 
+bool testFlowNormalizerKeepsTrapTerminal(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base + 0x180;
+  uint64_t afterTrap = entry + 0x02;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = entry + 0x20;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, afterTrap, {}});
+  function.Blocks.push_back({afterTrap, afterTrap + 0x02, {}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add test function with trap block\n";
+    return false;
+  }
+
+  state.addInstruction(makeInstruction(
+      entry, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::Trap));
+  state.addInstruction(makeInstruction(
+      afterTrap, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::Return));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeFunction *normalized = state.functionAt(entry);
+  bool trapHasNoSuccessor = false;
+  if (normalized != nullptr) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block :
+         normalized->Blocks) {
+      if (block.Start == entry && block.End == afterTrap &&
+          block.Successors.empty()) {
+        trapHasNoSuccessor = true;
+      }
+    }
+  }
+
+  return expectTrue(trapHasNoSuccessor,
+                    "trap block incorrectly gained a successor");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -553,5 +608,6 @@ int main(int argc, char **argv) {
   ok &= testFlowNormalizerRemovesInvalidBlockSuccessors(argv[0]);
   ok &= testFlowNormalizerSplitsDirectTargetInsideBlock(argv[0]);
   ok &= testFlowNormalizerSplitsFallthroughInsideBlock(argv[0]);
+  ok &= testFlowNormalizerKeepsTrapTerminal(argv[0]);
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

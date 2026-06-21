@@ -187,6 +187,7 @@ enum class NativeInstructionFlowKind {
   ConditionalBranch,
   UnconditionalBranch,
   IndirectBranch,
+  Trap,
   Return,
 };
 
