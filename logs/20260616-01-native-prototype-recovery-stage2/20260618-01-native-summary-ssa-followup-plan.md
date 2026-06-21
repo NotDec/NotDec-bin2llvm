@@ -997,3 +997,50 @@ llvm-as + opt verify: passed
 - 实现效果：8/10。native lowering 的 block body 现在由 native block range 决定，进一步减少了 pcode 顺序假设。
 - 理解成本：3/10。新增 `BlockEnds`，但和 `BlockStarts` 并行，含义清楚。
 - 维护成本：3/10。generic pcode 路径保持旧逻辑；native 路径依赖 discovery range facts。
+
+## 实现记录：native terminator lowering 去掉顺序 nextBlock fallback
+
+这次继续收紧 native lowering 里残留的顺序依赖。
+
+之前虽然 native mode 已经优先使用 `BlockRanges` / `BlockSuccessors`，但 `lower(...)` 仍然会先计算 `nextBlock(blockIndex)`，再把它作为 `lowerTerminator(...)` 的 fallback 传下去。这个 fallback 只有在 generic pcode 路径下才应该存在。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:76)
+  - `lower(...)` 在 native 模式下不再提前计算顺序 `nextBlock(blockIndex)` 作为 fallback。
+  - native terminator lowering 收到的 fallback 直接是 `nullptr`。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:280)
+  - `nativeFallthroughBlock(...)` / `nativeConditionalFalseBlock(...)` 继续只认 native CFG facts；找不到就返回空或 `notdec_exit`，不再回退到顺序 next block。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-llvm native_register_summary_test native_register_summary_ssa_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-no-pcode-fallback/fortune-3470-raw.ll
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-no-pcode-fallback-full/fortune.ll --summary-json-out /tmp/notdec-fortune-no-pcode-fallback-full/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-no-pcode-fallback/fortune-3470-raw.ll -o /tmp/notdec-fortune-no-pcode-fallback/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-no-pcode-fallback/fortune-3470-raw.bc -o /tmp/notdec-fortune-no-pcode-fallback/fortune-3470-raw.verified.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-no-pcode-fallback-full/fortune.ll -o /tmp/notdec-fortune-no-pcode-fallback-full/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-no-pcode-fallback-full/fortune.bc -o /tmp/notdec-fortune-no-pcode-fallback-full/fortune.verified.bc
+```
+
+结果：
+
+```text
+confirmed_functions: 25
+basic_blocks: 2369
+instructions: 2908
+0x3470 raw IR still has bb_3748 false edge to bb_374e
+final !notdec.register.access residue: 1
+remaining register access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：8/10。native lowering 的 terminator fallback 现在只剩 native CFG facts，没有顺序块兜底。
+- 理解成本：2/10。只是把 native / generic fallback 边界收紧。
+- 维护成本：2/10。不会影响 generic pcode 路径，也不会影响现有 summary 结果。

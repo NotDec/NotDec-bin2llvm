@@ -73,12 +73,14 @@ public:
       size_t end = BlockEnds[blockIndex];
       Builder.SetInsertPoint(BlockForStart[start]);
       Values.clear();
+      llvm::BasicBlock *nativeFallback = usesNativeCfg() ? nullptr
+                                                         : nextBlock(blockIndex);
 
       bool ended = false;
       for (size_t opIndex = start; opIndex < end; ++opIndex) {
         const PcodeOpView &op = program.Ops[opIndex];
         if (isTerminator(op.Opcode)) {
-          if (!lowerTerminator(blockIndex, opIndex, op, nextBlock(blockIndex),
+          if (!lowerTerminator(blockIndex, opIndex, op, nativeFallback,
                                errorMessage)) {
             return false;
           }
