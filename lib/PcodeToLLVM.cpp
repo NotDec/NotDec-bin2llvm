@@ -78,7 +78,13 @@ public:
       size_t start = BlockStarts[blockIndex];
       size_t end = BlockEnds[blockIndex];
       Builder.SetInsertPoint(BlockForStart[start]);
-      Values.clear();
+      // Native mode may split one machine block into several LLVM blocks for
+      // instruction-internal p-code control flow, e.g. CMOV. These internal
+      // blocks still belong to the same native block, so unique temporaries
+      // computed before the split must remain visible.
+      if (!isInternalPcodeBlock(blockIndex)) {
+        Values.clear();
+      }
       llvm::BasicBlock *nativeFallback = usesNativeCfg() ? nullptr
                                                          : nextBlock(blockIndex);
 
@@ -165,6 +171,16 @@ private:
       }
     }
     return false;
+  }
+
+  std::optional<std::pair<uint64_t, uint64_t>>
+  nativeRangeForAddress(uint64_t address) const {
+    for (const auto &[blockAddress, blockEnd] : Config.BlockRanges) {
+      if (address >= blockAddress && address < blockEnd) {
+        return std::make_pair(blockAddress, blockEnd);
+      }
+    }
+    return std::nullopt;
   }
 
   llvm::BasicBlock *entryBlockForProgram(std::string &errorMessage) {
@@ -275,6 +291,19 @@ private:
     }
   }
 
+  void addNativeBlockStart(std::set<size_t> &starts, size_t start,
+                           uint64_t blockAddress, uint64_t blockEnd,
+                           bool internalPcodeBlock = false) {
+    starts.insert(start);
+    NativeBlockAddressForStart[start] =
+        internalPcodeBlock ? (*CurrentProgramOps)[start].Address : blockAddress;
+    NativeParentBlockAddressForStart[start] = blockAddress;
+    NativeBlockEndForStart[start] = blockEnd;
+    if (internalPcodeBlock) {
+      NativeInternalPcodeStarts.insert(start);
+    }
+  }
+
   bool buildBasicBlocks(const PcodeProgram &program,
                         std::string &errorMessage) {
     std::map<uint64_t, size_t> firstOpForAddress;
@@ -296,9 +325,7 @@ private:
         for (size_t index = 0; index < program.Ops.size(); ++index) {
           uint64_t opAddress = program.Ops[index].Address;
           if (opAddress >= blockAddress && opAddress < blockEnd) {
-            starts.insert(index);
-            NativeBlockAddressForStart[index] = blockAddress;
-            NativeBlockEndForStart[index] = blockEnd;
+            addNativeBlockStart(starts, index, blockAddress, blockEnd);
             foundPcodeInBlock = true;
             break;
           }
@@ -310,6 +337,39 @@ private:
       if (starts.empty() && EmptyNativeBlockAddresses.empty()) {
         errorMessage = "native block ranges do not cover any p-code op";
         return false;
+      }
+      for (size_t index = 0; index < program.Ops.size(); ++index) {
+        const PcodeOpView &op = program.Ops[index];
+        if (!isTerminator(op.Opcode)) {
+          continue;
+        }
+        auto range = nativeRangeForAddress(op.Address);
+        if (!range) {
+          continue;
+        }
+        auto [blockAddress, blockEnd] = *range;
+        if (index + 1 < program.Ops.size() &&
+            program.Ops[index + 1].Address >= blockAddress &&
+            program.Ops[index + 1].Address < blockEnd) {
+          addNativeBlockStart(starts, index + 1, blockAddress, blockEnd,
+                              /*internalPcodeBlock=*/true);
+        }
+        if (auto target = directTarget(op, 0)) {
+          auto targetIt = firstOpForAddress.find(*target);
+          if (targetIt != firstOpForAddress.end() &&
+              *target >= blockAddress && *target < blockEnd) {
+            addNativeBlockStart(starts, targetIt->second, blockAddress,
+                                blockEnd,
+                                /*internalPcodeBlock=*/true);
+          }
+        } else if (auto targetIndex =
+                       relativeTargetIndex(index, op, 0, program.Ops.size())) {
+          uint64_t targetAddress = program.Ops[*targetIndex].Address;
+          if (targetAddress >= blockAddress && targetAddress < blockEnd) {
+            addNativeBlockStart(starts, *targetIndex, blockAddress, blockEnd,
+                                /*internalPcodeBlock=*/true);
+          }
+        }
       }
     }
     if (!usesNativeCfg()) {
@@ -392,7 +452,16 @@ private:
     }
 
     uint64_t blockEndAddress = rangeIt->second;
-    uint64_t blockStartAddress = blockAddressForStart(start);
+    uint64_t blockStartAddress = parentBlockAddressForIndex(blockIndex);
+    if (blockIndex + 1 < BlockStarts.size()) {
+      size_t nextStart = BlockStarts[blockIndex + 1];
+      auto nextRangeIt = NativeBlockEndForStart.find(nextStart);
+      if (nextRangeIt != NativeBlockEndForStart.end() &&
+          nextRangeIt->second == blockEndAddress &&
+          (*CurrentProgramOps)[nextStart].Address < blockEndAddress) {
+        return nextStart;
+      }
+    }
     size_t end = start;
     while (end < program.Ops.size() &&
            program.Ops[end].Address >= blockStartAddress &&
@@ -414,6 +483,19 @@ private:
     return blockAddressForStart(BlockStarts[blockIndex]);
   }
 
+  uint64_t parentBlockAddressForIndex(size_t blockIndex) const {
+    size_t start = BlockStarts[blockIndex];
+    auto it = NativeParentBlockAddressForStart.find(start);
+    if (it != NativeParentBlockAddressForStart.end()) {
+      return it->second;
+    }
+    return blockAddressForStart(start);
+  }
+
+  bool isInternalPcodeBlock(size_t blockIndex) const {
+    return NativeInternalPcodeStarts.count(BlockStarts[blockIndex]) != 0;
+  }
+
   llvm::BasicBlock *nextBlock(size_t blockIndex) {
     if (blockIndex + 1 >= BlockStarts.size()) {
       return nullptr;
@@ -421,9 +503,35 @@ private:
     return BlockForStart[BlockStarts[blockIndex + 1]];
   }
 
+  llvm::BasicBlock *internalPcodeContinuation(size_t blockIndex,
+                                              size_t opIndex) {
+    if (!usesNativeCfg() || opIndex + 1 >= CurrentProgramOps->size()) {
+      return nullptr;
+    }
+    auto blockIt = BlockForStart.find(opIndex + 1);
+    if (blockIt == BlockForStart.end()) {
+      return nullptr;
+    }
+    auto rangeIt = NativeBlockEndForStart.find(BlockStarts[blockIndex]);
+    if (rangeIt == NativeBlockEndForStart.end()) {
+      return nullptr;
+    }
+    uint64_t parentAddress = parentBlockAddressForIndex(blockIndex);
+    uint64_t blockEnd = rangeIt->second;
+    uint64_t nextAddress = (*CurrentProgramOps)[opIndex + 1].Address;
+    if (nextAddress < parentAddress || nextAddress >= blockEnd) {
+      return nullptr;
+    }
+    return blockIt->second;
+  }
+
   bool nativeFallthroughBlock(size_t blockIndex, llvm::BasicBlock *&result,
                               std::string &errorMessage) {
     result = nullptr;
+    if (isInternalPcodeBlock(blockIndex)) {
+      result = nextBlock(blockIndex);
+      return true;
+    }
     uint64_t blockAddress = blockAddressForIndex(blockIndex);
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
@@ -457,6 +565,10 @@ private:
                                    llvm::BasicBlock *&result,
                                    std::string &errorMessage) {
     result = nullptr;
+    if (isInternalPcodeBlock(blockIndex)) {
+      result = fallback;
+      return true;
+    }
     uint64_t blockAddress = blockAddressForIndex(blockIndex);
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
@@ -736,12 +848,18 @@ private:
       }
       llvm::BasicBlock *falseBlock = fallthrough ? fallthrough : exitBlock();
       if (trueAddress) {
-        llvm::BasicBlock *nativeFalseBlock = nullptr;
-        if (!nativeConditionalFalseBlock(blockIndex, *trueAddress, falseBlock,
-                                         nativeFalseBlock, errorMessage)) {
-          return false;
+        if (llvm::BasicBlock *internalContinuation =
+                internalPcodeContinuation(blockIndex, opIndex)) {
+          falseBlock = internalContinuation;
+        } else {
+          llvm::BasicBlock *nativeFalseBlock = nullptr;
+          if (!nativeConditionalFalseBlock(blockIndex, *trueAddress, falseBlock,
+                                           nativeFalseBlock, errorMessage)) {
+            return false;
+          }
+          falseBlock =
+              nativeFalseBlock != nullptr ? nativeFalseBlock : exitBlock();
         }
-        falseBlock = nativeFalseBlock != nullptr ? nativeFalseBlock : exitBlock();
       }
       Builder.CreateCondBr(asCondition(read(op.Inputs[1])), trueBlock,
                            falseBlock);
@@ -1734,7 +1852,9 @@ private:
   std::vector<size_t> BlockStarts;
   std::vector<size_t> BlockEnds;
   std::unordered_map<size_t, uint64_t> NativeBlockAddressForStart;
+  std::unordered_map<size_t, uint64_t> NativeParentBlockAddressForStart;
   std::unordered_map<size_t, uint64_t> NativeBlockEndForStart;
+  std::set<size_t> NativeInternalPcodeStarts;
   std::unordered_map<size_t, llvm::BasicBlock *> BlockForStart;
   std::unordered_map<uint64_t, llvm::BasicBlock *> BlockForAddress;
   std::unordered_map<uint64_t, llvm::BasicBlock *> TailJumpBlockForAddress;

@@ -2952,3 +2952,123 @@ extra_instruction_edges: 0
 - 实现效果：8/10。fortune 上 decoded instruction、block coverage、flow facts 三者一致。
 - 理解成本：4/10。多了一个后置 analyzer，但职责清楚：不 decode，只整理 facts。
 - 维护成本：3/10。当前 coverage 查询是线性扫描，真实大二进制上后续可能需要区间索引优化。
+
+## 计划：native lowering 支持指令内部 p-code 控制流
+
+继续看 fortune 的 lowered IR，发现 `0x2aad: CMOVNZ R8,RAX` 被降成：
+
+```text
+bb_2aad:
+  br i1 poison, label %notdec_exit, label %bb_2ab1
+```
+
+低层 p-code 是：
+
+```text
+CBRANCH (ram,0x2ab1,8) <cond>
+(register,0x80,8) = COPY <old RAX>
+```
+
+这不是机器级条件跳转，而是单条 `CMOVNZ` 指令内部的“条件跳过 COPY”。当前
+`PcodeToLLVM` 把所有 p-code `CBRANCH/BRANCH` 都当成 LLVM basic block terminator，导致
+`COPY` 被丢掉，语义错误。
+
+目标：
+
+- 机器级 CFG 继续只来自 native instruction/block facts。
+- `PcodeToLLVM` 在 native block 内允许 p-code 内部控制流，不能把这类 `CBRANCH` 解释成函数
+  CFG 边。
+- 对 `CMOV` 这类条件执行指令，至少不能把条件写错成无条件或直接跳 exit。
+
+技术路线：
+
+- 在 native lowering 的 `buildBasicBlocks(...)` 里，保留 native block start/end，同时为
+  native block 内部的 p-code branch target 和 fallthrough continuation 增加内部 block start。
+- `CBRANCH` 如果目标地址是当前 native block end 或当前 native block 内地址，false 分支应指向
+  下一条 p-code op 的内部 block，而不是 `exitBlock()`。
+- `BRANCH` 如果目标是当前 native block 内部地址，降成内部 block 跳转；如果目标是 native block
+  外部，仍按现有机器 CFG/tail call 规则处理。
+- native block 的最终 successor 仍通过 `BlockSuccessors` 校验，不能重新退回 p-code 顺序猜函数 CFG。
+
+风险：
+
+- 这个改动会让一个 native basic block 对应多个 LLVM basic block，后续 summary SSA 要继续依赖
+  LLVM CFG 正常工作。
+- 需要避免把真正的机器条件分支也当成指令内部控制流；判断边界必须基于 native block range 和
+  successor facts，而不是单看 p-code opcode。
+
+判断标准：
+
+- fortune 的 `bb_2aad` 不再跳到 `notdec_exit`，且 `CMOVNZ` 的 COPY 路径保留下来。
+- `pcode_to_llvm_test` 增加覆盖 native block 内部 CBRANCH 的用例。
+- fortune 仍能 `llvm-as` 和 `opt -passes=verify`，summary 链路仍通过核心测试。
+
+实现记录：
+
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:81)
+  在 native mode 下区分 native block 和 instruction-internal p-code block。内部 p-code
+  block 不清空 `Values`，否则同一条机器指令前面算出的 `unique` 临时值会在后续内部 block
+  里变成 poison。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:294)
+  增加 `addNativeBlockStart(...)`，记录 LLVM block 对应的显示地址、父 native block 地址、
+  native block end，以及是否是内部 p-code block。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:341)
+  在 `buildBasicBlocks(...)` 中为 native block 内 terminator 的 continuation 和同块 target
+  增加内部 block start。机器级 CFG 仍来自 native block facts。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:455)
+  `blockEndForStart(...)` 对内部 block 使用父 native block 的地址范围，修复同一条机器指令里
+  `CBRANCH` 后续 p-code 仍是同地址时被误判为空 block 的问题。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:506)
+  增加 `internalPcodeContinuation(...)`，`CBRANCH` 的 false path 优先跳到同 native block 内的
+  p-code continuation。
+- [tests/pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:665)
+  增加 `testNativeInternalConditionalKeepsSkippedPcode()`，覆盖 `CBRANCH` 跳过同一 native block
+  内 p-code 的情况，确保内部 block 不是空跳转。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_analysis_facts_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-internal-pcode/summary.json \
+  -o /tmp/notdec-fortune-internal-pcode/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-internal-pcode/fortune.ll \
+  -o /tmp/notdec-fortune-internal-pcode/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-internal-pcode/fortune.bc \
+  -o /tmp/notdec-fortune-internal-pcode/fortune.verified.bc
+```
+
+结果：
+
+- 核心测试通过。
+- fortune 默认 summary 链路通过 `llvm-as` 和 verifier，耗时 `10.62 sec`。
+- 用 `--no-register-ssa-pass --no-instcombine-pass` 看原始 lowering，`0x2aad: CMOVNZ R8,RAX`
+  已经变成：
+
+```llvm
+bb_2aad:
+  br i1 %816, label %bb_2ab1, label %bb_2aad2
+
+bb_2aad2:
+  store i64 %unique_39b00_8401, ptr @R8, align 4, !notdec.register.access !106
+  br label %bb_2ab1
+```
+
+后续观察：
+
+- 最终 summary SSA 后 `bb_2aad2` 变空，是因为 R8 的 store 被寄存器消除链路判断为无后续使用。
+- 最终 IR 里还有部分条件分支变成 `poison`，这是 summary/flag 处理的后续问题，不是这次
+  p-code 内部控制流切块的问题。
+
+评分：
+
+- 实现效果：8/10。原始 lowering 语义修正，fortune 和测试通过。
+- 理解成本：5/10。`PcodeToLLVM` 现在允许一个 native block 拆成多个 LLVM block，需要记住
+  “父 native block”和“内部 p-code block”的区别。
+- 维护成本：4/10。逻辑仍集中在 lowering 层，后续如果支持更复杂的 p-code 内部 merge，可能需要
+  给 `unique` 临时值补 PHI。

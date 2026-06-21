@@ -50,6 +50,16 @@ notdec::bin2llvm::PcodeOpView copyOp(uint64_t address) {
   return op;
 }
 
+notdec::bin2llvm::PcodeOpView copyFromUnknownUniqueOp(uint64_t address) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  op.OpcodeName = "COPY";
+  op.Output = uniqueVarnode(0x300, 8);
+  op.Inputs.push_back(uniqueVarnode(0x200, 8));
+  return op;
+}
+
 notdec::bin2llvm::PcodeOpView returnOp(uint64_t address) {
   notdec::bin2llvm::PcodeOpView op;
   op.Address = address;
@@ -652,6 +662,73 @@ bool testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor() {
                 "module failed verifier after outside true conditional");
 }
 
+bool testNativeInternalConditionalKeepsSkippedPcode() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(cbranchOp(0x1000, 0x1001));
+  program.Ops.push_back(copyFromUnknownUniqueOp(0x1000));
+  program.Ops.push_back(returnOp(0x1001));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_internal_conditional";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x1001, 0x1002);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x1001});
+  config.BlockSuccessors.emplace(0x1001, std::vector<uint64_t>{});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr,
+              "internal conditional function is missing")) {
+    return false;
+  }
+
+  bool hasInternalBlock = false;
+  bool internalBlockHasCopyWork = false;
+  bool entryBranchesToNativeSuccessor = false;
+  bool entryBranchesToInternalBlock = false;
+  for (llvm::BasicBlock &block : *function) {
+    bool isInternalBlock =
+        block.getName().starts_with("bb_1000") && block.getName() != "bb_1000";
+    hasInternalBlock |= isInternalBlock;
+    if (isInternalBlock) {
+      for (llvm::Instruction &inst : block) {
+        internalBlockHasCopyWork |= !inst.isTerminator();
+      }
+    }
+
+    if (block.getName() == "bb_1000") {
+      auto *branch = llvm::dyn_cast<llvm::BranchInst>(block.getTerminator());
+      if (branch != nullptr && branch->isConditional()) {
+        for (unsigned index = 0; index < branch->getNumSuccessors(); ++index) {
+          llvm::StringRef name = branch->getSuccessor(index)->getName();
+          entryBranchesToNativeSuccessor |= name == "bb_1001";
+          entryBranchesToInternalBlock |=
+              name.starts_with("bb_1000") && name != "bb_1000";
+        }
+      }
+    }
+  }
+
+  return expect(hasInternalBlock,
+                "native internal conditional did not create an internal block") &&
+         expect(internalBlockHasCopyWork,
+                "native internal conditional dropped skipped p-code") &&
+         expect(entryBranchesToNativeSuccessor,
+                "native internal conditional lost true native successor") &&
+         expect(entryBranchesToInternalBlock,
+                "native internal conditional lost false internal continuation") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after internal conditional lowering");
+}
+
 bool testNativeConditionalSuccessorsRejectMultipleFalseTargets() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -806,6 +883,7 @@ int main() {
   ok &= testNativeConditionalSuccessorsRequireTrueTarget();
   ok &= testNativeConditionalRequiresSuccessorFacts();
   ok &= testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor();
+  ok &= testNativeInternalConditionalKeepsSkippedPcode();
   ok &= testNativeConditionalSuccessorsRejectMultipleFalseTargets();
   ok &= testNativeIndirectBranchCanUseSingleSuccessor();
   ok &= testNativeIndirectBranchRequiresSuccessorFacts();
