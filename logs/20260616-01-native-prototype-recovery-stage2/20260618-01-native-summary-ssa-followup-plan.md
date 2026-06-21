@@ -1496,3 +1496,56 @@ llvm-as + opt verify: passed
 - 实现效果：6/10。补上 empty block 支持后的入口选择缺口。
 - 理解成本：1/10。入口选择和 native block fact 对齐。
 - 维护成本：1/10。没有新增状态。
+
+## 实现记录：native 多 successor block 必须有 terminator
+
+native lowering 里还有一个会隐藏 CFG 问题的点：一个 block 的 p-code 没有 terminator 时，会走 `nativeFallthroughBlock(...)`。如果 native `BlockSuccessors` 有多个 successor，之前会当成没有 successor，最后生成 `ret void`。
+
+这次只收紧多个 successor 的情况：
+
+- 0 successor：仍允许，常见于 no-return call 或函数出口。
+- 1 successor：正常 fallthrough 到这个 native successor。
+- 大于 1 successor：必须由 p-code terminator 处理；如果走到这里就报错。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:424)
+  - `nativeFallthroughBlock(...)` 对 `BlockSuccessors.size() > 1` 报错：`successors but no p-code terminator`。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:443)
+  - 增加 `testNativeMultipleSuccessorsRequireTerminator()`。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test notdec-native-llvm native_register_summary_test native_register_summary_ssa_test native_analysis_facts_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-strict-successors/fortune.ll --summary-json-out /tmp/notdec-fortune-strict-successors/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-strict-successors-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-strict-successors/fortune.ll -o /tmp/notdec-fortune-strict-successors/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-strict-successors/fortune.bc -o /tmp/notdec-fortune-strict-successors/fortune.verify.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-strict-successors-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-strict-successors-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-strict-successors-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-strict-successors-raw/fortune-3470-raw.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 9.51s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 109
+final !notdec.register.access residue: 1
+remaining !notdec.register.access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：5/10。只收紧一个错误兜底，但能防止多分支 CFG 被误降成函数出口。
+- 理解成本：1/10。规则直接对应 native successor 数量。
+- 维护成本：1/10。没有新增状态。

@@ -430,8 +430,16 @@ private:
       result = usesNativeCfg() ? nullptr : nextBlock(blockIndex);
       return true;
     }
-    if (successorIt->second.size() != 1) {
+    if (successorIt->second.empty()) {
       return true;
+    }
+    if (successorIt->second.size() > 1) {
+      std::ostringstream os;
+      os << "native block 0x" << std::hex << blockAddress << " has "
+         << std::dec << successorIt->second.size()
+         << " successors but no p-code terminator";
+      errorMessage = os.str();
+      return false;
     }
     result = blockForNativeTarget(successorIt->second.front(), errorMessage);
     return result != nullptr;

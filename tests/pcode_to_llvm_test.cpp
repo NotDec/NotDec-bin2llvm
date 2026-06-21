@@ -440,6 +440,32 @@ bool testNativeSuccessorRequiresKnownBlock() {
                 "missing native successor error was not reported");
 }
 
+bool testNativeMultipleSuccessorsRequireTerminator() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(copyOp(0x1000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_multiple_successors_without_terminator";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockRanges.emplace(0x3000, 0x3001);
+  config.BlockSuccessors.emplace(0x1000,
+                                 std::vector<uint64_t>{0x2000, 0x3000});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native block with multiple successors and no terminator "
+                "should fail") &&
+         expect(errorMessage.find("successors but no p-code terminator") !=
+                    std::string::npos,
+                "missing native terminator error was not reported");
+}
+
 } // namespace
 
 int main() {
@@ -454,5 +480,6 @@ int main() {
   ok &= testNativeDirectBranchCanTargetEmptyBlock();
   ok &= testNativeEntryAddressCanTargetEmptyBlock();
   ok &= testNativeSuccessorRequiresKnownBlock();
+  ok &= testNativeMultipleSuccessorsRequireTerminator();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
