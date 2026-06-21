@@ -3465,3 +3465,69 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：5/10。修的是前段 facts 的一个小口子，不改变 fortune 最终 residue，但减少了隐式 CFG 猜测。
 - 理解成本：1/10。规则直接：只有 `Fallthrough` 才表示普通顺序边。
 - 维护成本：1/10。没有新增状态，只是让两个已有位置消费同一个 instruction fact。
+
+## 实现记录：native relative target 必须对应真实 block
+
+背景：
+
+- 继续检查 `PcodeToLLVM` 后，发现 relative `BRANCH/CBRANCH` 还有一个旧兜底：
+  如果 relative target op 没有对应 native block，会通过 `blockForTarget()` 创建 synthetic block。
+- 这会掩盖一种 facts 不一致：branch target 地址落在某个 native block 中间，但 `BlockRanges` 没有
+  以这个地址开始的 block。
+- 调试时还发现 `buildBasicBlocks(...)` 会对所有 terminator 解析 relative target，导致
+  `RETURN const 0` 被误当成 relative target，并把 native block 地址映射覆盖成 p-code op 地址。
+
+实现：
+
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:357)
+  `buildBasicBlocks(...)` 只有 `BRANCH` / `CBRANCH` 才解析 direct / relative target 并创建
+  internal p-code block start。`RETURN` / `BRANCHIND` 不再参与这个逻辑。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:727)
+  `nativeDirectBranchTarget(...)` 增加 target block 一致性检查：native target 地址必须能在
+  `BlockForAddress` 中找到同一个 LLVM block；同一机器指令内的 internal p-code target 继续豁免。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:792)
+  `blockForRelativeTarget(...)` 在 native 模式下不再调用 `blockForTarget()` 创建 synthetic block。
+  relative target op 如果不是一个真实 native block start 或 internal p-code block，直接报错。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:936)
+  relative `CBRANCH` 复用 `blockForRelativeTarget(...)`，避免和 relative `BRANCH` 走两套规则。
+- [tests/pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:109)
+  增加 `relativeCbranchOp(...)` 测试 helper。
+- [tests/pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:474)
+  增加 `testNativeRelativeBranchRequiresNativeTargetBlock()`。
+- [tests/pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:712)
+  增加 `testNativeRelativeConditionalRequiresNativeTargetBlock()`。
+
+验证：
+
+```text
+cmake --build build --target pcode_to_llvm_test -j$(nproc)
+build/bin/pcode_to_llvm_test
+cmake --build build --target native_analysis_facts_test native_register_summary_test native_register_summary_ssa_test -j$(nproc)
+build/bin/native_analysis_facts_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+cmake --build build --target notdec-native-llvm -j$(nproc)
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-relative-target-facts/summary.json \
+  -o /tmp/notdec-fortune-relative-target-facts/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-relative-target-facts/fortune.ll \
+  -o /tmp/notdec-fortune-relative-target-facts/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-relative-target-facts/fortune.bc \
+  -o /tmp/notdec-fortune-relative-target-facts/fortune.verify.bc
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.45 sec`。
+- `!notdec.register.access` 数量为 0。
+- register global store 数量为 0。
+- register global load 数量为 6，仍是 `summary_ssa.entry` load。
+- `br i1 poison`、`ret ... poison`、`store ... ptr poison` 数量为 0。
+
+评分：
+
+- 实现效果：6/10。堵住 relative branch 通过 p-code op 顺序创建 synthetic target block 的路径。
+- 理解成本：2/10。规则仍然简单：native target 必须来自 native block facts，internal p-code target 例外。
+- 维护成本：2/10。改动集中在 lowering target 校验和测试，没有新增外部状态。

@@ -354,20 +354,23 @@ private:
           addNativeBlockStart(starts, index + 1, blockAddress, blockEnd,
                               /*internalPcodeBlock=*/true);
         }
-        if (auto target = directTarget(op, 0)) {
-          auto targetIt = firstOpForAddress.find(*target);
-          if (targetIt != firstOpForAddress.end() &&
-              *target >= blockAddress && *target < blockEnd) {
-            addNativeBlockStart(starts, targetIt->second, blockAddress,
-                                blockEnd,
-                                /*internalPcodeBlock=*/true);
-          }
-        } else if (auto targetIndex =
-                       relativeTargetIndex(index, op, 0, program.Ops.size())) {
-          uint64_t targetAddress = program.Ops[*targetIndex].Address;
-          if (targetAddress >= blockAddress && targetAddress < blockEnd) {
-            addNativeBlockStart(starts, *targetIndex, blockAddress, blockEnd,
-                                /*internalPcodeBlock=*/true);
+        if (op.Opcode == PcodeOpcode::Branch ||
+            op.Opcode == PcodeOpcode::CBranch) {
+          if (auto target = directTarget(op, 0)) {
+            auto targetIt = firstOpForAddress.find(*target);
+            if (targetIt != firstOpForAddress.end() &&
+                *target >= blockAddress && *target < blockEnd) {
+              addNativeBlockStart(starts, targetIt->second, blockAddress,
+                                  blockEnd,
+                                  /*internalPcodeBlock=*/true);
+            }
+          } else if (auto targetIndex = relativeTargetIndex(
+                         index, op, 0, program.Ops.size())) {
+            uint64_t targetAddress = program.Ops[*targetIndex].Address;
+            if (targetAddress >= blockAddress && targetAddress < blockEnd) {
+              addNativeBlockStart(starts, *targetIndex, blockAddress, blockEnd,
+                                  /*internalPcodeBlock=*/true);
+            }
           }
         }
       }
@@ -727,6 +730,15 @@ private:
     if (!usesNativeCfg() || isInternalPcodeTarget(blockIndex, targetBlock)) {
       return true;
     }
+    auto targetBlockIt = BlockForAddress.find(target);
+    if (targetBlockIt == BlockForAddress.end() ||
+        targetBlockIt->second != targetBlock) {
+      std::ostringstream os;
+      os << "native branch target 0x" << std::hex << target
+         << " is missing a native block";
+      errorMessage = os.str();
+      return false;
+    }
     uint64_t blockAddress = blockAddressForIndex(blockIndex);
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
@@ -779,7 +791,8 @@ private:
 
   llvm::BasicBlock *blockForRelativeTarget(size_t opIndex,
                                            const PcodeOpView &op,
-                                           size_t inputIndex) {
+                                           size_t inputIndex,
+                                           std::string &errorMessage) {
     auto targetIndex = relativeTargetIndex(opIndex, op, inputIndex,
                                            CurrentProgramOps->size());
     if (!targetIndex) {
@@ -787,7 +800,26 @@ private:
     }
     auto it = BlockForStart.find(*targetIndex);
     if (it != BlockForStart.end()) {
+      if (usesNativeCfg()) {
+        uint64_t targetAddress = (*CurrentProgramOps)[*targetIndex].Address;
+        uint64_t targetBlockAddress = blockAddressForStart(*targetIndex);
+        if (targetBlockAddress != targetAddress) {
+          std::ostringstream os;
+          os << "native relative branch target 0x" << std::hex
+             << targetAddress << " is missing a native block";
+          errorMessage = os.str();
+          return nullptr;
+        }
+      }
       return it->second;
+    }
+    if (usesNativeCfg()) {
+      std::ostringstream os;
+      os << "native relative branch target 0x" << std::hex
+         << (*CurrentProgramOps)[*targetIndex].Address
+         << " is missing a native block";
+      errorMessage = os.str();
+      return nullptr;
     }
     return blockForTarget((*CurrentProgramOps)[*targetIndex].Address);
   }
@@ -849,9 +881,12 @@ private:
       auto relativeIndex =
           relativeTargetIndex(opIndex, op, 0, CurrentProgramOps->size());
       llvm::BasicBlock *relativeTarget =
-          relativeIndex ? blockForRelativeTarget(opIndex, op, 0) : nullptr;
+          relativeIndex ? blockForRelativeTarget(opIndex, op, 0, errorMessage)
+                        : nullptr;
       if (relativeTarget == nullptr || !relativeIndex) {
-        errorMessage = "BRANCH target must be direct ram or relative const";
+        if (errorMessage.empty()) {
+          errorMessage = "BRANCH target must be direct ram or relative const";
+        }
         return false;
       }
       uint64_t relativeAddress = (*CurrentProgramOps)[*relativeIndex].Address;
@@ -901,24 +936,24 @@ private:
                                                CurrentProgramOps->size());
         if (targetIndex) {
           trueAddress = (*CurrentProgramOps)[*targetIndex].Address;
-          auto it = BlockForStart.find(*targetIndex);
-          trueBlock = it != BlockForStart.end()
-                          ? it->second
-                          : blockForTarget(*trueAddress);
+          trueBlock =
+              blockForRelativeTarget(opIndex, op, 0, errorMessage);
         }
       }
       if (trueBlock == nullptr) {
-        errorMessage = "CBRANCH target must be direct ram or relative const";
+        if (errorMessage.empty()) {
+          errorMessage = "CBRANCH target must be direct ram or relative const";
+        }
         return false;
       }
       llvm::BasicBlock *falseBlock = fallthrough ? fallthrough : exitBlock();
       if (trueAddress) {
+        if (!nativeConditionalTrueTarget(blockIndex, *trueAddress, trueBlock,
+                                         errorMessage)) {
+          return false;
+        }
         if (llvm::BasicBlock *internalContinuation =
                 internalPcodeContinuation(blockIndex, opIndex)) {
-          if (!nativeConditionalTrueTarget(blockIndex, *trueAddress, trueBlock,
-                                           errorMessage)) {
-            return false;
-          }
           falseBlock = internalContinuation;
         } else {
           llvm::BasicBlock *nativeFalseBlock = nullptr;

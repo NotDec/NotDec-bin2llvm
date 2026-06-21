@@ -106,6 +106,17 @@ notdec::bin2llvm::PcodeOpView cbranchOp(uint64_t address, uint64_t target) {
   return op;
 }
 
+notdec::bin2llvm::PcodeOpView relativeCbranchOp(uint64_t address,
+                                                int8_t offset) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::CBranch;
+  op.OpcodeName = "CBRANCH";
+  op.Inputs.push_back(constVarnode(static_cast<uint8_t>(offset), 1));
+  op.Inputs.push_back(constVarnode(1, 1));
+  return op;
+}
+
 notdec::bin2llvm::PcodeOpView branchIndOp(uint64_t address) {
   notdec::bin2llvm::PcodeOpView op;
   op.Address = address;
@@ -460,6 +471,31 @@ bool testNativeRelativeBranchRequiresSuccessorFact() {
                 "missing relative branch successor facts error was not reported");
 }
 
+bool testNativeRelativeBranchRequiresNativeTargetBlock() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(relativeBranchOp(0x1000, 1));
+  program.Ops.push_back(returnOp(0x2001));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_relative_missing_target_block";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2002);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x2001});
+  config.BlockSuccessors.emplace(0x2000, std::vector<uint64_t>{});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native relative branch to missing target block should fail") &&
+         expect(errorMessage.find("missing a native block") !=
+                    std::string::npos,
+                "missing relative target block error was not reported");
+}
+
 bool testNativeEntryAddressCanTargetEmptyBlock() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -646,9 +682,9 @@ bool testNativeConditionalSuccessorsRequireTrueTarget() {
                                          errorMessage);
   return expect(module == nullptr,
                 "native conditional without true successor should fail") &&
-         expect(errorMessage.find("missing true successor") !=
+         expect(errorMessage.find("missing successor 0x2000") !=
                     std::string::npos,
-                "missing true successor error was not reported");
+                "missing conditional true successor error was not reported");
 }
 
 bool testNativeConditionalRequiresSuccessorFacts() {
@@ -671,6 +707,33 @@ bool testNativeConditionalRequiresSuccessorFacts() {
          expect(errorMessage.find("missing successor facts") !=
                     std::string::npos,
                 "missing successor facts error was not reported");
+}
+
+bool testNativeRelativeConditionalRequiresNativeTargetBlock() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(relativeCbranchOp(0x1000, 1));
+  program.Ops.push_back(returnOp(0x2001));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_relative_conditional_missing_target_block";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2002);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x2001});
+  config.BlockSuccessors.emplace(0x2000, std::vector<uint64_t>{});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native relative conditional to missing target block should "
+                "fail") &&
+         expect(errorMessage.find("missing a native block") !=
+                    std::string::npos,
+                "missing relative conditional target block error was not "
+                "reported");
 }
 
 bool testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor() {
@@ -961,6 +1024,7 @@ int main() {
   ok &= testNativeDirectBranchCanTargetEmptyBlock();
   ok &= testNativeDirectBranchRequiresSuccessorFact();
   ok &= testNativeRelativeBranchRequiresSuccessorFact();
+  ok &= testNativeRelativeBranchRequiresNativeTargetBlock();
   ok &= testNativeEntryAddressCanTargetEmptyBlock();
   ok &= testAllEmptyNativeBlockCanLower();
   ok &= testNativeSuccessorRequiresKnownBlock();
@@ -969,6 +1033,7 @@ int main() {
   ok &= testEmptyNativeBlockRequiresSuccessorFacts();
   ok &= testNativeConditionalSuccessorsRequireTrueTarget();
   ok &= testNativeConditionalRequiresSuccessorFacts();
+  ok &= testNativeRelativeConditionalRequiresNativeTargetBlock();
   ok &= testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor();
   ok &= testNativeInternalConditionalKeepsSkippedPcode();
   ok &= testNativeInternalConditionalRequiresTrueSuccessorFact();
