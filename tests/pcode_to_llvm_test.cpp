@@ -378,6 +378,7 @@ bool testNativeDirectBranchCanTargetEmptyBlock() {
   config.EntryAddress = 0x1000;
   config.BlockRanges.emplace(0x1000, 0x1001);
   config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x2000});
   config.BlockSuccessors.emplace(0x2000, std::vector<uint64_t>{});
 
   std::string errorMessage;
@@ -400,6 +401,29 @@ bool testNativeDirectBranchCanTargetEmptyBlock() {
   return expect(hasEmptyTarget, "native empty target block was not emitted") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
                 "module failed verifier after native empty target lowering");
+}
+
+bool testNativeDirectBranchRequiresSuccessorFact() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(branchOp(0x1000, 0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_direct_missing_successor";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockSuccessors.emplace(0x2000, std::vector<uint64_t>{});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native direct branch without successor fact should fail") &&
+         expect(errorMessage.find("missing successor facts") !=
+                    std::string::npos,
+                "missing direct branch successor facts error was not reported");
 }
 
 bool testNativeEntryAddressCanTargetEmptyBlock() {
@@ -874,6 +898,7 @@ int main() {
   ok &= testNativeEntryAddressChoosesEntryBlock();
   ok &= testNativeDirectBranchOutsideRangesBecomesTailCall();
   ok &= testNativeDirectBranchCanTargetEmptyBlock();
+  ok &= testNativeDirectBranchRequiresSuccessorFact();
   ok &= testNativeEntryAddressCanTargetEmptyBlock();
   ok &= testAllEmptyNativeBlockCanLower();
   ok &= testNativeSuccessorRequiresKnownBlock();

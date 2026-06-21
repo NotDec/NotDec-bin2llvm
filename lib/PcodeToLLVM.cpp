@@ -705,6 +705,48 @@ private:
     return nullptr;
   }
 
+  bool isInternalPcodeTarget(size_t blockIndex, llvm::BasicBlock *targetBlock) {
+    if (targetBlock == nullptr || !usesNativeCfg()) {
+      return false;
+    }
+    for (size_t start : NativeInternalPcodeStarts) {
+      auto blockIt = BlockForStart.find(start);
+      if (blockIt == BlockForStart.end() || blockIt->second != targetBlock) {
+        continue;
+      }
+      auto parentIt = NativeParentBlockAddressForStart.find(start);
+      return parentIt != NativeParentBlockAddressForStart.end() &&
+             parentIt->second == parentBlockAddressForIndex(blockIndex);
+    }
+    return false;
+  }
+
+  bool nativeDirectBranchTarget(size_t blockIndex, uint64_t target,
+                                llvm::BasicBlock *targetBlock,
+                                std::string &errorMessage) {
+    if (!usesNativeCfg() || isInternalPcodeTarget(blockIndex, targetBlock)) {
+      return true;
+    }
+    uint64_t blockAddress = blockAddressForIndex(blockIndex);
+    auto successorIt = Config.BlockSuccessors.find(blockAddress);
+    if (successorIt == Config.BlockSuccessors.end()) {
+      std::ostringstream os;
+      os << "native direct branch block 0x" << std::hex << blockAddress
+         << " is missing successor facts";
+      errorMessage = os.str();
+      return false;
+    }
+    if (std::find(successorIt->second.begin(), successorIt->second.end(),
+                  target) != successorIt->second.end()) {
+      return true;
+    }
+    std::ostringstream os;
+    os << "native direct branch block 0x" << std::hex << blockAddress
+       << " is missing successor 0x" << target;
+    errorMessage = os.str();
+    return false;
+  }
+
   llvm::BasicBlock *
   tailJumpBlockForKnownFunction(uint64_t address,
                                 const std::string &calleeName) {
@@ -784,9 +826,14 @@ private:
             return false;
           }
         }
-        Builder.CreateBr(blockIt != BlockForAddress.end()
-                             ? blockIt->second
-                             : blockForTarget(*target));
+        llvm::BasicBlock *targetBlock =
+            blockIt != BlockForAddress.end() ? blockIt->second
+                                             : blockForTarget(*target);
+        if (!nativeDirectBranchTarget(blockIndex, *target, targetBlock,
+                                      errorMessage)) {
+          return false;
+        }
+        Builder.CreateBr(targetBlock);
         return true;
       }
       llvm::BasicBlock *relativeTarget = blockForRelativeTarget(opIndex, op, 0);

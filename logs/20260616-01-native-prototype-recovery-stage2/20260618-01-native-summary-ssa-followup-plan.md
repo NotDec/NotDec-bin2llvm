@@ -3215,3 +3215,65 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：8/10。no-instcombine 调试模式不再因为 signature rewrite 的跨函数 argument 泄漏失败。
 - 理解成本：4/10。多了一个 moved body 修复步骤，但位置集中在 internal signature rewrite。
 - 维护成本：3/10。逻辑保守：同名同类型才复用新参数，否则降级为 frozen unknown。
+
+## 实现记录：native direct branch 必须匹配 block successor facts
+
+背景：
+
+- 继续检查 `PcodeToLLVM` 后，发现 native mode 下 direct `BRANCH` 还有一处隐含的 p-code CFG
+  依赖：只要 p-code target 已经有 LLVM block，就直接生成 `br`，没有确认这个 target 是否是
+  当前 native block 的 `BlockSuccessors`。
+- 这和当前路线不一致。机器级 CFG 边应该来自 instruction/block facts；p-code target 可以帮助
+  lower 指令语义，但不能单独把两个 native block 连成 CFG。
+
+实现：
+
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:708)
+  增加 `isInternalPcodeTarget(...)`。指令内部 p-code block 仍允许直接跳，因为它属于同一个
+  native block，不是机器级 CFG 边。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:724)
+  增加 `nativeDirectBranchTarget(...)`。native mode 下 direct branch 目标如果不是内部 p-code
+  target，就必须出现在当前 block 的 `BlockSuccessors` 中；缺少 successor facts 或缺少该 successor
+  都直接报错。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:809)
+  direct `BRANCH` lowering 在生成 `br` 前调用 `nativeDirectBranchTarget(...)`。
+- [tests/pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:371)
+  `testNativeDirectBranchCanTargetEmptyBlock()` 明确补上 `0x1000 -> 0x2000` successor fact。
+- [tests/pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:403)
+  增加 `testNativeDirectBranchRequiresSuccessorFact()`，验证 direct branch 不能只凭 p-code target
+  连接到已有 native block。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_analysis_facts_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-strict-branch/summary.json \
+  -o /tmp/notdec-fortune-strict-branch/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-strict-branch/fortune.ll \
+  -o /tmp/notdec-fortune-strict-branch/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-strict-branch/fortune.bc \
+  -o /tmp/notdec-fortune-strict-branch/fortune.verified.bc
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --no-instcombine-pass \
+  --summary-json-out /tmp/notdec-fortune-strict-branch-noinst/summary.json \
+  -o /tmp/notdec-fortune-strict-branch-noinst/fortune.ll
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.43 sec`。
+- fortune `--no-instcombine-pass` 通过 `llvm-as` 和 verifier，耗时 `9.03 sec`。
+- 默认输出中 `br i1 poison`、`ret ... poison`、`store ... ptr poison` 仍为 0。
+
+评分：
+
+- 实现效果：8/10。direct branch 不再靠 p-code target 偷连 native CFG。
+- 理解成本：3/10。逻辑和 conditional/indirect branch 的 successor fact 校验一致。
+- 维护成本：3/10。指令内部 p-code target 有专门豁免，避免影响 CMOV 这类单指令内部控制流。
