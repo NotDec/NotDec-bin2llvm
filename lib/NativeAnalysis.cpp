@@ -1419,6 +1419,99 @@ findNearestLeaBase(const NativeProgramState &state,
   return std::nullopt;
 }
 
+bool writesRegister(const std::string &text, const std::string &reg) {
+  return text.rfind("MOV " + reg + ",", 0) == 0 ||
+         text.rfind("LEA " + reg + ",", 0) == 0 ||
+         text.rfind("POP " + reg, 0) == 0;
+}
+
+const NativeBasicBlock *functionBlockContaining(const NativeFunction &function,
+                                                uint64_t address) {
+  for (const NativeBasicBlock &block : function.Blocks) {
+    if (block.Start <= address && address < block.End) {
+      return &block;
+    }
+  }
+  return nullptr;
+}
+
+std::vector<const NativeBasicBlock *>
+functionPredecessorBlocks(const NativeFunction &function, uint64_t blockStart) {
+  std::vector<const NativeBasicBlock *> predecessors;
+  for (const NativeBasicBlock &block : function.Blocks) {
+    if (std::find(block.Successors.begin(), block.Successors.end(),
+                  blockStart) != block.Successors.end()) {
+      predecessors.push_back(&block);
+    }
+  }
+  return predecessors;
+}
+
+std::optional<uint64_t> findNearestLeaBaseInBlockRange(
+    const NativeProgramState &state, const NativeBasicBlock &block,
+    uint64_t beforeAddress, const std::string &reg) {
+  std::vector<const NativeInstruction *> instructions =
+      state.instructionsInRange(block.Start, beforeAddress);
+  const std::string prefix = "LEA " + reg + ",[0x";
+  for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
+       ++iterator) {
+    const std::string &text = (*iterator)->Mnemonic;
+    if (text.rfind(prefix, 0) == 0 && !text.empty() && text.back() == ']') {
+      return parseHex(text.substr(prefix.size(),
+                                  text.size() - prefix.size() - 1));
+    }
+    if (writesRegister(text, reg)) {
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+// Linear address order misses wrappers where a later block initializes a base
+// register and then jumps back into a tail-call block.  Follow only a unique
+// predecessor chain so we do not guess through CFG merges.
+std::optional<uint64_t> findNearestLeaBaseInFunctionCFGFromBlock(
+    const NativeProgramState &state, const NativeFunction &function,
+    const NativeBasicBlock &block,
+    uint64_t beforeAddress, const std::string &reg,
+    std::set<uint64_t> visitedBlocks) {
+  uint64_t scanEnd = beforeAddress < block.End ? beforeAddress : block.End;
+  if (auto base = findNearestLeaBaseInBlockRange(state, block, scanEnd, reg)) {
+    return base;
+  }
+
+  if (!visitedBlocks.insert(block.Start).second) {
+    return std::nullopt;
+  }
+
+  std::vector<const NativeBasicBlock *> predecessors =
+      functionPredecessorBlocks(function, block.Start);
+  if (predecessors.empty()) {
+    return std::nullopt;
+  }
+
+  const NativeBasicBlock *predecessor = predecessors.front();
+  for (const NativeBasicBlock *candidate : predecessors) {
+    if (candidate->Start > predecessor->Start) {
+      predecessor = candidate;
+    }
+  }
+  return findNearestLeaBaseInFunctionCFGFromBlock(
+      state, function, *predecessor, predecessor->End, reg, visitedBlocks);
+}
+
+std::optional<uint64_t> findNearestLeaBaseInFunctionCFG(
+    const NativeProgramState &state, const NativeFunction &function,
+    uint64_t beforeAddress, const std::string &reg,
+    std::set<uint64_t> &visitedBlocks) {
+  const NativeBasicBlock *block = functionBlockContaining(function, beforeAddress);
+  if (block == nullptr) {
+    return std::nullopt;
+  }
+  return findNearestLeaBaseInFunctionCFGFromBlock(
+      state, function, *block, beforeAddress, reg, visitedBlocks);
+}
+
 std::string low32RegisterName(const std::string &reg) {
   if (reg == "RAX") {
     return "EAX";
@@ -1623,6 +1716,44 @@ struct X86IndirectMemoryTarget {
 };
 
 std::optional<X86IndirectMemoryTarget>
+parseX86RegisterMemoryTarget(const std::string &text,
+                             const std::string &mnemonic,
+                             const std::string &destReg) {
+  const std::string prefix = mnemonic + " " + destReg + ",qword ptr [";
+  if (text.rfind(prefix, 0) != 0 || text.empty() || text.back() != ']') {
+    return std::nullopt;
+  }
+
+  std::string inner = trimAsciiWhitespace(
+      text.substr(prefix.size(), text.size() - prefix.size() - 1));
+  if (inner.empty()) {
+    return std::nullopt;
+  }
+
+  X86IndirectMemoryTarget target;
+  size_t plus = inner.find('+');
+  if (plus == std::string::npos) {
+    target.BaseReg = trimAsciiWhitespace(inner);
+    if (target.BaseReg.empty()) {
+      return std::nullopt;
+    }
+    return target;
+  }
+
+  target.BaseReg = trimAsciiWhitespace(inner.substr(0, plus));
+  if (target.BaseReg.empty()) {
+    return std::nullopt;
+  }
+  std::string displacementText = trimAsciiWhitespace(inner.substr(plus + 1));
+  std::optional<uint64_t> displacement = parseUnsignedNumber(displacementText);
+  if (!displacement) {
+    return std::nullopt;
+  }
+  target.Displacement = *displacement;
+  return target;
+}
+
+std::optional<X86IndirectMemoryTarget>
 parseX86IndirectMemoryTarget(const std::string &text,
                              const std::string &mnemonic) {
   const std::string prefix = mnemonic + " qword ptr [";
@@ -1676,9 +1807,7 @@ std::optional<uint64_t> findNearestLeaBaseInDecodedInstructions(
     if (auto address = parseX86LeaAbsoluteBase(text, reg)) {
       return address;
     }
-    if (text.rfind("MOV " + reg + ",", 0) == 0 ||
-        text.rfind("LEA " + reg + ",", 0) == 0 ||
-        text.rfind("POP " + reg, 0) == 0) {
+    if (writesRegister(text, reg)) {
       return std::nullopt;
     }
   }
@@ -1702,9 +1831,49 @@ std::optional<uint64_t> findNearestLeaBaseInKnownFallthroughInstructions(
     if (auto address = parseX86LeaAbsoluteBase(text, reg)) {
       return address;
     }
-    if (text.rfind("MOV " + reg + ",", 0) == 0 ||
-        text.rfind("LEA " + reg + ",", 0) == 0 ||
-        text.rfind("POP " + reg, 0) == 0) {
+    if (writesRegister(text, reg)) {
+      return std::nullopt;
+    }
+    expectedNext = instruction.Address;
+  }
+  return std::nullopt;
+}
+
+std::optional<X86IndirectMemoryTarget>
+findNearestRegisterLoadInDecodedInstructions(
+    const std::vector<NativeInstruction> &instructions, size_t beforeIndex,
+    const std::string &reg) {
+  for (size_t index = beforeIndex; index > 0; --index) {
+    const std::string &text = instructions[index - 1].Mnemonic;
+    if (auto target = parseX86RegisterMemoryTarget(text, "MOV", reg)) {
+      return target;
+    }
+    if (writesRegister(text, reg)) {
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<X86IndirectMemoryTarget>
+findNearestRegisterLoadInKnownFallthroughInstructions(
+    const NativeProgramState &state, uint64_t beforeAddress,
+    const std::string &reg) {
+  uint64_t start = beforeAddress > 64 ? beforeAddress - 64 : 0;
+  std::vector<const NativeInstruction *> instructions =
+      state.instructionsInRange(start, beforeAddress);
+  uint64_t expectedNext = beforeAddress;
+  for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
+       ++iterator) {
+    const NativeInstruction &instruction = **iterator;
+    if (!isInstructionFallthroughTo(instruction, expectedNext)) {
+      return std::nullopt;
+    }
+    const std::string &text = instruction.Mnemonic;
+    if (auto target = parseX86RegisterMemoryTarget(text, "MOV", reg)) {
+      return target;
+    }
+    if (writesRegister(text, reg)) {
       return std::nullopt;
     }
     expectedNext = instruction.Address;
@@ -1871,6 +2040,89 @@ matchX86ExternalFunctionPointerInstruction(
   }
 
   const NativeInstruction &instruction = instructions[index];
+  auto matchExternalPointer = [&](std::optional<uint64_t> base,
+                                  uint64_t displacement,
+                                  NativeXrefKind kind)
+      -> std::optional<X86ExternalFunctionPointerMatch> {
+    if (!base || *base > std::numeric_limits<uint64_t>::max() - displacement) {
+      return std::nullopt;
+    }
+    X86ExternalFunctionPointerMatch match;
+    match.SlotAddress = *base + displacement;
+    match.Kind = kind;
+    if (isExternalFunctionPointerRelocationAt(state, match.SlotAddress)) {
+      return match;
+    }
+    return std::nullopt;
+  };
+
+  std::optional<std::string> regJump =
+      parseX86RegisterAfterPrefix(instruction.Mnemonic, "JMP ");
+  if (!regJump) {
+    regJump = parseX86RegisterAfterPrefix(instruction.Mnemonic, "CALL ");
+  }
+  if (regJump) {
+    std::optional<X86IndirectMemoryTarget> loadTarget =
+        findNearestRegisterLoadInDecodedInstructions(instructions, index,
+                                                     *regJump);
+    if (!loadTarget) {
+      loadTarget = findNearestRegisterLoadInKnownFallthroughInstructions(
+          state, instruction.Address, *regJump);
+    }
+    if (loadTarget) {
+      if (loadTarget->BaseReg.rfind("0x", 0) == 0) {
+        if (auto match = matchExternalPointer(
+                parseUnsignedNumber(loadTarget->BaseReg),
+                loadTarget->Displacement,
+                instruction.HasIndirectCall ? NativeXrefKind::Call
+                                           : NativeXrefKind::Flow)) {
+          return match;
+        }
+      } else {
+        if (auto match = matchExternalPointer(
+                findNearestLeaBaseInDecodedInstructions(
+                    instructions, index, loadTarget->BaseReg),
+                loadTarget->Displacement,
+                instruction.HasIndirectCall ? NativeXrefKind::Call
+                                           : NativeXrefKind::Flow)) {
+          return match;
+        }
+        if (const NativeFunction *function =
+                state.functionContaining(instruction.Address)) {
+          if (auto match = matchExternalPointer(
+                  findNearestLeaBase(state, *function, instruction.Address,
+                                     loadTarget->BaseReg),
+                  loadTarget->Displacement,
+                  instruction.HasIndirectCall ? NativeXrefKind::Call
+                                             : NativeXrefKind::Flow)) {
+            return match;
+          }
+        }
+        if (auto match = matchExternalPointer(
+                findNearestLeaBaseInKnownFallthroughInstructions(
+                    state, instruction.Address, loadTarget->BaseReg),
+                loadTarget->Displacement,
+                instruction.HasIndirectCall ? NativeXrefKind::Call
+                                           : NativeXrefKind::Flow)) {
+          return match;
+        }
+        if (const NativeFunction *function =
+                state.functionContaining(instruction.Address)) {
+          std::set<uint64_t> visitedBlocks;
+          if (auto match = matchExternalPointer(
+                  findNearestLeaBaseInFunctionCFG(
+                      state, *function, instruction.Address,
+                      loadTarget->BaseReg, visitedBlocks),
+                  loadTarget->Displacement,
+                  instruction.HasIndirectCall ? NativeXrefKind::Call
+                                             : NativeXrefKind::Flow)) {
+            return match;
+          }
+        }
+      }
+    }
+  }
+
   std::optional<X86IndirectMemoryTarget> target;
   NativeXrefKind kind = NativeXrefKind::Flow;
   if (instruction.HasIndirectCall) {
@@ -1883,38 +2135,57 @@ matchX86ExternalFunctionPointerInstruction(
     return std::nullopt;
   }
 
-  std::optional<uint64_t> base;
+  auto matchExternalPointerForTarget =
+      [&](std::optional<uint64_t> base) -> std::optional<X86ExternalFunctionPointerMatch> {
+    if (!base || *base > std::numeric_limits<uint64_t>::max() -
+                             target->Displacement) {
+      return std::nullopt;
+    }
+    X86ExternalFunctionPointerMatch match;
+    match.SlotAddress = *base + target->Displacement;
+    match.Kind = kind;
+    if (isExternalFunctionPointerRelocationAt(state, match.SlotAddress)) {
+      return match;
+    }
+    return std::nullopt;
+  };
+
   if (target->BaseReg.rfind("0x", 0) == 0) {
-    base = parseUnsignedNumber(target->BaseReg);
+    if (auto match = matchExternalPointerForTarget(
+            parseUnsignedNumber(target->BaseReg))) {
+      return match;
+    }
   } else {
-    base = findNearestLeaBaseInDecodedInstructions(instructions, index,
-                                                   target->BaseReg);
-    if (!base) {
-      if (const NativeFunction *function =
-              state.functionContaining(instruction.Address)) {
-        base = findNearestLeaBase(state, *function, instruction.Address,
-                                  target->BaseReg);
+    if (auto match = matchExternalPointerForTarget(
+            findNearestLeaBaseInDecodedInstructions(instructions, index,
+                                                    target->BaseReg))) {
+      return match;
+    }
+    if (const NativeFunction *function =
+            state.functionContaining(instruction.Address)) {
+      if (auto match = matchExternalPointerForTarget(
+              findNearestLeaBase(state, *function, instruction.Address,
+                                 target->BaseReg))) {
+        return match;
       }
     }
-    if (!base) {
-      base = findNearestLeaBaseInKnownFallthroughInstructions(
-          state, instruction.Address, target->BaseReg);
+    if (auto match = matchExternalPointerForTarget(
+            findNearestLeaBaseInKnownFallthroughInstructions(
+                state, instruction.Address, target->BaseReg))) {
+      return match;
+    }
+    if (const NativeFunction *function =
+            state.functionContaining(instruction.Address)) {
+      std::set<uint64_t> visitedBlocks;
+      if (auto match = matchExternalPointerForTarget(
+              findNearestLeaBaseInFunctionCFG(state, *function,
+                                              instruction.Address,
+                                              target->BaseReg, visitedBlocks))) {
+        return match;
+      }
     }
   }
-  if (!base || *base > std::numeric_limits<uint64_t>::max() -
-                           target->Displacement) {
-    return std::nullopt;
-  }
-
-  X86ExternalFunctionPointerMatch match;
-  match.SlotAddress = *base + target->Displacement;
-  match.Kind = kind;
-  bool relocMatch =
-      isExternalFunctionPointerRelocationAt(state, match.SlotAddress);
-  if (!relocMatch) {
-    return std::nullopt;
-  }
-  return match;
+  return std::nullopt;
 }
 
 bool functionContainsBlockStart(const NativeProgramState &state,

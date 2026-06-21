@@ -4229,3 +4229,34 @@ cmake --build /tmp/notdec-bin2llvm-build \
 - 实现效果：8/10。收掉一批跨 block wrapper，并修掉一个低 8 位别名导致的 jump table 漏识别。
 - 理解成本：4/10。多了一个连续 fallthrough 向前扫，但约束明确，不跨非 fallthrough 边。
 - 维护成本：3/10。仍在 instruction facts 层，不影响 lowering 和 summary SSA。
+
+## 实现记录：补一层 CFG 回溯外部函数指针 wrapper
+
+这次继续补 native 前端 decode/facts 层，目标是把一批 `jmp/call reg` 的外部函数指针 wrapper 再往前追一层，尽量少靠线性地址顺扫。
+
+本次改动：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1422)
+  - 新增 `writesRegister()`，把寄存器写回判断收口。
+  - 新增 `functionBlockContaining()` / `functionPredecessorBlocks()`，给后面的 CFG 回溯用。
+  - 新增 `findNearestLeaBaseInBlockRange()` 和 `findNearestLeaBaseInFunctionCFG*()`，让 `LEA reg,[abs]` 可以沿 block 前驱链回追。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2034)
+  - `matchX86ExternalFunctionPointerInstruction()` 现在会把每个 base 候选都拿去试 relocation，不再因为前一个候选“有值”就直接停。
+  - 对 `jmp reg` / `call reg` 两条路径都补了 CFG fallback。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1802)
+  - `findNearestLeaBaseInDecodedInstructions()` / `findNearestLeaBaseInKnownFallthroughInstructions()` / 对应的 register-load helper 都改成只在真的改写目标寄存器时截断，不再把普通 `CALL/JMP` 当作硬截断点。
+
+验证：
+
+```text
+cmake --build build --target notdec-native-discover native_analysis_facts_test -j2
+build/bin/native_analysis_facts_test
+build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+timeout 60s build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+```
+
+结果：
+
+- `fortune` unresolved 仍是 `0`。
+- `redis-cli` unresolved 从 `289` 降到 `229`，耗时约 `14.2 sec`。
+- 这次还没把 `0x3ac21`、`0x3ba9f`、`0x3bbfe`、`0x2f0d6`、`0x34923`、`0x2ae14` 这几个 wrapper 彻底收掉，后面再单独盯这批点。
