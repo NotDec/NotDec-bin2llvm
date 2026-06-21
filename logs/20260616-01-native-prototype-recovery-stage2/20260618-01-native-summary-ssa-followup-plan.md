@@ -947,3 +947,53 @@ llvm-as + opt verify: passed
 - 实现效果：7/10。block range facts 已经进入 lowering config，为后续按 range 切 pcode block 做准备。
 - 理解成本：2/10。新增字段含义直接，和 `NativeBasicBlock` 一致。
 - 维护成本：2/10。目前只是传递事实和 native-mode 判断，行为风险低。
+
+## 实现记录：native lowering 用 BlockRanges 截断块内 pcode
+
+这次让 `PcodeToLLVM` 真正使用上一轮传入的 `BlockRanges`。
+
+之前 lower 层虽然拿到了 native block starts，但每个 LLVM basic block 的 pcode op end 仍按下一个 `BlockStart` 推导。这样仍然隐含了 pcode vector 顺序。现在 native 模式下会按 native block 的 `[start, end)` 地址范围截取块内 pcode op。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:70)
+  - lower loop 改为使用 `BlockEnds[blockIndex]`，不再现场用下一个 `BlockStart` 算 end。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:236)
+  - `buildBasicBlocks(...)` 在创建 block 时同步计算并保存 `BlockEnds`。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:248)
+  - 新增 `blockEndForStart(...)`。
+  - generic pcode 路径保持旧逻辑。
+  - native 路径优先读取 `Config.BlockRanges[startAddress]`，从 start op 向后扫描，直到 op 的 instruction address 离开 `[blockStart, blockEnd)`。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:1383)
+  - 新增 `BlockEnds`，和 `BlockStarts` 并行保存。
+
+验证：
+
+```text
+cmake --build build --target notdec-native-llvm native_register_summary_test native_register_summary_ssa_test -j4
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/fortune-blockends-raw.ll
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-blockends/fortune.ll --summary-json-out /tmp/notdec-fortune-blockends/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-blockends/fortune.ll -o /tmp/notdec-fortune-blockends/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-blockends/fortune.bc -o /tmp/notdec-fortune-blockends/fortune.verified.bc
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+```
+
+结果：
+
+```text
+fortune native pipeline: 12.71s
+confirmed_functions: 25
+basic_blocks: 2369
+instructions: 2908
+0x3470 raw IR still has bb_3748 false edge to bb_374e
+final !notdec.register.access residue: 1
+remaining register access: FS_OFFSET only
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：8/10。native lowering 的 block body 现在由 native block range 决定，进一步减少了 pcode 顺序假设。
+- 理解成本：3/10。新增 `BlockEnds`，但和 `BlockStarts` 并行，含义清楚。
+- 维护成本：3/10。generic pcode 路径保持旧逻辑；native 路径依赖 discovery range facts。

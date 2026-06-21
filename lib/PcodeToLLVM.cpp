@@ -70,9 +70,7 @@ public:
 
     for (size_t blockIndex = 0; blockIndex < BlockStarts.size(); ++blockIndex) {
       size_t start = BlockStarts[blockIndex];
-      size_t end = blockIndex + 1 < BlockStarts.size()
-                       ? BlockStarts[blockIndex + 1]
-                       : program.Ops.size();
+      size_t end = BlockEnds[blockIndex];
       Builder.SetInsertPoint(BlockForStart[start]);
       Values.clear();
 
@@ -238,11 +236,38 @@ private:
     for (size_t index = 0; index < BlockStarts.size(); ++index) {
       size_t start = BlockStarts[index];
       uint64_t address = program.Ops[start].Address;
+      size_t end = blockEndForStart(program, index);
+      BlockEnds.push_back(end);
       llvm::BasicBlock *block =
           llvm::BasicBlock::Create(Context, blockName(address), &Function);
       BlockForStart[start] = block;
       BlockForAddress.try_emplace(address, block);
     }
+  }
+
+  size_t blockEndForStart(const PcodeProgram &program, size_t blockIndex) {
+    size_t start = BlockStarts[blockIndex];
+    if (!usesNativeCfg()) {
+      return blockIndex + 1 < BlockStarts.size() ? BlockStarts[blockIndex + 1]
+                                                 : program.Ops.size();
+    }
+
+    uint64_t blockStartAddress = program.Ops[start].Address;
+    auto rangeIt = Config.BlockRanges.find(blockStartAddress);
+    if (rangeIt == Config.BlockRanges.end() ||
+        rangeIt->second <= blockStartAddress) {
+      return blockIndex + 1 < BlockStarts.size() ? BlockStarts[blockIndex + 1]
+                                                 : program.Ops.size();
+    }
+
+    uint64_t blockEndAddress = rangeIt->second;
+    size_t end = start;
+    while (end < program.Ops.size() &&
+           program.Ops[end].Address >= blockStartAddress &&
+           program.Ops[end].Address < blockEndAddress) {
+      ++end;
+    }
+    return end;
   }
 
   llvm::BasicBlock *nextBlock(size_t blockIndex) {
@@ -1355,6 +1380,7 @@ private:
   std::unordered_map<std::string, llvm::Value *> Values;
   std::unordered_map<std::string, uint64_t> SourceRamByVarnode;
   std::vector<size_t> BlockStarts;
+  std::vector<size_t> BlockEnds;
   std::unordered_map<size_t, llvm::BasicBlock *> BlockForStart;
   std::unordered_map<uint64_t, llvm::BasicBlock *> BlockForAddress;
   std::vector<llvm::BasicBlock *> ExternalTargetBlocks;
