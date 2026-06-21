@@ -1185,6 +1185,10 @@ llvm-as + opt verify: passed
     - `direct_call_targets`
     - `fallthrough`
     - `has_indirect_call`
+- [native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:19)
+  - 增加 `NativeInstructionFlowKind` 字符串输出测试。
+- [CMakeLists.txt](/sn640/NotDec/external/NotDec-bin2llvm/CMakeLists.txt:246)
+  - 在 native 依赖启用时注册 `notdec.native_analysis.facts`。
 
 抽样验证：
 
@@ -1207,7 +1211,8 @@ llvm-as + opt verify: passed
 完整验证：
 
 ```text
-cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-discover notdec-native-llvm native_register_summary_test native_register_summary_ssa_test pcode_to_llvm_test -j2
+cmake --build /tmp/notdec-bin2llvm-build --target native_analysis_facts_test notdec-native-discover notdec-native-llvm native_register_summary_test native_register_summary_ssa_test pcode_to_llvm_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
 /tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
 /tmp/notdec-bin2llvm-build/bin/native_register_summary_test
 /tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test

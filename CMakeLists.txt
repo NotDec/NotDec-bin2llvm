@@ -243,6 +243,23 @@ if (BUILD_TESTING)
       pcode_to_llvm_test
   )
 
+  if (TARGET notdec-bin2llvm-native)
+    add_executable(native_analysis_facts_test
+      tests/native_analysis_facts_test.cpp
+    )
+
+    target_link_libraries(native_analysis_facts_test
+      PRIVATE
+        notdec-bin2llvm-native
+    )
+
+    add_test(
+      NAME notdec.native_analysis.facts
+      COMMAND
+        native_analysis_facts_test
+    )
+  endif ()
+
   add_executable(native_instcombine_metadata_test
     tests/native_instcombine_metadata_test.cpp
   )
