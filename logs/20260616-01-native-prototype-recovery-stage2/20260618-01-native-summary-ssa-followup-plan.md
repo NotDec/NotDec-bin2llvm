@@ -3829,3 +3829,64 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：7/10。把条件分支 fallthrough 也纳入基本块边界，减少 lowering 看到不合法 block 的机会。
 - 理解成本：3/10。逻辑仍集中在 FlowFactNormalizer，只是 split 触发条件更完整。
 - 维护成本：3/10。后续更多 flow fact 也应先在 facts 层形成稳定 block 边界。
+
+## 实现记录：泛化 PIC i32 jump table matcher
+
+背景：
+
+- `redis-cli` decode-only 统计里还有大量 unresolved indirect branch。
+- 样本 `0x36920` 是 GCC 常见 PIC i32 offset jump table：
+  `LEA RDX,[table]`、`MOVSXD RAX,dword ptr [RDX + RAX*0x4]`、`ADD RAX,RDX`、`JMP RAX`。
+- 原 matcher 只覆盖更窄的寄存器组合和 32-bit compare，导致这类真实 jump table 没有恢复。
+
+实现：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1349)
+  新增 `X86PicI32DispatchPattern`，把 target/base/index register 从固定字符串里拆出来。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1396)
+  增加 register alias 辅助函数，让上界识别同时接受 `EAX` 和 `AL` 这种低位 compare。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1482)
+  新增 `parseX86RegisterAfterPrefix(...)`、`parseX86AddRegReg(...)` 和
+  `parseX86PicI32DispatchPattern(...)`，仍只接受明确的
+  `MOVSXD target,[base + index*4] / ADD target,base / JMP target` 形态。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1547)
+  `matchX86PicI32OffsetDispatch(...)` 改为使用解析出的 base/index register，再复用已有 table base 和 entry count 读取逻辑。
+
+验证：
+
+```text
+git diff --check
+cmake --build build --target native_analysis_facts_test notdec-native-discover -j$(nproc)
+build/bin/native_analysis_facts_test
+cmake --build build --target pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+build/bin/notdec-native-discover --blocks-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-jumptable-low8/summary.json \
+  -o /tmp/notdec-fortune-jumptable-low8/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-jumptable-low8/fortune.ll \
+  -o /tmp/notdec-fortune-jumptable-low8/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-jumptable-low8/fortune.bc \
+  -o /tmp/notdec-fortune-jumptable-low8/fortune.verify.bc
+```
+
+结果：
+
+- 核心 native 测试通过。
+- `redis-cli` decode-only unresolved indirect branch 从 115 降到 64。
+- `redis-cli` decode 后 block facts 仍闭合：555 个函数、15555 个 block，非法 successor 为 0，block overlap 为 0。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.84 sec`。
+- fortune `!notdec.register.access` 数量为 0。
+- fortune register global store 数量为 0。
+- fortune register global load 数量为 6，仍是 `summary_ssa.entry` load。
+- fortune `br i1 poison`、`ret ... poison`、`store ... ptr poison` 数量为 0。
+
+评分：
+
+- 实现效果：7/10。覆盖了 redis 里一批真实 jump table，明显减少 unresolved indirect branch。
+- 理解成本：4/10。多了几个字符串解析 helper，但仍限制在一个很窄的 x86 PIC jump table 模式。
+- 维护成本：3/10。后续如果要支持更多 jump table，应该继续放在 facts 层，避免 lowering 再猜 CFG。

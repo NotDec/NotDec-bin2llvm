@@ -1346,6 +1346,18 @@ struct X86PicI32JumpDispatch {
   uint64_t EntryCount = 0;
 };
 
+// A narrow parsed view of the common GCC/Clang PIC table dispatch:
+//   MOVSXD target, dword ptr [base + index*0x4]
+//   ADD    target, base
+//   JMP    target
+// The concrete registers vary, so keep the matcher semantic enough to avoid
+// baking in only RAX/RBX while still rejecting unrelated indirect branches.
+struct X86PicI32DispatchPattern {
+  std::string TargetReg;
+  std::string BaseReg;
+  std::string IndexReg;
+};
+
 const NativeInstruction *
 previousInstruction(const NativeProgramState &state,
                     const NativeFunction &function, uint64_t address,
@@ -1381,23 +1393,155 @@ findNearestLeaBase(const NativeProgramState &state,
   return std::nullopt;
 }
 
+std::string low32RegisterName(const std::string &reg) {
+  if (reg == "RAX") {
+    return "EAX";
+  }
+  if (reg == "RBX") {
+    return "EBX";
+  }
+  if (reg == "RCX") {
+    return "ECX";
+  }
+  if (reg == "RDX") {
+    return "EDX";
+  }
+  if (reg == "RSI") {
+    return "ESI";
+  }
+  if (reg == "RDI") {
+    return "EDI";
+  }
+  if (reg.size() >= 2 && reg[0] == 'R' && std::isdigit(reg[1])) {
+    return reg + "D";
+  }
+  return "";
+}
+
+std::string low8RegisterName(const std::string &reg) {
+  if (reg == "RAX") {
+    return "AL";
+  }
+  if (reg == "RBX") {
+    return "BL";
+  }
+  if (reg == "RCX") {
+    return "CL";
+  }
+  if (reg == "RDX") {
+    return "DL";
+  }
+  if (reg.size() >= 2 && reg[0] == 'R' && std::isdigit(reg[1])) {
+    return reg + "B";
+  }
+  return "";
+}
+
+std::vector<std::string> compareRegisterNamesForIndex(const std::string &reg) {
+  std::vector<std::string> names;
+  std::string low32 = low32RegisterName(reg);
+  if (!low32.empty()) {
+    names.push_back(low32);
+  }
+  // Small switch dispatches often mask the index and compare the low byte
+  // before using the full register in the table load.
+  std::string low8 = low8RegisterName(reg);
+  if (!low8.empty()) {
+    names.push_back(low8);
+  }
+  return names;
+}
+
 std::optional<uint64_t>
 findNearestUpperBound(const NativeProgramState &state,
-                      const NativeFunction &function, uint64_t beforeAddress) {
+                      const NativeFunction &function, uint64_t beforeAddress,
+                      const std::string &indexReg) {
   std::vector<const NativeInstruction *> instructions =
       state.instructionsInRange(function.RangeStart, beforeAddress);
+  std::vector<std::string> compareRegs =
+      compareRegisterNamesForIndex(indexReg);
+  if (compareRegs.empty()) {
+    return std::nullopt;
+  }
   for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
        ++iterator) {
     const std::string &text = (*iterator)->Mnemonic;
-    const std::string prefix = "CMP EAX,0x";
-    if (text.rfind(prefix, 0) == 0) {
-      std::optional<uint64_t> maxIndex = parseHex(text.substr(prefix.size()));
-      if (maxIndex) {
-        return *maxIndex + 1;
+    for (const std::string &compareReg : compareRegs) {
+      const std::string prefix = "CMP " + compareReg + ",0x";
+      if (text.rfind(prefix, 0) == 0) {
+        std::optional<uint64_t> maxIndex = parseHex(text.substr(prefix.size()));
+        if (maxIndex) {
+          return *maxIndex + 1;
+        }
       }
     }
   }
   return std::nullopt;
+}
+
+std::optional<std::string> parseX86RegisterAfterPrefix(
+    const std::string &text, const std::string &prefix) {
+  if (text.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  std::string reg = text.substr(prefix.size());
+  if (reg.empty() || reg.find(' ') != std::string::npos ||
+      reg.find(',') != std::string::npos || reg.find('[') != std::string::npos) {
+    return std::nullopt;
+  }
+  return reg;
+}
+
+std::optional<std::pair<std::string, std::string>>
+parseX86AddRegReg(const std::string &text) {
+  const std::string prefix = "ADD ";
+  if (text.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  size_t comma = text.find(',', prefix.size());
+  if (comma == std::string::npos || comma + 1 >= text.size()) {
+    return std::nullopt;
+  }
+  return std::make_pair(text.substr(prefix.size(), comma - prefix.size()),
+                        text.substr(comma + 1));
+}
+
+std::optional<X86PicI32DispatchPattern>
+parseX86PicI32DispatchPattern(const NativeInstruction &load,
+                              const NativeInstruction &add,
+                              const NativeInstruction &branch) {
+  std::optional<std::string> branchReg =
+      parseX86RegisterAfterPrefix(branch.Mnemonic, "JMP ");
+  if (!branchReg) {
+    return std::nullopt;
+  }
+
+  std::optional<std::pair<std::string, std::string>> addRegs =
+      parseX86AddRegReg(add.Mnemonic);
+  if (!addRegs || addRegs->first != *branchReg) {
+    return std::nullopt;
+  }
+
+  const std::string loadPrefix =
+      "MOVSXD " + *branchReg + ",dword ptr [" + addRegs->second + " + ";
+  const std::string loadSuffix = "*0x4]";
+  if (load.Mnemonic.rfind(loadPrefix, 0) != 0 ||
+      load.Mnemonic.size() <= loadPrefix.size() + loadSuffix.size() ||
+      load.Mnemonic.compare(load.Mnemonic.size() - loadSuffix.size(),
+                            loadSuffix.size(), loadSuffix) != 0) {
+    return std::nullopt;
+  }
+
+  X86PicI32DispatchPattern pattern;
+  pattern.TargetReg = *branchReg;
+  pattern.BaseReg = addRegs->second;
+  pattern.IndexReg = load.Mnemonic.substr(
+      loadPrefix.size(),
+      load.Mnemonic.size() - loadPrefix.size() - loadSuffix.size());
+  if (pattern.IndexReg.empty()) {
+    return std::nullopt;
+  }
+  return pattern;
 }
 
 std::optional<X86PicI32JumpDispatch>
@@ -1405,7 +1549,7 @@ matchX86PicI32OffsetDispatch(const NativeProgramState &state,
                              const NativeFunction &function,
                              uint64_t branchAddress) {
   const NativeInstruction *branch = state.instructionAt(branchAddress);
-  if (branch == nullptr || branch->Mnemonic != "JMP RAX") {
+  if (branch == nullptr) {
     return std::nullopt;
   }
 
@@ -1413,16 +1557,19 @@ matchX86PicI32OffsetDispatch(const NativeProgramState &state,
       previousInstruction(state, function, branchAddress, 2);
   const NativeInstruction *add =
       previousInstruction(state, function, branchAddress, 1);
-  if (load == nullptr || add == nullptr ||
-      load->Mnemonic != "MOVSXD RAX,dword ptr [RBX + RAX*0x4]" ||
-      add->Mnemonic != "ADD RAX,RBX") {
+  if (load == nullptr || add == nullptr) {
+    return std::nullopt;
+  }
+  std::optional<X86PicI32DispatchPattern> pattern =
+      parseX86PicI32DispatchPattern(*load, *add, *branch);
+  if (!pattern) {
     return std::nullopt;
   }
 
   std::optional<uint64_t> tableBase =
-      findNearestLeaBase(state, function, load->Address, "RBX");
+      findNearestLeaBase(state, function, load->Address, pattern->BaseReg);
   std::optional<uint64_t> entryCount =
-      findNearestUpperBound(state, function, load->Address);
+      findNearestUpperBound(state, function, load->Address, pattern->IndexReg);
   if (!tableBase || !entryCount || *entryCount == 0 || *entryCount > 256) {
     return std::nullopt;
   }
