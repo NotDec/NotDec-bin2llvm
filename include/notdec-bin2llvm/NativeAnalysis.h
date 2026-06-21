@@ -182,16 +182,29 @@ struct NativeUnresolvedFlow {
   std::string Source;
 };
 
+enum class NativeInstructionFlowKind {
+  None,
+  ConditionalBranch,
+  UnconditionalBranch,
+  IndirectBranch,
+  Return,
+};
+
 // NativeInstruction records decoded instruction facts accepted by native
-// analyzers.  It deliberately stores raw bytes and a light display mnemonic,
-// while operands and P-Code stay out until recursive decode has real users for
-// them.
+// analyzers.  It deliberately keeps operands and raw P-Code out, but it does
+// keep machine-level flow facts.  Later block construction and LLVM lowering
+// should consume these facts instead of guessing fallthrough from P-Code order.
 struct NativeInstruction {
   uint64_t Address = 0;
   uint64_t Size = 0;
   std::vector<uint8_t> Bytes;
   std::string Mnemonic;
   std::string Source;
+  NativeInstructionFlowKind FlowKind = NativeInstructionFlowKind::None;
+  std::vector<uint64_t> DirectFlowTargets;
+  std::vector<uint64_t> DirectCallTargets;
+  std::optional<uint64_t> Fallthrough;
+  bool HasIndirectCall = false;
 
   uint64_t end() const { return Address + Size; }
 };

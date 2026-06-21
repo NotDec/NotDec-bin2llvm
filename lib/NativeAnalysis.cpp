@@ -1369,10 +1369,12 @@ private:
 
   struct DecodedFlowInfo {
     std::vector<uint64_t> BranchTargets;
+    std::vector<uint64_t> CallTargets;
     bool HasConditionalBranch = false;
     bool HasUnconditionalBranch = false;
     bool HasIndirectBranch = false;
     bool HasReturn = false;
+    bool HasIndirectCall = false;
   };
 
   struct DirectControlFlowResult {
@@ -1493,6 +1495,7 @@ private:
     SleighInstructionDecode decode =
         decoder.decode(address, MaxInstructionsPerSeed, decodeBytes,
                        NullErrors);
+    std::vector<NativeInstruction> decodedInstructions;
     uint64_t rangeStart = 0;
     uint64_t rangeEnd = 0;
     for (const SleighInstructionSummary &summary : decode.Instructions) {
@@ -1509,7 +1512,7 @@ private:
                                   : summary.Mnemonic + " " + summary.Body;
       instruction.Source = "sleigh-seed-linear";
       (void)readBytes(state, summary.Address, summary.Size, instruction.Bytes);
-      state.addInstruction(std::move(instruction));
+      decodedInstructions.push_back(std::move(instruction));
     }
     std::map<uint64_t, DecodedFlowInfo> flowInfos;
     if (rangeStart == address && rangeStart < rangeEnd) {
@@ -1520,32 +1523,67 @@ private:
         addUniqueAddress(result.CallTargets, target);
       }
     }
+    annotateDecodedInstructionFlows(decodedInstructions, flowInfos);
+    for (const NativeInstruction &instruction : decodedInstructions) {
+      state.addInstruction(instruction);
+    }
     result.FallthroughTarget = fallthroughTargetForDecodedWindow(
         state, functionEntry, rangeStart, rangeEnd, decodeBytes,
-        decode.Instructions, flowInfos);
+        decodedInstructions);
     addDecodedFunctionBlocks(state, functionEntry, rangeStart, rangeEnd,
-                             decode.Instructions, flowInfos,
-                             result.FallthroughTarget, result.BranchTargets);
+                             decodedInstructions, result.FallthroughTarget,
+                             result.BranchTargets);
     return result;
+  }
+
+  static void annotateDecodedInstructionFlows(
+      std::vector<NativeInstruction> &instructions,
+      const std::map<uint64_t, DecodedFlowInfo> &flowInfos) {
+    for (size_t index = 0; index < instructions.size(); ++index) {
+      NativeInstruction &instruction = instructions[index];
+      auto flowIterator = flowInfos.find(instruction.Address);
+      if (flowIterator != flowInfos.end()) {
+        const DecodedFlowInfo &flowInfo = flowIterator->second;
+        instruction.DirectFlowTargets = flowInfo.BranchTargets;
+        instruction.DirectCallTargets = flowInfo.CallTargets;
+        instruction.HasIndirectCall = flowInfo.HasIndirectCall;
+        if (flowInfo.HasConditionalBranch) {
+          instruction.FlowKind = NativeInstructionFlowKind::ConditionalBranch;
+        } else if (flowInfo.HasUnconditionalBranch) {
+          instruction.FlowKind = NativeInstructionFlowKind::UnconditionalBranch;
+        } else if (flowInfo.HasIndirectBranch) {
+          instruction.FlowKind = NativeInstructionFlowKind::IndirectBranch;
+        } else if (flowInfo.HasReturn) {
+          instruction.FlowKind = NativeInstructionFlowKind::Return;
+        }
+      }
+
+      bool hasNextInstruction = index + 1 != instructions.size();
+      bool hasFallthrough =
+          instruction.FlowKind !=
+              NativeInstructionFlowKind::UnconditionalBranch &&
+          instruction.FlowKind != NativeInstructionFlowKind::IndirectBranch &&
+          instruction.FlowKind != NativeInstructionFlowKind::Return;
+      if (hasNextInstruction && hasFallthrough) {
+        instruction.Fallthrough = instructions[index + 1].Address;
+      }
+    }
   }
 
   static std::optional<uint64_t> fallthroughTargetForDecodedWindow(
       NativeProgramState &state, uint64_t entry, uint64_t rangeStart,
       uint64_t rangeEnd, uint64_t decodeBytes,
-      const std::vector<SleighInstructionSummary> &instructions,
-      const std::map<uint64_t, DecodedFlowInfo> &flowInfos) {
+      const std::vector<NativeInstruction> &instructions) {
     if (instructions.empty() || rangeStart == 0 || rangeStart >= rangeEnd) {
       return std::nullopt;
     }
-    const SleighInstructionSummary &last = instructions.back();
+    const NativeInstruction &last = instructions.back();
     if (last.Address + last.Size != rangeEnd) {
       return std::nullopt;
     }
-    auto flowIterator = flowInfos.find(last.Address);
-    if (flowIterator != flowInfos.end() &&
-        (flowIterator->second.HasUnconditionalBranch ||
-         flowIterator->second.HasIndirectBranch ||
-         flowIterator->second.HasReturn)) {
+    if (last.FlowKind == NativeInstructionFlowKind::UnconditionalBranch ||
+        last.FlowKind == NativeInstructionFlowKind::IndirectBranch ||
+        last.FlowKind == NativeInstructionFlowKind::Return) {
       return std::nullopt;
     }
     if (!state.isExecutableAddress(rangeEnd) ||
@@ -1563,8 +1601,7 @@ private:
   static void addDecodedFunctionBlocks(
       NativeProgramState &state, uint64_t entry, uint64_t rangeStart,
       uint64_t rangeEnd,
-      const std::vector<SleighInstructionSummary> &instructions,
-      const std::map<uint64_t, DecodedFlowInfo> &flowInfos,
+      const std::vector<NativeInstruction> &instructions,
       std::optional<uint64_t> fallthroughTarget,
       std::vector<uint64_t> &branchTargets) {
     if (rangeStart == 0 || rangeStart >= rangeEnd) {
@@ -1572,7 +1609,7 @@ private:
     }
 
     std::vector<NativeBasicBlock> blocks =
-        buildDecodedBlocks(instructions, flowInfos, rangeStart, rangeEnd);
+        buildDecodedBlocks(instructions, rangeStart, rangeEnd);
     for (NativeBasicBlock &block : blocks) {
       if (fallthroughTarget && block.End == rangeEnd &&
           block.Successors.empty()) {
@@ -1626,16 +1663,20 @@ private:
       std::optional<uint64_t> target = directRamTarget(op);
       if (op.Opcode == PcodeOpcode::Call) {
         if (target && state.isExecutableAddress(*target)) {
+          DecodedFlowInfo &info = result.FlowInfos[op.Address];
           if (state.lookupPltExternal(*target)) {
             addUniqueXref(state, seenXrefs, op.Address, *target,
                           NativeXrefKind::Call, "sleigh-pcode-plt-call");
+            addUniqueAddress(info.CallTargets, *target);
             continue;
           }
           addUniqueXref(state, seenXrefs, op.Address, *target,
                         NativeXrefKind::Call, "sleigh-pcode-direct-flow");
+          addUniqueAddress(info.CallTargets, *target);
           addUniqueAddress(result.CallTargets, *target);
         }
       } else if (op.Opcode == PcodeOpcode::CallInd) {
+        result.FlowInfos[op.Address].HasIndirectCall = true;
         if (auto gotAddress = callIndGotSource(sourceRamByVarnode, op)) {
           if (isExternalGlobDatSymbolAt(state, *gotAddress)) {
             addUniqueXref(state, seenXrefs, op.Address, *gotAddress,
@@ -1875,71 +1916,57 @@ private:
     state.addXref(std::move(xref));
   }
 
-  static std::vector<NativeBasicBlock> buildDecodedBlocks(
-      const std::vector<SleighInstructionSummary> &instructions,
-      const std::map<uint64_t, DecodedFlowInfo> &flowInfos, uint64_t rangeStart,
-      uint64_t rangeEnd) {
+  static std::vector<NativeBasicBlock>
+  buildDecodedBlocks(const std::vector<NativeInstruction> &instructions,
+                     uint64_t rangeStart, uint64_t rangeEnd) {
     std::vector<NativeBasicBlock> blocks;
     if (instructions.empty()) {
       return blocks;
     }
 
     std::set<uint64_t> instructionStarts;
-    for (const SleighInstructionSummary &instruction : instructions) {
+    for (const NativeInstruction &instruction : instructions) {
       instructionStarts.insert(instruction.Address);
     }
 
     std::set<uint64_t> blockStarts;
     blockStarts.insert(rangeStart);
     for (size_t index = 0; index < instructions.size(); ++index) {
-      const SleighInstructionSummary &instruction = instructions[index];
-      auto flowIterator = flowInfos.find(instruction.Address);
-      if (flowIterator == flowInfos.end()) {
-        continue;
-      }
-
-      const DecodedFlowInfo &flowInfo = flowIterator->second;
-      for (uint64_t target : flowInfo.BranchTargets) {
+      const NativeInstruction &instruction = instructions[index];
+      for (uint64_t target : instruction.DirectFlowTargets) {
         if (instructionStarts.count(target) != 0) {
           blockStarts.insert(target);
         }
       }
       if (index + 1 != instructions.size() &&
-          (flowInfo.HasConditionalBranch || flowInfo.HasUnconditionalBranch ||
-           flowInfo.HasIndirectBranch || flowInfo.HasReturn)) {
+          instruction.FlowKind != NativeInstructionFlowKind::None) {
         blockStarts.insert(instructions[index + 1].Address);
       }
     }
 
     uint64_t blockStart = rangeStart;
     for (size_t index = 0; index < instructions.size(); ++index) {
-      const SleighInstructionSummary &instruction = instructions[index];
+      const NativeInstruction &instruction = instructions[index];
       uint64_t instructionEnd = instruction.Address + instruction.Size;
       bool isLastInstruction = index + 1 == instructions.size();
       bool nextStartsBlock =
           !isLastInstruction &&
           blockStarts.count(instructions[index + 1].Address) != 0;
-      const DecodedFlowInfo *flowInfo = nullptr;
-      auto flowIterator = flowInfos.find(instruction.Address);
-      if (flowIterator != flowInfos.end()) {
-        flowInfo = &flowIterator->second;
-      }
 
       std::vector<uint64_t> successors;
       bool endBlock = isLastInstruction || nextStartsBlock;
-      if (flowInfo != nullptr) {
-        if (flowInfo->HasConditionalBranch) {
-          successors = flowInfo->BranchTargets;
-          if (!isLastInstruction) {
-            addUniqueAddress(successors, instructions[index + 1].Address);
+      if (instruction.FlowKind != NativeInstructionFlowKind::None) {
+        if (instruction.FlowKind ==
+            NativeInstructionFlowKind::ConditionalBranch) {
+          successors = instruction.DirectFlowTargets;
+          if (instruction.Fallthrough) {
+            addUniqueAddress(successors, *instruction.Fallthrough);
           }
-          endBlock = true;
-        } else if (flowInfo->HasUnconditionalBranch) {
-          successors = flowInfo->BranchTargets;
-          endBlock = true;
-        } else if (flowInfo->HasIndirectBranch || flowInfo->HasReturn) {
-          endBlock = true;
+        } else if (instruction.FlowKind ==
+                   NativeInstructionFlowKind::UnconditionalBranch) {
+          successors = instruction.DirectFlowTargets;
         }
+        endBlock = true;
       }
       if (nextStartsBlock && successors.empty()) {
         addUniqueAddress(successors, instructions[index + 1].Address);

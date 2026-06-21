@@ -735,3 +735,62 @@ llvm-as + opt verify: passed
 - 实现效果：9/10。修掉了 fortune 里误残留的 `R9`，也修正了 native sparse CFG 下条件跳转 false edge 的语义。
 - 理解成本：3/10。新增逻辑集中在 `CBRANCH` false edge，不影响 SummarySSA 抽象域。
 - 维护成本：3/10。依赖 discovery 的 `BlockSuccessors`，这正是 native lowering 已经传入的事实；缺失时仍保留旧 fallback。
+
+## 实现记录：native decode 增加 instruction flow facts
+
+本次根据前段 decode 复盘做第一步收紧，不改 SummarySSA，也不重写 discovery 算法。
+
+参考判断：
+
+- Ghidra 的 block model 是基于 instruction 的 `FlowType` / `FallThrough` / flow references 建块，不把 pcode 顺序当 CFG 权威。
+- angr 的 CFGFast 更偏 basic block lift，再从 block exits 建 CFG。
+- 当前 native 链路先线性 decode，再用 pcode 辅助切块；这次先把机器指令级 flow facts 写进 `NativeInstruction`，让后续 block 构建消费这份事实。
+
+具体改动：
+
+- [NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:185)
+  - 新增 `NativeInstructionFlowKind`，区分 none、conditional branch、unconditional branch、indirect branch、return。
+- [NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:197)
+  - `NativeInstruction` 增加 `FlowKind`、`DirectFlowTargets`、`DirectCallTargets`、`Fallthrough`、`HasIndirectCall`。
+  - 设计目标是让 instruction fact 明确携带控制流，不再只保存文本和 bytes。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1498)
+  - `decodeSeed(...)` 先把当前窗口收成 `decodedInstructions`，再用 pcode flow info 标注，最后写回 `NativeProgramState`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1539)
+  - 新增 `annotateDecodedInstructionFlows(...)`，把 `DecodedFlowInfo` 折叠进每条 `NativeInstruction`。
+  - 普通 call 只记录 `DirectCallTargets`，不作为 block terminator。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1919)
+  - `buildDecodedBlocks(...)` 改为消费 `NativeInstruction` 的 flow facts，不再直接依赖独立的 `flowInfos` map。
+
+验证：
+
+```text
+cmake --build build --target notdec-native-discover notdec-native-llvm -j4
+build/bin/notdec-native-discover --blocks-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/fortune-3470-flowfacts-raw.ll
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-flowfacts/fortune.ll --summary-json-out /tmp/notdec-fortune-flowfacts/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-flowfacts/fortune.ll -o /tmp/notdec-fortune-flowfacts/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-flowfacts/fortune.bc -o /tmp/notdec-fortune-flowfacts/fortune.verified.bc
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+```
+
+结果：
+
+```text
+fortune native pipeline: 13.09s
+confirmed_functions: 25
+basic_blocks: 2369
+instructions: 2908
+0x3470 / 0x3748 block successors: 0x3e81, 0x374e
+final !notdec.register.access residue: 1
+remaining register access: FS_OFFSET only
+llvm-as + opt verify: passed
+```
+
+性能：同口径上次 fortune 约 13.26s，本次 13.09s，没有看到性能下降。
+
+复杂度评估：
+
+- 实现效果：7/10。CFG 行为不变，但 instruction facts 更清晰，后续可以继续让 lowering 更少依赖 pcode 顺序。
+- 理解成本：3/10。新增几个字段，但含义直接，对照 Ghidra instruction flow/fallthrough 模型更容易解释。
+- 维护成本：3/10。当前字段只在 discovery 内使用，后续如果输出 JSON 或给 lowering 直接用，需要保持语义一致。
