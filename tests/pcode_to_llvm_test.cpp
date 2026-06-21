@@ -1,6 +1,7 @@
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -151,6 +152,43 @@ bool testNativeBlockRangeIsRequired() {
                 "missing block range error was not reported");
 }
 
+bool testNativeEntryAddressChoosesEntryBlock() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(returnOp(0x2000));
+  program.Ops.push_back(returnOp(0x1000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_entry_address";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockRanges.emplace(0x1000, 0x1001);
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr, "native entry function is missing")) {
+    return false;
+  }
+
+  llvm::BasicBlock &entry = function->getEntryBlock();
+  auto *branch = llvm::dyn_cast<llvm::BranchInst>(entry.getTerminator());
+  if (!expect(branch != nullptr && branch->isUnconditional(),
+              "lowered entry block is not an unconditional branch")) {
+    return false;
+  }
+
+  return expect(branch->getSuccessor(0)->getName() == "bb_1000",
+                "native entry address did not select the entry block") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after native entry selection");
+}
+
 } // namespace
 
 int main() {
@@ -158,5 +196,6 @@ int main() {
   ok &= testUnreachablePcodeBlocksAreRemoved();
   ok &= testExternalTailBranchWithoutLocalBlock();
   ok &= testNativeBlockRangeIsRequired();
+  ok &= testNativeEntryAddressChoosesEntryBlock();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

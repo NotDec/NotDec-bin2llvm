@@ -1242,3 +1242,64 @@ llvm-as + opt verify: passed
 - 实现效果：6/10。没有改变语义，但让 instruction facts 可以直接审计。
 - 理解成本：1/10。只是 JSON 字段和枚举字符串。
 - 维护成本：1/10。输出字段来自已有结构体，不新增分析状态。
+
+## 实现记录：native lowering 使用显式函数入口块
+
+上一轮已经让 native block facts 进入 `PcodeToLLVM`，但 LLVM `entry` 仍然跳到 `BlockStarts.front()`。
+这个值来自 p-code op 的顺序，不一定等于 native 函数入口。native decode 后续要减少对 p-code 顺序推 CFG 的依赖，所以这里改成显式入口地址驱动。
+
+具体改动：
+
+- [PcodeToLLVM.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/PcodeToLLVM.h:27)
+  - `PcodeLoweringConfig` 增加 `EntryAddress`。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:71)
+  - `PcodeLowerer::lower(...)` 不再直接用 `BlockStarts.front()` 作为入口。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:125)
+  - 新增 `entryBlockForProgram(...)`。
+  - native CFG 下按 `EntryAddress` 查找覆盖该地址的 `BlockRanges`。
+  - 普通 p-code lowering 没有设置 `EntryAddress` 时保持旧行为。
+- [notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:758)
+  - `--all-confirmed` 每个函数 lowering 时传入 `function.Entry`。
+- [notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:1021)
+  - 单函数 `-f` lowering 时传入选中的函数入口地址。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:155)
+  - 增加 `testNativeEntryAddressChoosesEntryBlock()`。
+  - 测试里 p-code op 顺序故意是 `0x2000` 在前、`0x1000` 在后，确认 LLVM `entry` 跳到 `bb_1000`。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test notdec-native-llvm native_register_summary_test native_register_summary_ssa_test native_analysis_facts_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-entry-address/fortune.ll --summary-json-out /tmp/notdec-fortune-entry-address/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-entry-address-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-entry-address/fortune.ll -o /tmp/notdec-fortune-entry-address/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-entry-address/fortune.bc -o /tmp/notdec-fortune-entry-address/fortune.verify.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-entry-address-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-entry-address-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-entry-address-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-entry-address-raw/fortune-3470-raw.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 9.56s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 109
+final !notdec.register.access residue: 1
+remaining !notdec.register.access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+注意：最终 IR 里还有少量 `summary_ssa.entry` load，例如 bootstrap / 顶层函数里的 `RBX`、`RSP`、`RAX`。这些不是原始 `!notdec.register.access` store/load 残留；后续要继续区分“真实入口环境输入”和“可消除寄存器访问”。
+
+复杂度评估：
+
+- 实现效果：7/10。修掉了一个明确的 p-code 顺序依赖点，native lowering 入口现在来自 function fact。
+- 理解成本：2/10。只给 lowering config 多传一个入口地址。
+- 维护成本：2/10。普通 p-code 路径保持旧行为，native 路径失败时给出明确错误。

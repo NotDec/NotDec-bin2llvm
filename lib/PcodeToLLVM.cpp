@@ -68,7 +68,11 @@ public:
     if (!buildBasicBlocks(program, errorMessage)) {
       return false;
     }
-    Builder.CreateBr(BlockForStart[BlockStarts.front()]);
+    llvm::BasicBlock *entryBlock = entryBlockForProgram(errorMessage);
+    if (entryBlock == nullptr) {
+      return false;
+    }
+    Builder.CreateBr(entryBlock);
 
     for (size_t blockIndex = 0; blockIndex < BlockStarts.size(); ++blockIndex) {
       size_t start = BlockStarts[blockIndex];
@@ -116,6 +120,37 @@ public:
 private:
   bool usesNativeCfg() const {
     return !Config.BlockRanges.empty() || !Config.BlockSuccessors.empty();
+  }
+
+  llvm::BasicBlock *entryBlockForProgram(std::string &errorMessage) {
+    if (!Config.EntryAddress) {
+      return BlockForStart[BlockStarts.front()];
+    }
+
+    uint64_t entryAddress = *Config.EntryAddress;
+    if (usesNativeCfg()) {
+      for (size_t start : BlockStarts) {
+        uint64_t blockAddress = blockAddressForStart(start);
+        auto endIt = NativeBlockEndForStart.find(start);
+        if (endIt == NativeBlockEndForStart.end()) {
+          continue;
+        }
+        if (entryAddress >= blockAddress && entryAddress < endIt->second) {
+          return BlockForStart[start];
+        }
+      }
+    } else {
+      auto blockIt = BlockForAddress.find(entryAddress);
+      if (blockIt != BlockForAddress.end()) {
+        return blockIt->second;
+      }
+    }
+
+    std::ostringstream os;
+    os << "entry address 0x" << std::hex << entryAddress
+       << " is not covered by lowered p-code blocks";
+    errorMessage = os.str();
+    return nullptr;
   }
 
   static bool isTerminator(PcodeOpcode opcode) {

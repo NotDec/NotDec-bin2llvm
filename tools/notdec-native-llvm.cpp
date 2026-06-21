@@ -755,6 +755,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
     notdec::bin2llvm::PcodeLoweringConfig config;
     config.ModuleName = "notdec.bin2llvm.native.confirmed.check";
     config.MemoryModel = memoryModel;
+    config.EntryAddress = function.Entry;
     auto nameIt = callTargets.Direct.find(function.Entry);
     if (nameIt == callTargets.Direct.end()) {
       continue;
@@ -1017,6 +1018,7 @@ int main(int argc, char **argv) {
         config.EntryFunctionName = entryFunctionName(*options->FunctionEntry);
       }
       if (options->FunctionEntry) {
+        config.EntryAddress = *options->FunctionEntry;
         NativeCallTargets callTargets =
             selectedState ? planNativeCallTargets(*selectedState)
                           : planNativeCallTargets(runNativeDiscovery(
