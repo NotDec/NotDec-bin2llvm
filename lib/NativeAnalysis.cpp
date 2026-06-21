@@ -2811,7 +2811,7 @@ public:
       state.addBasicBlock(entry, std::move(block));
     }
     for (const auto &[entry, function] : state.functions()) {
-      (void)entry;
+      state.removeInvalidBasicBlockSuccessors(entry);
       for (const NativeBasicBlock &block : function.Blocks) {
         normalizeBlockSuccessors(state, function, block);
       }
@@ -3366,6 +3366,33 @@ bool NativeProgramState::addBasicBlockSuccessors(
     return changed;
   }
   return false;
+}
+
+bool NativeProgramState::removeInvalidBasicBlockSuccessors(
+    uint64_t functionEntry) {
+  auto iterator = Functions.find(functionEntry);
+  if (iterator == Functions.end()) {
+    return false;
+  }
+
+  NativeFunction &function = iterator->second;
+  std::set<uint64_t> blockStarts;
+  for (const NativeBasicBlock &block : function.Blocks) {
+    blockStarts.insert(block.Start);
+  }
+
+  bool changed = false;
+  for (NativeBasicBlock &block : function.Blocks) {
+    size_t oldSize = block.Successors.size();
+    block.Successors.erase(
+        std::remove_if(block.Successors.begin(), block.Successors.end(),
+                       [&](uint64_t successor) {
+                         return blockStarts.count(successor) == 0;
+                       }),
+        block.Successors.end());
+    changed |= block.Successors.size() != oldSize;
+  }
+  return changed;
 }
 
 bool NativeProgramState::addInstructionDirectFlowTargets(

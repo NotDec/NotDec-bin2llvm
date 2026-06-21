@@ -326,6 +326,70 @@ bool testBasicBlockSuccessorsRequireBlockStarts(const char *argv0) {
   return ok;
 }
 
+bool testFlowNormalizerRemovesInvalidBlockSuccessors(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base + 0xc0;
+  uint64_t invalidTarget = entry + 0x08;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = entry + 0x20;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, entry + 0x02, {invalidTarget}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add test function with invalid successor\n";
+    return false;
+  }
+
+  auto branch = makeInstruction(
+      entry, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::UnconditionalBranch);
+  branch.DirectFlowTargets.push_back(invalidTarget);
+  state.addInstruction(std::move(branch));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeFunction *normalized = state.functionAt(entry);
+  bool successorWasRemoved = false;
+  if (normalized != nullptr) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block :
+         normalized->Blocks) {
+      if (block.Start == entry) {
+        successorWasRemoved = block.Successors.empty();
+      }
+    }
+  }
+
+  const notdec::bin2llvm::NativeInstruction *normalizedBranch =
+      state.instructionAt(entry);
+  bool targetWasMovedToTail = normalizedBranch != nullptr &&
+                              normalizedBranch->DirectFlowTargets.empty() &&
+                              normalizedBranch->TailFlowTargets.size() == 1 &&
+                              normalizedBranch->TailFlowTargets.front() ==
+                                  invalidTarget;
+
+  bool ok = true;
+  ok &= expectTrue(successorWasRemoved,
+                   "invalid block successor was not removed");
+  ok &= expectTrue(targetWasMovedToTail,
+                   "invalid direct target was not marked as tail");
+  return ok;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -338,5 +402,6 @@ int main(int argc, char **argv) {
   ok &= testFlowNormalizerFillsDecodedBlockHole(argv[0]);
   ok &= testFlowNormalizerDoesNotJoinMissingBlocksWithoutFallthrough(argv[0]);
   ok &= testBasicBlockSuccessorsRequireBlockStarts(argv[0]);
+  ok &= testFlowNormalizerRemovesInvalidBlockSuccessors(argv[0]);
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

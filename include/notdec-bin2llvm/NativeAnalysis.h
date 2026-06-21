@@ -279,6 +279,7 @@ public:
   bool addBasicBlock(uint64_t functionEntry, NativeBasicBlock block);
   bool addBasicBlockSuccessors(uint64_t functionEntry, uint64_t blockStart,
                                const std::vector<uint64_t> &successors);
+  bool removeInvalidBasicBlockSuccessors(uint64_t functionEntry);
   bool addInstructionDirectFlowTargets(uint64_t address,
                                        const std::vector<uint64_t> &targets);
   bool markInstructionTailFlowTarget(uint64_t address, uint64_t target);

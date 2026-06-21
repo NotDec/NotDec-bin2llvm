@@ -3652,3 +3652,60 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：5/10。不是新恢复能力，但把无效 CFG successor 拦在 facts 层，减少 lowering 兜底压力。
 - 理解成本：1/10。successor 必须是 block start，规则直接。
 - 维护成本：2/10。后续如果要表达跨函数 tail edge，仍应走 tail target / call target，不应写普通 block successor。
+
+## 实现记录：FlowFactNormalizer 清理残留非法 successor
+
+背景：
+
+- `addBasicBlockSuccessors(...)` 已经拒绝写入非 block-start successor。
+- 但 decode 初期 `addFunction(...)` / `addBasicBlock(...)` 仍允许 forward successor，因为目标 block 可能稍后才 decode。
+- 到 `FlowFactNormalizer` 运行时，Sleigh decode、jump table target 反向 decode 和 jump table analyzer 都已经跑完；
+  这时仍然不是 block start 的 successor 就不应该继续留在 block facts 里。
+
+实现：
+
+- [include/notdec-bin2llvm/NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:282)
+  新增 `NativeProgramState::removeInvalidBasicBlockSuccessors(...)`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2813)
+  `FlowFactNormalizer` 在 normalize 每个函数前先清理非法 successor。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3371)
+  `removeInvalidBasicBlockSuccessors(...)` 以当前函数所有 block start 为集合，删除不在集合里的 successor。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:329)
+  增加 `testFlowNormalizerRemovesInvalidBlockSuccessors()`，覆盖：
+  - 初始 block facts 中存在非 block-start successor。
+  - normalizer 删除该 successor。
+  - 对应 instruction direct target 被转为 tail target。
+
+验证：
+
+```text
+cmake --build build --target native_analysis_facts_test -j$(nproc)
+build/bin/native_analysis_facts_test
+cmake --build build --target pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-prune-invalid-successors/summary.json \
+  -o /tmp/notdec-fortune-prune-invalid-successors/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-prune-invalid-successors/fortune.ll \
+  -o /tmp/notdec-fortune-prune-invalid-successors/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-prune-invalid-successors/fortune.bc \
+  -o /tmp/notdec-fortune-prune-invalid-successors/fortune.verify.bc
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.66 sec`。
+- `!notdec.register.access` 数量为 0。
+- register global store 数量为 0。
+- register global load 数量为 6，仍是 `summary_ssa.entry` load。
+- `br i1 poison`、`ret ... poison`、`store ... ptr poison` 数量为 0。
+
+评分：
+
+- 实现效果：6/10。把 forward successor 的最终收敛点放到 FlowFactNormalizer，facts 层更闭合。
+- 理解成本：2/10。新增一个 state 清理方法，但规则仍然只是 successor 必须指向当前函数 block start。
+- 维护成本：2/10。如果后续支持跨函数 CFG edge，也不应复用普通 block successor。
