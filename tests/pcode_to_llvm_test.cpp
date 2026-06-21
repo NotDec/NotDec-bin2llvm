@@ -381,6 +381,43 @@ bool testNativeDirectBranchCanTargetEmptyBlock() {
                 "module failed verifier after native empty target lowering");
 }
 
+bool testNativeEntryAddressCanTargetEmptyBlock() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(returnOp(0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_empty_entry";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x2000});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr, "native empty entry function is missing")) {
+    return false;
+  }
+
+  llvm::BasicBlock &entry = function->getEntryBlock();
+  auto *branch = llvm::dyn_cast<llvm::BranchInst>(entry.getTerminator());
+  if (!expect(branch != nullptr && branch->isUnconditional(),
+              "native empty entry did not lower to an entry branch")) {
+    return false;
+  }
+
+  return expect(branch->getSuccessor(0)->getName() == "bb_1000",
+                "native empty entry address did not select the empty block") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after native empty entry lowering");
+}
+
 bool testNativeSuccessorRequiresKnownBlock() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -415,6 +452,7 @@ int main() {
   ok &= testNativeEntryAddressChoosesEntryBlock();
   ok &= testNativeDirectBranchOutsideRangesBecomesTailCall();
   ok &= testNativeDirectBranchCanTargetEmptyBlock();
+  ok &= testNativeEntryAddressCanTargetEmptyBlock();
   ok &= testNativeSuccessorRequiresKnownBlock();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

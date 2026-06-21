@@ -174,14 +174,13 @@ private:
 
     uint64_t entryAddress = *Config.EntryAddress;
     if (usesNativeCfg()) {
-      for (size_t start : BlockStarts) {
-        uint64_t blockAddress = blockAddressForStart(start);
-        auto endIt = NativeBlockEndForStart.find(start);
-        if (endIt == NativeBlockEndForStart.end()) {
-          continue;
-        }
-        if (entryAddress >= blockAddress && entryAddress < endIt->second) {
-          return BlockForStart[start];
+      for (const auto &[blockAddress, blockEnd] : sortedNativeRanges()) {
+        if (entryAddress >= blockAddress && entryAddress < blockEnd) {
+          auto blockIt = BlockForAddress.find(blockAddress);
+          if (blockIt != BlockForAddress.end()) {
+            return blockIt->second;
+          }
+          break;
         }
       }
     } else {

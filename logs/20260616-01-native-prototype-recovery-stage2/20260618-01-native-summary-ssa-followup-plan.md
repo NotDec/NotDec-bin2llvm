@@ -1445,3 +1445,54 @@ llvm-as + opt verify: passed
 - 实现效果：8/10。消除了 native CFG 下最危险的静默 ret block 兜底，同时覆盖了真实 NOP block 和跨 chunk branch。
 - 理解成本：5/10。`PcodeToLLVM` 多了 empty block 和 tail-call block 两个概念，但都直接对应 native CFG 事实。
 - 维护成本：4/10。后续如果要更精确处理共享 chunk，可能还要把跨 range branch 从 synthetic call 升级成显式 chunk/function 关系。
+
+## 实现记录：EntryAddress 支持 empty native block
+
+上一段已经让没有 p-code 的 native block 也能被 lower 成 LLVM block，但 `entryBlockForProgram(...)` 仍只从有 p-code 的 `BlockStarts` 里找入口。如果函数入口正好落在 NOP / ENDBR 这种 empty native block，LLVM `entry` 会找不到真实 native entry block。
+
+这次把 native 模式入口选择改成按 `BlockRanges` 查找入口地址所属 block，再从 `BlockForAddress` 取 LLVM block。这样有 p-code 的 block 和 empty block 走同一套 native block fact。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:170)
+  - `entryBlockForProgram(...)` 在 native CFG 模式下改为遍历 `sortedNativeRanges()`。
+  - 找到覆盖 `EntryAddress` 的 block range 后，用 block start 查 `BlockForAddress`。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:384)
+  - 增加 `testNativeEntryAddressCanTargetEmptyBlock()`。
+  - 测试构造 `0x1000` empty entry block，successor 是 `0x2000` 有 p-code block，确认 LLVM `entry` 跳到 `bb_1000`。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test notdec-native-llvm native_register_summary_test native_register_summary_ssa_test native_analysis_facts_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-empty-entry/fortune.ll --summary-json-out /tmp/notdec-fortune-empty-entry/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-empty-entry-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-empty-entry/fortune.ll -o /tmp/notdec-fortune-empty-entry/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-empty-entry/fortune.bc -o /tmp/notdec-fortune-empty-entry/fortune.verify.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-empty-entry-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-empty-entry-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-empty-entry-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-empty-entry-raw/fortune-3470-raw.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 9.38s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 109
+final !notdec.register.access residue: 1
+remaining !notdec.register.access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：6/10。补上 empty block 支持后的入口选择缺口。
+- 理解成本：1/10。入口选择和 native block fact 对齐。
+- 维护成本：1/10。没有新增状态。
