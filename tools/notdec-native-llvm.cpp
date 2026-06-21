@@ -18,6 +18,7 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 
 #include <LIEF/ELF/Binary.hpp>
 #include <LIEF/ELF/Parser.hpp>
@@ -881,6 +882,7 @@ bool runInstCombinePassIfEnabled(llvm::Module &module,
 
   llvm::FunctionPassManager functionPasses;
   functionPasses.addPass(llvm::InstCombinePass());
+  functionPasses.addPass(llvm::SimplifyCFGPass());
   for (llvm::Function &function : module) {
     if (!function.isDeclaration()) {
       functionPasses.run(function, functionAnalysis);

@@ -3072,3 +3072,77 @@ bb_2aad2:
   “父 native block”和“内部 p-code block”的区别。
 - 维护成本：4/10。逻辑仍集中在 lowering 层，后续如果支持更复杂的 p-code 内部 merge，可能需要
   给 `unique` 临时值补 PHI。
+
+## 实现记录：SummarySSA unknown 值和 CFG 清理
+
+背景：
+
+- 修完 native lowering 的内部 p-code 控制流后，fortune 默认输出仍有大量 `br i1 poison`。
+- 对比 `--no-register-ssa-pass` 的原始 lowering，`0x2aad: CMOVNZ R8,RAX` 的条件和值都正常；
+  问题主要来自 summary SSA 用裸 `undef` 表示 unknown register value，后续 instcombine 会把
+  相关条件折成 `poison`。
+- 修掉裸 `undef` 后，剩余少量 `br i1 poison` 位于常量分支保留下来的死边/死块里，单独跑
+  `simplifycfg` 可以清掉。
+
+实现：
+
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:119)
+  增加 `frozenPoisonBefore(...)` 和 `frozenPoisonAt(...)`，统一用 `freeze poison` 表示
+  summary SSA 自己制造的 unknown 值，避免裸 `undef` 直接进入 branch/call/return。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1159)
+  `completePhi(...)` 在某个 predecessor 的寄存器值无法确定时，在该 predecessor terminator
+  前插入 `freeze poison`，再作为 PHI incoming。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1438)
+  `callValue(...)` 对非 ABI return register 的 fallback 改成 frozen unknown，不再直接返回
+  `undef`。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1528)
+  `collectFunctionReturnValues(...)` 在函数出口无法读到返回寄存器值时使用 frozen unknown。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1629)
+  `buildReturnValue(...)` 对缺失返回值字段使用 frozen unknown。多返回值的 aggregate seed 仍用
+  `undef`，因为后续字段会被 `insertvalue` 覆盖；缺失字段本身不再是裸 `undef`。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1807)
+  signature rewrite 过程中，如果 call 参数或 helper return 无法匹配到真实值，使用 frozen unknown。
+- [tools/notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:883)
+  默认优化函数在 `InstCombinePass` 后追加 `SimplifyCFGPass`，清理常量分支留下来的死边和死块。
+- [tests/native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:293)
+  增加 `testUnknownPhiIncomingUsesFrozenPoison()`，覆盖一条路径写寄存器、另一条路径经过 unknown
+  external call、汇合后读寄存器的情况，要求 PHI incoming 使用 `FreezeInst` 而不是裸 `undef`。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_analysis_facts_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-frozen-summary/summary.json \
+  -o /tmp/notdec-fortune-frozen-summary/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-frozen-summary/fortune.ll \
+  -o /tmp/notdec-fortune-frozen-summary/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-frozen-summary/fortune.bc \
+  -o /tmp/notdec-fortune-frozen-summary/fortune.verified.bc
+```
+
+结果：
+
+- 核心测试通过。
+- fortune 默认 summary 链路通过 `llvm-as` 和 verifier，耗时 `10.49 sec`。
+- fortune 默认输出中：
+  - `br i1 poison`: 0
+  - `ret ... poison`: 0
+  - `store ... ptr poison`: 0
+
+已知后续：
+
+- `--no-instcombine-pass` 仍会暴露 summary SSA 对前置 cleanup 的依赖，当前不是默认 native 链路。
+  后续如果要支持这个调试模式，需要单独整理“summary 前最小规范化 pass”。
+
+评分：
+
+- 实现效果：8/10。默认 fortune 输出不再出现 branch/return/store pointer 直接使用 poison。
+- 理解成本：3/10。unknown 值表达统一为 `freeze poison`，符合 lowering 层已有做法。
+- 维护成本：3/10。`SimplifyCFGPass` 是 LLVM 标准清理，风险低；`freeze poison` 插入点需要后续
+  继续注意 dominance。

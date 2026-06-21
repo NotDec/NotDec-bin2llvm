@@ -290,6 +290,68 @@ bool testDuplicatePredecessorEdgesKeepPhiComplete() {
                   "module failed verifier after duplicate-edge PHI test");
 }
 
+bool testUnknownPhiIncomingUsesFrozenPoison() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-frozen-unknown", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *r10 = createRegisterGlobal(module, "R10");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *unknownExternal = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "unknown_external", module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "unknown_phi", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right =
+      llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+  builder.SetInsertPoint(left);
+  storeRegister(builder, r10, llvm::ConstantInt::get(r10->getValueType(), 42),
+                "R10");
+  builder.CreateBr(join);
+  builder.SetInsertPoint(right);
+  builder.CreateCall(voidType, unknownExternal);
+  builder.CreateBr(join);
+  builder.SetInsertPoint(join);
+  llvm::LoadInst *loaded = loadRegister(builder, r10, "R10", "merged");
+  builder.CreateRet(loaded);
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnableResidueRemoval = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+
+  bool hasFrozenIncoming = false;
+  bool hasUndefIncoming = false;
+  for (llvm::Instruction &inst : llvm::instructions(*function)) {
+    auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
+    if (phi == nullptr) {
+      continue;
+    }
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      hasFrozenIncoming |= llvm::isa<llvm::FreezeInst>(incoming);
+      hasUndefIncoming |= llvm::isa<llvm::UndefValue>(incoming);
+    }
+  }
+
+  return expect(summary.LoadsReplaced == 1,
+                "unknown incoming load was not replaced") &&
+         expect(summary.UnknownCallEffects >= 1,
+                "unknown call effect was not observed") &&
+         expect(hasFrozenIncoming,
+                "unknown incoming was not materialized as freeze poison") &&
+         expect(!hasUndefIncoming,
+                "unknown incoming still used bare undef") &&
+         verifyOk(module,
+                  "module failed verifier after frozen unknown incoming test");
+}
+
 bool testPreservedCallKeepsPreviousValue() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-preserved-call", context);
@@ -904,6 +966,7 @@ int main() {
   bool ok = true;
   ok &= testPhiIncomingMatchesPredecessors();
   ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
+  ok &= testUnknownPhiIncomingUsesFrozenPoison();
   ok &= testPreservedCallKeepsPreviousValue();
   ok &= testDemandedReturnCreatesCallValue();
   ok &= testIntrinsicDoesNotCreateCallValue();

@@ -116,6 +116,17 @@ struct SignatureRewriteState {
   std::set<const llvm::CallBase *> RewrittenCalls;
 };
 
+llvm::Value *frozenPoisonBefore(llvm::Instruction &insertBefore,
+                                llvm::Type *type, llvm::Twine name) {
+  llvm::IRBuilder<> builder(&insertBefore);
+  return builder.CreateFreeze(llvm::PoisonValue::get(type), name);
+}
+
+llvm::Value *frozenPoisonAt(llvm::IRBuilder<> &builder, llvm::Type *type,
+                            llvm::Twine name) {
+  return builder.CreateFreeze(llvm::PoisonValue::get(type), name);
+}
+
 const std::map<llvm::StringRef, KnownExternalPrototype> &
 knownExternalPrototypes() {
   static const std::map<llvm::StringRef, KnownExternalPrototype> prototypes = {
@@ -1147,7 +1158,12 @@ private:
       }
       llvm::Value *incoming = resolve(readBlockExit(*pred, unit));
       if (incoming == nullptr) {
-        incoming = llvm::UndefValue::get(unit.Global->getValueType());
+        llvm::Instruction *terminator = pred->getTerminator();
+        incoming = terminator != nullptr
+                       ? frozenPoisonBefore(*terminator,
+                                            unit.Global->getValueType(),
+                                            unit.Name + ".unknown")
+                       : llvm::UndefValue::get(unit.Global->getValueType());
       }
       phi->addIncoming(incoming, pred);
     }
@@ -1421,12 +1437,6 @@ private:
 
   llvm::Value *callValue(llvm::CallBase &call, const RegisterUnit &unit,
                          llvm::StringRef kind) {
-    if (kind == "return" && Abi.OutputsInOrder.end() ==
-                                std::find(Abi.OutputsInOrder.begin(),
-                                          Abi.OutputsInOrder.end(),
-                                          unit.Name)) {
-      return llvm::UndefValue::get(unit.Global->getValueType());
-    }
     CallValueKey key{&call, unit.Global, kind.str()};
     if (auto cached = CallValues.find(key); cached != CallValues.end()) {
       return cached->second;
@@ -1438,6 +1448,13 @@ private:
     }
     if (insertBefore == nullptr) {
       return llvm::UndefValue::get(unit.Global->getValueType());
+    }
+    if (kind == "return" && Abi.OutputsInOrder.end() ==
+                                std::find(Abi.OutputsInOrder.begin(),
+                                          Abi.OutputsInOrder.end(),
+                                          unit.Name)) {
+      return frozenPoisonBefore(*insertBefore, unit.Global->getValueType(),
+                                unit.Name + ".return_unknown");
     }
 
     llvm::IRBuilder<> builder(insertBefore);
@@ -1511,7 +1528,8 @@ private:
         llvm::Value *value = resolve(readValueBefore(block, *unit, ret));
         if (value == nullptr ||
             value->getType() != unit->Global->getValueType()) {
-          value = llvm::UndefValue::get(unit->Global->getValueType());
+          value = frozenPoisonBefore(*ret, unit->Global->getValueType(),
+                                     unit->Name + ".return_unknown");
         }
         values.push_back(value);
       }
@@ -1609,8 +1627,10 @@ llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
     return nullptr;
   }
   if (shape.Returns.size() == 1) {
-    return values.empty() ? llvm::UndefValue::get(singleReturnType(shape))
-                          : values.front();
+    return values.empty()
+               ? frozenPoisonAt(builder, singleReturnType(shape),
+                                "notdec.return_unknown")
+               : values.front();
   }
   llvm::Type *retTy = returnTypeForShape(builder.getContext(), shape);
   llvm::Value *result = llvm::UndefValue::get(retTy);
@@ -1618,8 +1638,9 @@ llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
     llvm::Value *value =
         index < values.size()
             ? values[index]
-            : llvm::UndefValue::get(
-                  shape.Returns[index]->Global->getValueType());
+            : frozenPoisonAt(builder,
+                             shape.Returns[index]->Global->getValueType(),
+                             shape.Returns[index]->Name + ".return_unknown");
     result = builder.CreateInsertValue(result, value, {index});
   }
   return result;
@@ -1783,6 +1804,7 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
     }
     std::vector<llvm::Value *> args;
     args.reserve(shape.Params.size());
+    llvm::IRBuilder<> oldCallBuilder(oldCall);
     for (unsigned index = 0; index < shape.Params.size(); ++index) {
       llvm::Value *value =
           index < bindings.size() ? bindings[index].Value : nullptr;
@@ -1791,8 +1813,9 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
       }
       if (value == nullptr ||
           value->getType() != shape.Params[index]->Global->getValueType()) {
-        value =
-            llvm::UndefValue::get(shape.Params[index]->Global->getValueType());
+        value = frozenPoisonAt(
+            oldCallBuilder, shape.Params[index]->Global->getValueType(),
+            shape.Params[index]->Name + ".arg_unknown");
       }
       args.push_back(value);
     }
@@ -1811,7 +1834,8 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         llvm::Value *value =
             extractReturnRegister(builder, shape, *newCall, name);
         if (value == nullptr) {
-          value = llvm::UndefValue::get(helper->getType());
+          value = frozenPoisonAt(builder, helper->getType(),
+                                 name + ".return_unknown");
         }
         valueMap[helper] = value;
         helper->replaceAllUsesWith(value);
