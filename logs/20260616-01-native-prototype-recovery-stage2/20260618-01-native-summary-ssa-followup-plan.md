@@ -4296,3 +4296,46 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -
 - `fortune` unresolved 仍是 `0`。
 - `fortune` 完整链路通过 `llvm-as` 和 `opt -passes=verify`，耗时约 `10.48 sec`。
 - `fortune` 输出里 `@notdec_native_load` / `@notdec_native_store` 都是 `0`。
+
+## 实现记录：补低 8 位寄存器别名，修复一个 PIC jump table
+
+`redis-cli` 里 `0x36ccb` 是标准 PIC jump table：
+
+```text
+CMP DL,0x4
+LEA RCX,[0x546ec]
+MOVZX EAX,DL
+MOVSXD RAX,dword ptr [RCX + RAX*0x4]
+ADD RAX,RCX
+JMP RAX
+```
+
+之前已经能识别 `MOVSXD/ADD/JMP` 形态，但上界分析从 `RAX` 反推到 `MOVZX EAX,DL` 后，没有把 `DL` 作为可比较寄存器继续保留，所以找不到 `CMP DL,0x4`。
+
+本次改动：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1652)
+  - `compareRegisterNamesForText()` 增加 `AL/BL/CL/DL/SIL/DIL/BPL/SPL` 直接别名。
+  - 这样 `MOVZX EAX,DL` 能把 `DL` 传播进 compare set，后续能匹配 `CMP DL,0x4`。
+
+验证：
+
+```text
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+timeout 120s build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+timeout 120s build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-jt/fortune.ll --summary-json-out /tmp/notdec-fortune-jt/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-jt/fortune.ll -o /tmp/notdec-fortune-jt/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-jt/fortune.bc -o /tmp/notdec-fortune-jt/fortune.verify.bc
+```
+
+结果：
+
+- `redis-cli` unresolved 从 `140` 降到 `138`。
+- `0x36ccb` 不再 unresolved。
+- `fortune` unresolved 仍是 `0`。
+- `fortune` 完整链路通过 `llvm-as` 和 `opt -passes=verify`，耗时约 `10.54 sec`。
+- `fortune` 输出里 `@notdec_native_load` / `@notdec_native_store` 都是 `0`。

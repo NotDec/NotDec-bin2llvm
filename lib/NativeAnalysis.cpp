@@ -1662,6 +1662,10 @@ std::vector<std::string> compareRegisterNamesForText(const std::string &reg) {
   if (reg == "EDX") {
     return {"EDX", "DL"};
   }
+  if (reg == "AL" || reg == "BL" || reg == "CL" || reg == "DL" ||
+      reg == "SIL" || reg == "DIL" || reg == "BPL" || reg == "SPL") {
+    return {reg};
+  }
   if (reg == "ESI") {
     return {"ESI"};
   }
