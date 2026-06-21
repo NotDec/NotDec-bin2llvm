@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <functional>
 #include <ostream>
 #include <set>
 #include <sstream>
@@ -1512,6 +1513,80 @@ std::optional<uint64_t> findNearestLeaBaseInFunctionCFG(
       state, function, *block, beforeAddress, reg, visitedBlocks);
 }
 
+std::optional<uint64_t> parseX86LeaAbsoluteBase(const std::string &text,
+                                                const std::string &reg);
+
+std::optional<uint64_t> findNearestLeaBaseInDecodedCFG(
+    const std::vector<NativeInstruction> &instructions, size_t beforeIndex,
+    const std::string &reg) {
+  if (instructions.empty() || beforeIndex == 0 ||
+      beforeIndex > instructions.size()) {
+    return std::nullopt;
+  }
+
+  std::map<uint64_t, size_t> indexByAddress;
+  std::map<uint64_t, std::vector<uint64_t>> predecessors;
+  for (size_t index = 0; index < instructions.size(); ++index) {
+    indexByAddress[instructions[index].Address] = index;
+  }
+  for (const NativeInstruction &instruction : instructions) {
+    for (uint64_t target : instruction.DirectFlowTargets) {
+      if (indexByAddress.count(target) != 0) {
+        predecessors[target].push_back(instruction.Address);
+      }
+    }
+    if (instruction.Fallthrough &&
+        isInstructionFallthroughTo(instruction, *instruction.Fallthrough) &&
+        indexByAddress.count(*instruction.Fallthrough) != 0) {
+      predecessors[*instruction.Fallthrough].push_back(instruction.Address);
+    }
+  }
+
+  std::set<uint64_t> visited;
+  std::function<std::optional<uint64_t>(uint64_t)> visit =
+      [&](uint64_t address) -> std::optional<uint64_t> {
+    if (!visited.insert(address).second) {
+      return std::nullopt;
+    }
+    auto indexIterator = indexByAddress.find(address);
+    if (indexIterator == indexByAddress.end()) {
+      return std::nullopt;
+    }
+    const NativeInstruction &instruction = instructions[indexIterator->second];
+    if (auto base = parseX86LeaAbsoluteBase(instruction.Mnemonic, reg)) {
+      return base;
+    }
+    if (writesRegister(instruction.Mnemonic, reg)) {
+      return std::nullopt;
+    }
+
+    auto predecessorIterator = predecessors.find(address);
+    if (predecessorIterator == predecessors.end()) {
+      return std::nullopt;
+    }
+
+    std::optional<uint64_t> candidate;
+    std::vector<uint64_t> ordered = predecessorIterator->second;
+    std::sort(ordered.begin(), ordered.end(), std::greater<uint64_t>());
+    for (uint64_t predecessor : ordered) {
+      std::optional<uint64_t> predecessorBase = visit(predecessor);
+      if (!predecessorBase) {
+        continue;
+      }
+      if (!candidate) {
+        candidate = predecessorBase;
+        continue;
+      }
+      if (*candidate != *predecessorBase) {
+        return std::nullopt;
+      }
+    }
+    return candidate;
+  };
+
+  return visit(instructions[beforeIndex - 1].Address);
+}
+
 std::string low32RegisterName(const std::string &reg) {
   if (reg == "RAX") {
     return "EAX";
@@ -2032,6 +2107,27 @@ struct X86ExternalFunctionPointerMatch {
 };
 
 std::optional<X86ExternalFunctionPointerMatch>
+matchAnyLeaBaseInDecodedInstructions(
+    const std::vector<NativeInstruction> &instructions,
+    const std::string &reg, uint64_t displacement, NativeXrefKind kind,
+    const NativeProgramState &state) {
+  for (const NativeInstruction &instruction : instructions) {
+    std::optional<uint64_t> base =
+        parseX86LeaAbsoluteBase(instruction.Mnemonic, reg);
+    if (!base || *base > std::numeric_limits<uint64_t>::max() - displacement) {
+      continue;
+    }
+    X86ExternalFunctionPointerMatch match;
+    match.SlotAddress = *base + displacement;
+    match.Kind = kind;
+    if (isExternalFunctionPointerRelocationAt(state, match.SlotAddress)) {
+      return match;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<X86ExternalFunctionPointerMatch>
 matchX86ExternalFunctionPointerInstruction(
     const NativeProgramState &state,
     const std::vector<NativeInstruction> &instructions, size_t index) {
@@ -2106,6 +2202,20 @@ matchX86ExternalFunctionPointerInstruction(
                                            : NativeXrefKind::Flow)) {
           return match;
         }
+        if (auto match = matchExternalPointer(
+                findNearestLeaBaseInDecodedCFG(instructions, index,
+                                               loadTarget->BaseReg),
+                loadTarget->Displacement,
+                instruction.HasIndirectCall ? NativeXrefKind::Call
+                                           : NativeXrefKind::Flow)) {
+          return match;
+        }
+        if (auto match = matchAnyLeaBaseInDecodedInstructions(
+                instructions, loadTarget->BaseReg, loadTarget->Displacement,
+                instruction.HasIndirectCall ? NativeXrefKind::Call
+                                           : NativeXrefKind::Flow, state)) {
+          return match;
+        }
         if (const NativeFunction *function =
                 state.functionContaining(instruction.Address)) {
           std::set<uint64_t> visitedBlocks;
@@ -2172,6 +2282,15 @@ matchX86ExternalFunctionPointerInstruction(
     if (auto match = matchExternalPointerForTarget(
             findNearestLeaBaseInKnownFallthroughInstructions(
                 state, instruction.Address, target->BaseReg))) {
+      return match;
+    }
+    if (auto match = matchExternalPointerForTarget(
+            findNearestLeaBaseInDecodedCFG(instructions, index,
+                                           target->BaseReg))) {
+      return match;
+    }
+    if (auto match = matchAnyLeaBaseInDecodedInstructions(
+            instructions, target->BaseReg, target->Displacement, kind, state)) {
       return match;
     }
     if (const NativeFunction *function =
@@ -3677,9 +3796,54 @@ public:
         normalizeBlockSuccessors(state, function, block);
       }
     }
+    recoverExternalFunctionPointerFlows(state);
   }
 
 private:
+  static void recoverExternalFunctionPointerFlows(NativeProgramState &state) {
+    std::vector<NativeUnresolvedFlow> unresolvedFlows = state.unresolvedFlows();
+    for (const NativeUnresolvedFlow &flow : unresolvedFlows) {
+      if (flow.Kind != NativeUnresolvedFlowKind::IndirectBranch &&
+          flow.Kind != NativeUnresolvedFlowKind::IndirectCall) {
+        continue;
+      }
+
+      const NativeFunction *function = state.functionContaining(flow.Address);
+      if (function == nullptr) {
+        continue;
+      }
+
+      std::vector<NativeInstruction> instructions;
+      std::map<uint64_t, size_t> indexByAddress;
+      for (const NativeInstruction *instruction :
+           state.instructionsInRange(function->RangeStart, function->RangeEnd)) {
+        indexByAddress[instruction->Address] = instructions.size();
+        instructions.push_back(*instruction);
+      }
+      auto indexIterator = indexByAddress.find(flow.Address);
+      if (indexIterator == indexByAddress.end()) {
+        continue;
+      }
+
+      std::optional<X86ExternalFunctionPointerMatch> match =
+          matchX86ExternalFunctionPointerInstruction(state, instructions,
+                                                     indexIterator->second);
+      if (!match) {
+        continue;
+      }
+
+      NativeXref xref;
+      xref.From = flow.Address;
+      xref.To = match->SlotAddress;
+      xref.Kind = match->Kind;
+      xref.Source = match->Kind == NativeXrefKind::Call
+                        ? "x86-call-external-function-pointer"
+                        : "x86-tail-branch-external-function-pointer";
+      state.addXref(std::move(xref));
+      state.removeUnresolvedFlow(flow.Address, flow.Kind);
+    }
+  }
+
   static void appendMissingBlocks(
       const NativeProgramState &state, const NativeFunction &function,
       std::vector<std::pair<uint64_t, NativeBasicBlock>> &result) {

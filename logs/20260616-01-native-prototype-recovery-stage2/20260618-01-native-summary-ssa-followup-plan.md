@@ -4260,3 +4260,39 @@ timeout 60s build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp
 - `fortune` unresolved 仍是 `0`。
 - `redis-cli` unresolved 从 `289` 降到 `229`，耗时约 `14.2 sec`。
 - 这次还没把 `0x3ac21`、`0x3ba9f`、`0x3bbfe`、`0x2f0d6`、`0x34923`、`0x2ae14` 这几个 wrapper 彻底收掉，后面再单独盯这批点。
+
+## 实现记录：把 external pointer 解析挪到 block facts 后
+
+前一轮的 seed 级 decode 里，`JMP reg` / `CALL reg` 只能看到当前局部 `decodedInstructions`，有些 wrapper 的 `LEA base,[abs]` 落在后续 block 里，在线性顺扫阶段还没进到那条路径，所以一直解析不到。  
+这次补了一个后置解析，放在 `FlowFactNormalizer` 后面，直接基于已经落到 `state.functions()` / `state.instructions()` / `state.unresolvedFlows()` 的完整事实再扫一遍。
+
+本次改动：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2130)
+  - `matchX86ExternalFunctionPointerInstruction()` 继续保留 seed 级回溯。
+  - 新增更宽的局部 CFG / 全 seed `LEA` 兜底，用来处理 wrapper 路径不在单次线性顺扫里的情况。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3793)
+  - `FlowFactNormalizer::run()` 末尾新增 `recoverExternalFunctionPointerFlows(state)`。
+  - 这个后置步骤遍历现有 `unresolvedFlows()`，对属于当前 function 的 `IndirectBranch` / `IndirectCall` 再跑一次外部函数指针解析。
+  - 一旦命中，就补 `xref` 并移除对应 `unresolved`。
+
+验证：
+
+```text
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+timeout 120s build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+timeout 120s build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-post/fortune.ll --summary-json-out /tmp/notdec-fortune-post/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-post/fortune.ll -o /tmp/notdec-fortune-post/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-post/fortune.bc -o /tmp/notdec-fortune-post/fortune.verify.bc
+```
+
+结果：
+
+- `redis-cli` unresolved 从 `228` 降到 `140`。
+- `fortune` unresolved 仍是 `0`。
+- `fortune` 完整链路通过 `llvm-as` 和 `opt -passes=verify`，耗时约 `10.48 sec`。
+- `fortune` 输出里 `@notdec_native_load` / `@notdec_native_store` 都是 `0`。
