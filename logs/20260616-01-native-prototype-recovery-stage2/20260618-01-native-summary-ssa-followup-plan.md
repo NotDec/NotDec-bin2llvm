@@ -2908,6 +2908,11 @@ extra_instruction_edges: 10
   - native discovery pipeline 在 `X86JumpTableAnalyzer` 后运行 `FlowFactNormalizer`。
 - [notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:387)
   - native LLVM pipeline 同步运行 `FlowFactNormalizer`。
+- [native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:81)
+  - 增加 `testFlowNormalizerMovesNonCfgTargetToTail(...)`，覆盖非当前 CFG successor 的 direct
+    target 被转成 tail target。
+- [native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:128)
+  - 增加 `testFlowNormalizerFillsDecodedBlockHole(...)`，覆盖已解码但未被 block 覆盖的指令段会补成 block。
 
 验证：
 
@@ -2917,9 +2922,9 @@ build/bin/native_analysis_facts_test
 build/bin/pcode_to_llvm_test
 build/bin/native_register_summary_test
 build/bin/native_register_summary_ssa_test
-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-flow-normalizer/summary.json -o /tmp/notdec-fortune-flow-normalizer/fortune.ll
-/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-flow-normalizer/fortune.ll -o /tmp/notdec-fortune-flow-normalizer/fortune.bc
-/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-flow-normalizer/fortune.bc -o /tmp/notdec-fortune-flow-normalizer/fortune.verified.bc
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-flow-normalizer-test/summary.json -o /tmp/notdec-fortune-flow-normalizer-test/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-flow-normalizer-test/fortune.ll -o /tmp/notdec-fortune-flow-normalizer-test/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-flow-normalizer-test/fortune.bc -o /tmp/notdec-fortune-flow-normalizer-test/fortune.verified.bc
 ```
 
 fortune 结果：
@@ -2931,7 +2936,7 @@ basic_blocks: 1016
 instructions: 2602
 xrefs total: 868
 unresolved_indirect_flows: 0
-native pipeline: 10.23s / 10.69s / 10.89s observed
+native pipeline: 10.23s / 10.69s / 10.89s / 10.61s observed
 ```
 
 一致性检查：

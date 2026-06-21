@@ -1,8 +1,14 @@
 #include "notdec-bin2llvm/NativeAnalysis.h"
 
+#include <LIEF/ELF/Binary.hpp>
+#include <LIEF/ELF/Parser.hpp>
+
 #include <cstdlib>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -14,6 +20,45 @@ bool expectEqual(const std::string &actual, const std::string &expected,
   std::cerr << label << ": expected " << expected << ", got " << actual
             << '\n';
   return false;
+}
+
+bool expectTrue(bool condition, const char *label) {
+  if (condition) {
+    return true;
+  }
+  std::cerr << label << '\n';
+  return false;
+}
+
+std::unique_ptr<LIEF::ELF::Binary> parseSelfBinary(const char *argv0) {
+  try {
+    return LIEF::ELF::Parser::parse(argv0);
+  } catch (const std::exception &error) {
+    std::cerr << "failed to parse test binary: " << error.what() << '\n';
+    return nullptr;
+  }
+}
+
+std::optional<uint64_t>
+firstExecutableAddress(const notdec::bin2llvm::NativeProgramState &state) {
+  for (const notdec::bin2llvm::NativeMemoryRange &range :
+       state.memoryRanges()) {
+    if (range.Executable && range.Size >= 0x100) {
+      return range.Start;
+    }
+  }
+  return std::nullopt;
+}
+
+notdec::bin2llvm::NativeInstruction
+makeInstruction(uint64_t address, uint64_t size,
+                notdec::bin2llvm::NativeInstructionFlowKind flowKind) {
+  notdec::bin2llvm::NativeInstruction instruction;
+  instruction.Address = address;
+  instruction.Size = size;
+  instruction.FlowKind = flowKind;
+  instruction.Source = "native-analysis-facts-test";
+  return instruction;
 }
 
 bool testInstructionFlowKindStrings() {
@@ -34,10 +79,140 @@ bool testInstructionFlowKindStrings() {
   return ok;
 }
 
+bool testFlowNormalizerMovesNonCfgTargetToTail(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base;
+  uint64_t localFallthrough = entry + 0x10;
+  uint64_t externalTarget = entry + 0x80;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = entry + 0x20;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, entry + 0x06, {localFallthrough}});
+  function.Blocks.push_back({localFallthrough, localFallthrough + 0x02, {}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add test function\n";
+    return false;
+  }
+
+  auto branch = makeInstruction(
+      entry, 0x06,
+      notdec::bin2llvm::NativeInstructionFlowKind::ConditionalBranch);
+  branch.DirectFlowTargets.push_back(externalTarget);
+  branch.Fallthrough = localFallthrough;
+  state.addInstruction(std::move(branch));
+  state.addInstruction(makeInstruction(
+      localFallthrough, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::Return));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeInstruction *normalized =
+      state.instructionAt(entry);
+  bool ok = true;
+  ok &= expectTrue(normalized != nullptr, "normalized branch missing");
+  if (normalized != nullptr) {
+    ok &= expectTrue(normalized->DirectFlowTargets.empty(),
+                     "non-CFG branch target stayed direct");
+    ok &= expectTrue(normalized->TailFlowTargets.size() == 1 &&
+                         normalized->TailFlowTargets.front() == externalTarget,
+                     "non-CFG branch target was not marked tail");
+  }
+  return ok;
+}
+
+bool testFlowNormalizerFillsDecodedBlockHole(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base + 0x30;
+  uint64_t hole = entry + 0x02;
+  uint64_t existingTarget = entry + 0x07;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = entry + 0x20;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, hole, {}});
+  function.Blocks.push_back({existingTarget, existingTarget + 0x02, {}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add test function with hole\n";
+    return false;
+  }
+
+  auto first = makeInstruction(
+      entry, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::None);
+  first.Fallthrough = hole;
+  state.addInstruction(std::move(first));
+
+  auto holeBody = makeInstruction(
+      hole, 0x03, notdec::bin2llvm::NativeInstructionFlowKind::None);
+  holeBody.Fallthrough = hole + 0x03;
+  state.addInstruction(std::move(holeBody));
+
+  auto holeTerminator = makeInstruction(
+      hole + 0x03, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::UnconditionalBranch);
+  holeTerminator.DirectFlowTargets.push_back(existingTarget);
+  state.addInstruction(std::move(holeTerminator));
+
+  state.addInstruction(makeInstruction(
+      existingTarget, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::Return));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeFunction *normalized = state.functionAt(entry);
+  bool sawHoleBlock = false;
+  if (normalized != nullptr) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block :
+         normalized->Blocks) {
+      if (block.Start == hole && block.End == existingTarget &&
+          block.Successors.size() == 1 &&
+          block.Successors.front() == existingTarget) {
+        sawHoleBlock = true;
+      }
+    }
+  }
+  return expectTrue(sawHoleBlock, "decoded instruction hole was not blocked");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc < 1) {
+    return EXIT_FAILURE;
+  }
   bool ok = true;
   ok &= testInstructionFlowKindStrings();
+  ok &= testFlowNormalizerMovesNonCfgTargetToTail(argv[0]);
+  ok &= testFlowNormalizerFillsDecodedBlockHole(argv[0]);
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
