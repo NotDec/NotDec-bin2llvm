@@ -204,6 +204,76 @@ bool testFlowNormalizerFillsDecodedBlockHole(const char *argv0) {
   return expectTrue(sawHoleBlock, "decoded instruction hole was not blocked");
 }
 
+bool testFlowNormalizerDoesNotJoinMissingBlocksWithoutFallthrough(
+    const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base + 0x60;
+  uint64_t hole = entry + 0x02;
+  uint64_t target = entry + 0x10;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = entry + 0x20;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, hole, {}});
+  function.Blocks.push_back({target, target + 0x02, {}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add test function with disconnected hole\n";
+    return false;
+  }
+
+  auto first = makeInstruction(
+      entry, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::None);
+  first.Fallthrough = hole;
+  state.addInstruction(std::move(first));
+
+  state.addInstruction(makeInstruction(
+      hole, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::None));
+  state.addInstruction(makeInstruction(
+      hole + 0x02, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::Return));
+  state.addInstruction(makeInstruction(
+      target, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::Return));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeFunction *normalized = state.functionAt(entry);
+  bool sawShortHoleBlock = false;
+  bool sawJoinedHoleBlock = false;
+  if (normalized != nullptr) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block :
+         normalized->Blocks) {
+      if (block.Start == hole && block.End == hole + 0x02) {
+        sawShortHoleBlock = true;
+      }
+      if (block.Start == hole && block.End > hole + 0x02) {
+        sawJoinedHoleBlock = true;
+      }
+    }
+  }
+
+  bool ok = true;
+  ok &= expectTrue(sawShortHoleBlock,
+                   "missing block without fallthrough was not split");
+  ok &= expectTrue(!sawJoinedHoleBlock,
+                   "missing block was joined by address adjacency");
+  return ok;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -214,5 +284,6 @@ int main(int argc, char **argv) {
   ok &= testInstructionFlowKindStrings();
   ok &= testFlowNormalizerMovesNonCfgTargetToTail(argv[0]);
   ok &= testFlowNormalizerFillsDecodedBlockHole(argv[0]);
+  ok &= testFlowNormalizerDoesNotJoinMissingBlocksWithoutFallthrough(argv[0]);
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

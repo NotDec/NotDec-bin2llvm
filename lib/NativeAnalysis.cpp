@@ -2374,7 +2374,9 @@ private:
         endBlock = true;
       }
       if (nextStartsBlock && successors.empty() &&
-          instruction.FlowKind == NativeInstructionFlowKind::None) {
+          instruction.FlowKind == NativeInstructionFlowKind::None &&
+          instruction.Fallthrough &&
+          *instruction.Fallthrough == instructions[index + 1].Address) {
         addUniqueAddress(successors, instructions[index + 1].Address);
       }
 
@@ -2834,7 +2836,7 @@ private:
           break;
         }
         if (endIndex + 1 == instructions.size() ||
-            instructions[endIndex + 1]->Address != current->end()) {
+            current->Fallthrough != instructions[endIndex + 1]->Address) {
           addInstructionSuccessors(function, *current, block.Successors);
           break;
         }

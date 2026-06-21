@@ -3408,3 +3408,60 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
   调试模式继续保持可验证。
 - 理解成本：4/10。同时碰到 lowering 和 summary rewrite 两处，但两处都是局部兜底。
 - 维护成本：3/10。CBRANCH 复用已有 successor 校验；foreign instruction 直接降级为 frozen unknown。
+
+## 实现记录：missing block 不再靠地址相邻合并
+
+背景：
+
+- 前面已经把 native lowering 收紧到主要消费 native block facts。
+- 继续检查 `FlowFactNormalizer` 时发现一个残留问题：补 missing block 时，如果两条 decoded
+  instruction 地址刚好连续，旧逻辑会直接把它们合进同一个 block。
+- 这仍然是在用地址顺序猜 CFG。现在 instruction fact 里已经有 `Fallthrough`，普通顺序执行也应该由
+  这个字段证明。
+
+实现：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2376)
+  `buildDecodedBlocks(...)` 只有在 `instruction.Fallthrough` 明确指向下一条 instruction 时，才给
+  普通 none-flow block 加 next-block successor。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2838)
+  `FlowFactNormalizer::appendMissingBlocks(...)` 继续扩展 missing block 时，也要求当前 instruction 的
+  `Fallthrough` 指向下一条 instruction；只靠地址连续不再合并。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:207)
+  增加 `testFlowNormalizerDoesNotJoinMissingBlocksWithoutFallthrough()`，构造两个地址连续但没有
+  fallthrough fact 的缺失指令，确认不会被合成一个 block。
+
+验证：
+
+```text
+cmake --build build --target native_analysis_facts_test -j$(nproc)
+build/bin/native_analysis_facts_test
+cmake --build build --target pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+cmake --build build --target notdec-native-llvm -j$(nproc)
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-fallthrough-facts/summary.json \
+  -o /tmp/notdec-fortune-fallthrough-facts/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-fallthrough-facts/fortune.ll \
+  -o /tmp/notdec-fortune-fallthrough-facts/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-fallthrough-facts/fortune.bc \
+  -o /tmp/notdec-fortune-fallthrough-facts/fortune.verify.bc
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.60 sec`。
+- `!notdec.register.access` 数量为 0。
+- register global store 数量为 0。
+- register global load 数量为 6，都是 `summary_ssa.entry` load，不是原始 register access 残留。
+- `br i1 poison`、`ret ... poison`、`store ... ptr poison` 数量为 0。
+
+评分：
+
+- 实现效果：5/10。修的是前段 facts 的一个小口子，不改变 fortune 最终 residue，但减少了隐式 CFG 猜测。
+- 理解成本：1/10。规则直接：只有 `Fallthrough` 才表示普通顺序边。
+- 维护成本：1/10。没有新增状态，只是让两个已有位置消费同一个 instruction fact。
