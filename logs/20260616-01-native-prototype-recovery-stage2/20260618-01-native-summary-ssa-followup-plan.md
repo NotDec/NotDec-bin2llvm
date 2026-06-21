@@ -4452,3 +4452,61 @@ python3 scripts/bench2-native-discovery-debug-check.py --build-dir build --targe
 - 实现效果：6/10。补掉一类真实 jump table 上界识别问题。
 - 理解成本：1/10。只是 compare 候选里补回寄存器自身。
 - 维护成本：1/10。规则仍限制在 x86 jump table facts 层。
+
+## 实现记录：补 memory-field compare 的 jump table 上界识别
+
+`memcached` 里 `0x14742` 是另一种常见 jump table：
+
+```text
+CMP dword ptr [R15 + 0x14],0x4
+JA 0x1475b
+MOV EAX,dword ptr [R15 + 0x14]
+MOVSXD RAX,dword ptr [R13 + RAX*0x4]
+ADD RAX,R13
+JMP RAX
+```
+
+这里 index 不是先放进寄存器再比较，而是先比较结构体字段，再把同一个字段
+load 到寄存器作为 index。之前上界识别只看寄存器比较，所以这类 table 没有恢复。
+
+本次改动：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1811)
+  - 新增 `parseX86MovRegMemory()`，识别 `MOV REG,<memory>`，把 index 寄存器对应的
+    memory operand 记录下来。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1831)
+  - 新增 `parseX86MemoryImmediate()`，识别 `CMP <memory>,imm`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1854)
+  - `findNearestUpperBound()` 现在除了寄存器 compare，也支持 exact memory operand
+    compare。当前只做字符串精确匹配，不做 alias 推断。
+
+验证：
+
+```text
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-memory-compare-jt/fortune.ll --summary-json-out /tmp/notdec-fortune-memory-compare-jt/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-memory-compare-jt/fortune.ll -o /tmp/notdec-fortune-memory-compare-jt/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-memory-compare-jt/fortune.bc -o /tmp/notdec-fortune-memory-compare-jt/fortune.verify.bc
+python3 scripts/bench2-native-discovery-debug-check.py --build-dir build --target memcached:executable --target redis:cli --target lighttpd:executable --target wrk:executable --target fortune:executable
+```
+
+结果：
+
+- `memcached` indirect branch 从 `4` 降到 `2`，`0x14742` 不再 unresolved。
+- `memcached` 总 unresolved 从 `47` 变成 `51`，原因是新 jump table target 被 decode 后暴露出
+  6 个新的 indirect call；剩余两个 indirect branch 是动态 tail jump。
+- `lighttpd` indirect branch 从 `14` 降到 `8`，总 unresolved 从 `106` 降到 `102`。
+- `redis-cli` 仍是 `134`，`wrk` 仍是 `30`。
+- `fortune` unresolved 仍是 `0`。
+- `fortune` 完整链路通过 `llvm-as` 和 `opt -passes=verify`，耗时 `10.59 sec`。
+- `memcached`、`redis:cli`、`lighttpd`、`wrk`、`fortune` 的 debug function confirmed coverage 都是 `1.0000`。
+- 实现效果：7/10。补掉一类真实结构体字段 switch / jump table。
+- 理解成本：3/10。多了两个字符串 parser，但仍只在上界识别里使用。
+- 维护成本：2/10。没有做 memory alias 推断，后续扩展空间明确。

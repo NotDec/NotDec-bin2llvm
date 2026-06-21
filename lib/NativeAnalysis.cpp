@@ -1808,6 +1808,49 @@ parseX86RegImmediate(const std::string &text, const std::string &mnemonic) {
   return std::make_pair(std::move(reg), *value);
 }
 
+std::optional<std::pair<std::string, std::string>>
+parseX86MovRegMemory(const std::string &text) {
+  const std::string prefix = "MOV ";
+  if (text.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  size_t comma = text.find(',', prefix.size());
+  if (comma == std::string::npos || comma + 1 >= text.size()) {
+    return std::nullopt;
+  }
+  std::string dest = text.substr(prefix.size(), comma - prefix.size());
+  std::string memory = trimAsciiWhitespace(text.substr(comma + 1));
+  if (dest.empty() || dest.find('[') != std::string::npos ||
+      dest.find(' ') != std::string::npos ||
+      memory.find(" ptr [") == std::string::npos) {
+    return std::nullopt;
+  }
+  return std::make_pair(std::move(dest), std::move(memory));
+}
+
+std::optional<std::pair<std::string, uint64_t>>
+parseX86MemoryImmediate(const std::string &text, const std::string &mnemonic) {
+  const std::string prefix = mnemonic + " ";
+  if (text.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  size_t comma = text.find(',', prefix.size());
+  if (comma == std::string::npos || comma + 1 >= text.size()) {
+    return std::nullopt;
+  }
+  std::string memory = trimAsciiWhitespace(
+      text.substr(prefix.size(), comma - prefix.size()));
+  if (memory.find(" ptr [") == std::string::npos) {
+    return std::nullopt;
+  }
+  std::optional<uint64_t> value =
+      parseUnsignedNumber(trimAsciiWhitespace(text.substr(comma + 1)));
+  if (!value) {
+    return std::nullopt;
+  }
+  return std::make_pair(std::move(memory), *value);
+}
+
 std::optional<uint64_t>
 findNearestUpperBound(const NativeProgramState &state,
                       const NativeFunction &function, uint64_t beforeAddress,
@@ -1819,6 +1862,7 @@ findNearestUpperBound(const NativeProgramState &state,
   if (compareRegs.empty()) {
     return std::nullopt;
   }
+  std::vector<std::string> compareMemoryOperands;
 
   std::vector<const NativeInstruction *> window;
   uint64_t scanned = 0;
@@ -1837,6 +1881,13 @@ findNearestUpperBound(const NativeProgramState &state,
         addCompareRegisterNames(compareRegs, move->second);
       }
     }
+    std::optional<std::pair<std::string, std::string>> memoryLoad =
+        parseX86MovRegMemory(text);
+    if (memoryLoad &&
+        std::find(compareRegs.begin(), compareRegs.end(),
+                  memoryLoad->first) != compareRegs.end()) {
+      addUniqueString(compareMemoryOperands, memoryLoad->second);
+    }
   }
 
   for (const NativeInstruction *instruction : window) {
@@ -1854,6 +1905,13 @@ findNearestUpperBound(const NativeProgramState &state,
           return *maxIndex + 1;
         }
       }
+    }
+    std::optional<std::pair<std::string, uint64_t>> memoryCompare =
+        parseX86MemoryImmediate(text, "CMP");
+    if (memoryCompare &&
+        std::find(compareMemoryOperands.begin(), compareMemoryOperands.end(),
+                  memoryCompare->first) != compareMemoryOperands.end()) {
+      return memoryCompare->second + 1;
     }
   }
   return std::nullopt;
