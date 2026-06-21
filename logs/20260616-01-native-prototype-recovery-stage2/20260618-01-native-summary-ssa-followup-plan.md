@@ -4153,3 +4153,79 @@ cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test native_regi
 - 实现效果：8/10。把一类明确的外部函数指针 wrapper 从 unresolved 里收回来了。
 - 理解成本：4/10。多了一段 x86 指令文本 matcher，但范围很窄，只在 instruction facts 层生效。
 - 维护成本：3/10。规则仍在 decode/facts 层，不影响 lowering 和 summary SSA。
+
+## 实现记录：跨 block 外部函数指针 wrapper 和 DIL jump table
+
+背景：
+
+- 上一轮只能处理 `LEA REG,[slot]` 和 `JMP/CALL qword ptr [REG(+disp)]`
+  落在同一个 seed decode 窗口里的情况。
+- `redis-cli` 里还有几处同类 wrapper 被拆成多个 block：
+  - `0x35f1b`
+  - `0x35ecb`
+  - `0x1532b`
+  这些地址本身只 decode 到 `JMP qword ptr [RAX + 0x20]`，
+  前面的 `LEA RAX,[0x609a0]` 已经作为别的 block 的 instruction fact 存在。
+- `0x3a26f` 是 PIC i32 jump table，但上界比较写成 `CMP DIL,0x4`。
+  之前 `RDI` 的低 8 位别名没有包含 `DIL`，所以没找到 entry count。
+
+实现：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1438)
+  `low32RegisterName(...)` 补 `RBP -> EBP`、`RSP -> ESP`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1453)
+  `low8RegisterName(...)` 补 `RSI/RDI/RBP/RSP` 到 `SIL/DIL/BPL/SPL`。
+  这样 `findNearestUpperBound(...)` 能把 `RDI` index 和 `DIL` compare 连起来。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1688)
+  新增 `findNearestLeaBaseInKnownFallthroughInstructions(...)`。
+  它只沿已知的连续 fallthrough instruction facts 向前扫 64 字节；
+  一旦 fallthrough 不连续，或者中间写了同一个寄存器，就停止。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1886)
+  `matchX86ExternalFunctionPointerInstruction(...)` 找 base 的顺序变成：
+  1. 当前 seed decode 窗口；
+  2. 已确认函数的 instruction facts；
+  3. 已知连续 fallthrough instruction facts。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build \
+  --target native_analysis_facts_test pcode_to_llvm_test native_register_summary_test \
+           native_register_summary_ssa_test notdec-native-discover notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --unresolved-json \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --unresolved-json \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  -o /tmp/notdec-fortune-crossblock-wrapper/fortune.ll \
+  --summary-json-out /tmp/notdec-fortune-crossblock-wrapper/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /tmp/notdec-fortune-crossblock-wrapper/fortune.ll \
+  -o /tmp/notdec-fortune-crossblock-wrapper/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-crossblock-wrapper/fortune.bc \
+  -o /tmp/notdec-fortune-crossblock-wrapper/fortune.verify.bc
+```
+
+结果：
+
+- `redis-cli` unresolved indirect flow 从上一轮的 `289` 降到 `229`：
+  - `call=205`
+  - `branch=24`
+- `0x35f1b`、`0x35ecb`、`0x1532b` 不再 unresolved。
+- `0x3a26f` 不再 unresolved。
+- `fortune` unresolved indirect flow 仍是 0。
+- `fortune` 默认 native pipeline 通过 `llvm-as` 和 verifier，耗时 `10.74 sec`。
+- `fortune.ll` 里 `@notdec_native_load` / `@notdec_native_store` 都是 0。
+
+评分：
+
+- 实现效果：8/10。收掉一批跨 block wrapper，并修掉一个低 8 位别名导致的 jump table 漏识别。
+- 理解成本：4/10。多了一个连续 fallthrough 向前扫，但约束明确，不跨非 fallthrough 边。
+- 维护成本：3/10。仍在 instruction facts 层，不影响 lowering 和 summary SSA。

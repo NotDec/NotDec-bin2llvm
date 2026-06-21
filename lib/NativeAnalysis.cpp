@@ -1438,6 +1438,12 @@ std::string low32RegisterName(const std::string &reg) {
   if (reg == "RDI") {
     return "EDI";
   }
+  if (reg == "RBP") {
+    return "EBP";
+  }
+  if (reg == "RSP") {
+    return "ESP";
+  }
   if (reg.size() >= 2 && reg[0] == 'R' && std::isdigit(reg[1])) {
     return reg + "D";
   }
@@ -1456,6 +1462,18 @@ std::string low8RegisterName(const std::string &reg) {
   }
   if (reg == "RDX") {
     return "DL";
+  }
+  if (reg == "RSI") {
+    return "SIL";
+  }
+  if (reg == "RDI") {
+    return "DIL";
+  }
+  if (reg == "RBP") {
+    return "BPL";
+  }
+  if (reg == "RSP") {
+    return "SPL";
   }
   if (reg.size() >= 2 && reg[0] == 'R' && std::isdigit(reg[1])) {
     return reg + "B";
@@ -1667,6 +1685,33 @@ std::optional<uint64_t> findNearestLeaBaseInDecodedInstructions(
   return std::nullopt;
 }
 
+std::optional<uint64_t> findNearestLeaBaseInKnownFallthroughInstructions(
+    const NativeProgramState &state, uint64_t beforeAddress,
+    const std::string &reg) {
+  uint64_t start = beforeAddress > 64 ? beforeAddress - 64 : 0;
+  std::vector<const NativeInstruction *> instructions =
+      state.instructionsInRange(start, beforeAddress);
+  uint64_t expectedNext = beforeAddress;
+  for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
+       ++iterator) {
+    const NativeInstruction &instruction = **iterator;
+    if (!isInstructionFallthroughTo(instruction, expectedNext)) {
+      return std::nullopt;
+    }
+    const std::string &text = instruction.Mnemonic;
+    if (auto address = parseX86LeaAbsoluteBase(text, reg)) {
+      return address;
+    }
+    if (text.rfind("MOV " + reg + ",", 0) == 0 ||
+        text.rfind("LEA " + reg + ",", 0) == 0 ||
+        text.rfind("POP " + reg, 0) == 0) {
+      return std::nullopt;
+    }
+    expectedNext = instruction.Address;
+  }
+  return std::nullopt;
+}
+
 std::optional<std::pair<std::string, std::string>>
 parseX86AddRegReg(const std::string &text) {
   const std::string prefix = "ADD ";
@@ -1844,6 +1889,17 @@ matchX86ExternalFunctionPointerInstruction(
   } else {
     base = findNearestLeaBaseInDecodedInstructions(instructions, index,
                                                    target->BaseReg);
+    if (!base) {
+      if (const NativeFunction *function =
+              state.functionContaining(instruction.Address)) {
+        base = findNearestLeaBase(state, *function, instruction.Address,
+                                  target->BaseReg);
+      }
+    }
+    if (!base) {
+      base = findNearestLeaBaseInKnownFallthroughInstructions(
+          state, instruction.Address, target->BaseReg);
+    }
   }
   if (!base || *base > std::numeric_limits<uint64_t>::max() -
                            target->Displacement) {
