@@ -1524,6 +1524,22 @@ private:
       }
     }
     annotateDecodedInstructionFlows(decodedInstructions, flowInfos);
+    // A seed is decoded linearly, but only locally reachable instructions should
+    // become block facts for this function entry.
+    std::set<uint64_t> reachableStarts =
+        reachableInstructionStarts(decodedInstructions, rangeStart);
+    decodedInstructions.erase(
+        std::remove_if(decodedInstructions.begin(), decodedInstructions.end(),
+                       [&](const NativeInstruction &instruction) {
+                         return reachableStarts.count(instruction.Address) == 0;
+                       }),
+        decodedInstructions.end());
+    if (decodedInstructions.empty()) {
+      return result;
+    }
+    rangeStart = decodedInstructions.front().Address;
+    rangeEnd =
+        decodedInstructions.back().Address + decodedInstructions.back().Size;
     for (const NativeInstruction &instruction : decodedInstructions) {
       state.addInstruction(instruction);
     }
@@ -1534,6 +1550,39 @@ private:
                              decodedInstructions, result.FallthroughTarget,
                              result.BranchTargets);
     return result;
+  }
+
+  static std::set<uint64_t> reachableInstructionStarts(
+      const std::vector<NativeInstruction> &instructions, uint64_t entry) {
+    std::map<uint64_t, const NativeInstruction *> instructionByAddress;
+    for (const NativeInstruction &instruction : instructions) {
+      instructionByAddress[instruction.Address] = &instruction;
+    }
+
+    std::set<uint64_t> reachable;
+    std::vector<uint64_t> worklist;
+    if (instructionByAddress.count(entry) != 0) {
+      worklist.push_back(entry);
+    }
+    while (!worklist.empty()) {
+      uint64_t address = worklist.back();
+      worklist.pop_back();
+      if (!reachable.insert(address).second) {
+        continue;
+      }
+
+      const NativeInstruction &instruction = *instructionByAddress[address];
+      for (uint64_t target : instruction.DirectFlowTargets) {
+        if (instructionByAddress.count(target) != 0) {
+          worklist.push_back(target);
+        }
+      }
+      if (instruction.Fallthrough &&
+          instructionByAddress.count(*instruction.Fallthrough) != 0) {
+        worklist.push_back(*instruction.Fallthrough);
+      }
+    }
+    return reachable;
   }
 
   static void annotateDecodedInstructionFlows(

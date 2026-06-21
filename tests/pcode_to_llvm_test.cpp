@@ -11,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -129,11 +130,33 @@ bool testExternalTailBranchWithoutLocalBlock() {
                 "module failed verifier after external tail branch lowering");
 }
 
+bool testNativeBlockRangeIsRequired() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(returnOp(0x1000));
+  program.Ops.push_back(returnOp(0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "missing_native_block_range";
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x2000});
+  config.BlockRanges.emplace(0x1000, 0x1001);
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr, "module should fail without full block ranges") &&
+         expect(errorMessage.find("outside native block ranges") !=
+                    std::string::npos,
+                "missing block range error was not reported");
+}
+
 } // namespace
 
 int main() {
   bool ok = true;
   ok &= testUnreachablePcodeBlocksAreRemoved();
   ok &= testExternalTailBranchWithoutLocalBlock();
+  ok &= testNativeBlockRangeIsRequired();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

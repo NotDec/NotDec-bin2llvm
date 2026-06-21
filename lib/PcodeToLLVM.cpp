@@ -65,7 +65,9 @@ public:
     }
 
     CurrentProgramOps = &program.Ops;
-    buildBasicBlocks(program);
+    if (!buildBasicBlocks(program, errorMessage)) {
+      return false;
+    }
     Builder.CreateBr(BlockForStart[BlockStarts.front()]);
 
     for (size_t blockIndex = 0; blockIndex < BlockStarts.size(); ++blockIndex) {
@@ -194,27 +196,40 @@ private:
     }
   }
 
-  void buildBasicBlocks(const PcodeProgram &program) {
+  bool buildBasicBlocks(const PcodeProgram &program,
+                        std::string &errorMessage) {
     std::map<uint64_t, size_t> firstOpForAddress;
     for (size_t index = 0; index < program.Ops.size(); ++index) {
       firstOpForAddress.try_emplace(program.Ops[index].Address, index);
     }
 
     std::set<size_t> starts;
-    starts.insert(0);
     if (usesNativeCfg()) {
       for (const auto &[blockAddress, blockEnd] : Config.BlockRanges) {
-        (void)blockEnd;
-        addBlockStart(starts, firstOpForAddress, blockAddress);
+        if (blockEnd <= blockAddress) {
+          std::ostringstream os;
+          os << "native block 0x" << std::hex << blockAddress
+             << " has an invalid block range ending at 0x" << blockEnd;
+          errorMessage = os.str();
+          return false;
+        }
+        for (size_t index = 0; index < program.Ops.size(); ++index) {
+          uint64_t opAddress = program.Ops[index].Address;
+          if (opAddress >= blockAddress && opAddress < blockEnd) {
+            starts.insert(index);
+            NativeBlockAddressForStart[index] = blockAddress;
+            NativeBlockEndForStart[index] = blockEnd;
+            break;
+          }
+        }
       }
-    }
-    for (const auto &[blockAddress, successors] : Config.BlockSuccessors) {
-      addBlockStart(starts, firstOpForAddress, blockAddress);
-      for (uint64_t successor : successors) {
-        addBlockStart(starts, firstOpForAddress, successor);
+      if (starts.empty()) {
+        errorMessage = "native block ranges do not cover any p-code op";
+        return false;
       }
     }
     if (!usesNativeCfg()) {
+      starts.insert(0);
       for (size_t index = 0; index < program.Ops.size(); ++index) {
         const PcodeOpView &op = program.Ops[index];
         if (op.Opcode == PcodeOpcode::Branch ||
@@ -233,36 +248,62 @@ private:
         }
       }
     }
+    if (usesNativeCfg()) {
+      for (const PcodeOpView &op : program.Ops) {
+        bool covered = false;
+        for (const auto &[blockAddress, blockEnd] : Config.BlockRanges) {
+          if (op.Address >= blockAddress && op.Address < blockEnd) {
+            covered = true;
+            break;
+          }
+        }
+        if (!covered) {
+          std::ostringstream os;
+          os << "p-code op at 0x" << std::hex << op.Address
+             << " is outside native block ranges";
+          errorMessage = os.str();
+          return false;
+        }
+      }
+    }
 
     BlockStarts.assign(starts.begin(), starts.end());
     for (size_t index = 0; index < BlockStarts.size(); ++index) {
       size_t start = BlockStarts[index];
-      uint64_t address = program.Ops[start].Address;
-      size_t end = blockEndForStart(program, index);
-      BlockEnds.push_back(end);
+      uint64_t address = blockAddressForStart(start);
+      auto end = blockEndForStart(program, index, errorMessage);
+      if (!end) {
+        return false;
+      }
+      BlockEnds.push_back(*end);
       llvm::BasicBlock *block =
           llvm::BasicBlock::Create(Context, blockName(address), &Function);
       BlockForStart[start] = block;
       BlockForAddress.try_emplace(address, block);
     }
+    return true;
   }
 
-  size_t blockEndForStart(const PcodeProgram &program, size_t blockIndex) {
+  std::optional<size_t> blockEndForStart(const PcodeProgram &program,
+                                         size_t blockIndex,
+                                         std::string &errorMessage) {
     size_t start = BlockStarts[blockIndex];
     if (!usesNativeCfg()) {
       return blockIndex + 1 < BlockStarts.size() ? BlockStarts[blockIndex + 1]
                                                  : program.Ops.size();
     }
 
-    uint64_t blockStartAddress = program.Ops[start].Address;
-    auto rangeIt = Config.BlockRanges.find(blockStartAddress);
-    if (rangeIt == Config.BlockRanges.end() ||
-        rangeIt->second <= blockStartAddress) {
-      return blockIndex + 1 < BlockStarts.size() ? BlockStarts[blockIndex + 1]
-                                                 : program.Ops.size();
+    auto rangeIt = NativeBlockEndForStart.find(start);
+    if (rangeIt == NativeBlockEndForStart.end()) {
+      std::ostringstream os;
+      os << "native block 0x" << std::hex << blockAddressForStart(start)
+         << " is missing a block range";
+      errorMessage = os.str();
+      return std::nullopt;
     }
 
     uint64_t blockEndAddress = rangeIt->second;
+    uint64_t blockStartAddress = blockAddressForStart(start);
     size_t end = start;
     while (end < program.Ops.size() &&
            program.Ops[end].Address >= blockStartAddress &&
@@ -270,6 +311,18 @@ private:
       ++end;
     }
     return end;
+  }
+
+  uint64_t blockAddressForStart(size_t start) const {
+    auto it = NativeBlockAddressForStart.find(start);
+    if (it != NativeBlockAddressForStart.end()) {
+      return it->second;
+    }
+    return (*CurrentProgramOps)[start].Address;
+  }
+
+  uint64_t blockAddressForIndex(size_t blockIndex) const {
+    return blockAddressForStart(BlockStarts[blockIndex]);
   }
 
   llvm::BasicBlock *nextBlock(size_t blockIndex) {
@@ -280,8 +333,7 @@ private:
   }
 
   llvm::BasicBlock *nativeFallthroughBlock(size_t blockIndex) {
-    uint64_t blockAddress =
-        (*CurrentProgramOps)[BlockStarts[blockIndex]].Address;
+    uint64_t blockAddress = blockAddressForIndex(blockIndex);
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
       return usesNativeCfg() ? nullptr : nextBlock(blockIndex);
@@ -295,8 +347,7 @@ private:
   llvm::BasicBlock *nativeConditionalFalseBlock(size_t blockIndex,
                                                 uint64_t trueTarget,
                                                 llvm::BasicBlock *fallback) {
-    uint64_t blockAddress =
-        (*CurrentProgramOps)[BlockStarts[blockIndex]].Address;
+    uint64_t blockAddress = blockAddressForIndex(blockIndex);
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
       return usesNativeCfg() ? nullptr : fallback;
@@ -1383,6 +1434,8 @@ private:
   std::unordered_map<std::string, uint64_t> SourceRamByVarnode;
   std::vector<size_t> BlockStarts;
   std::vector<size_t> BlockEnds;
+  std::unordered_map<size_t, uint64_t> NativeBlockAddressForStart;
+  std::unordered_map<size_t, uint64_t> NativeBlockEndForStart;
   std::unordered_map<size_t, llvm::BasicBlock *> BlockForStart;
   std::unordered_map<uint64_t, llvm::BasicBlock *> BlockForAddress;
   std::vector<llvm::BasicBlock *> ExternalTargetBlocks;

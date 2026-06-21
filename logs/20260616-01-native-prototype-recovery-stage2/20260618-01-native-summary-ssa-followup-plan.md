@@ -1044,3 +1044,69 @@ llvm-as + opt verify: passed
 - 实现效果：8/10。native lowering 的 terminator fallback 现在只剩 native CFG facts，没有顺序块兜底。
 - 理解成本：2/10。只是把 native / generic fallback 边界收紧。
 - 维护成本：2/10。不会影响 generic pcode 路径，也不会影响现有 summary 结果。
+
+## 实现记录：seed decode 改成本地可达 block facts
+
+这次继续减少 native decode 对线性 pcode 顺序的依赖。
+
+之前 seed decode 会一次线性取一个小窗口。窗口里如果包含 `return` / unconditional branch 后面的字节，后续 block 构建仍可能把这些字节放进同一个函数事实里。第一版尝试过直接在第一个 no-fallthrough terminator 处截断窗口，但 fortune 里会丢掉同一窗口内仍可由本地 branch target 到达的块，所以没有采用。
+
+最终做法是：先给窗口内 instruction 标注 flow facts，再从 seed entry 在这个小窗口内跑一次本地 CFG 可达性，只把本地可达 instruction 变成 block facts。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1526)
+  - `decodeSeed(...)` 在 `annotateDecodedInstructionFlows(...)` 后调用 `reachableInstructionStarts(...)`。
+  - `state.addInstruction(...)` 和 `addDecodedFunctionBlocks(...)` 只消费本地可达的 instruction。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1555)
+  - 新增 `reachableInstructionStarts(...)`。
+  - 在当前 decode 窗口内，从 seed entry 沿 `DirectFlowTargets` 和 `Fallthrough` 走本地 CFG。
+  - 不靠“下一个线性地址一定可达”来跨过 no-fallthrough terminator。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:199)
+  - `buildBasicBlocks(...)` 改为返回 `bool`，native 模式下要求 `BlockRanges` 覆盖所有 pcode op。
+  - native lowering 不再从 `BlockSuccessors` 反推缺失的 block start；缺 range 直接报错。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:316)
+  - 新增 `blockAddressForStart(...)` / `blockAddressForIndex(...)`，让 LLVM block 名和 successor 查询使用 native block start，而不是 pcode op 的地址。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:133)
+  - 增加 `testNativeBlockRangeIsRequired()`，覆盖 native range 缺失时失败的情况。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test notdec-native-llvm native_register_summary_test native_register_summary_ssa_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-local-reach/fortune.ll --summary-json-out /tmp/notdec-fortune-local-reach/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-local-reach-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-local-reach/fortune.ll -o /tmp/notdec-fortune-local-reach/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-local-reach/fortune.bc -o /tmp/notdec-fortune-local-reach/fortune.verified.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-local-reach-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-local-reach-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-local-reach-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-local-reach-raw/fortune-3470-raw.verified.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 9.31s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 130
+final !notdec.register.access residue: 1
+remaining register access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+额外检查：
+
+- discovery 里 `0x3748` 仍然是独立 block。
+- `0x3748` successors 是 `0x3e81` 和 `0x374e`。
+- full summary 链路没有再出现 `R9` register access residue。
+
+复杂度评估：
+
+- 实现效果：8/10。seed 内 block facts 现在来自 instruction flow 的本地可达性，明显减少线性窗口带来的不可达块。
+- 理解成本：4/10。新增一个小的本地 CFG walk；比直接截断窗口更准确。
+- 维护成本：3/10。逻辑只在 native discovery/lowering 边界，generic pcode 路径不受影响。
