@@ -82,6 +82,16 @@ notdec::bin2llvm::PcodeOpView branchOp(uint64_t address, uint64_t target) {
   return op;
 }
 
+notdec::bin2llvm::PcodeOpView relativeBranchOp(uint64_t address,
+                                               int8_t offset) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Branch;
+  op.OpcodeName = "BRANCH";
+  op.Inputs.push_back(constVarnode(static_cast<uint8_t>(offset), 1));
+  return op;
+}
+
 notdec::bin2llvm::PcodeOpView cbranchOp(uint64_t address, uint64_t target) {
   notdec::bin2llvm::PcodeOpView op;
   op.Address = address;
@@ -424,6 +434,30 @@ bool testNativeDirectBranchRequiresSuccessorFact() {
          expect(errorMessage.find("missing successor facts") !=
                     std::string::npos,
                 "missing direct branch successor facts error was not reported");
+}
+
+bool testNativeRelativeBranchRequiresSuccessorFact() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(relativeBranchOp(0x1000, 1));
+  program.Ops.push_back(returnOp(0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_relative_missing_successor";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockSuccessors.emplace(0x2000, std::vector<uint64_t>{});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native relative branch without successor fact should fail") &&
+         expect(errorMessage.find("missing successor facts") !=
+                    std::string::npos,
+                "missing relative branch successor facts error was not reported");
 }
 
 bool testNativeEntryAddressCanTargetEmptyBlock() {
@@ -899,6 +933,7 @@ int main() {
   ok &= testNativeDirectBranchOutsideRangesBecomesTailCall();
   ok &= testNativeDirectBranchCanTargetEmptyBlock();
   ok &= testNativeDirectBranchRequiresSuccessorFact();
+  ok &= testNativeRelativeBranchRequiresSuccessorFact();
   ok &= testNativeEntryAddressCanTargetEmptyBlock();
   ok &= testAllEmptyNativeBlockCanLower();
   ok &= testNativeSuccessorRequiresKnownBlock();

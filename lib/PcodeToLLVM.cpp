@@ -836,9 +836,17 @@ private:
         Builder.CreateBr(targetBlock);
         return true;
       }
-      llvm::BasicBlock *relativeTarget = blockForRelativeTarget(opIndex, op, 0);
-      if (relativeTarget == nullptr) {
+      auto relativeIndex =
+          relativeTargetIndex(opIndex, op, 0, CurrentProgramOps->size());
+      llvm::BasicBlock *relativeTarget =
+          relativeIndex ? blockForRelativeTarget(opIndex, op, 0) : nullptr;
+      if (relativeTarget == nullptr || !relativeIndex) {
         errorMessage = "BRANCH target must be direct ram or relative const";
+        return false;
+      }
+      uint64_t relativeAddress = (*CurrentProgramOps)[*relativeIndex].Address;
+      if (!nativeDirectBranchTarget(blockIndex, relativeAddress, relativeTarget,
+                                    errorMessage)) {
         return false;
       }
       Builder.CreateBr(relativeTarget);

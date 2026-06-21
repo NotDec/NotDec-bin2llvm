@@ -3277,3 +3277,61 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：8/10。direct branch 不再靠 p-code target 偷连 native CFG。
 - 理解成本：3/10。逻辑和 conditional/indirect branch 的 successor fact 校验一致。
 - 维护成本：3/10。指令内部 p-code target 有专门豁免，避免影响 CMOV 这类单指令内部控制流。
+
+## 实现记录：native relative branch 也必须匹配 block successor facts
+
+背景：
+
+- 继续检查 `PcodeToLLVM` 的 branch lowering 后，发现上一节只收紧了 direct RAM target。
+- `BRANCH` 如果使用 p-code relative const target，native mode 下仍会通过 p-code op index 找到
+  target block 并直接生成 `br`。这同样会绕过 `BlockSuccessors`。
+- 这类 relative branch 在 native mode 下只有两种合理情况：
+  - 指令内部 p-code 跳转，属于同一个 native block。
+  - 机器级 CFG 边，必须由 native block successor facts 证明。
+
+实现：
+
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:839)
+  relative `BRANCH` lowering 先解析 target op index 和 target address，再调用
+  `nativeDirectBranchTarget(...)`。如果不是同 native block 的 internal p-code target，就必须匹配
+  当前 block 的 `BlockSuccessors`。
+- [tests/pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:85)
+  增加 `relativeBranchOp(...)` 测试辅助。
+- [tests/pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:439)
+  增加 `testNativeRelativeBranchRequiresSuccessorFact()`，验证 relative p-code target 不能单独连接到
+  另一个 native block。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_analysis_facts_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-strict-relative/summary.json \
+  -o /tmp/notdec-fortune-strict-relative/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-strict-relative/fortune.ll \
+  -o /tmp/notdec-fortune-strict-relative/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-strict-relative/fortune.bc \
+  -o /tmp/notdec-fortune-strict-relative/fortune.verified.bc
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --no-instcombine-pass \
+  --summary-json-out /tmp/notdec-fortune-strict-relative-noinst/summary.json \
+  -o /tmp/notdec-fortune-strict-relative-noinst/fortune.ll
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.54 sec`。
+- fortune `--no-instcombine-pass` 通过 `llvm-as` 和 verifier，耗时 `9.08 sec`。
+- 默认输出中 `br i1 poison`、`ret ... poison`、`store ... ptr poison` 仍为 0。
+
+评分：
+
+- 实现效果：8/10。relative branch 不再靠 p-code op 顺序偷连 native CFG。
+- 理解成本：2/10。复用上一节的 `nativeDirectBranchTarget(...)`。
+- 维护成本：3/10。仍保留 internal p-code target 豁免，风险集中且可测试。
