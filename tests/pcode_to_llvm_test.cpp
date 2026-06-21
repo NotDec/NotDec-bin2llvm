@@ -86,6 +86,15 @@ notdec::bin2llvm::PcodeOpView cbranchOp(uint64_t address, uint64_t target) {
   return op;
 }
 
+notdec::bin2llvm::PcodeOpView branchIndOp(uint64_t address) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::BranchInd;
+  op.OpcodeName = "BRANCHIND";
+  op.Inputs.push_back(uniqueVarnode(0x200, 8));
+  return op;
+}
+
 bool testUnreachablePcodeBlocksAreRemoved() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -586,6 +595,98 @@ bool testNativeConditionalSuccessorsRejectMultipleFalseTargets() {
                 "multiple false successor error was not reported");
 }
 
+bool testNativeIndirectBranchCanUseSingleSuccessor() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(branchIndOp(0x1000));
+  program.Ops.push_back(returnOp(0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_indirect_single_successor";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x2000});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr,
+              "native indirect branch function is missing")) {
+    return false;
+  }
+
+  llvm::BasicBlock *sourceBlock = nullptr;
+  for (llvm::BasicBlock &block : *function) {
+    if (block.getName() == "bb_1000") {
+      sourceBlock = &block;
+      break;
+    }
+  }
+  if (!expect(sourceBlock != nullptr,
+              "native indirect branch source block is missing")) {
+    return false;
+  }
+  auto *branch = llvm::dyn_cast<llvm::BranchInst>(sourceBlock->getTerminator());
+  return expect(branch != nullptr && branch->isUnconditional(),
+                "native indirect branch did not lower to a direct branch") &&
+         expect(branch->getSuccessor(0)->getName() == "bb_2000",
+                "native indirect branch ignored successor facts") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after indirect successor lowering");
+}
+
+bool testNativeIndirectBranchRequiresSuccessorFacts() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(branchIndOp(0x1000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_indirect_missing_successors";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native indirect branch without successor facts should fail") &&
+         expect(errorMessage.find("missing successor facts") !=
+                    std::string::npos,
+                "missing indirect successor facts error was not reported");
+}
+
+bool testNativeIndirectBranchRejectsMultipleSuccessors() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(branchIndOp(0x1000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_indirect_multiple_successors";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockRanges.emplace(0x3000, 0x3001);
+  config.BlockSuccessors.emplace(0x1000,
+                                 std::vector<uint64_t>{0x2000, 0x3000});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native indirect branch with multiple successors should fail") &&
+         expect(errorMessage.find("multiple indirect targets") !=
+                    std::string::npos,
+                "multiple indirect successor error was not reported");
+}
+
 } // namespace
 
 int main() {
@@ -605,5 +706,8 @@ int main() {
   ok &= testNativeConditionalRequiresSuccessorFacts();
   ok &= testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor();
   ok &= testNativeConditionalSuccessorsRejectMultipleFalseTargets();
+  ok &= testNativeIndirectBranchCanUseSingleSuccessor();
+  ok &= testNativeIndirectBranchRequiresSuccessorFacts();
+  ok &= testNativeIndirectBranchRejectsMultipleSuccessors();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

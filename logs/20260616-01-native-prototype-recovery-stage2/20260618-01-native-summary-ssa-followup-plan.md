@@ -1662,3 +1662,68 @@ llvm-as + opt verify: passed
 - 实现效果：4/10。补齐上一轮 conditional successor 校验的 missing-entry 情况。
 - 理解成本：1/10。缺 successor facts 直接报错。
 - 维护成本：1/10。没有新增状态。
+
+## 实现记录：BRANCHIND 消费 native successor facts
+
+上一轮之后，direct branch / conditional branch 已经基本按 `BlockSuccessors` lowering，但 `BRANCHIND` 还会在找不到已知 GOT external tail jump 时直接接到 `notdec_exit`。这会无视 decode 层后续可能提供的 indirect branch successor facts。
+
+这次只做保守收紧：
+
+- 已知 GOT/PLT external tail jump 仍走原来的 tail call 逻辑。
+- native CFG 模式下，`BRANCHIND` 必须有当前 block 的 successor entry。
+- successor 为空时，表示 decode 层没有解析出目标，仍接 `notdec_exit`。
+- successor 正好一个时，按这个 fact 生成普通 `br`。
+- successor 多个时先报错，不用 `indirectbr` 硬凑。当前还没有 jump table 目标表达式和 LLVM label address 的可靠对应关系。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:522)
+  - 新增 `nativeIndirectBranchSuccessor(...)`，统一检查 `BRANCHIND` 的 native successor facts。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:744)
+  - `lowerTerminator(...)` 的 `BranchInd` 分支在 native CFG 模式下消费唯一 successor；缺 facts 或多 successor 报错。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:89)
+  - 新增 `branchIndOp(...)` 测试构造器。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:598)
+  - 增加唯一 successor 能降低为 direct branch 的测试。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:644)
+  - 增加缺 successor facts 报错测试。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:665)
+  - 增加多个 indirect successor 暂不支持的报错测试。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test notdec-native-llvm native_register_summary_test native_register_summary_ssa_test native_analysis_facts_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-branchind-successors/fortune.ll --summary-json-out /tmp/notdec-fortune-branchind-successors/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-branchind-successors-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-branchind-successors/fortune.ll -o /tmp/notdec-fortune-branchind-successors/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-branchind-successors/fortune.bc -o /tmp/notdec-fortune-branchind-successors/fortune.verify.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-branchind-successors-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-branchind-successors-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-branchind-successors-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-branchind-successors-raw/fortune-3470-raw.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 9.36s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 109
+unresolved_indirect_flows.total: 1
+unresolved_indirect_flows.indirect branch: 1
+final !notdec.register.access residue: 1
+remaining !notdec.register.access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：5/10。不会解决 fortune 里 `0x2879` 的未知 indirect branch，但以后 decode 层如果给出唯一后继，lowering 不再丢掉它。
+- 理解成本：2/10。规则和 direct/conditional 分支一致：native facts 是事实来源；多目标 indirect branch 明确留给 jump table 设计。
+- 维护成本：2/10。只新增一个局部 helper 和三条 synthetic 测试。

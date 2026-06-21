@@ -519,6 +519,39 @@ private:
     return result != nullptr;
   }
 
+  bool nativeIndirectBranchSuccessor(size_t blockIndex,
+                                     llvm::BasicBlock *&result,
+                                     std::string &errorMessage) {
+    result = nullptr;
+    if (!usesNativeCfg()) {
+      return true;
+    }
+
+    uint64_t blockAddress = blockAddressForIndex(blockIndex);
+    auto successorIt = Config.BlockSuccessors.find(blockAddress);
+    if (successorIt == Config.BlockSuccessors.end()) {
+      std::ostringstream os;
+      os << "native indirect branch block 0x" << std::hex << blockAddress
+         << " is missing successor facts";
+      errorMessage = os.str();
+      return false;
+    }
+    if (successorIt->second.empty()) {
+      return true;
+    }
+    if (successorIt->second.size() != 1) {
+      std::ostringstream os;
+      os << "native indirect branch block 0x" << std::hex << blockAddress
+         << " has " << std::dec << successorIt->second.size()
+         << " successors; multiple indirect targets are not lowered yet";
+      errorMessage = os.str();
+      return false;
+    }
+
+    result = blockForNativeTarget(successorIt->second.front(), errorMessage);
+    return result != nullptr;
+  }
+
   llvm::BasicBlock *blockForTarget(uint64_t address) {
     auto it = BlockForAddress.find(address);
     if (it != BlockForAddress.end()) {
@@ -709,6 +742,17 @@ private:
         auto it = Config.IndirectExternalCallTargets.find(*gotAddress);
         if (it != Config.IndirectExternalCallTargets.end()) {
           return lowerKnownVoidTailJump(it->second);
+        }
+      }
+      if (usesNativeCfg()) {
+        llvm::BasicBlock *successor = nullptr;
+        if (!nativeIndirectBranchSuccessor(blockIndex, successor,
+                                           errorMessage)) {
+          return false;
+        }
+        if (successor != nullptr) {
+          Builder.CreateBr(successor);
+          return true;
         }
       }
       Builder.CreateBr(exitBlock());
