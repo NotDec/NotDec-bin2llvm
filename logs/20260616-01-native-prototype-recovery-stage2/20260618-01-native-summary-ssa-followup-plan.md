@@ -3964,3 +3964,192 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：6/10。继续恢复一批真实 jump table，并让 trap facts 更准确。
 - 理解成本：4/10。matcher 多了短窗口和 register alias 追踪，但仍限制在明确机器指令形态。
 - 维护成本：3/10。规则仍在 native facts 层，后续可以继续扩展同类 matcher。
+
+## 实现记录：UD2 作为 trap，jump table matcher 继续补齐
+
+背景：
+
+- 前端 discovery 里还剩一批 `indirect branch`。
+- 其中一部分其实是 `UD2`，不是真正的间接跳转。
+- 另一部分是 PIC jump table，但之前只覆盖了更窄的寄存器形态，`wrk` 里还有 `RAX/R9/R14` 这类变体没进来。
+
+实现：
+
+- [include/notdec-bin2llvm/NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:185)
+  `NativeInstructionFlowKind` 增加 `Trap`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1513)
+  `findNearestUpperBound(...)` 先做短窗口 alias 收集，再找 `CMP`，支持像：
+  - `MOV EAX,EDI`
+  - `MOVZX EAX,AL`
+  - `MOV EAX,R9D`
+  这种中间有一两步复制/截断的 jump table 上界推断。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2029)
+  seed decode 在提交 unresolved flow 前，先把 `UD2` 过滤掉。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2233)
+  `UD2` 在 instruction facts 里标成 `Trap`，并清掉普通 flow target。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3045)
+  `X86JumpTableAnalyzer` 现在先把 jump table 的所有已解码 target 写回 instruction facts，
+  再把已有 block-start target 写回 block facts，最后交给 `FlowFactNormalizer` 去 split block。
+  不会再把落在指令中间的坏 target 强行写成 block。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:70)
+  `NativeInstructionFlowKind::Trap` 的字符串化补了测试。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:543)
+  增加 `testFlowNormalizerKeepsTrapTerminal()`，确认 trap block 不会被补 successor。
+
+验证：
+
+```text
+cmake --build build --target native_analysis_facts_test notdec-native-discover -j$(nproc)
+build/bin/native_analysis_facts_test
+cmake --build build --target pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-trap-jumptable-final/summary.json \
+  -o /tmp/notdec-fortune-trap-jumptable-final/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-trap-jumptable-final/fortune.ll \
+  -o /tmp/notdec-fortune-trap-jumptable-final/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-trap-jumptable-final/fortune.bc \
+  -o /tmp/notdec-fortune-trap-jumptable-final/fortune.verify.bc
+```
+
+结果：
+
+- 核心 native 测试通过。
+- `fortune` 默认链路通过 `llvm-as` 和 verifier，耗时 `10.65 sec`。
+- `fortune` 里 register access metadata 仍为 0，global store 为 0，global load 为 6。
+- 最新复跑里，`fortune` 的 unresolved indirect flows 仍是 0。
+- 最新复跑里，`wrk` 的 unresolved indirect branch 已经是 0，剩下的是 49 个 unresolved indirect call。
+- `wrk`、`memcached`、`redis-cli` 的 block facts 都保持闭合，非法 successor / overlap / empty block 都是 0。
+
+评分：
+
+- 实现效果：7/10。把 trap 和 jump table 的边界再收紧了一点，前端 facts 更接近真实机器语义。
+- 理解成本：4/10。新增了一个 trap 类型和一段 jump table alias 回溯，但都还在 decode/facts 层。
+- 维护成本：3/10。规则还是局部的；后续如果再加 matcher，也应该继续在这里补，不往 lowering 里塞猜测。
+
+## 实现记录：把 GOT/slot 里的可执行指针当成 call target
+
+背景：
+
+- `wrk` 里还剩 49 个 `indirect call`。
+- 抽样后发现一部分并不是“真正的未知回调”，而是像 `CALL qword ptr [0x142c8]` 这种通过已重定位槽位间接跳到可执行地址的调用。
+- 这类 call 之前只看 `slot` 本身是不是 external relocation，没有继续读槽里的值，所以被保守留成 unresolved。
+
+实现：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2534)
+  `collectDirectControlFlow(...)` 在 `CallInd` 分支里补了两种判断：
+  - 先看 `op.Inputs[0]` 如果就是 RAM 槽，直接读槽里的指针值；
+  - 再看 `callIndGotSource(...)` 追到的槽地址，读取其中的指针值。
+  只要读出来的是可执行地址，就直接写成 call xref，不再落到 unresolved。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2719)
+  新增 `resolvedExecutablePointerTargetAt(...)`，专门做“槽位里读出来的值是否真是可执行地址”的判断。
+- `BranchInd` 也顺手接了同样的 pointer-slot 判断，保持 call/branch 这两条线一致。
+
+验证：
+
+```text
+cmake --build build --target notdec-native-discover notdec-native-llvm -j$(nproc)
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk
+build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk
+build/bin/native_analysis_facts_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-current2/summary.json \
+  -o /tmp/notdec-fortune-current2/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-current2/fortune.ll \
+  -o /tmp/notdec-fortune-current2/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-current2/fortune.bc \
+  -o /tmp/notdec-fortune-current2/fortune.verify.bc
+```
+
+结果：
+
+- `wrk` 的 unresolved indirect call 从 49 降到 30。
+- 剩下的 30 个主要是像 `CALL RAX` / `CALL RCX` 这样的真实函数指针调用。
+- 抽样确认了几例：`0x7ddc` 是 `CALL RAX`，`0xb1f9` 是 `CALL RAX`，`0xc865` 是 `CALL RCX`。
+- 再往后抽样，`0x7a42` 是 `CALL qword ptr [R15 + 0x18]`，`0x77dd` 是 `CALL qword ptr [RBX + 0x8]`。
+  这类更像对象字段或虚表上的真实回调，不是当前前端 decode 还能靠 relocation 直接收回的漏识别。
+- `fortune` 继续通过 `llvm-as` 和 verifier。
+
+评分：
+
+- 实现效果：7/10。把一批“槽里明明已经是可执行地址”的 call 收回来了。
+- 理解成本：3/10。只加了一个读 pointer 的判断，路径还很短。
+- 维护成本：3/10。规则仍在 decode/facts 层，没有往 lowering 里塞额外猜测。
+
+## 实现记录：识别外部函数指针 tail-wrapper
+
+背景：
+
+- `redis-cli` 里还有一批很小的外部函数包装器，比如：
+  - `hi_sds_malloc`: `LEA RAX,[0x609a0]` 后 `JMP qword ptr [RAX]`
+  - `hi_sds_realloc`: 同一张表的 `+0x10`
+  - `hi_sds_free`: 同一张表的 `+0x20`
+- 这些槽位是 `X86_64_64` relocation，目标符号是 `malloc/realloc/free`。
+- 之前 decode 会把这些 `JMP qword ptr [...]` 留成 unresolved indirect branch。
+
+实现：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:380)
+  `NativeRelocationAnalyzer::run(...)` 对 `X86_64_64` 做保守处理：
+  只有外部函数符号才标成 `external`，其他仍是 `unsupported`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1602)
+  新增 `X86IndirectMemoryTarget`、`parseX86IndirectMemoryTarget(...)`、
+  `parseX86LeaAbsoluteBase(...)`、`findNearestLeaBaseInDecodedInstructions(...)`，
+  只匹配 `CALL/JMP qword ptr [REG(+disp)]` 和前面的 `LEA REG,[0x...]`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1802)
+  新增 `isExternalFunctionPointerRelocationAt(...)` 和
+  `matchX86ExternalFunctionPointerInstruction(...)`，确认槽位确实来自外部函数 relocation。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2211)
+  seed decode 在提交 unresolved flow 前调用 `collectExternalFunctionPointerXrefs(...)`。
+  命中的 call/branch 写成 xref，并从 unresolved indirect flow 里过滤掉。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2351)
+  `collectExternalFunctionPointerXrefs(...)` 直接基于本次 seed 的 instruction facts 做匹配，
+  不依赖当前函数是否已经写入 `NativeProgramState`。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target native_analysis_facts_test notdec-native-discover -j2
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-external-tail-wrapper/summary.json \
+  -o /tmp/notdec-fortune-external-tail-wrapper/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-external-tail-wrapper/fortune.ll \
+  -o /tmp/notdec-fortune-external-tail-wrapper/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-external-tail-wrapper/fortune.bc \
+  -o /tmp/notdec-fortune-external-tail-wrapper/fortune.verify.bc
+```
+
+结果：
+
+- `redis-cli` unresolved indirect flow 从 `380` 降到 `289`：
+  - `call=261`
+  - `branch=28`
+- `0x3b4fb`、`0x3b50b`、`0x3b51b` 都不再 unresolved。
+- `0x3b4fb` 现在有 xref：`0x3b4fb -> 0x609a0`，source 是
+  `x86-tail-branch-external-function-pointer`。
+- `fortune` unresolved indirect flow 仍是 0。
+- `fortune` 默认 native pipeline 通过 `llvm-as` 和 verifier，耗时 `10.59 sec`。
+- `fortune.ll` 里 `@notdec_native_load` / `@notdec_native_store` 都是 0。
+
+评分：
+
+- 实现效果：8/10。把一类明确的外部函数指针 wrapper 从 unresolved 里收回来了。
+- 理解成本：4/10。多了一段 x86 指令文本 matcher，但范围很窄，只在 instruction facts 层生效。
+- 维护成本：3/10。规则仍在 decode/facts 层，不影响 lowering 和 summary SSA。

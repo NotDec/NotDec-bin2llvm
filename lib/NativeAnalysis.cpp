@@ -119,6 +119,36 @@ std::optional<uint64_t> parseHex(const std::string &text) {
   return value;
 }
 
+std::optional<uint64_t> parseUnsignedNumber(const std::string &text) {
+  if (text.empty()) {
+    return std::nullopt;
+  }
+  try {
+    size_t parsedLength = 0;
+    uint64_t value = std::stoull(text, &parsedLength, 0);
+    if (parsedLength != text.size()) {
+      return std::nullopt;
+    }
+    return value;
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+}
+
+std::string trimAsciiWhitespace(const std::string &text) {
+  size_t begin = 0;
+  while (begin < text.size() &&
+         std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
+    ++begin;
+  }
+  size_t end = text.size();
+  while (end > begin &&
+         std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
+    --end;
+  }
+  return text.substr(begin, end - begin);
+}
+
 std::optional<int64_t> readSigned32(const NativeProgramState &state,
                                     uint64_t address) {
   std::vector<uint8_t> bytes;
@@ -346,6 +376,14 @@ public:
       case LIEF::ELF::Relocation::TYPE::X86_64_JUMP_SLOT:
         info.Status = "external";
         jumpSlots.push_back(info);
+        break;
+      case LIEF::ELF::Relocation::TYPE::X86_64_64:
+        if (symbolIsFunction && info.SymbolValue == 0 &&
+            !info.SymbolName.empty()) {
+          info.Status = "external";
+        } else {
+          info.Status = "unsupported";
+        }
         break;
       case LIEF::ELF::Relocation::TYPE::X86_64_IRELATIVE:
         info.ComputedValue = static_cast<uint64_t>(relocation.addend());
@@ -1561,6 +1599,74 @@ std::optional<std::string> parseX86RegisterAfterPrefix(
   return reg;
 }
 
+struct X86IndirectMemoryTarget {
+  std::string BaseReg;
+  uint64_t Displacement = 0;
+};
+
+std::optional<X86IndirectMemoryTarget>
+parseX86IndirectMemoryTarget(const std::string &text,
+                             const std::string &mnemonic) {
+  const std::string prefix = mnemonic + " qword ptr [";
+  if (text.rfind(prefix, 0) != 0 || text.empty() || text.back() != ']') {
+    return std::nullopt;
+  }
+
+  std::string inner = trimAsciiWhitespace(
+      text.substr(prefix.size(), text.size() - prefix.size() - 1));
+  if (inner.empty()) {
+    return std::nullopt;
+  }
+
+  X86IndirectMemoryTarget target;
+  size_t plus = inner.find('+');
+  if (plus == std::string::npos) {
+    target.BaseReg = trimAsciiWhitespace(inner);
+    if (target.BaseReg.empty()) {
+      return std::nullopt;
+    }
+    return target;
+  }
+
+  target.BaseReg = trimAsciiWhitespace(inner.substr(0, plus));
+  if (target.BaseReg.empty()) {
+    return std::nullopt;
+  }
+  std::string displacementText = trimAsciiWhitespace(inner.substr(plus + 1));
+  std::optional<uint64_t> displacement = parseUnsignedNumber(displacementText);
+  if (!displacement) {
+    return std::nullopt;
+  }
+  target.Displacement = *displacement;
+  return target;
+}
+
+std::optional<uint64_t> parseX86LeaAbsoluteBase(const std::string &text,
+                                                const std::string &reg) {
+  const std::string prefix = "LEA " + reg + ",[0x";
+  if (text.rfind(prefix, 0) != 0 || text.empty() || text.back() != ']') {
+    return std::nullopt;
+  }
+  return parseHex(text.substr(prefix.size(), text.size() - prefix.size() - 1));
+}
+
+std::optional<uint64_t> findNearestLeaBaseInDecodedInstructions(
+    const std::vector<NativeInstruction> &instructions, size_t beforeIndex,
+    const std::string &reg) {
+  for (size_t index = beforeIndex; index > 0; --index) {
+    const std::string &text = instructions[index - 1].Mnemonic;
+    if (auto address = parseX86LeaAbsoluteBase(text, reg)) {
+      return address;
+    }
+    if (text.rfind("MOV " + reg + ",", 0) == 0 ||
+        text.rfind("LEA " + reg + ",", 0) == 0 ||
+        text.rfind("POP " + reg, 0) == 0) {
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
 std::optional<std::pair<std::string, std::string>>
 parseX86AddRegReg(const std::string &text) {
   const std::string prefix = "ADD ";
@@ -1691,6 +1797,68 @@ matchX86PicI32OffsetDispatch(const NativeProgramState &state,
   dispatch.TableBase = *tableBase;
   dispatch.EntryCount = *entryCount;
   return dispatch;
+}
+
+bool isExternalFunctionPointerRelocationAt(const NativeProgramState &state,
+                                           uint64_t address) {
+  for (const NativeRelocationInfo &relocation : state.relocations()) {
+    if (relocation.Address != address || relocation.Status != "external" ||
+        relocation.SymbolName.empty()) {
+      continue;
+    }
+    return relocation.TypeName == "X86_64_GLOB_DAT" ||
+           relocation.TypeName == "X86_64_64";
+  }
+  return false;
+}
+
+struct X86ExternalFunctionPointerMatch {
+  uint64_t SlotAddress = 0;
+  NativeXrefKind Kind = NativeXrefKind::Flow;
+};
+
+std::optional<X86ExternalFunctionPointerMatch>
+matchX86ExternalFunctionPointerInstruction(
+    const NativeProgramState &state,
+    const std::vector<NativeInstruction> &instructions, size_t index) {
+  if (index >= instructions.size()) {
+    return std::nullopt;
+  }
+
+  const NativeInstruction &instruction = instructions[index];
+  std::optional<X86IndirectMemoryTarget> target;
+  NativeXrefKind kind = NativeXrefKind::Flow;
+  if (instruction.HasIndirectCall) {
+    target = parseX86IndirectMemoryTarget(instruction.Mnemonic, "CALL");
+    kind = NativeXrefKind::Call;
+  } else if (instruction.FlowKind == NativeInstructionFlowKind::IndirectBranch) {
+    target = parseX86IndirectMemoryTarget(instruction.Mnemonic, "JMP");
+  }
+  if (!target) {
+    return std::nullopt;
+  }
+
+  std::optional<uint64_t> base;
+  if (target->BaseReg.rfind("0x", 0) == 0) {
+    base = parseUnsignedNumber(target->BaseReg);
+  } else {
+    base = findNearestLeaBaseInDecodedInstructions(instructions, index,
+                                                   target->BaseReg);
+  }
+  if (!base || *base > std::numeric_limits<uint64_t>::max() -
+                           target->Displacement) {
+    return std::nullopt;
+  }
+
+  X86ExternalFunctionPointerMatch match;
+  match.SlotAddress = *base + target->Displacement;
+  match.Kind = kind;
+  bool relocMatch =
+      isExternalFunctionPointerRelocationAt(state, match.SlotAddress);
+  if (!relocMatch) {
+    return std::nullopt;
+  }
+  return match;
 }
 
 bool functionContainsBlockStart(const NativeProgramState &state,
@@ -2040,9 +2208,12 @@ private:
     for (const NativeXref &xref : reachableXrefs(flowResult, reachableStarts)) {
       state.addXref(xref);
     }
+    std::set<uint64_t> resolvedIndirectFlowStarts =
+        collectExternalFunctionPointerXrefs(state, decodedInstructions);
     std::set<uint64_t> trapStarts = trapInstructionStarts(decodedInstructions);
     for (const NativeUnresolvedFlow &flow :
-         reachableUnresolvedFlows(flowResult, reachableStarts, trapStarts)) {
+         reachableUnresolvedFlows(flowResult, reachableStarts, trapStarts,
+                                  resolvedIndirectFlowStarts)) {
       state.addUnresolvedFlow(flow);
     }
     rangeStart = decodedInstructions.front().Address;
@@ -2177,6 +2348,32 @@ private:
     return xrefs;
   }
 
+  static std::set<uint64_t> collectExternalFunctionPointerXrefs(
+      NativeProgramState &state,
+      const std::vector<NativeInstruction> &instructions) {
+    std::set<uint64_t> resolved;
+    for (size_t index = 0; index < instructions.size(); ++index) {
+      const NativeInstruction &instruction = instructions[index];
+      std::optional<X86ExternalFunctionPointerMatch> match =
+          matchX86ExternalFunctionPointerInstruction(state, instructions,
+                                                     index);
+      if (!match) {
+        continue;
+      }
+
+      NativeXref xref;
+      xref.From = instruction.Address;
+      xref.To = match->SlotAddress;
+      xref.Kind = match->Kind;
+      xref.Source = match->Kind == NativeXrefKind::Call
+                        ? "x86-call-external-function-pointer"
+                        : "x86-tail-branch-external-function-pointer";
+      state.addXref(std::move(xref));
+      resolved.insert(instruction.Address);
+    }
+    return resolved;
+  }
+
   static std::set<uint64_t>
   trapInstructionStarts(const std::vector<NativeInstruction> &instructions) {
     std::set<uint64_t> starts;
@@ -2191,11 +2388,13 @@ private:
   static std::vector<NativeUnresolvedFlow> reachableUnresolvedFlows(
       const DirectControlFlowResult &flowResult,
       const std::set<uint64_t> &reachableStarts,
-      const std::set<uint64_t> &trapStarts) {
+      const std::set<uint64_t> &trapStarts,
+      const std::set<uint64_t> &resolvedIndirectFlowStarts) {
     std::vector<NativeUnresolvedFlow> flows;
     for (const NativeUnresolvedFlow &flow : flowResult.UnresolvedFlows) {
       if (reachableStarts.count(flow.Address) != 0 &&
-          trapStarts.count(flow.Address) == 0) {
+          trapStarts.count(flow.Address) == 0 &&
+          resolvedIndirectFlowStarts.count(flow.Address) == 0) {
         flows.push_back(flow);
       }
     }
@@ -2365,15 +2564,30 @@ private:
         }
       } else if (op.Opcode == PcodeOpcode::CallInd) {
         result.FlowInfos[op.Address].HasIndirectCall = true;
+        if (op.Inputs.size() == 1 && op.Inputs[0].Space == "ram") {
+          if (auto pointerTarget =
+                  resolvedExecutablePointerTargetAt(state, op.Inputs[0].Offset)) {
+            addPendingXref(result.Xrefs, seenXrefs, op.Address, *pointerTarget,
+                           NativeXrefKind::Call,
+                           "sleigh-pcode-pointer-indirect-call");
+            continue;
+          }
+        }
         if (auto gotAddress = callIndGotSource(sourceRamByVarnode, op)) {
-          if (isExternalGlobDatSymbolAt(state, *gotAddress)) {
+          if (auto pointerTarget =
+                  resolvedExecutablePointerTargetAt(state, *gotAddress)) {
+            addPendingXref(result.Xrefs, seenXrefs, op.Address, *pointerTarget,
+                           NativeXrefKind::Call,
+                           "sleigh-pcode-pointer-indirect-call");
+            continue;
+          }
+          if (isExternalFunctionPointerRelocationAt(state, *gotAddress)) {
             addPendingXref(result.Xrefs, seenXrefs, op.Address, *gotAddress,
                            NativeXrefKind::Call,
                            "sleigh-pcode-got-indirect-call");
             continue;
           }
         }
-
         NativeUnresolvedFlow flow;
         flow.Address = op.Address;
         flow.Kind = NativeUnresolvedFlowKind::IndirectCall;
@@ -2401,6 +2615,15 @@ private:
         }
       } else if (op.Opcode == PcodeOpcode::BranchInd) {
         result.FlowInfos[op.Address].HasIndirectBranch = true;
+        if (op.Inputs.size() == 1 && op.Inputs[0].Space == "ram") {
+          if (auto pointerTarget =
+                  resolvedExecutablePointerTargetAt(state, op.Inputs[0].Offset)) {
+            addPendingXref(result.Xrefs, seenXrefs, op.Address, *pointerTarget,
+                           NativeXrefKind::Flow,
+                           "sleigh-pcode-pointer-indirect-branch");
+            continue;
+          }
+        }
         if (auto gotAddress = branchIndGotTarget(op)) {
           if (isPltGotSlot(state, *gotAddress)) {
             addPendingXref(result.Xrefs, seenXrefs, op.Address, *gotAddress,
@@ -2416,16 +2639,23 @@ private:
           }
         }
         // Guarded external tail jumps load the GOT slot into a register before
-        // BRANCHIND. Only accept slots proven by relocation as external GLOB_DAT.
+        // BRANCHIND. Only accept slots proven by relocation as external
+        // function pointers.
         if (auto gotAddress = branchIndGotSource(sourceRamByVarnode, op)) {
-          if (isExternalGlobDatSymbolAt(state, *gotAddress)) {
+          if (auto pointerTarget =
+                  resolvedExecutablePointerTargetAt(state, *gotAddress)) {
+            addPendingXref(result.Xrefs, seenXrefs, op.Address, *pointerTarget,
+                           NativeXrefKind::Flow,
+                           "sleigh-pcode-pointer-indirect-branch");
+            continue;
+          }
+          if (isExternalFunctionPointerRelocationAt(state, *gotAddress)) {
             addPendingXref(result.Xrefs, seenXrefs, op.Address, *gotAddress,
                            NativeXrefKind::Flow,
                            "sleigh-pcode-got-indirect-branch");
             continue;
           }
         }
-
         NativeUnresolvedFlow flow;
         flow.Address = op.Address;
         flow.Kind = NativeUnresolvedFlowKind::IndirectBranch;
@@ -2496,6 +2726,16 @@ private:
   }
 
   static std::optional<uint64_t>
+  resolvedExecutablePointerTargetAt(const NativeProgramState &state,
+                                    uint64_t address) {
+    std::optional<uint64_t> target = state.readPointer(address);
+    if (!target || !state.isExecutableAddress(*target)) {
+      return std::nullopt;
+    }
+    return target;
+  }
+
+  static std::optional<uint64_t>
   sourceRam(const std::map<std::string, uint64_t> &sources,
             const VarnodeView &varnode) {
     if (varnode.Space == "ram") {
@@ -2513,19 +2753,6 @@ private:
     stream << varnode.Space << ':' << std::hex << varnode.Offset << ':'
            << std::dec << varnode.Size;
     return stream.str();
-  }
-
-  static bool isExternalGlobDatSymbolAt(const NativeProgramState &state,
-                                        uint64_t address) {
-    for (const NativeRelocationInfo &relocation : state.relocations()) {
-      if (relocation.Address != address ||
-          relocation.TypeName != "X86_64_GLOB_DAT" ||
-          relocation.Status != "external" || relocation.SymbolName.empty()) {
-        continue;
-      }
-      return true;
-    }
-    return false;
   }
 
   static bool isPltGotSlot(const NativeProgramState &state, uint64_t address) {
@@ -3055,27 +3282,32 @@ private:
       return false;
     }
 
-    state.addInstructionDirectFlowTargets(branchAddress, targets);
-    std::vector<uint64_t> existingBlockTargets;
+    std::vector<uint64_t> decodedTargets;
     for (uint64_t target : targets) {
+      if (state.instructionAt(target) != nullptr) {
+        decodedTargets.push_back(target);
+      }
+    }
+    if (decodedTargets.empty()) {
+      return false;
+    }
+
+    state.addInstructionDirectFlowTargets(branchAddress, decodedTargets);
+    std::vector<uint64_t> existingBlockTargets;
+    for (uint64_t target : decodedTargets) {
       if (functionContainsBlockStart(state, target)) {
         existingBlockTargets.push_back(target);
       }
     }
     state.addBasicBlockSuccessors(function.Entry, dispatch->BlockStart,
                                   existingBlockTargets);
-    for (uint64_t target : targets) {
+    for (uint64_t target : decodedTargets) {
       NativeXref xref;
       xref.From = branchAddress;
       xref.To = target;
       xref.Kind = NativeXrefKind::Flow;
       xref.Source = "x86-jump-table";
       state.addXref(std::move(xref));
-    }
-    for (uint64_t target : targets) {
-      if (state.instructionAt(target) == nullptr) {
-        return false;
-      }
     }
     (void)complete;
     return true;
