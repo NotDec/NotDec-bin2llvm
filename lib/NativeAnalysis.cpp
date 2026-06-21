@@ -2880,7 +2880,8 @@ public:
   int priority() const override { return 70; }
 
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
-    for (const NativeUnresolvedFlow &flow : state.unresolvedFlows()) {
+    std::vector<NativeUnresolvedFlow> unresolvedFlows = state.unresolvedFlows();
+    for (const NativeUnresolvedFlow &flow : unresolvedFlows) {
       if (flow.Kind != NativeUnresolvedFlowKind::IndirectBranch) {
         continue;
       }
