@@ -96,6 +96,44 @@ bool readBytes(const NativeProgramState &state, uint64_t address, uint64_t size,
   return false;
 }
 
+std::optional<uint64_t> parseHex(const std::string &text) {
+  if (text.empty()) {
+    return std::nullopt;
+  }
+  for (char ch : text) {
+    if (!std::isxdigit(static_cast<unsigned char>(ch))) {
+      return std::nullopt;
+    }
+  }
+  uint64_t value = 0;
+  std::istringstream stream(text);
+  stream >> std::hex >> value;
+  if (!stream || !stream.eof()) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+std::optional<int64_t> readSigned32(const NativeProgramState &state,
+                                    uint64_t address) {
+  std::vector<uint8_t> bytes;
+  if (!readBytes(state, address, 4, bytes) || bytes.size() != 4) {
+    return std::nullopt;
+  }
+  uint32_t raw = 0;
+  for (uint8_t index = 0; index < 4; ++index) {
+    raw |= static_cast<uint32_t>(bytes[index]) << (index * 8);
+  }
+  return static_cast<int32_t>(raw);
+}
+
+void addUniqueAddress(std::vector<uint64_t> &addresses, uint64_t address) {
+  if (std::find(addresses.begin(), addresses.end(), address) ==
+      addresses.end()) {
+    addresses.push_back(address);
+  }
+}
+
 const NativeMemoryRange *findReadableRangeContaining(
     const NativeProgramState &state, uint64_t address) {
   for (const NativeMemoryRange &range : state.memoryRanges()) {
@@ -1294,6 +1332,146 @@ private:
   }
 };
 
+// Narrow x86-64 jump-table facts used by the current native frontend.
+// The matcher is intentionally based on decoded instruction text: this stage
+// only needs enough machine-level facts to recover CFG edges before lowering.
+struct X86PicI32JumpDispatch {
+  uint64_t BlockStart = 0;
+  uint64_t TableBase = 0;
+  uint64_t EntryCount = 0;
+};
+
+const NativeInstruction *
+previousInstruction(const NativeProgramState &state,
+                    const NativeFunction &function, uint64_t address,
+                    uint64_t distance) {
+  std::vector<const NativeInstruction *> instructions =
+      state.instructionsInRange(function.RangeStart, address);
+  if (instructions.size() < distance) {
+    return nullptr;
+  }
+  return instructions[instructions.size() - distance];
+}
+
+std::optional<uint64_t>
+findNearestLeaBase(const NativeProgramState &state,
+                   const NativeFunction &function, uint64_t beforeAddress,
+                   const std::string &reg) {
+  std::vector<const NativeInstruction *> instructions =
+      state.instructionsInRange(function.RangeStart, beforeAddress);
+  const std::string prefix = "LEA " + reg + ",[0x";
+  for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
+       ++iterator) {
+    const std::string &text = (*iterator)->Mnemonic;
+    if (text.rfind(prefix, 0) == 0 && !text.empty() && text.back() == ']') {
+      return parseHex(text.substr(prefix.size(),
+                                  text.size() - prefix.size() - 1));
+    }
+    if (text.rfind("MOV " + reg + ",", 0) == 0 ||
+        text.rfind("LEA " + reg + ",", 0) == 0 ||
+        text.rfind("POP " + reg, 0) == 0) {
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<uint64_t>
+findNearestUpperBound(const NativeProgramState &state,
+                      const NativeFunction &function, uint64_t beforeAddress) {
+  std::vector<const NativeInstruction *> instructions =
+      state.instructionsInRange(function.RangeStart, beforeAddress);
+  for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
+       ++iterator) {
+    const std::string &text = (*iterator)->Mnemonic;
+    const std::string prefix = "CMP EAX,0x";
+    if (text.rfind(prefix, 0) == 0) {
+      std::optional<uint64_t> maxIndex = parseHex(text.substr(prefix.size()));
+      if (maxIndex) {
+        return *maxIndex + 1;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<X86PicI32JumpDispatch>
+matchX86PicI32OffsetDispatch(const NativeProgramState &state,
+                             const NativeFunction &function,
+                             uint64_t branchAddress) {
+  const NativeInstruction *branch = state.instructionAt(branchAddress);
+  if (branch == nullptr || branch->Mnemonic != "JMP RAX") {
+    return std::nullopt;
+  }
+
+  const NativeInstruction *load =
+      previousInstruction(state, function, branchAddress, 2);
+  const NativeInstruction *add =
+      previousInstruction(state, function, branchAddress, 1);
+  if (load == nullptr || add == nullptr ||
+      load->Mnemonic != "MOVSXD RAX,dword ptr [RBX + RAX*0x4]" ||
+      add->Mnemonic != "ADD RAX,RBX") {
+    return std::nullopt;
+  }
+
+  std::optional<uint64_t> tableBase =
+      findNearestLeaBase(state, function, load->Address, "RBX");
+  std::optional<uint64_t> entryCount =
+      findNearestUpperBound(state, function, load->Address);
+  if (!tableBase || !entryCount || *entryCount == 0 || *entryCount > 256) {
+    return std::nullopt;
+  }
+
+  X86PicI32JumpDispatch dispatch;
+  dispatch.BlockStart = load->Address;
+  dispatch.TableBase = *tableBase;
+  dispatch.EntryCount = *entryCount;
+  return dispatch;
+}
+
+bool functionContainsBlockStart(const NativeProgramState &state,
+                                uint64_t address) {
+  const NativeFunction *function = state.functionContaining(address);
+  if (function == nullptr) {
+    return false;
+  }
+  for (const NativeBasicBlock &block : function->Blocks) {
+    if (block.Start == address) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool functionContainsAddress(const NativeFunction &function, uint64_t address) {
+  return address >= function.RangeStart && address < function.RangeEnd;
+}
+
+bool readX86PicI32Targets(const NativeProgramState &state, uint64_t tableBase,
+                          uint64_t entryCount, bool onlyExistingBlocks,
+                          std::vector<uint64_t> &targets, bool &complete) {
+  complete = true;
+  for (uint64_t index = 0; index < entryCount; ++index) {
+    std::optional<int64_t> offset = readSigned32(state, tableBase + index * 4);
+    if (!offset) {
+      return false;
+    }
+    uint64_t target =
+        static_cast<uint64_t>(static_cast<int64_t>(tableBase) + *offset);
+    if (!state.isExecutableAddress(target)) {
+      return false;
+    }
+    if (!functionContainsBlockStart(state, target)) {
+      complete = false;
+      if (onlyExistingBlocks) {
+        continue;
+      }
+    }
+    addUniqueAddress(targets, target);
+  }
+  return true;
+}
+
 class SleighSeedInstructionAnalyzer final : public NativeAnalyzer {
 public:
   explicit SleighSeedInstructionAnalyzer(NativeSleighDecodeOptions options)
@@ -1358,6 +1536,8 @@ public:
         enqueueSeed(state, item.FunctionEntry, *result.FallthroughTarget,
                     decodeQueue, queuedSeeds);
       }
+      enqueueRecoveredJumpTableTargets(state, item.FunctionEntry, decodeQueue,
+                                       queuedSeeds);
     }
   }
 
@@ -1480,6 +1660,41 @@ private:
     }
     decodeQueue.push_back({functionEntry, blockAddress});
     return true;
+  }
+
+  static void enqueueRecoveredJumpTableTargets(
+      NativeProgramState &state, uint64_t functionEntry,
+      std::deque<DecodeQueueItem> &decodeQueue,
+      std::set<std::pair<uint64_t, uint64_t>> &queuedSeeds) {
+    const NativeFunction *function = state.functionAt(functionEntry);
+    if (function == nullptr) {
+      return;
+    }
+
+    for (const NativeUnresolvedFlow &flow : state.unresolvedFlows()) {
+      if (flow.Kind != NativeUnresolvedFlowKind::IndirectBranch ||
+          !functionContainsAddress(*function, flow.Address)) {
+        continue;
+      }
+
+      std::optional<X86PicI32JumpDispatch> dispatch =
+          matchX86PicI32OffsetDispatch(state, *function, flow.Address);
+      if (!dispatch) {
+        continue;
+      }
+
+      std::vector<uint64_t> targets;
+      bool complete = false;
+      if (!readX86PicI32Targets(state, dispatch->TableBase,
+                                dispatch->EntryCount,
+                                /*onlyExistingBlocks=*/false, targets,
+                                complete)) {
+        continue;
+      }
+      for (uint64_t target : targets) {
+        enqueueSeed(state, functionEntry, target, decodeQueue, queuedSeeds);
+      }
+    }
   }
 
   DecodeSeedResult decodeSeed(NativeProgramState &state,
@@ -2118,14 +2333,6 @@ private:
            isBoundarySeed(seedIterator->second);
   }
 
-  static void addUniqueAddress(std::vector<uint64_t> &addresses,
-                               uint64_t address) {
-    if (std::find(addresses.begin(), addresses.end(), address) ==
-        addresses.end()) {
-      addresses.push_back(address);
-    }
-  }
-
   static std::optional<uint64_t>
   executableBytesFrom(const NativeProgramState &state, uint64_t address) {
     for (const NativeMemoryRange &range : state.memoryRanges()) {
@@ -2403,12 +2610,6 @@ public:
   }
 
 private:
-  struct JumpDispatch {
-    uint64_t BlockStart = 0;
-    uint64_t TableBase = 0;
-    uint64_t EntryCount = 0;
-  };
-
   static void recoverJumpTableAt(NativeProgramState &state,
                                  uint64_t branchAddress) {
     const NativeFunction *function = state.functionContaining(branchAddress);
@@ -2416,16 +2617,18 @@ private:
       return;
     }
 
-    std::optional<JumpDispatch> dispatch =
-        matchPicI32OffsetDispatch(state, *function, branchAddress);
+    std::optional<X86PicI32JumpDispatch> dispatch =
+        matchX86PicI32OffsetDispatch(state, *function, branchAddress);
     if (!dispatch) {
       return;
     }
 
     std::vector<uint64_t> targets;
     bool complete = false;
-    if (!readPicI32Targets(state, dispatch->TableBase, dispatch->EntryCount,
-                           targets, complete)) {
+    if (!readX86PicI32Targets(state, dispatch->TableBase,
+                              dispatch->EntryCount,
+                              /*onlyExistingBlocks=*/true, targets,
+                              complete)) {
       return;
     }
     if (targets.empty()) {
@@ -2446,170 +2649,6 @@ private:
       state.removeUnresolvedFlow(branchAddress,
                                  NativeUnresolvedFlowKind::IndirectBranch);
     }
-  }
-
-  // First implementation is deliberately narrow: it recognizes the PIC table
-  // form emitted by GCC in fortune.  Keeping this as a post-decode facts pass is
-  // the important part; broader table shapes can be added here without making
-  // the seed p-code scan stateful.
-  static std::optional<JumpDispatch>
-  matchPicI32OffsetDispatch(const NativeProgramState &state,
-                            const NativeFunction &function,
-                            uint64_t branchAddress) {
-    const NativeInstruction *branch = state.instructionAt(branchAddress);
-    if (branch == nullptr || branch->Mnemonic != "JMP RAX") {
-      return std::nullopt;
-    }
-
-    const NativeInstruction *load = previousInstruction(state, function,
-                                                        branchAddress, 2);
-    const NativeInstruction *add = previousInstruction(state, function,
-                                                       branchAddress, 1);
-    if (load == nullptr || add == nullptr ||
-        load->Mnemonic != "MOVSXD RAX,dword ptr [RBX + RAX*0x4]" ||
-        add->Mnemonic != "ADD RAX,RBX") {
-      return std::nullopt;
-    }
-
-    std::optional<uint64_t> tableBase =
-        findNearestLeaBase(state, function, load->Address, "RBX");
-    std::optional<uint64_t> entryCount =
-        findNearestUpperBound(state, function, load->Address);
-    if (!tableBase || !entryCount || *entryCount == 0 || *entryCount > 256) {
-      return std::nullopt;
-    }
-
-    JumpDispatch dispatch;
-    dispatch.BlockStart = load->Address;
-    dispatch.TableBase = *tableBase;
-    dispatch.EntryCount = *entryCount;
-    return dispatch;
-  }
-
-  static const NativeInstruction *
-  previousInstruction(const NativeProgramState &state,
-                      const NativeFunction &function, uint64_t address,
-                      uint64_t distance) {
-    std::vector<const NativeInstruction *> instructions =
-        state.instructionsInRange(function.RangeStart, address);
-    if (instructions.size() < distance) {
-      return nullptr;
-    }
-    return instructions[instructions.size() - distance];
-  }
-
-  static std::optional<uint64_t>
-  findNearestLeaBase(const NativeProgramState &state,
-                     const NativeFunction &function, uint64_t beforeAddress,
-                     const std::string &reg) {
-    std::vector<const NativeInstruction *> instructions =
-        state.instructionsInRange(function.RangeStart, beforeAddress);
-    const std::string prefix = "LEA " + reg + ",[0x";
-    for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
-         ++iterator) {
-      const std::string &text = (*iterator)->Mnemonic;
-      if (text.rfind(prefix, 0) == 0 && !text.empty() && text.back() == ']') {
-        return parseHex(text.substr(prefix.size(),
-                                    text.size() - prefix.size() - 1));
-      }
-      if (text.rfind("MOV " + reg + ",", 0) == 0 ||
-          text.rfind("LEA " + reg + ",", 0) == 0 ||
-          text.rfind("POP " + reg, 0) == 0) {
-        return std::nullopt;
-      }
-    }
-    return std::nullopt;
-  }
-
-  static std::optional<uint64_t>
-  findNearestUpperBound(const NativeProgramState &state,
-                        const NativeFunction &function,
-                        uint64_t beforeAddress) {
-    std::vector<const NativeInstruction *> instructions =
-        state.instructionsInRange(function.RangeStart, beforeAddress);
-    for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
-         ++iterator) {
-      const std::string &text = (*iterator)->Mnemonic;
-      const std::string prefix = "CMP EAX,0x";
-      if (text.rfind(prefix, 0) == 0) {
-        std::optional<uint64_t> maxIndex = parseHex(text.substr(prefix.size()));
-        if (maxIndex) {
-          return *maxIndex + 1;
-        }
-      }
-    }
-    return std::nullopt;
-  }
-
-  static bool readPicI32Targets(const NativeProgramState &state,
-                                uint64_t tableBase, uint64_t entryCount,
-                                std::vector<uint64_t> &targets,
-                                bool &complete) {
-    complete = true;
-    for (uint64_t index = 0; index < entryCount; ++index) {
-      std::optional<int64_t> offset = readSigned32(state, tableBase + index * 4);
-      if (!offset) {
-        return false;
-      }
-      uint64_t target =
-          static_cast<uint64_t>(static_cast<int64_t>(tableBase) + *offset);
-      if (!state.isExecutableAddress(target)) {
-        return false;
-      }
-      if (!functionContainsBlockStart(state, target)) {
-        complete = false;
-        continue;
-      }
-      if (std::find(targets.begin(), targets.end(), target) == targets.end()) {
-        targets.push_back(target);
-      }
-    }
-    return true;
-  }
-
-  static bool functionContainsBlockStart(const NativeProgramState &state,
-                                         uint64_t address) {
-    const NativeFunction *function = state.functionContaining(address);
-    if (function == nullptr) {
-      return false;
-    }
-    for (const NativeBasicBlock &block : function->Blocks) {
-      if (block.Start == address) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  static std::optional<int64_t> readSigned32(const NativeProgramState &state,
-                                             uint64_t address) {
-    std::vector<uint8_t> bytes;
-    if (!readBytes(state, address, 4, bytes) || bytes.size() != 4) {
-      return std::nullopt;
-    }
-    uint32_t raw = 0;
-    for (uint8_t index = 0; index < 4; ++index) {
-      raw |= static_cast<uint32_t>(bytes[index]) << (index * 8);
-    }
-    return static_cast<int32_t>(raw);
-  }
-
-  static std::optional<uint64_t> parseHex(const std::string &text) {
-    if (text.empty()) {
-      return std::nullopt;
-    }
-    for (char ch : text) {
-      if (!std::isxdigit(static_cast<unsigned char>(ch))) {
-        return std::nullopt;
-      }
-    }
-    uint64_t value = 0;
-    std::istringstream stream(text);
-    stream >> std::hex >> value;
-    if (!stream || !stream.eof()) {
-      return std::nullopt;
-    }
-    return value;
   }
 };
 

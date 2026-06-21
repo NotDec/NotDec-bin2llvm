@@ -1982,3 +1982,84 @@ llvm-as + opt verify: passed
 - 理解成本：3/10。新增一个 analyzer，但它只消费已有 facts，入口清晰。
 - 维护成本：3/10。当前匹配规则偏窄，后续应扩展为“恢复 table targets 后驱动
   decode”的完整流程。
+
+## 已完成：jump table targets 反向驱动 Sleigh decode
+
+上一节的问题是后置 `X86JumpTableAnalyzer` 只能补已经存在的 block target。
+如果 table 里有 `0x2970` 这种还没 decode 成 native block 的目标，直接写
+successor 会让 `PcodeToLLVM` 报 missing native block，所以只能保留
+unresolved。
+
+这次改成两步：
+
+- Sleigh seed decode 每处理完一个 seed，就查看当前函数里的 unresolved
+  indirect branch。
+- 如果能匹配 x86-64 PIC i32 offset jump table，就读取完整 table targets，
+  把这些 target 作为同一函数的新 seed 入队。
+- Sleigh 队列跑完后，后置 `X86JumpTableAnalyzer` 再写完整 successors；
+  此时 target block 已经存在，可以安全清掉 unresolved。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:97)
+  - 新增文件级 `parseHex(...)`、`readSigned32(...)` 和 `addUniqueAddress(...)`。
+    这些 helper 现在同时服务 Sleigh decode 队列和后置 jump table analyzer。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1336)
+  - 新增 `X86PicI32JumpDispatch` 和 x86 PIC i32 offset jump table 匹配 helper。
+    匹配仍然只覆盖 fortune 当前形态：
+    `LEA RBX,[table]`、`CMP EAX,max`、`MOVSXD RAX,[RBX+RAX*4]`、
+    `ADD RAX,RBX`、`JMP RAX`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1539)
+  - `SleighSeedInstructionAnalyzer::run(...)` 在每个 seed decode 后调用
+    `enqueueRecoveredJumpTableTargets(...)`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1665)
+  - 新增 `enqueueRecoveredJumpTableTargets(...)`，把恢复出的 table target
+    按同一 `functionEntry` 入队继续 decode。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2620)
+  - `X86JumpTableAnalyzer` 删除重复匹配代码，改为复用同一组 helper。
+
+当前 fortune 结果：
+
+```text
+block 0x2872 successors:
+  ["0x2970", "0x2efe", "0x2963", "0x2956", "0x2949", "0x2940",
+   "0x292a", "0x2913", "0x28f2", "0x28e5", "0x28cf", "0x28c5",
+   "0x2886", "0x287c"]
+unresolved indirect flows: 0
+```
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-discover notdec-native-llvm native_analysis_facts_test pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/usr/bin/time -f 'elapsed=%e' /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-jumptable-decode/fortune.ll --summary-json-out /tmp/notdec-fortune-jumptable-decode/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-jumptable-decode/fortune.ll -o /tmp/notdec-fortune-jumptable-decode/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-jumptable-decode/fortune.bc -o /tmp/notdec-fortune-jumptable-decode/fortune.verify.bc
+```
+
+结果：
+
+```text
+all native tests above: passed
+fortune unresolved flow count: 0
+fortune native pipeline: 11.59s
+llvm-as + opt verify: passed
+latest IR: /tmp/notdec-fortune-jumptable-decode/fortune.ll
+```
+
+性能说明：上一版 fortune 同口径是 9.83s，这次是 11.59s。变慢主要来自
+jump table target 被实际 decode 成 block，属于预期成本；后续如果 Bench2
+整体变慢明显，再考虑缓存 jump table 匹配结果或减少重复扫描 unresolved flows。
+
+复杂度评估：
+
+- 实现效果：7/10。fortune 这个 jump table 的 CFG 已经闭合，unresolved 为 0。
+- 理解成本：4/10。Sleigh decode 多了一次“恢复 target 后入队”的反馈，但 lowering
+  仍只消费已确认 CFG，没有新增特殊路径。
+- 维护成本：4/10。当前 matcher 仍偏窄，只覆盖 fortune 里这类 GCC PIC table；
+  后续扩展其他 table 形态时应继续复用同一组 helper。
