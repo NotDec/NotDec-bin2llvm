@@ -2372,3 +2372,112 @@ latest summary IR: /tmp/notdec-fortune-direct-call-source/fortune.ll
 - 实现效果：5/10。行为不变，但 call/flow facts 更清楚。
 - 理解成本：1/10。只改 source 字符串。
 - 维护成本：1/10。source 语义更明确。
+
+## 已完成：动态数组入口 thunk 的 tail branch 建模
+
+继续看 fortune 的 `0x32d0` 时，发现它来自 `.init_array`：
+
+```text
+0x32d0: endbr64
+0x32d4: jmp 0x3250
+```
+
+之前 decode 会把 `0x3250` 的主体块并进 `notdec_native_32d0`，导致
+`notdec_native_32d0` 的函数范围变成 `[0x3250, 0x32e0)`。这不是简单的空块问题，
+而是动态数组入口 thunk 被当成普通同函数跳转处理了。
+
+这次只对很窄的场景做处理：
+
+- seed 没有 `.eh_frame` / symbol 之类明确 range。
+- seed 来源包含 `dt-init-array` 或 `dt-fini-array`。
+- 当前指令是 direct unconditional branch。
+- branch target 小于当前 function entry。
+
+满足这些条件时，把目标记录为 `sleigh-tail-branch` seed，并从当前函数的
+`DirectFlowTargets` 中移走。这样当前函数不再吸收目标函数体，lowering 仍能用已有
+tail-call 表达。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1531)
+  - `SleighSeedInstructionAnalyzer::run(...)` 消费 `DecodeSeedResult::TailBranchTargets`，
+    为目标添加 `sleigh-tail-branch` function seed 并入队 decode。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1581)
+  - `DecodeSeedResult` 增加 `TailBranchTargets`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1757)
+  - `decodeSeed(...)` 在 reachable 计算前调用 `collectTailBranchTargets(...)`，
+    先把 tail branch 从本函数 CFG 边里切出去。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1798)
+  - 新增 `collectTailBranchTargets(...)`、`isTailBranchTarget(...)`、
+    `isDynamicArrayThunkSeed(...)`。
+
+fortune 结果：
+
+```text
+function_seeds: 26
+confirmed_functions: 26
+basic_blocks: 1013
+instructions: 2602
+xrefs total: 868
+unresolved_indirect_flows: 0
+sleigh-tail-branch: 1
+```
+
+`0x32d0` 现在是独立 thunk：
+
+```text
+notdec_native_32d0 range: [0x32d0, 0x32d9)
+notdec_native_3250 range: [0x3250, 0x3289)
+```
+
+raw IR 中对应为：
+
+```llvm
+define void @notdec_native_32d0() {
+bb_32d0:
+  tail call void @notdec_native_3250()
+  ret void
+}
+```
+
+summary IR 也生成 tail call。当前 signature rewrite 会给部分 internal tail call
+补 `undef` 参数，例如 `notdec_native_32d0 -> notdec_native_3250`。这次抽样中
+`notdec_native_3250` 的这些参数没有实际使用，所以不影响当前语义；但这属于
+signature rewrite 后续需要清理的点。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --no-register-ssa-pass --no-instcombine-pass --summary-json-out /tmp/notdec-fortune-tail-thunk-raw/summary.json -o /tmp/notdec-fortune-tail-thunk-raw/fortune.raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-tail-thunk-raw/fortune.raw.ll -o /tmp/notdec-fortune-tail-thunk-raw/fortune.raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-tail-thunk-raw/fortune.raw.bc -o /tmp/notdec-fortune-tail-thunk-raw/fortune.raw.verified.bc
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /sn640/NotDec-Exp/Bench2/bin2llvm-native-projects/selected-targets-native/fortune-executable/summary.json -o /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/fortune/executable/module-all.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/fortune/executable/module-all.ll -o /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/fortune/executable/module-all.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/fortune/executable/module-all.bc -o /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/fortune/executable/module-all.verified.bc
+```
+
+结果：
+
+```text
+native tests: passed
+raw IR verify: passed
+summary IR verify: passed
+fortune native pipeline: 10.16s
+latest raw IR: /tmp/notdec-fortune-tail-thunk-raw/fortune.raw.ll
+latest summary IR: /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/fortune/executable/module-all.ll
+```
+
+性能说明：上一版 fortune 是 10.10s 左右，这次是 10.16s，同口径没有明显退化。
+
+复杂度评估：
+
+- 实现效果：7/10。修掉了 `.init_array` 入口 thunk 吸收目标函数体的问题，同时没有
+  增加基本块数量。
+- 理解成本：4/10。新增了一类 tail branch seed，但只在 decode facts 层内部使用。
+- 维护成本：4/10。规则刻意保守，后续如果遇到更多 thunk 形态，再扩展匹配条件。

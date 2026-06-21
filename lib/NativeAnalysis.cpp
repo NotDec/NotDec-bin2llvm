@@ -1528,6 +1528,11 @@ public:
                               NativeFunctionConfidence::High);
         enqueueSeed(state, target, target, decodeQueue, queuedSeeds);
       }
+      for (uint64_t target : result.TailBranchTargets) {
+        state.addFunctionSeed(target, 0, "", "sleigh-tail-branch",
+                              NativeFunctionConfidence::High);
+        enqueueSeed(state, target, target, decodeQueue, queuedSeeds);
+      }
       for (uint64_t target : result.BranchTargets) {
         if (targetBelongsToFunctionRange(state, item.FunctionEntry, target)) {
           enqueueSeed(state, item.FunctionEntry, target, decodeQueue,
@@ -1575,6 +1580,10 @@ private:
   // function and should be decoded as another block.
   struct DecodeSeedResult {
     std::vector<uint64_t> CallTargets;
+    // A direct jump can hand off to another function instead of staying inside
+    // the current CFG.  Decode that target separately so this function does not
+    // absorb the callee's blocks.
+    std::vector<uint64_t> TailBranchTargets;
     std::vector<uint64_t> BranchTargets;
     std::optional<uint64_t> FallthroughTarget;
   };
@@ -1746,6 +1755,8 @@ private:
       flowInfos = flowResult.FlowInfos;
     }
     annotateDecodedInstructionFlows(decodedInstructions, flowInfos);
+    collectTailBranchTargets(state, functionEntry, decodedInstructions,
+                             result.TailBranchTargets);
     // A seed is decoded linearly, but only locally reachable instructions should
     // become block facts for this function entry.
     std::set<uint64_t> reachableStarts =
@@ -1782,6 +1793,52 @@ private:
                              decodedInstructions, result.FallthroughTarget,
                              result.BranchTargets);
     return result;
+  }
+
+  static void collectTailBranchTargets(
+      const NativeProgramState &state, uint64_t functionEntry,
+      std::vector<NativeInstruction> &instructions,
+      std::vector<uint64_t> &tailBranchTargets) {
+    for (NativeInstruction &instruction : instructions) {
+      std::vector<uint64_t> localTargets;
+      for (uint64_t target : instruction.DirectFlowTargets) {
+        if (isTailBranchTarget(state, functionEntry, instruction, target)) {
+          addUniqueAddress(tailBranchTargets, target);
+          continue;
+        }
+        addUniqueAddress(localTargets, target);
+      }
+      instruction.DirectFlowTargets = std::move(localTargets);
+    }
+  }
+
+  static bool isTailBranchTarget(const NativeProgramState &state,
+                                 uint64_t functionEntry,
+                                 const NativeInstruction &instruction,
+                                 uint64_t target) {
+    if (instruction.FlowKind != NativeInstructionFlowKind::UnconditionalBranch) {
+      return false;
+    }
+    if (!isDynamicArrayThunkSeed(state, functionEntry)) {
+      return false;
+    }
+    return target < functionEntry;
+  }
+
+  static bool isDynamicArrayThunkSeed(const NativeProgramState &state,
+                                      uint64_t functionEntry) {
+    auto seedIterator = state.functionSeeds().find(functionEntry);
+    if (seedIterator == state.functionSeeds().end()) {
+      return false;
+    }
+    const NativeFunctionSeed &seed = seedIterator->second;
+    if (seed.RangeStart != 0 && seed.RangeEnd > seed.RangeStart) {
+      return false;
+    }
+    return std::find(seed.Sources.begin(), seed.Sources.end(),
+                     "dt-init-array") != seed.Sources.end() ||
+           std::find(seed.Sources.begin(), seed.Sources.end(),
+                     "dt-fini-array") != seed.Sources.end();
   }
 
   static std::set<uint64_t> reachableInstructionStarts(
