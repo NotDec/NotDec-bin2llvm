@@ -1379,6 +1379,7 @@ int main(int argc, char **argv) {
         notdec::bin2llvm::createSleighSeedInstructionAnalyzer(
             options->DecodeOptions));
     manager.addAnalyzer(notdec::bin2llvm::createX86JumpTableAnalyzer());
+    manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
     if (options->Mode == OutputMode::TextReport) {
       manager.addAnalyzer(notdec::bin2llvm::createReportAnalyzer(std::cout));
     }

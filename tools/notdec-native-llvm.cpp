@@ -384,6 +384,7 @@ runNativeDiscovery(
   manager.addAnalyzer(
       notdec::bin2llvm::createSleighSeedInstructionAnalyzer(decodeOptions));
   manager.addAnalyzer(notdec::bin2llvm::createX86JumpTableAnalyzer());
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
   manager.run(state);
   return state;
 }

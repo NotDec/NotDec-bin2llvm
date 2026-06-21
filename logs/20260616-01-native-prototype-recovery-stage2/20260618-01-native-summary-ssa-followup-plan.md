@@ -2875,3 +2875,75 @@ extra_instruction_edges: 10
 - 实现效果：6/10。消除了函数末尾假 fallthrough，fortune 指标稳定。
 - 理解成本：1/10。只是在已有 fallthrough 判断里加已知 seed 末尾检查。
 - 维护成本：1/10。规则直接对应 eh-frame/symbol range 的边界语义。
+
+## 已完成：flow facts 后置归一化和 block 覆盖补洞
+
+继续检查剩余 extra instruction edges，发现还有两类问题：
+
+- 条件或无条件 direct branch 的目标是真实机器目标，但不是当前函数 CFG successor。例如
+  `0x3950: JZ 0x27b2`，true 分支跳到另一个函数入口，false 分支继续当前函数。
+- `0x2aa1..0x2aa6` 有 decoded instructions，但没有任何 basic block 覆盖，导致
+  `0x2a9f` 的 fallthrough 指到一个不存在的 block。
+
+这类信息必须等函数、jump table 和 block 都确认后才能判断，所以加了一个后置 analyzer，
+放在 `X86JumpTableAnalyzer` 之后。
+
+具体改动：
+
+- [NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:284)
+  - `NativeProgramState` 增加 `markInstructionTailFlowTarget(...)`，只把已有 direct target
+    移到 tail target，不新增控制流。
+- [NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:357)
+  - 增加 `createFlowFactNormalizer()` factory。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2789)
+  - 新增 `FlowFactNormalizer`。
+  - 第一阶段补 block 覆盖洞：找函数范围内已解码但未被 block 覆盖的连续指令，生成
+    `NativeBasicBlock`。
+  - 第二阶段归一化 successor：普通指令 fallthrough 指向同函数已有 block 时补 successor；
+    block 末尾 instruction 的 direct target 如果不在 block successor 中，则移动到
+    `TailFlowTargets`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3359)
+  - 实现 `NativeProgramState::markInstructionTailFlowTarget(...)`。
+- [notdec-native-discover.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-discover.cpp:1382)
+  - native discovery pipeline 在 `X86JumpTableAnalyzer` 后运行 `FlowFactNormalizer`。
+- [notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:387)
+  - native LLVM pipeline 同步运行 `FlowFactNormalizer`。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-flow-normalizer/summary.json -o /tmp/notdec-fortune-flow-normalizer/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-flow-normalizer/fortune.ll -o /tmp/notdec-fortune-flow-normalizer/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-flow-normalizer/fortune.bc -o /tmp/notdec-fortune-flow-normalizer/fortune.verified.bc
+```
+
+fortune 结果：
+
+```text
+function_seeds: 26
+confirmed_functions: 26
+basic_blocks: 1016
+instructions: 2602
+xrefs total: 868
+unresolved_indirect_flows: 0
+native pipeline: 10.23s / 10.69s / 10.89s observed
+```
+
+一致性检查：
+
+```text
+uncovered_instructions: 0
+missing_from_instruction_facts: 0
+extra_instruction_edges: 0
+```
+
+复杂度评估：
+
+- 实现效果：8/10。fortune 上 decoded instruction、block coverage、flow facts 三者一致。
+- 理解成本：4/10。多了一个后置 analyzer，但职责清楚：不 decode，只整理 facts。
+- 维护成本：3/10。当前 coverage 查询是线性扫描，真实大二进制上后续可能需要区间索引优化。

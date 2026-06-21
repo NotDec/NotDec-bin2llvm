@@ -281,6 +281,7 @@ public:
                                const std::vector<uint64_t> &successors);
   bool addInstructionDirectFlowTargets(uint64_t address,
                                        const std::vector<uint64_t> &targets);
+  bool markInstructionTailFlowTarget(uint64_t address, uint64_t target);
   void addXref(NativeXref xref);
   bool addUnresolvedFlow(NativeUnresolvedFlow flow);
   bool removeUnresolvedFlow(uint64_t address, NativeUnresolvedFlowKind kind);
@@ -353,6 +354,7 @@ std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer();
 std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
     NativeSleighDecodeOptions options = {});
 std::unique_ptr<NativeAnalyzer> createX86JumpTableAnalyzer();
+std::unique_ptr<NativeAnalyzer> createFlowFactNormalizer();
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output);
 
 } // namespace notdec::bin2llvm

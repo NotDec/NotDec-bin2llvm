@@ -2786,6 +2786,154 @@ private:
   }
 };
 
+class FlowFactNormalizer final : public NativeAnalyzer {
+public:
+  std::string name() const override { return "FlowFactNormalizer"; }
+  int priority() const override { return 80; }
+
+  void run(NativeProgramState &state, NativeAnalysisManager &) override {
+    std::vector<std::pair<uint64_t, NativeBasicBlock>> missingBlocks;
+    for (const auto &[entry, function] : state.functions()) {
+      appendMissingBlocks(state, function, missingBlocks);
+    }
+    for (auto &[entry, block] : missingBlocks) {
+      state.addBasicBlock(entry, std::move(block));
+    }
+    for (const auto &[entry, function] : state.functions()) {
+      (void)entry;
+      for (const NativeBasicBlock &block : function.Blocks) {
+        normalizeBlockSuccessors(state, function, block);
+      }
+    }
+  }
+
+private:
+  static void appendMissingBlocks(
+      const NativeProgramState &state, const NativeFunction &function,
+      std::vector<std::pair<uint64_t, NativeBasicBlock>> &result) {
+    std::vector<const NativeInstruction *> instructions =
+        state.instructionsInRange(function.RangeStart, function.RangeEnd);
+    for (size_t index = 0; index < instructions.size(); ++index) {
+      const NativeInstruction *instruction = instructions[index];
+      if (functionHasBlockContaining(function, instruction->Address)) {
+        continue;
+      }
+
+      NativeBasicBlock block;
+      block.Start = instruction->Address;
+      size_t endIndex = index;
+      while (endIndex < instructions.size()) {
+        const NativeInstruction *current = instructions[endIndex];
+        if (endIndex != index &&
+            functionHasBlockContaining(function, current->Address)) {
+          break;
+        }
+        block.End = current->end();
+        if (current->FlowKind != NativeInstructionFlowKind::None) {
+          addInstructionSuccessors(function, *current, block.Successors);
+          break;
+        }
+        if (endIndex + 1 == instructions.size() ||
+            instructions[endIndex + 1]->Address != current->end()) {
+          addInstructionSuccessors(function, *current, block.Successors);
+          break;
+        }
+        ++endIndex;
+      }
+
+      if (block.Start < block.End) {
+        result.push_back({function.Entry, std::move(block)});
+      }
+      index = endIndex;
+    }
+  }
+
+  static void normalizeBlockSuccessors(NativeProgramState &state,
+                                       const NativeFunction &function,
+                                       const NativeBasicBlock &block) {
+    const NativeInstruction *terminator = nullptr;
+    for (const NativeInstruction *instruction :
+         state.instructionsInRange(block.Start, block.End)) {
+      terminator = instruction;
+    }
+    if (terminator == nullptr) {
+      return;
+    }
+
+    if (terminator->FlowKind == NativeInstructionFlowKind::None &&
+        terminator->Fallthrough &&
+        functionHasBlockStartingAt(function, *terminator->Fallthrough)) {
+      state.addBasicBlockSuccessors(function.Entry, block.Start,
+                                    {*terminator->Fallthrough});
+    }
+
+    for (uint64_t target : terminator->DirectFlowTargets) {
+      if (std::find(block.Successors.begin(), block.Successors.end(),
+                    target) != block.Successors.end()) {
+        continue;
+      }
+      state.markInstructionTailFlowTarget(terminator->Address, target);
+    }
+  }
+
+  static bool functionHasBlockStartingAt(const NativeFunction &function,
+                                         uint64_t address) {
+    for (const NativeBasicBlock &block : function.Blocks) {
+      if (block.Start == address) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool functionHasBlockContaining(const NativeFunction &function,
+                                         uint64_t address) {
+    for (const NativeBasicBlock &block : function.Blocks) {
+      if (address >= block.Start && address < block.End) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static void addInstructionSuccessors(
+      const NativeFunction &function, const NativeInstruction &instruction,
+      std::vector<uint64_t> &successors) {
+    if (instruction.FlowKind == NativeInstructionFlowKind::ConditionalBranch) {
+      addLocalSuccessors(function, instruction.DirectFlowTargets, successors);
+      if (instruction.Fallthrough) {
+        addLocalSuccessor(function, *instruction.Fallthrough, successors);
+      }
+      return;
+    }
+    if (instruction.FlowKind == NativeInstructionFlowKind::UnconditionalBranch ||
+        instruction.FlowKind == NativeInstructionFlowKind::IndirectBranch) {
+      addLocalSuccessors(function, instruction.DirectFlowTargets, successors);
+      return;
+    }
+    if (instruction.FlowKind == NativeInstructionFlowKind::None &&
+        instruction.Fallthrough) {
+      addLocalSuccessor(function, *instruction.Fallthrough, successors);
+    }
+  }
+
+  static void addLocalSuccessors(const NativeFunction &function,
+                                 const std::vector<uint64_t> &targets,
+                                 std::vector<uint64_t> &successors) {
+    for (uint64_t target : targets) {
+      addLocalSuccessor(function, target, successors);
+    }
+  }
+
+  static void addLocalSuccessor(const NativeFunction &function, uint64_t target,
+                                std::vector<uint64_t> &successors) {
+    if (!functionHasBlockStartingAt(function, target)) {
+      return;
+    }
+    addUniqueAddress(successors, target);
+  }
+};
+
 } // namespace
 
 std::string toString(NativeFunctionConfidence confidence) {
@@ -3208,6 +3356,28 @@ bool NativeProgramState::addInstructionDirectFlowTargets(
   return changed;
 }
 
+bool NativeProgramState::markInstructionTailFlowTarget(uint64_t address,
+                                                       uint64_t target) {
+  auto iterator = Instructions.find(address);
+  if (iterator == Instructions.end()) {
+    return false;
+  }
+
+  NativeInstruction &instruction = iterator->second;
+  auto directTarget = std::find(instruction.DirectFlowTargets.begin(),
+                                instruction.DirectFlowTargets.end(), target);
+  if (directTarget == instruction.DirectFlowTargets.end()) {
+    return false;
+  }
+  instruction.DirectFlowTargets.erase(directTarget);
+  if (std::find(instruction.TailFlowTargets.begin(),
+                instruction.TailFlowTargets.end(),
+                target) == instruction.TailFlowTargets.end()) {
+    instruction.TailFlowTargets.push_back(target);
+  }
+  return true;
+}
+
 void NativeProgramState::addXref(NativeXref xref) {
   if (xref.From == 0 || xref.To == 0) {
     return;
@@ -3363,6 +3533,10 @@ std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
 
 std::unique_ptr<NativeAnalyzer> createX86JumpTableAnalyzer() {
   return std::make_unique<X86JumpTableAnalyzer>();
+}
+
+std::unique_ptr<NativeAnalyzer> createFlowFactNormalizer() {
+  return std::make_unique<FlowFactNormalizer>();
 }
 
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output) {
