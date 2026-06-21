@@ -4397,3 +4397,58 @@ build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/root
 - 实现效果：7/10。收掉一个真实 PIC jump table，剩下的 indirect branch 暂时不是同一类问题。
 - 理解成本：4/10。CFG 回溯比原来多一点状态，但限定在 `LEA` base 查询里。
 - 维护成本：3/10。后续如果继续补 jump table，仍应放在 facts 层，不动 lowering。
+
+## 实现记录：补 full-width index compare 的 jump table 上界识别
+
+`memcached` 里 `0x12e2d` 是另一类 PIC i32 jump table：
+
+```text
+CMP RDI,0xc
+JA 0x12db0
+LEA R8,[0x3a374]
+MOVSXD RDI,dword ptr [R8 + RDI*0x4]
+ADD RDI,R8
+JMP RDI
+```
+
+之前 `findNearestUpperBound()` 对 indexReg=`RDI` 只会查 `EDI/DIL`，
+所以能识别 `CMP AL,imm`、`CMP EAX,imm`，但漏掉 `CMP RDI,imm`。
+结果是 table base 和 dispatch pattern 都能匹配，上界匹配失败，jump table
+仍留在 unresolved。
+
+本次改动：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1737)
+  - `compareRegisterNamesForText()` 的 fallback 结果先加入 `reg` 自身，再加入
+    low32 / low8 别名。
+  - 这样 `RDI` 这种 64 位 index 能同时匹配 `CMP RDI,imm`、`CMP EDI,imm`、
+    `CMP DIL,imm`。
+
+验证：
+
+```text
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-regself-jumptable/fortune.ll --summary-json-out /tmp/notdec-fortune-regself-jumptable/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-regself-jumptable/fortune.ll -o /tmp/notdec-fortune-regself-jumptable/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-regself-jumptable/fortune.bc -o /tmp/notdec-fortune-regself-jumptable/fortune.verify.bc
+python3 scripts/bench2-native-discovery-debug-check.py --build-dir build --target memcached:executable --target redis:cli --target wrk:executable --target fortune:executable
+```
+
+结果：
+
+- `memcached` unresolved 从 `50` 降到 `47`，indirect branch 从 `7` 降到 `4`。
+- `memcached` 的 `0x12e2d`、`0x12f21` 不再 unresolved。
+- `redis-cli` 仍是 `134`，`lighttpd` 仍是 `106`，`wrk` 仍是 `30`。
+- `fortune` unresolved 仍是 `0`。
+- `fortune` 完整链路通过 `llvm-as` 和 `opt -passes=verify`，耗时 `10.47 sec`。
+- `memcached`、`redis:cli`、`wrk`、`fortune` 的 debug function confirmed coverage 都是 `1.0000`。
+- 实现效果：6/10。补掉一类真实 jump table 上界识别问题。
+- 理解成本：1/10。只是 compare 候选里补回寄存器自身。
+- 维护成本：1/10。规则仍限制在 x86 jump table facts 层。

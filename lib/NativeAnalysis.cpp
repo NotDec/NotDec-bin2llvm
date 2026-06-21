@@ -1735,6 +1735,7 @@ std::vector<std::string> compareRegisterNamesForText(const std::string &reg) {
     return {reg};
   }
   std::vector<std::string> names;
+  names.push_back(reg);
   std::string low32 = low32RegisterName(reg);
   if (!low32.empty()) {
     names.push_back(low32);
