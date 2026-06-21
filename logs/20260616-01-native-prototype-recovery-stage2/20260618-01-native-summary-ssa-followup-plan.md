@@ -1882,3 +1882,103 @@ table base 来自前面 block 的 `LEA`，继续在这里补跨 seed 回溯会�
 - 再把恢复出的 targets 写回 block successors。
 - `PcodeToLLVM` 不再需要新增特殊逻辑，直接消费多个 successors 并 lower 成
   `switch`。
+
+## 已完成：条件分支窗口 false 边和后置 jump table facts
+
+这一步修了两个 facts 层问题。
+
+第一个问题是 0x2866 这种窗口末尾的条件跳转：
+
+```text
+2866: sub eax,0x61
+2869: cmp eax,0x16
+286c: ja 0x2efe
+2872: movsxd rax,DWORD PTR [rbx+rax*4]
+```
+
+之前 block `0x2866..0x2872` 只有 true successor `0x2efe`，没有 false
+successor `0x2872`。现在最后一条 instruction 如果是 conditional branch，
+即使窗口里没有下一条 instruction，也把 `instruction.end()` 记录成
+fallthrough。
+
+第二个问题是 jump table 不应该塞进单个 seed 的 p-code 扫描。现在加了一个
+后置 `X86JumpTableAnalyzer`，它在 Sleigh decode 之后读稳定的 instruction /
+block facts，先只匹配 fortune 里的 x86-64 PIC 32-bit offset table 形态：
+
+```text
+LEA RBX,[0x63d8]
+CMP EAX,0x16
+MOVSXD RAX,dword ptr [RBX + RAX*0x4]
+ADD RAX,RBX
+JMP RAX
+```
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1664)
+  - `annotateDecodedInstructionFlows(...)` 给窗口末尾的条件跳转补
+    `instruction.end()` fallthrough。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2720)
+  - `NativeProgramState::addBasicBlock(...)` 对同 start/end 的重复 block
+    合并 successors，不再直接丢掉新 facts。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2763)
+  - 新增 `addBasicBlockSuccessors(...)`，让后置 analyzer 可以只补边。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2815)
+  - 新增 `removeUnresolvedFlow(...)`，但当前只有完整恢复时才移除 unresolved。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2411)
+  - 新增 `X86JumpTableAnalyzer`。当前只把已经有 native block 的 jump table
+    target 写回 successors；缺 block 的目标先不写，避免 lowering 跳过函数。
+- [NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:275)
+  - 暴露上述两个状态更新方法和 `createX86JumpTableAnalyzer()`。
+- [notdec-native-discover.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-discover.cpp:1378)
+  - 在 Sleigh decode 后运行 `X86JumpTableAnalyzer`。
+- [notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:386)
+  - native LLVM 主链路也运行该 analyzer。
+
+当前 fortune 结果：
+
+```text
+block 0x2866 successors: ["0x2efe", "0x2872"]
+block 0x2872 successors: ["0x2efe"]
+unresolved indirect flows: still 1 at 0x2879
+```
+
+这里 unresolved 仍保留是有意的。表里其他 target，比如 `0x2970`，当前还没有
+native block；如果直接写进 successors，`PcodeToLLVM` 会报
+`native branch target 0x2970 is missing a native block` 并跳过 `0x2820`。
+所以当前只补“已经确认有 block 的目标”，完整解决需要下一步让 jump table
+facts 反向驱动二次 decode，把所有 table target 先 decode 成 block，再移除
+unresolved。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-discover notdec-native-llvm native_analysis_facts_test pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --block-json 0x2866 /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --block-json 0x2872 /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/usr/bin/time -f 'elapsed=%e' /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-jumptable-facts/fortune.ll --summary-json-out /tmp/notdec-fortune-jumptable-facts/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-jumptable-facts/fortune.ll -o /tmp/notdec-fortune-jumptable-facts/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-jumptable-facts/fortune.bc -o /tmp/notdec-fortune-jumptable-facts/fortune.verify.bc
+```
+
+结果：
+
+```text
+all native tests above: passed
+fortune native pipeline: 9.83s
+notdec_native_2820 is generated
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：5/10。修复了条件 false 边，并把 jump table 恢复放到了正确阶段；
+  但还没有二次 decode，所以不是完整 jump table 支持。
+- 理解成本：3/10。新增一个 analyzer，但它只消费已有 facts，入口清晰。
+- 维护成本：3/10。当前匹配规则偏窄，后续应扩展为“恢复 table targets 后驱动
+  decode”的完整流程。

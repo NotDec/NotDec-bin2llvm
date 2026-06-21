@@ -383,6 +383,7 @@ runNativeDiscovery(
   manager.addAnalyzer(notdec::bin2llvm::createEhFrameAnalyzer());
   manager.addAnalyzer(
       notdec::bin2llvm::createSleighSeedInstructionAnalyzer(decodeOptions));
+  manager.addAnalyzer(notdec::bin2llvm::createX86JumpTableAnalyzer());
   manager.run(state);
   return state;
 }

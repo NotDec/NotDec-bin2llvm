@@ -11,6 +11,7 @@
 #include <LIEF/ELF/Symbol.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <deque>
 #include <filesystem>
 #include <iomanip>
@@ -1663,6 +1664,10 @@ private:
           instruction.FlowKind != NativeInstructionFlowKind::Return;
       if (hasNextInstruction && hasFallthrough) {
         instruction.Fallthrough = instructions[index + 1].Address;
+      } else if (!hasNextInstruction &&
+                 instruction.FlowKind ==
+                     NativeInstructionFlowKind::ConditionalBranch) {
+        instruction.Fallthrough = instruction.end();
       }
     }
   }
@@ -1710,7 +1715,7 @@ private:
     for (NativeBasicBlock &block : blocks) {
       if (fallthroughTarget && block.End == rangeEnd &&
           block.Successors.empty()) {
-        block.Successors.push_back(*fallthroughTarget);
+        addUniqueAddress(block.Successors, *fallthroughTarget);
       }
       eraseKnownOtherFunctionSuccessors(state, entry, block.Successors);
       for (uint64_t successor : block.Successors) {
@@ -2383,6 +2388,231 @@ private:
   std::ostream &Output;
 };
 
+class X86JumpTableAnalyzer final : public NativeAnalyzer {
+public:
+  std::string name() const override { return "X86JumpTableAnalyzer"; }
+  int priority() const override { return 70; }
+
+  void run(NativeProgramState &state, NativeAnalysisManager &) override {
+    for (const NativeUnresolvedFlow &flow : state.unresolvedFlows()) {
+      if (flow.Kind != NativeUnresolvedFlowKind::IndirectBranch) {
+        continue;
+      }
+      recoverJumpTableAt(state, flow.Address);
+    }
+  }
+
+private:
+  struct JumpDispatch {
+    uint64_t BlockStart = 0;
+    uint64_t TableBase = 0;
+    uint64_t EntryCount = 0;
+  };
+
+  static void recoverJumpTableAt(NativeProgramState &state,
+                                 uint64_t branchAddress) {
+    const NativeFunction *function = state.functionContaining(branchAddress);
+    if (function == nullptr) {
+      return;
+    }
+
+    std::optional<JumpDispatch> dispatch =
+        matchPicI32OffsetDispatch(state, *function, branchAddress);
+    if (!dispatch) {
+      return;
+    }
+
+    std::vector<uint64_t> targets;
+    bool complete = false;
+    if (!readPicI32Targets(state, dispatch->TableBase, dispatch->EntryCount,
+                           targets, complete)) {
+      return;
+    }
+    if (targets.empty()) {
+      return;
+    }
+
+    state.addBasicBlockSuccessors(function->Entry, dispatch->BlockStart,
+                                  targets);
+    for (uint64_t target : targets) {
+      NativeXref xref;
+      xref.From = branchAddress;
+      xref.To = target;
+      xref.Kind = NativeXrefKind::Flow;
+      xref.Source = "x86-jump-table";
+      state.addXref(std::move(xref));
+    }
+    if (complete) {
+      state.removeUnresolvedFlow(branchAddress,
+                                 NativeUnresolvedFlowKind::IndirectBranch);
+    }
+  }
+
+  // First implementation is deliberately narrow: it recognizes the PIC table
+  // form emitted by GCC in fortune.  Keeping this as a post-decode facts pass is
+  // the important part; broader table shapes can be added here without making
+  // the seed p-code scan stateful.
+  static std::optional<JumpDispatch>
+  matchPicI32OffsetDispatch(const NativeProgramState &state,
+                            const NativeFunction &function,
+                            uint64_t branchAddress) {
+    const NativeInstruction *branch = state.instructionAt(branchAddress);
+    if (branch == nullptr || branch->Mnemonic != "JMP RAX") {
+      return std::nullopt;
+    }
+
+    const NativeInstruction *load = previousInstruction(state, function,
+                                                        branchAddress, 2);
+    const NativeInstruction *add = previousInstruction(state, function,
+                                                       branchAddress, 1);
+    if (load == nullptr || add == nullptr ||
+        load->Mnemonic != "MOVSXD RAX,dword ptr [RBX + RAX*0x4]" ||
+        add->Mnemonic != "ADD RAX,RBX") {
+      return std::nullopt;
+    }
+
+    std::optional<uint64_t> tableBase =
+        findNearestLeaBase(state, function, load->Address, "RBX");
+    std::optional<uint64_t> entryCount =
+        findNearestUpperBound(state, function, load->Address);
+    if (!tableBase || !entryCount || *entryCount == 0 || *entryCount > 256) {
+      return std::nullopt;
+    }
+
+    JumpDispatch dispatch;
+    dispatch.BlockStart = load->Address;
+    dispatch.TableBase = *tableBase;
+    dispatch.EntryCount = *entryCount;
+    return dispatch;
+  }
+
+  static const NativeInstruction *
+  previousInstruction(const NativeProgramState &state,
+                      const NativeFunction &function, uint64_t address,
+                      uint64_t distance) {
+    std::vector<const NativeInstruction *> instructions =
+        state.instructionsInRange(function.RangeStart, address);
+    if (instructions.size() < distance) {
+      return nullptr;
+    }
+    return instructions[instructions.size() - distance];
+  }
+
+  static std::optional<uint64_t>
+  findNearestLeaBase(const NativeProgramState &state,
+                     const NativeFunction &function, uint64_t beforeAddress,
+                     const std::string &reg) {
+    std::vector<const NativeInstruction *> instructions =
+        state.instructionsInRange(function.RangeStart, beforeAddress);
+    const std::string prefix = "LEA " + reg + ",[0x";
+    for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
+         ++iterator) {
+      const std::string &text = (*iterator)->Mnemonic;
+      if (text.rfind(prefix, 0) == 0 && !text.empty() && text.back() == ']') {
+        return parseHex(text.substr(prefix.size(),
+                                    text.size() - prefix.size() - 1));
+      }
+      if (text.rfind("MOV " + reg + ",", 0) == 0 ||
+          text.rfind("LEA " + reg + ",", 0) == 0 ||
+          text.rfind("POP " + reg, 0) == 0) {
+        return std::nullopt;
+      }
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<uint64_t>
+  findNearestUpperBound(const NativeProgramState &state,
+                        const NativeFunction &function,
+                        uint64_t beforeAddress) {
+    std::vector<const NativeInstruction *> instructions =
+        state.instructionsInRange(function.RangeStart, beforeAddress);
+    for (auto iterator = instructions.rbegin(); iterator != instructions.rend();
+         ++iterator) {
+      const std::string &text = (*iterator)->Mnemonic;
+      const std::string prefix = "CMP EAX,0x";
+      if (text.rfind(prefix, 0) == 0) {
+        std::optional<uint64_t> maxIndex = parseHex(text.substr(prefix.size()));
+        if (maxIndex) {
+          return *maxIndex + 1;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  static bool readPicI32Targets(const NativeProgramState &state,
+                                uint64_t tableBase, uint64_t entryCount,
+                                std::vector<uint64_t> &targets,
+                                bool &complete) {
+    complete = true;
+    for (uint64_t index = 0; index < entryCount; ++index) {
+      std::optional<int64_t> offset = readSigned32(state, tableBase + index * 4);
+      if (!offset) {
+        return false;
+      }
+      uint64_t target =
+          static_cast<uint64_t>(static_cast<int64_t>(tableBase) + *offset);
+      if (!state.isExecutableAddress(target)) {
+        return false;
+      }
+      if (!functionContainsBlockStart(state, target)) {
+        complete = false;
+        continue;
+      }
+      if (std::find(targets.begin(), targets.end(), target) == targets.end()) {
+        targets.push_back(target);
+      }
+    }
+    return true;
+  }
+
+  static bool functionContainsBlockStart(const NativeProgramState &state,
+                                         uint64_t address) {
+    const NativeFunction *function = state.functionContaining(address);
+    if (function == nullptr) {
+      return false;
+    }
+    for (const NativeBasicBlock &block : function->Blocks) {
+      if (block.Start == address) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static std::optional<int64_t> readSigned32(const NativeProgramState &state,
+                                             uint64_t address) {
+    std::vector<uint8_t> bytes;
+    if (!readBytes(state, address, 4, bytes) || bytes.size() != 4) {
+      return std::nullopt;
+    }
+    uint32_t raw = 0;
+    for (uint8_t index = 0; index < 4; ++index) {
+      raw |= static_cast<uint32_t>(bytes[index]) << (index * 8);
+    }
+    return static_cast<int32_t>(raw);
+  }
+
+  static std::optional<uint64_t> parseHex(const std::string &text) {
+    if (text.empty()) {
+      return std::nullopt;
+    }
+    for (char ch : text) {
+      if (!std::isxdigit(static_cast<unsigned char>(ch))) {
+        return std::nullopt;
+      }
+    }
+    uint64_t value = 0;
+    std::istringstream stream(text);
+    stream >> std::hex >> value;
+    if (!stream || !stream.eof()) {
+      return std::nullopt;
+    }
+    return value;
+  }
+};
+
 } // namespace
 
 std::string toString(NativeFunctionConfidence confidence) {
@@ -2701,7 +2931,15 @@ bool NativeProgramState::addBasicBlock(uint64_t functionEntry,
       continue;
     }
     if (existing.End == block.End) {
-      return false;
+      bool changed = false;
+      for (uint64_t successor : block.Successors) {
+        if (std::find(existing.Successors.begin(), existing.Successors.end(),
+                      successor) == existing.Successors.end()) {
+          existing.Successors.push_back(successor);
+          changed = true;
+        }
+      }
+      return changed;
     }
     if (block.End < existing.End) {
       existing.End = block.End;
@@ -2732,6 +2970,31 @@ bool NativeProgramState::addBasicBlock(uint64_t functionEntry,
   return true;
 }
 
+bool NativeProgramState::addBasicBlockSuccessors(
+    uint64_t functionEntry, uint64_t blockStart,
+    const std::vector<uint64_t> &successors) {
+  auto iterator = Functions.find(functionEntry);
+  if (iterator == Functions.end()) {
+    return false;
+  }
+
+  for (NativeBasicBlock &block : iterator->second.Blocks) {
+    if (block.Start != blockStart) {
+      continue;
+    }
+    bool changed = false;
+    for (uint64_t successor : successors) {
+      if (std::find(block.Successors.begin(), block.Successors.end(),
+                    successor) == block.Successors.end()) {
+        block.Successors.push_back(successor);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+  return false;
+}
+
 void NativeProgramState::addXref(NativeXref xref) {
   if (xref.From == 0 || xref.To == 0) {
     return;
@@ -2754,6 +3017,18 @@ bool NativeProgramState::addUnresolvedFlow(NativeUnresolvedFlow flow) {
   }
   UnresolvedFlows.push_back(std::move(flow));
   return true;
+}
+
+bool NativeProgramState::removeUnresolvedFlow(uint64_t address,
+                                              NativeUnresolvedFlowKind kind) {
+  size_t oldSize = UnresolvedFlows.size();
+  UnresolvedFlows.erase(
+      std::remove_if(UnresolvedFlows.begin(), UnresolvedFlows.end(),
+                     [&](const NativeUnresolvedFlow &flow) {
+                       return flow.Address == address && flow.Kind == kind;
+                     }),
+      UnresolvedFlows.end());
+  return UnresolvedFlows.size() != oldSize;
 }
 
 bool NativeProgramState::addInstruction(NativeInstruction instruction) {
@@ -2860,6 +3135,10 @@ std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer() {
 std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
     NativeSleighDecodeOptions options) {
   return std::make_unique<SleighSeedInstructionAnalyzer>(options);
+}
+
+std::unique_ptr<NativeAnalyzer> createX86JumpTableAnalyzer() {
+  return std::make_unique<X86JumpTableAnalyzer>();
 }
 
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output) {

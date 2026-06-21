@@ -273,8 +273,11 @@ public:
                        std::string source, NativeFunctionConfidence confidence);
   bool addFunction(NativeFunction function);
   bool addBasicBlock(uint64_t functionEntry, NativeBasicBlock block);
+  bool addBasicBlockSuccessors(uint64_t functionEntry, uint64_t blockStart,
+                               const std::vector<uint64_t> &successors);
   void addXref(NativeXref xref);
   bool addUnresolvedFlow(NativeUnresolvedFlow flow);
+  bool removeUnresolvedFlow(uint64_t address, NativeUnresolvedFlowKind kind);
   bool addInstruction(NativeInstruction instruction);
   void addFunctionRange(uint64_t address, uint64_t start, uint64_t end,
                         std::string source);
@@ -343,6 +346,7 @@ std::unique_ptr<NativeAnalyzer> createElfSymbolAnalyzer();
 std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer();
 std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
     NativeSleighDecodeOptions options = {});
+std::unique_ptr<NativeAnalyzer> createX86JumpTableAnalyzer();
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output);
 
 } // namespace notdec::bin2llvm
