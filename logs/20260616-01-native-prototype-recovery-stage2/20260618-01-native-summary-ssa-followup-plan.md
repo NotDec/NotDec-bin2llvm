@@ -1608,3 +1608,57 @@ llvm-as + opt verify: passed
 - 实现效果：6/10。减少了 conditional false edge 的猜测，避免 successor facts 不一致时静默错连。
 - 理解成本：2/10。多了一个跨 ranges true target 例外，但它对应当前 tail-call lowering 规则。
 - 维护成本：2/10。仍局限在 PcodeToLLVM native lowering 内。
+
+## 实现记录：native CBRANCH 必须有 successor facts
+
+上一段已经校验 `CBRANCH` 的 true / false successor 内容，但如果当前 block 完全没有 `BlockSuccessors` entry，之前仍会落到旧 fallback。native 工具链正常会为每个 block 写入 successor entry，即使 successor 为空，所以缺 entry 本身就是 fact 缺失。
+
+这次只收紧 direct `CBRANCH`：
+
+- native CFG 模式下，当前 conditional block 没有 successor facts 时直接报错。
+- 如果确实没有当前函数内 false edge，应显式传空 successor list。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:448)
+  - `nativeConditionalFalseBlock(...)` 在 native CFG 模式下缺 `BlockSuccessors` entry 时报 `missing successor facts`。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:207)
+  - 旧的 conditional tail branch 测试补显式空 successor list。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:494)
+  - 增加 `testNativeConditionalRequiresSuccessorFacts()`。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test notdec-native-llvm native_register_summary_test native_register_summary_ssa_test native_analysis_facts_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-missing-cbranch-successors/fortune.ll --summary-json-out /tmp/notdec-fortune-missing-cbranch-successors/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-missing-cbranch-successors-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-missing-cbranch-successors/fortune.ll -o /tmp/notdec-fortune-missing-cbranch-successors/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-missing-cbranch-successors/fortune.bc -o /tmp/notdec-fortune-missing-cbranch-successors/fortune.verify.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-missing-cbranch-successors-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-missing-cbranch-successors-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-missing-cbranch-successors-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-missing-cbranch-successors-raw/fortune-3470-raw.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 9.40s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 109
+final !notdec.register.access residue: 1
+remaining !notdec.register.access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：4/10。补齐上一轮 conditional successor 校验的 missing-entry 情况。
+- 理解成本：1/10。缺 successor facts 直接报错。
+- 维护成本：1/10。没有新增状态。

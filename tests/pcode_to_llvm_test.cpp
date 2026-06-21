@@ -214,6 +214,7 @@ bool testInternalConditionalTailBranchWithoutLocalBlock() {
   config.EntryAddress = 0x1000;
   config.DirectCallTargets.emplace(0x2000, "notdec_native_2000");
   config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{});
 
   std::string errorMessage;
   std::unique_ptr<llvm::Module> module =
@@ -490,6 +491,28 @@ bool testNativeConditionalSuccessorsRequireTrueTarget() {
                 "missing true successor error was not reported");
 }
 
+bool testNativeConditionalRequiresSuccessorFacts() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(cbranchOp(0x1000, 0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_conditional_missing_successors";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native conditional without successor facts should fail") &&
+         expect(errorMessage.find("missing successor facts") !=
+                    std::string::npos,
+                "missing successor facts error was not reported");
+}
+
 bool testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -579,6 +602,7 @@ int main() {
   ok &= testNativeSuccessorRequiresKnownBlock();
   ok &= testNativeMultipleSuccessorsRequireTerminator();
   ok &= testNativeConditionalSuccessorsRequireTrueTarget();
+  ok &= testNativeConditionalRequiresSuccessorFacts();
   ok &= testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor();
   ok &= testNativeConditionalSuccessorsRejectMultipleFalseTargets();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;

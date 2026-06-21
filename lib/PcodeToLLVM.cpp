@@ -453,6 +453,13 @@ private:
     uint64_t blockAddress = blockAddressForIndex(blockIndex);
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
+      if (usesNativeCfg()) {
+        std::ostringstream os;
+        os << "native conditional block 0x" << std::hex << blockAddress
+           << " is missing successor facts";
+        errorMessage = os.str();
+        return false;
+      }
       result = usesNativeCfg() ? nullptr : fallback;
       return true;
     }
