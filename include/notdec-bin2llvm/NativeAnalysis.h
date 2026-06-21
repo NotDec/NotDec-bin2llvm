@@ -190,6 +190,8 @@ enum class NativeInstructionFlowKind {
   Return,
 };
 
+std::string toString(NativeInstructionFlowKind kind);
+
 // NativeInstruction records decoded instruction facts accepted by native
 // analyzers.  It deliberately keeps operands and raw P-Code out, but it does
 // keep machine-level flow facts.  Later block construction and LLVM lowering

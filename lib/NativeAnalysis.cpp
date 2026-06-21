@@ -2418,6 +2418,22 @@ std::string toString(NativeUnresolvedFlowKind kind) {
   return "unknown";
 }
 
+std::string toString(NativeInstructionFlowKind kind) {
+  switch (kind) {
+  case NativeInstructionFlowKind::None:
+    return "none";
+  case NativeInstructionFlowKind::ConditionalBranch:
+    return "conditional branch";
+  case NativeInstructionFlowKind::UnconditionalBranch:
+    return "unconditional branch";
+  case NativeInstructionFlowKind::IndirectBranch:
+    return "indirect branch";
+  case NativeInstructionFlowKind::Return:
+    return "return";
+  }
+  return "unknown";
+}
+
 NativeProgramState::NativeProgramState(const LIEF::ELF::Binary &binary)
     : Binary(binary), PointerSize(binary.ptr_size()) {
   for (const LIEF::ELF::Segment &segment : binary.segments()) {

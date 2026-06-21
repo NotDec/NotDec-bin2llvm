@@ -1214,7 +1214,24 @@ void printInstructionObject(
   output << indent << "  \"text\": \""
          << jsonEscape(instruction.Mnemonic) << "\",\n";
   output << indent << "  \"source\": \"" << jsonEscape(instruction.Source)
-         << "\"\n";
+         << "\",\n";
+  output << indent << "  \"flow_kind\": \""
+         << notdec::bin2llvm::toString(instruction.FlowKind) << "\",\n";
+  output << indent << "  \"direct_flow_targets\": ";
+  printAddressArray(output, instruction.DirectFlowTargets);
+  output << ",\n";
+  output << indent << "  \"direct_call_targets\": ";
+  printAddressArray(output, instruction.DirectCallTargets);
+  output << ",\n";
+  output << indent << "  \"fallthrough\": ";
+  if (instruction.Fallthrough) {
+    output << "\"" << hexString(*instruction.Fallthrough) << "\"";
+  } else {
+    output << "null";
+  }
+  output << ",\n";
+  output << indent << "  \"has_indirect_call\": "
+         << (instruction.HasIndirectCall ? "true" : "false") << "\n";
   output << indent << "}";
 }
 

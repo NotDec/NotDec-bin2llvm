@@ -1165,3 +1165,75 @@ llvm-as + opt verify: passed
 - 实现效果：8/10。block facts、call seeds、xref、unresolved flow 都统一受本地可达性约束。
 - 理解成本：4/10。多了 pending fact 提交流程，但比直接写 state 更符合当前分层。
 - 维护成本：3/10。逻辑仍限制在 seed decode 内，summary 链路和 generic pcode lowering 不受影响。
+
+## 实现记录：instruction JSON 输出 flow facts
+
+当前 native decode 已经把机器指令级 flow facts 存在 `NativeInstruction` 里，但 `notdec-native-discover --instructions-*` 之前只输出 address、bytes、text、source。这样排查 block facts 时还要回头看代码或 CFG 输出，不够直接。
+
+这次只暴露已有事实，不改变 discovery / lowering 行为。
+
+具体改动：
+
+- [NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:193)
+  - 声明 `toString(NativeInstructionFlowKind)`。
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2421)
+  - 实现 `NativeInstructionFlowKind` 的字符串输出。
+- [notdec-native-discover.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-discover.cpp:1204)
+  - `printInstructionObject(...)` 增加：
+    - `flow_kind`
+    - `direct_flow_targets`
+    - `direct_call_targets`
+    - `fallthrough`
+    - `has_indirect_call`
+
+抽样验证：
+
+```text
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --instructions-range-json 0x3740 0x3758 /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+```
+
+关键输出：
+
+```json
+{
+  "address": "0x3748",
+  "text": "JZ 0x3e81",
+  "flow_kind": "conditional branch",
+  "direct_flow_targets": ["0x3e81"],
+  "fallthrough": "0x374e"
+}
+```
+
+完整验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-discover notdec-native-llvm native_register_summary_test native_register_summary_ssa_test pcode_to_llvm_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-flow-json/fortune.ll --summary-json-out /tmp/notdec-fortune-flow-json/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-flow-json-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-flow-json/fortune.ll -o /tmp/notdec-fortune-flow-json/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-flow-json/fortune.bc -o /tmp/notdec-fortune-flow-json/fortune.verified.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-flow-json-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-flow-json-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-flow-json-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-flow-json-raw/fortune-3470-raw.verified.bc
+```
+
+结果：
+
+```text
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 109
+final !notdec.register.access residue: 1
+remaining register access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：6/10。没有改变语义，但让 instruction facts 可以直接审计。
+- 理解成本：1/10。只是 JSON 字段和枚举字符串。
+- 维护成本：1/10。输出字段来自已有结构体，不新增分析状态。
