@@ -3,6 +3,7 @@
 #include <sleigh/Support.h>
 #include <sleigh/libsleigh.hh>
 
+#include <algorithm>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -534,8 +535,16 @@ collectSleighPcodeRanges(ghidra::LoadImage &loadImage,
   program.IsBigEndian = engine.isBigEndian();
   collectRegisters(engine, program);
 
+  // Native block ranges should be consumed in address order, not in the
+  // order they happened to be discovered or passed in.
+  std::vector<std::pair<uint64_t, uint64_t>> sortedRanges = ranges;
+  std::sort(sortedRanges.begin(), sortedRanges.end(),
+            [](const auto &lhs, const auto &rhs) {
+              return lhs.first < rhs.first;
+            });
+
   PcodeCollector collector(engine, program);
-  for (const auto &[start, endOffset] : ranges) {
+  for (const auto &[start, endOffset] : sortedRanges) {
     if (start >= endOffset) {
       continue;
     }

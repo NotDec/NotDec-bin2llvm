@@ -1303,3 +1303,51 @@ llvm-as + opt verify: passed
 - 实现效果：7/10。修掉了一个明确的 p-code 顺序依赖点，native lowering 入口现在来自 function fact。
 - 理解成本：2/10。只给 lowering config 多传一个入口地址。
 - 维护成本：2/10。普通 p-code 路径保持旧行为，native 路径失败时给出明确错误。
+
+## 实现记录：native range decode 固定按地址顺序
+
+`collectSleighPcodeRanges(...)` 之前按调用方传入的 range 顺序拼接 p-code。native block facts 本身有明确地址，p-code 拼接顺序不应该取决于 discovery / vector 的偶然顺序。
+
+具体改动：
+
+- [SleighLift.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/SleighLift.cpp:6)
+  - 增加 `<algorithm>`。
+- [SleighLift.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/SleighLift.cpp:538)
+  - `collectSleighPcodeRanges(...)` 先复制并按 range start 排序，再逐个 range 调 Sleigh。
+  - 这不改变单个 range 内的指令顺序，只固定多个 native block range 的拼接顺序。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test notdec-native-llvm native_register_summary_test native_register_summary_ssa_test native_analysis_facts_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-range-sort/fortune.ll --summary-json-out /tmp/notdec-fortune-range-sort/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-range-sort-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-range-sort/fortune.ll -o /tmp/notdec-fortune-range-sort/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-range-sort/fortune.bc -o /tmp/notdec-fortune-range-sort/fortune.verify.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-range-sort-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-range-sort-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-range-sort-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-range-sort-raw/fortune-3470-raw.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 8.67s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 109
+final !notdec.register.access residue: 1
+remaining !notdec.register.access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：5/10。只是稳定 p-code range 拼接顺序，但方向上减少了调用方顺序对 lowering 的影响。
+- 理解成本：1/10。局部排序，行为直观。
+- 维护成本：1/10。没有新增状态。
