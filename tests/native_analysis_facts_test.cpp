@@ -390,6 +390,78 @@ bool testFlowNormalizerRemovesInvalidBlockSuccessors(const char *argv0) {
   return ok;
 }
 
+bool testFlowNormalizerSplitsDirectTargetInsideBlock(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base + 0xf0;
+  uint64_t target = entry + 0x02;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = entry + 0x20;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, target + 0x02, {target}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add test function with mid-block target\n";
+    return false;
+  }
+
+  auto branch = makeInstruction(
+      entry, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::UnconditionalBranch);
+  branch.DirectFlowTargets.push_back(target);
+  state.addInstruction(std::move(branch));
+  state.addInstruction(makeInstruction(
+      target, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::Return));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeFunction *normalized = state.functionAt(entry);
+  bool sawSourceBlock = false;
+  bool sawTargetBlock = false;
+  if (normalized != nullptr) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block :
+         normalized->Blocks) {
+      if (block.Start == entry && block.End == target &&
+          block.Successors.size() == 1 && block.Successors.front() == target) {
+        sawSourceBlock = true;
+      }
+      if (block.Start == target && block.End == target + 0x02) {
+        sawTargetBlock = true;
+      }
+    }
+  }
+
+  const notdec::bin2llvm::NativeInstruction *normalizedBranch =
+      state.instructionAt(entry);
+  bool directTargetStayedCfg =
+      normalizedBranch != nullptr &&
+      normalizedBranch->DirectFlowTargets.size() == 1 &&
+      normalizedBranch->DirectFlowTargets.front() == target &&
+      normalizedBranch->TailFlowTargets.empty();
+
+  bool ok = true;
+  ok &= expectTrue(sawSourceBlock,
+                   "source block was not split at direct target");
+  ok &= expectTrue(sawTargetBlock, "direct target block was not created");
+  ok &= expectTrue(directTargetStayedCfg,
+                   "direct target was incorrectly marked as tail");
+  return ok;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -403,5 +475,6 @@ int main(int argc, char **argv) {
   ok &= testFlowNormalizerDoesNotJoinMissingBlocksWithoutFallthrough(argv[0]);
   ok &= testBasicBlockSuccessorsRequireBlockStarts(argv[0]);
   ok &= testFlowNormalizerRemovesInvalidBlockSuccessors(argv[0]);
+  ok &= testFlowNormalizerSplitsDirectTargetInsideBlock(argv[0]);
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

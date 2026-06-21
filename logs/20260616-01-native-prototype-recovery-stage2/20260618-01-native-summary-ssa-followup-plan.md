@@ -3709,3 +3709,66 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：6/10。把 forward successor 的最终收敛点放到 FlowFactNormalizer，facts 层更闭合。
 - 理解成本：2/10。新增一个 state 清理方法，但规则仍然只是 successor 必须指向当前函数 block start。
 - 维护成本：2/10。如果后续支持跨函数 CFG edge，也不应复用普通 block successor。
+
+## 实现记录：direct target 落在 block 中间时先 split
+
+背景：
+
+- 上一节让 `FlowFactNormalizer` 清理最终仍不是 block start 的 successor。
+- 继续检查后发现一个重要前置情况：如果 instruction direct target 落在已有 block 中间，说明当前 block
+  facts 还没按真实跳转目标切开。
+- 这种情况不能直接把 target 清掉或标成 tail；正确处理是先按 direct target split block，再让普通
+  successor 校验继续工作。
+
+实现：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2813)
+  `FlowFactNormalizer` 在清理非法 successor 前，先调用新的 direct-target split 阶段。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2870)
+  新增 `appendDirectTargetSplitBlocks(...)`：
+  - 遍历函数内 instruction facts。
+  - 对每个 `DirectFlowTargets`，如果目标不是 block start 但落在某个 block 内，就生成一个从目标地址
+    开始的新 block。
+  - 新 block 继承原 containing block 的 successors。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3338)
+  `NativeProgramState::addBasicBlock(...)` split 已有 block 时，如果原 block 已经有 successor 指向 split
+  点，就保留这条边；不再只依赖 fallthrough。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:393)
+  增加 `testFlowNormalizerSplitsDirectTargetInsideBlock()`：
+  - 初始 block 覆盖两条指令。
+  - 第一条 direct branch 到第二条地址。
+  - normalizer 应 split 出目标 block，并保留 direct target 为 CFG edge，而不是 tail target。
+
+验证：
+
+```text
+cmake --build build --target native_analysis_facts_test -j$(nproc)
+build/bin/native_analysis_facts_test
+cmake --build build --target pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-split-direct-targets/summary.json \
+  -o /tmp/notdec-fortune-split-direct-targets/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-split-direct-targets/fortune.ll \
+  -o /tmp/notdec-fortune-split-direct-targets/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-split-direct-targets/fortune.bc \
+  -o /tmp/notdec-fortune-split-direct-targets/fortune.verify.bc
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.42 sec`。
+- `!notdec.register.access` 数量为 0。
+- register global store 数量为 0。
+- register global load 数量为 6，仍是 `summary_ssa.entry` load。
+- `br i1 poison`、`ret ... poison`、`store ... ptr poison` 数量为 0。
+
+评分：
+
+- 实现效果：7/10。把 direct branch target 对 block 边界的影响放回 facts 层，避免误归类为 tail。
+- 理解成本：3/10。多了一个 split 阶段，但它直接对应 CFG 基本块切分规则。
+- 维护成本：3/10。后续如果支持更多 computed target recovery，也应先补 block，再写 successor。
