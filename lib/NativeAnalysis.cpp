@@ -3334,6 +3334,23 @@ bool NativeProgramState::addBasicBlockSuccessors(
     return false;
   }
 
+  const NativeFunction &function = iterator->second;
+  auto hasBlockStart = [&](uint64_t address) {
+    for (const NativeBasicBlock &block : function.Blocks) {
+      if (block.Start == address) {
+        return true;
+      }
+    }
+    return false;
+  };
+  if (!successors.empty()) {
+    for (uint64_t successor : successors) {
+      if (!hasBlockStart(successor)) {
+        return false;
+      }
+    }
+  }
+
   for (NativeBasicBlock &block : iterator->second.Blocks) {
     if (block.Start != blockStart) {
       continue;

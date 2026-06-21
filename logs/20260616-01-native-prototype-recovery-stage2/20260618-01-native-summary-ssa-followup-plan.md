@@ -3599,3 +3599,56 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：6/10。把 fallthrough fact 的语义收紧到机器指令真实顺序边，减少 decode 顺序误用。
 - 理解成本：2/10。新增一个统一 helper，消费点更多但规则统一。
 - 维护成本：2/10。没有新增分析状态；如果未来支持 delay slot 或非普通 fallthrough，需要在 helper 里集中扩展。
+
+## 实现记录：block successor 写入必须指向 block start
+
+背景：
+
+- `X86JumpTableAnalyzer` 这类后置 analyzer 会通过 `NativeProgramState::addBasicBlockSuccessors(...)`
+  把恢复出的 CFG 边写回 block facts。
+- 之前这个接口只检查源 block 是否存在，不检查 successor 是否是同一函数内的 block start。
+- 这样如果 analyzer 传入“函数内地址但不是 block start”，错误会拖到 `PcodeToLLVM` lowering 阶段才暴露。
+  当前分层下，更合适的是在 facts 写入边界直接拒绝。
+
+实现：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3329)
+  `NativeProgramState::addBasicBlockSuccessors(...)` 在写入前检查每个 successor 必须是目标函数中已有
+  `NativeBasicBlock::Start`。只要存在非 block-start successor，整个写入失败且不改变 block。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:279)
+  增加 `testBasicBlockSuccessorsRequireBlockStarts()`，构造 successor 落在已有 block 中间的情况，
+  确认不会写入 CFG facts。
+
+验证：
+
+```text
+cmake --build build --target native_analysis_facts_test -j$(nproc)
+build/bin/native_analysis_facts_test
+cmake --build build --target pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-successor-start-facts/summary.json \
+  -o /tmp/notdec-fortune-successor-start-facts/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-successor-start-facts/fortune.ll \
+  -o /tmp/notdec-fortune-successor-start-facts/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-successor-start-facts/fortune.bc \
+  -o /tmp/notdec-fortune-successor-start-facts/fortune.verify.bc
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.54 sec`。
+- `!notdec.register.access` 数量为 0。
+- register global store 数量为 0。
+- register global load 数量为 6，仍是 `summary_ssa.entry` load。
+- `br i1 poison`、`ret ... poison`、`store ... ptr poison` 数量为 0。
+
+评分：
+
+- 实现效果：5/10。不是新恢复能力，但把无效 CFG successor 拦在 facts 层，减少 lowering 兜底压力。
+- 理解成本：1/10。successor 必须是 block start，规则直接。
+- 维护成本：2/10。后续如果要表达跨函数 tail edge，仍应走 tail target / call target，不应写普通 block successor。

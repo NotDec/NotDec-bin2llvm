@@ -276,6 +276,56 @@ bool testFlowNormalizerDoesNotJoinMissingBlocksWithoutFallthrough(
   return ok;
 }
 
+bool testBasicBlockSuccessorsRequireBlockStarts(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base + 0x90;
+  uint64_t successor = entry + 0x10;
+  uint64_t middleOfSuccessor = successor + 0x01;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = entry + 0x30;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, entry + 0x02, {}});
+  function.Blocks.push_back({successor, successor + 0x04, {}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add test function for successor validation\n";
+    return false;
+  }
+
+  bool accepted =
+      state.addBasicBlockSuccessors(entry, entry, {middleOfSuccessor});
+  const notdec::bin2llvm::NativeFunction *normalized = state.functionAt(entry);
+  bool successorWasAdded = false;
+  if (normalized != nullptr) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block :
+         normalized->Blocks) {
+      if (block.Start == entry) {
+        successorWasAdded = !block.Successors.empty();
+      }
+    }
+  }
+
+  bool ok = true;
+  ok &= expectTrue(!accepted,
+                   "non-block-start successor was accepted");
+  ok &= expectTrue(!successorWasAdded,
+                   "non-block-start successor was added");
+  return ok;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -287,5 +337,6 @@ int main(int argc, char **argv) {
   ok &= testFlowNormalizerMovesNonCfgTargetToTail(argv[0]);
   ok &= testFlowNormalizerFillsDecodedBlockHole(argv[0]);
   ok &= testFlowNormalizerDoesNotJoinMissingBlocksWithoutFallthrough(argv[0]);
+  ok &= testBasicBlockSuccessorsRequireBlockStarts(argv[0]);
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
