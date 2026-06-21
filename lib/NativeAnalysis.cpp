@@ -1997,7 +1997,7 @@ private:
             continue;
           }
           addPendingXref(result.Xrefs, seenXrefs, op.Address, *target,
-                         NativeXrefKind::Call, "sleigh-pcode-direct-flow");
+                         NativeXrefKind::Call, "sleigh-pcode-direct-call");
           addUniqueAddress(info.CallTargets, *target);
           addUniqueAddress(info.InternalCallTargets, *target);
         }

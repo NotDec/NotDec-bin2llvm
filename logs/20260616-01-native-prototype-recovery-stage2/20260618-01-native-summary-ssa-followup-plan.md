@@ -2317,3 +2317,58 @@ latest summary IR: /tmp/notdec-fortune-xref-dedup/fortune.ll
 - 实现效果：7/10。xref 噪声明显下降，callgraph / xref 查询更接近 facts 本身。
 - 理解成本：2/10。只是插入前去重。
 - 维护成本：2/10。保留 source 维度，不会把不同来源的证据合并掉。
+
+## 已完成：direct CALL xref source 与 flow 区分
+
+xref 去重后继续看 `callgraph-json`，发现直接 CALL 的 xref kind 已经是
+`call`，但 source 仍写成 `sleigh-pcode-direct-flow`。这会让调用边和普通
+BRANCH/CBRANCH 边在 source 上混在一起，不利于后续基于 facts 的判断。
+
+这次只改 direct CALL 的 source 名：
+
+- direct CALL: `sleigh-pcode-direct-call`
+- direct BRANCH/CBRANCH: 继续使用 `sleigh-pcode-direct-flow`
+- PLT call、GOT indirect call 的 source 不变。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2000)
+  - `collectDirectControlFlow(...)` 在 `PcodeOpcode::Call` 且非 PLT 的路径里，
+    把 xref source 从 `sleigh-pcode-direct-flow` 改为
+    `sleigh-pcode-direct-call`。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target notdec-native-discover notdec-native-llvm native_analysis_facts_test pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --xrefs-kind-json call /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --no-register-ssa-pass --no-instcombine-pass -o /tmp/notdec-fortune-raw-direct-call-source/fortune.raw.ll --summary-json-out /tmp/notdec-fortune-raw-direct-call-source/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-raw-direct-call-source/fortune.raw.ll -o /tmp/notdec-fortune-raw-direct-call-source/fortune.raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-raw-direct-call-source/fortune.raw.bc -o /tmp/notdec-fortune-raw-direct-call-source/fortune.raw.verify.bc
+/usr/bin/time -f 'elapsed=%e' /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-direct-call-source/fortune.ll --summary-json-out /tmp/notdec-fortune-direct-call-source/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-direct-call-source/fortune.ll -o /tmp/notdec-fortune-direct-call-source/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-direct-call-source/fortune.bc -o /tmp/notdec-fortune-direct-call-source/fortune.verify.bc
+```
+
+结果：
+
+```text
+native tests: passed
+fortune unresolved flow count: 0
+fortune native pipeline: 10.10s
+raw IR verify: passed
+summary IR verify: passed
+latest raw IR: /tmp/notdec-fortune-raw-direct-call-source/fortune.raw.ll
+latest summary IR: /tmp/notdec-fortune-direct-call-source/fortune.ll
+```
+
+复杂度评估：
+
+- 实现效果：5/10。行为不变，但 call/flow facts 更清楚。
+- 理解成本：1/10。只改 source 字符串。
+- 维护成本：1/10。source 语义更明确。
