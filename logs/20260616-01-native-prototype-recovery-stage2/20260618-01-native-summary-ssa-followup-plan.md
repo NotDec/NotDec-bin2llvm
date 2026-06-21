@@ -4339,3 +4339,61 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -
 - `fortune` unresolved 仍是 `0`。
 - `fortune` 完整链路通过 `llvm-as` 和 `opt -passes=verify`，耗时约 `10.54 sec`。
 - `fortune` 输出里 `@notdec_native_load` / `@notdec_native_store` 都是 `0`。
+
+## 实现记录：修复 CFG 回溯基址，收掉 redis-cli 一个 PIC jump table
+
+`redis-cli` 里 `hi_sdscatfmt` 的 `0x394ee` 是 PIC i32 jump table：
+
+```text
+MOVZX EDX,byte ptr [RBX + -0x1]
+MOV EAX,EDX
+AND EAX,0x7
+CMP AL,0x4
+MOVZX EAX,AL
+MOVSXD RAX,dword ptr [R13 + RAX*0x4]
+ADD RAX,R13
+JMP RAX
+```
+
+这里 `R13` 的 table base 在较早的 block 里通过 `LEA R13,[0x54840]`
+设置。按地址线性往回扫会先碰到另一条路径上的 `POP R13`，所以之前找不到
+base，jump table 没有恢复。
+
+本次改动：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1451)
+  - 新增 `LeaBaseBlockScan`，区分“当前 block 没找到 base”和“寄存器已经被写死”。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1480)
+  - `findNearestLeaBaseInFunctionCFGFromBlock()` 不再随便选地址最大的前驱。
+  - 改成沿 CFG 前驱回溯；多个前驱如果能找到 base，必须一致；找不到 base 的前驱不直接否决。
+  - 增加本次查询内的 block memo，避免 `redis-cli` 这类大函数上重复 DFS。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1787)
+  - 保留前一轮补的 `AND reg,imm` 上界识别，用来处理 `AND EAX,0x7` 这种 masked index。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2154)
+  - `matchX86PicI32OffsetDispatch()` 在线性 `LEA` 查找失败后，继续走 CFG base 回溯。
+
+验证：
+
+```text
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-decode-cfg-base/fortune.ll --summary-json-out /tmp/notdec-fortune-decode-cfg-base/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-decode-cfg-base/fortune.ll -o /tmp/notdec-fortune-decode-cfg-base/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-decode-cfg-base/fortune.bc -o /tmp/notdec-fortune-decode-cfg-base/fortune.verify.bc
+```
+
+结果：
+
+- `redis-cli` unresolved 从 `136` 降到 `134`。
+- `0x394ee` 不再 unresolved。
+- 剩余 indirect branch 是 `0x3e7b0`、`0x17ebd`、`0x3e800`，仍按函数指针 tail jump 暂时保留。
+- `redis-cli` discovery 耗时 `18.02 sec`，没有保留第一次无 memo 版本的明显性能退化。
+- `fortune` unresolved 仍是 `0`。
+- `fortune` 完整链路通过 `llvm-as` 和 `opt -passes=verify`，耗时 `10.47 sec`。
+- 实现效果：7/10。收掉一个真实 PIC jump table，剩下的 indirect branch 暂时不是同一类问题。
+- 理解成本：4/10。CFG 回溯比原来多一点状态，但限定在 `LEA` base 查询里。
+- 维护成本：3/10。后续如果继续补 jump table，仍应放在 facts 层，不动 lowering。

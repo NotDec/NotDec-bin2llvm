@@ -1448,7 +1448,15 @@ functionPredecessorBlocks(const NativeFunction &function, uint64_t blockStart) {
   return predecessors;
 }
 
-std::optional<uint64_t> findNearestLeaBaseInBlockRange(
+// Result of scanning one block backwards for an absolute LEA base.
+// "Killed" means the register was overwritten before a matching LEA was found;
+// callers must not keep walking predecessors through that path.
+struct LeaBaseBlockScan {
+  std::optional<uint64_t> Base;
+  bool Killed = false;
+};
+
+LeaBaseBlockScan findNearestLeaBaseInBlockRange(
     const NativeProgramState &state, const NativeBasicBlock &block,
     uint64_t beforeAddress, const std::string &reg) {
   std::vector<const NativeInstruction *> instructions =
@@ -1458,47 +1466,92 @@ std::optional<uint64_t> findNearestLeaBaseInBlockRange(
        ++iterator) {
     const std::string &text = (*iterator)->Mnemonic;
     if (text.rfind(prefix, 0) == 0 && !text.empty() && text.back() == ']') {
-      return parseHex(text.substr(prefix.size(),
-                                  text.size() - prefix.size() - 1));
+      return {parseHex(text.substr(prefix.size(),
+                                   text.size() - prefix.size() - 1)),
+              false};
     }
     if (writesRegister(text, reg)) {
-      return std::nullopt;
+      return {std::nullopt, true};
     }
   }
-  return std::nullopt;
+  return {};
 }
 
-// Linear address order misses wrappers where a later block initializes a base
-// register and then jumps back into a tail-call block.  Follow only a unique
-// predecessor chain so we do not guess through CFG merges.
+// Linear address order can cross unrelated blocks and hit a later clobber of
+// the base register.  Walk CFG predecessors instead; accept recovered bases
+// only when the predecessor paths that do find a base agree on one value.
 std::optional<uint64_t> findNearestLeaBaseInFunctionCFGFromBlock(
     const NativeProgramState &state, const NativeFunction &function,
     const NativeBasicBlock &block,
     uint64_t beforeAddress, const std::string &reg,
-    std::set<uint64_t> visitedBlocks) {
-  uint64_t scanEnd = beforeAddress < block.End ? beforeAddress : block.End;
-  if (auto base = findNearestLeaBaseInBlockRange(state, block, scanEnd, reg)) {
-    return base;
+    std::set<uint64_t> &visitingBlocks,
+    std::map<uint64_t, std::optional<uint64_t>> &memo) {
+  const bool fullBlockScan = beforeAddress >= block.End;
+  if (fullBlockScan) {
+    auto memoIterator = memo.find(block.Start);
+    if (memoIterator != memo.end()) {
+      return memoIterator->second;
+    }
   }
 
-  if (!visitedBlocks.insert(block.Start).second) {
+  uint64_t scanEnd = beforeAddress < block.End ? beforeAddress : block.End;
+  LeaBaseBlockScan scan =
+      findNearestLeaBaseInBlockRange(state, block, scanEnd, reg);
+  if (scan.Base || scan.Killed) {
+    if (fullBlockScan) {
+      memo[block.Start] = scan.Base;
+    }
+    return scan.Base;
+  }
+
+  if (!visitingBlocks.insert(block.Start).second) {
     return std::nullopt;
   }
 
   std::vector<const NativeBasicBlock *> predecessors =
       functionPredecessorBlocks(function, block.Start);
   if (predecessors.empty()) {
+    visitingBlocks.erase(block.Start);
+    if (fullBlockScan) {
+      memo[block.Start] = std::nullopt;
+    }
     return std::nullopt;
   }
 
-  const NativeBasicBlock *predecessor = predecessors.front();
-  for (const NativeBasicBlock *candidate : predecessors) {
-    if (candidate->Start > predecessor->Start) {
-      predecessor = candidate;
+  std::optional<uint64_t> commonBase;
+  bool sawBase = false;
+  for (const NativeBasicBlock *predecessor : predecessors) {
+    std::optional<uint64_t> predecessorBase =
+        findNearestLeaBaseInFunctionCFGFromBlock(
+            state, function, *predecessor, predecessor->End, reg,
+            visitingBlocks, memo);
+    if (!predecessorBase) {
+      continue;
+    }
+    sawBase = true;
+    if (!commonBase) {
+      commonBase = predecessorBase;
+      continue;
+    }
+    if (*commonBase != *predecessorBase) {
+      visitingBlocks.erase(block.Start);
+      if (fullBlockScan) {
+        memo[block.Start] = std::nullopt;
+      }
+      return std::nullopt;
     }
   }
-  return findNearestLeaBaseInFunctionCFGFromBlock(
-      state, function, *predecessor, predecessor->End, reg, visitedBlocks);
+  visitingBlocks.erase(block.Start);
+  if (!sawBase) {
+    if (fullBlockScan) {
+      memo[block.Start] = std::nullopt;
+    }
+    return std::nullopt;
+  }
+  if (fullBlockScan) {
+    memo[block.Start] = commonBase;
+  }
+  return commonBase;
 }
 
 std::optional<uint64_t> findNearestLeaBaseInFunctionCFG(
@@ -1509,8 +1562,9 @@ std::optional<uint64_t> findNearestLeaBaseInFunctionCFG(
   if (block == nullptr) {
     return std::nullopt;
   }
+  std::map<uint64_t, std::optional<uint64_t>> memo;
   return findNearestLeaBaseInFunctionCFGFromBlock(
-      state, function, *block, beforeAddress, reg, visitedBlocks);
+      state, function, *block, beforeAddress, reg, visitedBlocks, memo);
 }
 
 std::optional<uint64_t> parseX86LeaAbsoluteBase(const std::string &text,
@@ -1730,6 +1784,29 @@ parseX86MovRegReg(const std::string &text, const std::string &mnemonic) {
   return std::make_pair(std::move(dest), std::move(src));
 }
 
+std::optional<std::pair<std::string, uint64_t>>
+parseX86RegImmediate(const std::string &text, const std::string &mnemonic) {
+  const std::string prefix = mnemonic + " ";
+  if (text.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  size_t comma = text.find(',', prefix.size());
+  if (comma == std::string::npos || comma + 1 >= text.size()) {
+    return std::nullopt;
+  }
+  std::string reg = text.substr(prefix.size(), comma - prefix.size());
+  if (reg.empty() || reg.find('[') != std::string::npos ||
+      reg.find(' ') != std::string::npos) {
+    return std::nullopt;
+  }
+  std::optional<uint64_t> value =
+      parseUnsignedNumber(trimAsciiWhitespace(text.substr(comma + 1)));
+  if (!value) {
+    return std::nullopt;
+  }
+  return std::make_pair(std::move(reg), *value);
+}
+
 std::optional<uint64_t>
 findNearestUpperBound(const NativeProgramState &state,
                       const NativeFunction &function, uint64_t beforeAddress,
@@ -1745,7 +1822,7 @@ findNearestUpperBound(const NativeProgramState &state,
   std::vector<const NativeInstruction *> window;
   uint64_t scanned = 0;
   for (auto iterator = instructions.rbegin();
-       iterator != instructions.rend() && scanned < 64; ++iterator, ++scanned) {
+       iterator != instructions.rend() && scanned < 256; ++iterator, ++scanned) {
     window.push_back(*iterator);
   }
 
@@ -1764,6 +1841,11 @@ findNearestUpperBound(const NativeProgramState &state,
   for (const NativeInstruction *instruction : window) {
     const std::string &text = instruction->Mnemonic;
     for (const std::string &compareReg : compareRegs) {
+      std::optional<std::pair<std::string, uint64_t>> andMask =
+          parseX86RegImmediate(text, "AND");
+      if (andMask && andMask->first == compareReg && andMask->second < 256) {
+        return andMask->second + 1;
+      }
       const std::string prefix = "CMP " + compareReg + ",0x";
       if (text.rfind(prefix, 0) == 0) {
         std::optional<uint64_t> maxIndex = parseHex(text.substr(prefix.size()));
@@ -2071,6 +2153,11 @@ matchX86PicI32OffsetDispatch(const NativeProgramState &state,
 
   std::optional<uint64_t> tableBase =
       findNearestLeaBase(state, function, branchAddress, pattern->BaseReg);
+  if (!tableBase) {
+    std::set<uint64_t> visitedBlocks;
+    tableBase = findNearestLeaBaseInFunctionCFG(
+        state, function, branchAddress, pattern->BaseReg, visitedBlocks);
+  }
   std::optional<uint64_t> entryCount =
       findNearestUpperBound(state, function, branchAddress, pattern->IndexReg);
   if (!tableBase || !entryCount || *entryCount == 0 || *entryCount > 256) {
