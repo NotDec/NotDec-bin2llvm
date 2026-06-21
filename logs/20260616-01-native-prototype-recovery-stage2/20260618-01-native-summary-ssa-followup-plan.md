@@ -2814,3 +2814,64 @@ true successor 0x38cd`。tail branch 仍需要 PLT、已知函数入口、thunk 
 - 理解成本：3/10。`addBasicBlock(...)` 多了一个小 helper，但它直接表达“拆块必须有
   fallthrough 证据”。
 - 维护成本：2/10。后续新增 flow analyzer 仍然只需要维护 instruction facts，block facts 从这些事实导出。
+
+## 已完成：已知函数末尾不再生成续解码 fallthrough
+
+上一轮 consistency 检查后还剩 15 个 extra instruction edges。抽查其中一个：
+
+```text
+0x2815: MOV RDI,qword ptr [RBX + 0x20]
+0x2819: CALL 0x27a0
+```
+
+`0x2815` 的 eh-frame seed 范围正好到 `0x281e`。旧逻辑看到 decode 撞到 byte limit，
+就把 `0x281e` 当成下一段 fallthrough 写进 instruction fact；但 `0x281e` 已经是已知
+函数末尾，不是可执行 successor，block CFG 后面又把它按范围过滤掉了。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1984)
+  - `fallthroughTargetForDecodedWindow(...)` 增加 seed 边界检查：如果 `rangeEnd` 等于已知
+    seed 的 `RangeEnd`，不生成续解码 fallthrough。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-seed-end-fallthrough/summary.json -o /tmp/notdec-fortune-seed-end-fallthrough/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-seed-end-fallthrough/fortune.ll -o /tmp/notdec-fortune-seed-end-fallthrough/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-seed-end-fallthrough/fortune.bc -o /tmp/notdec-fortune-seed-end-fallthrough/fortune.verified.bc
+```
+
+fortune 结果：
+
+```text
+function_seeds: 26
+confirmed_functions: 26
+basic_blocks: 1013
+instructions: 2602
+xrefs total: 868
+unresolved_indirect_flows: 0
+native pipeline: 10.16s
+```
+
+一致性检查：
+
+```text
+missing_from_instruction_facts: 0
+extra_instruction_edges: 10
+```
+
+剩余 10 个 extra 主要是跨函数或跨范围的 instruction edge，例如 `0x27bb: JMP 0x38cd`。
+这类不是 seed 末尾 fallthrough 问题，后续应该在函数确认后做一轮 post-analysis facts
+归一化，不能在 seed decode 阶段只靠当前已知函数表判断。
+
+复杂度评估：
+
+- 实现效果：6/10。消除了函数末尾假 fallthrough，fortune 指标稳定。
+- 理解成本：1/10。只是在已有 fallthrough 判断里加已知 seed 末尾检查。
+- 维护成本：1/10。规则直接对应 eh-frame/symbol range 的边界语义。

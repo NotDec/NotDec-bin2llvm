@@ -1981,6 +1981,14 @@ private:
         isKnownOtherFunctionEntry(state, entry, rangeEnd)) {
       return std::nullopt;
     }
+    auto seedIterator = state.functionSeeds().find(entry);
+    if (seedIterator != state.functionSeeds().end()) {
+      const NativeFunctionSeed &seed = seedIterator->second;
+      if (seed.RangeStart != 0 && seed.RangeEnd > seed.RangeStart &&
+          rangeEnd == seed.RangeEnd) {
+        return std::nullopt;
+      }
+    }
     bool hitInstructionLimit = instructions.size() == MaxInstructionsPerSeed;
     bool hitByteLimit = rangeEnd == rangeStart + decodeBytes;
     if (!hitInstructionLimit && !hitByteLimit) {
