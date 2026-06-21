@@ -794,3 +794,55 @@ llvm-as + opt verify: passed
 - 实现效果：7/10。CFG 行为不变，但 instruction facts 更清晰，后续可以继续让 lowering 更少依赖 pcode 顺序。
 - 理解成本：3/10。新增几个字段，但含义直接，对照 Ghidra instruction flow/fallthrough 模型更容易解释。
 - 维护成本：3/10。当前字段只在 discovery 内使用，后续如果输出 JSON 或给 lowering 直接用，需要保持语义一致。
+
+## 实现记录：native lowering 直接消费 native CFG
+
+这次在前一轮 instruction flow facts 的基础上，继续收紧 lower 层对 pcode 顺序的依赖。
+
+核心判断：
+
+- 当 `PcodeLoweringConfig.BlockSuccessors` 非空时，说明这次是 native 链路的 lowering，CFG 应该优先信任 native discovery 的 block facts。
+- 只有在没有 native CFG 的通用 pcode 路径里，才保留旧的顺序 fallback。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:112)
+  - 增加 `usesNativeCfg()`，把 native lowering 和通用 pcode lowering 分开。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:219)
+  - `buildBasicBlocks(...)` 在 native 模式下不再因为 terminator 自动把 `index + 1` 加进 block starts，避免继续用 pcode 顺序猜块边界。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:243)
+  - `nativeFallthroughBlock(...)` 在 native 模式下只认 `Config.BlockSuccessors`，没有对应信息就返回空，不回退到顺序 next block。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:256)
+  - `nativeConditionalFalseBlock(...)` 在 native 模式下只从 `Config.BlockSuccessors` 里找 false edge，不再猜顺序 fallthrough。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:376)
+  - `CBRANCH` 的 false edge 如果 native CFG 找不到，就落到 `notdec_exit`，不再悄悄接到顺序块。
+
+验证：
+
+```text
+cmake --build build --target notdec-native-llvm native_register_summary_test native_register_summary_ssa_test -j4
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/fortune-nativecfg-raw.ll
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-nativecfg/fortune.ll --summary-json-out /tmp/notdec-fortune-nativecfg/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-nativecfg/fortune.ll -o /tmp/notdec-fortune-nativecfg/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-nativecfg/fortune.bc -o /tmp/notdec-fortune-nativecfg/fortune.verified.bc
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+```
+
+结果：
+
+```text
+fortune native pipeline: 12.71s
+confirmed_functions: 25
+basic_blocks: 2369
+instructions: 2908
+fortune still passes llvm-as + opt -passes=verify
+final !notdec.register.access residue: 1
+remaining register access: FS_OFFSET only
+```
+
+复杂度评估：
+
+- 实现效果：8/10。native CFG 现在更明确地作为 lowering 权威，减少了 pcode 顺序带来的误判机会。
+- 理解成本：3/10。只是把 native / generic 两条路径分开了。
+- 维护成本：3/10。fallback 还保留在非 native 路径里，后续如果要彻底统一，还可以再把 block facts 往前收。

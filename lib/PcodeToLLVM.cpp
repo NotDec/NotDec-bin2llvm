@@ -112,6 +112,8 @@ public:
   }
 
 private:
+  bool usesNativeCfg() const { return !Config.BlockSuccessors.empty(); }
+
   static bool isTerminator(PcodeOpcode opcode) {
     return opcode == PcodeOpcode::Branch ||
            opcode == PcodeOpcode::BranchInd ||
@@ -217,7 +219,8 @@ private:
         }
       }
 
-      if (isTerminator(op.Opcode) && index + 1 < program.Ops.size()) {
+      if (!usesNativeCfg() && isTerminator(op.Opcode) &&
+          index + 1 < program.Ops.size()) {
         starts.insert(index + 1);
       }
     }
@@ -245,7 +248,7 @@ private:
         (*CurrentProgramOps)[BlockStarts[blockIndex]].Address;
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
-      return nextBlock(blockIndex);
+      return usesNativeCfg() ? nullptr : nextBlock(blockIndex);
     }
     if (successorIt->second.size() != 1) {
       return nullptr;
@@ -260,7 +263,7 @@ private:
         (*CurrentProgramOps)[BlockStarts[blockIndex]].Address;
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
-      return fallback;
+      return usesNativeCfg() ? nullptr : fallback;
     }
 
     // SLEIGH CBRANCH only records the taken target.  Native discovery already
@@ -271,7 +274,7 @@ private:
         return blockForTarget(successor);
       }
     }
-    return fallback;
+    return usesNativeCfg() ? nullptr : fallback;
   }
 
   llvm::BasicBlock *blockForTarget(uint64_t address) {
@@ -373,8 +376,9 @@ private:
       }
       llvm::BasicBlock *falseBlock = fallthrough ? fallthrough : exitBlock();
       if (trueAddress) {
-        falseBlock =
+        llvm::BasicBlock *nativeFalseBlock =
             nativeConditionalFalseBlock(blockIndex, *trueAddress, falseBlock);
+        falseBlock = nativeFalseBlock != nullptr ? nativeFalseBlock : exitBlock();
       }
       Builder.CreateCondBr(asCondition(read(op.Inputs[1])), trueBlock,
                            falseBlock);
