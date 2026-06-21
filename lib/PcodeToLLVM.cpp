@@ -460,11 +460,33 @@ private:
     // SLEIGH CBRANCH only records the taken target.  Native discovery already
     // knows the machine-level false edge, which is safer than assuming the next
     // p-code block is the fallthrough for sparse or out-of-order ranges.
+    bool sawTrueTarget = !nativeRangesCoverAddress(trueTarget);
+    std::optional<uint64_t> falseTarget;
     for (uint64_t successor : successorIt->second) {
-      if (successor != trueTarget) {
-        result = blockForNativeTarget(successor, errorMessage);
-        return result != nullptr;
+      if (successor == trueTarget) {
+        sawTrueTarget = true;
+        continue;
       }
+      if (falseTarget) {
+        std::ostringstream os;
+        os << "native conditional block 0x" << std::hex << blockAddress
+           << " has multiple false successors";
+        errorMessage = os.str();
+        return false;
+      }
+      falseTarget = successor;
+    }
+
+    if (!sawTrueTarget) {
+      std::ostringstream os;
+      os << "native conditional block 0x" << std::hex << blockAddress
+         << " is missing true successor 0x" << trueTarget;
+      errorMessage = os.str();
+      return false;
+    }
+    if (falseTarget) {
+      result = blockForNativeTarget(*falseTarget, errorMessage);
+      return result != nullptr;
     }
     result = usesNativeCfg() ? nullptr : fallback;
     return true;

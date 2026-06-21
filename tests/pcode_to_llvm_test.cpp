@@ -466,6 +466,103 @@ bool testNativeMultipleSuccessorsRequireTerminator() {
                 "missing native terminator error was not reported");
 }
 
+bool testNativeConditionalSuccessorsRequireTrueTarget() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(cbranchOp(0x1000, 0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_conditional_missing_true";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockRanges.emplace(0x3000, 0x3001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x3000});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native conditional without true successor should fail") &&
+         expect(errorMessage.find("missing true successor") !=
+                    std::string::npos,
+                "missing true successor error was not reported");
+}
+
+bool testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(cbranchOp(0x1000, 0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_conditional_outside_true";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x3000, 0x3001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x3000});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  llvm::Function *callee = module->getFunction("notdec_native_2000");
+  if (!expect(function != nullptr,
+              "outside true conditional function is missing") ||
+      !expect(callee != nullptr, "outside true conditional callee is missing")) {
+    return false;
+  }
+
+  bool hasTailCall = false;
+  bool hasFalseTarget = false;
+  for (llvm::BasicBlock &block : *function) {
+    hasFalseTarget |= block.getName() == "bb_3000";
+    for (llvm::Instruction &inst : block) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      hasTailCall |= call != nullptr && call->getCalledFunction() == callee &&
+                     call->isTailCall();
+    }
+  }
+
+  return expect(hasTailCall,
+                "outside true conditional did not emit tail call") &&
+         expect(hasFalseTarget,
+                "outside true conditional did not keep false successor") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after outside true conditional");
+}
+
+bool testNativeConditionalSuccessorsRejectMultipleFalseTargets() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(cbranchOp(0x1000, 0x2000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_conditional_multiple_false";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x2000, 0x2001);
+  config.BlockRanges.emplace(0x3000, 0x3001);
+  config.BlockRanges.emplace(0x4000, 0x4001);
+  config.BlockSuccessors.emplace(
+      0x1000, std::vector<uint64_t>{0x2000, 0x3000, 0x4000});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native conditional with multiple false successors should "
+                "fail") &&
+         expect(errorMessage.find("multiple false successors") !=
+                    std::string::npos,
+                "multiple false successor error was not reported");
+}
+
 } // namespace
 
 int main() {
@@ -481,5 +578,8 @@ int main() {
   ok &= testNativeEntryAddressCanTargetEmptyBlock();
   ok &= testNativeSuccessorRequiresKnownBlock();
   ok &= testNativeMultipleSuccessorsRequireTerminator();
+  ok &= testNativeConditionalSuccessorsRequireTrueTarget();
+  ok &= testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor();
+  ok &= testNativeConditionalSuccessorsRejectMultipleFalseTargets();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

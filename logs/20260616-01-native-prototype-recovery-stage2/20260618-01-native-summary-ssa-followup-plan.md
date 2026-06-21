@@ -1549,3 +1549,62 @@ llvm-as + opt verify: passed
 - 实现效果：5/10。只收紧一个错误兜底，但能防止多分支 CFG 被误降成函数出口。
 - 理解成本：1/10。规则直接对应 native successor 数量。
 - 维护成本：1/10。没有新增状态。
+
+## 实现记录：校验 native conditional successor facts
+
+`CBRANCH` 的 p-code 只给 taken target，false edge 要靠 native `BlockSuccessors`。之前 `nativeConditionalFalseBlock(...)` 会从 successor 列表里拿第一个不等于 true target 的地址。如果 block facts 里漏了 true target，或者有多个 false 候选，lowering 会悄悄选错。
+
+这次把规则收紧：
+
+- true target 在当前函数 ranges 内时，`BlockSuccessors` 必须包含它。
+- true target 跳出当前函数 ranges 时，允许 `BlockSuccessors` 只记录当前函数内 false edge；`fortune` 里 `0x3470` 的 `0x3930 -> 0x27b2` 就是这种跨 chunk conditional tail path。
+- false successor 最多只能有一个。
+
+具体改动：
+
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:448)
+  - `nativeConditionalFalseBlock(...)` 校验 true target 是否在 successor facts 中。
+  - 对当前 ranges 外 true target 放宽，因为它会被 lower 成 tail-call block。
+  - 多个 false successor 直接报错。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:469)
+  - 增加 true successor 缺失时报错测试。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:493)
+  - 增加 true target 跳出当前 ranges 时允许只有 false successor 的测试。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:539)
+  - 增加多个 false successor 报错测试。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test notdec-native-llvm native_register_summary_test native_register_summary_ssa_test native_analysis_facts_test -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-strict-cbranch/fortune.ll --summary-json-out /tmp/notdec-fortune-strict-cbranch/summary.json
+/tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune -f 0x3470 --no-register-ssa-pass --no-prototype-recovery-pass --no-instcombine-pass -o /tmp/notdec-fortune-strict-cbranch-raw/fortune-3470-raw.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-strict-cbranch/fortune.ll -o /tmp/notdec-fortune-strict-cbranch/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-strict-cbranch/fortune.bc -o /tmp/notdec-fortune-strict-cbranch/fortune.verify.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-strict-cbranch-raw/fortune-3470-raw.ll -o /tmp/notdec-fortune-strict-cbranch-raw/fortune-3470-raw.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-strict-cbranch-raw/fortune-3470-raw.bc -o /tmp/notdec-fortune-strict-cbranch-raw/fortune-3470-raw.verify.bc
+```
+
+结果：
+
+```text
+fortune native pipeline: about 9.40s
+confirmed_functions: 25
+basic_blocks: 1022
+instructions: 2574
+sleigh-direct-call seeds: 109
+final !notdec.register.access residue: 1
+remaining !notdec.register.access: FS_OFFSET only
+stores to register globals: 0
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：6/10。减少了 conditional false edge 的猜测，避免 successor facts 不一致时静默错连。
+- 理解成本：2/10。多了一个跨 ranges true target 例外，但它对应当前 tail-call lowering 规则。
+- 维护成本：2/10。仍局限在 PcodeToLLVM native lowering 内。
