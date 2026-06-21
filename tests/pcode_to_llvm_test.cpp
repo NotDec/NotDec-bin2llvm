@@ -787,6 +787,33 @@ bool testNativeInternalConditionalKeepsSkippedPcode() {
                 "module failed verifier after internal conditional lowering");
 }
 
+bool testNativeInternalConditionalRequiresTrueSuccessorFact() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(cbranchOp(0x1000, 0x1001));
+  program.Ops.push_back(copyFromUnknownUniqueOp(0x1000));
+  program.Ops.push_back(returnOp(0x1001));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_internal_conditional_missing_true";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockRanges.emplace(0x1001, 0x1002);
+  config.BlockSuccessors.emplace(0x1001, std::vector<uint64_t>{});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  return expect(module == nullptr,
+                "native internal conditional without true successor fact "
+                "should fail") &&
+         expect(errorMessage.find("missing successor facts") !=
+                    std::string::npos,
+                "missing internal conditional true successor facts error was "
+                "not reported");
+}
+
 bool testNativeConditionalSuccessorsRejectMultipleFalseTargets() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -944,6 +971,7 @@ int main() {
   ok &= testNativeConditionalRequiresSuccessorFacts();
   ok &= testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor();
   ok &= testNativeInternalConditionalKeepsSkippedPcode();
+  ok &= testNativeInternalConditionalRequiresTrueSuccessorFact();
   ok &= testNativeConditionalSuccessorsRejectMultipleFalseTargets();
   ok &= testNativeIndirectBranchCanUseSingleSuccessor();
   ok &= testNativeIndirectBranchRequiresSuccessorFacts();

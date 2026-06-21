@@ -747,6 +747,16 @@ private:
     return false;
   }
 
+  bool nativeConditionalTrueTarget(size_t blockIndex, uint64_t target,
+                                   llvm::BasicBlock *targetBlock,
+                                   std::string &errorMessage) {
+    if (!usesNativeCfg() || !nativeRangesCoverAddress(target)) {
+      return true;
+    }
+    return nativeDirectBranchTarget(blockIndex, target, targetBlock,
+                                    errorMessage);
+  }
+
   llvm::BasicBlock *
   tailJumpBlockForKnownFunction(uint64_t address,
                                 const std::string &calleeName) {
@@ -905,6 +915,10 @@ private:
       if (trueAddress) {
         if (llvm::BasicBlock *internalContinuation =
                 internalPcodeContinuation(blockIndex, opIndex)) {
+          if (!nativeConditionalTrueTarget(blockIndex, *trueAddress, trueBlock,
+                                           errorMessage)) {
+            return false;
+          }
           falseBlock = internalContinuation;
         } else {
           llvm::BasicBlock *nativeFalseBlock = nullptr;

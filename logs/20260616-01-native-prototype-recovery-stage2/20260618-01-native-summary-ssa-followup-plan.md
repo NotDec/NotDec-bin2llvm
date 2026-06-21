@@ -3335,3 +3335,76 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：8/10。relative branch 不再靠 p-code op 顺序偷连 native CFG。
 - 理解成本：2/10。复用上一节的 `nativeDirectBranchTarget(...)`。
 - 维护成本：3/10。仍保留 internal p-code target 豁免，风险集中且可测试。
+
+## 实现记录：CBRANCH internal continuation 也校验 true successor
+
+背景：
+
+- 继续检查 `CBRANCH` lowering 后，发现 direct/relative true target 正常路径会经过
+  `nativeConditionalFalseBlock(...)`，从而校验 `BlockSuccessors`。
+- 但如果同一条指令存在 internal p-code continuation，代码会直接设置 false edge 为 internal
+  continuation，并跳过 `nativeConditionalFalseBlock(...)`。这样 true target 是 covered native block
+  时，也可能绕过 successor fact 校验。
+- 这在 CMOV 这类指令上尤其重要：false path 是同指令内部 p-code block，但 true path 仍然可能是
+  机器级 fallthrough block，必须由 native block facts 证明。
+
+实现：
+
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:747)
+  增加 `nativeConditionalTrueTarget(...)`。如果 true target 不在 native ranges 内，保留已有
+  external tail branch 行为；如果在 ranges 内，则复用 `nativeDirectBranchTarget(...)` 校验 successor
+  facts。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:915)
+  `CBRANCH` 在使用 `internalPcodeContinuation(...)` 作为 false edge 前，也校验 true target。
+- [tests/pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:790)
+  增加 `testNativeInternalConditionalRequiresTrueSuccessorFact()`，覆盖 internal continuation 存在时
+  缺少 true successor fact 的负例。
+
+同时修复：
+
+- fortune `--no-instcombine-pass` 复测时又暴露出 summary rewrite 的返回值缓存问题：
+  `FunctionReturns` 里可能保存了旧函数外的 instruction，例如 `%RAX.ret`，最终新函数 `ret` 引用
+  其他函数的 instruction。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1708)
+  增加 `localizeReturnValue(...)`。返回值如果是 foreign argument，按已有逻辑 remap；如果是
+  foreign instruction，则在当前 ret 前生成 frozen unknown。
+- [lib/passes/summary/NativeRegisterSummarySSA.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/passes/summary/NativeRegisterSummarySSA.cpp:1792)
+  `rewriteInternalFunctionBody(...)` 构造新 return 前调用 `localizeReturnValue(...)`。
+- [tests/native_register_summary_ssa_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_register_summary_ssa_test.cpp:694)
+  扩展 moved body 测试，同时检查不能留下 foreign instruction operand。
+
+验证：
+
+```text
+cmake --build build -j$(nproc)
+build/bin/pcode_to_llvm_test
+build/bin/native_analysis_facts_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-strict-cbranch/summary.json \
+  -o /tmp/notdec-fortune-strict-cbranch/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-strict-cbranch/fortune.ll \
+  -o /tmp/notdec-fortune-strict-cbranch/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-strict-cbranch/fortune.bc \
+  -o /tmp/notdec-fortune-strict-cbranch/fortune.verified.bc
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --no-instcombine-pass \
+  --summary-json-out /tmp/notdec-fortune-strict-cbranch-noinst/summary.json \
+  -o /tmp/notdec-fortune-strict-cbranch-noinst/fortune.ll
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.48 sec`。
+- fortune `--no-instcombine-pass` 通过 `llvm-as` 和 verifier，耗时 `9.16 sec`。
+- 默认输出中 `br i1 poison`、`ret ... poison`、`store ... ptr poison` 仍为 0。
+
+评分：
+
+- 实现效果：8/10。CBRANCH internal continuation 不再绕过 true successor fact；no-instcombine
+  调试模式继续保持可验证。
+- 理解成本：4/10。同时碰到 lowering 和 summary rewrite 两处，但两处都是局部兜底。
+- 维护成本：3/10。CBRANCH 复用已有 successor 校验；foreign instruction 直接降级为 frozen unknown。

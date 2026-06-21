@@ -1705,6 +1705,22 @@ void replaceForeignArgumentsInBody(llvm::Function &function) {
   }
 }
 
+llvm::Value *localizeReturnValue(llvm::Function &function,
+                                 llvm::ReturnInst &insertBefore,
+                                 llvm::Value *value) {
+  auto *argument = llvm::dyn_cast<llvm::Argument>(value);
+  if (argument != nullptr && argument->getParent() != &function) {
+    std::map<llvm::Type *, llvm::Value *> unknownByType;
+    return foreignArgumentReplacement(function, *argument, unknownByType);
+  }
+  auto *instruction = llvm::dyn_cast<llvm::Instruction>(value);
+  if (instruction != nullptr && instruction->getFunction() != &function) {
+    return frozenPoisonBefore(insertBefore, value->getType(),
+                              value->getName() + ".old");
+  }
+  return value;
+}
+
 llvm::CallInst *rewriteCallInst(llvm::CallBase &oldCall, llvm::Value &callee,
                                 llvm::FunctionType &newType,
                                 const std::vector<llvm::Value *> &args) {
@@ -1773,19 +1789,14 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
         values = valueIt->second;
       }
     }
+    llvm::IRBuilder<> builder(oldRet);
     for (llvm::Value *&value : values) {
       while (state.ValueMap.count(value) != 0 &&
              state.ValueMap[value] != value) {
         value = state.ValueMap[value];
       }
-      auto *argument = llvm::dyn_cast<llvm::Argument>(value);
-      if (argument != nullptr && argument->getParent() != &newFunction) {
-        std::map<llvm::Type *, llvm::Value *> unknownByType;
-        value = foreignArgumentReplacement(newFunction, *argument,
-                                           unknownByType);
-      }
+      value = localizeReturnValue(newFunction, *oldRet, value);
     }
-    llvm::IRBuilder<> builder(oldRet);
     if (shape.Returns.empty()) {
       builder.CreateRetVoid();
     } else {

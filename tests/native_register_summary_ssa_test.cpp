@@ -692,12 +692,17 @@ bool testForeignArgumentInMovedBodyIsReplaced() {
   llvm::Function *rewritten =
       module.getFunction("notdec_native_foreign_arg");
   bool hasForeignArgumentOperand = false;
+  bool hasForeignInstructionOperand = false;
   if (rewritten != nullptr) {
     for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
       for (llvm::Use &operand : inst.operands()) {
         auto *argument = llvm::dyn_cast<llvm::Argument>(operand.get());
         if (argument != nullptr && argument->getParent() != rewritten) {
           hasForeignArgumentOperand = true;
+        }
+        auto *instruction = llvm::dyn_cast<llvm::Instruction>(operand.get());
+        if (instruction != nullptr && instruction->getFunction() != rewritten) {
+          hasForeignInstructionOperand = true;
         }
       }
     }
@@ -706,6 +711,8 @@ bool testForeignArgumentInMovedBodyIsReplaced() {
   return expect(rewritten != nullptr, "foreign-argument callee missing") &&
          expect(!hasForeignArgumentOperand,
                 "moved body still referenced foreign argument") &&
+         expect(!hasForeignInstructionOperand,
+                "moved body still referenced foreign instruction") &&
          expect(summary.FunctionsRewritten >= 1,
                 "foreign-argument function was not rewritten") &&
          verifyOk(module,
