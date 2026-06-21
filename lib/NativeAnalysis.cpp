@@ -39,6 +39,11 @@ std::string hexAddress(uint64_t address) {
   return stream.str();
 }
 
+bool isInstructionFallthroughTo(const NativeInstruction &instruction,
+                                uint64_t target) {
+  return instruction.Fallthrough == target && instruction.end() == target;
+}
+
 NativeFunctionConfidence mergeConfidence(NativeFunctionConfidence lhs,
                                          NativeFunctionConfidence rhs) {
   return static_cast<int>(lhs) < static_cast<int>(rhs) ? lhs : rhs;
@@ -1877,6 +1882,7 @@ private:
         }
       }
       if (instruction.Fallthrough &&
+          isInstructionFallthroughTo(instruction, *instruction.Fallthrough) &&
           instructionByAddress.count(*instruction.Fallthrough) != 0) {
         worklist.push_back(*instruction.Fallthrough);
       }
@@ -1951,7 +1957,8 @@ private:
               NativeInstructionFlowKind::UnconditionalBranch &&
           instruction.FlowKind != NativeInstructionFlowKind::IndirectBranch &&
           instruction.FlowKind != NativeInstructionFlowKind::Return;
-      if (hasNextInstruction && hasFallthrough) {
+      if (hasNextInstruction && hasFallthrough &&
+          instructions[index + 1].Address == instruction.end()) {
         instruction.Fallthrough = instructions[index + 1].Address;
       } else if (!hasNextInstruction &&
                  instruction.FlowKind ==
@@ -2361,7 +2368,9 @@ private:
         if (instruction.FlowKind ==
             NativeInstructionFlowKind::ConditionalBranch) {
           successors = instruction.DirectFlowTargets;
-          if (instruction.Fallthrough) {
+          if (instruction.Fallthrough &&
+              isInstructionFallthroughTo(instruction,
+                                         *instruction.Fallthrough)) {
             addUniqueAddress(successors, *instruction.Fallthrough);
           }
         } else if (instruction.FlowKind ==
@@ -2375,8 +2384,8 @@ private:
       }
       if (nextStartsBlock && successors.empty() &&
           instruction.FlowKind == NativeInstructionFlowKind::None &&
-          instruction.Fallthrough &&
-          *instruction.Fallthrough == instructions[index + 1].Address) {
+          isInstructionFallthroughTo(instruction,
+                                     instructions[index + 1].Address)) {
         addUniqueAddress(successors, instructions[index + 1].Address);
       }
 
@@ -2836,7 +2845,8 @@ private:
           break;
         }
         if (endIndex + 1 == instructions.size() ||
-            current->Fallthrough != instructions[endIndex + 1]->Address) {
+            !isInstructionFallthroughTo(
+                *current, instructions[endIndex + 1]->Address)) {
           addInstructionSuccessors(function, *current, block.Successors);
           break;
         }
@@ -2864,6 +2874,7 @@ private:
 
     if (terminator->FlowKind == NativeInstructionFlowKind::None &&
         terminator->Fallthrough &&
+        isInstructionFallthroughTo(*terminator, *terminator->Fallthrough) &&
         functionHasBlockStartingAt(function, *terminator->Fallthrough)) {
       state.addBasicBlockSuccessors(function.Entry, block.Start,
                                     {*terminator->Fallthrough});
@@ -2903,7 +2914,8 @@ private:
       std::vector<uint64_t> &successors) {
     if (instruction.FlowKind == NativeInstructionFlowKind::ConditionalBranch) {
       addLocalSuccessors(function, instruction.DirectFlowTargets, successors);
-      if (instruction.Fallthrough) {
+      if (instruction.Fallthrough &&
+          isInstructionFallthroughTo(instruction, *instruction.Fallthrough)) {
         addLocalSuccessor(function, *instruction.Fallthrough, successors);
       }
       return;
@@ -2914,7 +2926,8 @@ private:
       return;
     }
     if (instruction.FlowKind == NativeInstructionFlowKind::None &&
-        instruction.Fallthrough) {
+        instruction.Fallthrough &&
+        isInstructionFallthroughTo(instruction, *instruction.Fallthrough)) {
       addLocalSuccessor(function, *instruction.Fallthrough, successors);
     }
   }
@@ -3257,7 +3270,7 @@ bool NativeProgramState::addBasicBlock(uint64_t functionEntry,
     for (auto instruction = Instructions.lower_bound(start);
          instruction != Instructions.end() && instruction->first < target;
          ++instruction) {
-      if (instruction->second.Fallthrough == target) {
+      if (isInstructionFallthroughTo(instruction->second, target)) {
         return true;
       }
     }

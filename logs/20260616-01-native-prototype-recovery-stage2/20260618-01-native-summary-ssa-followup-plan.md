@@ -3531,3 +3531,71 @@ build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
 - 实现效果：6/10。堵住 relative branch 通过 p-code op 顺序创建 synthetic target block 的路径。
 - 理解成本：2/10。规则仍然简单：native target 必须来自 native block facts，internal p-code target 例外。
 - 维护成本：2/10。改动集中在 lowering target 校验和测试，没有新增外部状态。
+
+## 实现记录：Fallthrough 必须等于 instruction end
+
+背景：
+
+- 前面已经让下游 block / lowering 更信任 `NativeInstruction::Fallthrough`。
+- 继续检查 facts 入口时发现，`annotateDecodedInstructionFlows(...)` 只要 decoded instruction
+  vector 里有下一条指令，就会设置 fallthrough 到下一条地址，没有确认下一条地址是否等于当前
+  instruction end。
+- 这会把“decode 顺序里的下一条”误提升成机器级 fallthrough fact。真实机器 fallthrough 只能是
+  `instruction.Address + instruction.Size`。
+
+实现：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:42)
+  新增 `isInstructionFallthroughTo(...)`，统一判断 `Fallthrough == target && instruction.end() == target`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1884)
+  本地 reachable walk 只有在 fallthrough 指向 instruction end 时才沿 false/顺序边继续。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:1960)
+  `annotateDecodedInstructionFlows(...)` 只有下一条 decoded instruction 地址等于当前 instruction end
+  时，才设置 fallthrough。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2369)
+  `buildDecodedBlocks(...)` 的 conditional false edge 和普通 next-block successor 都使用
+  `isInstructionFallthroughTo(...)`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2843)
+  `FlowFactNormalizer::appendMissingBlocks(...)` 只有连续 fallthrough 才继续扩展 missing block。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2872)
+  `normalizeBlockSuccessors(...)` 只有连续 fallthrough 才补 block successor。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2913)
+  `addInstructionSuccessors(...)` 对 conditional / none-flow 的 fallthrough 也使用同一规则。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3268)
+  `NativeProgramState::addBasicBlock(...)` 拆分重叠 block 时，也只用连续 fallthrough 补 split edge。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:242)
+  加强 `testFlowNormalizerDoesNotJoinMissingBlocksWithoutFallthrough()`，构造非连续 fallthrough，
+  确认不会被当成顺序边。
+
+验证：
+
+```text
+cmake --build build --target native_analysis_facts_test pcode_to_llvm_test native_register_summary_test native_register_summary_ssa_test -j$(nproc)
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --summary-json-out /tmp/notdec-fortune-strict-fallthrough-end/summary.json \
+  -o /tmp/notdec-fortune-strict-fallthrough-end/fortune.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-strict-fallthrough-end/fortune.ll \
+  -o /tmp/notdec-fortune-strict-fallthrough-end/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /tmp/notdec-fortune-strict-fallthrough-end/fortune.bc \
+  -o /tmp/notdec-fortune-strict-fallthrough-end/fortune.verify.bc
+```
+
+结果：
+
+- 核心 native 测试通过。
+- fortune 默认链路通过 `llvm-as` 和 verifier，耗时 `10.44 sec`。
+- `!notdec.register.access` 数量为 0。
+- register global store 数量为 0。
+- register global load 数量为 6，仍是 `summary_ssa.entry` load。
+- `br i1 poison`、`ret ... poison`、`store ... ptr poison` 数量为 0。
+
+评分：
+
+- 实现效果：6/10。把 fallthrough fact 的语义收紧到机器指令真实顺序边，减少 decode 顺序误用。
+- 理解成本：2/10。新增一个统一 helper，消费点更多但规则统一。
+- 维护成本：2/10。没有新增分析状态；如果未来支持 delay slot 或非普通 fallthrough，需要在 helper 里集中扩展。

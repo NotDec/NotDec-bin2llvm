@@ -239,8 +239,10 @@ bool testFlowNormalizerDoesNotJoinMissingBlocksWithoutFallthrough(
   first.Fallthrough = hole;
   state.addInstruction(std::move(first));
 
-  state.addInstruction(makeInstruction(
-      hole, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::None));
+  auto disconnected = makeInstruction(
+      hole, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::None);
+  disconnected.Fallthrough = target;
+  state.addInstruction(std::move(disconnected));
   state.addInstruction(makeInstruction(
       hole + 0x02, 0x02,
       notdec::bin2llvm::NativeInstructionFlowKind::Return));
