@@ -535,10 +535,11 @@ private:
     return result != nullptr;
   }
 
-  bool nativeIndirectBranchSuccessor(size_t blockIndex,
-                                     llvm::BasicBlock *&result,
-                                     std::string &errorMessage) {
-    result = nullptr;
+  bool nativeIndirectBranchSuccessor(
+      size_t blockIndex,
+      std::vector<std::pair<uint64_t, llvm::BasicBlock *>> &result,
+      std::string &errorMessage) {
+    result.clear();
     if (!usesNativeCfg()) {
       return true;
     }
@@ -555,17 +556,14 @@ private:
     if (successorIt->second.empty()) {
       return true;
     }
-    if (successorIt->second.size() != 1) {
-      std::ostringstream os;
-      os << "native indirect branch block 0x" << std::hex << blockAddress
-         << " has " << std::dec << successorIt->second.size()
-         << " successors; multiple indirect targets are not lowered yet";
-      errorMessage = os.str();
-      return false;
+    for (uint64_t successor : successorIt->second) {
+      llvm::BasicBlock *block = blockForNativeTarget(successor, errorMessage);
+      if (block == nullptr) {
+        return false;
+      }
+      result.push_back({successor, block});
     }
-
-    result = blockForNativeTarget(successorIt->second.front(), errorMessage);
-    return result != nullptr;
+    return true;
   }
 
   llvm::BasicBlock *blockForTarget(uint64_t address) {
@@ -761,13 +759,25 @@ private:
         }
       }
       if (usesNativeCfg()) {
-        llvm::BasicBlock *successor = nullptr;
-        if (!nativeIndirectBranchSuccessor(blockIndex, successor,
+        std::vector<std::pair<uint64_t, llvm::BasicBlock *>> successors;
+        if (!nativeIndirectBranchSuccessor(blockIndex, successors,
                                            errorMessage)) {
           return false;
         }
-        if (successor != nullptr) {
-          Builder.CreateBr(successor);
+        if (successors.size() == 1) {
+          Builder.CreateBr(successors.front().second);
+          return true;
+        }
+        if (!successors.empty()) {
+          llvm::Value *target = resize(read(op.Inputs[0]), 8);
+          auto *switchInst = Builder.CreateSwitch(target, exitBlock(),
+                                                  successors.size());
+          for (const auto &[address, successor] : successors) {
+            switchInst->addCase(
+                llvm::cast<llvm::ConstantInt>(
+                    llvm::ConstantInt::get(target->getType(), address)),
+                successor);
+          }
           return true;
         }
       }

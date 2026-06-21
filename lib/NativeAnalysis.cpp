@@ -2063,6 +2063,9 @@ private:
         } else if (instruction.FlowKind ==
                    NativeInstructionFlowKind::UnconditionalBranch) {
           successors = instruction.DirectFlowTargets;
+        } else if (instruction.FlowKind ==
+                   NativeInstructionFlowKind::IndirectBranch) {
+          successors = instruction.DirectFlowTargets;
         }
         endBlock = true;
       }

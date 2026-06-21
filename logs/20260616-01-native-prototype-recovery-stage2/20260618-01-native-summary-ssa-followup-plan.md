@@ -1794,3 +1794,91 @@ llvm-as + opt verify: passed
 - 实现效果：5/10。继续消除 lowering 层的隐式 `ret void` 兜底，让缺 facts 更早暴露。
 - 理解成本：1/10。规则简单：native CFG 模式下，每个需要 lower 控制流的 block 都必须有 successor entry。
 - 维护成本：1/10。没有新增状态，只收紧两个已有 helper。
+
+## 已完成：多目标 BRANCHIND lowering
+
+当前这一步只处理 lowering 侧：如果 block facts 已经明确给出 `BRANCHIND`
+的多个后继，`PcodeToLLVM` 可以把它表达成 LLVM `switch`。
+
+具体改动：
+
+- [NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2063)
+  - `buildDecodedBlocks(...)` 对 `NativeInstructionFlowKind::IndirectBranch`
+    使用 `DirectFlowTargets` 作为 block successors。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:535)
+  - `nativeIndirectBranchSuccessor(...)` 从单个 block 改为返回多个目标 block。
+- [PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:759)
+  - `lowerTerminator(...)` 在 `BRANCHIND` 有多个 native successors 时生成
+    `switch target, default notdec_exit`，每个 case 是一个目标地址。
+- [pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:707)
+  - `testNativeIndirectBranchLowersMultipleSuccessorsAsSwitch()` 覆盖多目标
+    indirect branch lowering。
+
+验证：
+
+```text
+cmake --build /tmp/notdec-bin2llvm-build --target pcode_to_llvm_test native_analysis_facts_test notdec-native-llvm -j2
+/tmp/notdec-bin2llvm-build/bin/pcode_to_llvm_test
+/tmp/notdec-bin2llvm-build/bin/native_analysis_facts_test
+cmake --build /tmp/notdec-bin2llvm-build --target native_register_summary_test native_register_summary_ssa_test -j2
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_test
+/tmp/notdec-bin2llvm-build/bin/native_register_summary_ssa_test
+/usr/bin/time -f 'elapsed=%e' /tmp/notdec-bin2llvm-build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-indirect-switch/fortune.ll --summary-json-out /tmp/notdec-fortune-indirect-switch/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-indirect-switch/fortune.ll -o /tmp/notdec-fortune-indirect-switch/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-indirect-switch/fortune.bc -o /tmp/notdec-fortune-indirect-switch/fortune.verify.bc
+```
+
+结果：
+
+```text
+pcode_to_llvm_test: passed
+native_analysis_facts_test: passed
+native_register_summary_test: passed
+native_register_summary_ssa_test: passed
+fortune native pipeline: 9.48s
+llvm-as + opt verify: passed
+```
+
+复杂度评估：
+
+- 实现效果：4/10。lowering 侧已经能消费多目标 indirect branch facts，但
+  fortune 的 jump table facts 还没有恢复出来。
+- 理解成本：1/10。已有 `BlockSuccessors` 继续作为唯一输入；多个目标用
+  `switch` 表达。
+- 维护成本：1/10。没有引入新的 CFG 状态。
+
+## 当前边界：jump table facts 还没恢复
+
+fortune 当前仍有一个 unresolved indirect branch：
+
+```text
+0x2879: notrack jmp rax
+0x2872 block successors: []
+unresolved indirect flows: [{ address: "0x2879", kind: "indirect branch" }]
+```
+
+对应汇编是 GCC switch table：
+
+```text
+2840: lea rbx,[0x63d8]
+2866: sub eax,0x61
+2869: cmp eax,0x16
+286c: ja 0x2efe
+2872: movsxd rax,DWORD PTR [rbx+rax*4]
+2876: add rax,rbx
+2879: notrack jmp rax
+```
+
+尝试过把 x86 jump table 识别塞进 `collectDirectControlFlow(...)` 的单次
+p-code 扫描，但没有保留：这个位置只能看到一个小 seed 的 p-code，`RBX`
+table base 来自前面 block 的 `LEA`，继续在这里补跨 seed 回溯会把 decode
+阶段做成半截数据流分析。
+
+下一步更合适的做法：
+
+- 先让 instruction/block facts 稳定下来。
+- 单独做一个 jump table facts pass，从已确认函数的 instruction facts、
+  block facts 和必要的短距离数据流里恢复 `{branch, tableBase, targets}`。
+- 再把恢复出的 targets 写回 block successors。
+- `PcodeToLLVM` 不再需要新增特殊逻辑，直接消费多个 successors 并 lower 成
+  `switch`。

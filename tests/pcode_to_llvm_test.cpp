@@ -707,7 +707,7 @@ bool testNativeIndirectBranchRequiresSuccessorFacts() {
                 "missing indirect successor facts error was not reported");
 }
 
-bool testNativeIndirectBranchRejectsMultipleSuccessors() {
+bool testNativeIndirectBranchLowersMultipleSuccessorsAsSwitch() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   program.Ops.push_back(branchIndOp(0x1000));
@@ -720,16 +720,30 @@ bool testNativeIndirectBranchRejectsMultipleSuccessors() {
   config.BlockRanges.emplace(0x3000, 0x3001);
   config.BlockSuccessors.emplace(0x1000,
                                  std::vector<uint64_t>{0x2000, 0x3000});
+  config.BlockSuccessors.emplace(0x2000, std::vector<uint64_t>{});
+  config.BlockSuccessors.emplace(0x3000, std::vector<uint64_t>{});
 
   std::string errorMessage;
   std::unique_ptr<llvm::Module> module =
       notdec::bin2llvm::buildPcodeModule(context, program, config,
                                          errorMessage);
-  return expect(module == nullptr,
-                "native indirect branch with multiple successors should fail") &&
-         expect(errorMessage.find("multiple indirect targets") !=
-                    std::string::npos,
-                "multiple indirect successor error was not reported");
+  llvm::Function *function = module ? module->getFunction(
+                                          "native_indirect_multiple_successors")
+                                    : nullptr;
+  bool hasSwitch = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      if (llvm::isa<llvm::SwitchInst>(block.getTerminator())) {
+        hasSwitch = true;
+      }
+    }
+  }
+  return expect(module != nullptr,
+                "native indirect branch with multiple successors should lower") &&
+         expect(function != nullptr,
+                "multiple indirect successor function is missing") &&
+         expect(hasSwitch,
+                "multiple indirect successor branch did not lower as switch");
 }
 
 } // namespace
@@ -755,6 +769,6 @@ int main() {
   ok &= testNativeConditionalSuccessorsRejectMultipleFalseTargets();
   ok &= testNativeIndirectBranchCanUseSingleSuccessor();
   ok &= testNativeIndirectBranchRequiresSuccessorFacts();
-  ok &= testNativeIndirectBranchRejectsMultipleSuccessors();
+  ok &= testNativeIndirectBranchLowersMultipleSuccessorsAsSwitch();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
