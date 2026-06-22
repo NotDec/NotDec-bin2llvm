@@ -49,7 +49,10 @@ enum class OutputMode {
 struct CliOptions {
   std::string ElfPath;
   OutputMode Mode = OutputMode::TextReport;
+  notdec::bin2llvm::NativeDecodeMode DecodeMode =
+      notdec::bin2llvm::NativeDecodeMode::Gtirb;
   notdec::bin2llvm::NativeSleighDecodeOptions DecodeOptions;
+  notdec::bin2llvm::NativeGtirbDecodeOptions GtirbOptions;
   std::optional<uint64_t> QueryAddress;
   std::optional<uint64_t> QueryStart;
   std::optional<uint64_t> QueryEnd;
@@ -60,7 +63,8 @@ struct CliOptions {
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0 << " <elf-file>\n";
   std::cerr << "       " << argv0
-            << " [--decode-seed-limit <count>] <mode> <elf-file>\n";
+            << " [--native-decode-mode gtirb|internal] [--gtirb <path>] "
+               "[--decode-seed-limit <count>] <mode> <elf-file>\n";
   std::cerr << "       " << argv0 << " --summary-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --memory-json <elf-file>\n";
   std::cerr << "       " << argv0 << " --relocations-json <elf-file>\n";
@@ -139,6 +143,34 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
         return std::nullopt;
       }
       options.DecodeOptions.MaxDecodedSeeds = *limit;
+      continue;
+    }
+    if (arg == "--native-decode-mode") {
+      if (index + 1 >= argc) {
+        return std::nullopt;
+      }
+      std::string mode = argv[++index];
+      if (mode == "gtirb") {
+        options.DecodeMode = notdec::bin2llvm::NativeDecodeMode::Gtirb;
+      } else if (mode == "internal") {
+        options.DecodeMode = notdec::bin2llvm::NativeDecodeMode::Internal;
+      } else {
+        return std::nullopt;
+      }
+      continue;
+    }
+    if (arg == "--gtirb") {
+      if (index + 1 >= argc) {
+        return std::nullopt;
+      }
+      options.GtirbOptions.GtirbPath = argv[++index];
+      continue;
+    }
+    if (arg == "--ddisasm") {
+      if (index + 1 >= argc) {
+        return std::nullopt;
+      }
+      options.GtirbOptions.DdisasmPath = argv[++index];
       continue;
     }
     args.push_back(std::move(arg));
@@ -1373,16 +1405,24 @@ int main(int argc, char **argv) {
     }
 
     notdec::bin2llvm::NativeProgramState state(*binary);
+    options->GtirbOptions.ElfPath = options->ElfPath;
     notdec::bin2llvm::NativeAnalysisManager manager;
     manager.addAnalyzer(notdec::bin2llvm::createElfLoadAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createRelocationPltAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createElfEntryAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createElfSymbolAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createEhFrameAnalyzer());
-    manager.addAnalyzer(
-        notdec::bin2llvm::createSleighSeedInstructionAnalyzer(
-            options->DecodeOptions));
-    manager.addAnalyzer(notdec::bin2llvm::createX86JumpTableAnalyzer());
+    if (options->DecodeMode == notdec::bin2llvm::NativeDecodeMode::Gtirb) {
+      options->DecodeOptions.DecodeExistingBlocksOnly = true;
+      manager.addAnalyzer(notdec::bin2llvm::createGtirbFunctionFactsAnalyzer(
+          options->GtirbOptions));
+      manager.addAnalyzer(notdec::bin2llvm::createSleighSeedInstructionAnalyzer(
+          options->DecodeOptions));
+    } else {
+      manager.addAnalyzer(notdec::bin2llvm::createSleighSeedInstructionAnalyzer(
+          options->DecodeOptions));
+      manager.addAnalyzer(notdec::bin2llvm::createX86JumpTableAnalyzer());
+    }
     manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
     if (options->Mode == OutputMode::TextReport) {
       manager.addAnalyzer(notdec::bin2llvm::createReportAnalyzer(std::cout));

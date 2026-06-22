@@ -194,6 +194,21 @@ enum class NativeInstructionFlowKind {
 
 std::string toString(NativeInstructionFlowKind kind);
 
+enum class NativeDecodeMode {
+  Gtirb,
+  Internal,
+};
+
+// GTIRB mode treats ddisasm as the owner of function boundaries and machine
+// CFG.  Sleigh is still used later for instruction semantics, but it should not
+// rediscover functions when this mode is active.
+struct NativeGtirbDecodeOptions {
+  std::string ElfPath;
+  std::string GtirbPath;
+  std::string DdisasmPath = "ddisasm";
+  bool GenerateIfMissing = true;
+};
+
 // NativeInstruction records decoded instruction facts accepted by native
 // analyzers.  It deliberately keeps operands and raw P-Code out, but it does
 // keep machine-level flow facts.  Later block construction and LLVM lowering
@@ -347,6 +362,7 @@ private:
 struct NativeSleighDecodeOptions {
   std::optional<uint64_t> MaxDecodedSeeds;
   std::vector<uint64_t> InitialFunctionEntries;
+  bool DecodeExistingBlocksOnly = false;
 };
 
 std::unique_ptr<NativeAnalyzer> createElfLoadAnalyzer();
@@ -354,6 +370,8 @@ std::unique_ptr<NativeAnalyzer> createRelocationPltAnalyzer();
 std::unique_ptr<NativeAnalyzer> createElfEntryAnalyzer();
 std::unique_ptr<NativeAnalyzer> createElfSymbolAnalyzer();
 std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer();
+std::unique_ptr<NativeAnalyzer> createGtirbFunctionFactsAnalyzer(
+    NativeGtirbDecodeOptions options = {});
 std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
     NativeSleighDecodeOptions options = {});
 std::unique_ptr<NativeAnalyzer> createX86JumpTableAnalyzer();

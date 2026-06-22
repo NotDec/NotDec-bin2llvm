@@ -58,7 +58,10 @@ struct CliOptions {
   bool AllConfirmed = false;
   std::string OutputPath;
   std::string SummaryJsonPath;
+  notdec::bin2llvm::NativeDecodeMode DecodeMode =
+      notdec::bin2llvm::NativeDecodeMode::Gtirb;
   notdec::bin2llvm::NativeSleighDecodeOptions DecodeOptions;
+  notdec::bin2llvm::NativeGtirbDecodeOptions GtirbOptions;
   notdec::bin2llvm::PcodeMemoryModel MemoryModel =
       notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
   bool DisableRegisterSSAPass = false;
@@ -85,6 +88,7 @@ void printUsage(const char *argv0) {
                "[--no-prototype-recovery-pass] "
                "[--prototype-recovery-summary] "
                "[--rewrite-prototype-signatures] "
+               "[--native-decode-mode gtirb|internal] [--gtirb <path>] "
                "[--decode-seed-limit <count>] "
                "[--memory-model inttoptr|global-array] [-p root-sla-dir] "
                "[-s pspec-file]\n";
@@ -207,6 +211,19 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.OutputPath = std::move(value);
     } else if (flag == "--summary-json-out") {
       options.SummaryJsonPath = std::move(value);
+    } else if (flag == "--native-decode-mode") {
+      if (value == "gtirb") {
+        options.DecodeMode = notdec::bin2llvm::NativeDecodeMode::Gtirb;
+      } else if (value == "internal") {
+        options.DecodeMode = notdec::bin2llvm::NativeDecodeMode::Internal;
+      } else {
+        std::cerr << "invalid native decode mode: " << value << '\n';
+        return std::nullopt;
+      }
+    } else if (flag == "--gtirb") {
+      options.GtirbOptions.GtirbPath = std::move(value);
+    } else if (flag == "--ddisasm") {
+      options.GtirbOptions.DdisasmPath = std::move(value);
     } else if (flag == "--decode-seed-limit") {
       uint64_t limit = 0;
       if (!parseUint64(value, limit)) {
@@ -372,9 +389,13 @@ std::string jsonEscape(const std::string &text) {
 }
 
 notdec::bin2llvm::NativeProgramState
-runNativeDiscovery(
-    const LIEF::ELF::Binary &binary,
-    notdec::bin2llvm::NativeSleighDecodeOptions decodeOptions = {}) {
+runNativeDiscovery(const LIEF::ELF::Binary &binary,
+                   const CliOptions &options) {
+  notdec::bin2llvm::NativeSleighDecodeOptions decodeOptions =
+      options.DecodeOptions;
+  notdec::bin2llvm::NativeGtirbDecodeOptions gtirbOptions =
+      options.GtirbOptions;
+  gtirbOptions.ElfPath = options.ElfPath;
   notdec::bin2llvm::NativeProgramState state(binary);
   notdec::bin2llvm::NativeAnalysisManager manager;
   manager.addAnalyzer(notdec::bin2llvm::createElfLoadAnalyzer());
@@ -382,9 +403,17 @@ runNativeDiscovery(
   manager.addAnalyzer(notdec::bin2llvm::createElfEntryAnalyzer());
   manager.addAnalyzer(notdec::bin2llvm::createElfSymbolAnalyzer());
   manager.addAnalyzer(notdec::bin2llvm::createEhFrameAnalyzer());
-  manager.addAnalyzer(
-      notdec::bin2llvm::createSleighSeedInstructionAnalyzer(decodeOptions));
-  manager.addAnalyzer(notdec::bin2llvm::createX86JumpTableAnalyzer());
+  if (options.DecodeMode == notdec::bin2llvm::NativeDecodeMode::Gtirb) {
+    decodeOptions.DecodeExistingBlocksOnly = true;
+    manager.addAnalyzer(
+        notdec::bin2llvm::createGtirbFunctionFactsAnalyzer(gtirbOptions));
+    manager.addAnalyzer(
+        notdec::bin2llvm::createSleighSeedInstructionAnalyzer(decodeOptions));
+  } else {
+    manager.addAnalyzer(
+        notdec::bin2llvm::createSleighSeedInstructionAnalyzer(decodeOptions));
+    manager.addAnalyzer(notdec::bin2llvm::createX86JumpTableAnalyzer());
+  }
   manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
   manager.run(state);
   return state;
@@ -973,7 +1002,7 @@ int main(int argc, char **argv) {
       }
       selectedState =
           std::make_unique<notdec::bin2llvm::NativeProgramState>(
-              runNativeDiscovery(*binary, options->DecodeOptions));
+              runNativeDiscovery(*binary, *options));
     }
     if (selectedState && !options->SummaryJsonPath.empty() &&
         !writeSummaryJson(*selectedState, options->SummaryJsonPath)) {
@@ -1029,7 +1058,7 @@ int main(int argc, char **argv) {
         NativeCallTargets callTargets =
             selectedState ? planNativeCallTargets(*selectedState)
                           : planNativeCallTargets(runNativeDiscovery(
-                                *binary, options->DecodeOptions));
+                                *binary, *options));
         callTargets.Direct[*options->FunctionEntry] = config.EntryFunctionName;
         config.DirectCallTargets = std::move(callTargets.Direct);
         config.ExternalCallTargets = std::move(callTargets.External);

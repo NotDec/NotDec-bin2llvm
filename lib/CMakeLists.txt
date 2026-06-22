@@ -60,6 +60,22 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
       LIEF::LIEF
   )
 
+  if (NOTDEC_BIN2LLVM_ENABLE_GTIRB AND gtirb_FOUND AND gtirb_pprinter_FOUND)
+    target_link_libraries(notdec-bin2llvm-native
+      PUBLIC
+        gtirb
+        gtirb_pprinter
+    )
+    target_compile_options(notdec-bin2llvm-native
+      PRIVATE
+        -frtti
+    )
+    target_compile_definitions(notdec-bin2llvm-native
+      PRIVATE
+        NOTDEC_BIN2LLVM_ENABLE_GTIRB=1
+    )
+  endif ()
+
   target_compile_definitions(notdec-bin2llvm-native
     PRIVATE
       NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR="${NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR}"

@@ -4759,3 +4759,105 @@ build/bin/native_register_summary_ssa_test
 - 新增 `gtirb` 模式，先读取 GTIRB 的 `functionEntries`、`functionBlocks`、
   `functionNames` 和 CFG edge，填充现有 `NativeProgramState`。
 - `gtirb` 模式作为默认；`internal` 模式只保留对照和兜底。
+
+## 实现记录：新增默认 ddisasm / GTIRB native frontend
+
+目标：停止继续扩展 internal facts decode，把它保留为显式 `internal` 模式；新增默认
+`gtirb` 模式，用 ddisasm 生成的 GTIRB 作为函数范围和 CFG 输入。Sleigh 仍只负责
+后续指令语义，不在 `gtirb` 模式里递归发现函数。
+
+本次改动：
+
+- [CMakeLists.txt](/sn640/NotDec/external/NotDec-bin2llvm/CMakeLists.txt:132)
+  - 新增 `NOTDEC_BIN2LLVM_ENABLE_GTIRB`，查找 `gtirb`、`gtirb_pprinter` 和
+    `Boost::{filesystem,program_options,system}`。
+- [lib/CMakeLists.txt](/sn640/NotDec/external/NotDec-bin2llvm/lib/CMakeLists.txt:63)
+  - `notdec-bin2llvm-native` 在 GTIRB 可用时链接 `gtirb` 和 `gtirb_pprinter`。
+  - 给 `notdec-bin2llvm-native` 单独打开 `-frtti`，因为 GTIRB auxdata API 使用
+    `typeid`，当前项目全局仍跟 LLVM 一样是 `-fno-rtti`。
+- [include/notdec-bin2llvm/NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:197)
+  - 新增 `NativeDecodeMode::{Gtirb,Internal}`。
+  - 新增 `NativeGtirbDecodeOptions`，记录 ELF 路径、可选 `.gtirb` 路径和 ddisasm
+    路径。
+  - `NativeSleighDecodeOptions` 新增 `DecodeExistingBlocksOnly`。
+  - 声明 `createGtirbFunctionFactsAnalyzer()`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2539)
+  - 新增 `GtirbFunctionFactsAnalyzer`。
+  - 如果没有传 `--gtirb`，自动调用 `ddisasm <elf> --ir <tmp.gtirb>`；stdout/stderr
+    都静默，避免污染 JSON 输出。
+  - 读取 `.gtirb` 前调用 `gtirb_pprint::registerAuxDataTypes()`，否则 ddisasm 产物
+    中的 auxdata schema 不能稳定读取。
+  - 读取 `functionEntries`、`functionBlocks`、`functionNames`，导入函数、block 和
+   名字。
+  - 遍历 GTIRB CFG：`Branch/Fallthrough` 写入 block successor，`Call` 写成 xref，
+    不把 call edge 当作函数内 CFG successor。
+  - 增加 seed-range fallback：当前 ddisasm 在部分 Ubuntu PIE/ELF 上会生成很少甚至
+    没有 `CodeBlock`，所以如果 GTIRB 没覆盖已有 high-confidence seed，而 seed 已有
+    `.eh_frame`/symbol range，就保守建一个 `gtirb-seed-range-fallback` 函数。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2962)
+  - `DecodeExistingBlocksOnly` 模式不再递归发现函数。
+  - 它先快照已有函数 block range，再用 Sleigh 解码这些 range，调用已有
+    `addDecodedFunctionBlocks()` 重建更细的 basic block 和 successor facts。
+  - 这修掉了 fallback 单块函数导致的 `missing successor facts`。
+- [tools/notdec-native-discover.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-discover.cpp:49)
+  - CLI 默认 `DecodeMode=Gtirb`。
+  - 新增 `--native-decode-mode gtirb|internal`、`--gtirb <path>`、`--ddisasm <path>`。
+  - 默认 `gtirb` 模式运行 `GtirbFunctionFactsAnalyzer + SleighSeedInstructionAnalyzer(DecodeExistingBlocksOnly)`。
+  - 显式 `internal` 模式保留旧 `SleighSeedInstructionAnalyzer + X86JumpTableAnalyzer`。
+- [tools/notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:48)
+  - CLI 默认 `DecodeMode=Gtirb`。
+  - 新增同样的 `--native-decode-mode`、`--gtirb`、`--ddisasm` 参数。
+  - `runNativeDiscovery()` 改为按 mode 组装 analyzer pipeline。
+
+验证：
+
+```text
+cmake --build build --target notdec-native-discover notdec-native-llvm -j$(nproc)
+build/bin/notdec-native-discover --summary-json /bin/true
+build/bin/notdec-native-discover --native-decode-mode internal --summary-json /bin/true
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-gtirb/fortune.ll --summary-json-out /tmp/notdec-fortune-gtirb/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-gtirb/fortune.ll -o /tmp/notdec-fortune-gtirb/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-gtirb/fortune.bc -o /tmp/notdec-fortune-gtirb/fortune.verified.bc
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk --all-confirmed -o /tmp/notdec-gtirb-bench-wrk/wrk.ll --summary-json-out /tmp/notdec-gtirb-bench-wrk/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-gtirb-bench-wrk/wrk.ll -o /tmp/notdec-gtirb-bench-wrk/wrk.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-gtirb-bench-wrk/wrk.bc -o /tmp/notdec-gtirb-bench-wrk/wrk.verified.bc
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed --no-register-ssa-pass -o /tmp/notdec-gtirb-nossa-memcached/memcached.ll --summary-json-out /tmp/notdec-gtirb-nossa-memcached/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-gtirb-nossa-memcached/memcached.ll -o /tmp/notdec-gtirb-nossa-memcached/memcached.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-gtirb-nossa-memcached/memcached.bc -o /tmp/notdec-gtirb-nossa-memcached/memcached.verified.bc
+```
+
+结果：
+
+- `/bin/true` 默认 `gtirb` JSON 输出不再被 ddisasm 日志污染。
+- `fortune` 默认 `gtirb`：`20` 个 confirmed functions，`708` 个 basic blocks，
+  `3029` 条 instructions；完整生成 IR，通过 `llvm-as` 和 `opt -passes=verify`，
+  耗时 `8.47 sec`。
+- `wrk` 默认 `gtirb`：`137` 个 confirmed functions，`2117` 个 basic blocks，
+  `9809` 条 instructions；完整生成 IR，通过 `llvm-as` 和 `opt -passes=verify`，
+  耗时 `45.68 sec`。
+- `redis-cli` 默认 `gtirb` discovery：`537` 个 confirmed functions，`10713` 个
+  basic blocks，`48926` 条 instructions，耗时 `3.34 sec`。
+- `memcached` 默认 `gtirb` discovery：`254` 个 confirmed functions，`7258` 个
+  basic blocks，`39764` 条 instructions，耗时 `2.27 sec`。
+- `memcached --no-register-ssa-pass` 可生成 IR，并通过 `llvm-as` 和
+  `opt -passes=verify`，耗时 `99.30 sec`。
+- `redis-cli` 和 `memcached` 默认完整链路仍会在后续 LLVM/register SSA 阶段触发
+  RAUW 类型断言或 dominance 问题；这些错误发生在 frontend discovery 之后，不属于
+  本次 native frontend decode / function partitioning 范围。
+
+风险和后续判断：
+
+- ddisasm 当前在一些 Ubuntu PIE/ELF 上会输出很少的 `CodeBlock`，所以本次保留
+  seed-range fallback。它不是继续扩展旧 internal facts 规则，而是使用已有 ELF/FDE
+  明确范围给 lowering 提供函数边界。
+- fallback 的 CFG 仍由 Sleigh 在已知 range 内解码并重建 block，不递归发现新函数；
+  因此新默认链路仍是 `gtirb + bounded Sleigh semantics`，旧 jump-table/internal facts
+  只在 `--native-decode-mode internal` 下启用。
+- 实现效果：7/10。默认链路已切到 GTIRB，并能在 fortune/wrk 上完成 IR 验证；大型目标
+  的后续 pass 还有独立问题。
+- 理解成本：5/10。新增一个 frontend mode 和 GTIRB 读取路径，但入口清晰。
+- 维护成本：4/10。依赖 ddisasm/gtirb_pprinter 系统安装，后续如果 ddisasm 输出质量提升，
+  可以减少 seed-range fallback 的使用。

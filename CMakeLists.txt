@@ -129,6 +129,18 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF)
   FetchContent_MakeAvailable(lief)
 endif ()
 
+option(NOTDEC_BIN2LLVM_ENABLE_GTIRB "Enable GTIRB frontend facts for native discovery." ON)
+if (NOTDEC_BIN2LLVM_ENABLE_GTIRB)
+  find_package(gtirb QUIET)
+  find_package(Boost QUIET COMPONENTS filesystem program_options system)
+  find_package(gtirb_pprinter QUIET)
+  if (NOT gtirb_FOUND)
+    message(WARNING "GTIRB package not found; native gtirb decode mode will be unavailable.")
+  elseif (NOT gtirb_pprinter_FOUND)
+    message(WARNING "gtirb-pprinter package not found; native gtirb decode mode may not read ddisasm auxdata.")
+  endif ()
+endif ()
+
 include_directories("${PROJECT_SOURCE_DIR}/include")
 include_directories("${PROJECT_SOURCE_DIR}/include/notdec-bin2llvm")
 

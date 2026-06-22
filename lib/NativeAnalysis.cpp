@@ -10,10 +10,16 @@
 #include <LIEF/ELF/Segment.hpp>
 #include <LIEF/ELF/Symbol.hpp>
 
+#if NOTDEC_BIN2LLVM_ENABLE_GTIRB
+#include <gtirb_pprinter/PrettyPrinter.hpp>
+#include <gtirb/gtirb.hpp>
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <functional>
@@ -2530,6 +2536,292 @@ bool readX86PicI32Targets(const NativeProgramState &state, uint64_t tableBase,
   return true;
 }
 
+class GtirbFunctionFactsAnalyzer final : public NativeAnalyzer {
+public:
+  explicit GtirbFunctionFactsAnalyzer(NativeGtirbDecodeOptions options)
+      : Options(std::move(options)) {}
+
+  std::string name() const override { return "GtirbFunctionFactsAnalyzer"; }
+  int priority() const override { return 55; }
+
+  void run(NativeProgramState &state, NativeAnalysisManager &) override {
+#if NOTDEC_BIN2LLVM_ENABLE_GTIRB
+    std::optional<std::filesystem::path> gtirbPath = resolveGtirbPath(state);
+    if (!gtirbPath) {
+      return;
+    }
+
+    std::ifstream input(*gtirbPath, std::ios::binary);
+    if (!input) {
+      state.addNote("gtirb frontend could not open: " + gtirbPath->string());
+      return;
+    }
+
+    gtirb::Context context;
+    gtirb_pprint::registerAuxDataTypes();
+    gtirb::ErrorOr<gtirb::IR *> loaded = gtirb::IR::load(context, input);
+    if (!loaded) {
+      state.addNote("gtirb frontend load failed: " +
+                    loaded.getError().message());
+      return;
+    }
+
+    uint64_t functionCount = 0;
+    uint64_t blockCount = 0;
+    uint64_t edgeCount = 0;
+    for (gtirb::Module &module : (*loaded)->modules()) {
+      importFunctions(state, context, module, functionCount, blockCount);
+      importCfgEdges(state, module, edgeCount);
+    }
+    uint64_t fallbackCount = importSeedRanges(state);
+    state.addNote("gtirb frontend imported " + std::to_string(functionCount) +
+                  " functions, " + std::to_string(blockCount) +
+                  " blocks, " + std::to_string(edgeCount) + " cfg edges, " +
+                  std::to_string(fallbackCount) + " seed-range fallbacks");
+#else
+    (void)state;
+    state.addNote("gtirb frontend unavailable: rebuild with GTIRB");
+#endif
+  }
+
+private:
+  NativeGtirbDecodeOptions Options;
+
+  static std::string shellQuote(const std::string &text) {
+    std::string quoted = "'";
+    for (char ch : text) {
+      if (ch == '\'') {
+        quoted += "'\\''";
+      } else {
+        quoted += ch;
+      }
+    }
+    quoted += "'";
+    return quoted;
+  }
+
+  std::optional<std::filesystem::path>
+  resolveGtirbPath(NativeProgramState &state) const {
+    if (!Options.GtirbPath.empty()) {
+      return std::filesystem::path(Options.GtirbPath);
+    }
+    if (!Options.GenerateIfMissing || Options.ElfPath.empty()) {
+      state.addNote("gtirb frontend skipped: no .gtirb path");
+      return std::nullopt;
+    }
+
+    std::filesystem::path output =
+        std::filesystem::temp_directory_path() /
+        ("notdec-" +
+         std::to_string(std::hash<std::string>{}(Options.ElfPath)) +
+         ".gtirb");
+    std::string command = shellQuote(Options.DdisasmPath) + " " +
+                          shellQuote(Options.ElfPath) + " --ir " +
+                          shellQuote(output.string()) + " >/dev/null 2>/dev/null";
+    int exitCode = std::system(command.c_str());
+    if (exitCode != 0 || !std::filesystem::exists(output)) {
+      state.addNote("gtirb frontend ddisasm failed for: " + Options.ElfPath);
+      return std::nullopt;
+    }
+    return output;
+  }
+
+#if NOTDEC_BIN2LLVM_ENABLE_GTIRB
+  static const gtirb::CodeBlock *codeBlockByUuid(const gtirb::Context &context,
+                                                 const gtirb::UUID &uuid) {
+    const gtirb::Node *node = gtirb::Node::getByUUID(context, uuid);
+    if (node == nullptr || !gtirb::CodeBlock::classof(node)) {
+      return nullptr;
+    }
+    return static_cast<const gtirb::CodeBlock *>(node);
+  }
+
+  static uint64_t codeBlockAddress(const gtirb::CodeBlock &block) {
+    return static_cast<uint64_t>(*block.getAddress());
+  }
+
+  static std::string functionNameFor(const gtirb::Context &context,
+                                     const gtirb::Module &module,
+                                     const gtirb::UUID &functionUuid) {
+    const auto *functionNames =
+        module.getAuxData<gtirb::schema::FunctionNames>();
+    if (functionNames == nullptr) {
+      return "";
+    }
+    auto iterator = functionNames->find(functionUuid);
+    if (iterator == functionNames->end()) {
+      return "";
+    }
+    const gtirb::Node *node = gtirb::Node::getByUUID(context, iterator->second);
+    if (node == nullptr || !gtirb::Symbol::classof(node)) {
+      return "";
+    }
+    return static_cast<const gtirb::Symbol *>(node)->getName();
+  }
+
+  static void importFunctions(NativeProgramState &state,
+                              const gtirb::Context &context,
+                              const gtirb::Module &module,
+                              uint64_t &functionCount, uint64_t &blockCount) {
+    const auto *functionEntries =
+        module.getAuxData<gtirb::schema::FunctionEntries>();
+    const auto *functionBlocks =
+        module.getAuxData<gtirb::schema::FunctionBlocks>();
+    if (functionEntries == nullptr || functionBlocks == nullptr) {
+      state.addNote("gtirb frontend missing function auxdata");
+      return;
+    }
+
+    for (const auto &[functionUuid, entryUuids] : *functionEntries) {
+      if (entryUuids.empty()) {
+        continue;
+      }
+      auto blocksIterator = functionBlocks->find(functionUuid);
+      if (blocksIterator == functionBlocks->end()) {
+        continue;
+      }
+
+      std::vector<NativeBasicBlock> blocks;
+      uint64_t rangeStart = std::numeric_limits<uint64_t>::max();
+      uint64_t rangeEnd = 0;
+      for (const gtirb::UUID &blockUuid : blocksIterator->second) {
+        const gtirb::CodeBlock *block = codeBlockByUuid(context, blockUuid);
+        if (block == nullptr || !block->getAddress() || block->getSize() == 0) {
+          continue;
+        }
+        uint64_t start = codeBlockAddress(*block);
+        uint64_t end = start + block->getSize();
+        if (!state.isExecutableAddress(start)) {
+          continue;
+        }
+        NativeBasicBlock nativeBlock;
+        nativeBlock.Start = start;
+        nativeBlock.End = end;
+        blocks.push_back(std::move(nativeBlock));
+        rangeStart = std::min(rangeStart, start);
+        rangeEnd = std::max(rangeEnd, end);
+      }
+      if (blocks.empty()) {
+        continue;
+      }
+
+      uint64_t entryAddress = 0;
+      for (const gtirb::UUID &entryUuid : entryUuids) {
+        const gtirb::CodeBlock *entryBlock =
+            codeBlockByUuid(context, entryUuid);
+        if (entryBlock != nullptr && entryBlock->getAddress()) {
+          entryAddress = codeBlockAddress(*entryBlock);
+          break;
+        }
+      }
+      if (entryAddress == 0) {
+        continue;
+      }
+
+      std::sort(blocks.begin(), blocks.end(),
+                [](const NativeBasicBlock &lhs,
+                   const NativeBasicBlock &rhs) { return lhs.Start < rhs.Start; });
+      std::string name = functionNameFor(context, module, functionUuid);
+      state.addFunctionSeed(entryAddress, rangeEnd - rangeStart, name,
+                            "gtirb-ddisasm",
+                            NativeFunctionConfidence::High);
+      NativeFunction function;
+      function.Entry = entryAddress;
+      function.RangeStart = rangeStart;
+      function.RangeEnd = rangeEnd;
+      function.Name = std::move(name);
+      function.Blocks = std::move(blocks);
+      function.Source = "gtirb-ddisasm";
+      if (state.addFunction(std::move(function))) {
+        ++functionCount;
+        blockCount += blocksIterator->second.size();
+      }
+    }
+  }
+
+  static void importCfgEdges(NativeProgramState &state,
+                             const gtirb::Module &module,
+                             uint64_t &edgeCount) {
+    const gtirb::CFG &cfg = module.getIR()->getCFG();
+    for (const auto &[entry, function] : state.functions()) {
+      (void)entry;
+      for (const NativeBasicBlock &block : function.Blocks) {
+        const gtirb::CodeBlock *gtirbBlock = nullptr;
+        for (const gtirb::CodeBlock &candidate : module.code_blocks()) {
+          if (candidate.getAddress() &&
+              static_cast<uint64_t>(*candidate.getAddress()) == block.Start) {
+            gtirbBlock = &candidate;
+            break;
+          }
+        }
+        if (gtirbBlock == nullptr) {
+          continue;
+        }
+
+        std::vector<uint64_t> successors;
+        for (auto [successorNode, label] :
+             gtirb::cfgSuccessors(cfg, gtirbBlock)) {
+          if (!label || !gtirb::CodeBlock::classof(successorNode)) {
+            continue;
+          }
+          const auto &[conditional, direct, type] = *label;
+          (void)conditional;
+          (void)direct;
+          const gtirb::CodeBlock *successor =
+              static_cast<const gtirb::CodeBlock *>(successorNode);
+          if (!successor->getAddress()) {
+            continue;
+          }
+          uint64_t target = static_cast<uint64_t>(*successor->getAddress());
+          if (type == gtirb::EdgeType::Branch ||
+              type == gtirb::EdgeType::Fallthrough) {
+            successors.push_back(target);
+            ++edgeCount;
+          } else if (type == gtirb::EdgeType::Call) {
+            NativeXref xref;
+            xref.From = block.Start;
+            xref.To = target;
+            xref.Kind = NativeXrefKind::Call;
+            xref.Source = "gtirb-ddisasm-call";
+            state.addXref(std::move(xref));
+          }
+        }
+        state.addBasicBlockSuccessors(function.Entry, block.Start, successors);
+      }
+    }
+  }
+
+  static uint64_t importSeedRanges(NativeProgramState &state) {
+    uint64_t imported = 0;
+    for (const auto &[entry, seed] : state.functionSeeds()) {
+      if (state.functionAt(entry) != nullptr ||
+          seed.Confidence != NativeFunctionConfidence::High ||
+          seed.RangeStart == 0 || seed.RangeEnd <= seed.RangeStart ||
+          !state.isExecutableAddress(entry) ||
+          !executableRangeContains(state, seed.RangeStart, seed.RangeEnd)) {
+        continue;
+      }
+
+      NativeBasicBlock block;
+      block.Start = seed.RangeStart;
+      block.End = seed.RangeEnd;
+
+      NativeFunction function;
+      function.Entry = entry;
+      function.RangeStart = seed.RangeStart;
+      function.RangeEnd = seed.RangeEnd;
+      function.Name = seed.PrimaryName;
+      function.Blocks.push_back(std::move(block));
+      function.Source = "gtirb-seed-range-fallback";
+      if (state.addFunction(std::move(function))) {
+        ++imported;
+      }
+    }
+    return imported;
+  }
+#endif
+};
+
 class SleighSeedInstructionAnalyzer final : public NativeAnalyzer {
 public:
   explicit SleighSeedInstructionAnalyzer(NativeSleighDecodeOptions options)
@@ -2553,6 +2845,10 @@ public:
     SleighInstructionDecoder decoder(loadImage, SpecOptions, NullErrors);
     if (!decoder.isValid()) {
       state.addNote("sleigh instruction decode skipped: engine init failed");
+      return;
+    }
+    if (Options.DecodeExistingBlocksOnly) {
+      decodeExistingBlocks(state, decoder);
       return;
     }
 
@@ -2656,6 +2952,82 @@ private:
   std::ostringstream NullErrors;
   SleighSpecOptions SpecOptions;
   NativeSleighDecodeOptions Options;
+
+  struct ExistingDecodeRange {
+    uint64_t FunctionEntry = 0;
+    uint64_t Start = 0;
+    uint64_t End = 0;
+  };
+
+  void decodeExistingBlocks(NativeProgramState &state,
+                            SleighInstructionDecoder &decoder) {
+    std::vector<ExistingDecodeRange> ranges;
+    for (const auto &[entry, function] : state.functions()) {
+      for (const NativeBasicBlock &block : function.Blocks) {
+        ranges.push_back({entry, block.Start, block.End});
+      }
+    }
+    for (const ExistingDecodeRange &range : ranges) {
+      decodeExistingBlock(state, decoder, range.FunctionEntry, range.Start,
+                          range.End);
+    }
+  }
+
+  void decodeExistingBlock(NativeProgramState &state,
+                           SleighInstructionDecoder &decoder,
+                           uint64_t functionEntry, uint64_t start,
+                           uint64_t end) {
+    if (start >= end || !state.isExecutableAddress(start)) {
+      return;
+    }
+    std::optional<uint64_t> availableBytes = executableBytesFrom(state, start);
+    if (!availableBytes || *availableBytes == 0) {
+      return;
+    }
+    uint64_t requestedBytes = std::min<uint64_t>(end - start, *availableBytes);
+    SleighInstructionDecode decode =
+        decoder.decode(start, std::numeric_limits<uint64_t>::max(),
+                       requestedBytes, NullErrors);
+    std::vector<NativeInstruction> decodedInstructions;
+    for (const SleighInstructionSummary &summary : decode.Instructions) {
+      if (summary.Address < start || summary.Address + summary.Size > end) {
+        continue;
+      }
+      NativeInstruction instruction;
+      instruction.Address = summary.Address;
+      instruction.Size = summary.Size;
+      instruction.Mnemonic = summary.Body.empty()
+                                  ? summary.Mnemonic
+                                  : summary.Mnemonic + " " + summary.Body;
+      instruction.Source = "sleigh-gtirb-block";
+      (void)readBytes(state, summary.Address, summary.Size, instruction.Bytes);
+      decodedInstructions.push_back(std::move(instruction));
+    }
+    DirectControlFlowResult flowResult =
+        collectDirectControlFlow(state, decode.Pcode);
+    annotateDecodedInstructionFlows(decodedInstructions, flowResult.FlowInfos);
+    std::vector<uint64_t> tailBranchTargets;
+    collectTailBranchTargets(state, functionEntry, decodedInstructions,
+                             tailBranchTargets);
+    for (const NativeInstruction &instruction : decodedInstructions) {
+      state.addInstruction(instruction);
+    }
+    for (const NativeXref &xref : flowResult.Xrefs) {
+      state.addXref(xref);
+    }
+    for (const NativeUnresolvedFlow &flow : flowResult.UnresolvedFlows) {
+      state.addUnresolvedFlow(flow);
+    }
+    if (!decodedInstructions.empty()) {
+      uint64_t rangeStart = decodedInstructions.front().Address;
+      uint64_t rangeEnd =
+          decodedInstructions.back().Address + decodedInstructions.back().Size;
+      std::vector<uint64_t> branchTargets;
+      addDecodedFunctionBlocks(state, functionEntry, rangeStart, rangeEnd,
+                               decodedInstructions, std::nullopt,
+                               branchTargets);
+    }
+  }
 
   static void addRelocationCodeSeeds(NativeProgramState &state) {
     for (const auto &[slot, target] : state.relocatedPointers()) {
@@ -4878,6 +5250,11 @@ std::unique_ptr<NativeAnalyzer> createElfSymbolAnalyzer() {
 
 std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer() {
   return std::make_unique<EhFrameAnalyzer>();
+}
+
+std::unique_ptr<NativeAnalyzer> createGtirbFunctionFactsAnalyzer(
+    NativeGtirbDecodeOptions options) {
+  return std::make_unique<GtirbFunctionFactsAnalyzer>(std::move(options));
 }
 
 std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
