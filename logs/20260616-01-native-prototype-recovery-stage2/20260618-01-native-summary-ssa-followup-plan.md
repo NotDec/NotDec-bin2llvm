@@ -4571,3 +4571,61 @@ python3 scripts/bench2-native-discovery-debug-check.py --build-dir build --targe
 - 实现效果：7/10。补掉一类真实 parser switch / jump table。
 - 理解成本：2/10。只多一个方向相反的 `MOV` parser。
 - 维护成本：2/10。仍然只做 exact operand，不做 alias 推断。
+
+## 实现记录：空 successor 的 indirect branch 降成 unknown tail call
+
+剩余的 `lighttpd` / `redis-cli` / `memcached` indirect branch 多数不是静态
+jump table，而是 epilogue 后的动态 tail jump 或对象 callback dispatch，例如：
+
+```text
+MOV RAX,qword ptr [RDI + 0x360]
+MOV RAX,qword ptr [RAX + 0x20]
+JMP RAX
+```
+
+这类不能伪造成固定目标。但 native block facts 已经能表达一个关键区别：
+
+- 没有 `BlockSuccessors` 记录：CFG 事实缺失，仍应报错，防止漏掉 jump table。
+- 有 `BlockSuccessors` 记录且 successor 列表为空：前端确认这是函数出口，没有本函数内
+  CFG 后继。
+
+本次改动：
+
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:993)
+  - `BRANCHIND` 在 native CFG 模式下，如果 successor facts 明确为空，就调用
+    `lowerUnknownVoidIndirectTailJump()`，而不是普通跳到 exit block。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:1716)
+  - 抽出 `createUnknownVoidIndirectCall()`，让普通 indirect call 和 unknown tail jump
+    共用 int-to-ptr call 构造。
+- [lib/PcodeToLLVM.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/PcodeToLLVM.cpp:1730)
+  - 新增 `lowerUnknownVoidIndirectTailJump()`，生成 `tail call` 后 `ret void`。
+- [tests/pcode_to_llvm_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/pcode_to_llvm_test.cpp:976)
+  - 新增 `testNativeIndirectBranchWithNoSuccessorsIsUnknownTailCall()`。
+  - 原来的 `testNativeIndirectBranchRequiresSuccessorFacts()` 保持不变，确认缺 successor
+    facts 仍然失败。
+
+验证：
+
+```text
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-unknown-tail/fortune.ll --summary-json-out /tmp/notdec-fortune-unknown-tail/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-unknown-tail/fortune.ll -o /tmp/notdec-fortune-unknown-tail/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-unknown-tail/fortune.bc -o /tmp/notdec-fortune-unknown-tail/fortune.verify.bc
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd --all-confirmed -o /tmp/notdec-lighttpd-unknown-tail/lighttpd.ll --summary-json-out /tmp/notdec-lighttpd-unknown-tail/summary.json
+```
+
+结果：
+
+- 四个本地测试通过。
+- `fortune` 完整链路通过 `llvm-as` 和 `opt -passes=verify`，耗时 `10.89 sec`。
+- `lighttpd` 完整链路跑到 summary register SSA 后失败，错误是
+  `Referring to an instruction in another function`，调用点在
+  `http_header_str_contains_token` 的签名改写附近。这个失败在 summary SSA /
+  signature rewrite 阶段，和本次 Pcode lowering 规则不是同一层；后续需要单独查。
+- 实现效果：6/10。动态 tail jump 不再被降成普通 exit block，但完整收益还要等
+  summary SSA 的 lighttpd 问题修掉后才能看。
+- 理解成本：2/10。只使用已有 block successor facts，没有新增前端事实。
+- 维护成本：2/10。仍保留缺 successor facts 报错，不掩盖 jump table 漏恢复。

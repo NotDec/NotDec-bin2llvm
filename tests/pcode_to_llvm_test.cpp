@@ -971,6 +971,48 @@ bool testNativeIndirectBranchRequiresSuccessorFacts() {
                 "missing indirect successor facts error was not reported");
 }
 
+bool testNativeIndirectBranchWithNoSuccessorsIsUnknownTailCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(branchIndOp(0x1000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_indirect_no_successors";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+  bool hasTailCall = false;
+  bool hasReturn = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+          hasTailCall |= call->isTailCall();
+        }
+        hasReturn |= llvm::isa<llvm::ReturnInst>(&instruction);
+      }
+    }
+  }
+
+  return expect(module != nullptr,
+                "native indirect branch with empty successors should lower") &&
+         expect(function != nullptr,
+                "empty indirect successor function is missing") &&
+         expect(hasTailCall,
+                "empty indirect successor did not lower as tail call") &&
+         expect(hasReturn,
+                "empty indirect successor did not return after tail call") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after empty indirect successor");
+}
+
 bool testNativeIndirectBranchLowersMultipleSuccessorsAsSwitch() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -1040,6 +1082,7 @@ int main() {
   ok &= testNativeConditionalSuccessorsRejectMultipleFalseTargets();
   ok &= testNativeIndirectBranchCanUseSingleSuccessor();
   ok &= testNativeIndirectBranchRequiresSuccessorFacts();
+  ok &= testNativeIndirectBranchWithNoSuccessorsIsUnknownTailCall();
   ok &= testNativeIndirectBranchLowersMultipleSuccessorsAsSwitch();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -990,6 +990,9 @@ private:
           Builder.CreateBr(successors.front().second);
           return true;
         }
+        if (successors.empty()) {
+          return lowerUnknownVoidIndirectTailJump(op.Inputs[0]);
+        }
         if (!successors.empty()) {
           llvm::Value *target = resize(read(op.Inputs[0]), 8);
           auto *switchInst = Builder.CreateSwitch(target, exitBlock(),
@@ -1710,13 +1713,24 @@ private:
     return Builder.CreateCall(callee, {});
   }
 
-  bool lowerUnknownVoidIndirectCall(const VarnodeView &target) {
+  llvm::CallInst *createUnknownVoidIndirectCall(const VarnodeView &target) {
     auto *calleeType =
         llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
     auto *calleePointer =
         Builder.CreateIntToPtr(resize(read(target), 8),
                                llvm::PointerType::getUnqual(Context));
-    Builder.CreateCall(calleeType, calleePointer, {});
+    return Builder.CreateCall(calleeType, calleePointer, {});
+  }
+
+  bool lowerUnknownVoidIndirectCall(const VarnodeView &target) {
+    createUnknownVoidIndirectCall(target);
+    return true;
+  }
+
+  bool lowerUnknownVoidIndirectTailJump(const VarnodeView &target) {
+    llvm::CallInst *call = createUnknownVoidIndirectCall(target);
+    call->setTailCallKind(llvm::CallInst::TCK_Tail);
+    Builder.CreateRetVoid();
     return true;
   }
 
