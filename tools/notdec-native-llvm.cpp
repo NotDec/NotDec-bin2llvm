@@ -466,6 +466,9 @@ bool writeSummaryJson(const notdec::bin2llvm::NativeProgramState &state,
          << ",\n";
   output << "    \"indirect branch\": "
          << unresolvedFlowCounts[NativeUnresolvedFlowKind::IndirectBranch]
+         << ",\n";
+  output << "    \"indirect tail branch\": "
+         << unresolvedFlowCounts[NativeUnresolvedFlowKind::IndirectTailBranch]
          << "\n";
   output << "  },\n";
   output << "  \"notes\": " << state.notes().size() << "\n";

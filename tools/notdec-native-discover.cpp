@@ -428,6 +428,10 @@ void printSummaryJson(std::ostream &output,
   output << "    \"" << toString(NativeUnresolvedFlowKind::IndirectBranch)
          << "\": "
          << unresolvedFlowCounts[NativeUnresolvedFlowKind::IndirectBranch]
+         << ",\n";
+  output << "    \""
+         << toString(NativeUnresolvedFlowKind::IndirectTailBranch) << "\": "
+         << unresolvedFlowCounts[NativeUnresolvedFlowKind::IndirectTailBranch]
          << "\n";
   output << "  }\n";
   output << "}\n";

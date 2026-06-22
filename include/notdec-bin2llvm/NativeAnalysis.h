@@ -137,6 +137,7 @@ std::string toString(NativeXrefKind kind);
 enum class NativeUnresolvedFlowKind {
   IndirectCall,
   IndirectBranch,
+  IndirectTailBranch,
 };
 
 std::string toString(NativeUnresolvedFlowKind kind);

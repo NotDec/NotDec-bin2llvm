@@ -3758,7 +3758,8 @@ public:
     Output << "    total: " << state.unresolvedFlows().size() << '\n';
     for (NativeUnresolvedFlowKind kind :
          {NativeUnresolvedFlowKind::IndirectCall,
-          NativeUnresolvedFlowKind::IndirectBranch}) {
+          NativeUnresolvedFlowKind::IndirectBranch,
+          NativeUnresolvedFlowKind::IndirectTailBranch}) {
       Output << "    " << toString(kind) << ": "
              << unresolvedFlowCounts[kind] << '\n';
     }
@@ -3976,15 +3977,46 @@ public:
         normalizeBlockSuccessors(state, function, block);
       }
     }
+    classifyIndirectTailExits(state);
     recoverExternalFunctionPointerFlows(state);
   }
 
 private:
+  static void classifyIndirectTailExits(NativeProgramState &state) {
+    std::vector<NativeUnresolvedFlow> unresolvedFlows = state.unresolvedFlows();
+    for (const NativeUnresolvedFlow &flow : unresolvedFlows) {
+      if (flow.Kind != NativeUnresolvedFlowKind::IndirectBranch) {
+        continue;
+      }
+
+      const NativeFunction *function = state.functionContaining(flow.Address);
+      if (function == nullptr) {
+        continue;
+      }
+      const NativeBasicBlock *block =
+          functionBlockContaining(*function, flow.Address);
+      const NativeInstruction *instruction = state.instructionAt(flow.Address);
+      if (block == nullptr || instruction == nullptr ||
+          instruction->FlowKind != NativeInstructionFlowKind::IndirectBranch ||
+          instruction->end() != block->End || block->End != function->RangeEnd ||
+          !block->Successors.empty()) {
+        continue;
+      }
+
+      NativeUnresolvedFlow tail = flow;
+      tail.Kind = NativeUnresolvedFlowKind::IndirectTailBranch;
+      tail.Source = "native-block-indirect-tail-exit";
+      state.removeUnresolvedFlow(flow.Address, flow.Kind);
+      state.addUnresolvedFlow(std::move(tail));
+    }
+  }
+
   static void recoverExternalFunctionPointerFlows(NativeProgramState &state) {
     std::vector<NativeUnresolvedFlow> unresolvedFlows = state.unresolvedFlows();
     for (const NativeUnresolvedFlow &flow : unresolvedFlows) {
       if (flow.Kind != NativeUnresolvedFlowKind::IndirectBranch &&
-          flow.Kind != NativeUnresolvedFlowKind::IndirectCall) {
+          flow.Kind != NativeUnresolvedFlowKind::IndirectCall &&
+          flow.Kind != NativeUnresolvedFlowKind::IndirectTailBranch) {
         continue;
       }
 
@@ -4234,6 +4266,8 @@ std::string toString(NativeUnresolvedFlowKind kind) {
     return "indirect call";
   case NativeUnresolvedFlowKind::IndirectBranch:
     return "indirect branch";
+  case NativeUnresolvedFlowKind::IndirectTailBranch:
+    return "indirect tail branch";
   }
   return "unknown";
 }

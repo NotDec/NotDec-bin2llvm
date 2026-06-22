@@ -4629,3 +4629,73 @@ build/bin/native_register_summary_ssa_test
   summary SSA 的 lighttpd 问题修掉后才能看。
 - 理解成本：2/10。只使用已有 block successor facts，没有新增前端事实。
 - 维护成本：2/10。仍保留缺 successor facts 报错，不掩盖 jump table 漏恢复。
+
+## 实现记录：把函数末尾动态 indirect branch 分成 tail-exit kind
+
+上一节让 lowering 能消费“空 successor 的 `BRANCHIND`”。但 discovery 统计里仍把两类问题混在一起：
+
+- `indirect branch`：可能是还没恢复出来的 jump table。
+- 函数末尾的动态 tail jump：目标来自对象、callback、vtable 或函数参数，不能静态展开。
+
+本次只做事实分类，不恢复动态目标。规则保持保守：
+
+- unresolved flow 必须原来是 `IndirectBranch`。
+- 指令必须是 block 末尾的 `IndirectBranch`。
+- block 必须是函数最后一个 block，即 `block.End == function.RangeEnd`。
+- block successor 必须为空。
+
+满足这些条件才改成 `IndirectTailBranch`。函数中间的 `BRANCHIND` 继续保留为
+`IndirectBranch`，避免掩盖漏掉的 jump table。
+
+本次改动：
+
+- [include/notdec-bin2llvm/NativeAnalysis.h](/sn640/NotDec/external/NotDec-bin2llvm/include/notdec-bin2llvm/NativeAnalysis.h:137)
+  - `NativeUnresolvedFlowKind` 新增 `IndirectTailBranch`。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:3985)
+  - `FlowFactNormalizer::classifyIndirectTailExits()` 根据最终 block 的空 successor facts
+    做重分类。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:4014)
+  - `recoverExternalFunctionPointerFlows()` 接受 `IndirectTailBranch`，外部函数指针 tail
+    jump 仍可继续恢复 xref。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:4263)
+  - `toString(NativeUnresolvedFlowKind)` 输出 `indirect tail branch`。
+- [tools/notdec-native-discover.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-discover.cpp:422)
+  - unresolved JSON 统计新增 `indirect tail branch`。
+- [tools/notdec-native-llvm.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tools/notdec-native-llvm.cpp:462)
+  - native summary JSON 统计新增 `indirect tail branch`。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:85)
+  - 新增 unresolved kind 字符串测试。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:157)
+  - 新增最终 block indirect branch 重分类测试。
+- [tests/native_analysis_facts_test.cpp](/sn640/NotDec/external/NotDec-bin2llvm/tests/native_analysis_facts_test.cpp:224)
+  - 新增函数中间 indirect branch 不重分类测试。
+
+验证：
+
+```text
+build/bin/native_analysis_facts_test
+build/bin/pcode_to_llvm_test
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-discover --unresolved-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk
+/usr/bin/time -f 'elapsed %e' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-tailkind/fortune.ll --summary-json-out /tmp/notdec-fortune-tailkind/summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-tailkind/fortune.ll -o /tmp/notdec-fortune-tailkind/fortune.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-tailkind/fortune.bc -o /tmp/notdec-fortune-tailkind/fortune.verify.bc
+```
+
+结果：
+
+- `lighttpd` unresolved：`indirect call=106`，`indirect branch=6`，
+  `indirect tail branch=1`。`0x2704d` 被分到 tail exit。
+- `redis-cli` unresolved：`indirect call=131`，`indirect branch=2`，
+  `indirect tail branch=1`。`0x17ebd` 被分到 tail exit。
+- `memcached` 仍是 `indirect call=49`，`indirect branch=2`；两个样例不是最终
+  block，暂不重分类。
+- `wrk` 仍是 `indirect call=30`，没有 unresolved branch。
+- `fortune` 完整链路通过 `llvm-as` 和 `opt -passes=verify`，耗时 `10.69 sec`。
+- 实现效果：5/10。没有恢复更多目标，但把“待恢复 CFG 分支”和“动态 tail exit”分开了。
+- 理解成本：2/10。新增一个 kind，分类规则集中在 `FlowFactNormalizer`。
+- 维护成本：2/10。规则保守，不改变 jump table 恢复路径。

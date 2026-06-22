@@ -82,6 +82,21 @@ bool testInstructionFlowKindStrings() {
   return ok;
 }
 
+bool testUnresolvedFlowKindStrings() {
+  using notdec::bin2llvm::NativeUnresolvedFlowKind;
+  using notdec::bin2llvm::toString;
+
+  bool ok = true;
+  ok &= expectEqual(toString(NativeUnresolvedFlowKind::IndirectCall),
+                    "indirect call", "indirect call unresolved kind");
+  ok &= expectEqual(toString(NativeUnresolvedFlowKind::IndirectBranch),
+                    "indirect branch", "indirect branch unresolved kind");
+  ok &= expectEqual(toString(NativeUnresolvedFlowKind::IndirectTailBranch),
+                    "indirect tail branch",
+                    "indirect tail branch unresolved kind");
+  return ok;
+}
+
 bool testFlowNormalizerMovesNonCfgTargetToTail(const char *argv0) {
   auto binary = parseSelfBinary(argv0);
   if (!binary) {
@@ -136,6 +151,144 @@ bool testFlowNormalizerMovesNonCfgTargetToTail(const char *argv0) {
                          normalized->TailFlowTargets.front() == externalTarget,
                      "non-CFG branch target was not marked tail");
   }
+  return ok;
+}
+
+bool testFlowNormalizerClassifiesFinalIndirectBranchTailExit(
+    const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base + 0x40;
+  uint64_t branchAddress = entry + 0x08;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = branchAddress + 0x02;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, function.RangeEnd, {}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add final indirect branch function\n";
+    return false;
+  }
+
+  state.addInstruction(makeInstruction(
+      entry, 0x08, notdec::bin2llvm::NativeInstructionFlowKind::None));
+  state.addInstruction(makeInstruction(
+      branchAddress, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::IndirectBranch));
+
+  notdec::bin2llvm::NativeUnresolvedFlow flow;
+  flow.Address = branchAddress;
+  flow.Kind = notdec::bin2llvm::NativeUnresolvedFlowKind::IndirectBranch;
+  flow.Source = "native-analysis-facts-test";
+  state.addUnresolvedFlow(std::move(flow));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  bool sawTailExit = false;
+  bool sawPlainIndirectBranch = false;
+  for (const notdec::bin2llvm::NativeUnresolvedFlow &candidate :
+       state.unresolvedFlows()) {
+    if (candidate.Address != branchAddress) {
+      continue;
+    }
+    sawTailExit |=
+        candidate.Kind ==
+        notdec::bin2llvm::NativeUnresolvedFlowKind::IndirectTailBranch;
+    sawPlainIndirectBranch |=
+        candidate.Kind ==
+        notdec::bin2llvm::NativeUnresolvedFlowKind::IndirectBranch;
+  }
+
+  bool ok = true;
+  ok &= expectTrue(sawTailExit,
+                   "final indirect branch was not classified as tail exit");
+  ok &= expectTrue(!sawPlainIndirectBranch,
+                   "final indirect branch kept plain unresolved kind");
+  return ok;
+}
+
+bool testFlowNormalizerKeepsMiddleIndirectBranchUnresolved(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base + 0x60;
+  uint64_t branchAddress = entry + 0x08;
+  uint64_t afterBranch = entry + 0x20;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = afterBranch + 0x02;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, branchAddress + 0x02, {}});
+  function.Blocks.push_back({afterBranch, afterBranch + 0x02, {}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add middle indirect branch function\n";
+    return false;
+  }
+
+  state.addInstruction(makeInstruction(
+      entry, 0x08, notdec::bin2llvm::NativeInstructionFlowKind::None));
+  state.addInstruction(makeInstruction(
+      branchAddress, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::IndirectBranch));
+  state.addInstruction(makeInstruction(
+      afterBranch, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::Return));
+
+  notdec::bin2llvm::NativeUnresolvedFlow flow;
+  flow.Address = branchAddress;
+  flow.Kind = notdec::bin2llvm::NativeUnresolvedFlowKind::IndirectBranch;
+  flow.Source = "native-analysis-facts-test";
+  state.addUnresolvedFlow(std::move(flow));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  bool sawPlainIndirectBranch = false;
+  bool sawTailExit = false;
+  for (const notdec::bin2llvm::NativeUnresolvedFlow &candidate :
+       state.unresolvedFlows()) {
+    if (candidate.Address != branchAddress) {
+      continue;
+    }
+    sawPlainIndirectBranch |=
+        candidate.Kind ==
+        notdec::bin2llvm::NativeUnresolvedFlowKind::IndirectBranch;
+    sawTailExit |=
+        candidate.Kind ==
+        notdec::bin2llvm::NativeUnresolvedFlowKind::IndirectTailBranch;
+  }
+
+  bool ok = true;
+  ok &= expectTrue(sawPlainIndirectBranch,
+                   "middle indirect branch lost unresolved kind");
+  ok &= expectTrue(!sawTailExit,
+                   "middle indirect branch was classified as tail exit");
   return ok;
 }
 
@@ -601,7 +754,10 @@ int main(int argc, char **argv) {
   }
   bool ok = true;
   ok &= testInstructionFlowKindStrings();
+  ok &= testUnresolvedFlowKindStrings();
   ok &= testFlowNormalizerMovesNonCfgTargetToTail(argv[0]);
+  ok &= testFlowNormalizerClassifiesFinalIndirectBranchTailExit(argv[0]);
+  ok &= testFlowNormalizerKeepsMiddleIndirectBranchUnresolved(argv[0]);
   ok &= testFlowNormalizerFillsDecodedBlockHole(argv[0]);
   ok &= testFlowNormalizerDoesNotJoinMissingBlocksWithoutFallthrough(argv[0]);
   ok &= testBasicBlockSuccessorsRequireBlockStarts(argv[0]);
