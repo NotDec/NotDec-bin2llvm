@@ -4699,3 +4699,63 @@ build/bin/native_register_summary_ssa_test
 - 实现效果：5/10。没有恢复更多目标，但把“待恢复 CFG 分支”和“动态 tail exit”分开了。
 - 理解成本：2/10。新增一个 kind，分类规则集中在 `FlowFactNormalizer`。
 - 维护成本：2/10。规则保守，不改变 jump table 恢复路径。
+
+## 依赖记录：准备切到 ddisasm / GTIRB frontend
+
+本阶段目标调整为：停止继续补 internal facts 规则，把现有 native decode/facts
+封装为 `internal` 模式；新增默认 `gtirb` 模式，使用 ddisasm 生成的 GTIRB 作为
+反汇编、函数划分和 CFG 结果。Sleigh low-pcode 以及后续 LLVM lowering 暂不改变。
+
+本次只安装和验证外部依赖，没有改 bin2llvm 代码：
+
+- 删除弃用目录 `/sn640/gtirb2llvm`。
+- clone GTIRB 到 `/sn640/gtirb`，安装 C++ API 到 `/usr/local`：
+  - `/usr/local/lib/gtirb/gtirbConfig.cmake`
+  - `/usr/local/lib/libgtirb.so`
+- clone `gtirb-pprinter` 到 `/sn640/gtirb-pprinter`，安装到 `/usr/local`：
+  - `/usr/local/lib/gtirb_pprinter/gtirb_pprinterConfig.cmake`
+  - `/usr/local/bin/gtirb-pprinter`
+- clone Capstone 5.0.9 到 `/sn640/capstone`，安装到 `/usr/local`：
+  - `/usr/local/bin/cstool`
+  - `/usr/local/lib/libcapstone.a`
+- clone `libehp` 到 `/sn640/libehp`，构建后手动安装：
+  - `/usr/local/lib/libehp.so`
+  - `/usr/local/include/ehp.hpp`
+- clone LIEF 0.16.6 到 `/sn640/LIEF-0.16.6`，安装到 `/usr/local`：
+  - `/usr/local/lib/cmake/LIEF/LIEFConfig.cmake`
+  - `/usr/local/lib/libLIEF.a`
+- clone ddisasm 源码已有 `/sn640/ddisasm`，按 x86_64-only 构建并安装：
+  - `/usr/local/bin/ddisasm`
+
+中间判断：
+
+- ddisasm 当前源码和 LIEF 0.17.6 的 PE API 不兼容，所以改用 ddisasm CMake 要求的
+  LIEF 0.16.6。
+- `gtirb-pprinter` 用 `cstool -v` 检查 Capstone 版本；GrammaTech fork 当前输出
+  `5.0.0`，低于要求，所以使用官方 Capstone `5.0.9`。
+- ddisasm 生成的 Souffle C++ 编译很慢，x86_64-only Release 构建里
+  `souffle_disasm_x86_64.cpp` 单文件编译约数分钟，峰值内存约 6GB。
+
+验证：
+
+```text
+/usr/local/bin/ddisasm --version
+/usr/local/bin/gtirb-pprinter --version
+/usr/local/bin/cstool -v
+/usr/local/bin/ddisasm /bin/true --ir /tmp/notdec-ddisasm-smoke/true.gtirb
+```
+
+结果：
+
+- `ddisasm`：`1.9.5 (6fd978cd 2026-06-22) X64`
+- `gtirb-pprinter`：`2.2.5 (3587fbc 2026-06-22)`
+- `cstool`：`v5.0.9`，`x86=1`
+- `/bin/true` 成功生成 `/tmp/notdec-ddisasm-smoke/true.gtirb`，大小 `43K`。
+
+下一步：
+
+- bin2llvm 增加可选 GTIRB 依赖。
+- 当前 native discovery pipeline 保留为 `internal` 模式。
+- 新增 `gtirb` 模式，先读取 GTIRB 的 `functionEntries`、`functionBlocks`、
+  `functionNames` 和 CFG edge，填充现有 `NativeProgramState`。
+- `gtirb` 模式作为默认；`internal` 模式只保留对照和兜底。
