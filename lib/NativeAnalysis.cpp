@@ -2546,38 +2546,46 @@ public:
 
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
 #if NOTDEC_BIN2LLVM_ENABLE_GTIRB
+    auto importGtirb = [&](const std::filesystem::path &gtirbPath,
+                           const char *source) -> bool {
+      std::ifstream input(gtirbPath, std::ios::binary);
+      if (!input) {
+        state.addNote(std::string("gtirb frontend could not open ") + source +
+                      ": " + gtirbPath.string());
+        return false;
+      }
+
+      gtirb::Context context;
+      gtirb_pprint::registerAuxDataTypes();
+      gtirb::ErrorOr<gtirb::IR *> loaded = gtirb::IR::load(context, input);
+      if (!loaded) {
+        state.addNote(std::string("gtirb frontend load failed from ") + source +
+                      ": " + loaded.getError().message());
+        return false;
+      }
+
+      uint64_t functionCount = 0;
+      uint64_t blockCount = 0;
+      uint64_t edgeCount = 0;
+      for (gtirb::Module &module : (*loaded)->modules()) {
+        importFunctions(state, context, module, functionCount, blockCount);
+        importCfgEdges(state, module, edgeCount);
+      }
+      uint64_t fallbackCount = importSeedRanges(state);
+      state.addNote("gtirb frontend imported from " + std::string(source) +
+                    ": " + std::to_string(functionCount) + " functions, " +
+                    std::to_string(blockCount) + " blocks, " +
+                    std::to_string(edgeCount) + " cfg edges, " +
+                    std::to_string(fallbackCount) +
+                    " seed-range fallbacks");
+      return true;
+    };
+
     std::optional<std::filesystem::path> gtirbPath = resolveGtirbPath(state);
     if (!gtirbPath) {
       return;
     }
-
-    std::ifstream input(*gtirbPath, std::ios::binary);
-    if (!input) {
-      state.addNote("gtirb frontend could not open: " + gtirbPath->string());
-      return;
-    }
-
-    gtirb::Context context;
-    gtirb_pprint::registerAuxDataTypes();
-    gtirb::ErrorOr<gtirb::IR *> loaded = gtirb::IR::load(context, input);
-    if (!loaded) {
-      state.addNote("gtirb frontend load failed: " +
-                    loaded.getError().message());
-      return;
-    }
-
-    uint64_t functionCount = 0;
-    uint64_t blockCount = 0;
-    uint64_t edgeCount = 0;
-    for (gtirb::Module &module : (*loaded)->modules()) {
-      importFunctions(state, context, module, functionCount, blockCount);
-      importCfgEdges(state, module, edgeCount);
-    }
-    uint64_t fallbackCount = importSeedRanges(state);
-    state.addNote("gtirb frontend imported " + std::to_string(functionCount) +
-                  " functions, " + std::to_string(blockCount) +
-                  " blocks, " + std::to_string(edgeCount) + " cfg edges, " +
-                  std::to_string(fallbackCount) + " seed-range fallbacks");
+    (void)importGtirb(*gtirbPath, "gtirb");
 #else
     (void)state;
     state.addNote("gtirb frontend unavailable: rebuild with GTIRB");
@@ -2619,11 +2627,27 @@ private:
                           shellQuote(Options.ElfPath) + " --ir " +
                           shellQuote(output.string()) + " >/dev/null 2>/dev/null";
     int exitCode = std::system(command.c_str());
-    if (exitCode != 0 || !std::filesystem::exists(output)) {
-      state.addNote("gtirb frontend ddisasm failed for: " + Options.ElfPath);
-      return std::nullopt;
+    if (exitCode == 0 && std::filesystem::exists(output)) {
+      return output;
     }
-    return output;
+
+    std::filesystem::path fallback =
+        std::filesystem::temp_directory_path() /
+        ("notdec-" +
+         std::to_string(std::hash<std::string>{}(Options.ElfPath)) +
+         "-no-analysis.gtirb");
+    command = shellQuote(Options.DdisasmPath) + " --no-analysis " +
+              shellQuote(Options.ElfPath) + " --ir " +
+              shellQuote(fallback.string()) + " >/dev/null 2>/dev/null";
+    exitCode = std::system(command.c_str());
+    if (exitCode == 0 && std::filesystem::exists(fallback)) {
+      state.addNote("gtirb frontend ddisasm fell back to no-analysis for: " +
+                    Options.ElfPath);
+      return fallback;
+    }
+
+    state.addNote("gtirb frontend ddisasm failed for: " + Options.ElfPath);
+    return std::nullopt;
   }
 
 #if NOTDEC_BIN2LLVM_ENABLE_GTIRB

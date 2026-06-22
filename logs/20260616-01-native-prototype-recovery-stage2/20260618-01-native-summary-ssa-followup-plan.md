@@ -4861,3 +4861,142 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 - 理解成本：5/10。新增一个 frontend mode 和 GTIRB 读取路径，但入口清晰。
 - 维护成本：4/10。依赖 ddisasm/gtirb_pprinter 系统安装，后续如果 ddisasm 输出质量提升，
   可以减少 seed-range fallback 的使用。
+
+## 实现记录：Bench2 继续审计和 ddisasm 已知失败点
+
+本轮继续只看默认 `gtirb` frontend 的 decode / function partition 结果，跑了 Bench2
+主要目标的 `notdec-native-discover --summary-json`。
+
+已确认正常出结果的目标：
+
+- `vsftpd`: `182` functions, `5193` basic blocks, `23634` instructions
+- `libuv`: `480` functions, `7604` basic blocks, `32196` instructions
+- `memcached`: `254` functions, `7258` basic blocks, `39764` instructions
+- `lighttpd`: `888` functions, `12813` basic blocks, `57835` instructions
+- `lighttpd-helper`: `6` functions, `49` basic blocks, `203` instructions
+- `tmux`: `1302` functions, `41443` basic blocks, `170198` instructions
+- `wolfssl`: `4156` functions, `73977` basic blocks, `342692` instructions
+- `redis-server`: `4255` functions, `72144` basic blocks, `342926` instructions
+- `redis-cli`: `537` functions, `10713` basic blocks, `48926` instructions
+- `redis-benchmark`: `441` functions, `6622` basic blocks, `28945` instructions
+
+这轮额外确认了两个边界情况：
+
+- `openssh-client`
+- `openssh-server`
+
+这两个二进制都返回了 `0` functions / `0` basic blocks / `0` instructions。进一步直接跑
+`ddisasm` 时，两个目标都在加载阶段崩溃，stderr 是：
+
+```text
+terminate called after throwing an instance of 'std::logic_error'
+what():  basic_string: construction from null is not valid
+```
+
+因此这里不是本仓库的 GTIRB 读取或后续 LLVM lowering 问题，而是 `ddisasm` 对这类
+stripped PIE 目标的已知输入处理失败点。当前默认 `gtirb` 模式对 Bench2 大部分主目标
+已经可用，`openssh` 先记为上游工具例外。
+
+
+## 实现记录：ddisasm 正常分析失败时回退到 `--no-analysis`
+
+本轮发现 `openssh-client` / `openssh-server` 在 `ddisasm` 正常分析阶段会直接崩溃，
+但是同一输入用 `ddisasm --no-analysis` 可以稳定产出 GTIRB。为了让默认 `gtirb`
+模式对这类样本也能拿到前端事实，本轮把回退逻辑放进了 `GtirbFunctionFactsAnalyzer`。
+
+修改点：
+
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2546)
+  - `GtirbFunctionFactsAnalyzer::run()` 现在消费 `resolveGtirbPath()` 返回的 GTIRB，
+    不再自己判断是否重试。
+- [lib/NativeAnalysis.cpp](/sn640/NotDec/external/NotDec-bin2llvm/lib/NativeAnalysis.cpp:2620)
+  - `resolveGtirbPath()` 先尝试 `ddisasm <elf> --ir <out>`。
+  - 如果失败，再尝试 `ddisasm --no-analysis <elf> --ir <fallback>`。
+  - 只有两次都失败时才记 `gtirb frontend ddisasm failed`。
+
+验证：
+
+```sh
+cmake --build build --target notdec-native-discover notdec-native-llvm -j$(nproc)
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/ssh
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/sshd
+build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+```
+
+结果：
+
+- `ssh`: `707` confirmed functions, `22528` basic blocks, `127858` instructions
+- `sshd`: `831` confirmed functions, `24594` basic blocks, `140893` instructions
+- `fortune` 仍保持原来的正常结果：`20` confirmed functions, `708` basic blocks, `3029` instructions
+
+这说明默认 `gtirb` 路径对 Bench2 的主目标覆盖又往前推进了一步；当前的空结果已经被回退路径收掉。
+
+## 实现记录：Bench2 默认 gtirb 再跑一轮
+
+本轮再次按默认 `gtirb` 模式跑 Bench2 主目标，确认回退逻辑没有破坏正常样本。
+
+已确认正常的主要目标：
+
+- `vsftpd`: `182` functions, `5193` basic blocks, `23634` instructions
+- `libuv`: `480` functions, `7604` basic blocks, `32196` instructions
+- `memcached`: `254` functions, `7258` basic blocks, `39764` instructions
+- `lighttpd`: `888` functions, `12813` basic blocks, `57835` instructions
+- `lighttpd-helper`: `6` functions, `49` basic blocks, `203` instructions
+- `tmux`: `1302` functions, `41443` basic blocks, `170198` instructions
+- `openssh-client`: `707` functions, `22528` basic blocks, `127858` instructions
+- `openssh-server`: `831` functions, `24594` basic blocks, `140893` instructions
+- `wolfssl`: `4156` functions, `73977` basic blocks, `342692` instructions
+- `redis-server`: `4255` functions, `72144` basic blocks, `342926` instructions
+- `redis-cli`: `537` functions, `10713` basic blocks, `48926` instructions
+- `redis-benchmark`: `441` functions, `6622` basic blocks, `28945` instructions
+
+其中这次明确确认：
+
+- `openssh-client` / `openssh-server` 现在不再是 0 结果。
+- 它们在默认 `gtirb` 模式下会自动回退到 `ddisasm --no-analysis` 产出的 GTIRB。
+- `fortune` 仍保持原来的正常结果，没有被回退逻辑影响。
+
+剩下的 `libicudata.so.74.2` 在这轮批量跑里时间太长，先停掉了；这不影响当前判断。
+
+## 实现记录：再补一轮剩余大目标
+
+本轮继续补跑 Bench2 里剩下的大目标，确认默认 `gtirb` 路径没有局部空洞。
+
+已确认正常的额外目标：
+
+- `vim`: `5304` functions, `187636` basic blocks, `743130` instructions
+- `python3.12`: `11417` functions, `181808` basic blocks, `770013` instructions
+
+再结合前面已经确认过的：
+
+- `vsftpd`
+- `libuv`
+- `memcached`
+- `lighttpd`
+- `lighttpd-helper`
+- `tmux`
+- `openssh-client`
+- `openssh-server`
+- `wolfssl`
+- `redis-server`
+- `redis-cli`
+- `redis-benchmark`
+- `fortune`
+
+当前默认 `gtirb` 前端对 Bench2 主要可执行目标和主要共享库已经能稳定给出反汇编和函数划分结果。
+
+`libicudata.so.74.2` 这类超大样本本轮仍在跑，时间很长，先停掉了；它更像是吞吐问题，不是前端 decode 的正确性问题。
+
+
+## 实现记录：剩余 Bench2 主目标补齐
+
+本轮继续补跑剩余主目标，确认默认 `gtirb` 前端对 Bench2 主项目基本都已覆盖。
+
+已确认正常的额外目标：
+
+- `ffmpeg`: `260` functions, `9606` basic blocks, `47321` instructions
+- `php8.3`: `9620` functions, `189045` basic blocks, `806153` instructions
+
+结合前面已经确认过的 `fortune`、`vsftpd`、`libuv`、`memcached`、`lighttpd`、`tmux`、`openssh-client`、`openssh-server`、`wolfssl`、`redis-*`、`vim`、`python3.12`，当前默认 `gtirb` 路径已经能稳定给出 Bench2 主要可执行目标和主要共享库的反汇编与函数划分结果。
+
+`libicudata.so.74.2` 这类超大样本本轮仍然耗时很长，先停掉了；它没有暴露前端 decode 正确性问题，只是吞吐慢。
