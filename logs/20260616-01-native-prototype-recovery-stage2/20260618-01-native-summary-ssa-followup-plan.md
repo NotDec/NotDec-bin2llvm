@@ -5329,3 +5329,52 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 - 实现效果：8/10，vararg 实参现在能保住，不再只剩固定头部。
 - 复杂度：4/10，只改了 call 参数收集和重写两处。
 - 维护成本：4/10，规则还是按 ABI 输入顺序收集，后续好查。
+
+## 实现记录：补齐 glibc vararg external
+
+上一轮先修了 vararg external 的实参保留逻辑，但 `vsftpd` 里 `__isoc99_sscanf` 和 `__syslog_chk` 还没有进入 known prototype 表，所以仍被当成普通 6 参数 fixed external。现在可以安全补上，因为 vararg rewrite 已经能保留额外 ABI 实参。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:141-152`
+  - `knownExternalPrototypes()` 新增：
+    - `__isoc99_sscanf`: 2 个固定参数 + vararg
+    - `__syslog_chk`: 2 个固定参数 + vararg
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1068-1075`
+  - `removeDeadStoresByLiveness()` 删除普通死 store 时，也检查 `storedValue` 是否已经被记录成 call arg。
+  - 这补上一个边界：同一个临时值如果同时喂给 vararg call 和另一个死寄存器 store，删除那个非 call-arg store 时不能递归删掉这个临时值。
+- `tests/native_register_summary_ssa_test.cpp:781-864`
+  - `testKnownVarArgExternalKeepsAbiInputs()` 改成表驱动，覆盖 `__isoc99_sscanf`、`__snprintf_chk`、`__syslog_chk`。
+- `tests/native_register_summary_ssa_test.cpp:866-875`
+  - `testRecordedCallArgValueSurvivesDeadStoreCleanup()` 增加一个共享同一临时值的额外死寄存器 store，覆盖非 call-arg store 误删 call arg value 的情况。
+- `tests/native_register_summary_ssa_test.cpp:1463-1464`
+  - 对应测试仍接在 `main()` 中。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j$(nproc)`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-vararg3.ll --summary-json-out /tmp/fortune-vararg3.summary.json`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/vsftpd --all-confirmed -o /tmp/vsftpd-vararg3.ll --summary-json-out /tmp/vsftpd-vararg3.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-vararg3.ll -o /tmp/fortune-vararg3.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-vararg3.bc -o /tmp/fortune-vararg3.verify.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/vsftpd-vararg3.ll -o /tmp/vsftpd-vararg3.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/vsftpd-vararg3.bc -o /tmp/vsftpd-vararg3.verify.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `fortune` 运行时间：`elapsed 8.67`。
+- `vsftpd` 运行时间：`elapsed 83.58`。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- `vsftpd` 当前输出：
+  - `declare i64 @__isoc99_sscanf(i64, i64, ...)`
+  - `call i64 (i64, i64, ...) @__isoc99_sscanf(i64 ..., i64 ..., i64 ..., i64 ..., i64 ...)`
+  - `declare void @__syslog_chk(i64, i64, ...)`
+  - `tail call void (i64, i64, ...) @__syslog_chk(i64 6, i64 2, i64 130471, i64 %RAX.ret166, i64 0, i64 %R9.clobber933)`
+
+评分：
+
+- 实现效果：8/10，两个真实 glibc vararg external 现在不再伪装成 fixed 6 参数。
+- 复杂度：3/10，只补 known 表和一个保活边界。
+- 维护成本：3/10，沿用上一轮 vararg rewrite 机制。

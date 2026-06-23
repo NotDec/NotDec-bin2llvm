@@ -140,6 +140,7 @@ knownExternalPrototypes() {
       {"__fdelt_chk", {1, false, false}},
       {"__fprintf_chk", {3, true, false}},
       {"__isoc23_strtol", {3, false, false}},
+      {"__isoc99_sscanf", {2, true, false}},
       {"__memcpy_chk", {4, false, false}},
       {"__memset_chk", {4, false, false}},
       {"__printf_chk", {2, true, false}},
@@ -148,6 +149,7 @@ knownExternalPrototypes() {
       {"__strcat_chk", {3, false, false}},
       {"__strcpy_chk", {3, false, false}},
       {"__strncpy_chk", {4, false, false}},
+      {"__syslog_chk", {2, true, false}},
       {"__stack_chk_fail", {0, false, true}},
       {"__tls_get_addr", {1, false, false}},
       {"__vasprintf_chk", {3, true, false}},
@@ -1065,7 +1067,8 @@ private:
     }
     for (llvm::StoreInst *store : deadStores) {
       llvm::Value *storedValue = store->getValueOperand();
-      bool keepStoredValue = isRecordedCallArgStore(store);
+      bool keepStoredValue =
+          isRecordedCallArgStore(store) || isRecordedCallArgValue(storedValue);
       store->eraseFromParent();
       if (!keepStoredValue) {
         if (auto *storedInst = llvm::dyn_cast<llvm::Instruction>(storedValue)) {
