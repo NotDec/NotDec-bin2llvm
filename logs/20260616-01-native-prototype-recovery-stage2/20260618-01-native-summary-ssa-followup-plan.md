@@ -6041,3 +6041,39 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：4/10，redis-cli 中一批明显 6 参数 external 被收窄。
 - 复杂度：1/10，只扩表和测试。
 - 维护成本：3/10，表继续增长；同时发现 tmux 默认 native 生成存在需要后续定位的长耗时问题。
+
+## 实现记录：ffmpeg fixed external arity 继续补齐
+
+`ffmpeg` 的当前 native 输出里还有几处很明显的固定参数 external 仍按 6 个 ABI 参数声明，主要是 `av_freep`、`av_packet_free`、`av_strerror`、`av_usleep`。这几个都能从本地头文件或常见 libavutil API 直接确认，适合继续收窄。`av_log` 这类 vararg 先不动。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:253,394,485,527`
+  - 在 `knownExternalPrototypes()` 中新增 `av_freep`, `av_packet_free`, `av_strerror`, `av_usleep`。
+- `tests/native_register_summary_ssa_test.cpp:770,866,931,1072`
+  - 扩展 `testKnownFixedExternalArities()`，覆盖这 4 个新增 fixed arity。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/ffmpeg --all-confirmed -o /tmp/notdec-ffmpeg-current2.ll --summary-json-out /tmp/notdec-ffmpeg-current2.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-ffmpeg-current2.ll -o /tmp/notdec-ffmpeg-current2.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-ffmpeg-current2.bc -o /tmp/notdec-ffmpeg-current2.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `ffmpeg` 运行时间：`elapsed 164.74`。
+- `ffmpeg` 和 LLVM 22 `llvm-as` / `opt -passes=verify` 均通过。
+- `ffmpeg` 输出中这几个声明已收窄为：
+  - `declare i64 @av_usleep(i64)`
+  - `declare i64 @av_packet_free(i64)`
+  - `declare void @av_strerror(i64, i64, i64)`
+  - `declare { i64, i64 } @av_freep(i64)`
+
+评分：
+
+- 实现效果：5/10，ffmpeg 中一批明显 6 参数 external 被收窄。
+- 复杂度：1/10，只扩表和测试。
+- 维护成本：2/10，都是明确固定签名，审查成本低。
