@@ -67,18 +67,21 @@ llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
   return global;
 }
 
-void attachTestAbi(llvm::Module &module) {
+void attachTestAbiWithInputs(llvm::Module &module,
+                             std::initializer_list<llvm::StringRef> inputs) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__summary_ssa_test";
   abi.StackPointerRegister = "RSP";
   abi.StackPointerSpace = "register";
 
-  notdec::bin2llvm::NativeAbiParamEntry input;
-  input.MinSize = 1;
-  input.MaxSize = 8;
-  input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
-  input.Storage.Name = "RDI";
-  abi.Inputs.push_back(input);
+  for (llvm::StringRef name : inputs) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 1;
+    input.MaxSize = 8;
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = name.str();
+    abi.Inputs.push_back(input);
+  }
 
   notdec::bin2llvm::NativeAbiParamEntry output;
   output.MinSize = 1;
@@ -102,6 +105,10 @@ void attachTestAbi(llvm::Module &module) {
   }
 
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
+void attachTestAbi(llvm::Module &module) {
+  attachTestAbiWithInputs(module, {"RDI"});
 }
 
 llvm::StoreInst *storeRegister(llvm::IRBuilder<> &builder,
@@ -548,6 +555,97 @@ bool testAbiInputStoreBeforeCallIsKept() {
                 "ABI input store before call was not collected") &&
          expect(callRewritten, "ABI input call was not rewritten") &&
          verifyOk(module, "module failed verifier after call input test");
+}
+
+bool testKnownZeroArgExternalDropsAbiInputs() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-zero-arg-external", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "random", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "known_zero_arg_call", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 42),
+                "RDI");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::CallInst *call = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      if (candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "random") {
+        call = candidate;
+      }
+    }
+  }
+
+  return expect(call != nullptr, "known zero-arg external call missing") &&
+         expect(call->arg_empty(),
+                "known zero-arg external kept ABI arguments") &&
+         expect(summary.DeadStoresRemoved == 1,
+                "dead ABI store before zero-arg external was not removed") &&
+         verifyOk(module,
+                  "module failed verifier after zero-arg external rewrite");
+}
+
+bool testKnownFixedArgExternalTruncatesAbiInputs() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-fixed-arg-external", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "lseek", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "known_fixed_arg_call", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                "RDX");
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 4),
+                "RCX");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::CallInst *call = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      if (candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "lseek") {
+        call = candidate;
+      }
+    }
+  }
+
+  return expect(call != nullptr, "known fixed-arg external call missing") &&
+         expect(call->arg_size() == 3,
+                "known fixed-arg external used wrong arity") &&
+         expect(summary.DeadStoresRemoved == 4,
+                "dead ABI stores before fixed-arg external were not removed") &&
+         verifyOk(module,
+                  "module failed verifier after fixed-arg external rewrite");
 }
 
 bool testInternalSignatureRewriteUsesArgsAndReturn() {
@@ -1022,6 +1120,8 @@ int main() {
   ok &= testOverwrittenStoreIsRemoved();
   ok &= testCrossBlockDeadStoreIsRemoved();
   ok &= testAbiInputStoreBeforeCallIsKept();
+  ok &= testKnownZeroArgExternalDropsAbiInputs();
+  ok &= testKnownFixedArgExternalTruncatesAbiInputs();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testForeignArgumentInMovedBodyIsReplaced();

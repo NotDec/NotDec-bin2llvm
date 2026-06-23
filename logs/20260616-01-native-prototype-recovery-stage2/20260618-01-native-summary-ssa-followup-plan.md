@@ -5114,3 +5114,41 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 
 - 旧 `module-all.check.log` 里的 duplicate function name error 已经过时，不是当前代码状态。
 - 这条线暂时不需要改 lowering，只需要继续盯真正会导致失败 bodies 的点。
+
+## 实现记录：fortune external call arity 收窄
+
+这次继续看 summary 链路的 external call rewrite。`fortune` 当前已经能把 ABI register value 改成 LLVM call operand，但已知 libc 函数缺少 arity 时，会把无关 ABI 输入也带进调用，比如旧输出里 `random` / `sleep` / `lseek` 会多带后续寄存器参数。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:130-223`
+  - 在 `knownExternalPrototypes()` 里新增：
+    - `lseek`: 3 个固定参数
+    - `lseek64`: 3 个固定参数
+    - `random`: 0 个固定参数
+    - `sleep`: 1 个固定参数
+- `tests/native_register_summary_ssa_test.cpp:67-111`
+  - 把测试 ABI helper 拆成 `attachTestAbiWithInputs(...)` 和默认 `attachTestAbi(...)`，方便测试多个 ABI 输入寄存器。
+- `tests/native_register_summary_ssa_test.cpp:560-649`
+  - 新增 `testKnownZeroArgExternalDropsAbiInputs()`，确认 `random()` 不保留 RDI。
+  - 新增 `testKnownFixedArgExternalTruncatesAbiInputs()`，确认 `lseek` 只保留 RDI/RSI/RDX，不保留 RCX。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j$(nproc)`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-current-3.ll --summary-json-out /tmp/fortune-current-3.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-current-3.ll -o /tmp/fortune-current-3.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-current-3.bc -o /tmp/fortune-current-3.verify.bc`
+
+结果：
+
+- `fortune` 运行时间：`elapsed 8.54`
+- 当前 IR 中：
+  - `declare void @random()`
+  - `call void @random()`
+  - `declare void @lseek(i64, i64, i64)`
+  - `call void @lseek(i64 %99, i64 %unique_4b80_8, i64 0)`
+  - `declare void @sleep(i64)`
+  - `call void @sleep(i64 %RDX.summary_ssa2210)`
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
