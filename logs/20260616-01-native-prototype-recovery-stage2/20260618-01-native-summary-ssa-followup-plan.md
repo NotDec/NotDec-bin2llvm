@@ -6312,3 +6312,43 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：3/10，补掉一个有头文件依据的 glibc helper。
 - 复杂度：1/10，只补 fixed arity 表和测试。
 - 维护成本：1/10，`__vsnprintf_chk` 原型稳定。
+
+## 实现记录：补齐 memcached 的 `SSL_CTX_ctrl`
+
+`memcached` 当前输出里 `SSL_CTX_ctrl` 仍按未知 external 扩成 6 个 ABI 参数。
+本地 `/usr/include/openssl/ssl.h:1967` 中它是 4 个固定参数：
+`long SSL_CTX_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)`。
+这次只补 OpenSSL 已有原型表中的这一项。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:494`
+  - 在 `knownExternalPrototypes()` 中新增 `SSL_CTX_ctrl`，fixed arity 为 4。
+- `tests/native_register_summary_ssa_test.cpp:942`
+  - 扩展 `testKnownFixedExternalArities()`，覆盖 `SSL_CTX_ctrl`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed -o /tmp/notdec-memcached-ssl-ctx-ctrl.ll --summary-json-out /tmp/notdec-memcached-ssl-ctx-ctrl.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-memcached-ssl-ctx-ctrl.ll -o /tmp/notdec-memcached-ssl-ctx-ctrl.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-memcached-ssl-ctx-ctrl.bc -o /tmp/notdec-memcached-ssl-ctx-ctrl.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-ssl-ctx-ctrl.ll --summary-json-out /tmp/fortune-ssl-ctx-ctrl.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-ssl-ctx-ctrl.ll -o /tmp/fortune-ssl-ctx-ctrl.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-ssl-ctx-ctrl.bc -o /tmp/fortune-ssl-ctx-ctrl.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `memcached` 运行时间：`elapsed 124.74`，改前同口径为 `elapsed 124.35`。
+- `fortune` 运行时间：`elapsed 8.94`，仍在当前 8 秒多范围。
+- `memcached` 和 `fortune` 都通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `memcached` 输出中目标声明从 6 参数收窄为：
+  - `declare void @SSL_CTX_ctrl(i64, i64, i64, i64)`
+
+评分：
+
+- 实现效果：3/10，补掉一个有头文件依据的 OpenSSL helper。
+- 复杂度：1/10，只补 fixed arity 表和测试。
+- 维护成本：1/10，`SSL_CTX_ctrl` 原型稳定。

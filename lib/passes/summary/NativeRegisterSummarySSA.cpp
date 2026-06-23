@@ -491,6 +491,7 @@ knownExternalPrototypes() {
       {"SSL_clear", {1, false}},
       {"SSL_connect", {1, false}},
       {"SSL_CTX_check_private_key", {1, false}},
+      {"SSL_CTX_ctrl", {4, false}},
       {"SSL_CTX_load_verify_locations", {3, false}},
       {"SSL_CTX_new", {1, false}},
       {"SSL_CTX_sess_set_new_cb", {2, false}},

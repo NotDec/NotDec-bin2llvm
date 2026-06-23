@@ -939,6 +939,7 @@ bool testKnownFixedExternalArities() {
       {"SSL_clear", 1},
       {"SSL_connect", 1},
       {"SSL_CTX_check_private_key", 1},
+      {"SSL_CTX_ctrl", 4},
       {"SSL_CTX_load_verify_locations", 3},
       {"SSL_CTX_new", 1},
       {"SSL_CTX_sess_set_new_cb", 2},
