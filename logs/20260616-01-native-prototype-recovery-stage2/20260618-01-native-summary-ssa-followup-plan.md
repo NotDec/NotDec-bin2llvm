@@ -5712,3 +5712,50 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
   - `call void @execvp(i64 %unique_df00_899, i64 %RSI.arg)`
 - `fortune` 运行时间：`elapsed 8.60`，未见性能退化。
 - `lighttpd-angel` 和 `fortune` 的 LLVM 22 `llvm-as`、`opt -passes=verify` 均通过。
+
+## 实现记录：wrk libc/POSIX arity 补齐
+
+`/usr/bin/wrk` 当前 native 链路可以跑完并通过 LLVM 22。输出里 `strtoul`、`getopt_long`、`epoll_create` 仍按 6 个 ABI 参数声明；这些函数都能从本地系统头文件直接确认固定参数数，适合补进 summary 链路的 known prototype。Lua 和 OpenSSL 符号这次不动，因为还需要确认目标环境版本和宏语义。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:197`
+  - 在 `knownExternalPrototypes()` 中新增 `epoll_create`: 1 参数。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:253`
+  - 在 `knownExternalPrototypes()` 中新增 `getopt_long`: 5 参数。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:488`
+  - 在 `knownExternalPrototypes()` 中新增 `strtoul`: 3 参数。
+- `tests/native_register_summary_ssa_test.cpp:738`
+  - 扩展 `testKnownFixedExternalArities`，覆盖 `epoll_create`。
+- `tests/native_register_summary_ssa_test.cpp:761`
+  - 扩展 `testKnownFixedExternalArities`，覆盖 `getopt_long`。
+- `tests/native_register_summary_ssa_test.cpp:899`
+  - 扩展 `testKnownFixedExternalArities`，覆盖 `strtoul`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk --all-confirmed -o /tmp/wrk-arity.ll --summary-json-out /tmp/wrk-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/wrk-arity.ll -o /tmp/wrk-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/wrk-arity.bc -o /tmp/wrk-arity.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-wrk-arity.ll --summary-json-out /tmp/fortune-wrk-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-wrk-arity.ll -o /tmp/fortune-wrk-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-wrk-arity.bc -o /tmp/fortune-wrk-arity.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `wrk` 运行时间：`elapsed 45.17`。
+- `fortune` 运行时间：`elapsed 8.41`，未见性能退化。
+- `wrk` 和 `fortune` 的 LLVM 22 `llvm-as`、`opt -passes=verify` 均通过。
+- `wrk` 输出中这批声明已经收窄：
+  - `declare i64 @strtoul(i64, i64, i64)`
+  - `declare { i64, i64 } @getopt_long(i64, i64, i64, i64, i64)`
+  - `declare i64 @epoll_create(i64)`
+
+评分：
+
+- 实现效果：4/10，只处理 wrk 中证据明确的三个标准函数。
+- 复杂度：1/10，只扩充 known prototype 表和固定 arity 单测。
+- 维护成本：2/10，新增项都是本地头文件可确认的固定签名。
