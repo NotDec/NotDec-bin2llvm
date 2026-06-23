@@ -771,6 +771,7 @@ bool testKnownFixedExternalArities() {
       {"fgetc", 1},
       {"fileno", 1},
       {"fopen64", 2},
+      {"fputs", 2},
       {"fsync", 1},
       {"fstat", 2},
       {"fstatfs64", 2},
@@ -1185,7 +1186,8 @@ bool testMismatchedDirectCallUseUsesReturnExtract() {
   auto *calleeType =
       llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
   llvm::Function *callee = llvm::Function::Create(
-      calleeType, llvm::GlobalValue::ExternalLinkage, "strlen", module);
+      calleeType, llvm::GlobalValue::ExternalLinkage, "unknown_external",
+      module);
   auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
   llvm::Function *function = llvm::Function::Create(
       type, llvm::GlobalValue::ExternalLinkage, "uses_direct_call_result",
@@ -1208,7 +1210,7 @@ bool testMismatchedDirectCallUseUsesReturnExtract() {
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
     if (candidate == nullptr || candidate->getCalledFunction() == nullptr ||
-        candidate->getCalledFunction()->getName() != "strlen") {
+        candidate->getCalledFunction()->getName() != "unknown_external") {
       continue;
     }
     hasStructCall = candidate->getType()->isStructTy();
@@ -1227,6 +1229,75 @@ bool testMismatchedDirectCallUseUsesReturnExtract() {
                 "old direct call use was not replaced by extract") &&
          verifyOk(module,
                   "module failed verifier after direct call use rewrite");
+}
+
+bool testKnownExternalUsesSingleIntegerReturn() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-external-single-return", context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_external_single_return_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  notdec::bin2llvm::NativeAbiParamEntry input;
+  input.MinSize = 1;
+  input.MaxSize = 8;
+  input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  input.Storage.Name = "RDI";
+  abi.Inputs.push_back(input);
+  for (llvm::StringRef name : {"RAX", "RDX"}) {
+    notdec::bin2llvm::NativeAbiParamEntry output;
+    output.MinSize = 1;
+    output.MaxSize = 8;
+    output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    output.Storage.Name = name.str();
+    abi.Outputs.push_back(output);
+
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = name.str();
+    abi.Effects.push_back(killed);
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "fclose", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "uses_fclose_rdx_after",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *raxLoad = loadRegister(builder, rax, "RAX", "rax.after");
+  llvm::LoadInst *rdxLoad = loadRegister(builder, rdx, "RDX", "rdx.after");
+  builder.CreateRet(builder.CreateAdd(raxLoad, rdxLoad));
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::CallInst *call = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (candidate != nullptr && candidate->getCalledFunction() != nullptr &&
+        candidate->getCalledFunction()->getName() == "fclose") {
+      call = candidate;
+    }
+  }
+
+  return expect(call != nullptr, "known external fclose call missing") &&
+         expect(call->getType()->isIntegerTy(64),
+                "known external fclose was widened to a multi-register return") &&
+         verifyOk(module,
+                  "module failed verifier after known external return rewrite");
 }
 
 bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
@@ -1890,6 +1961,7 @@ int main() {
   ok &= testKnownFixedExternalArities();
   ok &= testKnownVarArgExternalKeepsAbiInputs();
   ok &= testMismatchedDirectCallUseUsesReturnExtract();
+  ok &= testKnownExternalUsesSingleIntegerReturn();
   ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
   ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();

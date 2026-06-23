@@ -6113,3 +6113,78 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：5/10，ffmpeg 中一批明显 6 参数 external 被收窄。
 - 复杂度：1/10，只扩表和测试。
 - 维护成本：2/10，都是明确固定签名，审查成本低。
+
+
+## 实现记录：ffmpeg stdio 外部符号回归覆盖
+
+这次重新检查 `ffmpeg` 的当前 native 输出，确认 `fputs` 已经能收窄成 2 参数，但 `testKnownFixedExternalArities()` 没覆盖这个已知 stdio fixed arity。这里补测试覆盖，避免后续表项回退。
+
+改动点：
+
+- `tests/native_register_summary_ssa_test.cpp:774`
+  - 扩展 `testKnownFixedExternalArities()`，覆盖 `fputs`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/ffmpeg --all-confirmed -o /tmp/notdec-ffmpeg-current3.ll --summary-json-out /tmp/notdec-ffmpeg-current3.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-ffmpeg-current3.ll -o /tmp/notdec-ffmpeg-current3.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-ffmpeg-current3.bc -o /tmp/notdec-ffmpeg-current3.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `ffmpeg` 运行时间：`elapsed 167.33`。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- `ffmpeg` 输出里 `fputs` 已收窄为 `declare void @fputs(i64, i64)`。
+
+评分：
+
+- 实现效果：2/10，只补一个已存在 fixed arity 的回归覆盖。
+- 复杂度：1/10，只补测试。
+- 维护成本：1/10，这类 fixed arity 很稳定。
+
+## 实现记录：限制 known external 返回寄存器扩张
+
+`ffmpeg` 当前输出里 `fclose` 被重写成 `declare { i64, i64 } @fclose(i64)`，原因是 SummarySSA 看到 call 后读取了 `RDX`，就把 known external 的返回签名扩张成 `RAX/RDX` 双返回。`stdio.h` 中 `fclose` 是 `int fclose(FILE *)`，只应使用主整数返回寄存器。未知 external 仍保留原来的宽松多返回逻辑，known external 默认最多只收一个整数返回寄存器。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:91-95`
+  - `KnownExternalPrototype` 增加 `MaxReturnRegisters`，默认值为 `1`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1089-1115`
+  - `addDemandedExternalReturns()` 对 known external 限制最多接受 `MaxReturnRegisters` 个 ABI 返回寄存器。
+  - `NoReturn` 仍按 0 个返回寄存器处理。
+  - 未知 external 不设置限制，继续允许按实际 demand 扩张多返回。
+- `tests/native_register_summary_ssa_test.cpp:1188-1213`
+  - 把多返回 direct-use 回归用例从 `strlen` 改为 `unknown_external`，避免和 known external 的新限制冲突。
+- `tests/native_register_summary_ssa_test.cpp:1234-1300`
+  - 新增 `testKnownExternalUsesSingleIntegerReturn()`，复现 `fclose` 后读取 `RAX/RDX` 的情况，确认 known external 不会被扩张成 struct 返回。
+- `tests/native_register_summary_ssa_test.cpp:1964`
+  - 接入新增回归测试。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/ffmpeg --all-confirmed -o /tmp/notdec-ffmpeg-return-limit.ll --summary-json-out /tmp/notdec-ffmpeg-return-limit.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-ffmpeg-return-limit.ll -o /tmp/notdec-ffmpeg-return-limit.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-ffmpeg-return-limit.bc -o /tmp/notdec-ffmpeg-return-limit.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-return-limit.ll --summary-json-out /tmp/fortune-return-limit.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-return-limit.ll -o /tmp/fortune-return-limit.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-return-limit.bc -o /tmp/fortune-return-limit.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `ffmpeg` 运行时间：`elapsed 169.81`。
+- `fortune` 运行时间：`elapsed 8.94`，和前面 8 秒多同档。
+- `ffmpeg` 和 `fortune` 都通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `ffmpeg` 输出里 `fclose` 从 `declare { i64, i64 } @fclose(i64)` 收回为 `declare i64 @fclose(i64)`。
+
+评分：
+
+- 实现效果：6/10，修掉 known external 返回值过宽的问题，`ffmpeg` 中 `fclose` 语义更准。
+- 复杂度：2/10，只在 known external 返回收集处增加上限。
+- 维护成本：3/10，默认单整数返回适合当前表里绝大多数 known external；以后遇到真实多寄存器返回 API 再显式放宽。

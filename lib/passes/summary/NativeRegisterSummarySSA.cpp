@@ -92,6 +92,7 @@ struct KnownExternalPrototype {
   unsigned FixedArgs = 0;
   bool VarArg = false;
   bool NoReturn = false;
+  unsigned MaxReturnRegisters = 1;
 };
 
 struct SignatureShape {
@@ -1085,8 +1086,20 @@ void addDemandedExternalReturns(
     if (state.CallArgs.count(call) == 0) {
       state.CallArgs.emplace(call, std::vector<CallArgStoreBinding>{});
     }
+    std::optional<unsigned> maxReturnRegisters;
+    auto knownIt = knownExternalPrototypes().find(callee->getName());
+    if (knownIt != knownExternalPrototypes().end()) {
+      maxReturnRegisters =
+          knownIt->second.NoReturn ? 0 : knownIt->second.MaxReturnRegisters;
+    }
+    unsigned returnIndex = 0;
     for (const std::string &name : abi.OutputsInOrder) {
+      if (maxReturnRegisters.has_value() &&
+          returnIndex >= *maxReturnRegisters) {
+        break;
+      }
       if (helpers.count(name) == 0) {
+        ++returnIndex;
         continue;
       }
       bool alreadyPresent = false;
@@ -1099,6 +1112,7 @@ void addDemandedExternalReturns(
           shapeIt->second.Returns.push_back(unit);
         }
       }
+      ++returnIndex;
     }
   }
 }
