@@ -278,6 +278,22 @@ SummarySSA value binding -> callsite operand
   - 目标 JSON 现在可以稳定 lowering，LLVM 22 verifier 通过。
   - `notdec-heritage-llvm` 这次处理耗时约 `0.03s`，没有明显退化。
 
+### 2026-06-23：补齐 heritage lowering 的前向 unique 定义 materialize
+
+- 背景：`wolfssl/shared-library/module-all.lower.log` 里仍有少量函数因为 `read unmodeled varnode` 走 poison fallback，典型样例是 `sp_sqr` 里 `SUBPIECE` 先读到了同一 block 后面才定义的 `unique` 临时。
+- 修改：
+  - `lib/HeritageToLLVM.cpp:348-349`，构造函数里预先建立 `DefOpByOutput`。
+  - `lib/HeritageToLLVM.cpp:678-689`，函数 `read(...)`
+  - `lib/HeritageToLLVM.cpp:2095-2188`，新增 `isPureMaterializableOp(...)` 和 `tryMaterializePureDef(...)`，并让 `lowerBlock(...)` 记住已经 lowered 的 op，避免重复执行。
+  - `tests/heritage_to_llvm_test.cpp:1-99`，新增前向定义回归测试。
+  - `CMakeLists.txt:255-270`，新增 `heritage_to_llvm_test` 和对应 `ctest` 项。
+- 结果：
+  - `build/bin/heritage_to_llvm_test` 通过。
+  - `ctest --test-dir build -R 'notdec\\.heritage_to_llvm\\.forward_defs|notdec\\.pcode_to_llvm\\.cfg|notdec\\.native_register_summary\\.ssa' --output-on-failure` 通过。
+  - `build/bin/notdec-heritage-module-llvm /sn640/NotDec-Exp/Bench2/bin2llvm-ir/dynamic-libs/wolfssl/shared-library/module-all.json -o /tmp/notdec-wolfssl-module-all.ll` 成功，`failed function bodies: 0`。
+  - 对应 LLVM 22 `llvm-as` / `opt -passes=verify` 通过。
+  - `wolfssl/shared-library` 这次整模块 lowering 耗时约 `204.00s`，比旧日志里的失败状态多走了一步，但没有把函数体失败留在最终结果里。
+
 - stack 参数。
 - varargs 精确恢复。
 - partial register 精细建模。

@@ -348,6 +348,11 @@ public:
           context, module, registerInfosForHeritageProgram(program), false);
       Registers = OwnedRegisters.get();
     }
+    for (const HeritageOp &op : Program.Ops) {
+      if (op.Output) {
+        DefOpByOutput.emplace(*op.Output, &op);
+      }
+    }
   }
 
   bool lower(std::string &errorMessage) {
@@ -677,6 +682,11 @@ private:
     }
     if (llvm::Value *value = readAddressTiedInput(Builder, *varnode)) {
       return value;
+    }
+    if (tryMaterializePureDef(id)) {
+      if (auto it = Values.find(id); it != Values.end()) {
+        return resize(it->second, varnode->Size);
+      }
     }
 
     warnPoisonFallback("read unmodeled varnode " + describeVarnode(*varnode));
@@ -2085,22 +2095,80 @@ private:
     return false;
   }
 
+  bool isPureMaterializableOp(const HeritageOp &op) const {
+    if (!op.Output) {
+      return false;
+    }
+    const HeritageVarnode *output = varnodeFor(*op.Output);
+    if (output == nullptr || output->Space != "unique") {
+      return false;
+    }
+    return op.Mnemonic == "COPY" || op.Mnemonic == "INT_ADD" ||
+           op.Mnemonic == "INT_SUB" || op.Mnemonic == "INT_MULT" ||
+           op.Mnemonic == "INT_AND" || op.Mnemonic == "INT_OR" ||
+           op.Mnemonic == "INT_XOR" || op.Mnemonic == "INT_LEFT" ||
+           op.Mnemonic == "INT_RIGHT" || op.Mnemonic == "INT_SRIGHT" ||
+           op.Mnemonic == "INT_DIV" || op.Mnemonic == "INT_SDIV" ||
+           op.Mnemonic == "INT_REM" || op.Mnemonic == "INT_SREM" ||
+           op.Mnemonic == "INT_SLESSEQUAL" || op.Mnemonic == "INT_SLESS" ||
+           op.Mnemonic == "INT_LESSEQUAL" || op.Mnemonic == "INT_LESS" ||
+           op.Mnemonic == "INT_EQUAL" || op.Mnemonic == "INT_NOTEQUAL" ||
+           op.Mnemonic == "INT_CARRY" || op.Mnemonic == "INT_SCARRY" ||
+           op.Mnemonic == "INT_SBORROW" || op.Mnemonic == "POPCOUNT" ||
+           op.Mnemonic == "LZCOUNT" || op.Mnemonic == "INT_ZEXT" ||
+           op.Mnemonic == "INT_SEXT" || op.Mnemonic == "BOOL_NEGATE" ||
+           op.Mnemonic == "INT_NEGATE" || op.Mnemonic == "INT_2COMP" ||
+           op.Mnemonic == "BOOL_AND" || op.Mnemonic == "BOOL_OR" ||
+           op.Mnemonic == "BOOL_XOR" || op.Mnemonic == "SUBPIECE" ||
+           op.Mnemonic == "PIECE" || op.Mnemonic == "PTRADD" ||
+           op.Mnemonic == "PTRSUB" || op.Mnemonic == "INSERT" ||
+           op.Mnemonic == "EXTRACT" || op.Mnemonic == "ZPULL" ||
+           op.Mnemonic == "SPULL";
+  }
+
+  bool tryMaterializePureDef(const std::string &id) {
+    auto defIt = DefOpByOutput.find(id);
+    if (defIt == DefOpByOutput.end() || CurrentOp == nullptr) {
+      return false;
+    }
+    const HeritageOp *def = defIt->second;
+    if (def == nullptr || def->Parent != CurrentOp->Parent ||
+        LoweredOps.count(def->Id) != 0 || MaterializingOps.count(def->Id) != 0 ||
+        !isPureMaterializableOp(*def)) {
+      return false;
+    }
+
+    MaterializingOps.insert(def->Id);
+    const HeritageOp *saved = CurrentOp;
+    CurrentOp = def;
+    std::string ignoredError;
+    bool ok = lowerOp(*def, ignoredError);
+    CurrentOp = saved;
+    MaterializingOps.erase(def->Id);
+    if (!ok) {
+      return false;
+    }
+    LoweredOps.insert(def->Id);
+    return Values.count(id) != 0;
+  }
+
   bool lowerBlock(const HeritageBlock &block, std::string &errorMessage) {
     for (const std::string &opId : block.Ops) {
       const HeritageOp *op = Program.OpById.at(opId);
-      if (op->Mnemonic == "MULTIEQUAL") {
+      if (op->Mnemonic == "MULTIEQUAL" && LoweredOps.count(op->Id) == 0) {
         CurrentOp = op;
         bool ok = lowerPhi(*op, errorMessage);
         CurrentOp = nullptr;
         if (!ok) {
           return false;
         }
+        LoweredOps.insert(op->Id);
       }
     }
 
     for (const std::string &opId : block.Ops) {
       const HeritageOp *op = Program.OpById.at(opId);
-      if (op->Mnemonic == "MULTIEQUAL") {
+      if (op->Mnemonic == "MULTIEQUAL" || LoweredOps.count(op->Id) != 0) {
         continue;
       }
       if (op->Mnemonic == "BRANCH" || op->Mnemonic == "CBRANCH" ||
@@ -2116,6 +2184,7 @@ private:
       if (!ok) {
         return false;
       }
+      LoweredOps.insert(op->Id);
     }
 
     if (!block.Out.empty()) {
@@ -2147,6 +2216,9 @@ private:
   std::unordered_map<std::string, llvm::MDNode *> EffectMetadataByOpId;
   std::unordered_map<std::string, std::vector<PendingIndirectMetadata>>
       PendingIndirectsByEffect;
+  std::unordered_map<std::string, const HeritageOp *> DefOpByOutput;
+  std::unordered_set<std::string> LoweredOps;
+  std::unordered_set<std::string> MaterializingOps;
   std::unordered_set<std::string> PoisonFallbackWarnings;
   std::unordered_set<std::string> MissingParameterWarnings;
   std::vector<PendingPhi> PendingPhis;

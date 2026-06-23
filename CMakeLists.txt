@@ -255,6 +255,21 @@ if (BUILD_TESTING)
       pcode_to_llvm_test
   )
 
+  add_executable(heritage_to_llvm_test
+    tests/heritage_to_llvm_test.cpp
+  )
+
+  target_link_libraries(heritage_to_llvm_test
+    PRIVATE
+      notdec-bin2llvm-core
+  )
+
+  add_test(
+    NAME notdec.heritage_to_llvm.forward_defs
+    COMMAND
+      heritage_to_llvm_test
+  )
+
   if (TARGET notdec-bin2llvm-native)
     add_executable(native_analysis_facts_test
       tests/native_analysis_facts_test.cpp
