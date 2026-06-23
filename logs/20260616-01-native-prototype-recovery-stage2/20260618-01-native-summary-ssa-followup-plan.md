@@ -259,6 +259,25 @@ SummarySSA value binding -> callsite operand
 
 这一轮不做：
 
+## 实现记录
+
+### 2026-06-23：修复 heritage lowering 的 PHI 插入位置
+
+- 背景：Bench2 的 `php/one-zm_info_date.lower.log` 里出现 verifier 失败，报的是 `PHI nodes not grouped at top of basic block` 和 `Instruction does not dominate all uses`。
+- 修改：
+  - `lib/HeritageToLLVM.cpp:1584-1591`，函数 `lowerPhi(...)`
+  - 把 `MULTIEQUAL` 生成的 LLVM `PHI` 改为显式插到目标 block 的 `getFirstNonPHIIt()` 前面，避免被普通指令挤到 PHI 区之后。
+  - 新增一条简短注释，说明这里必须保持 PHI 分组。
+- 验证：
+  - `cmake --build build --target pcode_to_llvm_test notdec-heritage-llvm -j$(nproc)`
+  - `build/bin/pcode_to_llvm_test`
+  - `build/bin/notdec-heritage-llvm /sn640/NotDec-Exp/Bench2/bin2llvm-ir/php/one-zm_info_date.json -o /tmp/notdec-php-zm_info_date.ll`
+  - `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-php-zm_info_date.ll -o /tmp/notdec-php-zm_info_date.bc`
+  - `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-php-zm_info_date.bc -o /tmp/notdec-php-zm_info_date.verify.bc`
+- 结果：
+  - 目标 JSON 现在可以稳定 lowering，LLVM 22 verifier 通过。
+  - `notdec-heritage-llvm` 这次处理耗时约 `0.03s`，没有明显退化。
+
 - stack 参数。
 - varargs 精确恢复。
 - partial register 精细建模。

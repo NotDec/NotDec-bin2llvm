@@ -1584,8 +1584,12 @@ private:
       return false;
     }
 
-    auto *phi =
-        Builder.CreatePHI(intType(output->Size), op.Inputs.size(), *op.Output);
+    // MULTIEQUAL lowers to an LLVM PHI.  Keep it in the PHI group even if the
+    // p-code op is visited after other ops in the block.
+    llvm::IRBuilder<> phiBuilder(BlockMap.at(block->Id),
+                                 BlockMap.at(block->Id)->getFirstNonPHIIt());
+    auto *phi = phiBuilder.CreatePHI(intType(output->Size), op.Inputs.size(),
+                                     *op.Output);
     Values[*op.Output] = phi;
     PendingPhis.push_back(PendingPhi{phi, block->In, op.Inputs, output->Size});
     return true;
