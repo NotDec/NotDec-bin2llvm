@@ -60,6 +60,18 @@ notdec::bin2llvm::PcodeOpView copyFromUnknownUniqueOp(uint64_t address) {
   return op;
 }
 
+notdec::bin2llvm::PcodeOpView copyUniqueToUniqueOp(uint64_t address,
+                                                   uint64_t outputOffset,
+                                                   uint64_t inputOffset) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  op.OpcodeName = "COPY";
+  op.Output = uniqueVarnode(outputOffset, 8);
+  op.Inputs.push_back(uniqueVarnode(inputOffset, 8));
+  return op;
+}
+
 notdec::bin2llvm::PcodeOpView returnOp(uint64_t address) {
   notdec::bin2llvm::PcodeOpView op;
   op.Address = address;
@@ -850,6 +862,46 @@ bool testNativeInternalConditionalKeepsSkippedPcode() {
                 "module failed verifier after internal conditional lowering");
 }
 
+bool testNativeInternalConditionalJoinUsesPhiForPartialUniqueDef() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(relativeCbranchOp(0x1000, 2));
+  program.Ops.push_back(copyFromUnknownUniqueOp(0x1000));
+  program.Ops.push_back(copyUniqueToUniqueOp(0x1000, 0x400, 0x300));
+  program.Ops.push_back(returnOp(0x1000));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_internal_conditional_unique_join";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr,
+              "internal conditional unique join function is missing")) {
+    return false;
+  }
+
+  bool hasPhi = false;
+  for (llvm::BasicBlock &block : *function) {
+    for (llvm::Instruction &inst : block) {
+      hasPhi |= llvm::isa<llvm::PHINode>(&inst);
+    }
+  }
+
+  return expect(hasPhi,
+                "partial unique definition did not create a join PHI") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after partial unique join lowering");
+}
+
 bool testNativeInternalConditionalRequiresTrueSuccessorFact() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -1078,6 +1130,7 @@ int main() {
   ok &= testNativeRelativeConditionalRequiresNativeTargetBlock();
   ok &= testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor();
   ok &= testNativeInternalConditionalKeepsSkippedPcode();
+  ok &= testNativeInternalConditionalJoinUsesPhiForPartialUniqueDef();
   ok &= testNativeInternalConditionalRequiresTrueSuccessorFact();
   ok &= testNativeConditionalSuccessorsRejectMultipleFalseTargets();
   ok &= testNativeIndirectBranchCanUseSingleSuccessor();

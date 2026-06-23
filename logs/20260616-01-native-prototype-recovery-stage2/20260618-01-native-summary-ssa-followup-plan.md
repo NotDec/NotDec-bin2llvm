@@ -5581,3 +5581,50 @@ memcached native 链路暴露了一个 summary-SSA 自身问题：外部调用�
 - 实现效果：8/10，memcached 越过原来的 LLVM RAUW 断言，并产出可验证 IR。
 - 复杂度：3/10，只把无条件替换改成类型兼容替换，逻辑集中在 signature rewrite。
 - 维护成本：3/10，新增 helper 行为明确，后续如果要处理更多返回映射，只需要扩展这一处。
+
+## 实现记录：修复 p-code unique 在 native 内部 CFG join 的支配错误
+
+memcached 的 main（`notdec_native_6ba0`）在上一轮仍被跳过，报错是 `Instruction does not dominate all uses!`。失败 IR 里同一个 p-code `unique` 临时在多个内部前驱块各自定义，join 块却直接使用了最后一个前驱的 SSA 值，例如 `%unique_3c680_85700` 只定义在 `bb_8faf37`，但被 `bb_8faf38` 这个 17 前驱 join 块使用。
+
+改动点：
+
+- `lib/PcodeToLLVM.cpp:1082-1085`
+  - 读取缓存的 p-code varnode 时，不再直接 `resize` 后返回，而是走 `visibleCachedValue`。
+- `lib/PcodeToLLVM.cpp:1145-1227`
+  - 新增 `visibleCachedValue`、`instructionDefBlockIsDirectPred`、`instructionDominatesBlock`、`frozenPoisonAtEnd`。
+  - 当 cached unique 的定义块是当前 join 块的直接前驱，且当前块还有其它前驱时，在当前块入口创建 PHI。
+  - PHI 在定义边使用真实值，其它边使用 freeze poison，避免把单一路径上的 unique 值错误扩散到所有路径。
+- `lib/PcodeToLLVM.cpp:2050-2052`
+  - 新增 `NonDominatingReadValues` 缓存，避免同一块同一 varnode 重复创建 PHI。
+- `tests/pcode_to_llvm_test.cpp:63-73`
+  - 新增 `copyUniqueToUniqueOp` 测试 helper。
+- `tests/pcode_to_llvm_test.cpp:865-903`
+  - 新增 `testNativeInternalConditionalJoinUsesPhiForPartialUniqueDef`，复现同一 native block 内 CBRANCH 形成的内部 join。
+- `tests/pcode_to_llvm_test.cpp:1133`
+  - 接入新增回归测试。
+
+验证：
+
+- `cmake --build build --target pcode_to_llvm_test notdec-native-llvm -j2`
+- `./build/bin/pcode_to_llvm_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-unique-phi.ll --summary-json-out /tmp/fortune-unique-phi.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-unique-phi.ll -o /tmp/fortune-unique-phi.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-unique-phi.bc -o /tmp/fortune-unique-phi.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed -o /tmp/memcached-unique-phi-final2.ll --summary-json-out /tmp/memcached-unique-phi-final2.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/memcached-unique-phi-final2.ll -o /tmp/memcached-unique-phi-final2.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/memcached-unique-phi-final2.bc -o /tmp/memcached-unique-phi-final2.opt.bc`
+
+结果：
+
+- `pcode_to_llvm_test` 通过。
+- `fortune` 运行时间：`elapsed 8.62`，和前面 8.57/8.65 秒同档。
+- `memcached` 运行时间：`elapsed 118.72`。
+- `memcached` stderr 不再出现 `skip native function 0x6ba0`。
+- `/tmp/memcached-unique-phi-final2.ll` 中已生成 `define void @notdec_native_6ba0(...)`。
+- `fortune` 和 `memcached` 的 LLVM 22 `llvm-as`、`opt -passes=verify` 均通过。
+
+评分：
+
+- 实现效果：8/10，memcached main 从整函数跳过变成可生成、可汇编、可验证。
+- 复杂度：5/10，在 p-code lowering 的缓存读取处补了一层 join PHI，逻辑比普通 opcode lowering 更复杂。
+- 维护成本：5/10，后续如果要更完整处理 unique SSA，还需要把这种局部 PHI 扩展成更系统的 p-code SSA；但当前修复集中，回归测试覆盖了核心形状。

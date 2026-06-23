@@ -3,8 +3,10 @@
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -1079,7 +1081,7 @@ private:
 
     auto it = Values.find(varnodeKey(varnode));
     if (it != Values.end()) {
-      return resize(it->second, varnode.Size);
+      return visibleCachedValue(varnode, it->second);
     }
 
     if (varnode.Space == "ram") {
@@ -1138,6 +1140,90 @@ private:
       instruction->setName(valueName(varnode));
     }
     Values[varnodeKey(varnode)] = resized;
+  }
+
+  // Native CFG can split one machine instruction into several LLVM blocks.
+  // A unique temp may then be defined on one internal path and read after the
+  // paths join.  Reusing the cached SSA value directly would violate LLVM
+  // dominance, so create a local PHI that keeps the real value on defining
+  // edges and poison on edges where the temp is not defined.
+  llvm::Value *visibleCachedValue(const VarnodeView &varnode,
+                                  llvm::Value *value) {
+    llvm::Value *resized = resize(value, varnode.Size);
+    auto *instruction = llvm::dyn_cast<llvm::Instruction>(resized);
+    if (instruction == nullptr || instruction->getFunction() != &Function) {
+      return resized;
+    }
+
+    llvm::BasicBlock *block = Builder.GetInsertBlock();
+    if (block == nullptr) {
+      return resized;
+    }
+    bool directPredDef = instructionDefBlockIsDirectPred(*instruction, *block);
+    if ((!directPredDef && instructionDominatesBlock(*instruction, *block)) ||
+        (directPredDef && llvm::pred_size(block) == 1)) {
+      return resized;
+    }
+    if (llvm::pred_empty(block)) {
+      return Builder.CreateFreeze(llvm::PoisonValue::get(resized->getType()),
+                                  valueName(varnode) + ".missing");
+    }
+
+    auto key = std::make_pair(varnodeKey(varnode), block);
+    auto cached = NonDominatingReadValues.find(key);
+    if (cached != NonDominatingReadValues.end()) {
+      return cached->second;
+    }
+
+    llvm::IRBuilder<> phiBuilder(block, block->getFirstNonPHIIt());
+    llvm::PHINode *phi =
+        phiBuilder.CreatePHI(resized->getType(), llvm::pred_size(block),
+                             valueName(varnode) + ".join");
+    for (llvm::BasicBlock *pred : llvm::predecessors(block)) {
+      llvm::Value *incoming = nullptr;
+      if (pred == instruction->getParent()) {
+        incoming = resized;
+      } else if (!directPredDef && instructionDominatesBlock(*instruction,
+                                                             *pred)) {
+        incoming = resized;
+      } else {
+        incoming = frozenPoisonAtEnd(*pred, resized->getType(),
+                                     valueName(varnode) + ".missing");
+      }
+      phi->addIncoming(incoming, pred);
+    }
+    NonDominatingReadValues.emplace(key, phi);
+    return phi;
+  }
+
+  bool instructionDefBlockIsDirectPred(llvm::Instruction &instruction,
+                                       llvm::BasicBlock &block) {
+    for (llvm::BasicBlock *pred : llvm::predecessors(&block)) {
+      if (pred == instruction.getParent()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool instructionDominatesBlock(llvm::Instruction &instruction,
+                                 llvm::BasicBlock &block) {
+    if (instruction.getParent() == &block) {
+      llvm::Instruction *terminator = block.getTerminator();
+      return terminator == nullptr || instruction.comesBefore(terminator);
+    }
+    llvm::DominatorTree domTree(Function);
+    return domTree.dominates(instruction.getParent(), &block);
+  }
+
+  llvm::Value *frozenPoisonAtEnd(llvm::BasicBlock &block, llvm::Type *type,
+                                 llvm::Twine name) {
+    llvm::Instruction *terminator = block.getTerminator();
+    if (terminator == nullptr) {
+      return llvm::PoisonValue::get(type);
+    }
+    llvm::IRBuilder<> builder(terminator);
+    return builder.CreateFreeze(llvm::PoisonValue::get(type), name);
   }
 
   bool requireInputCount(const PcodeOpView &op, size_t count,
@@ -1966,6 +2052,8 @@ private:
   llvm::IRBuilder<> &Builder;
   const PcodeLoweringConfig &Config;
   std::unordered_map<std::string, llvm::Value *> Values;
+  std::map<std::pair<std::string, llvm::BasicBlock *>, llvm::Value *>
+      NonDominatingReadValues;
   std::unordered_map<std::string, uint64_t> SourceRamByVarnode;
   std::vector<size_t> BlockStarts;
   std::vector<size_t> BlockEnds;
