@@ -786,6 +786,7 @@ bool testKnownFixedExternalArities() {
       {"getegid", 0},
       {"getentropy", 2},
       {"getgid", 0},
+      {"getservbyname", 2},
       {"getgrgid", 1},
       {"getgrgid_r", 5},
       {"getgrnam", 1},

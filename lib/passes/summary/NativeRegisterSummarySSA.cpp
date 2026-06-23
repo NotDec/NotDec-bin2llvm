@@ -284,6 +284,7 @@ knownExternalPrototypes() {
       {"gethostname", {2, false}},
       {"getopt", {3, false}},
       {"getopt_long", {5, false}},
+      {"getservbyname", {2, false}},
       {"gethostbyname", {1, false}},
       {"getloadavg", {2, false}},
       {"getpagesize", {0, false}},

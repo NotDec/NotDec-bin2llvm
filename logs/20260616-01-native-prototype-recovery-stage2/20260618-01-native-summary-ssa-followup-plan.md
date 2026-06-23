@@ -6460,3 +6460,42 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：4/10，清掉 `lighttpd` 最后一个明显双返回 external。
 - 复杂度：1/10，只补 fixed arity 表和测试期望。
 - 维护成本：2/10，7 参数函数当前只表达前 6 个寄存器参数，后续如果实现栈上传参建模，需要重新检查这类测试。
+
+## 实现记录：补齐 `getservbyname`
+
+`ssh` 输出里 `getservbyname` 仍按 6 个参数处理，但本地 `/usr/include/netdb.h:288`
+里它只有 2 个参数。这个点很稳，能直接把 6 个寄存器参数收回成 2 个，
+比碰带栈上传参的接口更合适。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:287`
+  - 在 `knownExternalPrototypes()` 中新增 `getservbyname`，fixed arity 为 2。
+- `tests/native_register_summary_ssa_test.cpp:789`
+  - 扩展 `testKnownFixedExternalArities()`，覆盖 `getservbyname`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/ssh --all-confirmed -o /tmp/notdec-ssh-getservbyname.ll --summary-json-out /tmp/notdec-ssh-getservbyname.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-ssh-getservbyname.ll -o /tmp/notdec-ssh-getservbyname.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-ssh-getservbyname.bc -o /tmp/notdec-ssh-getservbyname.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-getservbyname.ll --summary-json-out /tmp/fortune-getservbyname.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-getservbyname.ll -o /tmp/fortune-getservbyname.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-getservbyname.bc -o /tmp/fortune-getservbyname.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `ssh` 运行时间：`elapsed 434.43`。
+- `fortune` 运行时间：`elapsed 9.03`。
+- `ssh` 和 `fortune` 都通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `ssh` 输出中 `getservbyname` 已从 6 参数收窄为：
+  - `declare i64 @getservbyname(i64, i64)`
+
+评分：
+
+- 实现效果：4/10，`ssh` 里这个接口收窄得很直接。
+- 复杂度：1/10，只补 fixed arity 表和测试。
+- 维护成本：1/10，`getservbyname` 原型稳定。
