@@ -6352,3 +6352,65 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：3/10，补掉一个有头文件依据的 OpenSSL helper。
 - 复杂度：1/10，只补 fixed arity 表和测试。
 - 维护成本：1/10，`SSL_CTX_ctrl` 原型稳定。
+
+## 实现记录：补齐 `mmap` / `recvfrom` / `sasl_server_start` / `splice`
+
+继续看 `memcached` 和 `lighttpd` 的 external 声明。`mmap`、`recvfrom`、
+`sasl_server_start` 本身就是 6 个寄存器参数，文本上不会收窄，但它们有头文件依据，
+应该从 unknown external 收进已知 fixed arity 表，避免按未知 external 传播额外返回寄存器。
+`splice` 在旧 `lighttpd` 输出里是 `{ i64, i64 }` 返回；本地 glibc 头文件证明它是
+6 参数、单整数返回，补表后可以直接收回双返回。
+
+头文件依据：
+
+- `/usr/include/x86_64-linux-gnu/sys/mman.h:57`
+  - `mmap` 是 6 个固定参数。
+- `/usr/include/x86_64-linux-gnu/sys/socket.h:163`
+  - `recvfrom` 是 6 个固定参数。
+- `/usr/include/sasl/sasl.h:1088`
+  - `sasl_server_start` 是 6 个固定参数。
+- `/usr/include/x86_64-linux-gnu/bits/fcntl-linux.h:421`
+  - `splice` 是 6 个固定参数，返回 `__ssize_t`。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:348`
+  - 在 `knownExternalPrototypes()` 中新增 `mmap`，fixed arity 为 6。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:467`
+  - 新增 `recvfrom`，fixed arity 为 6。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:478`
+  - 新增 `sasl_server_start`，fixed arity 为 6。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:552`
+  - 新增 `splice`，fixed arity 为 6。
+- `tests/native_register_summary_ssa_test.cpp:829,917,925,985`
+  - 扩展 `testKnownFixedExternalArities()`，覆盖这 4 个 fixed arity。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed -o /tmp/notdec-memcached-mmap-recvfrom-sasl.ll --summary-json-out /tmp/notdec-memcached-mmap-recvfrom-sasl.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-memcached-mmap-recvfrom-sasl.ll -o /tmp/notdec-memcached-mmap-recvfrom-sasl.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-memcached-mmap-recvfrom-sasl.bc -o /tmp/notdec-memcached-mmap-recvfrom-sasl.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd --all-confirmed -o /tmp/notdec-lighttpd-splice-known.ll --summary-json-out /tmp/notdec-lighttpd-splice-known.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-lighttpd-splice-known.ll -o /tmp/notdec-lighttpd-splice-known.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-lighttpd-splice-known.bc -o /tmp/notdec-lighttpd-splice-known.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-splice-known.ll --summary-json-out /tmp/fortune-splice-known.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-splice-known.ll -o /tmp/fortune-splice-known.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-splice-known.bc -o /tmp/fortune-splice-known.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `memcached` 运行时间：`elapsed 123.88`。
+- `lighttpd` 运行时间：`elapsed 306.30`。
+- `fortune` 运行时间：`elapsed 9.07`，仍在当前 8 到 9 秒范围。
+- `memcached`、`lighttpd`、`fortune` 都通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `lighttpd` 输出中 `splice` 已从双返回收窄为：
+  - `declare i64 @splice(i64, i64, i64, i64, i64, i64)`
+
+评分：
+
+- 实现效果：4/10，`splice` 明确清掉一个 `lighttpd` 双返回 external，另外 3 个 fixed arity 收进已知表。
+- 复杂度：1/10，只补 fixed arity 表和测试。
+- 维护成本：1/10，都是稳定 libc/SASL 接口。
