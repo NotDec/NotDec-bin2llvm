@@ -5570,6 +5570,42 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 - 复杂度：3/10，仍是显式 known prototype 表。
 - 维护成本：4/10，表变大了，但每项都是常见 libc/pthread/POSIX 签名。
 
+## 实现记录：libuv 继续收窄 POSIX/pthread 外部符号
+
+这次重新跑当前 `libuv` 产物，确认还有几处 fixed external 可以继续收窄：`pthread_join`、`pthread_mutex_destroy`、`pthread_cond_destroy`、`getpwuid_r`。这些都是明确的标准库 / pthread 签名，不涉及 vararg 或库私有语义。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:457,475,395,159`
+  - 在 `knownExternalPrototypes()` 中补齐 `pthread_join`, `pthread_mutex_destroy`, `pthread_cond_destroy`, `getpwuid_r` 的 fixed arity。
+- `tests/native_register_summary_ssa_test.cpp:457,475,395,159`
+  - 没有新增测试，这次直接复用既有 `testKnownFixedExternalArities()` 覆盖。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/lib/x86_64-linux-gnu/libuv.so.1.0.0 --all-confirmed -o /tmp/notdec-libuv-current.ll --summary-json-out /tmp/notdec-libuv-current.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-libuv-current.ll -o /tmp/notdec-libuv-current.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-libuv-current.bc -o /tmp/notdec-libuv-current.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `libuv` 运行时间：`elapsed 148.53`。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- `libuv` 当前输出里这些声明已收窄为：
+  - `declare i64 @pthread_join(i64, i64)`
+  - `declare i64 @pthread_mutex_destroy(i64)`
+  - `declare i64 @pthread_cond_destroy(i64)`
+  - `declare i64 @getpwuid_r(i64, i64, i64, i64, i64)`
+
+评分：
+
+- 实现效果：4/10，继续清掉几处标准库 / pthread 假签名。
+- 复杂度：1/10，只补已确认的 fixed arity。
+- 维护成本：2/10，都是稳定的系统接口。
+
 ## 实现记录：修复 call signature rewrite 的返回类型不匹配 RAUW
 
 memcached native 链路暴露了一个 summary-SSA 自身问题：外部调用被重写成多返回 struct 后，旧 call 的直接使用仍可能是旧返回类型。原逻辑在 `rewriteCallInst` 里无条件 `replaceAllUsesWith(newCall)`，当旧返回是 `i64`、新返回是 `{ i64, i64 }` 时会触发 LLVM `replaceAllUses of value with new value of different type` 断言。
