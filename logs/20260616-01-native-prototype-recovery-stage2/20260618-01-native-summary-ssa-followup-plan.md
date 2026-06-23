@@ -6554,3 +6554,35 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 
 - 这次改动同样很小，只补了一个确定原型。
 - 后面如果要继续收 Bench2 上的 FORTIFY 项，优先挑已经有头文件明确定义、而且当前 IR 仍明显不对的函数。
+
+## 实现记录：补齐 `getdelim`
+
+`memcached` 里已经能看到 `__getdelim` 从零参声明收回成 4 参调用，这个点和 `stdio.h` 的原型一致，属于确定性很高的修正。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:273`
+  - 在 `knownExternalPrototypes()` 中新增 `getdelim`，fixed arity 为 4。
+- `tests/native_register_summary_ssa_test.cpp:719`
+  - 在 `testKnownFixedExternalArities()` 里补上 `getdelim` 的 arity 断言。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed -o /tmp/notdec-memcached-stdio.ll --summary-json-out /tmp/notdec-memcached-stdio.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-memcached-stdio.ll -o /tmp/notdec-memcached-stdio.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-memcached-stdio.bc -o /tmp/notdec-memcached-stdio.opt.bc`
+
+结果：
+
+- 构建通过。
+- `native_register_summary_ssa_test` 通过。
+- `memcached` 通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `memcached` 输出里 `__getdelim` 已收回为：
+  - `declare i64 @__getdelim(i64, i64, i64, i64)`
+
+判断：
+
+- 这次改动很小，但能直接收回一类常见 stdio 误签名。
+- `getline`、`strchrnul` 还没在这轮目标里收口，后面继续换目标看它们是否也能稳定收回。
