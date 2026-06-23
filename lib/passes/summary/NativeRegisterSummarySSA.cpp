@@ -1736,6 +1736,8 @@ private:
   std::vector<CallArgStoreBinding>
   callArgStoreBindings(llvm::CallBase &call, const SignatureShape &shape) {
     std::vector<CallArgStoreBinding> bindings;
+    llvm::Function *callee = call.getCalledFunction();
+    bool allowEntryInputs = callee != nullptr && !callee->isDeclaration();
     unsigned argCount =
         shape.VarArg ? Abi.InputsInOrder.size() : shape.Params.size();
     for (unsigned index = 0; index < argCount; ++index) {
@@ -1752,7 +1754,7 @@ private:
         break;
       }
       llvm::StoreInst *store = findStoreBeforeCall(call, *unit, value);
-      if (isEntryInputValue(value) && store == nullptr) {
+      if (isEntryInputValue(value) && store == nullptr && !allowEntryInputs) {
         break;
       }
       bindings.push_back(CallArgStoreBinding{store, unit, value, index});

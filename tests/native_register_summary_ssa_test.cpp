@@ -1517,6 +1517,66 @@ bool testForeignMappedCallArgumentIsLocalized() {
                   "module failed verifier after foreign call arg rewrite");
 }
 
+bool testInternalCallArgBindingsKeepLaterArgsAfterEntryInput() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-internal-entry-input-call-arg", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "notdec_native_child",
+      module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  llvm::LoadInst *childRdi = loadRegister(calleeBuilder, rdi, "RDI", "rdi.in");
+  llvm::LoadInst *childRsi = loadRegister(calleeBuilder, rsi, "RSI", "rsi.in");
+  (void)childRdi;
+  (void)childRsi;
+  calleeBuilder.CreateRetVoid();
+
+  auto *parentType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *parent = llvm::Function::Create(
+      parentType, llvm::GlobalValue::ExternalLinkage, "notdec_native_parent",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", parent);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rdiEntry = loadRegister(builder, rdi, "RDI", "rdi.entry");
+  llvm::Value *rsiValue =
+      builder.CreateAdd(rdiEntry, llvm::ConstantInt::get(rsi->getValueType(), 7),
+                        "rsi.value");
+  storeRegister(builder, rsi, rsiValue, "RSI");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("notdec_native_child");
+  llvm::CallInst *call = nullptr;
+  if (llvm::Function *rewrittenParent = module.getFunction("notdec_native_parent")) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenParent)) {
+      auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (candidate != nullptr &&
+          candidate->getCalledFunction() == rewritten) {
+        call = candidate;
+      }
+    }
+  }
+
+  return expect(rewritten != nullptr, "internal child callee missing") &&
+         expect(call != nullptr, "internal child call missing") &&
+         expect(call->arg_size() == 2,
+                "internal child call did not keep later arg after entry input") &&
+         expect(call->getArgOperand(1) != nullptr,
+                "internal child later arg was dropped") &&
+        verifyOk(module,
+                  "module failed verifier after internal entry-input call arg test");
+}
+
 bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-stack-saved-register", context);
@@ -1827,6 +1887,7 @@ int main() {
   ok &= testKnownVarArgExternalKeepsAbiInputs();
   ok &= testMismatchedDirectCallUseUsesReturnExtract();
   ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
+  ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testForeignArgumentInMovedBodyIsReplaced();

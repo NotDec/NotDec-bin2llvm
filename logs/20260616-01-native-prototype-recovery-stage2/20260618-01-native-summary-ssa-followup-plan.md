@@ -707,6 +707,37 @@ stores_to_register_globals: 503
 - 理解成本：2/10。只是目录分组和 include 路径变化。
 - 维护成本：2/10。后续新功能可以直接放 summary 目录，旧链路留在 heritage 目录。
 
+## 实现记录：internal call 的 entry input 参数不再整条截断
+
+本次补了一个很小的 summary 链路修正，目标是减少 `notdec_native_*` 内部调用里还在用的 register global 兜底值。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1736-1762`
+  - 函数 `callArgStoreBindings(...)`
+  - 内部 callee 现在允许把“没有显式 store、但确实是 entry input”的参数继续往后收，不再因为第一个参数是 entry input 就把后面的实参整条截断。
+  - 外部 declaration 仍保留原来的保守截断，避免把纯 entry input 误判成实参。
+- `tests/native_register_summary_ssa_test.cpp:1520-1577`
+  - 新增 `testInternalCallArgBindingsKeepLaterArgsAfterEntryInput()`。
+  - 这个回归测试覆盖“前一个参数来自 entry input，但后一个参数有显式 store”的内部 call 形态。
+- `tests/native_register_summary_ssa_test.cpp:1878-1898`
+  - 把新测试接入主测试入口。
+
+验证：
+
+```text
+cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2
+./build/bin/native_register_summary_ssa_test
+/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-fortune-current-2.ll --summary-json-out /tmp/notdec-fortune-current-2.summary.json
+```
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `fortune` native 运行通过，时间约 `8.56s`，和之前同档。
+- 这次没有把 `fortune` 里的 `FS_OFFSET` 当成可删 residue；它仍然是正常的 TLS/canary 读。
+- 复跑后，`notdec_native_*` 内部调用里仍有不少 `0` 参数兜底，但这次没有看到数量级上的变化，说明剩下的主要还是别的调用绑定问题，不是这条 entry input 截断。
+
 ## 实现记录：修复 fortune R9 残留的前段根因
 
 这次问题一开始表现为 fortune `add_file` 里还剩两处 `R9` register access，但根因不在 SummarySSA。
