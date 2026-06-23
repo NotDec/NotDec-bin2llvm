@@ -6225,3 +6225,49 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：4/10，补掉 `libuv` 中最后一个明显双返回 external。
 - 复杂度：1/10，只补 fixed arity 表和测试。
 - 维护成本：1/10，`mmap64` 是稳定 libc 接口。
+
+## 实现记录：ffmpeg libc fixed arity 继续补齐
+
+继续检查当前 `ffmpeg` 输出中还保持 6 个 ABI 参数的 libc / glibc helper。`setvbuf`、`strtok`、`__sysv_signal`、`__vfprintf_chk` 都在当前 IR 中真实出现，并且能从本地 glibc 头文件直接确认 fixed arity。`round`、`log10` 涉及浮点 ABI，这次不动。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:173`
+  - 在 `knownExternalPrototypes()` 中新增 `__vfprintf_chk`，fixed arity 为 4。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:517`
+  - 新增 `setvbuf`，fixed arity 为 4。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:528`
+  - 新增 `__sysv_signal`，fixed arity 为 2。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:574`
+  - 新增 `strtok`，fixed arity 为 2。
+- `tests/native_register_summary_ssa_test.cpp:729,963,967,985`
+  - 扩展 `testKnownFixedExternalArities()`，覆盖这 4 个 fixed arity。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/ffmpeg --all-confirmed -o /tmp/notdec-ffmpeg-libc-arity.ll --summary-json-out /tmp/notdec-ffmpeg-libc-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-ffmpeg-libc-arity.ll -o /tmp/notdec-ffmpeg-libc-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-ffmpeg-libc-arity.bc -o /tmp/notdec-ffmpeg-libc-arity.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-libc-arity.ll --summary-json-out /tmp/fortune-libc-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-libc-arity.ll -o /tmp/fortune-libc-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-libc-arity.bc -o /tmp/fortune-libc-arity.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `ffmpeg` 运行时间：`elapsed 167.56`。
+- `fortune` 运行时间：`elapsed 8.83`，和前面 8 秒多同档。
+- `ffmpeg` 和 `fortune` 都通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `ffmpeg` 输出里这些声明已收窄：
+  - `declare i64 @strtok(i64, i64)`
+  - `declare void @__vfprintf_chk(i64, i64, i64, i64)`
+  - `declare void @__sysv_signal(i64, i64)`
+  - `declare void @setvbuf(i64, i64, i64, i64)`
+
+评分：
+
+- 实现效果：4/10，继续清掉 `ffmpeg` 中 4 个明确的 libc/glibc 假签名。
+- 复杂度：1/10，只补 fixed arity 表和测试。
+- 维护成本：2/10，都是稳定 libc/glibc 接口。
