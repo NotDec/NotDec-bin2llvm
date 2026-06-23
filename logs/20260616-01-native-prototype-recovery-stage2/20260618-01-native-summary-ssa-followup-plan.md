@@ -5481,3 +5481,60 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 - 实现效果：6/10，继续清理标准库 external，剩下多数是 OpenSSL/PAM/libcap/项目私有符号。
 - 复杂度：2/10，只补 known 表和测试表。
 - 维护成本：2/10，显式白名单，容易回退。
+
+## 实现记录：libuv POSIX/pthread arity 扩充
+
+这次切到 Bench2 的 `libuv` 共享库。当前 native summary 链路能跑完并通过 LLVM 22，但输出里大量 POSIX / pthread / glibc helper 还保持 6 参数 fixed external。这些签名明确，适合继续补 known prototype。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:141-229`
+  - 新增一批 glibc/POSIX helper 和系统调用 wrapper，例如：
+    - `__read_chk`, `__memmove_chk`, `__open64_2`, `__register_atfork`, `__sched_cpucount`, `__sysconf`
+    - `accept4`, `chown`, `cfmakeraw`, `clock_getres`, `dlclose`, `dlerror`, `dlopen`, `dup3`
+    - `epoll_create1`, `epoll_ctl`, `epoll_pwait`, `eventfd`, `fdatasync`, `fstatfs64`, `fsync`, `futimens`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:230-360`
+  - 新增 `getaddrinfo`, `getifaddrs`, `getgrgid_r`, `gethostname`, `getpwuid_r`, `getrlimit64`, `getrusage`, `if_indextoname`, `inotify_*`, `isatty`, `kill`, `lchown`, `link`, `memchr`, `mkdtemp`, `mkstemp64`, `pathconf`, `pipe2`, `poll`, `pread64`, `preadv64`, `pwrite64`, `pwritev64`。
+  - 新增一批 `pthread_*` 和 `sem_*` 原型。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:360-456`
+  - 新增 `readv`, `recvmmsg`, `sched_*`, `scandir64`, `sendfile64`, `sendmmsg`, `setenv`, `setpriority`, `sigaddset`, `sigemptyset`, `statfs64`, `strnlen`, `sysconf`, `symlink`, `tcgetattr`, `tcsetattr`, `ttyname_r`, `unsetenv`, `utimensat`, `writev`。
+- `tests/native_register_summary_ssa_test.cpp:707-923`
+  - `testVsftpdKnownExternalArities()` 改名为 `testKnownFixedExternalArities()`。
+  - 扩展 fixed arity 表，覆盖这批 libuv 里出现的标准函数。
+- `tests/native_register_summary_ssa_test.cpp:924-991`
+  - `testKnownVarArgExternalKeepsAbiInputs()` 增加 `fscanf`。
+- `tests/native_register_summary_ssa_test.cpp:1609-1610`
+  - 更新测试入口。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j$(nproc)`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-libuv-arity.ll --summary-json-out /tmp/fortune-libuv-arity.summary.json`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/lib/x86_64-linux-gnu/libuv.so.1.0.0 --all-confirmed -o /tmp/libuv-arity.ll --summary-json-out /tmp/libuv-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-libuv-arity.ll -o /tmp/fortune-libuv-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-libuv-arity.bc -o /tmp/fortune-libuv-arity.verify.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/libuv-arity.ll -o /tmp/libuv-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/libuv-arity.bc -o /tmp/libuv-arity.verify.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `fortune` 运行时间：`elapsed 8.65`。
+- `libuv` 运行时间：`elapsed 143.34`。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- `libuv` 当前输出里这些声明和调用已经收窄：
+  - `declare i64 @__read_chk(i64, i64, i64, i64)`
+  - `declare i64 @epoll_ctl(i64, i64, i64, i64)`
+  - `declare i64 @epoll_pwait(i64, i64, i64, i64, i64)`
+  - `declare i64 @pthread_create(i64, i64, i64, i64)`
+  - `declare i64 @poll(i64, i64, i64)`
+  - `declare i64 @sendmmsg(i64, i64, i64, i64)`
+  - `declare i64 @recvmmsg(i64, i64, i64, i64, i64)`
+  - `declare i64 @getaddrinfo(i64, i64, i64, i64)`
+
+评分：
+
+- 实现效果：7/10，libuv 里一大批明显错误的 6 参数 external 被收窄。
+- 复杂度：3/10，仍是显式 known prototype 表。
+- 维护成本：4/10，表变大了，但每项都是常见 libc/pthread/POSIX 签名。
