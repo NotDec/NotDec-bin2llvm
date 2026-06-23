@@ -824,6 +824,7 @@ bool testKnownFixedExternalArities() {
       {"mempcpy", 3},
       {"mkdir", 2},
       {"mkdtemp", 1},
+      {"mmap64", 6},
       {"mkostemp64", 2},
       {"mkstemp64", 1},
       {"mlockall", 1},

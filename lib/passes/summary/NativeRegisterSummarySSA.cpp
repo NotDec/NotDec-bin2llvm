@@ -343,6 +343,7 @@ knownExternalPrototypes() {
       {"mkostemp64", {2, false}},
       {"mkstemp64", {1, false}},
       {"mlockall", {1, false}},
+      {"mmap64", {6, false}},
       {"mktime", {1, false}},
       {"mprotect", {3, false}},
       {"msync", {3, false}},

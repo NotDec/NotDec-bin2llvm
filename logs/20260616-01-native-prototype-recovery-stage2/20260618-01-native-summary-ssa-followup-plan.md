@@ -6188,3 +6188,40 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：6/10，修掉 known external 返回值过宽的问题，`ffmpeg` 中 `fclose` 语义更准。
 - 复杂度：2/10，只在 known external 返回收集处增加上限。
 - 维护成本：3/10，默认单整数返回适合当前表里绝大多数 known external；以后遇到真实多寄存器返回 API 再显式放宽。
+
+## 实现记录：libuv mmap64 fixed arity 补齐
+
+用当前返回寄存器限制重新跑 `libuv` 后，输出里非 intrinsic 的双返回 external 只剩 `mmap64`。`/usr/include/x86_64-linux-gnu/sys/mman.h` 中 `mmap64` 是 6 参数，返回 `void *`。它之前没进 known prototype 表，所以按未知 external 处理后仍被扩成 `{ i64, i64 }` 返回。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:346`
+  - 在 `knownExternalPrototypes()` 中新增 `mmap64`，fixed arity 为 6。
+- `tests/native_register_summary_ssa_test.cpp:827`
+  - 扩展 `testKnownFixedExternalArities()`，覆盖 `mmap64`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/lib/x86_64-linux-gnu/libuv.so.1.0.0 --all-confirmed -o /tmp/notdec-libuv-mmap64.ll --summary-json-out /tmp/notdec-libuv-mmap64.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-libuv-mmap64.ll -o /tmp/notdec-libuv-mmap64.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-libuv-mmap64.bc -o /tmp/notdec-libuv-mmap64.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-mmap64.ll --summary-json-out /tmp/fortune-mmap64.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-mmap64.ll -o /tmp/fortune-mmap64.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-mmap64.bc -o /tmp/fortune-mmap64.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `libuv` 运行时间：`elapsed 149.90`。
+- `fortune` 运行时间：`elapsed 8.89`，和前面 8 秒多同档。
+- `libuv` 和 `fortune` 都通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `libuv` 输出里 `mmap64` 从 `declare { i64, i64 } @mmap64(i64, i64, i64, i64, i64, i64)` 收回为 `declare i64 @mmap64(i64, i64, i64, i64, i64, i64)`。
+- `libuv` 当前输出里已没有剩余的非 intrinsic 双返回 external。
+
+评分：
+
+- 实现效果：4/10，补掉 `libuv` 中最后一个明显双返回 external。
+- 复杂度：1/10，只补 fixed arity 表和测试。
+- 维护成本：1/10，`mmap64` 是稳定 libc 接口。
