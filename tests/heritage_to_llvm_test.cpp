@@ -97,10 +97,57 @@ bool testForwardUniqueDefIsMaterialized() {
                 "module failed verifier after forward unique def lowering");
 }
 
+bool testStackInputFallbackIsStable() {
+  notdec::bin2llvm::HeritageProgram program;
+  program.Schema = "notdec.heritage-pcode.v0";
+  program.Program.Language = "x86/little/64/default";
+  program.Function.Name = "stack_input_fallback";
+  program.Function.Entry = "ram:1000";
+  program.Function.ReturnType = "undefined8";
+
+  program.Varnodes.push_back(varnode("stack_in", "stack", 0x20, 8));
+  program.Varnodes.back().IsInput = true;
+  program.Varnodes.push_back(varnode("one", "const", 1, 8, true));
+  program.Varnodes.push_back(varnode("out", "unique", 0x100, 8));
+
+  program.Ops.push_back(op("add", "INT_ADD", "out",
+                           {"stack_in", "one"}));
+  program.Ops.push_back(op("ret", "RETURN", std::nullopt, {"stack_in"}));
+
+  notdec::bin2llvm::HeritageBlock block;
+  block.Id = "bb:0";
+  block.Start = "ram:1000";
+  block.Ops = {"add", "ret"};
+  program.Blocks.push_back(std::move(block));
+  notdec::bin2llvm::indexHeritageProgram(program);
+
+  llvm::LLVMContext context;
+  notdec::bin2llvm::HeritageLoweringConfig config;
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildHeritageModule(context, program, config,
+                                            errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+
+  int freezeCount = 0;
+  if (llvm::Function *function = module->getFunction("stack_input_fallback")) {
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      freezeCount += llvm::isa<llvm::FreezeInst>(&inst) ? 1 : 0;
+    }
+  }
+
+  return expect(freezeCount == 1, "stack input fallback was not reused") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after stack input fallback lowering");
+}
+
 } // namespace
 
 int main() {
   bool ok = true;
   ok &= testForwardUniqueDefIsMaterialized();
+  ok &= testStackInputFallbackIsStable();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

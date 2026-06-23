@@ -624,6 +624,10 @@ private:
            varnode.IsRegister;
   }
 
+  bool canCreateStackInputTemp(const HeritageVarnode &varnode) const {
+    return varnode.IsInput && varnode.Space == "stack";
+  }
+
   llvm::MDNode *registerSourceMetadata(const HeritageVarnode &varnode) {
     std::vector<llvm::Metadata *> fields = {
         llvm::MDString::get(Context, "space=" + varnode.Space),
@@ -657,6 +661,36 @@ private:
     return tempValue;
   }
 
+  llvm::Value *stackInputTemp(const HeritageVarnode &varnode) {
+    if (auto it = Values.find(varnode.Id); it != Values.end()) {
+      return resize(it->second, varnode.Size);
+    }
+
+    // Keep unreadable entry stack slots as one stable unknown value so later
+    // uses do not keep falling back to fresh poison.
+    llvm::IRBuilder<> entryBuilder(&Function->getEntryBlock(),
+                                   Function->getEntryBlock().begin());
+    llvm::Value *tempValue = entryBuilder.CreateFreeze(
+        llvm::PoisonValue::get(intType(varnode.Size)),
+        varnode.Id + ".stack_input");
+    if (llvm::Instruction *tempInst =
+            llvm::dyn_cast<llvm::Instruction>(tempValue)) {
+      tempInst->setMetadata("notdec.stack.input",
+                            llvm::MDNode::get(
+                                Context,
+                                {llvm::MDString::get(Context, "space=stack"),
+                                 llvm::MDString::get(
+                                     Context, "offset=" +
+                                                  std::to_string(varnode.Offset)),
+                                 llvm::MDString::get(
+                                     Context,
+                                     "size=" + std::to_string(varnode.Size)),
+                                 llvm::MDString::get(Context, "kind=temp")}));
+    }
+    Values[varnode.Id] = tempValue;
+    return tempValue;
+  }
+
   llvm::Value *read(const std::string &id) {
     if (auto it = Values.find(id); it != Values.end()) {
       const HeritageVarnode *varnode = varnodeFor(id);
@@ -682,6 +716,9 @@ private:
     }
     if (llvm::Value *value = readAddressTiedInput(Builder, *varnode)) {
       return value;
+    }
+    if (canCreateStackInputTemp(*varnode)) {
+      return stackInputTemp(*varnode);
     }
     if (tryMaterializePureDef(id)) {
       if (auto it = Values.find(id); it != Values.end()) {
@@ -1669,6 +1706,10 @@ private:
           return resizeForPhiIncoming(value, byteSize, incomingBlock);
         }
       }
+    }
+    if (varnode != nullptr && canCreateStackInputTemp(*varnode)) {
+      return resizeForPhiIncoming(stackInputTemp(*varnode), byteSize,
+                                  incomingBlock);
     }
 
     if (varnode != nullptr) {

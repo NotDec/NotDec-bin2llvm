@@ -5035,3 +5035,28 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 结合前面已经确认过的 `fortune`、`vsftpd`、`libuv`、`memcached`、`lighttpd`、`tmux`、`openssh-client`、`openssh-server`、`wolfssl`、`redis-*`、`vim`、`python3.12`，当前默认 `gtirb` 路径已经能稳定给出 Bench2 主要可执行目标和主要共享库的反汇编与函数划分结果。
 
 `libicudata.so.74.2` 这类超大样本本轮仍然耗时很长，先停掉了；它没有暴露前端 decode 正确性问题，只是吞吐慢。
+
+## 实现记录：stack input 入口兜底
+
+这次补了 `lib/HeritageToLLVM.cpp` 里入口 stack input 的兜底，不再让这类值每次都掉到 fresh poison。
+
+改动点：
+
+- `lib/HeritageToLLVM.cpp:627-729`
+  - 新增 `canCreateStackInputTemp()`。
+  - 新增 `stackInputTemp()`，给 `space=stack` 且 `isInput=1` 的 varnode 建一个 entry block 里的稳定 `freeze poison`。
+  - `read()` 里在 `readAddressTiedInput()` 之后、`tryMaterializePureDef()` 之前接入这条兜底。
+- `lib/HeritageToLLVM.cpp:1676-1688`
+  - `readPhiIncoming()` 里同样复用这条 stack input temp，避免 PHI incoming 再次走 poison fallback。
+- `tests/heritage_to_llvm_test.cpp:100-153`
+  - 新增 `testStackInputFallbackIsStable()`，确认同一个 stack 输入被多次读取时只生成一个稳定的 freeze，且 LLVM 22 verifier 通过。
+
+验证：
+
+- `cmake --build build --target heritage_to_llvm_test notdec-heritage-module-llvm -j$(nproc)`
+- `./build/bin/heritage_to_llvm_test`
+
+结果：
+
+- 测试通过。
+- 这次单测里只剩 `RETURN` 没有值输入的正常 warning，没有再出现 stack input 的 poison fallback。
