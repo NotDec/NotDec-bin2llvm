@@ -5082,5 +5082,35 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
   - `elapsed 196.10`
 - `/tmp/wolfssl-current.err` 里没有 `fell back to poison` / `read unmodeled varnode`。
 - 用 LLVM 22 验证通过：
-  - `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/wolfssl-current.ll -o /tmp/wolfssl-current.bc`
-  - `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/wolfssl-current.bc -o /tmp/wolfssl-current.verify.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/wolfssl-current.ll -o /tmp/wolfssl-current.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/wolfssl-current.bc -o /tmp/wolfssl-current.verify.bc`
+
+## 实现记录：module check 现状确认
+
+这次没有改 lowering 代码，只把当前 `notdec-heritage-module-check` 的真实现状确认了一遍，避免继续跟着旧的 `module-all.check.log` 误判。
+
+当前工具行为：
+
+- `tools/notdec-heritage-module-check.cpp`
+  - `checkModuleSymbols(...)` 只统计重复函数名，不再把重复短名当成 error。
+  - 真正会让 check 失败的还是重复 entry、未知引用、未知调用这类结构问题。
+
+当前验证结果：
+
+- `python/shared-library/module-all.json`
+  - `functions: 6966`
+  - `externals: 508`
+  - `failures: 0`
+  - `duplicate function names: 3`
+  - `status: ok`
+- `libicu/i18n-library/module-all.json`
+  - `functions: 10748`
+  - `externals: 520`
+  - `failures: 0`
+  - `duplicate function names: 2633`
+  - `status: ok`
+
+结论：
+
+- 旧 `module-all.check.log` 里的 duplicate function name error 已经过时，不是当前代码状态。
+- 这条线暂时不需要改 lowering，只需要继续盯真正会导致失败 bodies 的点。
