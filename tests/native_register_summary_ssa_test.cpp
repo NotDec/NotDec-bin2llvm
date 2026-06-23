@@ -711,10 +711,16 @@ bool testVsftpdKnownExternalArities() {
   };
   const KnownArityCase cases[] = {
       {"__strcpy_chk", 3}, {"accept", 3},       {"chmod", 2},
-      {"closelog", 0},    {"fork", 0},         {"getegid", 0},
-      {"getpeername", 3}, {"getsockopt", 5},   {"localtime", 1},
-      {"recv", 4},        {"select", 5},       {"socketpair", 4},
-      {"stat64", 2},      {"tzset", 0},        {"umask", 1},
+      {"closedir", 1},    {"closelog", 0},    {"fork", 0},
+      {"getegid", 0},     {"gethostbyname", 1},
+      {"getpagesize", 0}, {"getpeername", 3}, {"getsockopt", 5},
+      {"getpwuid", 1},    {"inet_ntoa", 1},   {"initgroups", 2},
+      {"localtime", 1},   {"lstat64", 2},      {"mkdir", 2},
+      {"recv", 4},        {"select", 5},       {"sendfile", 4},
+      {"sendmsg", 3},     {"setgid", 1},       {"setgroups", 2},
+      {"setregid", 2},    {"setreuid", 2},     {"setuid", 1},
+      {"socketpair", 4},  {"stat64", 2},       {"strndup", 2},
+      {"tzset", 0},       {"umask", 1},        {"wait", 1},
   };
 
   for (const KnownArityCase &testCase : cases) {
@@ -884,7 +890,9 @@ bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
   llvm::Value *path = builder.CreateAdd(
       function->getArg(0), llvm::ConstantInt::get(rdi->getValueType(), 7),
       "path");
-  storeRegister(builder, rbx, path, "RBX");
+  llvm::Value *deadValue = builder.CreateXor(
+      path, llvm::ConstantInt::get(rdi->getValueType(), 1), "dead.value");
+  storeRegister(builder, rbx, deadValue, "RBX");
   storeRegister(builder, rdi, path, "RDI");
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();

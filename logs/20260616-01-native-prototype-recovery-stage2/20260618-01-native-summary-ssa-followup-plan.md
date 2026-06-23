@@ -5378,3 +5378,56 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 - 实现效果：8/10，两个真实 glibc vararg external 现在不再伪装成 fixed 6 参数。
 - 复杂度：3/10，只补 known 表和一个保活边界。
 - 维护成本：3/10，沿用上一轮 vararg rewrite 机制。
+
+## 实现记录：vsftpd libc/POSIX fixed arity 继续补齐
+
+这次继续扫 `vsftpd` 里还剩的 6 参数 external。只补 libc/POSIX 里签名明确的固定参数函数，不猜 OpenSSL、PAM、libcap、tcp_wrappers 和项目私有函数。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:156-230`
+  - 在 `knownExternalPrototypes()` 里补充：
+    - `_exit`: 1 参数，noreturn
+    - `closedir`, `fchown`, `gethostbyname`, `getpagesize`, `getpwuid`, `inet_ntoa`, `initgroups`, `lstat64`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:250-333`
+  - 继续补充：
+    - `mkdir`, `qsort`, `sendfile`, `sendmsg`, `setgid`, `setgroups`, `setregid`, `setreuid`, `setuid`, `strndup`, `wait`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1068-1075`
+  - 签名重写前的死 store 清理不再递归删除 stored value。`SignatureState` 记录的 call arg 不是 LLVM use，递归删除在 rewrite 前可能把后续要用的值删掉。
+- `tests/native_register_summary_ssa_test.cpp:707-785`
+  - 扩展 `testVsftpdKnownExternalArities()` 的表，覆盖上述固定 arity。
+- `tests/native_register_summary_ssa_test.cpp:872-881`
+  - `testRecordedCallArgValueSurvivesDeadStoreCleanup()` 里增加一个从 call arg value 派生出来的额外死 store，覆盖 rewrite 前递归删除上游值的风险。
+- `tests/native_register_summary_ssa_test.cpp:1471-1472`
+  - 相关测试仍接在 `main()`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j$(nproc)`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-fixed3.ll --summary-json-out /tmp/fortune-fixed3.summary.json`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/vsftpd --all-confirmed -o /tmp/vsftpd-fixed3.ll --summary-json-out /tmp/vsftpd-fixed3.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-fixed3.ll -o /tmp/fortune-fixed3.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-fixed3.bc -o /tmp/fortune-fixed3.verify.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/vsftpd-fixed3.ll -o /tmp/vsftpd-fixed3.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/vsftpd-fixed3.bc -o /tmp/vsftpd-fixed3.verify.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `fortune` 运行时间：`elapsed 8.69`。
+- `vsftpd` 运行时间：`elapsed 79.09`。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- `vsftpd` 当前输出里这些调用已收窄：
+  - `declare i64 @strndup(i64, i64)` / `call i64 @strndup(i64 ..., i64 ...)`
+  - `declare void @getpagesize()` / `call void @getpagesize()`
+  - `declare { i64, i64 } @gethostbyname(i64)` / `call { i64, i64 } @gethostbyname(i64 ...)`
+  - `declare i64 @sendfile(i64, i64, i64, i64)`
+  - `declare i64 @qsort(i64, i64, i64, i64)`
+  - `declare i64 @wait(i64)`
+
+评分：
+
+- 实现效果：7/10，继续减少明显错误的 6 参数 external。
+- 复杂度：3/10，主要是 known 表扩充和一个清理时机保护。
+- 维护成本：3/10，仍是显式白名单，容易审查。
