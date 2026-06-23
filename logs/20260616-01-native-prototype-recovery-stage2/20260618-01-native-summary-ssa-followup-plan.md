@@ -6499,3 +6499,30 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：4/10，`ssh` 里这个接口收窄得很直接。
 - 复杂度：1/10，只补 fixed arity 表和测试。
 - 维护成本：1/10，`getservbyname` 原型稳定。
+
+## 实现记录：补齐一批 OpenSSL 固定参数原型
+
+这次继续只改 summary 链路的 fixed arity 表，不碰旧 heritage 链路。目标是把 `ssh` 里还残留的几项 OpenSSL 外部声明收回来，选的是头文件里能直接确认原型的函数。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:183,203,514`
+  - 在 `knownExternalPrototypes()` 中新增 `BN_sub`、`EC_GROUP_get_order`、`EC_KEY_set_private_key`、`RSA_set0_key`。
+- `tests/native_register_summary_ssa_test.cpp:738,961`
+  - 在 `testKnownFixedExternalArities()` 里补上同样 4 个函数的 arity 断言。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+
+结果：
+
+- 构建通过。
+- `native_register_summary_ssa_test` 通过。
+- 这次没有继续等 `ssh` 的全量转换跑完，先把这批确定性最强的原型表改动收口。
+
+判断：
+
+- 这批改动很小，只影响固定原型表和测试。
+- 后续再碰到 OpenSSL 相关外部声明，还是先看头文件，不先猜。
