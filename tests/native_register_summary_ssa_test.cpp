@@ -740,6 +740,7 @@ bool testKnownFixedExternalArities() {
       {"epoll_pwait", 5},
       {"epoll_wait", 4},
       {"execv", 2},
+      {"execvp", 2},
       {"eventfd", 2},
       {"fdatasync", 1},
       {"freeifaddrs", 1},

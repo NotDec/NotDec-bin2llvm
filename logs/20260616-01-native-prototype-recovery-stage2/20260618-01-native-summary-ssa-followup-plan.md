@@ -5680,3 +5680,35 @@ lighttpd 当前 native 链路可以跑完并通过 LLVM 22，但输出里仍有�
 - 实现效果：6/10，lighttpd 中一批明显错误的 6 参数 external 被收窄。
 - 复杂度：2/10，只扩充 known prototype 表和固定 arity 单测。
 - 维护成本：3/10，表继续变大，但每项都是明确固定签名，审查成本可控。
+
+## 实现记录：lighttpd-angel execvp arity 补齐
+
+lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑完并通过 LLVM 22。输出里普通 external 只剩 `execvp` 仍按 6 参数 ABI 形状声明；本地 `/usr/include/unistd.h` 中 `execvp` 是 2 参数，适合补进 known prototype。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:202`
+  - 新增 `execvp`: 2 参数。
+- `tests/native_register_summary_ssa_test.cpp:743`
+  - 扩展 `testKnownFixedExternalArities`，覆盖 `execvp`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd-angel --all-confirmed -o /tmp/lighttpd-angel-execvp.ll --summary-json-out /tmp/lighttpd-angel-execvp.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/lighttpd-angel-execvp.ll -o /tmp/lighttpd-angel-execvp.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/lighttpd-angel-execvp.bc -o /tmp/lighttpd-angel-execvp.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-execvp.ll --summary-json-out /tmp/fortune-execvp.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-execvp.ll -o /tmp/fortune-execvp.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-execvp.bc -o /tmp/fortune-execvp.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `lighttpd-angel` 运行时间：`elapsed 1.60`。
+- `lighttpd-angel` 输出中 `execvp` 已收窄为：
+  - `declare void @execvp(i64, i64)`
+  - `call void @execvp(i64 %unique_df00_899, i64 %RSI.arg)`
+- `fortune` 运行时间：`elapsed 8.60`，未见性能退化。
+- `lighttpd-angel` 和 `fortune` 的 LLVM 22 `llvm-as`、`opt -passes=verify` 均通过。

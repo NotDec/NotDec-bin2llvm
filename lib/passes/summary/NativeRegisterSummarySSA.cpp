@@ -199,6 +199,7 @@ knownExternalPrototypes() {
       {"epoll_pwait", {5, false}},
       {"epoll_wait", {4, false}},
       {"execv", {2, false}},
+      {"execvp", {2, false}},
       {"eventfd", {2, false}},
       {"event_add", {2, false}},
       {"event_base_set", {2, false}},
