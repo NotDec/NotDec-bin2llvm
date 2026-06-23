@@ -5060,3 +5060,27 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 
 - 测试通过。
 - 这次单测里只剩 `RETURN` 没有值输入的正常 warning，没有再出现 stack input 的 poison fallback。
+
+## 实现记录：wolfssl lowering 回归确认
+
+这次针对旧日志里的 `sp_sqr` 宽 `unique` forward def poison fallback 做了回归确认。当前代码已经能处理这个形状，所以没有改 lowering 逻辑，只补测试把它固定下来。
+
+改动点：
+
+- `tests/heritage_to_llvm_test.cpp:146-203`
+  - 新增 `testWideForwardUniqueDefIsMaterialized()`。
+  - 构造 `SUBPIECE(sum)` 在前、`PIECE(piece)` 和 `INT_ADD(sum)` 在后的 16 字节同 block forward def 链。
+  - 检查 lowering 后没有 `FreezeInst`，并跑 LLVM verifier。
+
+真实样例验证：
+
+- 旧 `wolfssl/shared-library/module-all.lower.log` 里有 20 个 failed body，以及 `sp_sqr` / stack input 的 poison fallback。
+- 用当前代码重新跑：
+  - `./build/bin/notdec-heritage-module-llvm /sn640/NotDec-Exp/Bench2/bin2llvm-ir/dynamic-libs/wolfssl/shared-library/module-all.json -o /tmp/wolfssl-current.ll`
+  - `lowered function bodies: 4057`
+  - `failed function bodies: 0`
+  - `elapsed 196.10`
+- `/tmp/wolfssl-current.err` 里没有 `fell back to poison` / `read unmodeled varnode`。
+- 用 LLVM 22 验证通过：
+  - `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/wolfssl-current.ll -o /tmp/wolfssl-current.bc`
+  - `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/wolfssl-current.bc -o /tmp/wolfssl-current.verify.bc`

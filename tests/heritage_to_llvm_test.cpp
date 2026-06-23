@@ -143,11 +143,62 @@ bool testStackInputFallbackIsStable() {
                 "module failed verifier after stack input fallback lowering");
 }
 
+bool testWideForwardUniqueDefIsMaterialized() {
+  notdec::bin2llvm::HeritageProgram program;
+  program.Schema = "notdec.heritage-pcode.v0";
+  program.Program.Language = "x86/little/64/default";
+  program.Function.Name = "wide_forward_unique_def";
+  program.Function.Entry = "ram:1000";
+  program.Function.ReturnType = "undefined8";
+
+  program.Varnodes.push_back(varnode("low", "const", 7, 8, true));
+  program.Varnodes.push_back(varnode("high", "const", 11, 8, true));
+  program.Varnodes.push_back(varnode("offset", "const", 0, 4, true));
+  program.Varnodes.push_back(varnode("retaddr", "const", 0, 8, true));
+  program.Varnodes.push_back(varnode("piece", "unique", 0x100, 16));
+  program.Varnodes.push_back(varnode("sum", "unique", 0x120, 16));
+  program.Varnodes.push_back(varnode("out", "unique", 0x140, 8));
+
+  program.Ops.push_back(op("subpiece", "SUBPIECE", "out", {"sum", "offset"}));
+  program.Ops.push_back(op("piece", "PIECE", "piece", {"high", "low"}));
+  program.Ops.push_back(op("add", "INT_ADD", "sum", {"piece", "piece"}));
+  program.Ops.push_back(op("ret", "RETURN", std::nullopt, {"retaddr", "out"}));
+
+  notdec::bin2llvm::HeritageBlock block;
+  block.Id = "bb:0";
+  block.Start = "ram:1000";
+  block.Ops = {"subpiece", "piece", "add", "ret"};
+  program.Blocks.push_back(std::move(block));
+  notdec::bin2llvm::indexHeritageProgram(program);
+
+  llvm::LLVMContext context;
+  notdec::bin2llvm::HeritageLoweringConfig config;
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildHeritageModule(context, program, config,
+                                            errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+
+  bool hasFreeze = false;
+  if (llvm::Function *function = module->getFunction("wide_forward_unique_def")) {
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      hasFreeze |= llvm::isa<llvm::FreezeInst>(&inst);
+    }
+  }
+
+  return expect(!hasFreeze, "wide forward unique def used poison fallback") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after wide forward def lowering");
+}
+
 } // namespace
 
 int main() {
   bool ok = true;
   ok &= testForwardUniqueDefIsMaterialized();
   ok &= testStackInputFallbackIsStable();
+  ok &= testWideForwardUniqueDefIsMaterialized();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
