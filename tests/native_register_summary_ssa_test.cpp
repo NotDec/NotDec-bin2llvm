@@ -648,6 +648,62 @@ bool testKnownFixedArgExternalTruncatesAbiInputs() {
                   "module failed verifier after fixed-arg external rewrite");
 }
 
+bool testKnownFiveArgExternalUsesFiveInputs() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-five-arg-external", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+  llvm::GlobalVariable *r9 = createRegisterGlobal(module, "R9");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "setsockopt", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "known_five_arg_call", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                "RDX");
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 4),
+                "RCX");
+  storeRegister(builder, r8, llvm::ConstantInt::get(r8->getValueType(), 5),
+                "R8");
+  storeRegister(builder, r9, llvm::ConstantInt::get(r9->getValueType(), 6),
+                "R9");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::CallInst *call = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      if (candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "setsockopt") {
+        call = candidate;
+      }
+    }
+  }
+
+  return expect(call != nullptr, "known five-arg external call missing") &&
+         expect(call->arg_size() == 5,
+                "known five-arg external used wrong arity") &&
+         expect(summary.DeadStoresRemoved == 6,
+                "dead ABI stores before five-arg external were not removed") &&
+         verifyOk(module,
+                  "module failed verifier after five-arg external rewrite");
+}
+
 bool testInternalSignatureRewriteUsesArgsAndReturn() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-internal-signature", context);
@@ -815,6 +871,71 @@ bool testForeignArgumentInMovedBodyIsReplaced() {
                 "foreign-argument function was not rewritten") &&
          verifyOk(module,
                   "module failed verifier after foreign argument rewrite");
+}
+
+bool testForeignMappedCallArgumentIsLocalized() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-foreign-call-arg", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_foreign_call_arg_callee", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(calleeEntry);
+  llvm::LoadInst *foreignInput =
+      loadRegister(builder, rdi, "RDI", "foreign.input");
+  storeRegister(builder, rax, foreignInput, "RAX");
+  builder.CreateRetVoid();
+
+  llvm::Function *caller =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_foreign_call_arg_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  // This matches real bad IR seen after summary rewrite: the recorded ABI input
+  // may chase through ValueMap into the rewritten callee's argument.
+  storeRegister(builder, rdi, foreignInput, "RDI");
+  builder.CreateCall(voidType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenCaller =
+      module.getFunction("notdec_native_foreign_call_arg_caller");
+  bool hasForeignCallOperand = false;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      for (llvm::Value *arg : call->args()) {
+        auto *argument = llvm::dyn_cast<llvm::Argument>(arg);
+        if (argument != nullptr && argument->getParent() != rewrittenCaller) {
+          hasForeignCallOperand = true;
+        }
+        auto *instruction = llvm::dyn_cast<llvm::Instruction>(arg);
+        if (instruction != nullptr &&
+            instruction->getFunction() != rewrittenCaller) {
+          hasForeignCallOperand = true;
+        }
+      }
+    }
+  }
+
+  return expect(rewrittenCaller != nullptr,
+                "foreign-call-arg caller missing") &&
+         expect(!hasForeignCallOperand,
+                "rewritten call still referenced a foreign value") &&
+         expect(summary.CallsRewritten >= 1,
+                "foreign-call-arg call rewrite was not counted") &&
+         verifyOk(module,
+                  "module failed verifier after foreign call arg rewrite");
 }
 
 bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
@@ -1122,9 +1243,11 @@ int main() {
   ok &= testAbiInputStoreBeforeCallIsKept();
   ok &= testKnownZeroArgExternalDropsAbiInputs();
   ok &= testKnownFixedArgExternalTruncatesAbiInputs();
+  ok &= testKnownFiveArgExternalUsesFiveInputs();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testForeignArgumentInMovedBodyIsReplaced();
+  ok &= testForeignMappedCallArgumentIsLocalized();
   ok &= testStaticRspStackRewriteKeepsSavedRegisterEvidence();
   ok &= testFramePointerLoadFeedsStackRewriteAndIgnoredSet();
   ok &= testSummarySSARemovesDeadStackFrameStore();

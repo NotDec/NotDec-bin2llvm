@@ -5195,3 +5195,47 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
   - `call i64 @readdir(i64 %R12.summary_ssa2183)`
 - 剩下的 6 参数 external 主要是 `recode_*` 和 `__libc_start_main`，本轮不猜。
 - LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+
+## 实现记录：vsftpd callsite 外部值本地化
+
+这次继续看 summary 链路在 `vsftpd` 上的真实失败。旧代码在 internal signature rewrite 时，会先把被调函数 body 搬到新函数，再用 `ValueMap` 重写 callsite 参数。某些记录下来的 ABI 输入会被追到被调函数里的 entry load 或新函数参数，结果新 call 直接引用了别的函数里的值，LLVM verifier 报：
+
+- `Referring to an instruction in another function!`
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:240`
+  - 在 `knownExternalPrototypes()` 里补 `setsockopt`: 5 个固定参数。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1748-1762`
+  - 新增 `localizeCallArgument(...)`。
+  - 如果 call 参数是别的函数的 `Argument`，优先换成本函数同名同类型参数，否则在本函数 entry 插入 `freeze poison`。
+  - 如果 call 参数是别的函数的 `Instruction`，在旧 call 前插入同类型 `freeze poison`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1911-1914`
+  - `rewriteSignatureShapes(...)` 重写 call 参数时，先走 `ValueMap`，再做本地化检查。
+- `tests/native_register_summary_ssa_test.cpp:651-705`
+  - 新增 `testKnownFiveArgExternalUsesFiveInputs()`，确认 `setsockopt` 只保留 5 个 ABI 输入。
+- `tests/native_register_summary_ssa_test.cpp:876-939`
+  - 新增 `testForeignMappedCallArgumentIsLocalized()`，覆盖 call 参数被 `ValueMap` 追到外部函数值的情况。
+- `tests/native_register_summary_ssa_test.cpp:1246-1250`
+  - 把两个新测试接进 `main()`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j$(nproc)`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/vsftpd --all-confirmed -o /tmp/vsftpd-current.ll --summary-json-out /tmp/vsftpd-current.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/vsftpd-current.ll -o /tmp/vsftpd-current.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/vsftpd-current.bc -o /tmp/vsftpd-current.verify.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `vsftpd` native 生成完成，运行时间：`elapsed 74.98`。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- 上一轮失败点在 `elapsed 72.07` 左右直接 verifier 失败，本轮能完整输出并通过验证。当前不能用这两个时间判断性能变化，只能说明没有引入明显卡死或指数级退化。
+
+评分：
+
+- 实现效果：8/10，修掉真实 verifier 失败，保守地把跨函数值替换成本地 unknown。
+- 复杂度：3/10，只新增一个小 helper 和两个回归测试。
+- 维护成本：3/10，逻辑和已有 `localizeReturnValue(...)` 保持一致，没有改签名推断策略。

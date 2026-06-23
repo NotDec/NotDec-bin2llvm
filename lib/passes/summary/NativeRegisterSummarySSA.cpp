@@ -237,6 +237,7 @@ knownExternalPrototypes() {
       {"sigprocmask", {3, false}},
       {"snprintf", {3, true}},
       {"socket", {3, false}},
+      {"setsockopt", {5, false}},
       {"sleep", {1, false}},
       {"srandom", {1, false}},
       {"sscanf", {2, true}},
@@ -1744,6 +1745,22 @@ llvm::Value *localizeReturnValue(llvm::Function &function,
   return value;
 }
 
+llvm::Value *localizeCallArgument(llvm::Function &function,
+                                  llvm::Instruction &insertBefore,
+                                  llvm::Value *value) {
+  auto *argument = llvm::dyn_cast<llvm::Argument>(value);
+  if (argument != nullptr && argument->getParent() != &function) {
+    std::map<llvm::Type *, llvm::Value *> unknownByType;
+    return foreignArgumentReplacement(function, *argument, unknownByType);
+  }
+  auto *instruction = llvm::dyn_cast<llvm::Instruction>(value);
+  if (instruction != nullptr && instruction->getFunction() != &function) {
+    return frozenPoisonBefore(insertBefore, value->getType(),
+                              value->getName() + ".old");
+  }
+  return value;
+}
+
 llvm::CallInst *rewriteCallInst(llvm::CallBase &oldCall, llvm::Value &callee,
                                 llvm::FunctionType &newType,
                                 const std::vector<llvm::Value *> &args) {
@@ -1893,6 +1910,7 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
           index < bindings.size() ? bindings[index].Value : nullptr;
       if (value != nullptr) {
         value = remapValue(value);
+        value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);
       }
       if (value == nullptr ||
           value->getType() != shape.Params[index]->Global->getValueType()) {
