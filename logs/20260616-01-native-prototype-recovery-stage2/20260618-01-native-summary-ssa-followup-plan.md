@@ -5152,3 +5152,46 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
   - `declare void @sleep(i64)`
   - `call void @sleep(i64 %RDX.summary_ssa2210)`
 - LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+
+## 实现记录：fortune libc arity 继续补齐
+
+这次继续沿着 `fortune` 当前 IR 查 external call。上一次后，仍有一些标准 libc 调用保持 6 个 ABI 参数。只补签名明确的 libc / POSIX 项，不猜 `recode_*` 这类库私有接口。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:130-250`
+  - 在 `knownExternalPrototypes()` 里补充：
+    - `__ctype_b_loc` / `__ctype_tolower_loc` / `__ctype_toupper_loc`: 0 参数
+    - `__cxa_finalize`: 1 参数
+    - `__strncpy_chk`: 4 参数
+    - `access`: 2 参数
+    - `fdopen`: 2 参数
+    - `fputc` / `fputs` / `putc`: 2 参数
+    - `getopt`: 3 参数
+    - `getpid`: 0 参数
+    - `nl_langinfo`: 1 参数
+    - `opendir` / `readdir`: 1 参数
+    - `re_comp` / `re_exec`: 1 参数
+    - `setlocale`: 2 参数
+    - `srandom`: 1 参数
+
+验证：
+
+- `cmake --build build --target notdec-native-llvm native_register_summary_ssa_test -j$(nproc)`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-current-5.ll --summary-json-out /tmp/fortune-current-5.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-current-5.ll -o /tmp/fortune-current-5.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-current-5.bc -o /tmp/fortune-current-5.verify.bc`
+
+结果：
+
+- `fortune` 运行时间：`elapsed 8.43`
+- 当前 IR 中这些调用已经收窄，例如：
+  - `tail call void @__ctype_toupper_loc()`
+  - `call void @getpid()`
+  - `call i64 @srandom(i64 %67)`
+  - `call i64 @re_exec(i64 %R14.summary_ssa744)`
+  - `call i64 @fdopen(i64 %60, i64 24822)`
+  - `call i64 @readdir(i64 %R12.summary_ssa2183)`
+- 剩下的 6 参数 external 主要是 `recode_*` 和 `__libc_start_main`，本轮不猜。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
