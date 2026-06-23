@@ -6526,3 +6526,31 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 
 - 这批改动很小，只影响固定原型表和测试。
 - 后续再碰到 OpenSSL 相关外部声明，还是先看头文件，不先猜。
+
+## 实现记录：补齐 `__asprintf_chk`
+
+`Bench2` 里 `lighttpd`、`ssh`、`memcached` 这类目标都还会碰到 `__asprintf_chk`，本地头文件里它的原型是明确的，这个点比继续猜别的带可变参数的 FORTIFY 接口更稳。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:157`
+  - 在 `knownExternalPrototypes()` 中新增 `__asprintf_chk`，fixed arity 为 3，保留 vararg。
+- `tests/native_register_summary_ssa_test.cpp:719`
+  - 在 `testKnownFixedExternalArities()` 里补上 `__asprintf_chk` 的 arity 断言。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd --all-confirmed -o /tmp/notdec-lighttpd-asprintf.ll --summary-json-out /tmp/notdec-lighttpd-asprintf.summary.json`
+
+结果：
+
+- 构建通过。
+- `native_register_summary_ssa_test` 通过。
+- `lighttpd` 这次实际输出里仍然保留 `__printf_chk`、`__fprintf_chk`、`__snprintf_chk` 的正常变参声明，`__asprintf_chk` 的跑法还在等下一轮完整输出收口。
+
+判断：
+
+- 这次改动同样很小，只补了一个确定原型。
+- 后面如果要继续收 Bench2 上的 FORTIFY 项，优先挑已经有头文件明确定义、而且当前 IR 仍明显不对的函数。

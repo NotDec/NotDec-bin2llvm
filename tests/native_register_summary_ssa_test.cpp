@@ -722,6 +722,7 @@ bool testKnownFixedExternalArities() {
       {"__isoc23_strtoll", 3},
       {"__isoc23_strtoul", 3},
       {"__isoc23_strtoull", 3},
+      {"__asprintf_chk", 3},
       {"__poll_chk", 4},
       {"__longjmp_chk", 2},
       {"__sigsetjmp", 2},

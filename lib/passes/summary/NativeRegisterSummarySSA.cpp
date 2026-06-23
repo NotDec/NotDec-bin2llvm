@@ -155,6 +155,7 @@ knownExternalPrototypes() {
       {"__memset_chk", {4, false, false}},
       {"__open64_2", {2, false, false}},
       {"__printf_chk", {2, true, false}},
+      {"__asprintf_chk", {3, true, false}},
       {"__poll_chk", {4, false, false}},
       {"__read_chk", {4, false, false}},
       {"__register_atfork", {4, false, false}},
