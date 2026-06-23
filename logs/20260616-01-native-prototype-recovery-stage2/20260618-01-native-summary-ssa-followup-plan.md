@@ -5431,3 +5431,53 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 - 实现效果：7/10，继续减少明显错误的 6 参数 external。
 - 复杂度：3/10，主要是 known 表扩充和一个清理时机保护。
 - 维护成本：3/10，仍是显式白名单，容易审查。
+
+## 实现记录：vsftpd utmpx/prctl arity 补齐
+
+继续扫 `vsftpd` 剩余 6 参数 external，这次只补 libc/POSIX 里很明确的项。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:176-209`
+  - 新增 `endutxent`: 0 参数
+  - 新增 `getgrgid`: 1 参数
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:265-294`
+  - 新增 `pututxline`: 1 参数
+  - 新增 `prctl`: 1 个固定参数 + vararg
+  - 新增 `setutxent`: 0 参数
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:335-337`
+  - 新增 `updwtmpx`: 2 参数
+- `tests/native_register_summary_ssa_test.cpp:707-799`
+  - 扩展 fixed arity 表，覆盖 `endutxent`, `getgrgid`, `pututxline`, `updwtmpx`。
+  - 扩展 vararg 表，覆盖 `prctl`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j$(nproc)`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-posix.ll --summary-json-out /tmp/fortune-posix.summary.json`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/vsftpd --all-confirmed -o /tmp/vsftpd-posix.ll --summary-json-out /tmp/vsftpd-posix.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-posix.ll -o /tmp/fortune-posix.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-posix.bc -o /tmp/fortune-posix.verify.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/vsftpd-posix.ll -o /tmp/vsftpd-posix.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/vsftpd-posix.bc -o /tmp/vsftpd-posix.verify.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `fortune` 运行时间：`elapsed 8.71`。
+- `vsftpd` 运行时间：`elapsed 78.61`。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- `vsftpd` 当前输出里：
+  - `declare void @setutxent()`
+  - `declare void @endutxent()`
+  - `declare void @pututxline(i64)`
+  - `declare i64 @updwtmpx(i64, i64)`
+  - `declare i64 @getgrgid(i64)`
+  - `declare { i64, i64 } @prctl(i64, ...)`
+
+评分：
+
+- 实现效果：6/10，继续清理标准库 external，剩下多数是 OpenSSL/PAM/libcap/项目私有符号。
+- 复杂度：2/10，只补 known 表和测试表。
+- 维护成本：2/10，显式白名单，容易回退。

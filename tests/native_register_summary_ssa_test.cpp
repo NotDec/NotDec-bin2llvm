@@ -712,15 +712,17 @@ bool testVsftpdKnownExternalArities() {
   const KnownArityCase cases[] = {
       {"__strcpy_chk", 3}, {"accept", 3},       {"chmod", 2},
       {"closedir", 1},    {"closelog", 0},    {"fork", 0},
-      {"getegid", 0},     {"gethostbyname", 1},
+      {"endutxent", 0},   {"getegid", 0},     {"getgrgid", 1},
+      {"gethostbyname", 1},
       {"getpagesize", 0}, {"getpeername", 3}, {"getsockopt", 5},
       {"getpwuid", 1},    {"inet_ntoa", 1},   {"initgroups", 2},
       {"localtime", 1},   {"lstat64", 2},      {"mkdir", 2},
       {"recv", 4},        {"select", 5},       {"sendfile", 4},
       {"sendmsg", 3},     {"setgid", 1},       {"setgroups", 2},
       {"setregid", 2},    {"setreuid", 2},     {"setuid", 1},
-      {"socketpair", 4},  {"stat64", 2},       {"strndup", 2},
-      {"tzset", 0},       {"umask", 1},        {"wait", 1},
+      {"pututxline", 1},  {"socketpair", 4},  {"stat64", 2},
+      {"strndup", 2},     {"tzset", 0},       {"umask", 1},
+      {"updwtmpx", 2},    {"wait", 1},
   };
 
   for (const KnownArityCase &testCase : cases) {
@@ -793,6 +795,7 @@ bool testKnownVarArgExternalKeepsAbiInputs() {
       {"__isoc99_sscanf", 2},
       {"__snprintf_chk", 4},
       {"__syslog_chk", 2},
+      {"prctl", 1},
   };
 
   for (const KnownVarArgCase &testCase : cases) {
