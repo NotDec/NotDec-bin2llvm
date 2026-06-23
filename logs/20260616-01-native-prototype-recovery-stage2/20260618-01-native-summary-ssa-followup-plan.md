@@ -5921,3 +5921,42 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：5/10，wrk/memcached 中一批 OpenSSL external 从 6 参数收窄。
 - 复杂度：1/10，只扩表和测试。
 - 维护成本：3/10，表继续增长；OpenSSL 这类库后续应考虑按库分组维护。
+
+## 实现记录：memcached SASL arity 补齐
+
+继续看 `memcached` 的剩余 6 参数 external。`/usr/include/sasl/sasl.h` 中能确认 `sasl_server_init`、`sasl_server_step`、`sasl_dispose` 的固定参数数，且它们会实际减少 ABI 输入。`sasl_server_new` 和 `sasl_listmech` 超过 6 参数，当前 summary fixed arity 只表达寄存器参数，不适合用它描述栈参；`sasl_server_start` 正好 6 参数，也不会减少当前错误输入，所以这次不加。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:459-461`
+  - 在 `knownExternalPrototypes()` 中新增 `sasl_dispose`, `sasl_server_init`, `sasl_server_step`。
+- `tests/native_register_summary_ssa_test.cpp:906-908`
+  - 扩展 `testKnownFixedExternalArities`，覆盖这 3 个 SASL fixed arity。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed -o /tmp/memcached-sasl-arity.ll --summary-json-out /tmp/memcached-sasl-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/memcached-sasl-arity.ll -o /tmp/memcached-sasl-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/memcached-sasl-arity.bc -o /tmp/memcached-sasl-arity.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-sasl-arity.ll --summary-json-out /tmp/fortune-sasl-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-sasl-arity.ll -o /tmp/fortune-sasl-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-sasl-arity.bc -o /tmp/fortune-sasl-arity.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `memcached` 运行时间：`elapsed 118.77`。
+- `fortune` 运行时间：`elapsed 8.49`，未见性能退化。
+- `memcached` 和 `fortune` 均通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `memcached` 输出中新增声明已收窄：
+  - `declare void @sasl_server_step(i64, i64, i64, i64, i64)`
+  - `declare i64 @sasl_server_init(i64, i64)`
+  - `declare i64 @sasl_dispose(i64)`
+
+评分：
+
+- 实现效果：3/10，只收窄 memcached 中 3 个 SASL external。
+- 复杂度：1/10，只扩表和测试。
+- 维护成本：2/10，新增项少且直接来自本地头文件。
