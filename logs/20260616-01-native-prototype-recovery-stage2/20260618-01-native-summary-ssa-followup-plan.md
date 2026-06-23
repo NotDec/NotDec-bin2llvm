@@ -5538,3 +5538,46 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 - 实现效果：7/10，libuv 里一大批明显错误的 6 参数 external 被收窄。
 - 复杂度：3/10，仍是显式 known prototype 表。
 - 维护成本：4/10，表变大了，但每项都是常见 libc/pthread/POSIX 签名。
+
+## 实现记录：修复 call signature rewrite 的返回类型不匹配 RAUW
+
+memcached native 链路暴露了一个 summary-SSA 自身问题：外部调用被重写成多返回 struct 后，旧 call 的直接使用仍可能是旧返回类型。原逻辑在 `rewriteCallInst` 里无条件 `replaceAllUsesWith(newCall)`，当旧返回是 `i64`、新返回是 `{ i64, i64 }` 时会触发 LLVM `replaceAllUses of value with new value of different type` 断言。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1985-1995`
+  - `rewriteCallInst` 只创建新 call，不再无条件替换旧 call 的 uses。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1998-2019`
+  - 新增 `replacementForOldCallUses`。
+  - 旧 call 和新 call 类型相同时直接用新 call。
+  - 旧 call 类型匹配某个返回寄存器类型、且新 call 是多返回时，用 `extractvalue` 作为旧 uses 的替代值。
+  - 找不到类型兼容替代值时不替换，避免再触发类型不匹配 RAUW。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:2171-2181`
+  - signature rewrite 阶段改为先计算类型兼容 replacement，再替换旧 uses。
+- `tests/native_register_summary_ssa_test.cpp:1011-1090`
+  - 新增 `testMismatchedDirectCallUseUsesReturnExtract`。
+  - 构造 `strlen` 固定参数外部调用，同时让 RAX/RBX 成为 demanded returns，并保留旧 call 返回值的直接 use，验证新 call 返回 struct 后旧 use 走 `extractvalue`。
+- `tests/native_register_summary_ssa_test.cpp:1692`
+  - 接入新增回归测试。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed -o /tmp/memcached-current.ll --summary-json-out /tmp/memcached-current.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/memcached-current.ll -o /tmp/memcached-current.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/memcached-current.bc -o /tmp/memcached-current.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `memcached` native 运行通过，时间：`elapsed 110.84`。
+- `/tmp/memcached-current.ll` 和 `/tmp/memcached-current.summary.json` 已生成。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- 运行中仍看到 `skip native function 0x6ba0: Instruction does not dominate all uses!`，这是另一个输入 IR 支配关系问题；本次不混在 RAUW 修复里处理。
+
+评分：
+
+- 实现效果：8/10，memcached 越过原来的 LLVM RAUW 断言，并产出可验证 IR。
+- 复杂度：3/10，只把无条件替换改成类型兼容替换，逻辑集中在 signature rewrite。
+- 维护成本：3/10，新增 helper 行为明确，后续如果要处理更多返回映射，只需要扩展这一处。

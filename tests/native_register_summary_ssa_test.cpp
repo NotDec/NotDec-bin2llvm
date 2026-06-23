@@ -1008,6 +1008,87 @@ bool testKnownVarArgExternalKeepsAbiInputs() {
   return true;
 }
 
+bool testMismatchedDirectCallUseUsesReturnExtract() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-direct-call-use-return-extract", context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_multi_return_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  notdec::bin2llvm::NativeAbiParamEntry input;
+  input.MinSize = 1;
+  input.MaxSize = 8;
+  input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  input.Storage.Name = "RDI";
+  abi.Inputs.push_back(input);
+  for (llvm::StringRef name : {"RAX", "RBX"}) {
+    notdec::bin2llvm::NativeAbiParamEntry output;
+    output.MinSize = 1;
+    output.MaxSize = 8;
+    output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    output.Storage.Name = name.str();
+    abi.Outputs.push_back(output);
+
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = name.str();
+    abi.Effects.push_back(killed);
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "strlen", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "uses_direct_call_result",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  llvm::CallInst *call = builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *raxLoad = loadRegister(builder, rax, "RAX", "rax.after");
+  llvm::LoadInst *rbxLoad = loadRegister(builder, rbx, "RBX", "rbx.after");
+  llvm::Value *sum = builder.CreateAdd(call, raxLoad);
+  sum = builder.CreateAdd(sum, rbxLoad);
+  builder.CreateRet(sum);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool hasStructCall = false;
+  bool hasExtractedDirectUse = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (candidate == nullptr || candidate->getCalledFunction() == nullptr ||
+        candidate->getCalledFunction()->getName() != "strlen") {
+      continue;
+    }
+    hasStructCall = candidate->getType()->isStructTy();
+    for (llvm::User *user : candidate->users()) {
+      auto *extract = llvm::dyn_cast<llvm::ExtractValueInst>(user);
+      if (extract != nullptr && extract->getType()->isIntegerTy(64)) {
+        hasExtractedDirectUse = true;
+      }
+    }
+  }
+
+  return expect(summary.CallsRewritten >= 1,
+                "multi-return direct-use call was not rewritten") &&
+         expect(hasStructCall, "multi-return call did not return struct") &&
+         expect(hasExtractedDirectUse,
+                "old direct call use was not replaced by extract") &&
+         verifyOk(module,
+                  "module failed verifier after direct call use rewrite");
+}
+
 bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-call-arg-value-survives-cleanup", context);
@@ -1608,6 +1689,7 @@ int main() {
   ok &= testKnownFiveArgExternalUsesFiveInputs();
   ok &= testKnownFixedExternalArities();
   ok &= testKnownVarArgExternalKeepsAbiInputs();
+  ok &= testMismatchedDirectCallUseUsesReturnExtract();
   ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();

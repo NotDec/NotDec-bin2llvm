@@ -1992,11 +1992,30 @@ llvm::CallInst *rewriteCallInst(llvm::CallBase &oldCall, llvm::Value &callee,
       oldCall.getContext(), oldCall.getAttributes().getFnAttrs(),
       oldCall.getAttributes().getRetAttrs(), argAttrs));
   newCall->copyMetadata(oldCall);
-  if (!oldCall.use_empty()) {
-    oldCall.replaceAllUsesWith(newCall);
-    newCall->takeName(&oldCall);
-  }
   return newCall;
+}
+
+llvm::Value *replacementForOldCallUses(llvm::IRBuilder<> &builder,
+                                       llvm::CallBase &oldCall,
+                                       llvm::CallInst &newCall,
+                                       const SignatureShape &shape) {
+  if (oldCall.getType()->isVoidTy()) {
+    return nullptr;
+  }
+  if (oldCall.getType() == newCall.getType()) {
+    return &newCall;
+  }
+  for (unsigned index = 0; index < shape.Returns.size(); ++index) {
+    if (shape.Returns[index]->Global->getValueType() != oldCall.getType()) {
+      continue;
+    }
+    if (shape.Returns.size() == 1) {
+      return &newCall;
+    }
+    return builder.CreateExtractValue(&newCall, {index},
+                                      oldCall.getName() + ".ret");
+  }
+  return nullptr;
 }
 
 void rewriteInternalFunctionBody(llvm::Function &oldFunction,
@@ -2152,6 +2171,15 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
     llvm::CallInst *newCall = rewriteCallInst(
         *oldCall, *newCallee, *newCallee->getFunctionType(), args);
     state.RewrittenCalls.insert(newCall);
+    if (!oldCall->use_empty()) {
+      llvm::IRBuilder<> builder(newCall->getNextNode());
+      llvm::Value *replacement =
+          replacementForOldCallUses(builder, *oldCall, *newCall, shape);
+      if (replacement != nullptr) {
+        oldCall->replaceAllUsesWith(replacement);
+        newCall->takeName(oldCall);
+      }
+    }
     valueMap[oldCall] = newCall;
     oldCallsToErase.push_back(oldCall);
     auto helpersIt = state.ReturnHelpers.find(oldCall);
