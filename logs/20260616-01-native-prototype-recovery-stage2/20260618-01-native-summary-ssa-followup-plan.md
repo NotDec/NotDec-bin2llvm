@@ -5821,3 +5821,51 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：5/10，memcached/lighttpd 中一批明显的 6 参数 libc/POSIX external 被收窄。
 - 复杂度：1/10，只扩充 known prototype 表和现有表驱动测试。
 - 维护成本：3/10，表继续增长，但新增项都有本地头文件依据；后续更适合考虑从系统头文件/符号库生成或分组维护。
+
+## 实现记录：memcached libevent/libc arity 补齐
+
+继续看 `memcached` 的剩余 6 参数 external。OpenSSL、SASL 和浮点返回函数仍先不动；这次只处理本地头文件能确认、参数数明确的 libevent、libc 和 pthread 符号。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:211-220`
+  - 在 `knownExternalPrototypes()` 中新增 `event_base_free`, `event_base_loop`, `event_base_loopexit`, `event_base_new_with_config`, `event_config_free`, `event_config_new`, `event_config_set_flag`, `event_get_version`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:232`
+  - 新增 `fileno`: 1 参数。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:424`
+  - 新增 `pthread_setname_np`: 2 参数。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:518`
+  - 新增 `strtok_r`: 3 参数。
+- `tests/native_register_summary_ssa_test.cpp:750-760,887,932`
+  - 扩展 `testKnownFixedExternalArities`，覆盖上述新增 fixed arity。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed -o /tmp/memcached-event-arity.ll --summary-json-out /tmp/memcached-event-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/memcached-event-arity.ll -o /tmp/memcached-event-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/memcached-event-arity.bc -o /tmp/memcached-event-arity.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-event-arity.ll --summary-json-out /tmp/fortune-event-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-event-arity.ll -o /tmp/fortune-event-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-event-arity.bc -o /tmp/fortune-event-arity.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `memcached` 运行时间：`elapsed 119.11`。
+- `fortune` 运行时间：`elapsed 8.53`，未见性能退化。
+- `memcached` 和 `fortune` 均通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `memcached` 输出中新增声明已收窄，例如：
+  - `declare i64 @event_base_loop(i64, i64)`
+  - `declare void @event_base_free(i64)`
+  - `declare void @event_config_new()`
+  - `declare i64 @fileno(i64)`
+  - `declare i64 @pthread_setname_np(i64, i64)`
+  - `declare { i64, i64 } @strtok_r(i64, i64, i64)`
+
+评分：
+
+- 实现效果：4/10，memcached 中一批 libevent/libc/pthread external 从 6 参数收窄。
+- 复杂度：1/10，只扩表和测试。
+- 维护成本：3/10，表继续增大；这类第三方库函数后续最好集中分组或生成。
