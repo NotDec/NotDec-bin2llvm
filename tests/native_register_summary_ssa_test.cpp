@@ -704,6 +704,134 @@ bool testKnownFiveArgExternalUsesFiveInputs() {
                   "module failed verifier after five-arg external rewrite");
 }
 
+bool testVsftpdKnownExternalArities() {
+  struct KnownArityCase {
+    const char *Name;
+    unsigned Args;
+  };
+  const KnownArityCase cases[] = {
+      {"__strcpy_chk", 3}, {"accept", 3},       {"chmod", 2},
+      {"closelog", 0},    {"fork", 0},         {"getegid", 0},
+      {"getpeername", 3}, {"getsockopt", 5},   {"localtime", 1},
+      {"recv", 4},        {"select", 5},       {"socketpair", 4},
+      {"stat64", 2},      {"tzset", 0},        {"umask", 1},
+  };
+
+  for (const KnownArityCase &testCase : cases) {
+    llvm::LLVMContext context;
+    llvm::Module module(std::string("summary-ssa-known-") + testCase.Name,
+                        context);
+    attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+    llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+    llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+    llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+    llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+    llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+    llvm::GlobalVariable *r9 = createRegisterGlobal(module, "R9");
+
+    auto *calleeType =
+        llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+    llvm::Function *callee =
+        llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                               testCase.Name, module);
+    auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+    llvm::Function *function = llvm::Function::Create(
+        type, llvm::GlobalValue::ExternalLinkage,
+        std::string("known_call_") + testCase.Name, module);
+    llvm::BasicBlock *entry =
+        llvm::BasicBlock::Create(context, "entry", function);
+    llvm::IRBuilder<> builder(entry);
+    storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                  "RDI");
+    storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                  "RSI");
+    storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                  "RDX");
+    storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 4),
+                  "RCX");
+    storeRegister(builder, r8, llvm::ConstantInt::get(r8->getValueType(), 5),
+                  "R8");
+    storeRegister(builder, r9, llvm::ConstantInt::get(r9->getValueType(), 6),
+                  "R9");
+    builder.CreateCall(calleeType, callee);
+    builder.CreateRetVoid();
+
+    notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+    llvm::CallInst *call = nullptr;
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+        if (candidate->getCalledFunction() != nullptr &&
+            candidate->getCalledFunction()->getName() == testCase.Name) {
+          call = candidate;
+        }
+      }
+    }
+
+    if (!expect(call != nullptr, "known vsftpd external call missing") ||
+        !expect(call->arg_size() == testCase.Args,
+                "known vsftpd external used wrong arity") ||
+        !verifyOk(module,
+                  "module failed verifier after vsftpd external rewrite")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-call-arg-value-survives-cleanup", context);
+  attachTestAbiWithInputs(module, {"RDI"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "unlink", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                                       {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "call_arg_cleanup", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *path = builder.CreateAdd(
+      function->getArg(0), llvm::ConstantInt::get(rdi->getValueType(), 7),
+      "path");
+  storeRegister(builder, rdi, path, "RDI");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::CallInst *call = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      if (candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "unlink") {
+        call = candidate;
+      }
+    }
+  }
+
+  bool argIsLocalInstruction = false;
+  if (call != nullptr && call->arg_size() == 1) {
+    auto *instruction =
+        llvm::dyn_cast<llvm::Instruction>(call->getArgOperand(0));
+    argIsLocalInstruction =
+        instruction != nullptr && instruction->getFunction() == function;
+  }
+
+  return expect(call != nullptr, "known one-arg external call missing") &&
+         expect(call->arg_size() == 1,
+                "known one-arg external used wrong arity") &&
+         expect(argIsLocalInstruction,
+                "recorded call arg instruction was deleted before rewrite") &&
+         expect(summary.DeadStoresRemoved >= 1,
+                "dead ABI store before one-arg external was not removed") &&
+         verifyOk(module,
+                  "module failed verifier after call arg cleanup rewrite");
+}
+
 bool testInternalSignatureRewriteUsesArgsAndReturn() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-internal-signature", context);
@@ -1244,6 +1372,8 @@ int main() {
   ok &= testKnownZeroArgExternalDropsAbiInputs();
   ok &= testKnownFixedArgExternalTruncatesAbiInputs();
   ok &= testKnownFiveArgExternalUsesFiveInputs();
+  ok &= testVsftpdKnownExternalArities();
+  ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testForeignArgumentInMovedBodyIsReplaced();

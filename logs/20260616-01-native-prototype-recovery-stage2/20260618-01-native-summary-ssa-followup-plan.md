@@ -5239,3 +5239,46 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 - 实现效果：8/10，修掉真实 verifier 失败，保守地把跨函数值替换成本地 unknown。
 - 复杂度：3/10，只新增一个小 helper 和两个回归测试。
 - 维护成本：3/10，逻辑和已有 `localizeReturnValue(...)` 保持一致，没有改签名推断策略。
+
+## 实现记录：vsftpd 固定 external arity 补齐和 call arg 保活
+
+这次继续看 `vsftpd` 的 native 输出，先把一批签名明确的 libc / POSIX external 补齐，再修掉一次由死 store 清理引起的悬空指针。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:131-309`
+  - 在 `knownExternalPrototypes()` 里补充了这些固定 arity：
+    - `accept`, `chmod`, `chroot`, `closelog`, `dirfd`, `dup2`, `fchmod`, `ftruncate64`, `fork`, `getcwd`, `getegid`, `geteuid`, `getpeername`, `getpgrp`, `getuid`, `gmtime`, `if_nametoindex`, `inet_aton`, `localtime`, `mktime`, `nanosleep`, `openlog`, `putenv`, `rand`, `readlink`, `readdir64`, `realpath`, `recv`, `recvmsg`, `rename`, `rmdir`, `select`, `setrlimit64`, `setsid`, `setsockopt`, `sigfillset`, `socketpair`, `srand`, `stat64`, `tzset`, `umask`
+    - 以及已经确认固定参数的 `__strcpy_chk`
+  - 这轮没有碰 `__isoc99_sscanf`、`__syslog_chk` 这类 vararg 函数，避免把可变参数实参截掉。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:949-1077`
+  - `removeDeadReplacedLoads()` 和 `removeDeadStoresByLiveness()` 现在会保留已记录的 call arg value / store。
+  - 这样后面的 signature rewrite 还能拿到原始值，不会再把刚记录下来的临时指令删成悬空指针。
+- `tests/native_register_summary_ssa_test.cpp:707-779`
+  - 新增 `testVsftpdKnownExternalArities()`，覆盖这一批固定 arity external。
+- `tests/native_register_summary_ssa_test.cpp:781-832`
+  - 新增 `testRecordedCallArgValueSurvivesDeadStoreCleanup()`，覆盖 dead store 清理误删 call arg 值的回归。
+- `tests/native_register_summary_ssa_test.cpp:1374-1375`
+  - 把两个新测试接进 `main()`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j$(nproc)`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/vsftpd --all-confirmed -o /tmp/vsftpd-arity.ll --summary-json-out /tmp/vsftpd-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/vsftpd-arity.ll -o /tmp/vsftpd-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/vsftpd-arity.bc -o /tmp/vsftpd-arity.verify.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `vsftpd` native 生成完成，运行时间：`elapsed 78.27`。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- 当前 `vsftpd` 输出里，像 `tzset()`, `fork()`, `getuid()`, `getpeername(...)`, `getsockopt(...)`, `select(...)`, `socketpair(...)`, `stat64(...)`, `umask(...)`, `accept(...)`, `chmod(...)`, `closelog()` 这些都已经收窄到更接近真实签名。
+- `__isoc99_sscanf` 和 `__syslog_chk` 仍保持原样，因为它们是 vararg，现有 summary 重写还不能安全保留可变参数。
+
+评分：
+
+- 实现效果：7/10，补了明显的固定签名，且修掉一次真实 crash。
+- 复杂度：4/10，新增两条很小的保护逻辑。
+- 维护成本：3/10，名单仍是显式枚举，没引入新抽象。

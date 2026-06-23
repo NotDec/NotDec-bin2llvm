@@ -146,22 +146,29 @@ knownExternalPrototypes() {
       {"__snprintf_chk", {4, true, false}},
       {"__sprintf_chk", {3, true, false}},
       {"__strcat_chk", {3, false, false}},
+      {"__strcpy_chk", {3, false, false}},
       {"__strncpy_chk", {4, false, false}},
       {"__stack_chk_fail", {0, false, true}},
       {"__tls_get_addr", {1, false, false}},
       {"__vasprintf_chk", {3, true, false}},
       {"abort", {0, false, true}},
       {"access", {2, false}},
+      {"accept", {3, false}},
       {"alarm", {1, false}},
       {"arc4random_buf", {2, false}},
       {"bind", {3, false}},
       {"calloc", {2, false}},
       {"chdir", {1, false}},
+      {"chmod", {2, false}},
+      {"chroot", {1, false}},
       {"clock_gettime", {2, false}},
       {"close", {1, false}},
+      {"closelog", {0, false}},
       {"connect", {3, false}},
       {"dcgettext", {3, false}},
+      {"dirfd", {1, false}},
       {"dlsym", {2, false}},
+      {"dup2", {2, false}},
       {"event_add", {2, false}},
       {"event_base_set", {2, false}},
       {"event_del", {1, false}},
@@ -182,20 +189,34 @@ knownExternalPrototypes() {
       {"fread", {4, false}},
       {"free", {1, false}},
       {"freeaddrinfo", {1, false}},
+      {"fchmod", {2, false}},
       {"fseek", {3, false}},
       {"fstat64", {2, false}},
+      {"ftruncate64", {2, false}},
+      {"fork", {0, false}},
       {"ftell", {1, false}},
       {"fwrite", {4, false}},
+      {"getcwd", {2, false}},
+      {"getegid", {0, false}},
       {"getenv", {1, false}},
+      {"geteuid", {0, false}},
       {"getopt", {3, false}},
+      {"getpeername", {3, false}},
       {"getpid", {0, false}},
+      {"getpgrp", {0, false}},
       {"getpwnam", {1, false}},
       {"getsockname", {3, false}},
+      {"getsockopt", {5, false}},
+      {"getuid", {0, false}},
       {"gettimeofday", {2, false}},
+      {"gmtime", {1, false}},
       {"gmtime_r", {2, false}},
+      {"if_nametoindex", {1, false}},
+      {"inet_aton", {2, false}},
       {"inet_ntop", {4, false}},
       {"ioctl", {2, true}},
       {"listen", {2, false}},
+      {"localtime", {1, false}},
       {"lseek", {3, false}},
       {"lseek64", {3, false}},
       {"malloc", {1, false}},
@@ -204,11 +225,14 @@ knownExternalPrototypes() {
       {"memcpy", {3, false}},
       {"memmove", {3, false}},
       {"memset", {3, false}},
+      {"mktime", {1, false}},
       {"mprotect", {3, false}},
       {"munmap", {2, false}},
+      {"nanosleep", {2, false}},
       {"nl_langinfo", {1, false}},
       {"open", {2, true}},
       {"open64", {2, true}},
+      {"openlog", {3, false}},
       {"opendir", {1, false}},
       {"perror", {1, false}},
       {"printf", {1, true}},
@@ -220,28 +244,44 @@ knownExternalPrototypes() {
       {"pthread_mutex_unlock", {1, false}},
       {"pthread_setspecific", {2, false}},
       {"pthread_sigmask", {3, false}},
-      {"puts", {1, false}},
       {"putc", {2, false}},
+      {"putenv", {1, false}},
+      {"puts", {1, false}},
       {"raise", {1, false}},
+      {"rand", {0, false}},
       {"random", {0, false}},
       {"read", {3, false}},
       {"readdir", {1, false}},
+      {"readdir64", {1, false}},
+      {"readlink", {3, false}},
       {"re_comp", {1, false}},
       {"re_exec", {1, false}},
       {"realloc", {2, false}},
+      {"realpath", {2, false}},
+      {"recv", {4, false}},
+      {"recvmsg", {3, false}},
+      {"rename", {2, false}},
+      {"rmdir", {1, false}},
+      {"select", {5, false}},
       {"setlocale", {2, false}},
+      {"setrlimit64", {2, false}},
+      {"setsid", {0, false}},
+      {"setsockopt", {5, false}},
       {"shutdown", {2, false}},
       {"sigaction", {3, false}},
       {"sigdelset", {2, false}},
+      {"sigfillset", {1, false}},
       {"signal", {2, false}},
       {"sigprocmask", {3, false}},
       {"snprintf", {3, true}},
       {"socket", {3, false}},
-      {"setsockopt", {5, false}},
+      {"socketpair", {4, false}},
       {"sleep", {1, false}},
       {"srandom", {1, false}},
+      {"srand", {1, false}},
       {"sscanf", {2, true}},
       {"stat", {2, false}},
+      {"stat64", {2, false}},
       {"strcasecmp", {2, false}},
       {"strcat", {2, false}},
       {"strchr", {2, false}},
@@ -264,8 +304,11 @@ knownExternalPrototypes() {
       {"syscall", {1, true}},
       {"sysinfo", {1, false}},
       {"time", {1, false}},
+      {"tzset", {0, false}},
+      {"umask", {1, false}},
       {"uname", {1, false}},
       {"unlink", {1, false}},
+      {"utime", {2, false}},
       {"waitpid", {3, false}},
       {"write", {3, false}},
   };
@@ -908,9 +951,28 @@ private:
       if (load->getParent() == nullptr || !load->use_empty()) {
         continue;
       }
+      if (isRecordedCallArgValue(load)) {
+        continue;
+      }
       load->eraseFromParent();
       ++Summary.DeadLoadsRemoved;
     }
+  }
+
+  bool isRecordedCallArgStore(llvm::StoreInst *store) const {
+    return SignatureState.StoresToErase.count(store) != 0;
+  }
+
+  bool isRecordedCallArgValue(llvm::Value *value) const {
+    for (const auto &[call, bindings] : SignatureState.CallArgs) {
+      (void)call;
+      for (const CallArgStoreBinding &binding : bindings) {
+        if (binding.Value == value) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   void removeDeadStoresByLiveness() {
@@ -1003,9 +1065,12 @@ private:
     }
     for (llvm::StoreInst *store : deadStores) {
       llvm::Value *storedValue = store->getValueOperand();
+      bool keepStoredValue = isRecordedCallArgStore(store);
       store->eraseFromParent();
-      if (auto *storedInst = llvm::dyn_cast<llvm::Instruction>(storedValue)) {
-        llvm::RecursivelyDeleteTriviallyDeadInstructions(storedInst);
+      if (!keepStoredValue) {
+        if (auto *storedInst = llvm::dyn_cast<llvm::Instruction>(storedValue)) {
+          llvm::RecursivelyDeleteTriviallyDeadInstructions(storedInst);
+        }
       }
       ++Summary.DeadStoresRemoved;
     }
