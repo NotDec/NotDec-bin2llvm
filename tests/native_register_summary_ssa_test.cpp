@@ -778,6 +778,73 @@ bool testVsftpdKnownExternalArities() {
   return true;
 }
 
+bool testKnownVarArgExternalKeepsAbiInputs() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-vararg-external", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+  llvm::GlobalVariable *r9 = createRegisterGlobal(module, "R9");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__snprintf_chk",
+      module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "known_vararg_call", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                "RDX");
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 4),
+                "RCX");
+  storeRegister(builder, r8, llvm::ConstantInt::get(r8->getValueType(), 5),
+                "R8");
+  storeRegister(builder, r9, llvm::ConstantInt::get(r9->getValueType(), 6),
+                "R9");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::CallInst *call = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      if (candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "__snprintf_chk") {
+        call = candidate;
+      }
+    }
+  }
+
+  bool calleeIsVarArg = false;
+  if (call != nullptr && call->getCalledFunction() != nullptr) {
+    llvm::FunctionType *rewrittenType =
+        call->getCalledFunction()->getFunctionType();
+    calleeIsVarArg =
+        rewrittenType->isVarArg() && rewrittenType->getNumParams() == 4;
+  }
+
+  return expect(call != nullptr, "known vararg external call missing") &&
+         expect(call->arg_size() == 6,
+                "known vararg external dropped ABI varargs") &&
+         expect(calleeIsVarArg,
+                "known vararg external did not keep vararg function type") &&
+         expect(summary.DeadStoresRemoved == 6,
+                "dead ABI stores before vararg external were not removed") &&
+         verifyOk(module,
+                  "module failed verifier after vararg external rewrite");
+}
+
 bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-call-arg-value-survives-cleanup", context);
@@ -1373,6 +1440,7 @@ int main() {
   ok &= testKnownFixedArgExternalTruncatesAbiInputs();
   ok &= testKnownFiveArgExternalUsesFiveInputs();
   ok &= testVsftpdKnownExternalArities();
+  ok &= testKnownVarArgExternalKeepsAbiInputs();
   ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();

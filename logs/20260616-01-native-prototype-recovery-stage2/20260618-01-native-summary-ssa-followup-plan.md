@@ -5282,3 +5282,50 @@ build/bin/notdec-native-discover --summary-json /sn640/NotDec-Exp/Bench2/rootfs/
 - 实现效果：7/10，补了明显的固定签名，且修掉一次真实 crash。
 - 复杂度：4/10，新增两条很小的保护逻辑。
 - 维护成本：3/10，名单仍是显式枚举，没引入新抽象。
+
+## 实现记录：vararg external 保留额外实参
+
+这次继续看 `vsftpd` 和 `fortune` 的 native 输出。前一轮已经把一批固定参数 external 收窄了，但 `__snprintf_chk`、`__fprintf_chk`、`snprintf` 这类 vararg external 还会把可变参数实参丢掉。这个问题直接影响语义，不只是签名干净不干净。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:765-785`
+  - `shapeForKnownExternal(...)` 继续只收固定参数，但保留 `shape.VarArg`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1454-1478`
+  - `callArgStoreBindings(...)` 在 `shape.VarArg` 时会继续读取所有 ABI 输入寄存器，不再只停在固定参数数目。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1978-2004`
+  - `rewriteSignatureShapes(...)` 在重写 call 时，固定参数之后把 vararg 的绑定值继续 append 到新 call。
+  - 这样 vararg external 的函数类型仍然是 `fixed, ...`，但实参不会被截断。
+- `tests/native_register_summary_ssa_test.cpp:781-846`
+  - 新增 `testKnownVarArgExternalKeepsAbiInputs()`，确认 `__snprintf_chk` 仍是 4 个固定参数 + vararg，并且 call 里保留额外 ABI 输入。
+- `tests/native_register_summary_ssa_test.cpp:1443`
+  - 把新测试接进 `main()`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j$(nproc)`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-vararg.ll --summary-json-out /tmp/fortune-vararg.summary.json`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/vsftpd --all-confirmed -o /tmp/vsftpd-vararg.ll --summary-json-out /tmp/vsftpd-vararg.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-vararg.ll -o /tmp/fortune-vararg.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-vararg.bc -o /tmp/fortune-vararg.verify.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/vsftpd-vararg.ll -o /tmp/vsftpd-vararg.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/vsftpd-vararg.bc -o /tmp/vsftpd-vararg.verify.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `fortune` 运行时间：`elapsed 8.57`。
+- `vsftpd` 运行时间：`elapsed 78.01`。
+- LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- 现在 `fortune` 里可见：
+  - `call void (i64, i64, i64, ...) @__fprintf_chk(..., i64 %RDX.summary_ssa2415, i64 %RCX.summary_ssa2416, i64 %R8.summary_ssa2418, i64 %R9.summary_ssa2421)`
+  - `call void (i64, i64, i64, i64, ...) @__snprintf_chk(..., i64 24789, i64 %7)`
+  - `call void (i64, i64, i64, ...) @snprintf(..., i64 24881, i64 %unique_df00_8264, i64 0, i64 0)`
+- `__isoc99_sscanf` 和 `__syslog_chk` 仍保持 vararg 形态，不被误截断。
+
+评分：
+
+- 实现效果：8/10，vararg 实参现在能保住，不再只剩固定头部。
+- 复杂度：4/10，只改了 call 参数收集和重写两处。
+- 维护成本：4/10，规则还是按 ABI 输入顺序收集，后续好查。

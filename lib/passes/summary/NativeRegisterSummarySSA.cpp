@@ -1454,8 +1454,12 @@ private:
   std::vector<CallArgStoreBinding>
   callArgStoreBindings(llvm::CallBase &call, const SignatureShape &shape) {
     std::vector<CallArgStoreBinding> bindings;
-    for (unsigned index = 0; index < shape.Params.size(); ++index) {
-      const RegisterUnit *unit = shape.Params[index];
+    unsigned argCount =
+        shape.VarArg ? Abi.InputsInOrder.size() : shape.Params.size();
+    for (unsigned index = 0; index < argCount; ++index) {
+      const RegisterUnit *unit =
+          index < shape.Params.size() ? shape.Params[index]
+                                      : unitByName(Abi.InputsInOrder[index]);
       if (unit == nullptr) {
         break;
       }
@@ -1968,7 +1972,7 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
       continue;
     }
     std::vector<llvm::Value *> args;
-    args.reserve(shape.Params.size());
+    args.reserve(bindings.size());
     llvm::IRBuilder<> oldCallBuilder(oldCall);
     for (unsigned index = 0; index < shape.Params.size(); ++index) {
       llvm::Value *value =
@@ -1984,6 +1988,20 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
             shape.Params[index]->Name + ".arg_unknown");
       }
       args.push_back(value);
+    }
+    if (shape.VarArg) {
+      for (const CallArgStoreBinding &binding : bindings) {
+        if (binding.Index < shape.Params.size()) {
+          continue;
+        }
+        llvm::Value *value = binding.Value;
+        if (value == nullptr) {
+          continue;
+        }
+        value = remapValue(value);
+        value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);
+        args.push_back(value);
+      }
     }
     llvm::CallInst *newCall = rewriteCallInst(
         *oldCall, *newCallee, *newCallee->getFunctionType(), args);
