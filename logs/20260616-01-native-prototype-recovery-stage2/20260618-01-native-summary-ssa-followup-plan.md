@@ -5628,3 +5628,55 @@ memcached 的 main（`notdec_native_6ba0`）在上一轮仍被跳过，报错是
 - 实现效果：8/10，memcached main 从整函数跳过变成可生成、可汇编、可验证。
 - 复杂度：5/10，在 p-code lowering 的缓存读取处补了一层 join PHI，逻辑比普通 opcode lowering 更复杂。
 - 维护成本：5/10，后续如果要更完整处理 unique SSA，还需要把这种局部 PHI 扩展成更系统的 p-code SSA；但当前修复集中，回归测试覆盖了核心形状。
+
+## 实现记录：lighttpd external arity 扩充
+
+lighttpd 当前 native 链路可以跑完并通过 LLVM 22，但输出里仍有一批标准库、POSIX、PCRE2 和 nettle 外部符号保持 6 个 ABI 参数。这些签名能从本地系统头文件或常见 libc/PCRE2/nettle API 直接确认，适合继续补 known prototype，减少明显错误的 external 声明和调用。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:143-160`
+  - 新增 `__isoc23_strtoll`, `__isoc23_strtoul`, `__longjmp_chk`, `__sigsetjmp`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:172-201`
+  - 新增 `arc4random`, `dup`, `epoll_wait`, `execv`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:237-291`
+  - 新增 `gai_strerror`, `getentropy`, `getgid`, `getgrnam`, `getloadavg`, `getxattr`, `glob64`, `globfree64`, `inet_pton`, `localtime_r`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:301-340`
+  - 新增 `mempcpy`, `mkostemp64`。
+  - 新增 lighttpd 中出现的固定参数 nettle API：`nettle_arcfour_*`, `nettle_knuth_lfib_*`, `nettle_sha256_*`, `nettle_yarrow256_init`。
+  - 新增固定参数 PCRE2 8-bit API：`pcre2_code_free_8`, `pcre2_get_error_message_8`, `pcre2_get_ovector_pointer_8`, `pcre2_jit_compile_8`, `pcre2_match_data_create_8`, `pcre2_match_data_create_from_pattern_8`, `pcre2_match_data_free_8`, `pcre2_pattern_info_8`。
+  - 新增 `pipe` 和固定参数 `posix_spawn_file_actions_*` / `posix_spawnattr_*`。
+- `tests/native_register_summary_ssa_test.cpp:718-820`
+  - 扩展 `testKnownFixedExternalArities`，覆盖这批新增 fixed arity external。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `cmake --build build --target notdec-native-llvm -j2`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-lighttpd-arity.ll --summary-json-out /tmp/fortune-lighttpd-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-lighttpd-arity.ll -o /tmp/fortune-lighttpd-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-lighttpd-arity.bc -o /tmp/fortune-lighttpd-arity.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd --all-confirmed -o /tmp/lighttpd-arity-final.ll --summary-json-out /tmp/lighttpd-arity-final.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/lighttpd-arity-final.ll -o /tmp/lighttpd-arity-final.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/lighttpd-arity-final.bc -o /tmp/lighttpd-arity-final.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `fortune` 运行时间：`elapsed 8.57`，未见性能退化。
+- `lighttpd` 运行时间：`elapsed 288.87`。
+- `fortune` 和 `lighttpd` 的 LLVM 22 `llvm-as`、`opt -passes=verify` 均通过。
+- `lighttpd` 输出中这批声明已经收窄，例如：
+  - `declare { i64, i64 } @__isoc23_strtoul(i64, i64, i64)`
+  - `declare i64 @getentropy(i64, i64)`
+  - `declare i64 @epoll_wait(i64, i64, i64, i64)`
+  - `declare i64 @pcre2_get_error_message_8(i64, i64, i64)`
+  - `declare void @nettle_sha256_update(i64, i64, i64)`
+  - `declare i64 @posix_spawn_file_actions_adddup2(i64, i64, i64)`
+
+评分：
+
+- 实现效果：6/10，lighttpd 中一批明显错误的 6 参数 external 被收窄。
+- 复杂度：2/10，只扩充 known prototype 表和固定 arity 单测。
+- 维护成本：3/10，表继续变大，但每项都是明确固定签名，审查成本可控。
