@@ -6414,3 +6414,49 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：4/10，`splice` 明确清掉一个 `lighttpd` 双返回 external，另外 3 个 fixed arity 收进已知表。
 - 复杂度：1/10，只补 fixed arity 表和测试。
 - 维护成本：1/10，都是稳定 libc/SASL 接口。
+
+## 实现记录：补齐 `getnameinfo`
+
+最新 `lighttpd` 输出里，非 intrinsic 的双返回 external 只剩 `getnameinfo`。
+本地 `/usr/include/netdb.h:675` 中它是 7 个固定参数，返回 `int`。
+当前 summary 链路只把 x86-64 ABI 的前 6 个寄存器参数重写进 LLVM 函数类型，
+第 7 个栈上传参暂时不在 external signature rewrite 中表达；但 known 表记录 fixed arity 为 7，
+可以限制它最多只有 1 个返回寄存器，避免 `{ i64, i64 }` 假返回。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:273`
+  - 在 `knownExternalPrototypes()` 中新增 `getnameinfo`，fixed arity 为 7。
+- `tests/native_register_summary_ssa_test.cpp:19`
+  - 新增 `<algorithm>`，用于测试里计算当前 ABI 可表达的参数数。
+- `tests/native_register_summary_ssa_test.cpp:785`
+  - 扩展 `testKnownFixedExternalArities()`，覆盖 `getnameinfo`。
+- `tests/native_register_summary_ssa_test.cpp:1066`
+  - fixed external arity 测试期望改成 `min(真实 fixed arity, 6)`，匹配当前 6 个寄存器参数 ABI。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd --all-confirmed -o /tmp/notdec-lighttpd-getnameinfo.ll --summary-json-out /tmp/notdec-lighttpd-getnameinfo.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-lighttpd-getnameinfo.ll -o /tmp/notdec-lighttpd-getnameinfo.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-lighttpd-getnameinfo.bc -o /tmp/notdec-lighttpd-getnameinfo.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-getnameinfo.ll --summary-json-out /tmp/fortune-getnameinfo.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-getnameinfo.ll -o /tmp/fortune-getnameinfo.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-getnameinfo.bc -o /tmp/fortune-getnameinfo.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `lighttpd` 运行时间：`elapsed 310.87`。
+- `fortune` 运行时间：`elapsed 8.98`。
+- `lighttpd` 和 `fortune` 都通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `lighttpd` 输出中 `getnameinfo` 已从双返回收窄为：
+  - `declare i64 @getnameinfo(i64, i64, i64, i64, i64, i64)`
+- `lighttpd` 当前输出里已经没有非 intrinsic 的双返回 external。
+
+评分：
+
+- 实现效果：4/10，清掉 `lighttpd` 最后一个明显双返回 external。
+- 复杂度：1/10，只补 fixed arity 表和测试期望。
+- 维护成本：2/10，7 参数函数当前只表达前 6 个寄存器参数，后续如果实现栈上传参建模，需要重新检查这类测试。

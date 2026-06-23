@@ -270,6 +270,7 @@ knownExternalPrototypes() {
       {"fwrite", {4, false}},
       {"gai_strerror", {1, false}},
       {"getaddrinfo", {4, false}},
+      {"getnameinfo", {7, false}},
       {"getcwd", {2, false}},
       {"getegid", {0, false}},
       {"getentropy", {2, false}},
