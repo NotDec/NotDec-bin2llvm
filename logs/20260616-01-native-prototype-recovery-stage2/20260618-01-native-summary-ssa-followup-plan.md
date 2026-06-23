@@ -5960,3 +5960,53 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：3/10，只收窄 memcached 中 3 个 SASL external。
 - 复杂度：1/10，只扩表和测试。
 - 维护成本：2/10，新增项少且直接来自本地头文件。
+
+## 实现记录：redis-cli external arity 补齐
+
+继续从未完整检查的 Bench2 目标往后看。`tmux` 默认 native 生成跑到约 9 分钟仍未完成，进程持续占满 CPU 且 IR 文件没有真正写出，后续需要单独定位性能卡点。本次先切到 `redis-cli`，该目标能生成并通过 LLVM 22，但输出里仍有一批 libc 和 OpenSSL 直接函数保持 6 个 ABI 参数。
+
+这次只补本地头文件能直接确认、且会实际减少寄存器参数的符号。`pow`、`lround`、`strtod` 涉及浮点 ABI，`SSL_ctrl`/`SSL_CTX_ctrl` 涉及 ctrl 入口语义，`mallctl` 缺少本地 jemalloc 头文件确认，先不动。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:137,172`
+  - 在 `knownExternalPrototypes()` 中新增 `__cxa_atexit`, `__xpg_strerror_r`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:176-180`
+  - 新增 `ERR_clear_error`, `ERR_peek_last_error`, `ERR_reason_error_string`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:242-245,302,441,478`
+  - 新增 `fgetc`, `fopen64`, `getc`, `putchar`, `send`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:491-493,501,532`
+  - 新增 `SSL_CTX_set_ciphersuites`, `SSL_CTX_set_default_verify_paths`, `SSL_CTX_free`, `SSL_set_connect_state`。
+- `tests/native_register_summary_ssa_test.cpp:715,729-735,770-772,801,901,925,938-940,950,966`
+  - 扩展 `testKnownFixedExternalArities`，覆盖新增 fixed arity。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli --all-confirmed -o /tmp/redis-cli-arity.ll --summary-json-out /tmp/redis-cli-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/redis-cli-arity.ll -o /tmp/redis-cli-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/redis-cli-arity.bc -o /tmp/redis-cli-arity.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-redis-cli-arity.ll --summary-json-out /tmp/fortune-redis-cli-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-redis-cli-arity.ll -o /tmp/fortune-redis-cli-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-redis-cli-arity.bc -o /tmp/fortune-redis-cli-arity.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `redis-cli` 运行时间：`elapsed 192.00`。
+- `fortune` 运行时间：`elapsed 8.46`，未见性能退化。
+- `redis-cli` 和 `fortune` 均通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `redis-cli` 输出中新增声明已收窄，例如：
+  - `declare void @__xpg_strerror_r(i64, i64, i64)`
+  - `declare void @ERR_peek_last_error()`
+  - `declare void @send(i64, i64, i64, i64)`
+  - `declare i64 @SSL_CTX_set_default_verify_paths(i64)`
+  - `declare i64 @SSL_CTX_set_ciphersuites(i64, i64)`
+  - `declare void @__cxa_atexit(i64, i64, i64)`
+
+评分：
+
+- 实现效果：4/10，redis-cli 中一批明显 6 参数 external 被收窄。
+- 复杂度：1/10，只扩表和测试。
+- 维护成本：3/10，表继续增长；同时发现 tmux 默认 native 生成存在需要后续定位的长耗时问题。
