@@ -5869,3 +5869,55 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：4/10，memcached 中一批 libevent/libc/pthread external 从 6 参数收窄。
 - 复杂度：1/10，只扩表和测试。
 - 维护成本：3/10，表继续增大；这类第三方库函数后续最好集中分组或生成。
+
+## 实现记录：OpenSSL external arity 补齐
+
+`memcached` 和 `wrk` 的剩余 6 参数 external 中有一批 OpenSSL/ERR 符号。本地 `/usr/include/openssl/ssl.h`、`crypto.h`、`err.h` 能直接确认这些函数的固定参数数，适合先收窄参数。`SSL_ctrl` / `SSL_CTX_ctrl` 以及各类宏包装语义这次不动，返回类型也不在本轮处理。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:173-177`
+  - 在 `knownExternalPrototypes()` 中新增 `ERR_error_string_n`, `ERR_get_error`, `ERR_print_errors_fp`, `OPENSSL_init_crypto`, `OPENSSL_init_ssl`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:470-484`
+  - 新增 `SSL_accept`, `SSL_clear`, `SSL_connect`, `SSL_CTX_check_private_key`, `SSL_CTX_load_verify_locations`, `SSL_CTX_new`, `SSL_CTX_sess_set_new_cb`, `SSL_CTX_set_cipher_list`, `SSL_CTX_set_client_CA_list`, `SSL_CTX_set_options`, `SSL_CTX_set_session_id_context`, `SSL_CTX_set_verify`, `SSL_CTX_set_verify_depth`, `SSL_CTX_use_certificate_chain_file`, `SSL_CTX_use_PrivateKey_file`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:510-519`
+  - 新增 `SSL_free`, `SSL_get_error`, `SSL_load_client_CA_file`, `SSL_new`, `SSL_pending`, `SSL_read`, `SSL_set_fd`, `SSL_set_info_callback`, `SSL_shutdown`, `SSL_write`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:561-562`
+  - 新增 `TLS_client_method`, `TLS_server_method`。
+- `tests/native_register_summary_ssa_test.cpp:728-732,917-931,944-953,968-969`
+  - 扩展 `testKnownFixedExternalArities`，覆盖新增 OpenSSL fixed arity。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk --all-confirmed -o /tmp/wrk-openssl-arity.ll --summary-json-out /tmp/wrk-openssl-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/wrk-openssl-arity.ll -o /tmp/wrk-openssl-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/wrk-openssl-arity.bc -o /tmp/wrk-openssl-arity.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed -o /tmp/memcached-openssl-arity.ll --summary-json-out /tmp/memcached-openssl-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/memcached-openssl-arity.ll -o /tmp/memcached-openssl-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/memcached-openssl-arity.bc -o /tmp/memcached-openssl-arity.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-openssl-arity.ll --summary-json-out /tmp/fortune-openssl-arity.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-openssl-arity.ll -o /tmp/fortune-openssl-arity.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-openssl-arity.bc -o /tmp/fortune-openssl-arity.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `wrk` 运行时间：`elapsed 46.16`。
+- `memcached` 运行时间：`elapsed 119.24`。
+- `fortune` 运行时间：`elapsed 8.53`，未见性能退化。
+- 三个输出均通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `wrk` / `memcached` 输出中新增声明已收窄，例如：
+  - `declare i64 @SSL_read(i64, i64, i64)`
+  - `declare i64 @SSL_write(i64, i64, i64)`
+  - `declare void @SSL_CTX_set_verify(i64, i64, i64)`
+  - `declare i64 @SSL_CTX_load_verify_locations(i64, i64, i64)`
+  - `declare void @ERR_get_error()`
+  - `declare void @TLS_server_method()`
+
+评分：
+
+- 实现效果：5/10，wrk/memcached 中一批 OpenSSL external 从 6 参数收窄。
+- 复杂度：1/10，只扩表和测试。
+- 维护成本：3/10，表继续增长；OpenSSL 这类库后续应考虑按库分组维护。
