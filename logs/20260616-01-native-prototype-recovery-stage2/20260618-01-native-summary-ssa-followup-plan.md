@@ -5759,3 +5759,65 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：4/10，只处理 wrk 中证据明确的三个标准函数。
 - 复杂度：1/10，只扩充 known prototype 表和固定 arity 单测。
 - 维护成本：2/10，新增项都是本地头文件可确认的固定签名。
+
+## 实现记录：memcached/lighttpd libc/POSIX arity 继续补齐
+
+继续检查 `memcached` 和 `lighttpd` 的 native IR，发现还有一批本地头文件能确认、且少于 6 个寄存器参数的 libc/POSIX 符号仍按 6 参数声明。OpenSSL、Lua、libevent、sasl、浮点返回函数和本身就是 6 个或更多参数的函数这次不动，避免把类型或栈参问题混进 fixed arity 表。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:141-156`
+  - 在 `knownExternalPrototypes()` 中新增 `__fgets_chk`, `__getdelim`, `__isoc23_sscanf`, `__isoc23_strtoull`, `__poll_chk`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:236-237`
+  - 新增 `fstat`, `ftruncate`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:272-277`
+  - 新增 `getrlimit`, `getsubopt`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:304-324`
+  - 新增 `lstat`, `madvise`, `mlockall`, `msync`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:352-371`
+  - 新增 `posix_memalign`, `pread`, `preadv`, `preadv64v2`, `pwrite`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:462-464`
+  - 新增 `setrlimit`, `setbuf`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:495-511`
+  - 新增 `strerror_r`, `strtoll`, `strtoull`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:519-529`
+  - 新增 `timegm`, `usleep`。
+- `tests/native_register_summary_ssa_test.cpp:715-723,753-778,796-806,824-842,879-933`
+  - 扩展 `testKnownFixedExternalArities`，覆盖新增 fixed arity。
+- `tests/native_register_summary_ssa_test.cpp:984`
+  - 扩展 `testKnownVarArgExternalKeepsAbiInputs`，覆盖 `__isoc23_sscanf` 的 fixed 2 + vararg。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed -o /tmp/memcached-arity2.ll --summary-json-out /tmp/memcached-arity2.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/memcached-arity2.ll -o /tmp/memcached-arity2.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/memcached-arity2.bc -o /tmp/memcached-arity2.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/lighttpd --all-confirmed -o /tmp/lighttpd-arity2.ll --summary-json-out /tmp/lighttpd-arity2.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/lighttpd-arity2.ll -o /tmp/lighttpd-arity2.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/lighttpd-arity2.bc -o /tmp/lighttpd-arity2.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-arity2.ll --summary-json-out /tmp/fortune-arity2.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-arity2.ll -o /tmp/fortune-arity2.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-arity2.bc -o /tmp/fortune-arity2.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `memcached` 运行时间：`elapsed 120.81`。
+- `lighttpd` 运行时间：`elapsed 290.43`。
+- `fortune` 运行时间：`elapsed 8.47`，未见性能退化。
+- 三个输出均通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- 输出中新增声明已经收窄，例如：
+  - `declare i64 @posix_memalign(i64, i64, i64)`
+  - `declare i64 @pread(i64, i64, i64, i64)`
+  - `declare i64 @preadv64v2(i64, i64, i64, i64, i64)`
+  - `declare void @__isoc23_sscanf(i64, i64, ...)`
+  - `declare i64 @strerror_r(i64, i64, i64)`
+  - `declare i64 @timegm(i64)`
+
+评分：
+
+- 实现效果：5/10，memcached/lighttpd 中一批明显的 6 参数 libc/POSIX external 被收窄。
+- 复杂度：1/10，只扩充 known prototype 表和现有表驱动测试。
+- 维护成本：3/10，表继续增长，但新增项都有本地头文件依据；后续更适合考虑从系统头文件/符号库生成或分组维护。
