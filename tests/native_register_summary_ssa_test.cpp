@@ -727,6 +727,7 @@ bool testKnownFixedExternalArities() {
       {"__strcpy_chk", 3},
       {"__sysconf", 1},
       {"__vfprintf_chk", 4},
+      {"__vsnprintf_chk", 6},
       {"__xpg_strerror_r", 3},
       {"ERR_error_string_n", 3},
       {"ERR_clear_error", 0},

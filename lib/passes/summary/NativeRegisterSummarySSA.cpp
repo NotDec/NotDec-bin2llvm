@@ -171,6 +171,7 @@ knownExternalPrototypes() {
       {"__tls_get_addr", {1, false, false}},
       {"__vasprintf_chk", {3, true, false}},
       {"__vfprintf_chk", {4, false, false}},
+      {"__vsnprintf_chk", {6, false, false}},
       {"__xpg_strerror_r", {3, false, false}},
       {"_exit", {1, false, true}},
       {"abort", {0, false, true}},

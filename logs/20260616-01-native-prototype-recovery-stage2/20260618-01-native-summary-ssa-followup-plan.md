@@ -6271,3 +6271,44 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 - 实现效果：4/10，继续清掉 `ffmpeg` 中 4 个明确的 libc/glibc 假签名。
 - 复杂度：1/10，只补 fixed arity 表和测试。
 - 维护成本：2/10，都是稳定 libc/glibc 接口。
+
+## 实现记录：补齐 ffmpeg 的 `__vsnprintf_chk`
+
+继续看 `ffmpeg` 当前输出，`__vsnprintf_chk` 仍按未知 external 处理。本地
+`/usr/include/x86_64-linux-gnu/bits/stdio2.h` 中它是 6 个固定参数：
+`char *s, size_t n, int flag, size_t slen, const char *format, __gnuc_va_list ap`。
+它不涉及浮点 ABI，这次只补这一条。
+
+改动点：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:174`
+  - 在 `knownExternalPrototypes()` 中新增 `__vsnprintf_chk`，fixed arity 为 6。
+- `tests/native_register_summary_ssa_test.cpp:730`
+  - 扩展 `testKnownFixedExternalArities()`，覆盖 `__vsnprintf_chk`。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/ffmpeg --all-confirmed -o /tmp/notdec-ffmpeg-vsnprintf.ll --summary-json-out /tmp/notdec-ffmpeg-vsnprintf.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-ffmpeg-vsnprintf.ll -o /tmp/notdec-ffmpeg-vsnprintf.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-ffmpeg-vsnprintf.bc -o /tmp/notdec-ffmpeg-vsnprintf.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/fortune-vsnprintf.ll --summary-json-out /tmp/fortune-vsnprintf.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/fortune-vsnprintf.ll -o /tmp/fortune-vsnprintf.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-vsnprintf.bc -o /tmp/fortune-vsnprintf.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `ffmpeg` 运行时间：`elapsed 170.37`。
+- `fortune` 运行时间：`elapsed 8.90`，仍在当前 8 秒多范围。
+- `ffmpeg` 和 `fortune` 都通过 LLVM 22 `llvm-as` 和 `opt -passes=verify`。
+- `ffmpeg` 输出中目标声明为：
+  - `declare void @__vsnprintf_chk(i64, i64, i64, i64, i64, i64)`
+  - 调用点为 6 个固定参数，返回值未使用，所以声明为 `void`。
+
+评分：
+
+- 实现效果：3/10，补掉一个有头文件依据的 glibc helper。
+- 复杂度：1/10，只补 fixed arity 表和测试。
+- 维护成本：1/10，`__vsnprintf_chk` 原型稳定。
