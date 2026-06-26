@@ -24,6 +24,19 @@ bool hasParamRegister(
   return false;
 }
 
+const notdec::bin2llvm::NativeAbiParamEntry *findParamRegister(
+    const std::vector<notdec::bin2llvm::NativeAbiParamEntry> &entries,
+    const std::string &name) {
+  for (const notdec::bin2llvm::NativeAbiParamEntry &entry : entries) {
+    if (entry.Storage.Kind ==
+            notdec::bin2llvm::NativeAbiStorageKind::Register &&
+        entry.Storage.Name == name) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
 bool hasEffectRegister(const notdec::bin2llvm::NativeAbiSpec &abi,
                        notdec::bin2llvm::NativeAbiEffectKind kind,
                        const std::string &name) {
@@ -75,6 +88,22 @@ int main(int argc, char **argv) {
   ok &= expect(hasParamRegister(abi->Inputs, "R9"), "missing input R9");
   ok &= expect(hasParamRegister(abi->Outputs, "RAX"), "missing output RAX");
   ok &= expect(hasParamRegister(abi->Outputs, "RDX"), "missing output RDX");
+  const notdec::bin2llvm::NativeAbiParamEntry *xmm0Input =
+      findParamRegister(abi->Inputs, "XMM0_Qa");
+  ok &= expect(xmm0Input != nullptr, "missing float input XMM0_Qa");
+  if (xmm0Input != nullptr) {
+    ok &= expect(xmm0Input->MetaType == "float",
+                 "XMM0_Qa input is not marked float");
+    ok &= expect(xmm0Input->MinSize == 4 && xmm0Input->MaxSize == 8,
+                 "XMM0_Qa input has unexpected size range");
+  }
+  const notdec::bin2llvm::NativeAbiParamEntry *xmm0Output =
+      findParamRegister(abi->Outputs, "XMM0_Qa");
+  ok &= expect(xmm0Output != nullptr, "missing float output XMM0_Qa");
+  if (xmm0Output != nullptr) {
+    ok &= expect(xmm0Output->MetaType == "float",
+                 "XMM0_Qa output is not marked float");
+  }
   ok &= expect(hasEffectRegister(*abi,
                                  notdec::bin2llvm::NativeAbiEffectKind::
                                      Unaffected,
@@ -90,6 +119,11 @@ int main(int argc, char **argv) {
                                      KilledByCall,
                                  "RAX"),
                "missing killedbycall RAX");
+  ok &= expect(hasEffectRegister(*abi,
+                                 notdec::bin2llvm::NativeAbiEffectKind::
+                                     KilledByCall,
+                                 "XMM0"),
+               "missing killedbycall XMM0");
   if (!ok) {
     return EXIT_FAILURE;
   }

@@ -63,8 +63,22 @@ struct FunctionSummaryFacts {
 struct AbiFacts {
   std::set<std::string> Inputs;
   std::vector<std::string> InputsInOrder;
+  // ABI slots keep the cspec register name and the backing lifted register
+  // separate.  For x86-64 this lets XMM0_Qa be consumed as the low lane of
+  // the lifted ZMM0 global without changing the register model.
+  struct RegisterSlot {
+    std::string UnitName;
+    std::string AbiName;
+    std::string MetaType;
+    unsigned OffsetBits = 0;
+    unsigned SizeBits = 0;
+  };
+  std::vector<RegisterSlot> IntegerInputsInOrder;
+  std::vector<RegisterSlot> FloatInputsInOrder;
   std::set<std::string> Outputs;
   std::vector<std::string> OutputsInOrder;
+  std::vector<RegisterSlot> IntegerOutputsInOrder;
+  std::vector<RegisterSlot> FloatOutputsInOrder;
   std::set<std::string> InternalParamRegisters;
   std::set<std::string> InternalReturnRegisters;
   std::set<std::string> Unaffected;
@@ -85,6 +99,7 @@ using CallValueKey =
 struct CallArgStoreBinding {
   llvm::StoreInst *Store = nullptr;
   const RegisterUnit *Unit = nullptr;
+  llvm::Value *RegisterValue = nullptr;
   llvm::Value *Value = nullptr;
   unsigned Index = 0;
 };
@@ -165,11 +180,37 @@ struct KnownExternalPrototype {
   bool VarArg = false;
   bool NoReturn = false;
   unsigned MaxReturnRegisters = 1;
+  enum class ValueType {
+    I64,
+    Float,
+    Double,
+  };
+  std::vector<ValueType> TypedParams;
+  std::optional<ValueType> TypedReturn;
+};
+
+enum class NativeSignatureSlotKind {
+  IntegerRegister,
+  FloatRegister,
+};
+
+// A signature slot is the bridge between the ABI slot and the lifted register
+// global.  Integer slots keep the old whole-register behavior; float slots
+// carry the LLVM scalar type that should be read from or written to the low
+// lane of the backing register.
+struct NativeSignatureSlot {
+  NativeSignatureSlotKind Kind = NativeSignatureSlotKind::IntegerRegister;
+  const RegisterUnit *Unit = nullptr;
+  std::string AbiName;
+  std::string MetaType;
+  unsigned OffsetBits = 0;
+  unsigned SizeBits = 0;
+  llvm::Type *LlvmType = nullptr;
 };
 
 struct SignatureShape {
-  std::vector<const RegisterUnit *> Params;
-  std::vector<const RegisterUnit *> Returns;
+  std::vector<NativeSignatureSlot> Params;
+  std::vector<NativeSignatureSlot> Returns;
   bool VarArg = false;
 };
 
@@ -202,6 +243,7 @@ llvm::Value *frozenPoisonAt(llvm::IRBuilder<> &builder, llvm::Type *type,
 
 const std::map<llvm::StringRef, KnownExternalPrototype> &
 knownExternalPrototypes() {
+  using ValueType = KnownExternalPrototype::ValueType;
   static const std::map<llvm::StringRef, KnownExternalPrototype> prototypes = {
       {"__assert_fail", {4, false, true}},
       {"__ctype_b_loc", {0, false, false}},
@@ -468,6 +510,13 @@ knownExternalPrototypes() {
       {"posix_spawnattr_setsigdefault", {2, false}},
       {"posix_spawnattr_setsigmask", {2, false}},
       {"poll", {3, false}},
+      {"pow",
+       {0,
+        false,
+        false,
+        1,
+        {ValueType::Double, ValueType::Double},
+        ValueType::Double}},
       {"printf", {1, true}},
       {"prctl", {1, true}},
       {"popen", {2, false}},
@@ -927,6 +976,27 @@ void pushUnique(std::vector<std::string> &items, const std::string &item) {
   }
 }
 
+const RegisterUnit *
+unitByName(const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+           llvm::StringRef name);
+
+AbiFacts::RegisterSlot abiRegisterSlot(
+    const NativeAbiParamEntry &entry, const std::string &unitName,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  AbiFacts::RegisterSlot slot;
+  slot.UnitName = unitName;
+  slot.AbiName = entry.Storage.Name;
+  slot.MetaType = entry.MetaType;
+  slot.SizeBits = entry.MaxSize * 8;
+  const RegisterUnit *unit = unitByName(units, unitName);
+  if (unit != nullptr && entry.Storage.Space == unit->Space &&
+      entry.Storage.Offset >= unit->Offset &&
+      entry.Storage.Offset < unit->Offset + unit->Size) {
+    slot.OffsetBits = (entry.Storage.Offset - unit->Offset) * 8;
+  }
+  return slot;
+}
+
 AbiFacts collectAbiFacts(
     const llvm::Module &module,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -941,10 +1011,13 @@ AbiFacts collectAbiFacts(
       std::string name = storageUnitName(entry.Storage, units);
       facts.Inputs.insert(name);
       if (entry.MetaType == "float") {
+        facts.FloatInputsInOrder.push_back(
+            abiRegisterSlot(entry, name, units));
         continue;
       }
       facts.InternalParamRegisters.insert(name);
       pushUnique(facts.InputsInOrder, name);
+      facts.IntegerInputsInOrder.push_back(abiRegisterSlot(entry, name, units));
     }
   }
   for (const NativeAbiParamEntry &entry : abi->Outputs) {
@@ -953,10 +1026,14 @@ AbiFacts collectAbiFacts(
       std::string name = storageUnitName(entry.Storage, units);
       facts.Outputs.insert(name);
       if (entry.MetaType == "float") {
+        facts.FloatOutputsInOrder.push_back(
+            abiRegisterSlot(entry, name, units));
         continue;
       }
       facts.InternalReturnRegisters.insert(name);
       pushUnique(facts.OutputsInOrder, name);
+      facts.IntegerOutputsInOrder.push_back(
+          abiRegisterSlot(entry, name, units));
     }
   }
   for (const NativeAbiEffect &effect : abi->Effects) {
@@ -1016,11 +1093,70 @@ unitByName(const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
   return nullptr;
 }
 
+llvm::Type *llvmTypeForKnownValue(llvm::LLVMContext &context,
+                                  KnownExternalPrototype::ValueType type) {
+  switch (type) {
+  case KnownExternalPrototype::ValueType::I64:
+    return llvm::Type::getInt64Ty(context);
+  case KnownExternalPrototype::ValueType::Float:
+    return llvm::Type::getFloatTy(context);
+  case KnownExternalPrototype::ValueType::Double:
+    return llvm::Type::getDoubleTy(context);
+  }
+  return llvm::Type::getInt64Ty(context);
+}
+
+bool isFloatKnownValue(KnownExternalPrototype::ValueType type) {
+  return type == KnownExternalPrototype::ValueType::Float ||
+         type == KnownExternalPrototype::ValueType::Double;
+}
+
+NativeSignatureSlot integerSignatureSlot(const RegisterUnit &unit) {
+  NativeSignatureSlot slot;
+  slot.Kind = NativeSignatureSlotKind::IntegerRegister;
+  slot.Unit = &unit;
+  slot.AbiName = unit.Name;
+  slot.SizeBits =
+      unit.Global->getValueType()->getScalarSizeInBits();
+  slot.LlvmType = unit.Global->getValueType();
+  return slot;
+}
+
+std::optional<NativeSignatureSlot> signatureSlotFromAbi(
+    const AbiFacts::RegisterSlot &abiSlot,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    llvm::Type *llvmType, NativeSignatureSlotKind kind) {
+  const RegisterUnit *unit = unitByName(units, abiSlot.UnitName);
+  if (unit == nullptr) {
+    return std::nullopt;
+  }
+  NativeSignatureSlot slot;
+  slot.Kind = kind;
+  slot.Unit = unit;
+  slot.AbiName = abiSlot.AbiName;
+  slot.MetaType = abiSlot.MetaType;
+  slot.OffsetBits = abiSlot.OffsetBits;
+  slot.SizeBits = abiSlot.SizeBits;
+  slot.LlvmType = llvmType;
+  if (slot.LlvmType == nullptr) {
+    slot.LlvmType = unit->Global->getValueType();
+  }
+  if (kind == NativeSignatureSlotKind::FloatRegister) {
+    slot.SizeBits = slot.LlvmType->getScalarSizeInBits();
+  }
+  return slot;
+}
+
+llvm::Type *slotType(const NativeSignatureSlot &slot) {
+  return slot.LlvmType != nullptr ? slot.LlvmType
+                                  : slot.Unit->Global->getValueType();
+}
+
 llvm::Type *singleReturnType(const SignatureShape &shape) {
   if (shape.Returns.empty()) {
     return nullptr;
   }
-  return shape.Returns.front()->Global->getValueType();
+  return slotType(shape.Returns.front());
 }
 
 llvm::Type *returnTypeForShape(llvm::LLVMContext &context,
@@ -1033,8 +1169,8 @@ llvm::Type *returnTypeForShape(llvm::LLVMContext &context,
   }
   std::vector<llvm::Type *> fields;
   fields.reserve(shape.Returns.size());
-  for (const RegisterUnit *unit : shape.Returns) {
-    fields.push_back(unit->Global->getValueType());
+  for (const NativeSignatureSlot &slot : shape.Returns) {
+    fields.push_back(slotType(slot));
   }
   return llvm::StructType::get(context, fields);
 }
@@ -1043,8 +1179,8 @@ llvm::FunctionType *functionTypeForShape(llvm::LLVMContext &context,
                                          const SignatureShape &shape) {
   std::vector<llvm::Type *> params;
   params.reserve(shape.Params.size());
-  for (const RegisterUnit *unit : shape.Params) {
-    params.push_back(unit->Global->getValueType());
+  for (const NativeSignatureSlot &slot : shape.Params) {
+    params.push_back(slotType(slot));
   }
   return llvm::FunctionType::get(returnTypeForShape(context, shape), params,
                                  shape.VarArg);
@@ -1086,7 +1222,7 @@ SignatureShape shapeForInternalFunction(
     }
     auto regIt = factsIt->second.Registers.find(unit->Name);
     if (regIt != factsIt->second.Registers.end() && regIt->second.ReadEntry) {
-      shape.Params.push_back(unit);
+      shape.Params.push_back(integerSignatureSlot(*unit));
     }
   }
 
@@ -1097,10 +1233,53 @@ SignatureShape shapeForInternalFunction(
     auto regIt = factsIt->second.Registers.find(unit->Name);
     if (regIt != factsIt->second.Registers.end() &&
         regIt->second.MayNonEntry && regIt->second.ExitDemand) {
-      shape.Returns.push_back(unit);
+      shape.Returns.push_back(integerSignatureSlot(*unit));
     }
   }
   return shape;
+}
+
+std::optional<NativeSignatureSlot> typedParamSlot(
+    KnownExternalPrototype::ValueType type, unsigned &integerIndex,
+    unsigned &floatIndex, const std::map<llvm::GlobalVariable *, RegisterUnit>
+                              &units,
+    const AbiFacts &abi, llvm::LLVMContext &context) {
+  llvm::Type *llvmType = llvmTypeForKnownValue(context, type);
+  if (isFloatKnownValue(type)) {
+    if (floatIndex >= abi.FloatInputsInOrder.size()) {
+      return std::nullopt;
+    }
+    return signatureSlotFromAbi(abi.FloatInputsInOrder[floatIndex++], units,
+                                llvmType,
+                                NativeSignatureSlotKind::FloatRegister);
+  }
+  if (integerIndex >= abi.IntegerInputsInOrder.size()) {
+    return std::nullopt;
+  }
+  return signatureSlotFromAbi(abi.IntegerInputsInOrder[integerIndex++], units,
+                              llvmType,
+                              NativeSignatureSlotKind::IntegerRegister);
+}
+
+std::optional<NativeSignatureSlot> typedReturnSlot(
+    KnownExternalPrototype::ValueType type,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi, llvm::LLVMContext &context) {
+  llvm::Type *llvmType = llvmTypeForKnownValue(context, type);
+  if (isFloatKnownValue(type)) {
+    if (abi.FloatOutputsInOrder.empty()) {
+      return std::nullopt;
+    }
+    return signatureSlotFromAbi(abi.FloatOutputsInOrder.front(), units,
+                                llvmType,
+                                NativeSignatureSlotKind::FloatRegister);
+  }
+  if (abi.IntegerOutputsInOrder.empty()) {
+    return std::nullopt;
+  }
+  return signatureSlotFromAbi(abi.IntegerOutputsInOrder.front(), units,
+                              llvmType,
+                              NativeSignatureSlotKind::IntegerRegister);
 }
 
 SignatureShape shapeForKnownExternal(
@@ -1113,6 +1292,28 @@ SignatureShape shapeForKnownExternal(
   if (knownIt == knownExternalPrototypes().end()) {
     count = abi.InputsInOrder.size();
   } else {
+    const KnownExternalPrototype &known = knownIt->second;
+    if (!known.TypedParams.empty()) {
+      unsigned integerIndex = 0;
+      unsigned floatIndex = 0;
+      for (KnownExternalPrototype::ValueType type : known.TypedParams) {
+        std::optional<NativeSignatureSlot> slot = typedParamSlot(
+            type, integerIndex, floatIndex, units, abi, function.getContext());
+        if (!slot) {
+          return shape;
+        }
+        shape.Params.push_back(*slot);
+      }
+      if (known.TypedReturn) {
+        std::optional<NativeSignatureSlot> slot = typedReturnSlot(
+            *known.TypedReturn, units, abi, function.getContext());
+        if (slot) {
+          shape.Returns.push_back(*slot);
+        }
+      }
+      shape.VarArg = known.VarArg;
+      return shape;
+    }
     count =
         std::min<unsigned>(knownIt->second.FixedArgs, abi.InputsInOrder.size());
     shape.VarArg = knownIt->second.VarArg;
@@ -1120,7 +1321,7 @@ SignatureShape shapeForKnownExternal(
   for (unsigned index = 0; index < count; ++index) {
     const RegisterUnit *unit = unitByName(units, abi.InputsInOrder[index]);
     if (unit != nullptr) {
-      shape.Params.push_back(unit);
+      shape.Params.push_back(integerSignatureSlot(*unit));
     }
   }
   return shape;
@@ -1159,13 +1360,13 @@ void addDemandedExternalReturns(
         continue;
       }
       bool alreadyPresent = false;
-      for (const RegisterUnit *unit : shapeIt->second.Returns) {
-        alreadyPresent |= unit->Name == name;
+      for (const NativeSignatureSlot &slot : shapeIt->second.Returns) {
+        alreadyPresent |= slot.Unit->Name == name;
       }
       if (!alreadyPresent) {
         const RegisterUnit *unit = unitByName(units, name);
         if (unit != nullptr) {
-          shapeIt->second.Returns.push_back(unit);
+          shapeIt->second.Returns.push_back(integerSignatureSlot(*unit));
         }
       }
       ++returnIndex;
@@ -1194,6 +1395,10 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
   }
   return shapes;
 }
+
+llvm::Value *castRegisterValueToSlot(llvm::IRBuilder<> &builder,
+                                     llvm::Value *value,
+                                     const NativeSignatureSlot &slot);
 
 class FunctionBuilder {
 public:
@@ -1878,7 +2083,7 @@ private:
     for (const auto &[call, bindings] : SignatureState.CallArgs) {
       (void)call;
       for (const CallArgStoreBinding &binding : bindings) {
-        if (binding.Value == value) {
+        if (binding.Value == value || binding.RegisterValue == value) {
           return true;
         }
       }
@@ -2368,10 +2573,19 @@ private:
     bool allowEntryInputs = callee != nullptr && !callee->isDeclaration();
     unsigned argCount =
         shape.VarArg ? Abi.InputsInOrder.size() : shape.Params.size();
+    llvm::IRBuilder<> builder(&call);
     for (unsigned index = 0; index < argCount; ++index) {
-      const RegisterUnit *unit =
-          index < shape.Params.size() ? shape.Params[index]
-                                      : unitByName(Abi.InputsInOrder[index]);
+      NativeSignatureSlot slot;
+      if (index < shape.Params.size()) {
+        slot = shape.Params[index];
+      } else {
+        const RegisterUnit *unit = unitByName(Abi.InputsInOrder[index]);
+        if (unit == nullptr) {
+          break;
+        }
+        slot = integerSignatureSlot(*unit);
+      }
+      const RegisterUnit *unit = slot.Unit;
       if (unit == nullptr) {
         break;
       }
@@ -2385,7 +2599,12 @@ private:
       if (isEntryInputValue(value) && store == nullptr && !allowEntryInputs) {
         break;
       }
-      bindings.push_back(CallArgStoreBinding{store, unit, value, index});
+      llvm::Value *argValue = castRegisterValueToSlot(builder, value, slot);
+      if (argValue == nullptr || argValue->getType() != slotType(slot)) {
+        break;
+      }
+      bindings.push_back(
+          CallArgStoreBinding{store, unit, value, argValue, index});
     }
     return bindings;
   }
@@ -2454,10 +2673,8 @@ private:
     if (insertBefore == nullptr) {
       return llvm::UndefValue::get(unit.Global->getValueType());
     }
-    if (kind == "return" && Abi.OutputsInOrder.end() ==
-                                std::find(Abi.OutputsInOrder.begin(),
-                                          Abi.OutputsInOrder.end(),
-                                          unit.Name)) {
+    if (kind == "return" && !isIntegerAbiOutput(unit) &&
+        !signatureReturnUsesUnit(call, unit)) {
       return frozenPoisonBefore(*insertBefore, unit.Global->getValueType(),
                                 unit.Name + ".return_unknown");
     }
@@ -2477,6 +2694,30 @@ private:
       ++Summary.CallClobberValues;
     }
     return value;
+  }
+
+  bool isIntegerAbiOutput(const RegisterUnit &unit) const {
+    return Abi.OutputsInOrder.end() !=
+           std::find(Abi.OutputsInOrder.begin(), Abi.OutputsInOrder.end(),
+                     unit.Name);
+  }
+
+  bool signatureReturnUsesUnit(llvm::CallBase &call,
+                               const RegisterUnit &unit) const {
+    llvm::Function *callee = call.getCalledFunction();
+    if (callee == nullptr) {
+      return false;
+    }
+    auto shapeIt = SignatureState.Shapes.find(callee);
+    if (shapeIt == SignatureState.Shapes.end()) {
+      return false;
+    }
+    for (const NativeSignatureSlot &slot : shapeIt->second.Returns) {
+      if (slot.Unit == &unit || slot.Unit->Name == unit.Name) {
+        return true;
+      }
+    }
+    return false;
   }
 
   llvm::FunctionCallee callValueHelper(const RegisterUnit &unit,
@@ -2529,11 +2770,11 @@ private:
       }
       std::vector<llvm::Value *> values;
       values.reserve(shapeIt->second.Returns.size());
-      for (const RegisterUnit *unit : shapeIt->second.Returns) {
+      for (const NativeSignatureSlot &slot : shapeIt->second.Returns) {
+        const RegisterUnit *unit = slot.Unit;
         llvm::Value *value = resolve(readValueBefore(block, *unit, ret));
-        if (value == nullptr ||
-            value->getType() != unit->Global->getValueType()) {
-          value = frozenPoisonBefore(*ret, unit->Global->getValueType(),
+        if (value == nullptr || value->getType() != slotType(slot)) {
+          value = frozenPoisonBefore(*ret, slotType(slot),
                                      unit->Name + ".return_unknown");
         }
         values.push_back(value);
@@ -2628,6 +2869,10 @@ llvm::Function *createReplacementFunction(llvm::Function &oldFunction,
   return newFunction;
 }
 
+llvm::Value *castSlotValueToRegister(llvm::IRBuilder<> &builder,
+                                     llvm::Value *value,
+                                     const NativeSignatureSlot &slot);
+
 llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
                               const SignatureShape &shape,
                               const std::vector<llvm::Value *> &values) {
@@ -2644,16 +2889,15 @@ llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
   llvm::Type *retTy = returnTypeForShape(builder.getContext(), shape);
   llvm::Value *result = llvm::UndefValue::get(retTy);
   for (unsigned index = 0; index < shape.Returns.size(); ++index) {
+    const NativeSignatureSlot &slot = shape.Returns[index];
     llvm::Value *value =
         index < values.size()
             ? values[index]
-            : frozenPoisonAt(builder,
-                             shape.Returns[index]->Global->getValueType(),
-                             shape.Returns[index]->Name + ".return_unknown");
-    if (value->getType() != shape.Returns[index]->Global->getValueType()) {
-      value = frozenPoisonAt(builder,
-                             shape.Returns[index]->Global->getValueType(),
-                             shape.Returns[index]->Name + ".return_unknown");
+            : frozenPoisonAt(builder, slotType(slot),
+                             slot.Unit->Name + ".return_unknown");
+    if (value->getType() != slotType(slot)) {
+      value = frozenPoisonAt(builder, slotType(slot),
+                             slot.Unit->Name + ".return_unknown");
     }
     result = builder.CreateInsertValue(result, value, {index});
   }
@@ -2665,14 +2909,21 @@ llvm::Value *extractReturnRegister(llvm::IRBuilder<> &builder,
                                    llvm::Value &call,
                                    llvm::StringRef registerName) {
   for (unsigned index = 0; index < shape.Returns.size(); ++index) {
-    if (shape.Returns[index]->Name != registerName) {
+    const NativeSignatureSlot &slot = shape.Returns[index];
+    if (slot.Unit->Name != registerName) {
       continue;
     }
+    llvm::Value *value = nullptr;
     if (shape.Returns.size() == 1) {
-      return &call;
+      value = &call;
+    } else {
+      value = builder.CreateExtractValue(&call, {index},
+                                         registerName.str() + ".ret");
     }
-    return builder.CreateExtractValue(&call, {index},
-                                      registerName.str() + ".ret");
+    if (value->getType() == slot.Unit->Global->getValueType()) {
+      return value;
+    }
+    return castSlotValueToRegister(builder, value, slot);
   }
   return nullptr;
 }
@@ -2745,6 +2996,104 @@ llvm::Value *localizeCallArgument(llvm::Function &function,
   return value;
 }
 
+llvm::Value *castRegisterValueToSlot(llvm::IRBuilder<> &builder,
+                                     llvm::Value *value,
+                                     const NativeSignatureSlot &slot) {
+  if (value == nullptr) {
+    return nullptr;
+  }
+  llvm::Type *targetType = slotType(slot);
+  if (slot.Kind == NativeSignatureSlotKind::IntegerRegister) {
+    if (value->getType() == targetType) {
+      return value;
+    }
+    if (value->getType()->isIntegerTy() && targetType->isIntegerTy()) {
+      unsigned srcBits = value->getType()->getIntegerBitWidth();
+      unsigned dstBits = targetType->getIntegerBitWidth();
+      if (srcBits > dstBits) {
+        return builder.CreateTrunc(value, targetType,
+                                   slot.Unit->Name + ".arg_trunc");
+      }
+      if (srcBits < dstBits) {
+        return builder.CreateZExt(value, targetType,
+                                  slot.Unit->Name + ".arg_zext");
+      }
+    }
+    return nullptr;
+  }
+
+  if (!value->getType()->isIntegerTy() || !targetType->isFloatingPointTy()) {
+    return nullptr;
+  }
+  unsigned sourceBits = value->getType()->getIntegerBitWidth();
+  if (slot.OffsetBits >= sourceBits || slot.SizeBits == 0 ||
+      slot.OffsetBits + slot.SizeBits > sourceBits) {
+    return nullptr;
+  }
+  llvm::Value *bits = value;
+  if (slot.OffsetBits != 0) {
+    bits = builder.CreateLShr(
+        bits, llvm::ConstantInt::get(bits->getType(), slot.OffsetBits),
+        slot.Unit->Name + ".arg_shift");
+  }
+  llvm::Type *intType = llvm::IntegerType::get(builder.getContext(),
+                                               slot.SizeBits);
+  if (bits->getType() != intType) {
+    bits = builder.CreateTrunc(bits, intType, slot.Unit->Name + ".arg_bits");
+  }
+  return builder.CreateBitCast(bits, targetType,
+                               slot.Unit->Name + ".arg_float");
+}
+
+llvm::Value *castSlotValueToRegister(llvm::IRBuilder<> &builder,
+                                     llvm::Value *value,
+                                     const NativeSignatureSlot &slot) {
+  if (value == nullptr) {
+    return nullptr;
+  }
+  llvm::Type *registerType = slot.Unit->Global->getValueType();
+  if (slot.Kind == NativeSignatureSlotKind::IntegerRegister) {
+    if (value->getType() == registerType) {
+      return value;
+    }
+    if (value->getType()->isIntegerTy() && registerType->isIntegerTy()) {
+      unsigned srcBits = value->getType()->getIntegerBitWidth();
+      unsigned dstBits = registerType->getIntegerBitWidth();
+      if (srcBits < dstBits) {
+        return builder.CreateZExt(value, registerType,
+                                  slot.Unit->Name + ".ret_zext");
+      }
+      if (srcBits > dstBits) {
+        return builder.CreateTrunc(value, registerType,
+                                   slot.Unit->Name + ".ret_trunc");
+      }
+    }
+    return nullptr;
+  }
+
+  if (!value->getType()->isFloatingPointTy() || !registerType->isIntegerTy()) {
+    return nullptr;
+  }
+  unsigned registerBits = registerType->getIntegerBitWidth();
+  if (slot.OffsetBits >= registerBits || slot.SizeBits == 0 ||
+      slot.OffsetBits + slot.SizeBits > registerBits) {
+    return nullptr;
+  }
+  llvm::Type *intType = llvm::IntegerType::get(builder.getContext(),
+                                               slot.SizeBits);
+  llvm::Value *bits =
+      builder.CreateBitCast(value, intType, slot.Unit->Name + ".ret_bits");
+  if (slot.OffsetBits != 0) {
+    bits = builder.CreateZExt(bits, registerType,
+                              slot.Unit->Name + ".ret_wide");
+    bits = builder.CreateShl(
+        bits, llvm::ConstantInt::get(registerType, slot.OffsetBits),
+        slot.Unit->Name + ".ret_shift");
+    return bits;
+  }
+  return builder.CreateZExt(bits, registerType, slot.Unit->Name + ".ret_wide");
+}
+
 llvm::CallInst *rewriteCallInst(llvm::CallBase &oldCall, llvm::Value &callee,
                                 llvm::FunctionType &newType,
                                 const std::vector<llvm::Value *> &args) {
@@ -2775,7 +3124,8 @@ llvm::Value *replacementForOldCallUses(llvm::IRBuilder<> &builder,
     return &newCall;
   }
   for (unsigned index = 0; index < shape.Returns.size(); ++index) {
-    if (shape.Returns[index]->Global->getValueType() != oldCall.getType()) {
+    if (shape.Returns[index].Unit->Global->getValueType() !=
+        oldCall.getType()) {
       continue;
     }
     if (shape.Returns.size() == 1) {
@@ -2797,7 +3147,7 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
     if (index >= shape.Params.size()) {
       break;
     }
-    arg.setName(shape.Params[index]->Name + ".arg");
+    arg.setName(shape.Params[index].Unit->Name + ".arg");
     for (llvm::BasicBlock &block : newFunction) {
       for (auto it = block.begin(); it != block.end();) {
         llvm::Instruction &inst = *it++;
@@ -2808,7 +3158,7 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
         }
         auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
             load->getPointerOperand()->stripPointerCasts());
-        if (global == shape.Params[index]->Global) {
+        if (global == shape.Params[index].Unit->Global) {
           state.ValueMap[load] = &arg;
           load->replaceAllUsesWith(&arg);
         }
@@ -2909,17 +3259,16 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
     args.reserve(bindings.size());
     llvm::IRBuilder<> oldCallBuilder(oldCall);
     for (unsigned index = 0; index < shape.Params.size(); ++index) {
+      const NativeSignatureSlot &slot = shape.Params[index];
       llvm::Value *value =
           index < bindings.size() ? bindings[index].Value : nullptr;
       if (value != nullptr) {
         value = remapValue(value);
         value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);
       }
-      if (value == nullptr ||
-          value->getType() != shape.Params[index]->Global->getValueType()) {
-        value = frozenPoisonAt(
-            oldCallBuilder, shape.Params[index]->Global->getValueType(),
-            shape.Params[index]->Name + ".arg_unknown");
+      if (value == nullptr || value->getType() != slotType(slot)) {
+        value = frozenPoisonAt(oldCallBuilder, slotType(slot),
+                               slot.Unit->Name + ".arg_unknown");
       }
       args.push_back(value);
     }

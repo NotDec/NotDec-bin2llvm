@@ -1970,6 +1970,93 @@ bool testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn() {
          verifyOk(module, "module failed verifier after ZMM ABI effect test");
 }
 
+bool testKnownPowUsesFloatAbiSlots() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-pow-float-abi", context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_pow_test";
+  for (llvm::StringRef name : {"XMM0_Qa", "XMM1_Qa"}) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 4;
+    input.MaxSize = 8;
+    input.MetaType = "float";
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = name.str();
+    abi.Inputs.push_back(input);
+  }
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.MetaType = "float";
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "XMM0_Qa";
+  abi.Outputs.push_back(output);
+  for (llvm::StringRef name : {"XMM0", "XMM1"}) {
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = name.str();
+    abi.Effects.push_back(killed);
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+  llvm::GlobalVariable *zmm1 =
+      createRegisterGlobal(module, "ZMM1", zmmType, 4672, 64);
+
+  auto *oldPowType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *powFunction = llvm::Function::Create(
+      oldPowType, llvm::GlobalValue::ExternalLinkage, "pow", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "pow_float_slots", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, zmm0, llvm::ConstantInt::get(zmmType, 1), "ZMM0");
+  storeRegister(builder, zmm1, llvm::ConstantInt::get(zmmType, 2), "ZMM1");
+  builder.CreateCall(oldPowType, powFunction);
+  llvm::Value *powBits =
+      builder.CreateTrunc(loadRegister(builder, zmm0, "ZMM0", "pow.after"),
+                          llvm::Type::getInt64Ty(context));
+  builder.CreateRet(powBits);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::CallInst *powCall = nullptr;
+  unsigned zmmStores = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      if (call->getCalledFunction() != nullptr &&
+          call->getCalledFunction()->getName() == "pow") {
+        powCall = call;
+      }
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      if (store->getPointerOperand()->stripPointerCasts() == zmm0 ||
+          store->getPointerOperand()->stripPointerCasts() == zmm1) {
+        ++zmmStores;
+      }
+    }
+  }
+
+  return expect(powCall != nullptr, "pow call missing after rewrite") &&
+         expect(powCall->getType()->isDoubleTy(),
+                "pow return type was not rewritten to double") &&
+         expect(powCall->arg_size() == 2,
+                "pow did not receive two float ABI arguments") &&
+         expect(powCall->getArgOperand(0)->getType()->isDoubleTy() &&
+                    powCall->getArgOperand(1)->getType()->isDoubleTy(),
+                "pow arguments were not rewritten to double") &&
+         expect(zmmStores == 0, "pow ABI ZMM argument stores remained") &&
+         expect(summary.CallsRewritten >= 1,
+                "pow call was not counted as rewritten") &&
+         verifyOk(module, "module failed verifier after pow ABI rewrite test");
+}
+
 bool testPartialKeepHighStoreIsDemandRewritten() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-demand", context);
@@ -2146,6 +2233,7 @@ int main() {
   ok &= testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall();
   ok &= testNoReturnExternalDoesNotCreateSummaryReturn();
   ok &= testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn();
+  ok &= testKnownPowUsesFloatAbiSlots();
   ok &= testPartialKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();
