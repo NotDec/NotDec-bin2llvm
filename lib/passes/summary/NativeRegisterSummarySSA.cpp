@@ -318,6 +318,8 @@ knownExternalPrototypes() {
       {"closelog", {0, false}},
       {"cfmakeraw", {1, false}},
       {"connect", {3, false}},
+      {"cos",
+       {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"EC_GROUP_get_order", {3, false}},
       {"EC_KEY_set_private_key", {2, false}},
       {"dcgettext", {3, false}},
@@ -353,6 +355,8 @@ knownExternalPrototypes() {
       {"event_once", {5, false}},
       {"event_set", {5, false}},
       {"exit", {1, false, true}},
+      {"exp",
+       {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"fclose", {1, false}},
       {"fcntl", {2, true}},
       {"fcntl64", {2, true}},
@@ -448,6 +452,8 @@ knownExternalPrototypes() {
       {"listen", {2, false}},
       {"localtime", {1, false}},
       {"localtime_r", {2, false}},
+      {"log",
+       {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"lstat", {2, false}},
       {"lstat64", {2, false}},
       {"lseek", {3, false}},
@@ -663,6 +669,8 @@ knownExternalPrototypes() {
       {"__sysv_signal", {2, false}},
       {"signal", {2, false}},
       {"sigprocmask", {3, false}},
+      {"sin",
+       {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"snprintf", {3, true}},
       {"av_usleep", {1, false}},
       {"socket", {3, false}},
@@ -682,6 +690,8 @@ knownExternalPrototypes() {
       {"splice", {6, false}},
       {"srandom", {1, false}},
       {"srand", {1, false}},
+      {"sqrt",
+       {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"sscanf", {2, true}},
       {"stat", {2, false}},
       {"stat64", {2, false}},
@@ -3447,6 +3457,8 @@ void printNativeRegisterSummarySSASummary(
      << " call_returns=" << summary.CallReturnValues
      << " call_clobbers=" << summary.CallClobberValues
      << " call_arg_stores_marked=" << summary.CallArgStoresMarked
+     << " calls_rewritten=" << summary.CallsRewritten
+     << " functions_rewritten=" << summary.FunctionsRewritten
      << " preserved_calls=" << summary.PreservedCalls
      << " unknown_call_effects=" << summary.UnknownCallEffects
      << " stack_frame_accesses_rewritten="
@@ -3479,6 +3491,8 @@ void printNativeRegisterSummarySSASummary(
        << " call_returns=" << function.CallReturnValues
        << " call_clobbers=" << function.CallClobberValues
        << " call_arg_stores_marked=" << function.CallArgStoresMarked
+       << " calls_rewritten=" << function.CallsRewritten
+       << " functions_rewritten=" << function.FunctionsRewritten
        << " preserved_calls=" << function.PreservedCalls
        << " unknown_call_effects=" << function.UnknownCallEffects
        << " partial_demand_candidates=" << function.PartialDemandCandidates

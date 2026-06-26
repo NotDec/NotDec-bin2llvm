@@ -130,11 +130,23 @@ print(value)
 PY
 }
 
-parse_prototype_metric() {
+parse_summary_ssa_metric() {
   local file="$1"
-  local label="$2"
-  sed -n "s/[[:space:]]*$label:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" |
-    head -n 1
+  local key="$2"
+  python3 - "$file" "$key" <<'PY'
+import re
+import sys
+
+path, key = sys.argv[1:]
+pattern = re.compile(rf"(?:^| ){re.escape(key)}=([0-9]+)(?: |$)")
+with open(path, "r", encoding="utf-8") as handle:
+    for line in handle:
+        match = pattern.search(line)
+        if match:
+            print(match.group(1))
+            raise SystemExit(0)
+print("")
+PY
 }
 
 require_metric() {
@@ -181,7 +193,7 @@ mkdir -p "$OUT_DIR"
 echo "out_dir=$OUT_DIR"
 
 METRICS="$OUT_DIR/metrics.tsv"
-printf 'target\tproject\trole\trootfs_path\tdecode_seed_limit\tdiscover_seconds\tall_confirmed_seconds\tsignature_rewrite_seconds\tconfirmed_functions\tbasic_blocks\tinstructions\tunresolved_indirect_call\tunresolved_indirect_branch\tprototype_functions\tprototype_external_inputs\tprototype_input_candidates\tprototype_return_candidates\tsignature_rewrite_needed\tsignature_rewrite_seen\tsignature_rewrite_rewritten\tsignature_rewrite_skipped\n' \
+printf 'target\tproject\trole\trootfs_path\tdecode_seed_limit\tdiscover_seconds\tall_confirmed_seconds\tsignature_rewrite_seconds\tconfirmed_functions\tbasic_blocks\tinstructions\tunresolved_indirect_call\tunresolved_indirect_branch\tsummary_functions\tsummary_loads\tsummary_stores\tsummary_calls_rewritten\tsummary_functions_rewritten\trewrite_summary_functions\trewrite_summary_loads\trewrite_summary_stores\trewrite_summary_calls_rewritten\trewrite_summary_functions_rewritten\n' \
   >"$METRICS"
 
 native_llvm_args=()
@@ -221,7 +233,7 @@ for target in "${TARGETS[@]}"; do
 
   started_at="$(date +%s)"
   "$NATIVE_LLVM" "$binary" --all-confirmed "${native_llvm_args[@]}" \
-    --prototype-recovery-summary \
+    --register-ssa-summary --prototype-recovery-summary \
     -o "$ll" >"$native_stdout" 2>"$native_stderr"
   all_confirmed_seconds="$(( $(date +%s) - started_at ))"
   "$LLVM_AS" "$ll" -o "$bc" 2>"$llvm_as_stderr"
@@ -229,7 +241,8 @@ for target in "${TARGETS[@]}"; do
 
   started_at="$(date +%s)"
   "$NATIVE_LLVM" "$binary" --all-confirmed "${native_llvm_args[@]}" \
-    --prototype-recovery-summary --rewrite-prototype-signatures -o "$rewrite_ll" \
+    --register-ssa-summary --prototype-recovery-summary \
+    --rewrite-prototype-signatures -o "$rewrite_ll" \
     >"$rewrite_stdout" 2>"$rewrite_stderr"
   signature_rewrite_seconds="$(( $(date +%s) - started_at ))"
   "$LLVM_AS" "$rewrite_ll" -o "$rewrite_bc" 2>"$rewrite_llvm_as_stderr"
@@ -242,29 +255,33 @@ for target in "${TARGETS[@]}"; do
   instructions="$(summary_metric "$summary" "instructions")"
   unresolved_indirect_call="$(summary_metric "$summary" "unresolved_indirect_flows.indirect call")"
   unresolved_indirect_branch="$(summary_metric "$summary" "unresolved_indirect_flows.indirect branch")"
-  prototype_functions="$(parse_prototype_metric "$native_stderr" "functions")"
-  prototype_external_inputs="$(parse_prototype_metric "$native_stderr" "external inputs")"
-  prototype_input_candidates="$(parse_prototype_metric "$native_stderr" "input candidates")"
-  prototype_return_candidates="$(parse_prototype_metric "$native_stderr" "return candidates")"
-  signature_rewrite_needed="$(parse_prototype_metric "$rewrite_stderr" "signature rewrite needed functions")"
-  signature_rewrite_seen="$(parse_prototype_metric "$rewrite_stderr" "signature rewrite seen functions")"
-  signature_rewrite_rewritten="$(parse_prototype_metric "$rewrite_stderr" "signature rewrite rewritten functions")"
-  signature_rewrite_skipped="$(parse_prototype_metric "$rewrite_stderr" "signature rewrite skipped functions")"
+  summary_functions="$(parse_summary_ssa_metric "$native_stderr" "functions")"
+  summary_loads="$(parse_summary_ssa_metric "$native_stderr" "loads")"
+  summary_stores="$(parse_summary_ssa_metric "$native_stderr" "stores")"
+  summary_calls_rewritten="$(parse_summary_ssa_metric "$native_stderr" "calls_rewritten")"
+  summary_functions_rewritten="$(parse_summary_ssa_metric "$native_stderr" "functions_rewritten")"
+  rewrite_summary_functions="$(parse_summary_ssa_metric "$rewrite_stderr" "functions")"
+  rewrite_summary_loads="$(parse_summary_ssa_metric "$rewrite_stderr" "loads")"
+  rewrite_summary_stores="$(parse_summary_ssa_metric "$rewrite_stderr" "stores")"
+  rewrite_summary_calls_rewritten="$(parse_summary_ssa_metric "$rewrite_stderr" "calls_rewritten")"
+  rewrite_summary_functions_rewritten="$(parse_summary_ssa_metric "$rewrite_stderr" "functions_rewritten")"
 
-  require_metric "$target" "$prototype_functions" "functions" "$native_stderr"
-  require_metric "$target" "$signature_rewrite_needed" "signature rewrite needed functions" "$rewrite_stderr"
-  require_metric "$target" "$signature_rewrite_rewritten" "signature rewrite rewritten functions" "$rewrite_stderr"
+  require_metric "$target" "$summary_functions" "summary SSA functions" "$native_stderr"
+  require_metric "$target" "$summary_calls_rewritten" "summary SSA calls_rewritten" "$native_stderr"
+  require_metric "$target" "$rewrite_summary_functions" "rewrite summary SSA functions" "$rewrite_stderr"
+  require_metric "$target" "$rewrite_summary_calls_rewritten" "rewrite summary SSA calls_rewritten" "$rewrite_stderr"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$target" "$project" "$role" "$rootfs_path" \
     "${DECODE_SEED_LIMIT:-all}" \
     "$discover_seconds" "$all_confirmed_seconds" "$signature_rewrite_seconds" \
     "$confirmed_functions" "$basic_blocks" "$instructions" \
     "$unresolved_indirect_call" "$unresolved_indirect_branch" \
-    "$prototype_functions" "$prototype_external_inputs" \
-    "$prototype_input_candidates" "$prototype_return_candidates" \
-    "$signature_rewrite_needed" "$signature_rewrite_seen" \
-    "$signature_rewrite_rewritten" "$signature_rewrite_skipped" >>"$METRICS"
+    "$summary_functions" "$summary_loads" "$summary_stores" \
+    "$summary_calls_rewritten" "$summary_functions_rewritten" \
+    "$rewrite_summary_functions" "$rewrite_summary_loads" \
+    "$rewrite_summary_stores" "$rewrite_summary_calls_rewritten" \
+    "$rewrite_summary_functions_rewritten" >>"$METRICS"
 
   echo "$target ok all_confirmed=${all_confirmed_seconds}s signature_rewrite=${signature_rewrite_seconds}s"
 done

@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -110,6 +111,35 @@ void attachTestAbiWithInputs(llvm::Module &module,
 
 void attachTestAbi(llvm::Module &module) {
   attachTestAbiWithInputs(module, {"RDI"});
+}
+
+void attachTestFloatAbi(llvm::Module &module, unsigned floatInputs) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_float_test";
+  for (unsigned index = 0; index < floatInputs; ++index) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 4;
+    input.MaxSize = 8;
+    input.MetaType = "float";
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = ("XMM" + std::to_string(index) + "_Qa");
+    abi.Inputs.push_back(input);
+  }
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.MetaType = "float";
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "XMM0_Qa";
+  abi.Outputs.push_back(output);
+  for (unsigned index = 0; index < floatInputs; ++index) {
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = "XMM" + std::to_string(index);
+    abi.Effects.push_back(killed);
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
 llvm::StoreInst *storeRegister(llvm::IRBuilder<> &builder,
@@ -1973,33 +2003,7 @@ bool testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn() {
 bool testKnownPowUsesFloatAbiSlots() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-pow-float-abi", context);
-
-  notdec::bin2llvm::NativeAbiSpec abi;
-  abi.PrototypeName = "__summary_ssa_pow_test";
-  for (llvm::StringRef name : {"XMM0_Qa", "XMM1_Qa"}) {
-    notdec::bin2llvm::NativeAbiParamEntry input;
-    input.MinSize = 4;
-    input.MaxSize = 8;
-    input.MetaType = "float";
-    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
-    input.Storage.Name = name.str();
-    abi.Inputs.push_back(input);
-  }
-  notdec::bin2llvm::NativeAbiParamEntry output;
-  output.MinSize = 1;
-  output.MaxSize = 8;
-  output.MetaType = "float";
-  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
-  output.Storage.Name = "XMM0_Qa";
-  abi.Outputs.push_back(output);
-  for (llvm::StringRef name : {"XMM0", "XMM1"}) {
-    notdec::bin2llvm::NativeAbiEffect killed;
-    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
-    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
-    killed.Storage.Name = name.str();
-    abi.Effects.push_back(killed);
-  }
-  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+  attachTestFloatAbi(module, 2);
 
   llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
   llvm::GlobalVariable *zmm0 =
@@ -2055,6 +2059,73 @@ bool testKnownPowUsesFloatAbiSlots() {
          expect(summary.CallsRewritten >= 1,
                 "pow call was not counted as rewritten") &&
          verifyOk(module, "module failed verifier after pow ABI rewrite test");
+}
+
+bool testKnownUnaryLibmUsesFloatAbiSlots() {
+  bool ok = true;
+  for (const std::string &calleeName :
+       std::vector<std::string>{"sqrt", "sin", "cos", "log", "exp"}) {
+    llvm::LLVMContext context;
+    llvm::Module module("summary-ssa-libm-float-abi", context);
+    attachTestFloatAbi(module, 1);
+
+    llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+    llvm::GlobalVariable *zmm0 =
+        createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+
+    auto *oldCalleeType =
+        llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+    llvm::Function *callee = llvm::Function::Create(
+        oldCalleeType, llvm::GlobalValue::ExternalLinkage, calleeName, module);
+    auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+    llvm::Function *function = llvm::Function::Create(
+        type, llvm::GlobalValue::ExternalLinkage,
+        calleeName + "_float_slots", module);
+    llvm::BasicBlock *entry =
+        llvm::BasicBlock::Create(context, "entry", function);
+    llvm::IRBuilder<> builder(entry);
+    storeRegister(builder, zmm0, llvm::ConstantInt::get(zmmType, 1), "ZMM0");
+    builder.CreateCall(oldCalleeType, callee);
+    llvm::Value *bits =
+        builder.CreateTrunc(loadRegister(builder, zmm0, "ZMM0", "libm.after"),
+                            llvm::Type::getInt64Ty(context));
+    builder.CreateRet(bits);
+
+    auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+    llvm::CallInst *rewrittenCall = nullptr;
+    unsigned zmmStores = 0;
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+        if (call->getCalledFunction() != nullptr &&
+            call->getCalledFunction()->getName() == calleeName) {
+          rewrittenCall = call;
+        }
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        if (store->getPointerOperand()->stripPointerCasts() == zmm0) {
+          ++zmmStores;
+        }
+      }
+    }
+
+    std::string prefix = calleeName + ": ";
+    ok &= expect(rewrittenCall != nullptr,
+                 (prefix + "call missing after rewrite").c_str());
+    if (rewrittenCall != nullptr) {
+      ok &= expect(rewrittenCall->getType()->isDoubleTy(),
+                   (prefix + "return type was not double").c_str());
+      ok &= expect(rewrittenCall->arg_size() == 1,
+                   (prefix + "did not receive one argument").c_str());
+      ok &= expect(rewrittenCall->getArgOperand(0)->getType()->isDoubleTy(),
+                   (prefix + "argument was not double").c_str());
+    }
+    ok &= expect(zmmStores == 0,
+                 (prefix + "ABI ZMM argument store remained").c_str());
+    ok &= expect(summary.CallsRewritten >= 1,
+                 (prefix + "call was not counted as rewritten").c_str());
+    ok &= verifyOk(module, (prefix + "module failed verifier").c_str());
+  }
+  return ok;
 }
 
 bool testPartialKeepHighStoreIsDemandRewritten() {
@@ -2234,6 +2305,7 @@ int main() {
   ok &= testNoReturnExternalDoesNotCreateSummaryReturn();
   ok &= testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn();
   ok &= testKnownPowUsesFloatAbiSlots();
+  ok &= testKnownUnaryLibmUsesFloatAbiSlots();
   ok &= testPartialKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();

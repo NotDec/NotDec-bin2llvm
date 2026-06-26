@@ -607,3 +607,48 @@ Ghidra / Sleigh 的 ABI 信息已经覆盖浮点寄存器参数和返回值。�
 - 后期维护成本：5/10。后续加 `sqrt/sin/cos/log/exp` 只需扩 known prototype；真正复杂的是 vararg、stack float、internal float，这次没有提前引入。
 
 更好的方案是接入更完整的外部原型库和 Ghidra datatype rule engine，但当前目标只需要 fixed libm 的确定原型。先闭 `pow` 比一次性复刻完整 ABI 类型系统风险更低。
+
+## 实现记录：扩展 fixed libm 和修复 Bench2 audit
+
+### 实现内容
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:319`、`356`、`453`、`674`、`695`：known external prototype 表新增 `cos(double)->double`、`exp(double)->double`、`log(double)->double`、`sin(double)->double`、`sqrt(double)->double`。这些都走已有 typed float ABI slot，不新增 vararg、stack float 或 internal float 推断。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:3460`、`3494`：summary SSA 文本统计补 `calls_rewritten` 和 `functions_rewritten`，让脚本能检查 summary 链路自己的 rewrite 结果。
+- `tests/native_register_summary_ssa_test.cpp:116`：新增 `attachTestFloatAbi()`，复用 `XMM*_Qa` 的 float ABI metadata。
+- `tests/native_register_summary_ssa_test.cpp:2003`、`2064`、`2308`：`pow` 测试改用 helper，并新增 `testKnownUnaryLibmUsesFloatAbiSlots()`，覆盖 `sqrt/sin/cos/log/exp` 生成 `call double @name(double)`，且参数/返回不保留 ZMM store。
+- `scripts/bench2-native-prototype-audit.sh:133`、`195`、`235`、`243`、`258`：audit 脚本打开 `--register-ssa-summary`，metrics 改为记录 summary SSA 的 `functions/loads/stores/calls_rewritten/functions_rewritten`，不再硬依赖旧 prototype recovery stderr 指标。
+
+### `powerLawRand` 的 `ZMM3` 分类
+
+`/tmp/notdec-bin2llvm-bench2-float-libm-audit/redis-cli.signature-rewrite.ll:14126` 仍有 `store i512 0, ptr @ZMM3`。它位于两次 `pow` 调用之间：
+
+- `call double @pow(double %1, double %0)`
+- `store i512 0, ptr @ZMM3`
+- `call double @pow(double %7, double 0x7FF8000000000000)`
+
+这条 store 的 metadata 是 `!notdec.register.access !400`，`!400 = !{!"base=ZMM3", !"space=register", !"offset=4800", !"size=64", !"name=ZMM3"}`。它是 `powerLawRand` 自身的 vector register 写入，不是 `pow` 参数或返回。`pow` 的声明和调用已经完全是 typed double。
+
+### 验证
+
+- `bash -n scripts/bench2-native-prototype-audit.sh`
+- `cmake --build build --target native_register_summary_ssa_test native_abi_cspec_test notdec-native-llvm notdec-native-discover -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `./build/bin/native_abi_cspec_test /sn640/ghidra/Ghidra/Processors/x86/data/languages/x86-64-gcc.cspec`
+- `scripts/bench2-native-prototype-audit.sh --target redis:cli --build-dir build --out-dir /tmp/notdec-bin2llvm-bench2-float-libm-audit`
+  - 通过，`all_confirmed=194s`，`signature_rewrite=192s`。
+  - metrics：`summary_functions=537`，`summary_calls_rewritten=2883`，`summary_functions_rewritten=693`。
+  - `redis-cli.signature-rewrite.llvm-as.stderr` 和 `redis-cli.signature-rewrite.opt.stderr` 都是 0 字节。
+- `/usr/bin/time -f 'fortune elapsed=%e user=%U sys=%S maxrss=%M' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-float-libm.summary.json -o /tmp/notdec-fortune-float-libm.ll && /sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-float-libm.ll -o /tmp/notdec-fortune-float-libm.bc && /sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-float-libm.bc -o /tmp/notdec-fortune-float-libm.opt.bc`
+  - `fortune elapsed=8.51 user=8.48 sys=0.03 maxrss=168124`，通过 verifier。上一轮同口径 `8.70s`，未见退化。
+- `wrk elapsed=45.42 user=45.35 sys=0.06 maxrss=184536`，通过 LLVM 22 verifier。上一轮同口径 `46.47s`，未见退化。
+- `memcached elapsed=118.15 user=118.03 sys=0.10 maxrss=242808`，通过 LLVM 22 verifier。上一轮同口径 `120.15s`，未见退化。
+- `scripts/native-register-residue-audit.py /tmp/notdec-bin2llvm-bench2-float-libm-audit/redis-cli.signature-rewrite.ll`
+  - 仍有 `vector store/access/full/full/no = 10`，其中 `powerLawRand` 的 `ZMM3` store 已分类为非 `pow` 参数/返回残留。
+- `scripts/native-register-residue-audit.py /tmp/notdec-fortune-float-libm.ll`
+  - 无残留行。
+
+### 评分
+
+- 实现效果：8/10。fixed unary libm 已接入 typed float ABI slot，redis audit 脚本恢复可用，当前 Bench2 关注目标 verifier 通过。
+- 复杂度：5/10。新增原型复用已有 typed slot；脚本只是改统计来源。主要成本是 summary stderr 现在会更大。
+- 后期维护成本：4/10。后续继续补 fixed external prototype 只需扩表和测试；真正复杂的 vararg float、stack float、internal float 仍未引入。
