@@ -219,10 +219,15 @@ Ghidra 对 segment base / TLS 不是把 `FS_OFFSET` 当普通参数寄存器消�
   - epilogue 重新读取 guard。
   - 比较保存值和当前值。
   - 失败分支调用 `__stack_chk_fail`，然后 `unreachable`。
+- 实现形态先按当前 native 链路风格做独立 helper pass，不先接 LLVM PassManager：
+  - 头文件声明 `runNativeStackCanaryCleanup(llvm::Module &module)`。
+  - cpp 内部返回 cleanup summary，至少记录扫描函数数、rewrite 次数、删除 fail block 数。
+  - 由 `runNativeRegisterSummarySSA()` 串起来调用，而不是把 matcher 继续塞进 `FunctionBuilder`。
 - 在 `runNativeRegisterSummarySSA()` 里找插入点。优先放在 `runNativeStackFrameRewrite(module)` 之后、`runNativeRegisterSummary(module, summaryOptions)` 之前：
   - stack/frame 访问已经过一轮规整。
   - `FS_OFFSET` 还没有被 summary SSA 改成 entry load / phi，模式更直接。
   - canary 分支不会继续污染后面的 register demand 和 signature rewrite。
+- 暂不放到更晚的位置。晚于 summary SSA 后，`FS_OFFSET` 可能已经变成 entry load / phi，CFG 和 PHI 也更容易被 canary fail path 污染，matcher 会复杂很多。
 - 如果早期位置覆盖不了某些 wrk 形状，再补一个晚期 cleanup，但第一版先避免支持两套 matcher。
 - matcher 只处理能证明的 stack protector epilogue：
   - 条件分支的一边只调用 `__stack_chk_fail` 或平台 stack smash handler，然后 `unreachable`。
