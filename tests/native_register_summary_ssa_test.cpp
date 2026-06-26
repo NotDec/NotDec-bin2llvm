@@ -722,7 +722,6 @@ bool testKnownFixedExternalArities() {
       {"__isoc23_strtoll", 3},
       {"__isoc23_strtoul", 3},
       {"__isoc23_strtoull", 3},
-      {"__asprintf_chk", 3},
       {"getdelim", 4},
       {"__poll_chk", 4},
       {"__longjmp_chk", 2},
@@ -919,6 +918,7 @@ bool testKnownFixedExternalArities() {
       {"pwrite64", 4},
       {"pwritev64", 4},
       {"qsort", 4},
+      {"popen", 2},
       {"readv", 3},
       {"recvmmsg", 5},
       {"recv", 4},
@@ -1072,9 +1072,14 @@ bool testKnownFixedExternalArities() {
     }
 
     unsigned expectedArgs = std::min<unsigned>(testCase.Args, 6);
-    if (!expect(call != nullptr, "known fixed external call missing") ||
-        !expect(call->arg_size() == expectedArgs,
-                "known fixed external used wrong arity") ||
+    std::string contextMessage =
+        std::string(" for known fixed external ") + testCase.Name;
+    std::string missingMessage =
+        "known fixed external call missing" + contextMessage;
+    std::string arityMessage =
+        "known fixed external used wrong arity" + contextMessage;
+    if (!expect(call != nullptr, missingMessage.c_str()) ||
+        !expect(call->arg_size() == expectedArgs, arityMessage.c_str()) ||
         !verifyOk(module,
                   "module failed verifier after fixed external rewrite")) {
       return false;
@@ -1091,6 +1096,7 @@ bool testKnownVarArgExternalKeepsAbiInputs() {
   const KnownVarArgCase cases[] = {
       {"__isoc23_sscanf", 2},
       {"__isoc99_sscanf", 2},
+      {"__asprintf_chk", 3},
       {"__snprintf_chk", 4},
       {"__syslog_chk", 2},
       {"fscanf", 2},
@@ -1964,6 +1970,149 @@ bool testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn() {
          verifyOk(module, "module failed verifier after ZMM ABI effect test");
 }
 
+bool testPartialKeepHighStoreIsDemandRewritten() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-demand", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "partial_keep_high", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *old = loadRegister(builder, rdx, "RDX", "old");
+  llvm::Value *keep = builder.CreateAnd(
+      old, llvm::ConstantInt::get(
+               rdx->getValueType(), llvm::APInt::getBitsSet(64, 8, 64)));
+  llvm::Value *low = llvm::ConstantInt::get(rdx->getValueType(), 7);
+  storeRegister(builder, rdx, builder.CreateOr(keep, low), "RDX");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  unsigned rdxLoads = 0;
+  unsigned rdxStores = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      if (load->getPointerOperand()->stripPointerCasts() == rdx) {
+        ++rdxLoads;
+      }
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      if (store->getPointerOperand()->stripPointerCasts() == rdx) {
+        ++rdxStores;
+      }
+    }
+  }
+
+  return expect(summary.PartialDemandCandidates >= 1,
+                "partial keep-high store was not seen as a candidate") &&
+         expect(summary.PartialDemandMatched >= 1,
+                "partial keep-high store was not demand rewritten") &&
+         expect(rdxLoads == 0,
+                "partial keep-high old load was not removed") &&
+         verifyOk(module,
+                  "module failed verifier after partial demand rewrite test");
+}
+
+bool testPartialZmmKeepHighStoreIsDemandRewritten() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-zmm-demand", context);
+  attachTestAbi(module);
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "partial_zmm_keep_high",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *old = loadRegister(builder, zmm0, "ZMM0", "old");
+  llvm::Value *keep = builder.CreateAnd(
+      old, llvm::ConstantInt::get(
+               zmmType, llvm::APInt::getBitsSet(512, 128, 512)));
+  llvm::Value *low = llvm::ConstantInt::get(zmmType, 7);
+  storeRegister(builder, zmm0, builder.CreateOr(keep, low), "ZMM0");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  unsigned zmmLoads = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      if (load->getPointerOperand()->stripPointerCasts() == zmm0) {
+        ++zmmLoads;
+      }
+    }
+  }
+
+  return expect(summary.PartialDemandCandidates >= 1,
+                "partial zmm keep-high store was not seen as a candidate") &&
+         expect(summary.PartialDemandMatched >= 1,
+                "partial zmm keep-high store was not demand rewritten") &&
+         expect(zmmLoads == 0,
+                "partial zmm keep-high old load was not removed") &&
+         verifyOk(module,
+                  "module failed verifier after partial zmm demand test");
+}
+
+bool testPartialZmmDisjointLaneChainIsDemandRewritten() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-zmm-lane-chain", context);
+  attachTestAbi(module);
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "partial_zmm_lane_chain",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *old = loadRegister(builder, zmm0, "ZMM0", "old");
+  llvm::Value *keep = builder.CreateAnd(
+      old, llvm::ConstantInt::get(
+               zmmType, llvm::APInt::getBitsSet(512, 128, 512)));
+  llvm::Value *low = llvm::ConstantInt::get(zmmType, 7);
+  llvm::Value *mid = builder.CreateOr(keep, low, "mid", /*IsDisjoint=*/true);
+  llvm::Value *lane1 = builder.CreateShl(
+      llvm::ConstantInt::get(zmmType, 11), llvm::ConstantInt::get(zmmType, 64));
+  llvm::Value *combined =
+      builder.CreateOr(mid, lane1, "combined", /*IsDisjoint=*/true);
+  storeRegister(builder, zmm0, combined, "ZMM0");
+  llvm::Value *used = builder.CreateTrunc(
+      builder.CreateLShr(combined, llvm::ConstantInt::get(zmmType, 64)),
+      llvm::Type::getInt64Ty(context));
+  llvm::Value *slot =
+      builder.CreateAlloca(llvm::Type::getInt64Ty(context), nullptr, "slot");
+  builder.CreateStore(used, slot);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  unsigned zmmLoads = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      if (load->getPointerOperand()->stripPointerCasts() == zmm0) {
+        ++zmmLoads;
+      }
+    }
+  }
+
+  return expect(summary.PartialDemandCandidates >= 1,
+                "partial zmm lane chain store was not seen as a candidate") &&
+         expect(summary.PartialDemandMatched >= 1,
+                "partial zmm lane chain was not demand rewritten") &&
+         expect(zmmLoads == 0,
+                "partial zmm lane chain old load was not removed") &&
+         verifyOk(module,
+                  "module failed verifier after partial zmm lane chain test");
+}
+
 } // namespace
 
 int main() {
@@ -1997,5 +2146,8 @@ int main() {
   ok &= testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall();
   ok &= testNoReturnExternalDoesNotCreateSummaryReturn();
   ok &= testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn();
+  ok &= testPartialKeepHighStoreIsDemandRewritten();
+  ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
+  ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

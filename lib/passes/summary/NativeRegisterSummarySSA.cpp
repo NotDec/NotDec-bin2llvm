@@ -5,6 +5,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
@@ -86,6 +87,77 @@ struct CallArgStoreBinding {
   const RegisterUnit *Unit = nullptr;
   llvm::Value *Value = nullptr;
   unsigned Index = 0;
+};
+
+// Backward bit demand for values produced while lowering partial register
+// writes.  A set bit means some later real observer needs that bit.  Register
+// stores are not observers by themselves; later loads, calls, returns, branches,
+// and ordinary memory stores seed the demand.
+struct PartialDemandState {
+  std::map<llvm::Value *, llvm::APInt> Demands;
+  std::vector<llvm::Value *> Worklist;
+
+  static llvm::APInt fullMask(unsigned bitWidth) {
+    return llvm::APInt::getAllOnes(bitWidth);
+  }
+
+  static llvm::APInt trimmedMask(const llvm::APInt &mask,
+                                 unsigned bitWidth) {
+    if (bitWidth == 0) {
+      return llvm::APInt();
+    }
+    if (mask.getBitWidth() == bitWidth) {
+      return mask;
+    }
+    if (mask.getBitWidth() < bitWidth) {
+      return mask.zext(bitWidth);
+    }
+    return mask.trunc(bitWidth);
+  }
+
+  static unsigned bitWidthOf(const llvm::Value &value) {
+    llvm::Type *type = value.getType();
+    if (type == nullptr || !type->isSized()) {
+      return 0;
+    }
+    return type->getScalarSizeInBits();
+  }
+
+  void addDemand(llvm::Value *value, llvm::APInt demand) {
+    if (value == nullptr || demand.isZero()) {
+      return;
+    }
+    unsigned bitWidth = bitWidthOf(*value);
+    if (bitWidth == 0) {
+      return;
+    }
+    demand = trimmedMask(demand, bitWidth);
+    if (demand.isZero()) {
+      return;
+    }
+    auto it = Demands.find(value);
+    if (it == Demands.end()) {
+      Demands.emplace(value, demand);
+      Worklist.push_back(value);
+      return;
+    }
+    llvm::APInt combined = it->second | demand;
+    if (combined != it->second) {
+      it->second = combined;
+      Worklist.push_back(value);
+    }
+  }
+
+  llvm::APInt demandOf(llvm::Value *value) const {
+    if (value == nullptr) {
+      return llvm::APInt();
+    }
+    auto it = Demands.find(value);
+    if (it == Demands.end()) {
+      return llvm::APInt(bitWidthOf(*value), 0);
+    }
+    return it->second;
+  }
 };
 
 struct KnownExternalPrototype {
@@ -398,6 +470,7 @@ knownExternalPrototypes() {
       {"poll", {3, false}},
       {"printf", {1, true}},
       {"prctl", {1, true}},
+      {"popen", {2, false}},
       {"pread64", {4, false}},
       {"pread", {4, false}},
       {"preadv64", {4, false}},
@@ -804,44 +877,6 @@ bool isAnalyzableCall(const llvm::CallBase &call) {
   return callee == nullptr || !callee->isIntrinsic();
 }
 
-bool isKeepHighPartialLoadUse(llvm::LoadInst &load,
-                              llvm::GlobalVariable *global) {
-  // RegisterStorage lowers partial writes by reading the whole backing
-  // register, preserving the lanes outside the write mask, and storing the
-  // whole register back.  This load is not a real liveness use when it only
-  // feeds that keep-high expression.
-  if (load.getPointerOperand()->stripPointerCasts() != global ||
-      load.user_empty()) {
-    return false;
-  }
-  for (llvm::User *loadUser : load.users()) {
-    auto *andOp = llvm::dyn_cast<llvm::Operator>(loadUser);
-    if (andOp == nullptr || andOp->getOpcode() != llvm::Instruction::And) {
-      return false;
-    }
-    bool hasStore = false;
-    for (llvm::User *andUser : andOp->users()) {
-      auto *orOp = llvm::dyn_cast<llvm::Operator>(andUser);
-      if (orOp == nullptr || orOp->getOpcode() != llvm::Instruction::Or) {
-        return false;
-      }
-      for (llvm::User *orUser : orOp->users()) {
-        auto *store = llvm::dyn_cast<llvm::StoreInst>(orUser);
-        if (store == nullptr ||
-            store->getPointerOperand()->stripPointerCasts() != global ||
-            store->getValueOperand() != orOp) {
-          return false;
-        }
-        hasStore = true;
-      }
-    }
-    if (!hasStore) {
-      return false;
-    }
-  }
-  return true;
-}
-
 std::string storageUnitName(
     const NativeAbiStorage &storage,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -1178,6 +1213,7 @@ public:
     collectAccesses();
     if (Options.EnableRewrite) {
       rewriteLoads();
+      rewritePartialWrites();
       collectSignatureCallArgs();
       finalizePendingPhis();
       collectFunctionReturnValues();
@@ -1217,6 +1253,562 @@ private:
   std::map<llvm::GlobalVariable *, llvm::LoadInst *> EntryInputs;
   std::map<CallValueKey, llvm::Value *> CallValues;
   bool PostSignatureCleanup = false;
+
+  static unsigned valueBitWidth(llvm::Value *value) {
+    if (value == nullptr) {
+      return 0;
+    }
+    llvm::Type *type = value->getType();
+    if (type == nullptr || !type->isSized()) {
+      return 0;
+    }
+    if (auto *integerType = llvm::dyn_cast<llvm::IntegerType>(type)) {
+      return integerType->getBitWidth();
+    }
+    return type->getScalarSizeInBits();
+  }
+
+  static llvm::APInt fullMaskFor(llvm::Value *value) {
+    unsigned bitWidth = valueBitWidth(value);
+    if (bitWidth == 0) {
+      return llvm::APInt();
+    }
+    return llvm::APInt::getAllOnes(bitWidth);
+  }
+
+  static llvm::APInt maskForLowBits(unsigned bitWidth, unsigned lowBits) {
+    if (bitWidth == 0 || lowBits == 0) {
+      return llvm::APInt(bitWidth, 0);
+    }
+    unsigned count = std::min(bitWidth, lowBits);
+    return llvm::APInt::getLowBitsSet(bitWidth, count);
+  }
+
+  static llvm::APInt shiftedMask(const llvm::APInt &mask, unsigned shift,
+                                 unsigned width) {
+    if (width == 0) {
+      return llvm::APInt();
+    }
+    llvm::APInt wide = PartialDemandState::trimmedMask(mask, width);
+    if (wide.isZero()) {
+      return wide;
+    }
+    if (shift >= width) {
+      return llvm::APInt(width, 0);
+    }
+    wide <<= shift;
+    return PartialDemandState::trimmedMask(wide, width);
+  }
+
+  static llvm::APInt lshrSourceDemand(const llvm::APInt &resultDemand,
+                                      unsigned shift, unsigned sourceWidth) {
+    if (sourceWidth == 0 || shift >= sourceWidth) {
+      return llvm::APInt(sourceWidth, 0);
+    }
+    return shiftedMask(resultDemand, shift, sourceWidth);
+  }
+
+  static bool isDisjointOr(const llvm::Instruction &inst) {
+    auto *possiblyDisjoint = llvm::dyn_cast<llvm::PossiblyDisjointInst>(&inst);
+    return possiblyDisjoint != nullptr && possiblyDisjoint->isDisjoint();
+  }
+
+  static bool isRegisterPointer(llvm::Value *ptr,
+                                const std::map<llvm::GlobalVariable *,
+                                               RegisterUnit> &units,
+                                const RegisterUnit *&unit) {
+    auto *global =
+        llvm::dyn_cast_or_null<llvm::GlobalVariable>(ptr->stripPointerCasts());
+    if (global == nullptr) {
+      return false;
+    }
+    auto it = units.find(global);
+    if (it == units.end()) {
+      return false;
+    }
+    unit = &it->second;
+    return true;
+  }
+
+  bool matchKeepHighPartialStore(llvm::StoreInst &store,
+                                 const RegisterUnit &unit,
+                                 llvm::LoadInst *&load,
+                                 llvm::Value *&lowValue,
+                                 llvm::BinaryOperator *&andInst,
+                                 llvm::BinaryOperator *&orInst,
+                                 llvm::APInt &keepMask) {
+    load = nullptr;
+    lowValue = nullptr;
+    andInst = nullptr;
+    orInst = nullptr;
+    keepMask = fullMaskFor(store.getValueOperand());
+    auto *storeOp = llvm::dyn_cast<llvm::BinaryOperator>(store.getValueOperand());
+    if (storeOp == nullptr || storeOp->getOpcode() != llvm::Instruction::Or) {
+      return false;
+    }
+    orInst = storeOp;
+    llvm::Value *lhs = orInst->getOperand(0);
+    llvm::Value *rhs = orInst->getOperand(1);
+    auto matchAnd = [&](llvm::Value *candidate, llvm::Value *other)
+        -> bool {
+      auto *andOp = llvm::dyn_cast<llvm::BinaryOperator>(candidate);
+      if (andOp == nullptr || andOp->getOpcode() != llvm::Instruction::And) {
+        return false;
+      }
+      auto *candidateLoad = llvm::dyn_cast<llvm::LoadInst>(andOp->getOperand(0));
+      llvm::Value *maskValue = andOp->getOperand(1);
+      if (candidateLoad == nullptr) {
+        candidateLoad = llvm::dyn_cast<llvm::LoadInst>(andOp->getOperand(1));
+        maskValue = andOp->getOperand(0);
+      }
+      if (candidateLoad == nullptr ||
+          candidateLoad->getPointerOperand()->stripPointerCasts() !=
+              unit.Global) {
+        return false;
+      }
+      auto *maskConst = llvm::dyn_cast<llvm::ConstantInt>(maskValue);
+      if (maskConst == nullptr) {
+        return false;
+      }
+      load = candidateLoad;
+      lowValue = other;
+      andInst = andOp;
+      keepMask = maskConst->getValue();
+      return true;
+    };
+    if (matchAnd(lhs, rhs) || matchAnd(rhs, lhs)) {
+      return true;
+    }
+    return false;
+  }
+
+  bool rewriteDeadKeepHighParts(llvm::Value *value,
+                                const std::map<llvm::Value *, llvm::APInt>
+                                    &demands) {
+    auto *orInst = llvm::dyn_cast<llvm::BinaryOperator>(value);
+    if (orInst == nullptr || orInst->getOpcode() != llvm::Instruction::Or) {
+      return false;
+    }
+
+    bool changed = false;
+    for (unsigned index = 0; index < 2; ++index) {
+      auto *andInst =
+          llvm::dyn_cast<llvm::BinaryOperator>(orInst->getOperand(index));
+      if (andInst == nullptr ||
+          andInst->getOpcode() != llvm::Instruction::And) {
+        changed |= rewriteDeadKeepHighParts(orInst->getOperand(index), demands);
+        continue;
+      }
+      bool hasRegisterLoad = false;
+      for (llvm::Value *operand : andInst->operand_values()) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(operand);
+        if (load == nullptr) {
+          continue;
+        }
+        const RegisterUnit *unit = nullptr;
+        if (isRegisterPointer(load->getPointerOperand(), Units, unit)) {
+          hasRegisterLoad = true;
+          break;
+        }
+      }
+      if (!hasRegisterLoad) {
+        changed |= rewriteDeadKeepHighParts(orInst->getOperand(index), demands);
+        continue;
+      }
+      auto demandIt = demands.find(andInst);
+      if (demandIt != demands.end() && !demandIt->second.isZero()) {
+        continue;
+      }
+      // The keep-high side only preserves old register bits.  If no later
+      // observer demands those bits, make the dataflow independent of the old
+      // register value and let normal DCE erase the load chain.
+      llvm::Value *zero = llvm::ConstantInt::get(andInst->getType(), 0);
+      orInst->setOperand(index, zero);
+      if (andInst->use_empty()) {
+        llvm::RecursivelyDeleteTriviallyDeadInstructions(andInst);
+      }
+      changed = true;
+    }
+    return changed;
+  }
+
+  std::map<llvm::Value *, llvm::APInt> computePartialDemands() {
+    std::map<llvm::Value *, llvm::APInt> demands;
+    std::map<llvm::Value *, llvm::APInt> knownMasks;
+    std::vector<llvm::Value *> worklist;
+    std::function<llvm::APInt(llvm::Value *)> knownValueMask =
+        [&](llvm::Value *value) -> llvm::APInt {
+      if (value == nullptr) {
+        return llvm::APInt();
+      }
+      auto cached = knownMasks.find(value);
+      if (cached != knownMasks.end()) {
+        return cached->second;
+      }
+      unsigned width = valueBitWidth(value);
+      if (width == 0) {
+        return llvm::APInt();
+      }
+      llvm::APInt result(width, 0);
+      if (auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value)) {
+        result = PartialDemandState::trimmedMask(constant->getValue(), width);
+        knownMasks.emplace(value, result);
+        return result;
+      }
+      auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
+      if (inst == nullptr) {
+        result = fullMaskFor(value);
+        knownMasks.emplace(value, result);
+        return result;
+      }
+      auto computeUnaryMask = [&](unsigned operandIndex) -> llvm::APInt {
+        return knownValueMask(inst->getOperand(operandIndex));
+      };
+      switch (inst->getOpcode()) {
+      case llvm::Instruction::And:
+        if (auto *lhs = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(0))) {
+          result = PartialDemandState::trimmedMask(lhs->getValue(), width);
+          break;
+        }
+        if (auto *rhs = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+          result = PartialDemandState::trimmedMask(rhs->getValue(), width);
+          break;
+        }
+        result = computeUnaryMask(0) & computeUnaryMask(1);
+        break;
+      case llvm::Instruction::Or:
+      case llvm::Instruction::Xor:
+        result = computeUnaryMask(0) | computeUnaryMask(1);
+        break;
+      case llvm::Instruction::Trunc:
+        result = llvm::APInt::getAllOnes(width);
+        break;
+      case llvm::Instruction::ZExt: {
+        unsigned srcWidth = valueBitWidth(inst->getOperand(0));
+        result = maskForLowBits(width, srcWidth);
+        break;
+      }
+      case llvm::Instruction::SExt: {
+        unsigned srcWidth = valueBitWidth(inst->getOperand(0));
+        result = maskForLowBits(width, srcWidth);
+        break;
+      }
+      case llvm::Instruction::Shl:
+        if (auto *shift = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+          unsigned amount = shift->getLimitedValue();
+          if (amount < width) {
+            result = shiftedMask(computeUnaryMask(0), amount, width);
+          }
+          break;
+        }
+        result = fullMaskFor(value);
+        break;
+      case llvm::Instruction::LShr:
+        if (auto *shift = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+          unsigned amount = shift->getLimitedValue();
+          if (amount < width) {
+            result = computeUnaryMask(0).lshr(amount).zextOrTrunc(width);
+          }
+          break;
+        }
+        result = fullMaskFor(value);
+        break;
+      case llvm::Instruction::Select:
+        result = computeUnaryMask(1) | computeUnaryMask(2);
+        break;
+      case llvm::Instruction::ExtractValue:
+      case llvm::Instruction::InsertValue: {
+        for (llvm::Value *operand : inst->operand_values()) {
+          result |= knownValueMask(operand);
+        }
+        break;
+      }
+      default:
+        result = fullMaskFor(value);
+        break;
+      }
+      knownMasks.emplace(value, result);
+      return result;
+    };
+    auto enqueue = [&](llvm::Value *value, llvm::APInt demand) {
+      if (value == nullptr || demand.isZero()) {
+        return;
+      }
+      unsigned bitWidth = valueBitWidth(value);
+      if (bitWidth == 0) {
+        return;
+      }
+      demand = PartialDemandState::trimmedMask(demand, bitWidth);
+      if (demand.isZero()) {
+        return;
+      }
+      auto it = demands.find(value);
+      if (it == demands.end()) {
+        demands.emplace(value, demand);
+        worklist.push_back(value);
+        return;
+      }
+      llvm::APInt merged = it->second | demand;
+      if (merged != it->second) {
+        it->second = merged;
+        worklist.push_back(value);
+      }
+    };
+    auto seedOperand = [&](llvm::Value *value) {
+      enqueue(value, fullMaskFor(value));
+    };
+
+    for (llvm::Instruction &inst : llvm::instructions(Function)) {
+      if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&inst)) {
+        if (llvm::Value *value = ret->getReturnValue()) {
+          seedOperand(value);
+        }
+        continue;
+      }
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        for (llvm::Use &operand : call->args()) {
+          seedOperand(operand.get());
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit == nullptr) {
+          seedOperand(store->getValueOperand());
+        }
+        continue;
+      }
+      if (auto *br = llvm::dyn_cast<llvm::BranchInst>(&inst)) {
+        if (!br->isUnconditional()) {
+          seedOperand(br->getCondition());
+        }
+        continue;
+      }
+      if (auto *sw = llvm::dyn_cast<llvm::SwitchInst>(&inst)) {
+        seedOperand(sw->getCondition());
+        continue;
+      }
+      if (auto *icmp = llvm::dyn_cast<llvm::ICmpInst>(&inst)) {
+        seedOperand(icmp->getOperand(0));
+        seedOperand(icmp->getOperand(1));
+        continue;
+      }
+      if (auto *fcmp = llvm::dyn_cast<llvm::FCmpInst>(&inst)) {
+        seedOperand(fcmp->getOperand(0));
+        seedOperand(fcmp->getOperand(1));
+        continue;
+      }
+    }
+
+    while (!worklist.empty()) {
+      llvm::Value *value = worklist.back();
+      worklist.pop_back();
+      llvm::APInt demand = demands[value];
+      auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
+      if (inst == nullptr) {
+        continue;
+      }
+      llvm::APInt inputDemand = demand;
+      switch (inst->getOpcode()) {
+      case llvm::Instruction::Trunc:
+        enqueue(inst->getOperand(0), inputDemand);
+        break;
+      case llvm::Instruction::ZExt:
+        enqueue(inst->getOperand(0),
+                PartialDemandState::trimmedMask(
+                    inputDemand,
+                    valueBitWidth(inst->getOperand(0))));
+        break;
+      case llvm::Instruction::SExt:
+        if (auto *srcType = llvm::dyn_cast<llvm::IntegerType>(
+                inst->getOperand(0)->getType())) {
+          unsigned srcWidth = srcType->getBitWidth();
+          llvm::APInt sourceDemand =
+              PartialDemandState::trimmedMask(inputDemand, srcWidth);
+          llvm::APInt highMask =
+              inputDemand & ~maskForLowBits(valueBitWidth(inst), srcWidth);
+          if (!highMask.isZero() && srcWidth > 0) {
+            sourceDemand |= llvm::APInt::getSignMask(srcWidth);
+          }
+          enqueue(inst->getOperand(0), sourceDemand);
+        } else {
+          enqueue(inst->getOperand(0), inputDemand);
+        }
+        break;
+      case llvm::Instruction::BitCast:
+      case llvm::Instruction::Freeze:
+        enqueue(inst->getOperand(0), inputDemand);
+        break;
+      case llvm::Instruction::PHI:
+        for (llvm::Value *incoming : inst->operand_values()) {
+          enqueue(incoming, inputDemand);
+        }
+        break;
+      case llvm::Instruction::Select:
+        enqueue(inst->getOperand(1), inputDemand);
+        enqueue(inst->getOperand(2), inputDemand);
+        break;
+      case llvm::Instruction::And: {
+        llvm::ConstantInt *constOp = nullptr;
+        if (auto *lhs = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(0))) {
+          constOp = lhs;
+          enqueue(inst->getOperand(1),
+                  inputDemand & lhs->getValue());
+        } else if (auto *rhs =
+                       llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+          constOp = rhs;
+          enqueue(inst->getOperand(0),
+                  inputDemand & rhs->getValue());
+        } else {
+          enqueue(inst->getOperand(0), inputDemand);
+          enqueue(inst->getOperand(1), inputDemand);
+        }
+        (void)constOp;
+        break;
+      }
+      case llvm::Instruction::Or:
+      case llvm::Instruction::Xor: {
+        llvm::APInt lhsMask = knownValueMask(inst->getOperand(0));
+        llvm::APInt rhsMask = knownValueMask(inst->getOperand(1));
+        bool canSplit =
+            inst->getOpcode() == llvm::Instruction::Or &&
+            isDisjointOr(*inst) && lhsMask.getBitWidth() == rhsMask.getBitWidth() &&
+            !lhsMask.isZero() && !rhsMask.isZero();
+        if (canSplit) {
+          enqueue(inst->getOperand(0), inputDemand & lhsMask);
+          enqueue(inst->getOperand(1), inputDemand & rhsMask);
+        } else {
+          enqueue(inst->getOperand(0), inputDemand);
+          enqueue(inst->getOperand(1), inputDemand);
+        }
+        break;
+      }
+      case llvm::Instruction::Add:
+      case llvm::Instruction::Sub:
+      case llvm::Instruction::Mul: {
+        unsigned srcWidth = valueBitWidth(inst->getOperand(0));
+        llvm::APInt lowDemand = PartialDemandState::trimmedMask(inputDemand, srcWidth);
+        llvm::APInt highDemand = inputDemand & ~maskForLowBits(valueBitWidth(inst), srcWidth);
+        if (!highDemand.isZero()) {
+          enqueue(inst->getOperand(0), fullMaskFor(inst->getOperand(0)));
+          enqueue(inst->getOperand(1), fullMaskFor(inst->getOperand(1)));
+        } else {
+          enqueue(inst->getOperand(0), lowDemand);
+          enqueue(inst->getOperand(1), lowDemand);
+        }
+        break;
+      }
+      case llvm::Instruction::Shl:
+        if (auto *shift = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+          unsigned amount = shift->getLimitedValue();
+          enqueue(inst->getOperand(0),
+                  shiftedMask(inputDemand, amount,
+                              valueBitWidth(inst->getOperand(0))));
+        } else {
+          enqueue(inst->getOperand(0), inputDemand);
+        }
+        break;
+      case llvm::Instruction::LShr:
+        if (auto *shift = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+          unsigned amount = shift->getLimitedValue();
+          enqueue(inst->getOperand(0),
+                  lshrSourceDemand(inputDemand, amount,
+                                   valueBitWidth(inst->getOperand(0))));
+        } else {
+          enqueue(inst->getOperand(0), inputDemand);
+        }
+        break;
+      case llvm::Instruction::AShr:
+        enqueue(inst->getOperand(0), inputDemand);
+        break;
+      case llvm::Instruction::PtrToInt:
+      case llvm::Instruction::IntToPtr:
+      case llvm::Instruction::AddrSpaceCast:
+        enqueue(inst->getOperand(0), inputDemand);
+        break;
+      case llvm::Instruction::InsertValue:
+      case llvm::Instruction::ExtractValue:
+        for (llvm::Value *operand : inst->operand_values()) {
+          enqueue(operand, inputDemand);
+        }
+        break;
+      default:
+        for (llvm::Value *operand : inst->operand_values()) {
+          enqueue(operand, inputDemand);
+        }
+        break;
+      }
+    }
+    return demands;
+  }
+
+  void rewritePartialWrites() {
+    std::map<llvm::Value *, llvm::APInt> demands = computePartialDemands();
+    for (llvm::Instruction &inst : llvm::instructions(Function)) {
+      auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+      if (store == nullptr) {
+        continue;
+      }
+      RegisterAccess access = registerStore(*store, Units);
+      if (access.Unit == nullptr || !access.IsStorageValue) {
+        continue;
+      }
+      ++Summary.PartialDemandCandidates;
+      llvm::LoadInst *load = nullptr;
+      llvm::Value *lowValue = nullptr;
+      llvm::BinaryOperator *andInst = nullptr;
+      llvm::BinaryOperator *orInst = nullptr;
+      llvm::APInt keepMask;
+      if (!matchKeepHighPartialStore(*store, *access.Unit, load, lowValue,
+                                     andInst, orInst, keepMask)) {
+        if (rewriteDeadKeepHighParts(store->getValueOperand(), demands)) {
+          ++Summary.PartialDemandMatched;
+        } else {
+          ++Summary.PartialDemandRejected;
+        }
+        continue;
+      }
+      llvm::APInt keepDemand = demands[andInst];
+      if (!keepDemand.isZero()) {
+        if (rewriteDeadKeepHighParts(store->getValueOperand(), demands)) {
+          ++Summary.PartialDemandMatched;
+        } else {
+          ++Summary.PartialDemandRejected;
+        }
+        continue;
+      }
+      llvm::IRBuilder<> builder(store);
+      llvm::Type *ty = store->getValueOperand()->getType();
+      llvm::Value *replacement = lowValue;
+      if (replacement->getType() != ty) {
+        if (replacement->getType()->isIntegerTy() && ty->isIntegerTy()) {
+          unsigned srcBits = replacement->getType()->getIntegerBitWidth();
+          unsigned dstBits = ty->getIntegerBitWidth();
+          if (srcBits < dstBits) {
+            replacement = builder.CreateZExt(replacement, ty,
+                                             replacement->getName() + ".zext");
+          } else if (srcBits > dstBits) {
+            replacement = builder.CreateTrunc(replacement, ty,
+                                              replacement->getName() + ".trunc");
+          }
+        }
+      }
+      if (replacement != nullptr && replacement != store->getValueOperand()) {
+        store->setOperand(0, replacement);
+        if (orInst != nullptr && orInst->use_empty()) {
+          llvm::RecursivelyDeleteTriviallyDeadInstructions(orInst);
+        }
+        if (load != nullptr && load->getParent() != nullptr &&
+            load->use_empty()) {
+          load->eraseFromParent();
+          ++Summary.DeadLoadsRemoved;
+        }
+        ++Summary.PartialDemandMatched;
+      } else {
+        ++Summary.PartialDemandRejected;
+      }
+    }
+  }
 
   void collectAccesses() {
     for (llvm::BasicBlock &block : Function) {
@@ -1409,9 +2001,6 @@ private:
                             std::set<llvm::GlobalVariable *> &live) const {
     RegisterAccess access = registerLoad(load, Units);
     if (access.Unit != nullptr && access.IsStorageValue) {
-      if (isKeepHighPartialLoadUse(load, access.Unit->Global)) {
-        return;
-      }
       // Entry/replaced loads are SummarySSA scaffolding.  After signature
       // rewrite, only still-raw register loads require keeping global stores.
       if (PostSignatureCleanup &&
@@ -2003,6 +2592,9 @@ void addFunctionSummary(NativeRegisterSummarySSASummary &total,
   total.StackFrameAllocaLoadsRemoved += fn.StackFrameAllocaLoadsRemoved;
   total.StackFrameAllocaStoresRemoved += fn.StackFrameAllocaStoresRemoved;
   total.StackFrameAllocasRemoved += fn.StackFrameAllocasRemoved;
+  total.PartialDemandCandidates += fn.PartialDemandCandidates;
+  total.PartialDemandMatched += fn.PartialDemandMatched;
+  total.PartialDemandRejected += fn.PartialDemandRejected;
 }
 
 llvm::AttributeList attributesForNewFunction(llvm::Function &oldFunction,
@@ -2521,6 +3113,9 @@ void printNativeRegisterSummarySSASummary(
      << " stack_frame_alloca_stores_removed="
      << summary.StackFrameAllocaStoresRemoved
      << " stack_frame_allocas_removed=" << summary.StackFrameAllocasRemoved
+     << " partial_demand_candidates=" << summary.PartialDemandCandidates
+     << " partial_demand_matched=" << summary.PartialDemandMatched
+     << " partial_demand_rejected=" << summary.PartialDemandRejected
      << "\n";
   for (const NativeRegisterSummarySSAFunctionSummary &function :
        summary.Functions) {
@@ -2536,7 +3131,11 @@ void printNativeRegisterSummarySSASummary(
        << " call_clobbers=" << function.CallClobberValues
        << " call_arg_stores_marked=" << function.CallArgStoresMarked
        << " preserved_calls=" << function.PreservedCalls
-       << " unknown_call_effects=" << function.UnknownCallEffects << "\n";
+       << " unknown_call_effects=" << function.UnknownCallEffects
+       << " partial_demand_candidates=" << function.PartialDemandCandidates
+       << " partial_demand_matched=" << function.PartialDemandMatched
+       << " partial_demand_rejected=" << function.PartialDemandRejected
+       << "\n";
   }
 }
 

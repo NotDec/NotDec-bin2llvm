@@ -6586,3 +6586,63 @@ lighttpd helper `/usr/sbin/lighttpd-angel` 当前 native 链路可以快速跑�
 
 - 这次改动很小，但能直接收回一类常见 stdio 误签名。
 - `getline`、`strchrnul` 还没在这轮目标里收口，后面继续换目标看它们是否也能稳定收回。
+
+## 实现记录：完整 native 链路回归和 `popen` arity
+
+本轮目标是确认 `gtirb` 默认前端之后，完整 native 链路能不能继续跑到
+SummarySSA / 寄存器消除，并通过 LLVM verifier。
+
+先处理一个小的确定性外部原型：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
+  - 在 `knownExternalPrototypes()` 中新增 `popen`，fixed arity 为 2。
+- `tests/native_register_summary_ssa_test.cpp`
+  - `testKnownFixedExternalArities()` 增加 `popen`。
+  - fixed arity 测试失败信息增加 symbol 名，后续定位更直接。
+  - `__asprintf_chk` 从 fixed 测试移到 vararg 测试，因为实现里它是 fixed args 为 3 的 vararg 函数。
+
+验证：
+
+- `cmake --build build --target native_register_summary_ssa_test -j2`
+- `./build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed -o /tmp/notdec-goal-fortune.ll --summary-json-out /tmp/notdec-goal-fortune.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-goal-fortune.ll -o /tmp/notdec-goal-fortune.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-goal-fortune.bc -o /tmp/notdec-goal-fortune.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk --all-confirmed -o /tmp/notdec-goal-wrk.ll --summary-json-out /tmp/notdec-goal-wrk.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-goal-wrk.ll -o /tmp/notdec-goal-wrk.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-goal-wrk.bc -o /tmp/notdec-goal-wrk.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/memcached --all-confirmed -o /tmp/notdec-goal-memcached.ll --summary-json-out /tmp/notdec-goal-memcached.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-goal-memcached.ll -o /tmp/notdec-goal-memcached.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-goal-memcached.bc -o /tmp/notdec-goal-memcached.opt.bc`
+- `/usr/bin/time -f 'elapsed %e' ./build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/redis-cli --all-confirmed -o /tmp/notdec-goal-redis-cli.ll --summary-json-out /tmp/notdec-goal-redis-cli.summary.json`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-goal-redis-cli.ll -o /tmp/notdec-goal-redis-cli.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-goal-redis-cli.bc -o /tmp/notdec-goal-redis-cli.opt.bc`
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `fortune` 用时 `elapsed 8.56`，通过 `llvm-as` 和 `opt -passes=verify`。
+- `wrk` 用时 `elapsed 45.97`，通过 `llvm-as` 和 `opt -passes=verify`。
+- `memcached` 用时 `elapsed 120.88`，通过 `llvm-as` 和 `opt -passes=verify`。
+- `redis-cli` 用时 `elapsed 193.46`，通过 `llvm-as` 和 `opt -passes=verify`。
+
+残留寄存器访问检查：
+
+- `fortune` / `wrk` 只剩少量 entry load。
+- `memcached` / `redis-cli` 仍有非 entry 的 `load/store @RCX`、`load/store @RDX` 和较多 `ZMM*` 访问。
+- 典型模式是 partial write 保留高位：
+  - `load @RDX`
+  - `and -256`
+  - `or lowbit`
+  - `store @RDX`
+
+当前代码已有 `isKeepHighPartialLoadUse()`，会在死 store liveness 里把这种 keep-high load 当作非真实 use。
+但真实样例仍残留，说明问题已经不是简单漏一条 fixed arity 或一个局部死 store 规则。
+下一步需要明确技术决策：是否在 SummarySSA 前后专门做 partial-register expression rewrite，
+把这种“保留高位、替换低位”的模式纳入 SSA 值系统；否则继续补局部 liveness 规则容易误删。
+
+评分：
+
+- 实现效果：5/10，四个目标的完整 native 链路已经通过 verifier，并补了一个确定原型。
+- 复杂度：2/10，代码改动只在 known prototype 表和测试输出。
+- 维护成本：2/10，`popen` 原型稳定；残留 partial-register 问题需要单独方案，不建议混在 arity 表修复里。
