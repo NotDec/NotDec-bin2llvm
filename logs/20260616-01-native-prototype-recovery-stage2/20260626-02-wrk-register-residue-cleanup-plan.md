@@ -348,3 +348,46 @@ Ghidra 对 segment base / TLS 不是把 `FS_OFFSET` 当普通参数寄存器消�
 
 - 对简单项目，普通寄存器残留可以接近 0。
 - 对复杂项目，剩余项不再混成“寄存器没消掉”，而是分成 flags、segment/TLS、x87、真实 vector state 等明确类别。
+
+# 阶段 1 实现情况
+
+已完成 `FS_OFFSET` / canary rewrite，处理方式是直接改 IR，不做纯标注。
+
+改动文件：
+
+- `include/notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h`
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h`
+- `lib/CMakeLists.txt`
+- `tests/native_register_summary_ssa_test.cpp`
+
+关键函数：
+
+- `runNativeStackCanaryCleanup()`
+- `eraseStackCanaryCheck()`
+- `blockOnlyCallsStackCheckFail()`
+- `runNativeRegisterSummarySSA()`
+
+做法：
+
+- 在 summary 链路里新增独立 `NativeStackCanaryCleanup` helper。
+- 放在 `runNativeStackFrameRewrite(module)` 之后先跑一次，残余清理阶段再补一次。
+- 只匹配能证明的 stack protector epilogue：
+  - 比较值来自保存的栈 slot 和 `FS_OFFSET + 40`。
+  - 条件只接受 `icmp eq/ne`，以及外层 `zext` 后再和 0 比较。
+  - fail block 只允许 `__stack_chk_fail` / `__stack_smash_handler`，前面可有局部 setup。
+- 命中后直接把分支改成跳 success 分支，删 compare、删 `FS_OFFSET` 读链、删 fail block。
+
+结果：
+
+- `build/bin/native_register_summary_ssa_test` 通过。
+- `ctest --test-dir build -R notdec.native_register_summary.ssa --output-on-failure` 通过。
+- 重新生成 `wrk` 后，LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- `wrk` summary 里 `stack_canary_checks_removed=4`，`stack_canary_fail_blocks_removed=4`。
+- residue audit 里 `FS_OFFSET` 已经不再出现。
+
+补充判断：
+
+- 这一步只处理 canary epilogue，不碰别的 `FS_OFFSET` 读。
+- 这一步也没有改 heritage 链路。

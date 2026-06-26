@@ -73,6 +73,8 @@ struct NativeRegisterSummarySSASummary {
   uint64_t StackFrameAllocaLoadsRemoved = 0;
   uint64_t StackFrameAllocaStoresRemoved = 0;
   uint64_t StackFrameAllocasRemoved = 0;
+  uint64_t StackCanaryChecksRemoved = 0;
+  uint64_t StackCanaryFailBlocksRemoved = 0;
   uint64_t PartialDemandCandidates = 0;
   uint64_t PartialDemandMatched = 0;
   uint64_t PartialDemandRejected = 0;

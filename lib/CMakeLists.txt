@@ -8,6 +8,7 @@ add_library(notdec-bin2llvm-core STATIC
   PcodeToLLVM.cpp
   passes/heritage/NativePrototypeRecovery.cpp
   passes/summary/NativeStackFrame.cpp
+  passes/summary/NativeStackCanaryCleanup.cpp
   passes/summary/NativeRegisterSummary.cpp
   passes/summary/NativeRegisterSummarySSA.cpp
   passes/heritage/NativeHeritageSSA.cpp

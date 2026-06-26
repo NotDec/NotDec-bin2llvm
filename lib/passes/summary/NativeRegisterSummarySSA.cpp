@@ -2,6 +2,7 @@
 
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
+#include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
 #include "llvm/ADT/StringRef.h"
@@ -3373,6 +3374,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   summaryOptions.AttachMetadata = true;
   NativeStackFrameRewriteSummary stackFrameSummary =
       runNativeStackFrameRewrite(module);
+  NativeStackCanaryCleanupSummary canarySummary =
+      runNativeStackCanaryCleanup(module);
   NativeRegisterSummarySSAOptions effectiveOptions = options;
   effectiveOptions.IgnoredRegisters.insert(
       stackFrameSummary.IgnoredRegisters.begin(),
@@ -3392,6 +3395,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   }
 
   NativeRegisterSummarySSASummary summary;
+  summary.StackCanaryChecksRemoved = canarySummary.CanaryChecksRemoved;
+  summary.StackCanaryFailBlocksRemoved = canarySummary.FailBlocksRemoved;
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;
@@ -3435,6 +3440,12 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       summary.StackFrameAllocaStoresRemoved +=
           cleanupSummary.StackAllocaStoresRemoved;
       summary.StackFrameAllocasRemoved += cleanupSummary.StackAllocasRemoved;
+      NativeStackCanaryCleanupSummary lateCanarySummary =
+          runNativeStackCanaryCleanup(module);
+      summary.StackCanaryChecksRemoved +=
+          lateCanarySummary.CanaryChecksRemoved;
+      summary.StackCanaryFailBlocksRemoved +=
+          lateCanarySummary.FailBlocksRemoved;
     }
   }
   summary.FunctionsSeen = summary.Functions.size();
@@ -3474,6 +3485,9 @@ void printNativeRegisterSummarySSASummary(
      << " stack_frame_alloca_stores_removed="
      << summary.StackFrameAllocaStoresRemoved
      << " stack_frame_allocas_removed=" << summary.StackFrameAllocasRemoved
+     << " stack_canary_checks_removed=" << summary.StackCanaryChecksRemoved
+     << " stack_canary_fail_blocks_removed="
+     << summary.StackCanaryFailBlocksRemoved
      << " partial_demand_candidates=" << summary.PartialDemandCandidates
      << " partial_demand_matched=" << summary.PartialDemandMatched
      << " partial_demand_rejected=" << summary.PartialDemandRejected
