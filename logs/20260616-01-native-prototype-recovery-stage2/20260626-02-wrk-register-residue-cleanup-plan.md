@@ -2,6 +2,10 @@
 
 接下来以wrk为目标，调研一下wrk的结果中剩余的寄存器情况，规划一下该怎么处理，写成一个新的plan文件
 
+# 补充 prompt
+
+把顺序改一下吧，处理FS_Offset以及canary的问题提前，作为第一点。同时改进一下这步：首先，调研LLVM源码中插入canary的pass，看它会对函数做什么样的变换，其次，考虑在当前Pass链路里找合适的位置创建一个canary消除的Pass，专门匹配这种模式，然后删除掉canary相关的判断和check fail分支。注意必须要直接做rewrite这一步，而不是先纯标注。
+
 # 背景
 
 当前默认 native 链路是 summary：
@@ -66,7 +70,7 @@ scripts/native-register-residue-audit.py --details /tmp/notdec-wrk-float-libm.ll
 
 - `wrk` 当前没有 GPR 残留。
 - `wrk` 当前没有 ZMM/XMM 残留。
-- 剩余问题集中在 x87 `ST*`、两个 `OF` store、一个 `FS_OFFSET` TLS/canary 读。
+- 剩余问题集中在一个 `FS_OFFSET` TLS/canary 读、x87 `ST*`、两个 `OF` store。
 
 # Ghidra 相关依据
 
@@ -100,9 +104,50 @@ scripts/native-register-residue-audit.py --details /tmp/notdec-wrk-float-libm.ll
 
 Ghidra 对 segment base / TLS 不是把 `FS_OFFSET` 当普通参数寄存器消掉，而是有 segment op / resolver 这条机制。native 侧现在只是把 `FS_OFFSET` 当 register global，所以 stack canary 路径还会留下 `load @FS_OFFSET`。
 
+# LLVM StackProtector 相关依据
+
+文件：`/sn640/NotDec/llvm-source/llvm/lib/CodeGen/StackProtector.cpp`
+
+关键点：
+
+- `:117-149`：new PM 的 `StackProtectorPass::run()` 判断需要保护后调用 `InsertStackProtectors()`。
+- `:171-204`：legacy `StackProtector::runOnFunction()` 也是同一路线。
+- `:527-550`：`getStackGuard()` 从 target TLS guard 或 `llvm.stackguard` intrinsic 取当前 guard。
+- `:562-571`：`CreatePrologue()` 在入口插入 `StackGuardSlot` alloca 和 `llvm.stackprotector`。
+- `:574-719`：`InsertStackProtectors()` 在 return 或必要的 noreturn call 前插入 epilogue 检查。
+- `:690-713`：inline 检查形状是“取当前 guard、取保存的 guard、`icmp`、条件跳转”，成功分支回原返回路径，失败分支到 fail block。
+- `:721-751`：`CreateFailBB()` 创建 `__stack_chk_fail` 或目标平台的 stack smash handler，然后 `unreachable`。
+
+对应到 x86-64 native lifted IR，当前 guard 通常表现为 `FS_OFFSET + 40`，即 `FS:0x28`。所以 summary 链路要识别的是已经 lower 之后的 canary epilogue：从本地栈 slot 读保存值，从 `FS_OFFSET + 40` 读当前值，比较后失败分支调用 `__stack_chk_fail`。
+
+旧 heritage 链路的 `lib/passes/heritage/NativePrototypeRecovery.cpp` 里已有 `eraseStackCanaryCheck()`、`loadIsFsCanary()` 等代码，可读作模式参考。但这次不能依赖 heritage，也不应把新功能写回 `NativePrototypeRecovery`。
+
 # 残留分类
 
-## 1. x87 ST 栈残留
+## 1. FS_OFFSET TLS/canary 读
+
+位置：
+
+- `notdec_native_6cc0:3353`：`%FS_OFFSET256 = load i64, ptr @FS_OFFSET`
+
+周边 IR 是 stack canary 检查：
+
+- 先从本地栈 slot 取保存的 canary。
+- `load @FS_OFFSET`
+- 加 `40`
+- 从 `FS_OFFSET + 40` 读当前 canary。
+- 比较，不等则走 `__stack_chk_fail`。
+
+这条不是寄存器传参残留，而是编译器插入的 stack protector epilogue。它的处理目标不是先标注 TLS/segment 后继续保留，而是直接 rewrite：匹配 canary 检查后，删除比较、失败分支和只服务于 canary 的 `FS_OFFSET + 40` 读。
+
+处理判断：
+
+- 不能把 `FS_OFFSET` 当常量删。TLS base 是运行时状态。
+- 不能删除所有 `FS_OFFSET` 读。只删能证明是 stack canary epilogue 的模式。
+- 不能只改 residue audit 分类。第一步必须在当前 summary pass 链路里实际 rewrite IR。
+- 不能直接复用旧 heritage pass；可以参考旧 matcher 的形状，但实现要放在 summary 链路。
+
+## 2. x87 ST 栈残留
 
 位置：
 
@@ -125,7 +170,7 @@ Ghidra 对 segment base / TLS 不是把 `FS_OFFSET` 当普通参数寄存器消�
 - 不能只做死 store 删除。`notdec_native_8530` 的 `ST*` load/store 形成跨 block 的 x87 栈保存/恢复。
 - 需要单独建 x87 栈模型，至少识别 `ST0..ST7` 的 push/pop/rotate/restore 模式，或者先做非常窄的 wrk pattern cleanup。
 
-## 2. OF flag store
+## 3. OF flag store
 
 位置：
 
@@ -139,45 +184,82 @@ Ghidra 对 segment base / TLS 不是把 `FS_OFFSET` 当普通参数寄存器消�
 - flags 也可能被后续条件跳转读取，不能全局按“call 前 flags”删除。
 - 需要用现有 backward demand 或局部 use 检查，只删到下一个真实 flags observer 之前没有被读的 store。
 
-## 3. FS_OFFSET TLS/canary 读
-
-位置：
-
-- `notdec_native_6cc0:3353`：`%FS_OFFSET256 = load i64, ptr @FS_OFFSET`
-
-周边 IR 是 stack canary 检查：
-
-- 先从本地栈 slot 取保存的 canary。
-- `load @FS_OFFSET`
-- 加 `40`
-- 从 `FS_OFFSET + 40` 读当前 canary。
-- 比较，不等则走 `__stack_chk_fail`。
-
-这条不是寄存器传参残留，而是 TLS/segment base 语义。当前 IR 表达成 `load @FS_OFFSET`，所以 residue audit 会报出来。
-
-处理判断：
-
-- 不应该直接删除。
-- 更合适的是把 `FS_OFFSET` 从“普通 register residue”里单独归类，或者把 segment/TLS lowering 成明确 helper / intrinsic / metadata，避免被当作 register elimination 未完成。
-
 # 目标
 
 以 `wrk` 为第一目标，把当前 residue 从“普通 register access”里继续收敛：
 
-1. 先消掉确定无语义的 `OF` flag store。
-2. 把 `FS_OFFSET` 改成明确的 TLS/segment 语义，至少从 residue audit 里单独分类，不把它当失败。
-3. 对 x87 `ST*` 做保守方案：先分类和建最小测试，再决定是局部 cleanup 还是真正的 x87 stack model。
+1. 先处理 `FS_OFFSET` / canary：调研 LLVM StackProtector 形状，在 summary 链路里新增 canary cleanup，直接 rewrite 掉 canary 判断和 `__stack_chk_fail` 失败分支。
+2. 再消掉确定无语义的 `OF` flag store。
+3. 最后对 x87 `ST*` 做保守方案：先分类和建最小测试，再决定是局部 cleanup 还是真正的 x87 stack model。
 
 成功标准不是盲目让 audit 为 0，而是让剩余每一类都有清楚语义：
 
 - GPR / XMM / ZMM 继续为 0。
+- `FS_OFFSET + 40` canary 检查被 rewrite，相关 `__stack_chk_fail` 失败分支被删；如果还有 `__stack_chk_fail`，必须能说明不是已支持 canary 模式。
 - `OF` 两条 store 删除，且 `wrk` verifier 通过。
-- `FS_OFFSET` 被分类为 TLS/segment，不再和普通 register residue 混在一起。
 - x87 `ST*` 如果暂不删除，要能列出保存/恢复链，不误删。
 
 # 阶段计划
 
-## 阶段 1：flag store cleanup
+## 阶段 1：FS_OFFSET / canary rewrite
+
+范围：
+
+- 新增 summary 链路 pass/helper，建议命名为 `NativeStackCanaryCleanup`。
+- `include/notdec-bin2llvm/passes/summary/`
+- `lib/passes/summary/`
+- `lib/CMakeLists.txt`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
+- `tests/native_register_summary_ssa_test.cpp`
+
+路线：
+
+- 先按 LLVM 22 的 `StackProtector.cpp` 固定 canary 形状：
+  - prologue 保存 guard。
+  - epilogue 重新读取 guard。
+  - 比较保存值和当前值。
+  - 失败分支调用 `__stack_chk_fail`，然后 `unreachable`。
+- 在 `runNativeRegisterSummarySSA()` 里找插入点。优先放在 `runNativeStackFrameRewrite(module)` 之后、`runNativeRegisterSummary(module, summaryOptions)` 之前：
+  - stack/frame 访问已经过一轮规整。
+  - `FS_OFFSET` 还没有被 summary SSA 改成 entry load / phi，模式更直接。
+  - canary 分支不会继续污染后面的 register demand 和 signature rewrite。
+- 如果早期位置覆盖不了某些 wrk 形状，再补一个晚期 cleanup，但第一版先避免支持两套 matcher。
+- matcher 只处理能证明的 stack protector epilogue：
+  - 条件分支的一边只调用 `__stack_chk_fail` 或平台 stack smash handler，然后 `unreachable`。
+  - 条件来自 `icmp eq/ne`，允许外层 `zext` 再和 0 比较。
+  - 一个比较输入是本地栈 slot 里的 saved canary。
+  - 另一个比较输入是 `load (inttoptr (load @FS_OFFSET + 40))` 形状的 current canary。
+  - 两个 canary load 和地址计算链除这个检查外没有真实用户。
+- rewrite 动作必须直接改 IR：
+  - 把条件分支改成无条件跳到成功分支。
+  - 删除 fail block，或者在不可达后由 `removeUnreachableBlocks()` 清掉。
+  - 删除 compare、`FS_OFFSET + 40` 地址链、saved/current canary load 等死指令。
+  - 不插入 `notdec_stack_canary_check` 语义 helper。
+- 负例必须保守：
+  - fail block 有额外副作用不删。
+  - `FS_OFFSET` 读被其他逻辑使用不删。
+  - 偏移不是 `40` 不删。
+  - 条件不是 canary equality 不删。
+
+验证：
+
+- 单测新增：
+  - 正常 `eq`/`ne` canary check 被 rewrite。
+  - `zext` 后和 0 比较的 lifted 形状被 rewrite。
+  - fail block 有额外副作用时不 rewrite。
+  - `FS_OFFSET + 非 40` 时不 rewrite。
+- `wrk` 重新生成并过 LLVM 22 verifier。
+- residue audit 中 `FS_OFFSET` 普通残留目标为 0。
+- `wrk` 中已匹配 canary check 的 `__stack_chk_fail` 失败分支消失。
+- `fortune` 同口径耗时不明显退化。
+
+风险：
+
+- lifted IR 可能已经把 `FS_OFFSET` 改成 summary SSA phi；第一版如果只放早期位置，要确认 wrk 目标形状是否都在早期可见。
+- 部分函数可能把 canary 差值用于额外计算，不能只因为看到 `__stack_chk_fail` 就删。
+- 删除 CFG 分支后要维护 verifier，特别是 PHI incoming 和 unreachable block 清理。
+
+## 阶段 2：flag store cleanup
 
 范围：
 
@@ -202,28 +284,6 @@ Ghidra 对 segment base / TLS 不是把 `FS_OFFSET` 当普通参数寄存器消�
 
 - flags 在 lifted IR 里可能通过 load 后参与 select/branch，不一定直接接 branch。
 - 不能把所有 intrinsic 前 flags store 都删，先按 demand 证明。
-
-## 阶段 2：FS_OFFSET 分类 / TLS 表达
-
-范围：
-
-- 优先改 `scripts/native-register-residue-audit.py`。
-- 如果要改 IR 表达，再考虑 native lowering 或 summary cleanup。
-
-路线：
-
-- 先把 `FS_OFFSET` / `GS_OFFSET` 从 `other` 分类为 `segment_base` 或 `tls_base`。
-- residue audit 输出里保留它，但不要和普通 register elimination 混为一类。
-- 计划外不要直接把 `load @FS_OFFSET` 替换成常量。TLS base 是运行时状态，不是常量。
-
-验证：
-
-- `native_register_residue_audit_test.py` 覆盖 `FS_OFFSET` 分类。
-- `wrk` audit 显示 `segment_base load = 1`，普通 `other load` 相应减少。
-
-风险：
-
-- 这只是分类，不是语义降级。真正想消掉 `@FS_OFFSET`，需要 segment/TLS helper 设计。
 
 ## 阶段 3：x87 ST 残留分类和最小模型
 
@@ -259,7 +319,10 @@ Ghidra 对 segment base / TLS 不是把 `FS_OFFSET` 当普通参数寄存器消�
 # 不做什么
 
 - 不回退旧 heritage 链路。
+- 不只把 `FS_OFFSET` 标成 TLS/segment 就结束。
 - 不把 `FS_OFFSET` 当常量删。
+- 不删除非 canary 语义的 `FS_OFFSET` 读。
+- 不无条件删除所有 `__stack_chk_fail` 调用。
 - 不把所有 x87 `ST*` 都按 caller-saved 删除。
 - 不在这一步处理 stack 参数 rewrite。
 - 不扩大 fixed external prototype 表，除非 wrk 残留明确指向某个缺失原型。
@@ -272,8 +335,8 @@ Ghidra 对 segment base / TLS 不是把 `FS_OFFSET` 当普通参数寄存器消�
 - `fortune` 同口径耗时不明显退化。
 - `scripts/native-register-residue-audit.py /tmp/notdec-wrk-*.ll` 中：
   - GPR / vector 仍为 0。
+  - canary rewrite 后，`FS_OFFSET` 普通残留目标为 0。
   - flags store 目标为 0。
-  - `FS_OFFSET` 被单独分类。
   - x87 残留数量和位置可解释。
 
 长期：
