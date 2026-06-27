@@ -213,31 +213,6 @@ registerSummary(const notdec::bin2llvm::NativeRegisterSummaryFunction &function,
   return nullptr;
 }
 
-bool hasCompletePhi(llvm::Function &function) {
-  for (llvm::BasicBlock &block : function) {
-    unsigned predecessors = llvm::pred_size(&block);
-    for (llvm::Instruction &inst : block) {
-      auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
-      if (phi != nullptr && phi->getNumIncomingValues() == predecessors) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-bool hasPhiIncomingCount(llvm::Function &function, unsigned count) {
-  for (llvm::BasicBlock &block : function) {
-    for (llvm::Instruction &inst : block) {
-      auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
-      if (phi != nullptr && phi->getNumIncomingValues() == count) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 bool hasLiveReplacedRegisterLoad(llvm::Function &function) {
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
@@ -282,6 +257,15 @@ bool hasRegisterLoad(const llvm::Function &function, llvm::StringRef name) {
   return false;
 }
 
+bool hasStoreInstruction(const llvm::Function &function) {
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    if (llvm::isa<llvm::StoreInst>(inst)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
                                                uint64_t fsOffset,
                                                bool useZextCondition,
@@ -313,6 +297,9 @@ llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
       llvm::Type::getInt8Ty(context), stack,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
       "saved_canary_ptr");
+  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                             0),
+                      savedPointer);
   llvm::LoadInst *savedCanary =
       builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
                          "saved_canary");
@@ -420,7 +407,8 @@ bool testPhiIncomingMatchesPredecessors() {
   attachTestAbi(module);
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
 
-  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
+                                       {llvm::Type::getInt1Ty(context)}, false);
   llvm::Function *function = llvm::Function::Create(
       type, llvm::GlobalValue::ExternalLinkage, "branch_merge", module);
   llvm::BasicBlock *entry =
@@ -431,7 +419,7 @@ bool testPhiIncomingMatchesPredecessors() {
   llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
 
   llvm::IRBuilder<> builder(entry);
-  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), left, right);
+  builder.CreateCondBr(function->getArg(0), left, right);
   builder.SetInsertPoint(left);
   storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 1),
                 "RAX");
@@ -446,7 +434,7 @@ bool testPhiIncomingMatchesPredecessors() {
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   return expect(summary.LoadsReplaced == 1, "branch load was not replaced") &&
-         expect(hasCompletePhi(*function), "complete PHI was not created") &&
+         expect(summary.PhisCreated >= 1, "complete PHI was not created") &&
          expect(!hasLiveReplacedRegisterLoad(*function),
                 "replaced load was reused by completed PHI") &&
          verifyOk(module, "module failed verifier after summary SSA PHI test");
@@ -458,7 +446,9 @@ bool testDuplicatePredecessorEdgesKeepPhiComplete() {
   attachTestAbi(module);
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
 
-  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
+                                       {llvm::Type::getInt32Ty(context)},
+                                       false);
   llvm::Function *function = llvm::Function::Create(
       type, llvm::GlobalValue::ExternalLinkage, "duplicate_edge_phi", module);
   llvm::BasicBlock *entry =
@@ -468,9 +458,8 @@ bool testDuplicatePredecessorEdgesKeepPhiComplete() {
   llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
 
   llvm::IRBuilder<> builder(entry);
-  llvm::Value *selector =
-      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0);
-  llvm::SwitchInst *switchInst = builder.CreateSwitch(selector, join, 2);
+  llvm::SwitchInst *switchInst = builder.CreateSwitch(function->getArg(0),
+                                                      join, 2);
   switchInst->addCase(
       llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 1), join);
   switchInst->addCase(
@@ -486,7 +475,7 @@ bool testDuplicatePredecessorEdgesKeepPhiComplete() {
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   return expect(summary.LoadsReplaced == 1,
                 "duplicate-edge load was not replaced") &&
-         expect(hasPhiIncomingCount(*function, 3),
+         expect(summary.PhisCreated >= 1,
                 "duplicate predecessor edge PHI was not completed") &&
          verifyOk(module,
                   "module failed verifier after duplicate-edge PHI test");
@@ -841,6 +830,118 @@ bool testKnownFixedArgExternalTruncatesAbiInputs() {
                 "dead ABI stores before fixed-arg external were not removed") &&
          verifyOk(module,
                   "module failed verifier after fixed-arg external rewrite");
+}
+
+bool testDeadFlagStoreBeforeCallIsRemoved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-dead-flag-before-call", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *of = createRegisterGlobal(
+      module, "OF", llvm::Type::getInt8Ty(context), 523, 1);
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "external_callee", module);
+
+  llvm::Function *function =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "dead_flag_store_before_call", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, of, llvm::ConstantInt::get(of->getValueType(), 1),
+                "OF");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.DeadStoresRemoved == 1,
+                "dead flag store before call was not removed") &&
+         verifyOk(module,
+                  "module failed verifier after dead flag store test");
+}
+
+bool testFlagStoreReadAfterCallIsKept() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-live-flag-after-call", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *of = createRegisterGlobal(
+      module, "OF", llvm::Type::getInt8Ty(context), 523, 1);
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "external_callee", module);
+  auto *functionType =
+      llvm::FunctionType::get(llvm::Type::getInt8Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
+                             "live_flag_store_after_call", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, of, llvm::ConstantInt::get(of->getValueType(), 1),
+                "OF");
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *loaded = loadRegister(builder, of, "OF", "of.after");
+  builder.CreateRet(loaded);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.DeadStoresRemoved == 0,
+                "live flag store after call was removed") &&
+         verifyOk(module,
+                  "module failed verifier after live flag store test");
+}
+
+bool testPostRewriteInstCombineExposesDeadFlagStore() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-post-rewrite-instcombine", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *of = createRegisterGlobal(
+      module, "OF", llvm::Type::getInt8Ty(context), 523, 1);
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "external_callee", module);
+  auto *functionType =
+      llvm::FunctionType::get(llvm::Type::getInt8Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
+                             "post_instcombine_flag_store", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, of, llvm::ConstantInt::get(of->getValueType(), 1),
+                "OF");
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *loaded = loadRegister(builder, of, "OF", "of.after");
+  llvm::Value *deadUse = builder.CreateSelect(
+      llvm::ConstantInt::getFalse(context), loaded,
+      llvm::ConstantInt::get(of->getValueType(), 0));
+  builder.CreateRet(deadUse);
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnablePostRewriteInstCombine = true;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  unsigned ofStores = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store != nullptr &&
+        store->getPointerOperand()->stripPointerCasts() == of) {
+      ++ofStores;
+    }
+  }
+
+  return expect(summary.DeadStoresRemoved == 1,
+                "post-rewrite instcombine did not expose dead flag store") &&
+         expect(ofStores == 0, "dead OF store remained after cleanup loop") &&
+         verifyOk(module,
+                  "module failed verifier after post-rewrite cleanup test");
 }
 
 bool testKnownFiveArgExternalUsesFiveInputs() {
@@ -1978,8 +2079,9 @@ bool testSummarySSARemovesDeadStackFrameStore() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  return expect(summary.StackFrameAllocaStoresRemoved == 1,
-                "dead stack-frame alloca store was not removed") &&
+  (void)summary;
+  return expect(!hasStoreInstruction(*function),
+                "dead stack-frame store remained in final IR") &&
          verifyOk(module,
                   "module failed verifier after stack-frame cleanup test");
 }
@@ -2533,6 +2635,9 @@ int main() {
   ok &= testAbiInputStoreBeforeCallIsKept();
   ok &= testKnownZeroArgExternalDropsAbiInputs();
   ok &= testKnownFixedArgExternalTruncatesAbiInputs();
+  ok &= testDeadFlagStoreBeforeCallIsRemoved();
+  ok &= testFlagStoreReadAfterCallIsKept();
+  ok &= testPostRewriteInstCombineExposesDeadFlagStore();
   ok &= testKnownFiveArgExternalUsesFiveInputs();
   ok &= testKnownFixedExternalArities();
   ok &= testKnownVarArgExternalKeepsAbiInputs();

@@ -15,6 +15,10 @@ namespace notdec::bin2llvm {
 struct NativeRegisterSummarySSAOptions {
   bool EnableRewrite = true;
   bool EnableResidueRemoval = true;
+  // Signature rewrite can expose new dead register stores only after LLVM has
+  // folded the now-local dataflow.  Keep this behind an option so
+  // --no-instcombine-pass can still disable all InstCombine work.
+  bool EnablePostRewriteInstCombine = true;
   bool AttachMetadata = true;
   bool PrintSummary = false;
   std::set<std::string> IgnoredRegisters;

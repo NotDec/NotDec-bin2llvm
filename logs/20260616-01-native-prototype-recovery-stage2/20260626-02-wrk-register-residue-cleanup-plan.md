@@ -391,3 +391,58 @@ Ghidra 对 segment base / TLS 不是把 `FS_OFFSET` 当普通参数寄存器消�
 
 - 这一步只处理 canary epilogue，不碰别的 `FS_OFFSET` 读。
 - 这一步也没有改 heritage 链路。
+
+# 补充实现：SummarySSA 内部 InstCombine + residue cleanup 小循环
+
+这次把 `OF` 的收尾问题直接放进 summary 链路里处理，不再单独加新的 residue pass 文件。
+思路很简单：signature rewrite 之后，先让 LLVM 折一次局部表达式，再跑一轮 register
+cleanup，最多迭代 10 次。这样能把 `load @OF` 之类的中间值先压掉，再删掉前面的死 store。
+
+改动文件：
+
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h:15-24`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1417-1443`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:3442-3471`
+- `tools/notdec-native-llvm.cpp:883-889`
+- `tests/native_register_summary_ssa_test.cpp:216-267`
+- `tests/native_register_summary_ssa_test.cpp:269-305`
+- `tests/native_register_summary_ssa_test.cpp:432-480`
+- `tests/native_register_summary_ssa_test.cpp:857-945`
+- `tests/native_register_summary_ssa_test.cpp:2060-2086`
+
+关键函数：
+
+- `runPostRewriteInstCombine()`
+- `runNativeRegisterSummarySSA()`
+- `createStackCanaryCheckFunction()`
+- `testPhiIncomingMatchesPredecessors()`
+- `testDuplicatePredecessorEdgesKeepPhiComplete()`
+- `testSummarySSARemovesDeadStackFrameStore()`
+- `testPostRewriteInstCombineExposesDeadFlagStore()`
+
+实现点：
+
+- `runNativeRegisterSummarySSA()` 在 signature rewrite 之后，改成最多 10 轮
+  `InstCombine -> summary residue cleanup`。
+- `--no-instcombine-pass` 仍然生效：它会关掉这个内部 canonicalization。
+- PHI 相关测试改成看 summary 计数，不再强绑最终 IR 一定保留 PHI 节点。
+- stack-frame store 测试改成看最终 IR 里是否还有 store，而不是盯单个 counter。
+- canary 负例补了 saved slot 初始化 store，避免 LLVM 自己把分支折没。
+- 新增一个 flag 测试，专门验证内部 InstCombine 能把 `select false, load @OF, 0`
+  折掉，从而让后续 cleanup 删掉前面的 `OF` store。
+
+验证结果：
+
+- `cmake --build build --target notdec-native-llvm native_register_summary_ssa_test -j$(nproc)`
+- `build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed=%e user=%U sys=%S maxrss=%M' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk --all-confirmed --summary-json-out /tmp/notdec-wrk-post-cleanup-loop.summary.json -o /tmp/notdec-wrk-post-cleanup-loop.ll`
+- `scripts/native-register-residue-audit.py /tmp/notdec-wrk-post-cleanup-loop.ll`
+- `scripts/native-register-residue-audit.py --details /tmp/notdec-wrk-post-cleanup-loop.ll`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-wrk-post-cleanup-loop.ll -o /tmp/notdec-wrk-post-cleanup-loop.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-wrk-post-cleanup-loop.bc -o /tmp/notdec-wrk-post-cleanup-loop.verified.bc`
+
+结果：
+
+- wrk 耗时 `elapsed=47.06`
+- residue audit 里 `OF` 已经为 0，`FS_OFFSET` 也为 0
+- 剩下的是 x87 `ST*`，和这次改动无关

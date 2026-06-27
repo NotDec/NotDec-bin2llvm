@@ -21,8 +21,11 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 
 #include <algorithm>
 #include <map>
@@ -1410,6 +1413,34 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
 llvm::Value *castRegisterValueToSlot(llvm::IRBuilder<> &builder,
                                      llvm::Value *value,
                                      const NativeSignatureSlot &slot);
+
+// Local canonicalization used between signature rewrite and final residue
+// cleanup.  It is intentionally kept at the SummarySSA top level: the per
+// function builder caches instruction pointers while rewriting, and running
+// LLVM cleanup inside that phase would make those caches unsafe.
+void runPostRewriteInstCombine(llvm::Module &module) {
+  llvm::LoopAnalysisManager loopAnalysis;
+  llvm::FunctionAnalysisManager functionAnalysis;
+  llvm::CGSCCAnalysisManager cgsccAnalysis;
+  llvm::ModuleAnalysisManager moduleAnalysis;
+
+  llvm::PassBuilder builder;
+  builder.registerModuleAnalyses(moduleAnalysis);
+  builder.registerCGSCCAnalyses(cgsccAnalysis);
+  builder.registerFunctionAnalyses(functionAnalysis);
+  builder.registerLoopAnalyses(loopAnalysis);
+  builder.crossRegisterProxies(loopAnalysis, functionAnalysis, cgsccAnalysis,
+                               moduleAnalysis);
+
+  llvm::FunctionPassManager functionPasses;
+  functionPasses.addPass(llvm::InstCombinePass());
+  functionPasses.addPass(llvm::SimplifyCFGPass());
+  for (llvm::Function &function : module) {
+    if (!function.isDeclaration()) {
+      functionPasses.run(function, functionAnalysis);
+    }
+  }
+}
 
 class FunctionBuilder {
 public:
@@ -3413,15 +3444,30 @@ runNativeRegisterSummarySSA(llvm::Module &module,
     rewriteSignatureShapes(module, signatureState, summary);
     eraseUnusedSummaryHelperDeclarations(module);
     if (options.EnableResidueRemoval) {
-      for (llvm::Function &function : module) {
-        if (function.isDeclaration()) {
-          continue;
+      constexpr unsigned maxPostRewriteCleanupIterations = 10;
+      for (unsigned iteration = 0;
+           iteration < maxPostRewriteCleanupIterations; ++iteration) {
+        if (effectiveOptions.EnablePostRewriteInstCombine) {
+          runPostRewriteInstCombine(module);
         }
-        NativeRegisterSummarySSAFunctionSummary cleanupFn;
-        FunctionBuilder cleanup(function, units, facts, abi, options, cleanupFn,
-                                signatureState);
-        cleanup.removeDeadStoresAfterSignatureRewrite();
-        summary.DeadStoresRemoved += cleanupFn.DeadStoresRemoved;
+
+        uint64_t deadStoresRemovedThisIteration = 0;
+        for (llvm::Function &function : module) {
+          if (function.isDeclaration()) {
+            continue;
+          }
+          NativeRegisterSummarySSAFunctionSummary cleanupFn;
+          FunctionBuilder cleanup(function, units, facts, abi, options,
+                                  cleanupFn, signatureState);
+          cleanup.removeDeadStoresAfterSignatureRewrite();
+          deadStoresRemovedThisIteration += cleanupFn.DeadStoresRemoved;
+        }
+        summary.DeadStoresRemoved += deadStoresRemovedThisIteration;
+
+        if (!effectiveOptions.EnablePostRewriteInstCombine ||
+            deadStoresRemovedThisIteration == 0) {
+          break;
+        }
       }
       NativeStackFrameCleanupOptions cleanupOptions;
       cleanupOptions.StackPointerRegister = stackFrameSummary.StackPointerRegister;

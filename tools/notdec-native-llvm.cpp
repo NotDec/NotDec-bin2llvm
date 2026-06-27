@@ -884,6 +884,7 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
   passOptions.EnableRewrite = true;
   passOptions.EnableResidueRemoval =
       !options.DisableSummaryRegisterResidueRemoval;
+  passOptions.EnablePostRewriteInstCombine = !options.DisableInstCombinePass;
   passOptions.PrintSummary = options.PrintRegisterSSASummary;
   notdec::bin2llvm::runNativeRegisterSummarySSA(module, passOptions);
   if (llvm::verifyModule(module, &llvm::errs())) {
