@@ -546,3 +546,94 @@ Bench2 产物：
 - 复杂度：6/10。matcher 多了三种形状，但仍集中在 `NativeStackCanaryCleanup` 内。
 - 后期维护成本：5/10。风险主要是 PHI/zero-base matcher 继续长形状；目前靠 canary 整体
   模式约束，误删面较小。
+
+# 补充实现：从算法上去掉 FS_OFFSET zero-base 兜底
+
+这次复盘 Braun SSA 后，确认 `FS_OFFSET` 被传播成 0 的问题不能靠 canary cleanup 继续兜底。
+`0` 是真实常量，不是 unknown；把它当 TLS base 会虚构出 `inttoptr (i64 40 to ptr)` 这种
+不存在的 canary 地址。
+
+根因：
+
+- SummarySSA 对普通未知寄存器值使用 `freeze poison`，这对普通 GPR/flags 是可以接受的。
+- 但 `FS_OFFSET` 是 x86 segment base 状态，不是普通 SysV ABI caller-saved 寄存器。
+- 外部函数调用不应 clobber `FS_OFFSET` / `GS_OFFSET`。如果把它当 unknown，后续 InstCombine /
+  SimplifyCFG 可以把 unknown 在某些路径上固化成 `0`，然后 late canary cleanup 之前就出现
+  `FS_OFFSET.summary_ssa` 的 0 incoming。
+
+改动文件和函数：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:943`
+  - 新增 `isSegmentBaseUnit()`，当前只覆盖 `FS_OFFSET` / `GS_OFFSET`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:2380`
+  - 新增 `unknownBefore()`，把 SummarySSA 的 unknown 入口集中起来；自环 trivial PHI 没有真实
+    incoming 时也落成显式 unknown，而不是保留自引用 PHI。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:2405`
+  - `completePhi()` 调用 `simplifyPhi(*phi, &unit)`，让 trivial PHI 收口时能知道寄存器类型。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:2431`
+  - `simplifyPhi()` 对只有 self incoming 的 PHI 生成 unknown，避免把不完整状态留在 IR 中。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:2557`
+  - `callEffect()` 对 declaration call 特判 `FS_OFFSET` / `GS_OFFSET` 为 preserve。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:93`
+  - 新增 `unknownValue()`，只把 `undef/poison/freeze poison` 当 unknown。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:185`
+  - `valueIsFsBase()` 不再接受常量 0 作为可忽略 FS base incoming。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:231`
+  - `integerOffsetFromFsBase()` 不再接受裸常量 40 作为 FS-relative offset，只接受真实
+    `FS_OFFSET + 40` 或带 unknown incoming 的 PHI 形状。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:323-351`
+  - 删除 `findZeroBaseFsCanaryAddress()`，`findFsCanaryAddress()` 不再识别
+    `inttoptr (i64 40 to ptr)`。
+- `tests/native_register_summary_ssa_test.cpp:466`
+  - PHI FS canary 测试把原来的 `0` incoming 改成 `freeze poison` unknown incoming。
+- `tests/native_register_summary_ssa_test.cpp:566`
+  - shared fail canary 测试改成真实 `FS_OFFSET + 40`，不再靠裸 `inttoptr 40`。
+- `tests/native_register_summary_ssa_test.cpp:714`
+  - PHI canary address 测试把原来的地址常量 40 incoming 改成 unknown incoming。
+- `tests/native_register_summary_ssa_test.cpp:977`
+  - `testUnknownPhiIncomingUsesFrozenPoison()` 增加断言：普通 unknown PHI incoming 不能折成
+    常量 0。
+- `tests/native_register_summary_ssa_test.cpp:1044`
+  - 新增 `testSelfOnlyPhiBecomesFrozenPoison()`，覆盖只有 self incoming 的 PHI 收口。
+- `tests/native_register_summary_ssa_test.cpp:1098`
+  - 新增 `testFsOffsetPreservedAcrossExternalCall()`，覆盖外部调用不 clobber `FS_OFFSET`。
+- `tests/native_register_summary_ssa_test.cpp:2852`
+  - zero-base canary 测试从正例改成负例：裸 `inttoptr 40` 不再允许被删。
+
+验证结果：
+
+- `cmake --build build --target notdec-native-llvm native_register_summary_ssa_test -j$(nproc)`
+- `build/bin/native_register_summary_ssa_test`
+- `ctest --test-dir build -R notdec.native_register_summary.ssa --output-on-failure`
+- `/usr/bin/time -f 'elapsed=%e user=%U sys=%S maxrss=%M' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk --all-confirmed --summary-json-out /tmp/notdec-wrk-final-fs-preserve.summary.json -o /tmp/notdec-wrk-final-fs-preserve.ll`
+  - 结果：`elapsed=46.70 user=46.62 sys=0.07 maxrss=183392`
+- `scripts/native-register-residue-audit.py /tmp/notdec-wrk-final-fs-preserve.ll`
+  - 结果：只剩 x87 `ST*`，`other load=4/store=2`。
+- `rg -n "FS_OFFSET|inttoptr \\(i64 40 to ptr\\)|__stack_chk_fail|summary_unknown|FS_OFFSET.summary_ssa.*\\[ 0" /tmp/notdec-wrk-final-fs-preserve.ll`
+  - 结果：`FS_OFFSET` 只剩 global 和 metadata；`__stack_chk_fail` 只剩 declaration；没有
+    `inttoptr (i64 40 to ptr)`、没有 `summary_unknown`、没有 `FS_OFFSET.summary_ssa [ 0`。
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-wrk-final-fs-preserve.ll -o /tmp/notdec-wrk-final-fs-preserve.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-wrk-final-fs-preserve.bc -o /tmp/notdec-wrk-final-fs-preserve.verified.bc`
+- fortune 同口径性能：
+  - `/usr/bin/time -f 'elapsed=%e user=%U sys=%S maxrss=%M' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --summary-json-out /tmp/notdec-fortune-final-fs-preserve.summary.json -o /tmp/notdec-fortune-final-fs-preserve.ll`
+  - 结果：`elapsed=8.90 user=8.88 sys=0.02 maxrss=168536`
+
+Bench2 wrk selected target 已更新：
+
+- `/sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/wrk/executable/module-all.ll`
+- `/sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/wrk/executable/module-all.bc`
+- `/sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/wrk/executable/module-all.verified.bc`
+- `/sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/wrk/executable/module-all.summary.json`
+
+补充判断：
+
+- 这次不再把 zero-base 作为合法 canary 形状；如果后续再看到 `inttoptr 40`，应继续追
+  SummarySSA/优化把哪个 unknown 固化成了 0，而不是恢复 matcher 兜底。
+- fortune 仍有直接 `FS_OFFSET + 40` 的 canary 调用形状，residue audit 为 0，但 canary matcher
+  尚未覆盖；这和本次 `FS_OFFSET -> 0` 根修不同，后续单独处理。
+
+评分：
+
+- 实现效果：9/10。wrk 中 `FS_OFFSET -> 0` 和 zero-base canary 残留消失，剩余只有暂不处理的 x87。
+- 复杂度：4/10。核心改动是 segment base preserve 和收紧 matcher，没有继续扩大 canary 形状。
+- 后期维护成本：4/10。后续如果出现 zero-base，应按算法来源继续修，不应再让 matcher 接受常量 0。

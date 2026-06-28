@@ -82,17 +82,24 @@ bool loadReadsRegister(const llvm::LoadInst &load,
          registerName(*global) == wantedRegister;
 }
 
-bool zeroIntegerConstant(llvm::Value *value) {
-  auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value);
-  return constant != nullptr && constant->isZero();
-}
-
 std::optional<int64_t> signedConstantValue(llvm::Value *value) {
   auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value);
   if (constant == nullptr || constant->getBitWidth() > 64) {
     return std::nullopt;
   }
   return constant->getSExtValue();
+}
+
+bool unknownValue(llvm::Value *value) {
+  value = value->stripPointerCasts();
+  if (llvm::isa<llvm::UndefValue>(value) ||
+      llvm::isa<llvm::PoisonValue>(value)) {
+    return true;
+  }
+  auto *freeze = llvm::dyn_cast<llvm::FreezeInst>(value);
+  return freeze != nullptr &&
+         (llvm::isa<llvm::UndefValue>(freeze->getOperand(0)) ||
+          llvm::isa<llvm::PoisonValue>(freeze->getOperand(0)));
 }
 
 std::optional<int64_t>
@@ -175,12 +182,11 @@ bool valueIsFsBase(llvm::Value *value, std::set<llvm::Value *> &visiting,
     return finish(false);
   }
 
-  // SummarySSA can leave an FS base PHI with real FS values on live edges and
-  // zero on edges where the original register value was not used.  Only accept
-  // that narrow shape so ordinary constants do not become TLS bases.
+  // Unknown FS inputs are allowed, but concrete constants are not: treating
+  // zero as a TLS base would invent a real address such as inttoptr(40).
   bool sawFsInput = false;
   for (llvm::Value *incoming : phi->incoming_values()) {
-    if (llvm::isa<llvm::UndefValue>(incoming) || zeroIntegerConstant(incoming)) {
+    if (unknownValue(incoming)) {
       continue;
     }
     if (visiting.count(incoming->stripPointerCasts()) != 0) {
@@ -221,13 +227,13 @@ std::optional<int64_t> integerOffsetFromFsBase(
   if (valueIsFsBase(value, baseVisiting, baseCache, chain, baseLoad)) {
     return finish(0);
   }
-  if (std::optional<int64_t> constant = signedConstantValue(value)) {
-    return finish(*constant);
-  }
 
   if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
     bool sawInput = false;
     for (llvm::Value *incoming : phi->incoming_values()) {
+      if (unknownValue(incoming)) {
+        continue;
+      }
       if (visiting.count(incoming->stripPointerCasts()) != 0) {
         continue;
       }
@@ -321,29 +327,6 @@ std::optional<int64_t> pointerOffsetFromIntegerBase(
   }
   std::set<llvm::Value *> seen;
   return integerOffsetFromBase(integer, base, seen, addressChain);
-}
-
-std::optional<FsCanaryAddress>
-findZeroBaseFsCanaryAddress(llvm::LoadInst &load) {
-  std::set<llvm::Instruction *> addressChain;
-  if (auto *inst = llvm::dyn_cast<llvm::Instruction>(load.getPointerOperand())) {
-    addressChain.insert(inst);
-  }
-
-  llvm::Value *integer = intToPtrIntegerOperand(load.getPointerOperand());
-  if (integer == nullptr) {
-    return std::nullopt;
-  }
-  std::optional<int64_t> offset = signedConstantValue(integer);
-  if (!offset || *offset != 40) {
-    return std::nullopt;
-  }
-
-  // SummarySSA may replace an unneeded FS base with zero before the late canary
-  // cleanup runs.  At that point FS:0x28 is visible as a plain address 40.
-  FsCanaryAddress address;
-  address.AddressChain = std::move(addressChain);
-  return address;
 }
 
 std::optional<FsCanaryAddress>
@@ -478,10 +461,6 @@ std::optional<FsCanaryAddress> findFsCanaryAddress(llvm::LoadInst &load) {
         return address;
       }
     }
-  }
-  if (std::optional<FsCanaryAddress> address =
-          findZeroBaseFsCanaryAddress(load)) {
-    return address;
   }
   if (std::optional<FsCanaryAddress> address =
           findFsCanaryIntegerAddress(load)) {

@@ -463,15 +463,22 @@ llvm::Function *createPhiFsBaseStackCanaryCheckFunction(llvm::Module &module) {
   builder.SetInsertPoint(fsEdge);
   builder.CreateBr(innerMerge);
   builder.SetInsertPoint(zeroEdge);
+  llvm::Value *unknownInnerFs =
+      builder.CreateFreeze(llvm::PoisonValue::get(
+                               llvm::Type::getInt64Ty(context)),
+                           "fs_base_inner_unknown");
   builder.CreateBr(innerMerge);
   builder.SetInsertPoint(innerMerge);
   llvm::PHINode *innerPhi =
       builder.CreatePHI(llvm::Type::getInt64Ty(context), 2, "fs_base_inner");
   innerPhi->addIncoming(fsBase, fsEdge);
-  innerPhi->addIncoming(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), zeroEdge);
+  innerPhi->addIncoming(unknownInnerFs, zeroEdge);
   builder.CreateBr(merge);
   builder.SetInsertPoint(outerZeroEdge);
+  llvm::Value *unknownOuterFs =
+      builder.CreateFreeze(llvm::PoisonValue::get(
+                               llvm::Type::getInt64Ty(context)),
+                           "fs_base_outer_unknown");
   builder.CreateBr(merge);
 
   builder.SetInsertPoint(merge);
@@ -479,9 +486,7 @@ llvm::Function *createPhiFsBaseStackCanaryCheckFunction(llvm::Module &module) {
       builder.CreatePHI(llvm::Type::getInt64Ty(context), 3, "fs_base_phi");
   fsBasePhi->addIncoming(fsBase, directEdge);
   fsBasePhi->addIncoming(innerPhi, innerMerge);
-  fsBasePhi->addIncoming(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0),
-      outerZeroEdge);
+  fsBasePhi->addIncoming(unknownOuterFs, outerZeroEdge);
   llvm::LoadInst *savedCanary =
       builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
                          "saved_canary");
@@ -560,6 +565,8 @@ llvm::Function *createZeroBaseStackCanaryCheckFunction(llvm::Module &module) {
 
 llvm::Function *createSharedFailStackCanaryCheckFunction(llvm::Module &module) {
   llvm::LLVMContext &context = module.getContext();
+  llvm::GlobalVariable *fsOffsetRegister =
+      createRegisterGlobal(module, "FS_OFFSET");
 
   auto *failType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *failFunction = llvm::Function::Create(
@@ -596,12 +603,17 @@ llvm::Function *createSharedFailStackCanaryCheckFunction(llvm::Module &module) {
   builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
                                              0),
                       secondSavedPointer);
+  llvm::LoadInst *fsBase =
+      loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
+  llvm::Value *fsCanaryAddress = builder.CreateAdd(
+      fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
+      "fs_canary_addr");
   llvm::LoadInst *firstSavedCanary =
       builder.CreateLoad(llvm::Type::getInt64Ty(context), firstSavedPointer,
                          "first_saved_canary");
   llvm::Value *firstCanaryPointer = builder.CreateIntToPtr(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
-      llvm::PointerType::get(context, 0), "first_fs_canary_ptr");
+      fsCanaryAddress, llvm::PointerType::get(context, 0),
+      "first_fs_canary_ptr");
   llvm::LoadInst *firstFsCanary =
       builder.CreateLoad(llvm::Type::getInt64Ty(context), firstCanaryPointer,
                          "first_fs_canary");
@@ -610,12 +622,15 @@ llvm::Function *createSharedFailStackCanaryCheckFunction(llvm::Module &module) {
   builder.CreateCondBr(firstSame, secondCheck, failBlock);
 
   builder.SetInsertPoint(secondCheck);
+  llvm::Value *secondFsCanaryAddress = builder.CreateAdd(
+      fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
+      "second_fs_canary_addr");
   llvm::LoadInst *secondSavedCanary =
       builder.CreateLoad(llvm::Type::getInt64Ty(context), secondSavedPointer,
                          "second_saved_canary");
   llvm::Value *secondCanaryPointer = builder.CreateIntToPtr(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
-      llvm::PointerType::get(context, 0), "second_fs_canary_ptr");
+      secondFsCanaryAddress, llvm::PointerType::get(context, 0),
+      "second_fs_canary_ptr");
   llvm::LoadInst *secondFsCanary =
       builder.CreateLoad(llvm::Type::getInt64Ty(context), secondCanaryPointer,
                          "second_fs_canary");
@@ -696,6 +711,10 @@ llvm::Function *createPhiFsCanaryAddressStackCanaryCheckFunction(
   builder.SetInsertPoint(directEdge);
   builder.CreateBr(merge);
   builder.SetInsertPoint(zeroBaseEdge);
+  llvm::Value *unknownCanaryAddress =
+      builder.CreateFreeze(llvm::PoisonValue::get(
+                               llvm::Type::getInt64Ty(context)),
+                           "fs_canary_addr_unknown");
   builder.CreateBr(merge);
 
   builder.SetInsertPoint(merge);
@@ -703,9 +722,7 @@ llvm::Function *createPhiFsCanaryAddressStackCanaryCheckFunction(
       builder.CreatePHI(llvm::Type::getInt64Ty(context), 2,
                         "fs_canary_addr_phi");
   canaryAddress->addIncoming(fsCanaryAddress, directEdge);
-  canaryAddress->addIncoming(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
-      zeroBaseEdge);
+  canaryAddress->addIncoming(unknownCanaryAddress, zeroBaseEdge);
   llvm::LoadInst *savedCanary =
       builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
                          "saved_canary");
@@ -996,6 +1013,7 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
 
   bool hasFrozenIncoming = false;
   bool hasUndefIncoming = false;
+  bool hasZeroIncoming = false;
   for (llvm::Instruction &inst : llvm::instructions(*function)) {
     auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
     if (phi == nullptr) {
@@ -1004,6 +1022,8 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
     for (llvm::Value *incoming : phi->incoming_values()) {
       hasFrozenIncoming |= llvm::isa<llvm::FreezeInst>(incoming);
       hasUndefIncoming |= llvm::isa<llvm::UndefValue>(incoming);
+      auto *constant = llvm::dyn_cast<llvm::ConstantInt>(incoming);
+      hasZeroIncoming |= constant != nullptr && constant->isZero();
     }
   }
 
@@ -1015,8 +1035,132 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
                 "unknown incoming was not materialized as freeze poison") &&
          expect(!hasUndefIncoming,
                 "unknown incoming still used bare undef") &&
+         expect(!hasZeroIncoming,
+                "unknown incoming was folded to zero") &&
          verifyOk(module,
                   "module failed verifier after frozen unknown incoming test");
+}
+
+bool testSelfOnlyPhiBecomesFrozenPoison() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-self-only-phi", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *r10 = createRegisterGlobal(module, "R10");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
+                                       {llvm::Type::getInt1Ty(context)},
+                                       false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "self_only_phi", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *loop = llvm::BasicBlock::Create(context, "loop", function);
+  llvm::BasicBlock *exit = llvm::BasicBlock::Create(context, "exit", function);
+  llvm::BasicBlock *unreachableLoop =
+      llvm::BasicBlock::Create(context, "unreachable_loop", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(function->getArg(0), loop, exit);
+  builder.SetInsertPoint(loop);
+  llvm::LoadInst *loaded = loadRegister(builder, r10, "R10", "known_value");
+  builder.CreateRet(loaded);
+  builder.SetInsertPoint(exit);
+  builder.CreateRet(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
+  builder.SetInsertPoint(unreachableLoop);
+  llvm::LoadInst *selfLoaded =
+      loadRegister(builder, r10, "R10", "self_loop_value");
+  llvm::Value *sinkPointer = builder.CreateIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 4096),
+      llvm::PointerType::get(context, 0), "self_loop_sink");
+  builder.CreateStore(selfLoaded, sinkPointer);
+  builder.CreateCondBr(function->getArg(0), unreachableLoop, unreachableLoop);
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnableResidueRemoval = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+
+  bool hasSelfLoopFreeze = false;
+  for (llvm::Instruction &inst : *unreachableLoop) {
+    hasSelfLoopFreeze |= llvm::isa<llvm::FreezeInst>(&inst);
+  }
+
+  return expect(summary.LoadsReplaced >= 1,
+                "self-only PHI test did not replace any load") &&
+         expect(summary.PhisSimplified >= 1,
+                "self-only PHI was not simplified") &&
+         expect(hasSelfLoopFreeze,
+                "self-only PHI did not become frozen poison") &&
+         verifyOk(module,
+                  "module failed verifier after self-only PHI unknown test");
+}
+
+bool testFsOffsetPreservedAcrossExternalCall() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-fs-offset-preserve", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *fsOffset = createRegisterGlobal(module, "FS_OFFSET");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "unknown_external", module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
+                                       {llvm::Type::getInt1Ty(context)},
+                                       false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "fs_preserved", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right =
+      llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(function->getArg(0), left, right);
+  builder.SetInsertPoint(left);
+  llvm::LoadInst *direct =
+      loadRegister(builder, fsOffset, "FS_OFFSET", "fs_direct");
+  (void)direct;
+  builder.CreateBr(join);
+  builder.SetInsertPoint(right);
+  builder.CreateCall(voidType, external);
+  builder.CreateBr(join);
+  builder.SetInsertPoint(join);
+  llvm::LoadInst *merged =
+      loadRegister(builder, fsOffset, "FS_OFFSET", "fs_merged");
+  builder.CreateRet(merged);
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnableResidueRemoval = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+
+  bool hasZeroFsPhiIncoming = false;
+  bool hasFreezeFsPhiIncoming = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
+    if (phi == nullptr ||
+        phi->getMetadata("notdec.register.summary_ssa.phi") == nullptr) {
+      continue;
+    }
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      auto *constant = llvm::dyn_cast<llvm::ConstantInt>(incoming);
+      hasZeroFsPhiIncoming |= constant != nullptr && constant->isZero();
+      hasFreezeFsPhiIncoming |= llvm::isa<llvm::FreezeInst>(incoming);
+    }
+  }
+
+  return expect(summary.LoadsReplaced >= 1,
+                "FS_OFFSET load was not replaced") &&
+         expect(summary.UnknownCallEffects == 0,
+                "external call clobbered FS_OFFSET") &&
+         expect(!hasZeroFsPhiIncoming,
+                "FS_OFFSET PHI used zero as unknown incoming") &&
+         expect(!hasFreezeFsPhiIncoming,
+                "FS_OFFSET PHI used frozen poison as incoming") &&
+         verifyOk(module,
+                  "module failed verifier after FS_OFFSET preserve test");
 }
 
 bool testPreservedCallKeepsPreviousValue() {
@@ -2781,17 +2925,17 @@ bool testPhiFsBaseStackCanaryCheckIsRemoved() {
                   "module failed verifier after PHI FS stack canary test");
 }
 
-bool testZeroBaseStackCanaryCheckIsRemoved() {
+bool testZeroBaseStackCanaryCheckIsKept() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-stack-canary-zero-base", context);
   attachTestAbi(module);
   llvm::Function *function = createZeroBaseStackCanaryCheckFunction(module);
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  return expect(summary.StackCanaryChecksRemoved == 1,
-                "zero-base stack canary check was not removed") &&
-         expect(!hasCallTo(*function, "__stack_chk_fail"),
-                "zero-base stack canary fail call was kept") &&
+  return expect(summary.StackCanaryChecksRemoved == 0,
+                "zero-base stack canary check was incorrectly removed") &&
+         expect(hasCallTo(*function, "__stack_chk_fail"),
+                "zero-base stack canary fail call was incorrectly removed") &&
          verifyOk(module,
                   "module failed verifier after zero-base stack canary test");
 }
@@ -3200,6 +3344,8 @@ int main() {
   ok &= testPhiIncomingMatchesPredecessors();
   ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
   ok &= testUnknownPhiIncomingUsesFrozenPoison();
+  ok &= testSelfOnlyPhiBecomesFrozenPoison();
+  ok &= testFsOffsetPreservedAcrossExternalCall();
   ok &= testPreservedCallKeepsPreviousValue();
   ok &= testDemandedReturnCreatesCallValue();
   ok &= testIntrinsicDoesNotCreateCallValue();
@@ -3234,7 +3380,7 @@ int main() {
   ok &= testStackCanaryWrongFsOffsetIsKept();
   ok &= testRawRspStackCanaryCheckIsRemovedAfterStackCleanup();
   ok &= testPhiFsBaseStackCanaryCheckIsRemoved();
-  ok &= testZeroBaseStackCanaryCheckIsRemoved();
+  ok &= testZeroBaseStackCanaryCheckIsKept();
   ok &= testSharedFailStackCanaryChecksAreRemoved();
   ok &= testPhiFsCanaryAddressStackCanaryCheckIsRemoved();
   ok &= testSelfPhiFsCanaryAddressStackCanaryCheckIsRemoved();

@@ -940,6 +940,10 @@ bool isAnalyzableCall(const llvm::CallBase &call) {
   return callee == nullptr || !callee->isIntrinsic();
 }
 
+bool isSegmentBaseUnit(llvm::StringRef name) {
+  return name == "FS_OFFSET" || name == "GS_OFFSET";
+}
+
 std::string storageUnitName(
     const NativeAbiStorage &storage,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -2373,6 +2377,16 @@ private:
     return ExitValue[key];
   }
 
+  llvm::Value *unknownBefore(llvm::Instruction &insertBefore,
+                             const RegisterUnit &unit,
+                             llvm::Twine suffix) {
+    // A missing reaching definition is unknown, not integer zero.  Keep this
+    // materialization in one place so special register classes can avoid this
+    // path when they need stronger preservation rules.
+    return frozenPoisonBefore(insertBefore, unit.Global->getValueType(),
+                              unit.Name + suffix);
+  }
+
   llvm::PHINode *ensurePhi(llvm::BasicBlock &block, const RegisterUnit &unit) {
     BlockRegKey key{&block, unit.Global};
     if (auto existing = PendingPhi.find(key); existing != PendingPhi.end()) {
@@ -2406,17 +2420,15 @@ private:
       if (incoming == nullptr) {
         llvm::Instruction *terminator = pred->getTerminator();
         incoming = terminator != nullptr
-                       ? frozenPoisonBefore(*terminator,
-                                            unit.Global->getValueType(),
-                                            unit.Name + ".unknown")
+                       ? unknownBefore(*terminator, unit, ".unknown")
                        : llvm::UndefValue::get(unit.Global->getValueType());
       }
       phi->addIncoming(incoming, pred);
     }
-    return simplifyPhi(*phi);
+    return simplifyPhi(*phi, &unit);
   }
 
-  llvm::Value *simplifyPhi(llvm::PHINode &phi) {
+  llvm::Value *simplifyPhi(llvm::PHINode &phi, const RegisterUnit *unit) {
     if (!isCompletePhi(phi)) {
       return &phi;
     }
@@ -2435,7 +2447,15 @@ private:
       }
     }
     if (same == nullptr) {
-      return &phi;
+      if (unit == nullptr) {
+        return &phi;
+      }
+      auto insertIt = phi.getParent()->getFirstInsertionPt();
+      if (insertIt == phi.getParent()->end()) {
+        return &phi;
+      }
+      llvm::Instruction *insertBefore = &*insertIt;
+      same = unknownBefore(*insertBefore, *unit, ".phi_unknown");
     }
     Replacement[&phi] = same;
     phi.replaceAllUsesWith(same);
@@ -2534,6 +2554,9 @@ private:
       return CallRegisterEffect::Unknown;
     }
 
+    if (isSegmentBaseUnit(unit.Name)) {
+      return CallRegisterEffect::Preserve;
+    }
     if (Abi.Unaffected.count(unit.Name) != 0) {
       return CallRegisterEffect::Preserve;
     }
