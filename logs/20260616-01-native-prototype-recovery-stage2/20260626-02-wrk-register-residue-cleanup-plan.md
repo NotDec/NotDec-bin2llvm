@@ -446,3 +446,79 @@ cleanup，最多迭代 10 次。这样能把 `load @OF` 之类的中间值先压
 - wrk 耗时 `elapsed=47.06`
 - residue audit 里 `OF` 已经为 0，`FS_OFFSET` 也为 0
 - 剩下的是 x87 `ST*`，和这次改动无关
+
+# 补充实现：完善 NativeStackCanaryCleanup 的 FS canary 匹配
+
+这次继续修 wrk 里的 `load @FS_OFFSET + 40 + __stack_chk_fail` 残留。根因是
+`NativeStackCanaryCleanup` 只认直接 `load @FS_OFFSET` 作为 base。SummarySSA 之后，wrk
+里会出现几种等价形状：
+
+- `FS_OFFSET.entry` 经过一层或多层 PHI 合流，PHI 的其他输入是 0。
+- late cleanup 时 `FS_OFFSET` base 被替换成 0，`FS:0x28` 变成
+  `load i64, ptr inttoptr (i64 40 to ptr)`。
+- 两个 canary compare 共用同一个 `__stack_chk_fail` block，fail block 里有 PHI 做返回地址
+  store 的地址 setup。
+
+改动文件和函数：
+
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:85-88`
+  - 新增 `zeroIntegerConstant()`。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:146-196`
+  - 新增 `valueIsFsBase()`，识别直接 `FS_OFFSET` load，或所有非 0/undef 输入都来自
+    `FS_OFFSET` 的 PHI。
+  - 用 `visiting + cache` 避免真循环，同时允许多个 PHI 输入复用同一个 `FS_OFFSET.entry`。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:233-254`
+  - 新增 `findZeroBaseFsCanaryAddress()`，识别 late cleanup 后的 `inttoptr (i64 40 to ptr)`。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:274-318`
+  - 扩展 `findFsCanaryAddress()`，按直接 base、PHI base、zero-base 三种形状匹配。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:404-424`
+  - `blockOnlyCallsStackCheckFail()` 的 setup 判断允许 fail block 内部 PHI，但仍要求只喂本
+    block。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:529-538`
+  - `eraseStackCanaryCheck()` 改分支前调用 `fail->removePredecessor(checkBlock)`，处理共享
+    fail block 的 PHI incoming。
+- `tests/native_register_summary_ssa_test.cpp:404-638`
+  - 新增 PHI FS、zero-base、共享 fail block 三种构造函数。
+- `tests/native_register_summary_ssa_test.cpp:2537-2582`
+  - 新增三条回归测试：
+    `testPhiFsBaseStackCanaryCheckIsRemoved()`、
+    `testZeroBaseStackCanaryCheckIsRemoved()`、
+    `testSharedFailStackCanaryChecksAreRemoved()`。
+- `tests/native_register_summary_ssa_test.cpp:3016-3018`
+  - 把三条新测试加入主测试列表。
+
+保守边界：
+
+- 仍然必须是“saved stack slot load”和 `FS:0x28` load 做 `icmp eq/ne`。
+- fail block 仍然只能做局部 setup、返回地址 store、`__stack_chk_fail` /
+  `__stack_smash_handler`，不能有其他副作用。
+- 不处理 x87 `ST*`，不无条件删除所有 `inttoptr (i64 40 to ptr)`，也不删除裸
+  `__stack_chk_fail` 声明。
+
+验证结果：
+
+- `cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j$(nproc)`
+- `build/bin/native_register_summary_ssa_test`
+- `/usr/bin/time -f 'elapsed=%e user=%U sys=%S maxrss=%M' build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk --all-confirmed --summary-json-out /tmp/notdec-wrk-canary-final.summary.json -o /tmp/notdec-wrk-canary-final.ll`
+  - 结果：`elapsed=47.09 user=47.01 sys=0.06 maxrss=183212`
+- `scripts/native-register-residue-audit.py /tmp/notdec-wrk-canary-final.ll`
+  - 结果：只剩 x87 `ST*` 对应的 `other load=4/store=2`。
+- `rg -n "load i64, ptr @FS_OFFSET|add i64 %FS_OFFSET|inttoptr \\(i64 40 to ptr\\)|call void @__stack_chk_fail|@__stack_chk_fail" /tmp/notdec-wrk-canary-final.ll`
+  - 结果：只剩 `declare void @__stack_chk_fail()`，没有调用和 canary load。
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-wrk-canary-final.ll -o /tmp/notdec-wrk-canary-final.bc`
+- `/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-wrk-canary-final.bc -o /tmp/notdec-wrk-canary-final.verified.bc`
+
+Bench2 产物：
+
+- `/sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/wrk/executable/module-all.ll`
+- `/sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/wrk/executable/module-all.bc`
+- `/sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/wrk/executable/module-all.verified.bc`
+- `/sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/wrk/executable/module-all.summary.json`
+- `/sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/wrk/executable/target.txt`
+
+评分：
+
+- 实现效果：9/10。wrk 的 FS canary 残留清完，剩余仍是暂不处理的 x87。
+- 复杂度：6/10。matcher 多了三种形状，但仍集中在 `NativeStackCanaryCleanup` 内。
+- 后期维护成本：5/10。风险主要是 PHI/zero-base matcher 继续长形状；目前靠 canary 整体
+  模式约束，误删面较小。
