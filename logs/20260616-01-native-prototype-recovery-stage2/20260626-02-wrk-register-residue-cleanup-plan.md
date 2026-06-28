@@ -6,6 +6,30 @@
 
 把顺序改一下吧，处理FS_Offset以及canary的问题提前，作为第一点。同时改进一下这步：首先，调研LLVM源码中插入canary的pass，看它会对函数做什么样的变换，其次，考虑在当前Pass链路里找合适的位置创建一个canary消除的Pass，专门匹配这种模式，然后删除掉canary相关的判断和check fail分支。注意必须要直接做rewrite这一步，而不是先纯标注。
 
+# 本次实现记录
+
+本次先试了把 canary cleanup 前移，并补了 `NativeStackCanaryCleanup` 对 `RBP + 负偏移` 保存槽的识别，确认 `FS_OFFSET` / canary 的 saved side 不必强依赖 `%notdec_stack.native`。随后又试过把 `runNativeRegisterSummarySSA()` 里的 late canary cleanup 去掉、以及在前置 cleanup 前插一轮 `InstCombine`，结果 `vsftpd` 仍然会留下多处 `__stack_chk_fail` 和 `FS_OFFSET + 40` 残留，所以最后保留 late cleanup，只保留这次对 saved canary slot 的补强。
+
+改动文件：
+
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp`
+  - 新增 `offsetFromFramePointer()`、`framePointerSavedCanaryPointer()`，让 `loadIsSavedCanarySlot()` 也接受可证明的 `RBP/EBP/BP + 负偏移` 栈槽。
+  - 新增 `integerOffsetFromFsBase()` / `findFsCanaryIntegerAddress()`，继续支持 `FS_OFFSET` PHI 和 `inttoptr (i64 40 to ptr)` 这类前后端折叠后的 canary 地址形状。
+- `tests/native_register_summary_ssa_test.cpp`
+  - 新增 `phi_fs_canary_address`、`self_phi_fs_canary_address`、`self_phi_fs_base_canary` 三个回归用例，覆盖 PHI 合流、递归 PHI、以及只剩 `0/entry` 的 FS base 形状。
+
+验证：
+
+- `build/bin/native_register_summary_ssa_test`
+- `notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/vsftpd --all-confirmed ...`
+- `scripts/native-register-residue-audit.py /tmp/notdec-vsftpd-final-canary.ll`
+- `llvm-as` / `opt -passes=verify` 通过
+
+结果：
+
+- `vsftpd` 最终 residue 只剩 `vector store access full full no 8`
+- canary 残留没有继续扩散，但也不能只靠前置 cleanup 清掉，所以 late cleanup 还是需要保留。
+
 # 背景
 
 当前默认 native 链路是 summary：

@@ -183,6 +183,9 @@ bool valueIsFsBase(llvm::Value *value, std::set<llvm::Value *> &visiting,
     if (llvm::isa<llvm::UndefValue>(incoming) || zeroIntegerConstant(incoming)) {
       continue;
     }
+    if (visiting.count(incoming->stripPointerCasts()) != 0) {
+      continue;
+    }
     if (!valueIsFsBase(incoming, visiting, cache, chain, baseLoad)) {
       return finish(false);
     }
@@ -193,6 +196,96 @@ bool valueIsFsBase(llvm::Value *value, std::set<llvm::Value *> &visiting,
   }
   chain.insert(phi);
   return finish(true);
+}
+
+std::optional<int64_t> integerOffsetFromFsBase(
+    llvm::Value *value, std::set<llvm::Value *> &visiting,
+    std::map<llvm::Value *, std::optional<int64_t>> &cache,
+    std::set<llvm::Instruction *> &chain, llvm::LoadInst **baseLoad) {
+  value = value->stripPointerCasts();
+  auto cached = cache.find(value);
+  if (cached != cache.end()) {
+    return cached->second;
+  }
+  if (!visiting.insert(value).second) {
+    return std::nullopt;
+  }
+  auto finish = [&](std::optional<int64_t> result) {
+    visiting.erase(value);
+    cache[value] = result;
+    return result;
+  };
+
+  std::set<llvm::Value *> baseVisiting;
+  std::map<llvm::Value *, bool> baseCache;
+  if (valueIsFsBase(value, baseVisiting, baseCache, chain, baseLoad)) {
+    return finish(0);
+  }
+  if (std::optional<int64_t> constant = signedConstantValue(value)) {
+    return finish(*constant);
+  }
+
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+    bool sawInput = false;
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      if (visiting.count(incoming->stripPointerCasts()) != 0) {
+        continue;
+      }
+      std::optional<int64_t> incomingOffset =
+          integerOffsetFromFsBase(incoming, visiting, cache, chain, baseLoad);
+      if (!incomingOffset) {
+        return finish(std::nullopt);
+      }
+      if (*incomingOffset != 40) {
+        return finish(std::nullopt);
+      }
+      sawInput = true;
+    }
+    if (!sawInput) {
+      return finish(std::nullopt);
+    }
+    chain.insert(phi);
+    return finish(40);
+  }
+
+  auto *op = llvm::dyn_cast<llvm::Operator>(value);
+  if (op == nullptr) {
+    return finish(std::nullopt);
+  }
+
+  std::optional<int64_t> result;
+  if (op->getOpcode() == llvm::Instruction::Add) {
+    if (auto lhs =
+            integerOffsetFromFsBase(op->getOperand(0), visiting, cache, chain,
+                                    baseLoad)) {
+      if (auto rhs = signedConstantValue(op->getOperand(1))) {
+        result = *lhs + *rhs;
+      }
+    }
+    if (!result) {
+      if (auto rhs = integerOffsetFromFsBase(op->getOperand(1), visiting,
+                                             cache, chain, baseLoad)) {
+        if (auto lhs = signedConstantValue(op->getOperand(0))) {
+          result = *lhs + *rhs;
+        }
+      }
+    }
+  } else if (op->getOpcode() == llvm::Instruction::Sub) {
+    if (auto lhs =
+            integerOffsetFromFsBase(op->getOperand(0), visiting, cache, chain,
+                                    baseLoad)) {
+      if (auto rhs = signedConstantValue(op->getOperand(1))) {
+        result = *lhs - *rhs;
+      }
+    }
+  }
+
+  if (result) {
+    if (auto *instruction = llvm::dyn_cast<llvm::Instruction>(value)) {
+      chain.insert(instruction);
+    }
+  }
+  return finish(result);
 }
 
 llvm::Value *intToPtrIntegerOperand(llvm::Value *pointer) {
@@ -253,6 +346,31 @@ findZeroBaseFsCanaryAddress(llvm::LoadInst &load) {
   return address;
 }
 
+std::optional<FsCanaryAddress>
+findFsCanaryIntegerAddress(llvm::LoadInst &load) {
+  std::set<llvm::Instruction *> addressChain;
+  if (auto *inst = llvm::dyn_cast<llvm::Instruction>(load.getPointerOperand())) {
+    addressChain.insert(inst);
+  }
+
+  llvm::Value *integer = intToPtrIntegerOperand(load.getPointerOperand());
+  if (integer == nullptr) {
+    return std::nullopt;
+  }
+
+  std::set<llvm::Value *> visiting;
+  std::map<llvm::Value *, std::optional<int64_t>> cache;
+  FsCanaryAddress address;
+  address.AddressChain = std::move(addressChain);
+  std::optional<int64_t> offset =
+      integerOffsetFromFsBase(integer, visiting, cache, address.AddressChain,
+                              &address.BaseLoad);
+  if (offset && *offset == 40) {
+    return address;
+  }
+  return std::nullopt;
+}
+
 bool stackAllocaPointer(llvm::Value *value) {
   value = value->stripPointerCasts();
   auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(value);
@@ -266,9 +384,60 @@ bool stackAllocaPointer(llvm::Value *value) {
   return false;
 }
 
+std::optional<int64_t> offsetFromFramePointer(llvm::Value *value,
+                                              std::set<llvm::Value *> &seen) {
+  value = value->stripPointerCasts();
+  if (!seen.insert(value).second) {
+    return std::nullopt;
+  }
+
+  auto *load = llvm::dyn_cast<llvm::LoadInst>(value);
+  if (load != nullptr && (loadReadsRegister(*load, "RBP") ||
+                          loadReadsRegister(*load, "EBP") ||
+                          loadReadsRegister(*load, "BP"))) {
+    return 0;
+  }
+
+  auto *op = llvm::dyn_cast<llvm::Operator>(value);
+  if (op == nullptr) {
+    return std::nullopt;
+  }
+  if (op->getOpcode() == llvm::Instruction::Add) {
+    if (auto lhs = offsetFromFramePointer(op->getOperand(0), seen)) {
+      if (auto rhs = signedConstantValue(op->getOperand(1))) {
+        return *lhs + *rhs;
+      }
+    }
+    if (auto rhs = offsetFromFramePointer(op->getOperand(1), seen)) {
+      if (auto lhs = signedConstantValue(op->getOperand(0))) {
+        return *lhs + *rhs;
+      }
+    }
+  }
+  if (op->getOpcode() == llvm::Instruction::Sub) {
+    if (auto lhs = offsetFromFramePointer(op->getOperand(0), seen)) {
+      if (auto rhs = signedConstantValue(op->getOperand(1))) {
+        return *lhs - *rhs;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+bool framePointerSavedCanaryPointer(llvm::Value *pointer) {
+  llvm::Value *integer = intToPtrIntegerOperand(pointer);
+  if (integer == nullptr) {
+    return false;
+  }
+  std::set<llvm::Value *> seen;
+  std::optional<int64_t> offset = offsetFromFramePointer(integer, seen);
+  return offset && *offset < 0;
+}
+
 bool loadIsSavedCanarySlot(llvm::LoadInst &load) {
   return !load.isVolatile() && !load.isAtomic() &&
-         stackAllocaPointer(load.getPointerOperand());
+         (stackAllocaPointer(load.getPointerOperand()) ||
+          framePointerSavedCanaryPointer(load.getPointerOperand()));
 }
 
 std::optional<FsCanaryAddress> findFsCanaryAddress(llvm::LoadInst &load) {
@@ -312,6 +481,10 @@ std::optional<FsCanaryAddress> findFsCanaryAddress(llvm::LoadInst &load) {
   }
   if (std::optional<FsCanaryAddress> address =
           findZeroBaseFsCanaryAddress(load)) {
+    return address;
+  }
+  if (std::optional<FsCanaryAddress> address =
+          findFsCanaryIntegerAddress(load)) {
     return address;
   }
   return std::nullopt;
