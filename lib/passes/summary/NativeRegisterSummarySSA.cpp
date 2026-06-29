@@ -1032,6 +1032,7 @@ AbiFacts collectAbiFacts(
       if (entry.MetaType == "float") {
         facts.FloatInputsInOrder.push_back(
             abiRegisterSlot(entry, name, units));
+        facts.InternalParamRegisters.insert(name);
         continue;
       }
       facts.InternalParamRegisters.insert(name);
@@ -1047,6 +1048,7 @@ AbiFacts collectAbiFacts(
       if (entry.MetaType == "float") {
         facts.FloatOutputsInOrder.push_back(
             abiRegisterSlot(entry, name, units));
+        facts.InternalReturnRegisters.insert(name);
         continue;
       }
       facts.InternalReturnRegisters.insert(name);
@@ -1205,6 +1207,14 @@ llvm::FunctionType *functionTypeForShape(llvm::LLVMContext &context,
                                  shape.VarArg);
 }
 
+bool isFloatAbiOutputUnit(const AbiFacts &abi, llvm::StringRef name) {
+  return std::any_of(abi.FloatOutputsInOrder.begin(),
+                     abi.FloatOutputsInOrder.end(),
+                     [&](const AbiFacts::RegisterSlot &slot) {
+                       return slot.UnitName == name;
+                     });
+}
+
 SignatureShape shapeForInternalFunction(
     llvm::Function &function,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -1231,10 +1241,9 @@ SignatureShape shapeForInternalFunction(
             });
 
   // Internal native functions can be compiled with interprocedural register
-  // allocation, so their real interface is not limited to the external ABI
-  // argument and return registers.  Stay within ABI-described general-purpose
-  // registers, but let summary facts decide which of them are real inputs and
-  // demanded outputs.
+  // allocation, so their real interface is not limited to the external ABI.
+  // Stay within ABI-described register classes, then let summary facts decide
+  // which registers are real inputs and demanded outputs.
   for (const RegisterUnit *unit : orderedUnits) {
     if (abi.InternalParamRegisters.count(unit->Name) == 0) {
       continue;
@@ -1247,6 +1256,13 @@ SignatureShape shapeForInternalFunction(
 
   for (const RegisterUnit *unit : orderedUnits) {
     if (abi.InternalReturnRegisters.count(unit->Name) == 0) {
+      continue;
+    }
+    // Whole-ZMM returns are only safe for lifted void helpers.  If a function
+    // already has an LLVM return value, widening it to i512 would overwrite the
+    // existing public return shape instead of refining register passing.
+    if (!function.getReturnType()->isVoidTy() &&
+        isFloatAbiOutputUnit(abi, unit->Name)) {
       continue;
     }
     auto regIt = factsIt->second.Registers.find(unit->Name);

@@ -2421,6 +2421,84 @@ bool testInternalSignatureRewriteUsesNonAbiReturn() {
                   "module failed verifier after non-ABI return rewrite");
 }
 
+bool testInternalSignatureRewriteUsesZmmArgAndReturn() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-internal-zmm-signature", context);
+  attachTestFloatAbi(module, 1);
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_zmm_callee", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(calleeEntry);
+  llvm::LoadInst *input = loadRegister(builder, zmm0, "ZMM0", "input");
+  llvm::Value *result = builder.CreateXor(
+      input, llvm::ConstantInt::get(zmmType, 1), "result");
+  storeRegister(builder, zmm0, result, "ZMM0");
+  builder.CreateRetVoid();
+
+  llvm::Function *caller =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_zmm_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  storeRegister(builder, zmm0, llvm::ConstantInt::get(zmmType, 7), "ZMM0");
+  builder.CreateCall(voidType, callee);
+  llvm::LoadInst *loaded = loadRegister(builder, zmm0, "ZMM0", "loaded");
+  (void)loaded;
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("notdec_native_zmm_callee");
+  llvm::Function *rewrittenCaller =
+      module.getFunction("notdec_native_zmm_caller");
+  bool callRewritten = false;
+  unsigned zmmStores = 0;
+  unsigned zmmLoads = 0;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+      if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+        if (call->getCalledFunction() == rewritten && call->arg_size() == 1 &&
+            call->getArgOperand(0)->getType() == zmmType &&
+            call->getType() == zmmType) {
+          callRewritten = true;
+        }
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        if (store->getPointerOperand()->stripPointerCasts() == zmm0) {
+          ++zmmStores;
+        }
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (load->getPointerOperand()->stripPointerCasts() == zmm0) {
+          ++zmmLoads;
+        }
+      }
+    }
+  }
+
+  return expect(rewritten != nullptr, "ZMM internal callee missing") &&
+         expect(rewrittenCaller != nullptr, "ZMM internal caller missing") &&
+         expect(rewritten->arg_size() == 1,
+                "ZMM internal argument was not rewritten") &&
+         expect(rewritten->getArg(0)->getType() == zmmType,
+                "ZMM internal argument was not i512") &&
+         expect(rewritten->getReturnType() == zmmType,
+                "ZMM internal return was not i512") &&
+         expect(callRewritten, "ZMM internal callsite was not rewritten") &&
+         expect(zmmStores == 0, "ZMM caller argument store remained") &&
+         expect(zmmLoads == 0, "ZMM caller result load remained") &&
+         expect(summary.CallsRewritten >= 1,
+                "ZMM internal call rewrite was not counted") &&
+         verifyOk(module, "module failed verifier after ZMM signature rewrite");
+}
+
 bool testForeignArgumentInMovedBodyIsReplaced() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-foreign-argument", context);
@@ -3416,6 +3494,7 @@ int main() {
   ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
+  ok &= testInternalSignatureRewriteUsesZmmArgAndReturn();
   ok &= testForeignArgumentInMovedBodyIsReplaced();
   ok &= testForeignMappedCallArgumentIsLocalized();
   ok &= testStaticRspStackRewriteKeepsSavedRegisterEvidence();

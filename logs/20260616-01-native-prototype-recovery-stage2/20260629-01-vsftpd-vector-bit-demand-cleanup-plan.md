@@ -173,3 +173,78 @@ scripts/native-register-residue-audit.py \
 
 - 做第二阶段 internal XMM/ZMM signature rewrite，让内部 call 前的 SIMD 参数不再依赖寄存器 global store。
 - 把 bit demand 的 observer 和 rewrite 规则继续补成更系统的 value rewrite，而不是只处理 integer operand 置 0。
+
+# 第二阶段实现记录：internal XMM/ZMM signature rewrite
+
+本阶段先做 conservative 版本：只让 summary 链路的 internal signature rewrite 支持 ABI float slot 对应的 backing `ZMMn`，并按 whole register `i512` 传递。外部 unknown call 规则不变；外部已知 prototype 仍走原来的 float/double slot。
+
+改动文件：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
+  - `collectAbiFacts()`：第 1032-1036 行和第 1048-1052 行，把 `MetaType=float` 的 ABI input/output 映射后的 backing register 加入 internal param/return 候选集合。这样 `XMM0_Qa` / `XMM0` / `YMM0` 能通过已有 fallback 对到 `ZMM0`。
+  - 新增 `isFloatAbiOutputUnit()`：第 1210-1216 行，用于识别一个 internal return 候选是否来自 float ABI output。
+  - `shapeForInternalFunction()`：第 1243-1273 行继续用 summary facts 判断 `ReadEntry` / `MayNonEntry` / `ExitDemand`，但允许 float backing register 进入候选；同时限制 whole-ZMM return 只用于原本 `void` 的 lifted helper。已有 LLVM 返回值的函数不额外加 `ZMM` 返回，避免覆盖原来的 public return shape。
+- `tests/native_register_summary_ssa_test.cpp`
+  - 新增 `testInternalSignatureRewriteUsesZmmArgAndReturn()`：第 2424-2499 行，覆盖内部 callee 从 `ZMM0` 读入、写回 `ZMM0`，caller 通过 call 前 store 和 call 后 load 传值。期望 rewrite 后 callee 变成 `i512 (i512)`，caller 里 `ZMM0` store/load 被清掉。
+  - `main()`：第 3497 行加入该测试。
+
+实现时踩到一个边界：最初直接把 float output backing register 全部加入 internal return，会让 `pow/sqrt/sin/cos/log/exp` 这类测试 wrapper 被改成 `i512` 返回，导致已有 `ret i64` 语义被 signature rewrite 覆盖。最后把 whole-ZMM return 限制在原本 `void` 的 lifted helper 上；参数侧不需要这个限制。
+
+验证：
+
+```bash
+cmake --build build --target native_register_summary_ssa_test
+build/bin/native_register_summary_ssa_test
+ctest --test-dir build -R notdec.native_register_summary.ssa --output-on-failure
+cmake --build build --target notdec-native-llvm
+
+/usr/bin/time -f 'elapsed=%e user=%U sys=%S maxrss=%M' \
+  build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/sbin/vsftpd \
+  --all-confirmed \
+  --summary-json-out /sn640/NotDec-Exp/Bench2/bin2llvm-native-projects/selected-targets-native/vsftpd-executable/summary.json \
+  -o /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/vsftpd/executable/module-all.ll
+
+scripts/native-register-residue-audit.py \
+  /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/vsftpd/executable/module-all.ll
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as \
+  /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/vsftpd/executable/module-all.ll \
+  -o /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/vsftpd/executable/module-all.bc
+
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify \
+  /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/vsftpd/executable/module-all.bc \
+  -o /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/vsftpd/executable/module-all.verified.bc
+
+/usr/bin/time -f 'elapsed=%e user=%U sys=%S maxrss=%M' \
+  build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed \
+  --summary-json-out /tmp/notdec-fortune-xmm-zmm-signature.summary.json \
+  -o /tmp/notdec-fortune-xmm-zmm-signature.ll
+
+scripts/native-register-residue-audit.py /tmp/notdec-fortune-xmm-zmm-signature.ll
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-fortune-xmm-zmm-signature.ll -o /tmp/notdec-fortune-xmm-zmm-signature.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-fortune-xmm-zmm-signature.bc -o /tmp/notdec-fortune-xmm-zmm-signature.verified.bc
+
+scripts/native-register-residue-audit.py \
+  /sn640/NotDec-Exp/Bench2/bin2llvm-ir/selected-targets-native/wrk/executable/module-all.ll
+```
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `ctest -R notdec.native_register_summary.ssa` 通过。
+- `vsftpd` 重新生成成功，耗时 `elapsed=82.63 user=82.53 sys=0.08 maxrss=211476`。
+- `vsftpd` residue audit 为空，LLVM 22 `llvm-as` 和 `opt -passes=verify` 通过。
+- `fortune` 生成耗时 `elapsed=8.20 user=8.16 sys=0.03 maxrss=167876`，residue audit 为空，LLVM 22 verify 通过。
+- `wrk` 没有非 x87 回退，仍是 4 load + 2 store 的 `ST*` 残留。
+
+评分：
+
+- 实现效果：7/10。internal `ZMMn` 参数/返回第一步打通了，但返回侧还保守限制在原 `void` helper。
+- 复杂度：4/10。改动集中在 ABI facts 和 shape 构造，没有改 call rewrite 主体。
+- 维护成本：4/10。whole `i512` 是过渡表达，后续还需要把 `XMMn_Qa` 低 lane 精细化成 float/double/vector slot。
+
+后续更好的方案：
+
+- 支持 internal signature 的 typed SIMD slot，不再把所有 `XMM`/`YMM` backing 都表达成 whole `i512`。
+- 明确处理已有 LLVM 返回值和寄存器返回同时存在的情况，而不是简单跳过非 `void` 函数的 whole-ZMM return。
