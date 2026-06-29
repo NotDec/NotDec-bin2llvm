@@ -7,6 +7,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
@@ -1464,8 +1465,8 @@ public:
     collectAccesses();
     if (Options.EnableRewrite) {
       rewriteLoads();
-      rewritePartialWrites();
       collectSignatureCallArgs();
+      rewritePartialWrites();
       finalizePendingPhis();
       collectFunctionReturnValues();
       if (Options.EnableResidueRemoval) {
@@ -1482,6 +1483,7 @@ public:
   void removeDeadStoresAfterSignatureRewrite() {
     Summary.FunctionName = Function.getName().str();
     PostSignatureCleanup = true;
+    rewritePartialWrites();
     removeDeadStoresByLiveness();
   }
 
@@ -1564,119 +1566,90 @@ private:
     return possiblyDisjoint != nullptr && possiblyDisjoint->isDisjoint();
   }
 
-  static bool isRegisterPointer(llvm::Value *ptr,
-                                const std::map<llvm::GlobalVariable *,
-                                               RegisterUnit> &units,
-                                const RegisterUnit *&unit) {
-    auto *global =
-        llvm::dyn_cast_or_null<llvm::GlobalVariable>(ptr->stripPointerCasts());
-    if (global == nullptr) {
-      return false;
+  llvm::APInt demandedBits(
+      llvm::Value *value,
+      const std::map<llvm::Value *, llvm::APInt> &demands) const {
+    unsigned width = valueBitWidth(value);
+    if (width == 0) {
+      return llvm::APInt();
     }
-    auto it = units.find(global);
-    if (it == units.end()) {
-      return false;
+    auto it = demands.find(value);
+    if (it == demands.end()) {
+      return llvm::APInt(width, 0);
     }
-    unit = &it->second;
-    return true;
+    return PartialDemandState::trimmedMask(it->second, width);
   }
 
-  bool matchKeepHighPartialStore(llvm::StoreInst &store,
-                                 const RegisterUnit &unit,
-                                 llvm::LoadInst *&load,
-                                 llvm::Value *&lowValue,
-                                 llvm::BinaryOperator *&andInst,
-                                 llvm::BinaryOperator *&orInst,
-                                 llvm::APInt &keepMask) {
-    load = nullptr;
-    lowValue = nullptr;
-    andInst = nullptr;
-    orInst = nullptr;
-    keepMask = fullMaskFor(store.getValueOperand());
-    auto *storeOp = llvm::dyn_cast<llvm::BinaryOperator>(store.getValueOperand());
-    if (storeOp == nullptr || storeOp->getOpcode() != llvm::Instruction::Or) {
-      return false;
+  llvm::Constant *zeroDemandReplacement(llvm::Type *type) const {
+    if (type == nullptr || !type->isIntegerTy()) {
+      return nullptr;
     }
-    orInst = storeOp;
-    llvm::Value *lhs = orInst->getOperand(0);
-    llvm::Value *rhs = orInst->getOperand(1);
-    auto matchAnd = [&](llvm::Value *candidate, llvm::Value *other)
-        -> bool {
-      auto *andOp = llvm::dyn_cast<llvm::BinaryOperator>(candidate);
-      if (andOp == nullptr || andOp->getOpcode() != llvm::Instruction::And) {
-        return false;
-      }
-      auto *candidateLoad = llvm::dyn_cast<llvm::LoadInst>(andOp->getOperand(0));
-      llvm::Value *maskValue = andOp->getOperand(1);
-      if (candidateLoad == nullptr) {
-        candidateLoad = llvm::dyn_cast<llvm::LoadInst>(andOp->getOperand(1));
-        maskValue = andOp->getOperand(0);
-      }
-      if (candidateLoad == nullptr ||
-          candidateLoad->getPointerOperand()->stripPointerCasts() !=
-              unit.Global) {
-        return false;
-      }
-      auto *maskConst = llvm::dyn_cast<llvm::ConstantInt>(maskValue);
-      if (maskConst == nullptr) {
-        return false;
-      }
-      load = candidateLoad;
-      lowValue = other;
-      andInst = andOp;
-      keepMask = maskConst->getValue();
-      return true;
-    };
-    if (matchAnd(lhs, rhs) || matchAnd(rhs, lhs)) {
-      return true;
-    }
-    return false;
+    return llvm::ConstantInt::get(type, 0);
   }
 
-  bool rewriteDeadKeepHighParts(llvm::Value *value,
-                                const std::map<llvm::Value *, llvm::APInt>
-                                    &demands) {
-    auto *orInst = llvm::dyn_cast<llvm::BinaryOperator>(value);
-    if (orInst == nullptr || orInst->getOpcode() != llvm::Instruction::Or) {
+  void eraseTriviallyDeadNonPhiTree(llvm::Instruction *root) {
+    std::vector<llvm::Instruction *> worklist;
+    worklist.push_back(root);
+    while (!worklist.empty()) {
+      llvm::Instruction *inst = worklist.back();
+      worklist.pop_back();
+      if (inst == nullptr || inst->getParent() == nullptr ||
+          llvm::isa<llvm::PHINode>(inst) ||
+          !llvm::isInstructionTriviallyDead(inst)) {
+        continue;
+      }
+
+      std::vector<llvm::Instruction *> operands;
+      for (llvm::Value *operand : inst->operand_values()) {
+        if (auto *operandInst = llvm::dyn_cast<llvm::Instruction>(operand)) {
+          operands.push_back(operandInst);
+        }
+      }
+      inst->eraseFromParent();
+      for (llvm::Instruction *operand : operands) {
+        if (operand->use_empty()) {
+          worklist.push_back(operand);
+        }
+      }
+    }
+  }
+
+  bool rewriteZeroDemandOperands(
+      llvm::Value *value, const std::map<llvm::Value *, llvm::APInt> &demands,
+      llvm::SmallPtrSetImpl<llvm::Value *> &visiting) {
+    auto *inst = llvm::dyn_cast_or_null<llvm::Instruction>(value);
+    if (inst == nullptr || !visiting.insert(inst).second) {
+      return false;
+    }
+    if (llvm::isa<llvm::CallBase>(inst) || inst->mayHaveSideEffects()) {
       return false;
     }
 
     bool changed = false;
-    for (unsigned index = 0; index < 2; ++index) {
-      auto *andInst =
-          llvm::dyn_cast<llvm::BinaryOperator>(orInst->getOperand(index));
-      if (andInst == nullptr ||
-          andInst->getOpcode() != llvm::Instruction::And) {
-        changed |= rewriteDeadKeepHighParts(orInst->getOperand(index), demands);
+    for (llvm::Use &operandUse : inst->operands()) {
+      llvm::Value *operand = operandUse.get();
+      if (llvm::isa<llvm::Constant>(operand)) {
         continue;
       }
-      bool hasRegisterLoad = false;
-      for (llvm::Value *operand : andInst->operand_values()) {
-        auto *load = llvm::dyn_cast<llvm::LoadInst>(operand);
-        if (load == nullptr) {
-          continue;
-        }
-        const RegisterUnit *unit = nullptr;
-        if (isRegisterPointer(load->getPointerOperand(), Units, unit)) {
-          hasRegisterLoad = true;
-          break;
-        }
-      }
-      if (!hasRegisterLoad) {
-        changed |= rewriteDeadKeepHighParts(orInst->getOperand(index), demands);
+
+      llvm::APInt demand = demandedBits(operand, demands);
+      if (!demand.isZero()) {
+        changed |= rewriteZeroDemandOperands(operand, demands, visiting);
         continue;
       }
-      auto demandIt = demands.find(andInst);
-      if (demandIt != demands.end() && !demandIt->second.isZero()) {
+
+      // This only rewrites register-store dataflow.  Replacing a zero-demand
+      // integer operand with zero preserves every bit that has a real observer
+      // and lets normal DCE remove stale register loads.
+      llvm::Constant *zero = zeroDemandReplacement(operand->getType());
+      if (zero == nullptr) {
+        changed |= rewriteZeroDemandOperands(operand, demands, visiting);
         continue;
       }
-      // The keep-high side only preserves old register bits.  If no later
-      // observer demands those bits, make the dataflow independent of the old
-      // register value and let normal DCE erase the load chain.
-      llvm::Value *zero = llvm::ConstantInt::get(andInst->getType(), 0);
-      orInst->setOperand(index, zero);
-      if (andInst->use_empty()) {
-        llvm::RecursivelyDeleteTriviallyDeadInstructions(andInst);
+
+      operandUse.set(zero);
+      if (auto *operandInst = llvm::dyn_cast<llvm::Instruction>(operand)) {
+        eraseTriviallyDeadNonPhiTree(operandInst);
       }
       changed = true;
     }
@@ -1995,9 +1968,14 @@ private:
 
   void rewritePartialWrites() {
     std::map<llvm::Value *, llvm::APInt> demands = computePartialDemands();
+    std::vector<llvm::StoreInst *> stores;
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
-      auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
-      if (store == nullptr) {
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        stores.push_back(store);
+      }
+    }
+    for (llvm::StoreInst *store : stores) {
+      if (store->getParent() == nullptr) {
         continue;
       }
       RegisterAccess access = registerStore(*store, Units);
@@ -2005,55 +1983,15 @@ private:
         continue;
       }
       ++Summary.PartialDemandCandidates;
-      llvm::LoadInst *load = nullptr;
-      llvm::Value *lowValue = nullptr;
-      llvm::BinaryOperator *andInst = nullptr;
-      llvm::BinaryOperator *orInst = nullptr;
-      llvm::APInt keepMask;
-      if (!matchKeepHighPartialStore(*store, *access.Unit, load, lowValue,
-                                     andInst, orInst, keepMask)) {
-        if (rewriteDeadKeepHighParts(store->getValueOperand(), demands)) {
-          ++Summary.PartialDemandMatched;
-        } else {
-          ++Summary.PartialDemandRejected;
-        }
+      if (!PostSignatureCleanup &&
+          (isRecordedCallArgStore(store) ||
+           isRecordedCallArgValue(store->getValueOperand()))) {
+        ++Summary.PartialDemandRejected;
         continue;
       }
-      llvm::APInt keepDemand = demands[andInst];
-      if (!keepDemand.isZero()) {
-        if (rewriteDeadKeepHighParts(store->getValueOperand(), demands)) {
-          ++Summary.PartialDemandMatched;
-        } else {
-          ++Summary.PartialDemandRejected;
-        }
-        continue;
-      }
-      llvm::IRBuilder<> builder(store);
-      llvm::Type *ty = store->getValueOperand()->getType();
-      llvm::Value *replacement = lowValue;
-      if (replacement->getType() != ty) {
-        if (replacement->getType()->isIntegerTy() && ty->isIntegerTy()) {
-          unsigned srcBits = replacement->getType()->getIntegerBitWidth();
-          unsigned dstBits = ty->getIntegerBitWidth();
-          if (srcBits < dstBits) {
-            replacement = builder.CreateZExt(replacement, ty,
-                                             replacement->getName() + ".zext");
-          } else if (srcBits > dstBits) {
-            replacement = builder.CreateTrunc(replacement, ty,
-                                              replacement->getName() + ".trunc");
-          }
-        }
-      }
-      if (replacement != nullptr && replacement != store->getValueOperand()) {
-        store->setOperand(0, replacement);
-        if (orInst != nullptr && orInst->use_empty()) {
-          llvm::RecursivelyDeleteTriviallyDeadInstructions(orInst);
-        }
-        if (load != nullptr && load->getParent() != nullptr &&
-            load->use_empty()) {
-          load->eraseFromParent();
-          ++Summary.DeadLoadsRemoved;
-        }
+      llvm::SmallPtrSet<llvm::Value *, 16> visiting;
+      if (rewriteZeroDemandOperands(store->getValueOperand(), demands,
+                                    visiting)) {
         ++Summary.PartialDemandMatched;
       } else {
         ++Summary.PartialDemandRejected;

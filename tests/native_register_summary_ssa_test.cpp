@@ -3283,6 +3283,56 @@ bool testPartialZmmKeepHighStoreIsDemandRewritten() {
                   "module failed verifier after partial zmm demand test");
 }
 
+bool testPartialZmmNakedKeepHighStoreIsDemandRewritten() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-zmm-naked-keep-high", context);
+  attachTestAbi(module);
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage,
+      "partial_zmm_naked_keep_high", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *old = loadRegister(builder, zmm0, "ZMM0", "old");
+  llvm::Value *keep = builder.CreateAnd(
+      old, llvm::ConstantInt::get(
+               zmmType, llvm::APInt::getBitsSet(512, 128, 512)));
+  storeRegister(builder, zmm0, keep, "ZMM0");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  unsigned zmmLoads = 0;
+  unsigned zmmStores = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      if (load->getPointerOperand()->stripPointerCasts() == zmm0) {
+        ++zmmLoads;
+      }
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      if (store->getPointerOperand()->stripPointerCasts() == zmm0) {
+        ++zmmStores;
+      }
+    }
+  }
+
+  return expect(summary.PartialDemandCandidates >= 1,
+                "partial zmm naked keep-high store was not seen as a candidate") &&
+         expect(summary.PartialDemandMatched >= 1,
+                "partial zmm naked keep-high store was not demand rewritten") &&
+         expect(zmmLoads == 0,
+                "partial zmm naked keep-high old load was not removed") &&
+         expect(zmmStores == 0,
+                "partial zmm naked keep-high store was not removed") &&
+         verifyOk(module,
+                  "module failed verifier after partial zmm naked demand test");
+}
+
 bool testPartialZmmDisjointLaneChainIsDemandRewritten() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-zmm-lane-chain", context);
@@ -3390,6 +3440,7 @@ int main() {
   ok &= testKnownUnaryLibmUsesFloatAbiSlots();
   ok &= testPartialKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
+  ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
