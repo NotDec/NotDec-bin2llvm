@@ -68,3 +68,38 @@ python3 scripts/native-register-residue-audit.py \
 - 维护成本：2/10。后续如果新增 summary metadata key，只需要补 key 列表；不需要维护自定义 global DCE 逻辑。
 
 更好的方案是未来把 register residue audit 接成更正式的 C++ 或 lit 检查，但当前先用现有 native summary SSA 单测和 fortune smoke 覆盖主链路即可。
+
+## native --skip-runtime 早期过滤
+
+用户追问 native 链路是否也能像 Java 导出一样，在最开始识别并去掉 `_start`、PLT、init/fini 这些非源码函数。当前实现把 runtime 识别下沉到 `NativeAnalysis`，`notdec-native-llvm --skip-runtime` 会在 seed / GTIRB import / Sleigh 递归发现阶段尽早过滤；最终 lowering 前仍保留同一个判断，防止已有状态里混入 runtime 函数。
+
+### 实现
+
+- `include/notdec-bin2llvm/NativeAnalysis.h`：新增 `NativeRuntimeFilterOptions`，并把 runtime filter 挂到 `NativeGtirbDecodeOptions` / `NativeSleighDecodeOptions`。
+- `include/notdec-bin2llvm/NativeAnalysis.h`：公开 `isNativeRuntimeFunctionName`、`isNativeRuntimeSectionName`、`isNativeRuntimeAddress`、`isNativeRuntimeSeed`、`isNativeRuntimeFunction`，供 CLI 和测试复用。
+- `lib/NativeAnalysis.cpp`：`ElfEntryAnalyzer` 在 `SkipRuntimeFunctions` 打开时不再添加 ELF entry / init / fini seed。
+- `lib/NativeAnalysis.cpp`：`ElfSymbolAnalyzer`、GTIRB function import、GTIRB seed fallback、Sleigh 初始 seed 队列和递归 call/tail target 都会跳过 runtime 地址。
+- `lib/NativeAnalysis.cpp`：runtime 地址规则覆盖 `.plt` / `.plt.got` / `.plt.sec` / `.init` / `.fini`，并补了 x86-64 glibc `_start` 指令模板识别，用于无符号/无名字时过滤 `_start`。
+- `tools/notdec-native-llvm.cpp`：新增 `--skip-runtime`，把选项传给 discovery，并在 all-confirmed lowering 前复用 `isNativeRuntimeFunction(...)` 做最后一道过滤。
+- `tests/native_analysis_facts_test.cpp`：补 runtime predicate 单测，覆盖名字、section、seed source 和普通函数不误判。
+
+### 验证
+
+```bash
+cmake --build build --target notdec-native-llvm native_analysis_facts_test -j4
+./build/bin/native_analysis_facts_test
+ctest --test-dir build -R notdec.native_analysis.facts --output-on-failure
+build/bin/notdec-native-llvm /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune --all-confirmed --skip-runtime -o /tmp/notdec-bin2llvm-fortune-skip-runtime-early3-20260702/fortune.native.skip-runtime.ll --summary-json-out /tmp/notdec-bin2llvm-fortune-skip-runtime-early3-20260702/fortune.native.summary.json
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-bin2llvm-fortune-skip-runtime-early3-20260702/fortune.native.skip-runtime.ll -o /tmp/notdec-bin2llvm-fortune-skip-runtime-early3-20260702/fortune.native.skip-runtime.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-bin2llvm-fortune-skip-runtime-early3-20260702/fortune.native.skip-runtime.bc -o /tmp/notdec-bin2llvm-fortune-skip-runtime-early3-20260702/fortune.native.skip-runtime.verified.bc
+```
+
+结果：构建通过；`notdec.native_analysis.facts` 通过，用时约 `28.61s`；fortune `llvm-as` / `opt -passes=verify` 通过，运行时间 `7.31s`。
+
+输出效果：`_start` / PLT stub 已经不在最终 IR 里，`@RAX/@RSP/@RDX` 被 DCE 清掉。当前还剩 `@RBX`，来源是 `notdec_native_27f0`，对应 `get_tbl.cold`，不是 runtime；它是源函数 cold fragment，后续要靠 cold fragment 合并或跨 fragment 参数/寄存器传递处理，不能按 runtime 直接删。
+
+### 评估
+
+- 实现效果：7/10。runtime 过滤已经提前到 discovery，能清掉 `_start` 造成的寄存器残留；但 fortune 仍剩 `get_tbl.cold` 的真实 cold fragment 残留。
+- 复杂度：4/10。规则集中在 `NativeAnalysis`，CLI 只传选项；x86-64 `_start` 模板有少量字节匹配。
+- 维护成本：4/10。后续如果遇到不同 libc/startup 模板，需要补样例；普通应用函数不会因为 `.text` 地址被误删。

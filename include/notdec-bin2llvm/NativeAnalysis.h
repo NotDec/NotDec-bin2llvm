@@ -164,6 +164,13 @@ struct NativeFunction {
   std::string Source;
 };
 
+// Runtime filtering keeps ELF/glibc startup, teardown, and PLT stubs out of
+// application-module discovery.  It is opt-in because these functions are still
+// useful when auditing the native lifter itself.
+struct NativeRuntimeFilterOptions {
+  bool SkipRuntimeFunctions = false;
+};
+
 // NativeXref keeps only the common reference shape used by CFG, callgraph, and
 // CLI queries.  More detailed operand metadata can be added when decode starts
 // producing it; the indexes below only depend on from/to/kind.
@@ -207,6 +214,7 @@ struct NativeGtirbDecodeOptions {
   std::string GtirbPath;
   std::string DdisasmPath = "ddisasm";
   bool GenerateIfMissing = true;
+  NativeRuntimeFilterOptions RuntimeFilter;
 };
 
 // NativeInstruction records decoded instruction facts accepted by native
@@ -363,12 +371,15 @@ struct NativeSleighDecodeOptions {
   std::optional<uint64_t> MaxDecodedSeeds;
   std::vector<uint64_t> InitialFunctionEntries;
   bool DecodeExistingBlocksOnly = false;
+  NativeRuntimeFilterOptions RuntimeFilter;
 };
 
 std::unique_ptr<NativeAnalyzer> createElfLoadAnalyzer();
 std::unique_ptr<NativeAnalyzer> createRelocationPltAnalyzer();
-std::unique_ptr<NativeAnalyzer> createElfEntryAnalyzer();
-std::unique_ptr<NativeAnalyzer> createElfSymbolAnalyzer();
+std::unique_ptr<NativeAnalyzer>
+createElfEntryAnalyzer(NativeRuntimeFilterOptions options = {});
+std::unique_ptr<NativeAnalyzer>
+createElfSymbolAnalyzer(NativeRuntimeFilterOptions options = {});
 std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer();
 std::unique_ptr<NativeAnalyzer> createGtirbFunctionFactsAnalyzer(
     NativeGtirbDecodeOptions options = {});
@@ -377,5 +388,13 @@ std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
 std::unique_ptr<NativeAnalyzer> createX86JumpTableAnalyzer();
 std::unique_ptr<NativeAnalyzer> createFlowFactNormalizer();
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output);
+
+bool isNativeRuntimeFunctionName(const std::string &name);
+bool isNativeRuntimeSectionName(const std::string &name);
+bool isNativeRuntimeAddress(const NativeProgramState &state, uint64_t address);
+bool isNativeRuntimeSeed(const NativeProgramState &state,
+                         const NativeFunctionSeed &seed);
+bool isNativeRuntimeFunction(const NativeProgramState &state,
+                             const NativeFunction &function);
 
 } // namespace notdec::bin2llvm

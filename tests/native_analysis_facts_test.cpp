@@ -97,6 +97,48 @@ bool testUnresolvedFlowKindStrings() {
   return ok;
 }
 
+bool testRuntimeFilterPredicates(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+
+  notdec::bin2llvm::NativeFunctionSeed nameSeed;
+  nameSeed.PrimaryName = "_start";
+
+  notdec::bin2llvm::NativeFunctionSeed entrySeed;
+  entrySeed.Sources.push_back("elf-entry");
+
+  notdec::bin2llvm::NativeFunction runtimeFunction;
+  runtimeFunction.Name = "_init";
+
+  notdec::bin2llvm::NativeFunction normalFunction;
+  normalFunction.Name = "main";
+
+  bool ok = true;
+  ok &= expectTrue(notdec::bin2llvm::isNativeRuntimeFunctionName("_start"),
+                   "_start was not recognized as runtime");
+  ok &= expectTrue(!notdec::bin2llvm::isNativeRuntimeFunctionName("main"),
+                   "main was incorrectly recognized as runtime");
+  ok &= expectTrue(notdec::bin2llvm::isNativeRuntimeSectionName(".plt"),
+                   ".plt was not recognized as runtime");
+  ok &= expectTrue(!notdec::bin2llvm::isNativeRuntimeSectionName(".text"),
+                   ".text was incorrectly recognized as runtime");
+  ok &= expectTrue(notdec::bin2llvm::isNativeRuntimeSeed(state, nameSeed),
+                   "runtime-name seed was not recognized");
+  ok &= expectTrue(notdec::bin2llvm::isNativeRuntimeSeed(state, entrySeed),
+                   "elf-entry seed was not recognized");
+  ok &= expectTrue(
+      notdec::bin2llvm::isNativeRuntimeFunction(state, runtimeFunction),
+      "runtime-name function was not recognized");
+  ok &= expectTrue(
+      !notdec::bin2llvm::isNativeRuntimeFunction(state, normalFunction),
+      "normal function was incorrectly recognized as runtime");
+  return ok;
+}
+
 bool testFlowNormalizerMovesNonCfgTargetToTail(const char *argv0) {
   auto binary = parseSelfBinary(argv0);
   if (!binary) {
@@ -755,6 +797,7 @@ int main(int argc, char **argv) {
   bool ok = true;
   ok &= testInstructionFlowKindStrings();
   ok &= testUnresolvedFlowKindStrings();
+  ok &= testRuntimeFilterPredicates(argv[0]);
   ok &= testFlowNormalizerMovesNonCfgTargetToTail(argv[0]);
   ok &= testFlowNormalizerClassifiesFinalIndirectBranchTailExit(argv[0]);
   ok &= testFlowNormalizerKeepsMiddleIndirectBranchUnresolved(argv[0]);

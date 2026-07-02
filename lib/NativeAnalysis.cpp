@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <limits>
 #include <functional>
 #include <ostream>
@@ -251,6 +252,53 @@ bool executableRangeContains(const NativeProgramState &state, uint64_t start,
     }
   }
   return false;
+}
+
+bool hasSource(const NativeFunctionSeed &seed, const std::string &source) {
+  return std::find(seed.Sources.begin(), seed.Sources.end(), source) !=
+         seed.Sources.end();
+}
+
+bool hasBytesAt(const NativeProgramState &state, uint64_t address,
+                std::initializer_list<uint8_t> expected) {
+  std::vector<uint8_t> bytes;
+  if (!readBytes(state, address, expected.size(), bytes)) {
+    return false;
+  }
+  return std::equal(bytes.begin(), bytes.end(), expected.begin(),
+                    expected.end());
+}
+
+bool isX86GlibcStartPattern(const NativeProgramState &state,
+                            uint64_t address) {
+  if (state.binary().header().machine_type() != LIEF::ELF::ARCH::X86_64) {
+    return false;
+  }
+
+  uint64_t cursor = address;
+  if (hasBytesAt(state, cursor, {0xf3, 0x0f, 0x1e, 0xfa})) {
+    cursor += 4;
+  }
+  if (!hasBytesAt(state, cursor,
+                  {0x31, 0xed, 0x49, 0x89, 0xd1, 0x5e, 0x48, 0x89,
+                   0xe2, 0x48, 0x83, 0xe4, 0xf0, 0x50, 0x54, 0x45,
+                   0x31, 0xc0, 0x31, 0xc9})) {
+    return false;
+  }
+  cursor += 20;
+
+  if (hasBytesAt(state, cursor, {0x48, 0x8d, 0x3d}) ||
+      hasBytesAt(state, cursor, {0x48, 0x8b, 0x3d}) ||
+      hasBytesAt(state, cursor, {0x48, 0xc7, 0xc7})) {
+    cursor += 7;
+  } else if (hasBytesAt(state, cursor, {0x48, 0xbf})) {
+    cursor += 10;
+  } else {
+    return false;
+  }
+
+  return hasBytesAt(state, cursor, {0xe8}) ||
+         hasBytesAt(state, cursor, {0xff, 0x15});
 }
 
 void addUnsupportedEhFrameSample(NativeEhFrameStats &stats,
@@ -541,10 +589,18 @@ private:
 
 class ElfEntryAnalyzer final : public NativeAnalyzer {
 public:
+  explicit ElfEntryAnalyzer(NativeRuntimeFilterOptions options)
+      : Options(options) {}
+
   std::string name() const override { return "ElfEntryAnalyzer"; }
   int priority() const override { return 30; }
 
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
+    if (Options.SkipRuntimeFunctions) {
+      state.addNote("runtime filter skipped ELF entry/init/fini seeds");
+      return;
+    }
+
     const LIEF::ELF::Binary &binary = state.binary();
     addDynamicScalarEntry(state, binary.entrypoint(), "elf-entry");
 
@@ -591,21 +647,27 @@ public:
                            "dt-preinit-array");
     addDynamicArrayEntries(state, finiArray, finiArraySize, "dt-fini-array");
   }
+
+private:
+  NativeRuntimeFilterOptions Options;
 };
 
 class ElfSymbolAnalyzer final : public NativeAnalyzer {
 public:
+  explicit ElfSymbolAnalyzer(NativeRuntimeFilterOptions options)
+      : Options(options) {}
+
   std::string name() const override { return "ElfSymbolAnalyzer"; }
   int priority() const override { return 40; }
 
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
     std::set<std::pair<uint64_t, std::string>> seenSymbols;
     for (const LIEF::ELF::Symbol &symbol : state.binary().symbols()) {
-      addSymbolSeed(state, symbol, "elf-symbol", seenSymbols);
+      addSymbolSeed(state, symbol, "elf-symbol", Options, seenSymbols);
     }
 
     for (const LIEF::ELF::Symbol &symbol : state.binary().dynamic_symbols()) {
-      addSymbolSeed(state, symbol, "elf-dynamic-symbol", seenSymbols);
+      addSymbolSeed(state, symbol, "elf-dynamic-symbol", Options, seenSymbols);
     }
   }
 
@@ -613,6 +675,7 @@ private:
   static void
   addSymbolSeed(NativeProgramState &state, const LIEF::ELF::Symbol &symbol,
                 const std::string &source,
+                const NativeRuntimeFilterOptions &options,
                 std::set<std::pair<uint64_t, std::string>> &seenSymbols) {
     if (symbol.type() != LIEF::ELF::Symbol::TYPE::FUNC ||
         symbol.shndx() == LIEF::ELF::Symbol::SECTION_INDEX::UNDEF ||
@@ -624,12 +687,19 @@ private:
       return;
     }
     std::string name = symbol.name();
+    if (options.SkipRuntimeFunctions &&
+        (isNativeRuntimeFunctionName(name) ||
+         isNativeRuntimeAddress(state, address))) {
+      return;
+    }
     if (!seenSymbols.insert({address, source + "\n" + name}).second) {
       return;
     }
     state.addFunctionSeed(address, symbol.size(), std::move(name), source,
                           NativeFunctionConfidence::High);
   }
+
+  NativeRuntimeFilterOptions Options;
 };
 
 class EhFrameAnalyzer final : public NativeAnalyzer {
@@ -2568,10 +2638,11 @@ public:
       uint64_t blockCount = 0;
       uint64_t edgeCount = 0;
       for (gtirb::Module &module : (*loaded)->modules()) {
-        importFunctions(state, context, module, functionCount, blockCount);
+        importFunctions(state, context, module, Options.RuntimeFilter,
+                        functionCount, blockCount);
         importCfgEdges(state, module, edgeCount);
       }
-      uint64_t fallbackCount = importSeedRanges(state);
+      uint64_t fallbackCount = importSeedRanges(state, Options.RuntimeFilter);
       state.addNote("gtirb frontend imported from " + std::string(source) +
                     ": " + std::to_string(functionCount) + " functions, " +
                     std::to_string(blockCount) + " blocks, " +
@@ -2686,6 +2757,7 @@ private:
   static void importFunctions(NativeProgramState &state,
                               const gtirb::Context &context,
                               const gtirb::Module &module,
+                              const NativeRuntimeFilterOptions &runtimeFilter,
                               uint64_t &functionCount, uint64_t &blockCount) {
     const auto *functionEntries =
         module.getAuxData<gtirb::schema::FunctionEntries>();
@@ -2746,6 +2818,11 @@ private:
                 [](const NativeBasicBlock &lhs,
                    const NativeBasicBlock &rhs) { return lhs.Start < rhs.Start; });
       std::string name = functionNameFor(context, module, functionUuid);
+      if (runtimeFilter.SkipRuntimeFunctions &&
+          (isNativeRuntimeFunctionName(name) ||
+           isNativeRuntimeAddress(state, entryAddress))) {
+        continue;
+      }
       state.addFunctionSeed(entryAddress, rangeEnd - rangeStart, name,
                             "gtirb-ddisasm",
                             NativeFunctionConfidence::High);
@@ -2815,7 +2892,9 @@ private:
     }
   }
 
-  static uint64_t importSeedRanges(NativeProgramState &state) {
+  static uint64_t
+  importSeedRanges(NativeProgramState &state,
+                   const NativeRuntimeFilterOptions &runtimeFilter) {
     uint64_t imported = 0;
     for (const auto &[entry, seed] : state.functionSeeds()) {
       if (state.functionAt(entry) != nullptr ||
@@ -2823,6 +2902,10 @@ private:
           seed.RangeStart == 0 || seed.RangeEnd <= seed.RangeStart ||
           !state.isExecutableAddress(entry) ||
           !executableRangeContains(state, seed.RangeStart, seed.RangeEnd)) {
+        continue;
+      }
+      if (runtimeFilter.SkipRuntimeFunctions &&
+          isNativeRuntimeSeed(state, seed)) {
         continue;
       }
 
@@ -2902,11 +2985,19 @@ public:
           decodeSeed(state, decoder, item.FunctionEntry, item.BlockAddress);
       ++decodedSeedCount;
       for (uint64_t target : result.CallTargets) {
+        if (Options.RuntimeFilter.SkipRuntimeFunctions &&
+            isNativeRuntimeAddress(state, target)) {
+          continue;
+        }
         state.addFunctionSeed(target, 0, "", "sleigh-direct-call",
                               NativeFunctionConfidence::High);
         enqueueSeed(state, target, target, decodeQueue, queuedSeeds);
       }
       for (uint64_t target : result.TailBranchTargets) {
+        if (Options.RuntimeFilter.SkipRuntimeFunctions &&
+            isNativeRuntimeAddress(state, target)) {
+          continue;
+        }
         state.addFunctionSeed(target, 0, "", "sleigh-tail-branch",
                               NativeFunctionConfidence::High);
         enqueueSeed(state, target, target, decodeQueue, queuedSeeds);
@@ -3108,6 +3199,10 @@ private:
         auto seedIterator = state.functionSeeds().find(item.Address);
         if (seedIterator == state.functionSeeds().end() ||
             seedIterator->second.Confidence != confidence) {
+          continue;
+        }
+        if (options.RuntimeFilter.SkipRuntimeFunctions &&
+            isNativeRuntimeSeed(state, seedIterator->second)) {
           continue;
         }
         enqueueSeed(state, item.Address, item.Address, decodeQueue,
@@ -4937,6 +5032,68 @@ bool NativeProgramState::addFunction(NativeFunction function) {
   return true;
 }
 
+bool isNativeRuntimeFunctionName(const std::string &name) {
+  static const std::set<std::string> names = {
+      "_start",
+      "_init",
+      "_fini",
+      "_DT_INIT",
+      "_DT_FINI",
+      "_INIT_0",
+      "_FINI_0",
+      "deregister_tm_clones",
+      "register_tm_clones",
+      "__do_global_dtors_aux",
+      "frame_dummy",
+      "_dl_relocate_static_pie",
+  };
+  return names.find(name) != names.end();
+}
+
+bool isNativeRuntimeSectionName(const std::string &name) {
+  return name == ".plt" || name == ".plt.got" || name == ".plt.sec" ||
+         name == ".init" || name == ".fini";
+}
+
+bool isNativeRuntimeAddress(const NativeProgramState &state,
+                            uint64_t address) {
+  for (const NativeSectionInfo &section : state.sections()) {
+    if (isNativeRuntimeSectionName(section.Name) &&
+        containsAddress(section.Address, section.Size, address)) {
+      return true;
+    }
+  }
+  return isX86GlibcStartPattern(state, address);
+}
+
+bool isNativeRuntimeSeed(const NativeProgramState &state,
+                         const NativeFunctionSeed &seed) {
+  if (isNativeRuntimeFunctionName(seed.PrimaryName) ||
+      isNativeRuntimeAddress(state, seed.Address) ||
+      hasSource(seed, "elf-entry") || hasSource(seed, "dt-init") ||
+      hasSource(seed, "dt-fini") || hasSource(seed, "dt-init-array") ||
+      hasSource(seed, "dt-preinit-array") || hasSource(seed, "dt-fini-array")) {
+    return true;
+  }
+  for (const std::string &alias : seed.Aliases) {
+    if (isNativeRuntimeFunctionName(alias)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool isNativeRuntimeFunction(const NativeProgramState &state,
+                             const NativeFunction &function) {
+  if (isNativeRuntimeFunctionName(function.Name) ||
+      isNativeRuntimeAddress(state, function.Entry)) {
+    return true;
+  }
+  auto seed = state.functionSeeds().find(function.Entry);
+  return seed != state.functionSeeds().end() &&
+         isNativeRuntimeSeed(state, seed->second);
+}
+
 bool NativeProgramState::addBasicBlock(uint64_t functionEntry,
                                        NativeBasicBlock block) {
   auto iterator = Functions.find(functionEntry);
@@ -5264,12 +5421,14 @@ std::unique_ptr<NativeAnalyzer> createRelocationPltAnalyzer() {
   return std::make_unique<RelocationPltAnalyzer>();
 }
 
-std::unique_ptr<NativeAnalyzer> createElfEntryAnalyzer() {
-  return std::make_unique<ElfEntryAnalyzer>();
+std::unique_ptr<NativeAnalyzer>
+createElfEntryAnalyzer(NativeRuntimeFilterOptions options) {
+  return std::make_unique<ElfEntryAnalyzer>(options);
 }
 
-std::unique_ptr<NativeAnalyzer> createElfSymbolAnalyzer() {
-  return std::make_unique<ElfSymbolAnalyzer>();
+std::unique_ptr<NativeAnalyzer>
+createElfSymbolAnalyzer(NativeRuntimeFilterOptions options) {
+  return std::make_unique<ElfSymbolAnalyzer>(options);
 }
 
 std::unique_ptr<NativeAnalyzer> createEhFrameAnalyzer() {

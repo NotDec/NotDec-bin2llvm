@@ -73,6 +73,7 @@ struct CliOptions {
   bool DisablePrototypeRecoveryPass = false;
   bool PrintPrototypeRecoverySummary = false;
   bool RewritePrototypeSignatures = false;
+  bool SkipRuntimeFunctions = false;
 };
 
 void printUsage(const char *argv0) {
@@ -89,6 +90,7 @@ void printUsage(const char *argv0) {
                "[--no-prototype-recovery-pass] "
                "[--prototype-recovery-summary] "
                "[--rewrite-prototype-signatures] "
+               "[--skip-runtime] "
                "[--native-decode-mode gtirb|internal] [--gtirb <path>] "
                "[--decode-seed-limit <count>] "
                "[--memory-model inttoptr|global-array] [-p root-sla-dir] "
@@ -179,6 +181,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
     if (flag == "--rewrite-prototype-signatures") {
       options.RewritePrototypeSignatures = true;
+      continue;
+    }
+    if (flag == "--skip-runtime") {
+      options.SkipRuntimeFunctions = true;
       continue;
     }
     if (argIndex + 1 >= argc) {
@@ -396,13 +402,17 @@ runNativeDiscovery(const LIEF::ELF::Binary &binary,
       options.DecodeOptions;
   notdec::bin2llvm::NativeGtirbDecodeOptions gtirbOptions =
       options.GtirbOptions;
+  notdec::bin2llvm::NativeRuntimeFilterOptions runtimeFilter;
+  runtimeFilter.SkipRuntimeFunctions = options.SkipRuntimeFunctions;
+  decodeOptions.RuntimeFilter = runtimeFilter;
+  gtirbOptions.RuntimeFilter = runtimeFilter;
   gtirbOptions.ElfPath = options.ElfPath;
   notdec::bin2llvm::NativeProgramState state(binary);
   notdec::bin2llvm::NativeAnalysisManager manager;
   manager.addAnalyzer(notdec::bin2llvm::createElfLoadAnalyzer());
   manager.addAnalyzer(notdec::bin2llvm::createRelocationPltAnalyzer());
-  manager.addAnalyzer(notdec::bin2llvm::createElfEntryAnalyzer());
-  manager.addAnalyzer(notdec::bin2llvm::createElfSymbolAnalyzer());
+  manager.addAnalyzer(notdec::bin2llvm::createElfEntryAnalyzer(runtimeFilter));
+  manager.addAnalyzer(notdec::bin2llvm::createElfSymbolAnalyzer(runtimeFilter));
   manager.addAnalyzer(notdec::bin2llvm::createEhFrameAnalyzer());
   if (options.DecodeMode == notdec::bin2llvm::NativeDecodeMode::Gtirb) {
     decodeOptions.DecodeExistingBlocksOnly = true;
@@ -642,8 +652,20 @@ sectionByName(const notdec::bin2llvm::NativeProgramState &state,
   return std::nullopt;
 }
 
+bool shouldLowerNativeFunction(
+    const notdec::bin2llvm::NativeProgramState &state,
+    const notdec::bin2llvm::NativeFunction &function,
+    bool skipRuntimeFunctions) {
+  if (function.RangeEnd <= function.Entry) {
+    return false;
+  }
+  return !skipRuntimeFunctions ||
+         !notdec::bin2llvm::isNativeRuntimeFunction(state, function);
+}
+
 NativeCallTargets planNativeCallTargets(
-    const notdec::bin2llvm::NativeProgramState &state) {
+    const notdec::bin2llvm::NativeProgramState &state,
+    bool skipRuntimeFunctions) {
   NativeCallTargets targets;
   std::set<std::string> usedNames;
   std::unordered_map<std::string, std::string> externalNamesBySymbol;
@@ -659,7 +681,7 @@ NativeCallTargets planNativeCallTargets(
 
   for (const auto &[entry, function] : state.functions()) {
     (void)entry;
-    if (function.RangeEnd <= function.Entry) {
+    if (!shouldLowerNativeFunction(state, function, skipRuntimeFunctions)) {
       continue;
     }
     targets.Direct.emplace(function.Entry,
@@ -767,16 +789,22 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
     notdec::bin2llvm::LiefElfLoadImage &loadImage,
     const notdec::bin2llvm::SleighSpecOptions &specOptions,
     notdec::bin2llvm::PcodeMemoryModel memoryModel,
+    bool skipRuntimeFunctions,
     std::string &errorMessage) {
   auto module =
       std::make_unique<llvm::Module>("notdec.bin2llvm.native.confirmed", context);
 
-  NativeCallTargets callTargets = planNativeCallTargets(state);
+  NativeCallTargets callTargets =
+      planNativeCallTargets(state, skipRuntimeFunctions);
 
   unsigned appended = 0;
+  unsigned skippedRuntime = 0;
   for (const auto &[entry, function] : state.functions()) {
     (void)entry;
-    if (function.RangeEnd <= function.Entry) {
+    if (!shouldLowerNativeFunction(state, function, skipRuntimeFunctions)) {
+      if (function.RangeEnd > function.Entry && skipRuntimeFunctions) {
+        ++skippedRuntime;
+      }
       continue;
     }
 
@@ -824,6 +852,11 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
       return nullptr;
     }
     ++appended;
+  }
+
+  if (skippedRuntime != 0) {
+    std::cerr << "skipped runtime native functions: " << skippedRuntime
+              << '\n';
   }
 
   if (appended == 0) {
@@ -1044,7 +1077,7 @@ int main(int argc, char **argv) {
     if (options->AllConfirmed) {
       module = buildConfirmedModule(context, *selectedState, loadImage,
                                     options->SpecOptions, options->MemoryModel,
-                                    errorMessage);
+                                    options->SkipRuntimeFunctions, errorMessage);
     } else {
       notdec::bin2llvm::PcodeProgram program;
       if (!options->FunctionBlockRanges.empty()) {
@@ -1071,9 +1104,11 @@ int main(int argc, char **argv) {
       if (options->FunctionEntry) {
         config.EntryAddress = *options->FunctionEntry;
         NativeCallTargets callTargets =
-            selectedState ? planNativeCallTargets(*selectedState)
-                          : planNativeCallTargets(runNativeDiscovery(
-                                *binary, *options));
+            selectedState ? planNativeCallTargets(
+                                *selectedState, options->SkipRuntimeFunctions)
+                          : planNativeCallTargets(
+                                runNativeDiscovery(*binary, *options),
+                                options->SkipRuntimeFunctions);
         callTargets.Direct[*options->FunctionEntry] = config.EntryFunctionName;
         config.DirectCallTargets = std::move(callTargets.Direct);
         config.ExternalCallTargets = std::move(callTargets.External);
