@@ -1,4 +1,5 @@
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
@@ -260,6 +261,30 @@ bool hasRegisterLoad(const llvm::Function &function, llvm::StringRef name) {
 bool hasStoreInstruction(const llvm::Function &function) {
   for (const llvm::Instruction &inst : llvm::instructions(function)) {
     if (llvm::isa<llvm::StoreInst>(inst)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool functionHasAnyRegisterSummaryMetadata(const llvm::Function &function) {
+  return function.getMetadata("notdec.register.summary") != nullptr ||
+         function.getMetadata("notdec.register.summary.read_entry") != nullptr ||
+         function.getMetadata("notdec.register.summary.preserves") != nullptr ||
+         function.getMetadata("notdec.register.summary.modifies") != nullptr ||
+         function.getMetadata("notdec.register.summary.demanded_returns") !=
+             nullptr ||
+         function.getMetadata("notdec.register.summary_ssa") != nullptr;
+}
+
+bool moduleHasFunctionNamed(const llvm::Module &module, llvm::StringRef name) {
+  return module.getFunction(name) != nullptr;
+}
+
+bool moduleHasOverflowIntrinsicDeclaration(const llvm::Module &module) {
+  for (const llvm::Function &function : module) {
+    if (function.isDeclaration() &&
+        function.getName().contains(".with.overflow.")) {
       return true;
     }
   }
@@ -3465,6 +3490,103 @@ bool testPartialZmmDisjointLaneChainIsDemandRewritten() {
                   "module failed verifier after partial zmm lane chain test");
 }
 
+bool testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-clean", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "final_cleanup_clean", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *value = llvm::ConstantInt::get(rdi->getValueType(), 17);
+  storeRegister(builder, rdi, value, "RDI");
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool hadMetadata = functionHasAnyRegisterSummaryMetadata(*function);
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+
+  return expect(hadMetadata, "summary SSA did not attach metadata before cleanup") &&
+         expect(module.getGlobalVariable("RDI") == nullptr,
+                "dead RDI global remained after final cleanup") &&
+         expect(!functionHasAnyRegisterSummaryMetadata(*function),
+                "register summary metadata remained on clean function") &&
+         expect(cleanup.FunctionMetadataCleared >= 1,
+                "final cleanup did not count cleared metadata") &&
+         expect(cleanup.RemainingRegisterAccesses == 0,
+                "final cleanup reported register residue in clean module") &&
+         verifyOk(module, "module failed verifier after final cleanup test");
+}
+
+bool testFinalCleanupKeepsMetadataWhenRegisterAccessRemains() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-residue", context);
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "final_cleanup_residue", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  loadRegister(builder, rbx, "RBX", "rbx.live");
+  builder.CreateRetVoid();
+
+  llvm::LLVMContext &moduleContext = module.getContext();
+  llvm::Metadata *field[] = {
+      llvm::MDString::get(moduleContext, "loads_replaced=0"),
+  };
+  function->setMetadata("notdec.register.summary_ssa",
+                        llvm::MDNode::get(moduleContext, field));
+
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+
+  return expect(module.getGlobalVariable("RBX") != nullptr,
+                "live RBX global was removed") &&
+         expect(function->getMetadata("notdec.register.summary_ssa") != nullptr,
+                "metadata was cleared while register access remained") &&
+         expect(cleanup.RemainingRegisterAccesses == 1,
+                "final cleanup did not report remaining register access") &&
+         verifyOk(module, "module failed verifier after residue cleanup test");
+}
+
+bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-globaldce", context);
+
+  llvm::Intrinsic::getOrInsertDeclaration(
+      &module, llvm::Intrinsic::ssub_with_overflow,
+      {llvm::Type::getInt8Ty(context)});
+  auto *helperType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
+                                             {}, false);
+  llvm::Function::Create(helperType, llvm::GlobalValue::ExternalLinkage,
+                         "notdec.register.summary_return.i64", module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "final_cleanup_globaldce", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+
+  return expect(!moduleHasOverflowIntrinsicDeclaration(module),
+                "unused overflow intrinsic declaration remained") &&
+         expect(!moduleHasFunctionNamed(module,
+                                        "notdec.register.summary_return.i64"),
+                "unused register summary helper declaration remained") &&
+         verifyOk(module, "module failed verifier after globaldce cleanup test");
+}
+
 } // namespace
 
 int main() {
@@ -3521,5 +3643,8 @@ int main() {
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();
+  ok &= testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata();
+  ok &= testFinalCleanupKeepsMetadataWhenRegisterAccessRemains();
+  ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

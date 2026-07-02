@@ -6,6 +6,7 @@
 #include "notdec-bin2llvm/SleighLift.h"
 #include "notdec-bin2llvm/passes/heritage/NativePrototypeRecovery.h"
 #include "notdec-bin2llvm/passes/heritage/NativeHeritageSSA.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 
 #include "llvm/IR/LLVMContext.h"
@@ -948,6 +949,16 @@ bool runPrototypeRecoveryPassIfEnabled(llvm::Module &module,
   return true;
 }
 
+bool runFinalCleanupPass(llvm::Module &module) {
+  notdec::bin2llvm::NativeRegisterFinalCleanupOptions passOptions;
+  notdec::bin2llvm::runNativeRegisterFinalCleanup(module, passOptions);
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after final cleanup pass\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -980,6 +991,9 @@ int main(int argc, char **argv) {
         return 1;
       }
       if (!runPrototypeRecoveryPassIfEnabled(*module, *options)) {
+        return 1;
+      }
+      if (!runFinalCleanupPass(*module)) {
         return 1;
       }
       return writeModule(*module, options->OutputPath);
@@ -1100,6 +1114,9 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (!runPrototypeRecoveryPassIfEnabled(*module, *options)) {
+      return 1;
+    }
+    if (!runFinalCleanupPass(*module)) {
       return 1;
     }
 

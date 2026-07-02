@@ -11,6 +11,7 @@ add_library(notdec-bin2llvm-core STATIC
   passes/summary/NativeStackCanaryCleanup.cpp
   passes/summary/NativeRegisterSummary.cpp
   passes/summary/NativeRegisterSummarySSA.cpp
+  passes/summary/NativeRegisterFinalCleanup.cpp
   passes/heritage/NativeHeritageSSA.cpp
   RegisterStorage.cpp
 )
