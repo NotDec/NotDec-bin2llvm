@@ -139,6 +139,100 @@ bool testRuntimeFilterPredicates(const char *argv0) {
   return ok;
 }
 
+bool testFlowNormalizerFoldsEhFrameOnlyBranchTarget(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t entry = *base + 0x180;
+  uint64_t fallthrough = entry + 0x02;
+  uint64_t cold = entry + 0x40;
+
+  notdec::bin2llvm::NativeFunction owner;
+  owner.Entry = entry;
+  owner.RangeStart = entry;
+  owner.RangeEnd = fallthrough + 0x02;
+  owner.Source = "native-analysis-facts-test";
+  owner.Blocks.push_back({entry, fallthrough, {}});
+  owner.Blocks.push_back({fallthrough, fallthrough + 0x02, {}});
+  if (!state.addFunction(std::move(owner))) {
+    std::cerr << "failed to add owner function\n";
+    return false;
+  }
+
+  state.addFunctionSeed(cold, 0, "", "eh-frame",
+                        notdec::bin2llvm::NativeFunctionConfidence::High);
+  state.addFunctionRange(cold, cold, cold + 0x02, "eh-frame");
+
+  notdec::bin2llvm::NativeFunction coldFunction;
+  coldFunction.Entry = cold;
+  coldFunction.RangeStart = cold;
+  coldFunction.RangeEnd = cold + 0x02;
+  coldFunction.Source = "gtirb-seed-range-fallback";
+  coldFunction.Blocks.push_back({cold, cold + 0x02, {}});
+  if (!state.addFunction(std::move(coldFunction))) {
+    std::cerr << "failed to add cold function\n";
+    return false;
+  }
+
+  notdec::bin2llvm::NativeInstruction branch = makeInstruction(
+      entry, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::ConditionalBranch);
+  branch.TailFlowTargets.push_back(cold);
+  branch.Fallthrough = fallthrough;
+  state.addInstruction(std::move(branch));
+  state.addInstruction(makeInstruction(
+      fallthrough, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::Return));
+  state.addInstruction(makeInstruction(
+      cold, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::Trap));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeFunction *folded = state.functionAt(entry);
+  bool sawColdBlock = false;
+  bool sourceBranchesToCold = false;
+  if (folded != nullptr) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block : folded->Blocks) {
+      if (block.Start == cold && block.End == cold + 0x02) {
+        sawColdBlock = true;
+      }
+      if (block.Start == entry) {
+        sourceBranchesToCold =
+            std::find(block.Successors.begin(), block.Successors.end(), cold) !=
+            block.Successors.end();
+      }
+    }
+  }
+
+  auto seed = state.functionSeeds().find(cold);
+  const notdec::bin2llvm::NativeInstruction *normalizedBranch =
+      state.instructionAt(entry);
+  bool ok = true;
+  ok &= expectTrue(state.functionAt(cold) == nullptr,
+                   "eh-frame-only branch target stayed a function");
+  ok &= expectTrue(seed != state.functionSeeds().end() && !seed->second.IsEntry,
+                   "folded eh-frame seed stayed an entry");
+  ok &= expectTrue(sawColdBlock, "cold block was not folded into owner");
+  ok &= expectTrue(sourceBranchesToCold,
+                   "owner branch did not gain cold successor");
+  ok &= expectTrue(normalizedBranch != nullptr &&
+                       normalizedBranch->DirectFlowTargets.size() == 1 &&
+                       normalizedBranch->DirectFlowTargets.front() == cold &&
+                       normalizedBranch->TailFlowTargets.empty(),
+                   "folded branch still carries tail-flow metadata");
+  return ok;
+}
+
 bool testFlowNormalizerMovesNonCfgTargetToTail(const char *argv0) {
   auto binary = parseSelfBinary(argv0);
   if (!binary) {
@@ -798,6 +892,7 @@ int main(int argc, char **argv) {
   ok &= testInstructionFlowKindStrings();
   ok &= testUnresolvedFlowKindStrings();
   ok &= testRuntimeFilterPredicates(argv[0]);
+  ok &= testFlowNormalizerFoldsEhFrameOnlyBranchTarget(argv[0]);
   ok &= testFlowNormalizerMovesNonCfgTargetToTail(argv[0]);
   ok &= testFlowNormalizerClassifiesFinalIndirectBranchTailExit(argv[0]);
   ok &= testFlowNormalizerKeepsMiddleIndirectBranchUnresolved(argv[0]);

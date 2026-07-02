@@ -83,7 +83,8 @@ collectSleighPcodeRanges(ghidra::LoadImage &loadImage,
                          const SleighSpecOptions &options,
                          const std::vector<std::pair<uint64_t, uint64_t>>
                              &ranges,
-                         std::ostream &errorStream);
+                         std::ostream &errorStream,
+                         bool preserveRangeOrder = false);
 
 std::vector<SleighInstructionSummary>
 collectSleighInstructionSummaries(ghidra::LoadImage &loadImage,

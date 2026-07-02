@@ -1797,6 +1797,14 @@ private:
     auto seedOperand = [&](llvm::Value *value) {
       enqueue(value, fullMaskFor(value));
     };
+    auto seedMemoryPointer = [&](llvm::Value *pointer) {
+      seedOperand(pointer);
+      auto *op = llvm::dyn_cast_or_null<llvm::Operator>(pointer);
+      if (op != nullptr && op->getOpcode() == llvm::Instruction::IntToPtr &&
+          op->getNumOperands() != 0) {
+        seedOperand(op->getOperand(0));
+      }
+    };
 
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
       if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&inst)) {
@@ -1811,9 +1819,17 @@ private:
         }
         continue;
       }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        RegisterAccess access = registerLoad(*load, Units);
+        if (access.Unit == nullptr) {
+          seedMemoryPointer(load->getPointerOperand());
+        }
+        continue;
+      }
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
         RegisterAccess access = registerStore(*store, Units);
         if (access.Unit == nullptr) {
+          seedMemoryPointer(store->getPointerOperand());
           seedOperand(store->getValueOperand());
         }
         continue;
@@ -1965,6 +1981,9 @@ private:
       case llvm::Instruction::IntToPtr:
       case llvm::Instruction::AddrSpaceCast:
         enqueue(inst->getOperand(0), inputDemand);
+        break;
+      case llvm::Instruction::Load:
+        seedMemoryPointer(inst->getOperand(0));
         break;
       case llvm::Instruction::InsertValue:
       case llvm::Instruction::ExtractValue:

@@ -1154,14 +1154,6 @@ private:
         return;
       }
 
-      bool inserted = State.addFunctionSeed(pcBegin, 0, "", "eh-frame",
-                                            NativeFunctionConfidence::High);
-      if (inserted) {
-        ++stats().AddedSeedCount;
-      } else {
-        ++stats().OverlappedSeedCount;
-      }
-
       if (pcBegin > std::numeric_limits<uint64_t>::max() - pcRange) {
         ++stats().InvalidCount;
         return;
@@ -1175,6 +1167,13 @@ private:
         return;
       }
 
+      bool inserted = State.addFunctionSeed(pcBegin, 0, "", "eh-frame",
+                                            NativeFunctionConfidence::High);
+      if (inserted) {
+        ++stats().AddedSeedCount;
+      } else {
+        ++stats().OverlappedSeedCount;
+      }
       State.addFunctionRange(pcBegin, pcBegin, pcEnd, "eh-frame");
       stats().FrameFdes.push_back({pcBegin, recordAddress(recordOffset)});
       ++stats().ParsedFdeCount;
@@ -4065,6 +4064,7 @@ private:
     }
     auto seedIterator = state.functionSeeds().find(address);
     return seedIterator != state.functionSeeds().end() &&
+           seedIterator->second.IsEntry &&
            isBoundarySeed(seedIterator->second);
   }
 
@@ -4462,6 +4462,7 @@ public:
     for (auto &[entry, block] : splitBlocks) {
       state.addBasicBlock(entry, std::move(block));
     }
+    foldEhFrameOnlyBranchTargets(state);
     for (const auto &[entry, function] : state.functions()) {
       state.removeInvalidBasicBlockSuccessors(entry);
       for (const NativeBasicBlock &block : function.Blocks) {
@@ -4544,6 +4545,81 @@ private:
                         : "x86-tail-branch-external-function-pointer";
       state.addXref(std::move(xref));
       state.removeUnresolvedFlow(flow.Address, flow.Kind);
+    }
+  }
+
+  static void foldEhFrameOnlyBranchTargets(NativeProgramState &state) {
+    std::vector<std::pair<uint64_t, uint64_t>> folds;
+    for (const auto &[entry, function] : state.functions()) {
+      for (const NativeBasicBlock &block : function.Blocks) {
+        const NativeInstruction *terminator = nullptr;
+        for (const NativeInstruction *instruction :
+             state.instructionsInRange(block.Start, block.End)) {
+          terminator = instruction;
+        }
+        if (terminator == nullptr ||
+            terminator->FlowKind == NativeInstructionFlowKind::UnconditionalBranch) {
+          continue;
+        }
+        std::vector<uint64_t> targets = terminator->DirectFlowTargets;
+        if (terminator->FlowKind == NativeInstructionFlowKind::ConditionalBranch) {
+          for (uint64_t target : terminator->TailFlowTargets) {
+            addUniqueAddress(targets, target);
+          }
+        }
+        for (uint64_t target : targets) {
+          if (target == entry || functionHasBlockStartingAt(function, target)) {
+            continue;
+          }
+          const NativeFunction *targetFunction = state.functionAt(target);
+          if (targetFunction == nullptr || targetFunction->Source !=
+                                               "gtirb-seed-range-fallback") {
+            continue;
+          }
+          auto seedIterator = state.functionSeeds().find(target);
+          if (seedIterator == state.functionSeeds().end() ||
+              !hasSource(seedIterator->second, "eh-frame") ||
+              seedIterator->second.Sources.size() != 1) {
+            continue;
+          }
+          folds.push_back({entry, target});
+        }
+      }
+    }
+
+    for (const auto &[ownerEntry, targetEntry] : folds) {
+      const NativeFunction *targetFunction = state.functionAt(targetEntry);
+      if (targetFunction == nullptr) {
+        continue;
+      }
+      std::vector<NativeBasicBlock> blocks = targetFunction->Blocks;
+      for (NativeBasicBlock &block : blocks) {
+        state.addBasicBlock(ownerEntry, std::move(block));
+      }
+      for (const auto &[entry, function] : state.functions()) {
+        if (entry != ownerEntry) {
+          continue;
+        }
+        for (const NativeBasicBlock &block : function.Blocks) {
+          const NativeInstruction *terminator = nullptr;
+          for (const NativeInstruction *instruction :
+               state.instructionsInRange(block.Start, block.End)) {
+            terminator = instruction;
+          }
+          if (terminator == nullptr ||
+              terminator->FlowKind != NativeInstructionFlowKind::ConditionalBranch ||
+              std::find(terminator->TailFlowTargets.begin(),
+                        terminator->TailFlowTargets.end(), targetEntry) ==
+                  terminator->TailFlowTargets.end()) {
+            continue;
+          }
+          state.restoreInstructionTailFlowTarget(terminator->Address,
+                                                 targetEntry);
+          state.addBasicBlockSuccessors(ownerEntry, block.Start, {targetEntry});
+        }
+      }
+      state.demoteFunctionSeedToRangeHint(targetEntry);
+      state.removeFunction(targetEntry);
     }
   }
 
@@ -4968,6 +5044,10 @@ bool NativeProgramState::addFunctionSeed(uint64_t address, uint64_t size,
       seed.RangeSource = source;
     }
   } else {
+    bool promotedRangeHint = !seed.IsEntry;
+    if (promotedRangeHint) {
+      seed.IsEntry = true;
+    }
     if (seed.Size == 0 && size != 0) {
       seed.Size = size;
     }
@@ -4994,6 +5074,9 @@ bool NativeProgramState::addFunctionSeed(uint64_t address, uint64_t size,
       seed.Aliases.push_back(std::move(name));
     }
     seed.Confidence = mergeConfidence(seed.Confidence, confidence);
+    if (promotedRangeHint) {
+      FunctionWorklist.push_back({address, source});
+    }
   }
 
   if (inserted) {
@@ -5029,6 +5112,19 @@ bool NativeProgramState::addFunction(NativeFunction function) {
   }
 
   Functions.emplace(function.Entry, std::move(function));
+  return true;
+}
+
+bool NativeProgramState::removeFunction(uint64_t entry) {
+  return Functions.erase(entry) != 0;
+}
+
+bool NativeProgramState::demoteFunctionSeedToRangeHint(uint64_t address) {
+  auto iterator = FunctionSeeds.find(address);
+  if (iterator == FunctionSeeds.end()) {
+    return false;
+  }
+  iterator->second.IsEntry = false;
   return true;
 }
 
@@ -5281,6 +5377,29 @@ bool NativeProgramState::markInstructionTailFlowTarget(uint64_t address,
                 instruction.TailFlowTargets.end(),
                 target) == instruction.TailFlowTargets.end()) {
     instruction.TailFlowTargets.push_back(target);
+  }
+  return true;
+}
+
+bool NativeProgramState::restoreInstructionTailFlowTarget(uint64_t address,
+                                                          uint64_t target) {
+  auto iterator = Instructions.find(address);
+  if (iterator == Instructions.end()) {
+    return false;
+  }
+
+  NativeInstruction &instruction = iterator->second;
+  auto tailTarget = std::find(instruction.TailFlowTargets.begin(),
+                              instruction.TailFlowTargets.end(), target);
+  if (tailTarget == instruction.TailFlowTargets.end()) {
+    return false;
+  }
+
+  instruction.TailFlowTargets.erase(tailTarget);
+  if (std::find(instruction.DirectFlowTargets.begin(),
+                instruction.DirectFlowTargets.end(),
+                target) == instruction.DirectFlowTargets.end()) {
+    instruction.DirectFlowTargets.push_back(target);
   }
   return true;
 }

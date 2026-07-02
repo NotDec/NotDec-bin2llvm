@@ -37,6 +37,11 @@ struct NativeMemoryRange {
 struct NativeFunctionSeed {
   uint64_t Address = 0;
   uint64_t Size = 0;
+  // Some metadata, notably .eh_frame FDEs, gives a useful decode range without
+  // proving that the start address is a source-level function entry.  Keep that
+  // distinction explicit so cold fragments can be decoded without being split
+  // into standalone functions.
+  bool IsEntry = true;
   // Function ranges are half-open: [RangeStart, RangeEnd).  This matches later
   // decode-boundary checks and avoids inclusive-end overflow cases.
   uint64_t RangeStart = 0;
@@ -300,7 +305,9 @@ public:
 
   bool addFunctionSeed(uint64_t address, uint64_t size, std::string name,
                        std::string source, NativeFunctionConfidence confidence);
+  bool demoteFunctionSeedToRangeHint(uint64_t address);
   bool addFunction(NativeFunction function);
+  bool removeFunction(uint64_t entry);
   bool addBasicBlock(uint64_t functionEntry, NativeBasicBlock block);
   bool addBasicBlockSuccessors(uint64_t functionEntry, uint64_t blockStart,
                                const std::vector<uint64_t> &successors);
@@ -308,6 +315,7 @@ public:
   bool addInstructionDirectFlowTargets(uint64_t address,
                                        const std::vector<uint64_t> &targets);
   bool markInstructionTailFlowTarget(uint64_t address, uint64_t target);
+  bool restoreInstructionTailFlowTarget(uint64_t address, uint64_t target);
   void addXref(NativeXref xref);
   bool addUnresolvedFlow(NativeUnresolvedFlow flow);
   bool removeUnresolvedFlow(uint64_t address, NativeUnresolvedFlowKind kind);

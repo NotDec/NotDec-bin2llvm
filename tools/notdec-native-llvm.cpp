@@ -24,6 +24,7 @@
 #include <LIEF/ELF/Binary.hpp>
 #include <LIEF/ELF/Parser.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <fstream>
@@ -576,6 +577,16 @@ std::vector<std::pair<uint64_t, uint64_t>> blockRanges(
   for (const notdec::bin2llvm::NativeBasicBlock &block : function.Blocks) {
     ranges.push_back({block.Start, block.End});
   }
+  std::stable_sort(ranges.begin(), ranges.end(),
+                   [&](const auto &lhs, const auto &rhs) {
+                     if (lhs.first == function.Entry) {
+                       return rhs.first != function.Entry;
+                     }
+                     if (rhs.first == function.Entry) {
+                       return false;
+                     }
+                     return lhs.first < rhs.first;
+                   });
   return ranges;
 }
 
@@ -809,7 +820,8 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
     }
 
     auto program = notdec::bin2llvm::collectSleighPcodeRanges(
-        loadImage, specOptions, blockRanges(function), std::cerr);
+        loadImage, specOptions, blockRanges(function), std::cerr,
+        /*preserveRangeOrder=*/true);
     if (program.Ops.empty() && function.Blocks.empty()) {
       std::cerr << "skip native function 0x" << std::hex << function.Entry
                 << std::dec << ": empty p-code\n";
@@ -1083,7 +1095,7 @@ int main(int argc, char **argv) {
       if (!options->FunctionBlockRanges.empty()) {
         program = notdec::bin2llvm::collectSleighPcodeRanges(
             loadImage, options->SpecOptions, options->FunctionBlockRanges,
-            std::cerr);
+            std::cerr, /*preserveRangeOrder=*/true);
       } else {
         program = notdec::bin2llvm::collectSleighPcode(
             loadImage, options->SpecOptions, options->Address, options->Length,

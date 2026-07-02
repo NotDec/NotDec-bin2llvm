@@ -3490,6 +3490,95 @@ bool testPartialZmmDisjointLaneChainIsDemandRewritten() {
                   "module failed verifier after partial zmm lane chain test");
 }
 
+bool testPartialDemandKeepsMemoryPointerRegisterAddress() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-memory-pointer-demand", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "ordinary_memory_sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage,
+      "partial_memory_pointer_demand", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *base = loadRegister(builder, rdi, "RDI", "rdi_base");
+  llvm::Value *address = builder.CreateAdd(
+      base, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
+      "mem_addr");
+  auto *pointerType = llvm::PointerType::get(context, 0);
+  llvm::Value *pointer = builder.CreateIntToPtr(address, pointerType, "mem_ptr");
+  llvm::Value *memoryValue =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), pointer, "mem_value");
+  builder.CreateStore(memoryValue, sink);
+
+  llvm::Value *old = loadRegister(builder, rdx, "RDX", "old_rdx");
+  llvm::Value *keep = builder.CreateAnd(
+      old, llvm::ConstantInt::get(
+               rdx->getValueType(), llvm::APInt::getBitsSet(64, 8, 64)));
+  storeRegister(builder, rdx, builder.CreateOr(keep, memoryValue), "RDX");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+
+  llvm::IntToPtrInst *memoryPointer = nullptr;
+  for (llvm::Function &rewrittenFunction : module) {
+    if (rewrittenFunction.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+      if (auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(&inst)) {
+        if (intToPtr->getName() == "mem_ptr") {
+          memoryPointer = intToPtr;
+          break;
+        }
+      }
+    }
+    if (memoryPointer != nullptr) {
+      break;
+    }
+  }
+  if (memoryPointer == nullptr) {
+    for (llvm::Function &rewrittenFunction : module) {
+      if (rewrittenFunction.isDeclaration()) {
+        continue;
+      }
+      for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+        if (load == nullptr || load->getName() != "mem_value") {
+          continue;
+        }
+        memoryPointer =
+            llvm::dyn_cast<llvm::IntToPtrInst>(load->getPointerOperand());
+        break;
+      }
+    }
+  }
+  bool addressWasZero = false;
+  if (memoryPointer != nullptr) {
+    if (auto *constant =
+            llvm::dyn_cast<llvm::ConstantInt>(memoryPointer->getOperand(0))) {
+      addressWasZero = constant->isZero();
+    }
+  }
+
+  return expect(summary.PartialDemandCandidates >= 1,
+                "partial memory pointer store was not seen as a candidate") &&
+         expect(summary.PartialDemandMatched >= 1,
+                "partial memory pointer store was not demand rewritten") &&
+         expect(memoryPointer != nullptr,
+                "ordinary memory inttoptr was removed") &&
+         expect(!addressWasZero,
+                "ordinary memory pointer register address was rewritten to zero") &&
+         verifyOk(module,
+                  "module failed verifier after partial memory pointer test");
+}
+
 bool testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-clean", context);
@@ -3643,6 +3732,7 @@ int main() {
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();
+  ok &= testPartialDemandKeepsMemoryPointerRegisterAddress();
   ok &= testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata();
   ok &= testFinalCleanupKeepsMetadataWhenRegisterAccessRemains();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();

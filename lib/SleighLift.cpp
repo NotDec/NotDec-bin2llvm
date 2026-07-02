@@ -522,7 +522,8 @@ collectSleighPcodeRanges(ghidra::LoadImage &loadImage,
                          const SleighSpecOptions &options,
                          const std::vector<std::pair<uint64_t, uint64_t>>
                              &ranges,
-                         std::ostream &errorStream) {
+                         std::ostream &errorStream,
+                         bool preserveRangeOrder) {
   PcodeProgram program;
   ghidra::ContextInternal context;
   XmlCapableSleigh engine(&loadImage, &context);
@@ -535,13 +536,16 @@ collectSleighPcodeRanges(ghidra::LoadImage &loadImage,
   program.IsBigEndian = engine.isBigEndian();
   collectRegisters(engine, program);
 
-  // Native block ranges should be consumed in address order, not in the
-  // order they happened to be discovered or passed in.
+  // Address order is the default for raw range lifting.  Native function
+  // lifting may pass entry-first ranges so cold fragments before the hot entry
+  // do not become the first real LLVM block in the function.
   std::vector<std::pair<uint64_t, uint64_t>> sortedRanges = ranges;
-  std::sort(sortedRanges.begin(), sortedRanges.end(),
-            [](const auto &lhs, const auto &rhs) {
-              return lhs.first < rhs.first;
-            });
+  if (!preserveRangeOrder) {
+    std::sort(sortedRanges.begin(), sortedRanges.end(),
+              [](const auto &lhs, const auto &rhs) {
+                return lhs.first < rhs.first;
+              });
+  }
 
   PcodeCollector collector(engine, program);
   for (const auto &[start, endOffset] : sortedRanges) {
