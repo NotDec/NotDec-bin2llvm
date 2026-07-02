@@ -16,6 +16,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include <algorithm>
@@ -67,6 +68,7 @@ public:
     }
 
     CurrentProgramOps = &program.Ops;
+    prepareX64CallReturnStackSuppression(program);
     if (!buildBasicBlocks(program, errorMessage)) {
       return false;
     }
@@ -92,6 +94,10 @@ public:
 
       bool ended = false;
       for (size_t opIndex = start; opIndex < end; ++opIndex) {
+        if (SuppressedPcodeOpIndices.count(opIndex) != 0) {
+          continue;
+        }
+
         const PcodeOpView &op = program.Ops[opIndex];
         if (isTerminator(op.Opcode)) {
           if (!lowerTerminator(blockIndex, opIndex, op, nativeFallback,
@@ -219,6 +225,186 @@ private:
     return opcode == PcodeOpcode::Branch ||
            opcode == PcodeOpcode::BranchInd ||
            opcode == PcodeOpcode::CBranch || opcode == PcodeOpcode::Return;
+  }
+
+  static bool sameVarnode(const VarnodeView &lhs, const VarnodeView &rhs) {
+    return lhs.Space == rhs.Space && lhs.Offset == rhs.Offset &&
+           lhs.Size == rhs.Size;
+  }
+
+  static bool isConstValue(const VarnodeView &varnode, uint64_t value,
+                           uint32_t size) {
+    return varnode.Space == "const" && varnode.Size == size &&
+           varnode.Offset == value;
+  }
+
+  static bool isRegisterNamed(const VarnodeView &varnode,
+                              const char *registerName, uint32_t size) {
+    return varnode.IsRegister && varnode.RegisterName &&
+           *varnode.RegisterName == registerName && varnode.Size == size;
+  }
+
+  static bool isX64Rsp(const VarnodeView &varnode) {
+    return isRegisterNamed(varnode, "RSP", 8);
+  }
+
+  static bool isX64Program(const PcodeProgram &program) {
+    if (program.IsBigEndian) {
+      return false;
+    }
+
+    bool hasRsp = false;
+    bool hasRip = false;
+    for (const RegisterInfo &reg : program.Registers) {
+      hasRsp |= reg.Name == "RSP" && reg.Size == 8;
+      hasRip |= reg.Name == "RIP" && reg.Size == 8;
+    }
+    return hasRsp && hasRip;
+  }
+
+  static bool isX64RspSubtract8(const PcodeOpView &op) {
+    return op.Opcode == PcodeOpcode::IntSub && op.Output &&
+           isX64Rsp(*op.Output) && op.Inputs.size() == 2 &&
+           isX64Rsp(op.Inputs[0]) && isConstValue(op.Inputs[1], 8, 8);
+  }
+
+  static bool isX64RspAdd8(const PcodeOpView &op) {
+    return op.Opcode == PcodeOpcode::IntAdd && op.Output &&
+           isX64Rsp(*op.Output) && op.Inputs.size() == 2 &&
+           isX64Rsp(op.Inputs[0]) && isConstValue(op.Inputs[1], 8, 8);
+  }
+
+  static bool isX64ReturnAddressStore(const PcodeOpView &op,
+                                      const VarnodeView &stackPointer,
+                                      uint64_t fallthrough) {
+    return op.Opcode == PcodeOpcode::Store && op.Inputs.size() == 3 &&
+           sameVarnode(op.Inputs[1], stackPointer) &&
+           isConstValue(op.Inputs[2], fallthrough, 8);
+  }
+
+  static bool isX64ReturnAddressLoad(const PcodeOpView &op,
+                                     const VarnodeView &returnTarget) {
+    return op.Opcode == PcodeOpcode::Load && op.Output &&
+           sameVarnode(*op.Output, returnTarget) && op.Inputs.size() == 2 &&
+           isX64Rsp(op.Inputs[1]);
+  }
+
+  bool suppressX64CallStackEffect(size_t start, size_t end) {
+    std::optional<size_t> rspSubtractIndex;
+    std::optional<size_t> storeIndex;
+    uint64_t fallthrough = 0;
+
+    for (size_t index = start; index < end; ++index) {
+      const PcodeOpView &op = (*CurrentProgramOps)[index];
+      if (!isX64RspSubtract8(op) || op.InstructionSize == 0) {
+        continue;
+      }
+      rspSubtractIndex = index;
+      fallthrough = op.Address + op.InstructionSize;
+      break;
+    }
+    if (!rspSubtractIndex) {
+      return false;
+    }
+
+    const VarnodeView &stackPointer =
+        *(*CurrentProgramOps)[*rspSubtractIndex].Output;
+    for (size_t index = *rspSubtractIndex + 1; index < end; ++index) {
+      if (isX64ReturnAddressStore((*CurrentProgramOps)[index], stackPointer,
+                                  fallthrough)) {
+        storeIndex = index;
+        break;
+      }
+    }
+    if (!storeIndex) {
+      return false;
+    }
+
+    SuppressedPcodeOpIndices.insert(*rspSubtractIndex);
+    SuppressedPcodeOpIndices.insert(*storeIndex);
+    return true;
+  }
+
+  bool suppressX64ReturnStackEffect(size_t start, size_t end) {
+    std::optional<size_t> returnIndex;
+    for (size_t index = start; index < end; ++index) {
+      if ((*CurrentProgramOps)[index].Opcode == PcodeOpcode::Return) {
+        returnIndex = index;
+        break;
+      }
+    }
+    if (!returnIndex || (*CurrentProgramOps)[*returnIndex].Inputs.size() != 1) {
+      return false;
+    }
+
+    const VarnodeView &returnTarget =
+        (*CurrentProgramOps)[*returnIndex].Inputs[0];
+    std::optional<size_t> loadIndex;
+    for (size_t index = start; index < *returnIndex; ++index) {
+      if (isX64ReturnAddressLoad((*CurrentProgramOps)[index], returnTarget)) {
+        loadIndex = index;
+        break;
+      }
+    }
+    if (!loadIndex) {
+      return false;
+    }
+
+    std::optional<size_t> rspAddIndex;
+    for (size_t index = *loadIndex + 1; index < *returnIndex; ++index) {
+      if (isX64RspAdd8((*CurrentProgramOps)[index])) {
+        rspAddIndex = index;
+        break;
+      }
+    }
+    if (!rspAddIndex) {
+      return false;
+    }
+
+    SuppressedPcodeOpIndices.insert(*loadIndex);
+    SuppressedPcodeOpIndices.insert(*rspAddIndex);
+    return true;
+  }
+
+  void warnX64StackPatternMiss(uint64_t address, const char *kind) {
+    llvm::errs() << "warning: x64 " << kind << " at 0x";
+    llvm::errs().write_hex(address);
+    llvm::errs() << " did not match implicit return-address stack pattern\n";
+  }
+
+  void prepareX64CallReturnStackSuppression(const PcodeProgram &program) {
+    SuppressedPcodeOpIndices.clear();
+    if (!isX64Program(program)) {
+      return;
+    }
+
+    for (size_t start = 0; start < program.Ops.size();) {
+      size_t end = start + 1;
+      while (end < program.Ops.size() &&
+             program.Ops[end].Address == program.Ops[start].Address) {
+        ++end;
+      }
+
+      bool hasCall = false;
+      bool hasReturn = false;
+      for (size_t index = start; index < end; ++index) {
+        PcodeOpcode opcode = program.Ops[index].Opcode;
+        hasCall |= opcode == PcodeOpcode::Call ||
+                   opcode == PcodeOpcode::CallInd;
+        hasReturn |= opcode == PcodeOpcode::Return;
+      }
+
+      if (hasCall) {
+        if (!suppressX64CallStackEffect(start, end)) {
+          warnX64StackPatternMiss(program.Ops[start].Address, "CALL");
+        }
+      }
+      if (hasReturn && !suppressX64ReturnStackEffect(start, end)) {
+        warnX64StackPatternMiss(program.Ops[start].Address, "RET");
+      }
+
+      start = end;
+    }
   }
 
   std::string blockName(uint64_t address) {
@@ -2064,6 +2250,7 @@ private:
   std::unordered_map<size_t, llvm::BasicBlock *> BlockForStart;
   std::unordered_map<uint64_t, llvm::BasicBlock *> BlockForAddress;
   std::unordered_map<uint64_t, llvm::BasicBlock *> TailJumpBlockForAddress;
+  std::set<size_t> SuppressedPcodeOpIndices;
   std::vector<uint64_t> EmptyNativeBlockAddresses;
   std::vector<llvm::BasicBlock *> ExternalTargetBlocks;
   const std::vector<PcodeOpView> *CurrentProgramOps = nullptr;

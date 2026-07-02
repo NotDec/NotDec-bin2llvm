@@ -100,6 +100,10 @@ struct VarnodeView {
 // ops.
 struct PcodeOpView {
   uint64_t Address = 0;
+  // Size of the machine instruction that emitted this p-code op.  It lets
+  // lowering recognize instruction-local effects such as x64 CALL writing the
+  // fallthrough return address to the stack.
+  uint64_t InstructionSize = 0;
   PcodeOpcode Opcode = PcodeOpcode::Unsupported;
   std::string OpcodeName;
   std::optional<VarnodeView> Output;

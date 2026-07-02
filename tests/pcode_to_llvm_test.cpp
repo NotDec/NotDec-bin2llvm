@@ -40,6 +40,104 @@ notdec::bin2llvm::VarnodeView uniqueVarnode(uint64_t offset, uint32_t size) {
   return varnode;
 }
 
+notdec::bin2llvm::VarnodeView ramVarnode(uint64_t offset, uint32_t size) {
+  notdec::bin2llvm::VarnodeView varnode;
+  varnode.Space = "ram";
+  varnode.Offset = offset;
+  varnode.Size = size;
+  return varnode;
+}
+
+notdec::bin2llvm::VarnodeView registerVarnode(uint64_t offset, uint32_t size,
+                                              std::string name) {
+  notdec::bin2llvm::VarnodeView varnode;
+  varnode.Space = "register";
+  varnode.Offset = offset;
+  varnode.Size = size;
+  varnode.IsRegister = true;
+  varnode.RegisterName = std::move(name);
+  return varnode;
+}
+
+void addX64Registers(notdec::bin2llvm::PcodeProgram &program) {
+  program.Registers.push_back({"register", 0x20, 8, "RSP"});
+  program.Registers.push_back({"register", 0x288, 8, "RIP"});
+}
+
+notdec::bin2llvm::PcodeOpView rspSub8Op(uint64_t address,
+                                         uint64_t instructionSize) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.InstructionSize = instructionSize;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::IntSub;
+  op.OpcodeName = "INT_SUB";
+  op.Output = registerVarnode(0x20, 8, "RSP");
+  op.Inputs.push_back(registerVarnode(0x20, 8, "RSP"));
+  op.Inputs.push_back(constVarnode(8, 8));
+  return op;
+}
+
+notdec::bin2llvm::PcodeOpView rspAdd8Op(uint64_t address,
+                                         uint64_t instructionSize) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.InstructionSize = instructionSize;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::IntAdd;
+  op.OpcodeName = "INT_ADD";
+  op.Output = registerVarnode(0x20, 8, "RSP");
+  op.Inputs.push_back(registerVarnode(0x20, 8, "RSP"));
+  op.Inputs.push_back(constVarnode(8, 8));
+  return op;
+}
+
+notdec::bin2llvm::PcodeOpView storeReturnAddressOp(uint64_t address,
+                                                   uint64_t instructionSize) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.InstructionSize = instructionSize;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Store;
+  op.OpcodeName = "STORE";
+  op.Inputs.push_back(constVarnode(0, 8));
+  op.Inputs.push_back(registerVarnode(0x20, 8, "RSP"));
+  op.Inputs.push_back(constVarnode(address + instructionSize, 8));
+  return op;
+}
+
+notdec::bin2llvm::PcodeOpView callOp(uint64_t address, uint64_t target,
+                                     uint64_t instructionSize) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.InstructionSize = instructionSize;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Call;
+  op.OpcodeName = "CALL";
+  op.Inputs.push_back(ramVarnode(target, 8));
+  return op;
+}
+
+notdec::bin2llvm::PcodeOpView loadReturnTargetOp(uint64_t address,
+                                                 uint64_t instructionSize) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.InstructionSize = instructionSize;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Load;
+  op.OpcodeName = "LOAD";
+  op.Output = registerVarnode(0x288, 8, "RIP");
+  op.Inputs.push_back(constVarnode(0, 8));
+  op.Inputs.push_back(registerVarnode(0x20, 8, "RSP"));
+  return op;
+}
+
+notdec::bin2llvm::PcodeOpView x64ReturnOp(uint64_t address,
+                                           uint64_t instructionSize) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.InstructionSize = instructionSize;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Return;
+  op.OpcodeName = "RETURN";
+  op.Inputs.push_back(registerVarnode(0x288, 8, "RIP"));
+  return op;
+}
+
 notdec::bin2llvm::PcodeOpView copyOp(uint64_t address) {
   notdec::bin2llvm::PcodeOpView op;
   op.Address = address;
@@ -86,11 +184,7 @@ notdec::bin2llvm::PcodeOpView branchOp(uint64_t address, uint64_t target) {
   op.Address = address;
   op.Opcode = notdec::bin2llvm::PcodeOpcode::Branch;
   op.OpcodeName = "BRANCH";
-  notdec::bin2llvm::VarnodeView targetVarnode;
-  targetVarnode.Space = "ram";
-  targetVarnode.Offset = target;
-  targetVarnode.Size = 8;
-  op.Inputs.push_back(std::move(targetVarnode));
+  op.Inputs.push_back(ramVarnode(target, 8));
   return op;
 }
 
@@ -1104,6 +1198,124 @@ bool testNativeIndirectBranchLowersMultipleSuccessorsAsSwitch() {
                 "multiple indirect successor branch did not lower as switch");
 }
 
+bool functionUsesGlobal(llvm::Function *function, const std::string &name) {
+  if (function == nullptr) {
+    return false;
+  }
+  for (llvm::BasicBlock &block : *function) {
+    for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+      for (llvm::Value *operand : instruction.operands()) {
+        if (auto *global = llvm::dyn_cast<llvm::GlobalVariable>(operand)) {
+          if (global->getName() == name) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool testX64CallSuppressesReturnAddressStackEffect() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  program.Ops.push_back(rspSub8Op(0x1000, 5));
+  program.Ops.push_back(storeReturnAddressOp(0x1000, 5));
+  program.Ops.push_back(callOp(0x1000, 0x2000, 5));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x64_call_suppresses_return_address_stack";
+  config.DirectCallTargets.emplace(0x2000, "callee");
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+  llvm::Function *callee = module ? module->getFunction("callee") : nullptr;
+
+  bool hasCall = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        hasCall |= call != nullptr && call->getCalledFunction() == callee;
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x64 call function is missing") &&
+         expect(hasCall, "x64 call did not lower to callee call") &&
+         expect(!functionUsesGlobal(function, "RSP"),
+                "x64 call kept return-address RSP update") &&
+         expect(!functionUsesGlobal(function, "notdec_ram"),
+                "x64 call kept return-address stack store") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x64 call stack suppression");
+}
+
+bool testX64ReturnSuppressesReturnAddressStackEffect() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  program.Ops.push_back(loadReturnTargetOp(0x1000, 1));
+  program.Ops.push_back(rspAdd8Op(0x1000, 1));
+  program.Ops.push_back(x64ReturnOp(0x1000, 1));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x64_return_suppresses_return_address_stack";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x64 return function is missing") &&
+         expect(!functionUsesGlobal(function, "RSP"),
+                "x64 return kept return-address RSP update") &&
+         expect(!functionUsesGlobal(function, "RIP"),
+                "x64 return kept return-address target load") &&
+         expect(!functionUsesGlobal(function, "notdec_ram"),
+                "x64 return kept return-address stack load") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x64 return stack suppression");
+}
+
+bool testNonX64DoesNotSuppressCallStackEffect() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Registers.push_back({"register", 0x20, 8, "RSP"});
+  program.Ops.push_back(rspSub8Op(0x1000, 5));
+  program.Ops.push_back(storeReturnAddressOp(0x1000, 5));
+  program.Ops.push_back(callOp(0x1000, 0x2000, 5));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "non_x64_keeps_call_stack_effect";
+  config.DirectCallTargets.emplace(0x2000, "callee");
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "non-x64 call function is missing") &&
+         expect(functionUsesGlobal(function, "RSP"),
+                "non-x64 call incorrectly removed RSP update") &&
+         expect(functionUsesGlobal(function, "notdec_ram"),
+                "non-x64 call incorrectly removed stack store") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after non-x64 call lowering");
+}
+
 } // namespace
 
 int main() {
@@ -1137,5 +1349,8 @@ int main() {
   ok &= testNativeIndirectBranchRequiresSuccessorFacts();
   ok &= testNativeIndirectBranchWithNoSuccessorsIsUnknownTailCall();
   ok &= testNativeIndirectBranchLowersMultipleSuccessorsAsSwitch();
+  ok &= testX64CallSuppressesReturnAddressStackEffect();
+  ok &= testX64ReturnSuppressesReturnAddressStackEffect();
+  ok &= testNonX64DoesNotSuppressCallStackEffect();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

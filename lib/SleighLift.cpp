@@ -259,11 +259,21 @@ void collectRegisters(const ghidra::Sleigh &engine, PcodeProgram &program) {
   }
 }
 
+void setInstructionSize(PcodeProgram &program, size_t firstOp,
+                        uint64_t instructionSize) {
+  for (size_t index = firstOp; index < program.Ops.size(); ++index) {
+    program.Ops[index].InstructionSize = instructionSize;
+  }
+}
+
 bool appendInstructionPcode(ghidra::Sleigh &engine, PcodeCollector &collector,
                             ghidra::Address &current,
                             std::ostream &errorStream, PcodeProgram &program) {
   try {
+    size_t firstOp = program.Ops.size();
     int32_t instructionLength = engine.oneInstruction(collector, current);
+    setInstructionSize(program, firstOp,
+                       static_cast<uint64_t>(instructionLength));
     current = current + instructionLength;
     return true;
   } catch (ghidra::UnimplError &error) {
@@ -454,12 +464,15 @@ SleighInstructionDecoder::decode(uint64_t address, uint64_t maxInstructions,
       // Generate p-code before assembly text.  oneInstruction() applies Sleigh
       // context commits; doing printAssembly() first can leave the reused
       // parser cache in a stale state for context-sensitive x86 instructions.
+      size_t firstOp = decode.Pcode.Ops.size();
       int32_t instructionLength =
           Pimpl->Engine.oneInstruction(pcodeCollector, current);
       if (instructionLength <= 0 || static_cast<uint64_t>(instructionLength) >
                                         end.getOffset() - current.getOffset()) {
         break;
       }
+      setInstructionSize(decode.Pcode, firstOp,
+                         static_cast<uint64_t>(instructionLength));
       int32_t assemblyLength = Pimpl->Engine.printAssembly(collector, current);
       if (assemblyLength != instructionLength) {
         errorStream << "Sleigh decode length mismatch @ " << current << ": "
