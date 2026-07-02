@@ -436,6 +436,71 @@ llvm::Function *createRawRspStackCanaryCheckFunction(llvm::Module &module) {
   return function;
 }
 
+llvm::Function *createRawRspZfStackCanaryCheckFunction(llvm::Module &module) {
+  llvm::LLVMContext &context = module.getContext();
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  llvm::GlobalVariable *zf = createRegisterGlobal(
+      module, "ZF", llvm::Type::getInt8Ty(context), 0, 1);
+  llvm::GlobalVariable *fsOffsetRegister =
+      createRegisterGlobal(module, "FS_OFFSET");
+
+  auto *failType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *failFunction = llvm::Function::Create(
+      failType, llvm::GlobalValue::ExternalLinkage, "__stack_chk_fail", module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "raw_rsp_zf_stack_canary",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *success =
+      llvm::BasicBlock::Create(context, "success", function);
+  llvm::BasicBlock *failBlock =
+      llvm::BasicBlock::Create(context, "fail", function);
+
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspBase = loadRegister(builder, rsp, "RSP", "rsp_base");
+  llvm::Value *savedAddress = builder.CreateAdd(
+      rspBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8200),
+      "saved_canary_addr");
+  llvm::Value *savedPointer =
+      builder.CreateIntToPtr(savedAddress, llvm::PointerType::get(context, 0),
+                             "saved_canary_ptr");
+  llvm::LoadInst *savedCanary =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
+                         "saved_canary");
+  llvm::LoadInst *fsBase =
+      loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
+  llvm::Value *fsCanaryAddress = builder.CreateAdd(
+      fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
+      "fs_canary_addr");
+  llvm::Value *fsCanaryPointer =
+      builder.CreateIntToPtr(fsCanaryAddress, llvm::PointerType::get(context, 0),
+                             "fs_canary_ptr");
+  llvm::LoadInst *fsCanary =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
+                         "fs_canary");
+  llvm::Value *same =
+      builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same");
+  llvm::Value *flag =
+      builder.CreateZExt(same, llvm::Type::getInt8Ty(context), "zf_value");
+  storeRegister(builder, zf, flag, "ZF");
+  llvm::LoadInst *flagLoad = loadRegister(builder, zf, "ZF", "zf_after_cmp");
+  llvm::Value *flagIsZero = builder.CreateICmpEQ(
+      flagLoad, llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0),
+      "zf_is_zero");
+  builder.CreateCondBr(flagIsZero, failBlock, success);
+
+  builder.SetInsertPoint(success);
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(failBlock);
+  builder.CreateCall(failFunction->getFunctionType(), failFunction, {});
+  builder.CreateUnreachable();
+  return function;
+}
+
 llvm::Function *createPhiFsBaseStackCanaryCheckFunction(llvm::Module &module) {
   llvm::LLVMContext &context = module.getContext();
   llvm::GlobalVariable *fsOffsetRegister =
@@ -692,6 +757,80 @@ llvm::Function *createSharedFailStackCanaryCheckFunction(llvm::Module &module) {
   builder.CreateStore(
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1),
       returnSlotPointer);
+  builder.CreateCall(failFunction->getFunctionType(), failFunction, {});
+  builder.CreateUnreachable();
+  return function;
+}
+
+llvm::Function *
+createMixedFailPredecessorStackCanaryCheckFunction(llvm::Module &module) {
+  llvm::LLVMContext &context = module.getContext();
+  llvm::GlobalVariable *fsOffsetRegister =
+      createRegisterGlobal(module, "FS_OFFSET");
+
+  auto *failType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *failFunction = llvm::Function::Create(
+      failType, llvm::GlobalValue::ExternalLinkage, "__stack_chk_fail", module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                                       {llvm::Type::getInt1Ty(context)}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage,
+      "mixed_fail_predecessor_stack_canary", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *canaryCheck =
+      llvm::BasicBlock::Create(context, "canary_check", function);
+  llvm::BasicBlock *ordinaryCheck =
+      llvm::BasicBlock::Create(context, "ordinary_check", function);
+  llvm::BasicBlock *success =
+      llvm::BasicBlock::Create(context, "success", function);
+  llvm::BasicBlock *failBlock =
+      llvm::BasicBlock::Create(context, "fail", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(function->getArg(0), canaryCheck, ordinaryCheck);
+
+  builder.SetInsertPoint(canaryCheck);
+  auto *slotType = llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 64);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(slotType, nullptr, "notdec_stack.native");
+  llvm::Value *savedPointer = builder.CreateInBoundsGEP(
+      llvm::Type::getInt8Ty(context), stack,
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
+      "saved_canary_ptr");
+  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                             0),
+                      savedPointer);
+  llvm::LoadInst *savedCanary =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
+                         "saved_canary");
+  llvm::LoadInst *fsBase =
+      loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
+  llvm::Value *fsCanaryAddress = builder.CreateAdd(
+      fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
+      "fs_canary_addr");
+  llvm::Value *fsCanaryPointer =
+      builder.CreateIntToPtr(fsCanaryAddress, llvm::PointerType::get(context, 0),
+                             "fs_canary_ptr");
+  llvm::LoadInst *fsCanary =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
+                         "fs_canary");
+  llvm::Value *same =
+      builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same");
+  builder.CreateCondBr(same, success, failBlock);
+
+  builder.SetInsertPoint(ordinaryCheck);
+  llvm::Value *ordinaryError =
+      builder.CreateICmpEQ(function->getArg(0),
+                           llvm::ConstantInt::getFalse(context),
+                           "ordinary_error");
+  builder.CreateCondBr(ordinaryError, failBlock, success);
+
+  builder.SetInsertPoint(success);
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(failBlock);
   builder.CreateCall(failFunction->getFunctionType(), failFunction, {});
   builder.CreateUnreachable();
   return function;
@@ -3021,6 +3160,25 @@ bool testRawRspStackCanaryCheckIsRemovedAfterStackCleanup() {
                   "module failed verifier after raw RSP stack canary test");
 }
 
+bool testRawRspZfStackCanaryCheckIsRemoved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-stack-canary-raw-rsp-zf", context);
+  attachTestAbi(module);
+  llvm::Function *function = createRawRspZfStackCanaryCheckFunction(module);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.StackCanaryChecksRemoved == 1,
+                "raw RSP ZF stack canary check was not removed") &&
+         expect(!hasCallTo(*function, "__stack_chk_fail"),
+                "raw RSP ZF stack canary fail call was kept") &&
+         expect(!hasRegisterLoad(*function, "FS_OFFSET"),
+                "raw RSP ZF stack canary FS_OFFSET load was kept") &&
+         expect(!hasRegisterLoad(*function, "ZF"),
+                "raw RSP ZF stack canary flag load was kept") &&
+         verifyOk(module,
+                  "module failed verifier after raw RSP ZF stack canary test");
+}
+
 bool testPhiFsBaseStackCanaryCheckIsRemoved() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-stack-canary-phi-fs", context);
@@ -3066,6 +3224,26 @@ bool testSharedFailStackCanaryChecksAreRemoved() {
                 "shared-fail stack canary fail call was kept") &&
          verifyOk(module,
                   "module failed verifier after shared-fail canary test");
+}
+
+bool testMixedFailPredecessorKeepsNonCanaryFailPath() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-stack-canary-mixed-fail", context);
+  attachTestAbi(module);
+  llvm::Function *function =
+      createMixedFailPredecessorStackCanaryCheckFunction(module);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.StackCanaryChecksRemoved == 1,
+                "mixed-fail canary predecessor was not removed") &&
+         expect(summary.StackCanaryFailBlocksRemoved == 0,
+                "mixed-fail block with non-canary predecessor was removed") &&
+         expect(hasCallTo(*function, "__stack_chk_fail"),
+                "mixed-fail non-canary fail call was removed") &&
+         expect(!hasRegisterLoad(*function, "FS_OFFSET"),
+                "mixed-fail canary FS_OFFSET load was kept") &&
+         verifyOk(module,
+                  "module failed verifier after mixed-fail canary test");
 }
 
 bool testPhiFsCanaryAddressStackCanaryCheckIsRemoved() {
@@ -3763,9 +3941,11 @@ int main() {
   ok &= testStackCanaryFailSideEffectIsKept();
   ok &= testStackCanaryWrongFsOffsetIsKept();
   ok &= testRawRspStackCanaryCheckIsRemovedAfterStackCleanup();
+  ok &= testRawRspZfStackCanaryCheckIsRemoved();
   ok &= testPhiFsBaseStackCanaryCheckIsRemoved();
   ok &= testZeroBaseStackCanaryCheckIsKept();
   ok &= testSharedFailStackCanaryChecksAreRemoved();
+  ok &= testMixedFailPredecessorKeepsNonCanaryFailPath();
   ok &= testPhiFsCanaryAddressStackCanaryCheckIsRemoved();
   ok &= testSelfPhiFsCanaryAddressStackCanaryCheckIsRemoved();
   ok &= testSelfPhiFsBaseStackCanaryCheckIsRemoved();

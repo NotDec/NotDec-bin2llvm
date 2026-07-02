@@ -1,6 +1,9 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
 
+#include "notdec-bin2llvm/NativeAbi.h"
+
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -17,6 +20,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace notdec::bin2llvm {
 namespace {
@@ -24,6 +28,12 @@ namespace {
 struct FsCanaryAddress {
   llvm::LoadInst *BaseLoad = nullptr;
   std::set<llvm::Instruction *> AddressChain;
+};
+
+struct CanaryConditionMatch {
+  bool TrueMeansEqual = false;
+  llvm::ICmpInst *EqualCmp = nullptr;
+  llvm::StoreInst *FlagStore = nullptr;
 };
 
 std::optional<std::string> mdField(const llvm::MDNode *node,
@@ -76,8 +86,24 @@ bool loadReadsRegister(const llvm::LoadInst &load,
                             wantedRegister)) {
     return true;
   }
+  if (accessMatchesRegister(load.getMetadata("notdec.register.summary_ssa.entry"),
+                            wantedRegister)) {
+    return true;
+  }
   auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
       load.getPointerOperand()->stripPointerCasts());
+  return global != nullptr && global->getMetadata("notdec.register") != nullptr &&
+         registerName(*global) == wantedRegister;
+}
+
+bool storeWritesRegister(const llvm::StoreInst &store,
+                         llvm::StringRef wantedRegister) {
+  if (accessMatchesRegister(store.getMetadata("notdec.register.access"),
+                            wantedRegister)) {
+    return true;
+  }
+  auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+      store.getPointerOperand()->stripPointerCasts());
   return global != nullptr && global->getMetadata("notdec.register") != nullptr &&
          registerName(*global) == wantedRegister;
 }
@@ -417,10 +443,69 @@ bool framePointerSavedCanaryPointer(llvm::Value *pointer) {
   return offset && *offset < 0;
 }
 
-bool loadIsSavedCanarySlot(llvm::LoadInst &load) {
+std::optional<int64_t> offsetFromRegister(llvm::Value *value,
+                                          llvm::StringRef registerName,
+                                          std::set<llvm::Value *> &seen) {
+  value = value->stripPointerCasts();
+  if (!seen.insert(value).second) {
+    return std::nullopt;
+  }
+
+  auto *load = llvm::dyn_cast<llvm::LoadInst>(value);
+  if (load != nullptr && loadReadsRegister(*load, registerName)) {
+    return 0;
+  }
+
+  auto *op = llvm::dyn_cast<llvm::Operator>(value);
+  if (op == nullptr) {
+    return std::nullopt;
+  }
+  if (op->getOpcode() == llvm::Instruction::Add) {
+    if (auto lhs = offsetFromRegister(op->getOperand(0), registerName, seen)) {
+      if (auto rhs = signedConstantValue(op->getOperand(1))) {
+        return *lhs + *rhs;
+      }
+    }
+    if (auto rhs = offsetFromRegister(op->getOperand(1), registerName, seen)) {
+      if (auto lhs = signedConstantValue(op->getOperand(0))) {
+        return *lhs + *rhs;
+      }
+    }
+  }
+  if (op->getOpcode() == llvm::Instruction::Sub) {
+    if (auto lhs = offsetFromRegister(op->getOperand(0), registerName, seen)) {
+      if (auto rhs = signedConstantValue(op->getOperand(1))) {
+        return *lhs - *rhs;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+bool stackPointerSavedCanaryPointer(llvm::Value *pointer,
+                                    llvm::StringRef stackPointerRegister) {
+  if (stackPointerRegister.empty()) {
+    return false;
+  }
+  llvm::Value *integer = intToPtrIntegerOperand(pointer);
+  if (integer == nullptr) {
+    return false;
+  }
+  std::set<llvm::Value *> seen;
+  std::optional<int64_t> offset =
+      offsetFromRegister(integer, stackPointerRegister, seen);
+  // Raw lifted x64 can still address the saved canary from the current RSP
+  // before stack-frame localization, so the offset may be positive or negative.
+  return offset && *offset != 0;
+}
+
+bool loadIsSavedCanarySlot(llvm::LoadInst &load,
+                           llvm::StringRef stackPointerRegister) {
   return !load.isVolatile() && !load.isAtomic() &&
          (stackAllocaPointer(load.getPointerOperand()) ||
-          framePointerSavedCanaryPointer(load.getPointerOperand()));
+          framePointerSavedCanaryPointer(load.getPointerOperand()) ||
+          stackPointerSavedCanaryPointer(load.getPointerOperand(),
+                                         stackPointerRegister));
 }
 
 std::optional<FsCanaryAddress> findFsCanaryAddress(llvm::LoadInst &load) {
@@ -516,6 +601,61 @@ std::optional<bool> conditionTrueMeansCanaryEqual(llvm::Value *condition,
   return cmp->getPredicate() == llvm::ICmpInst::ICMP_EQ;
 }
 
+std::optional<bool> zfConditionTrueMeansCanaryEqual(
+    llvm::Value *condition, llvm::ICmpInst **equalCmp,
+    llvm::StoreInst **flagStore) {
+  auto *cmp = llvm::dyn_cast_or_null<llvm::ICmpInst>(condition);
+  if (cmp == nullptr ||
+      (cmp->getPredicate() != llvm::ICmpInst::ICMP_EQ &&
+       cmp->getPredicate() != llvm::ICmpInst::ICMP_NE)) {
+    return std::nullopt;
+  }
+
+  llvm::Value *maybeZero = nullptr;
+  llvm::Value *maybeFlag = nullptr;
+  if (llvm::isa<llvm::ConstantInt>(cmp->getOperand(0))) {
+    maybeZero = cmp->getOperand(0);
+    maybeFlag = cmp->getOperand(1);
+  } else if (llvm::isa<llvm::ConstantInt>(cmp->getOperand(1))) {
+    maybeZero = cmp->getOperand(1);
+    maybeFlag = cmp->getOperand(0);
+  }
+  auto *zero = llvm::dyn_cast_or_null<llvm::ConstantInt>(maybeZero);
+  auto *flagLoad = llvm::dyn_cast_or_null<llvm::LoadInst>(maybeFlag);
+  if (zero == nullptr || !zero->isZero() || flagLoad == nullptr ||
+      !loadReadsRegister(*flagLoad, "ZF")) {
+    return std::nullopt;
+  }
+
+  llvm::BasicBlock *block = flagLoad->getParent();
+  if (block == nullptr) {
+    return std::nullopt;
+  }
+  for (auto it = flagLoad->getIterator(); it != block->begin();) {
+    --it;
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&*it);
+    if (store == nullptr || !storeWritesRegister(*store, "ZF")) {
+      continue;
+    }
+    auto *zext = llvm::dyn_cast<llvm::ZExtInst>(store->getValueOperand());
+    auto *inner = zext == nullptr
+                      ? llvm::dyn_cast<llvm::ICmpInst>(store->getValueOperand())
+                      : llvm::dyn_cast<llvm::ICmpInst>(zext->getOperand(0));
+    if (inner == nullptr ||
+        (inner->getPredicate() != llvm::ICmpInst::ICMP_EQ &&
+         inner->getPredicate() != llvm::ICmpInst::ICMP_NE)) {
+      return std::nullopt;
+    }
+    bool trueMeansFlagOne = cmp->getPredicate() == llvm::ICmpInst::ICMP_NE;
+    bool innerTrueMeansEqual =
+        inner->getPredicate() == llvm::ICmpInst::ICMP_EQ;
+    *equalCmp = inner;
+    *flagStore = store;
+    return trueMeansFlagOne ? innerTrueMeansEqual : !innerTrueMeansEqual;
+  }
+  return std::nullopt;
+}
+
 bool conditionUseChainIsPrivate(llvm::BranchInst &branch,
                                 llvm::ICmpInst &equalCmp) {
   llvm::Value *condition = branch.getCondition();
@@ -533,6 +673,58 @@ bool conditionUseChainIsPrivate(llvm::BranchInst &branch,
   auto *zext = llvm::dyn_cast<llvm::ZExtInst>(maybeZext);
   return zext != nullptr && zext->getOperand(0) == &equalCmp &&
          hasOnlyUser(*zext, *outer) && hasOnlyUser(equalCmp, *zext);
+}
+
+bool zfConditionUseChainIsPrivate(llvm::BranchInst &branch,
+                                  llvm::ICmpInst &equalCmp,
+                                  llvm::StoreInst &flagStore) {
+  auto *outer = llvm::dyn_cast<llvm::ICmpInst>(branch.getCondition());
+  if (outer == nullptr || !hasOnlyUser(*outer, branch)) {
+    return false;
+  }
+  llvm::Value *maybeFlag = llvm::isa<llvm::ConstantInt>(outer->getOperand(0))
+                               ? outer->getOperand(1)
+                               : outer->getOperand(0);
+  auto *flagLoad = llvm::dyn_cast<llvm::LoadInst>(maybeFlag);
+  if (flagLoad == nullptr || !hasOnlyUser(*flagLoad, *outer)) {
+    return false;
+  }
+  auto *zext = llvm::dyn_cast<llvm::ZExtInst>(flagStore.getValueOperand());
+  if (zext != nullptr) {
+    return zext->getOperand(0) == &equalCmp && hasOnlyUser(*zext, flagStore) &&
+           hasOnlyUser(equalCmp, *zext);
+  }
+  return flagStore.getValueOperand() == &equalCmp &&
+         hasOnlyUser(equalCmp, flagStore);
+}
+
+std::optional<CanaryConditionMatch>
+matchCanaryCondition(llvm::BranchInst &branch) {
+  CanaryConditionMatch zfMatch;
+  // Lifted x64 checks often materialize the canary comparison into ZF and then
+  // branch on ZF == 0.  Match that first so the outer flag compare is not
+  // mistaken for the canary equality itself.
+  if (std::optional<bool> trueMeansEqual = zfConditionTrueMeansCanaryEqual(
+          branch.getCondition(), &zfMatch.EqualCmp, &zfMatch.FlagStore)) {
+    if (zfMatch.EqualCmp != nullptr && zfMatch.FlagStore != nullptr &&
+        zfConditionUseChainIsPrivate(branch, *zfMatch.EqualCmp,
+                                     *zfMatch.FlagStore)) {
+      zfMatch.TrueMeansEqual = *trueMeansEqual;
+      return zfMatch;
+    }
+  }
+
+  CanaryConditionMatch match;
+  if (std::optional<bool> trueMeansEqual =
+          conditionTrueMeansCanaryEqual(branch.getCondition(),
+                                        &match.EqualCmp)) {
+    if (match.EqualCmp != nullptr &&
+        conditionUseChainIsPrivate(branch, *match.EqualCmp)) {
+      match.TrueMeansEqual = *trueMeansEqual;
+      return match;
+    }
+  }
+  return std::nullopt;
 }
 
 bool pointerIsFailCallSetupValue(llvm::Value *value, llvm::BasicBlock &block) {
@@ -624,25 +816,36 @@ void eraseDeadLoadAndPointer(llvm::LoadInst &load) {
   llvm::RecursivelyDeleteTriviallyDeadInstructions(pointer);
 }
 
-bool eraseStackCanaryCheck(llvm::BranchInst &branch,
-                           NativeStackCanaryCleanupSummary &summary) {
+void eraseDeadFlagStoreAndValue(llvm::StoreInst &store) {
+  if (store.getParent() == nullptr) {
+    return;
+  }
+  llvm::Value *value = store.getValueOperand();
+  store.eraseFromParent();
+  llvm::RecursivelyDeleteTriviallyDeadInstructions(value);
+}
+
+bool eraseStackCanaryPredecessor(llvm::BranchInst &branch,
+                                 llvm::BasicBlock &fail,
+                                 llvm::StringRef stackPointerRegister,
+                                 NativeStackCanaryCleanupSummary &summary) {
   if (!branch.isConditional()) {
     return false;
   }
 
-  llvm::ICmpInst *equalCmp = nullptr;
-  std::optional<bool> trueMeansEqual =
-      conditionTrueMeansCanaryEqual(branch.getCondition(), &equalCmp);
-  if (!trueMeansEqual || equalCmp == nullptr ||
-      !conditionUseChainIsPrivate(branch, *equalCmp)) {
+  std::optional<CanaryConditionMatch> condition = matchCanaryCondition(branch);
+  if (!condition || condition->EqualCmp == nullptr) {
     return false;
   }
+  llvm::ICmpInst *equalCmp = condition->EqualCmp;
 
   llvm::BasicBlock *success =
-      *trueMeansEqual ? branch.getSuccessor(0) : branch.getSuccessor(1);
-  llvm::BasicBlock *fail =
-      *trueMeansEqual ? branch.getSuccessor(1) : branch.getSuccessor(0);
-  if (success == fail || !blockOnlyCallsStackCheckFail(*fail)) {
+      condition->TrueMeansEqual ? branch.getSuccessor(0)
+                                : branch.getSuccessor(1);
+  llvm::BasicBlock *matchedFail =
+      condition->TrueMeansEqual ? branch.getSuccessor(1)
+                                : branch.getSuccessor(0);
+  if (success == matchedFail || matchedFail != &fail) {
     return false;
   }
 
@@ -655,14 +858,15 @@ bool eraseStackCanaryCheck(llvm::BranchInst &branch,
   llvm::LoadInst *savedLoad = nullptr;
   llvm::LoadInst *fsCanaryLoad = nullptr;
   std::optional<FsCanaryAddress> fsAddress;
-  if (loadIsSavedCanarySlot(*first)) {
+  if (loadIsSavedCanarySlot(*first, stackPointerRegister)) {
     fsAddress = findFsCanaryAddress(*second);
     if (fsAddress) {
       savedLoad = first;
       fsCanaryLoad = second;
     }
   }
-  if (savedLoad == nullptr && loadIsSavedCanarySlot(*second)) {
+  if (savedLoad == nullptr &&
+      loadIsSavedCanarySlot(*second, stackPointerRegister)) {
     fsAddress = findFsCanaryAddress(*first);
     if (fsAddress) {
       savedLoad = second;
@@ -680,12 +884,15 @@ bool eraseStackCanaryCheck(llvm::BranchInst &branch,
 
   llvm::BasicBlock *checkBlock = branch.getParent();
   llvm::Value *oldCondition = branch.getCondition();
-  fail->removePredecessor(checkBlock);
+  fail.removePredecessor(checkBlock);
   llvm::IRBuilder<> builder(&branch);
   builder.CreateBr(success);
   branch.eraseFromParent();
 
   llvm::RecursivelyDeleteTriviallyDeadInstructions(oldCondition);
+  if (condition->FlagStore != nullptr) {
+    eraseDeadFlagStoreAndValue(*condition->FlagStore);
+  }
   eraseDeadLoadAndPointer(*savedLoad);
   eraseDeadLoadAndPointer(*fsCanaryLoad);
 
@@ -699,15 +906,35 @@ bool eraseStackCanaryCheck(llvm::BranchInst &branch,
 }
 
 void eraseStackCanaryChecks(llvm::Function &function,
+                            llvm::StringRef stackPointerRegister,
                             NativeStackCanaryCleanupSummary &summary) {
   bool changed = true;
   while (changed) {
     changed = false;
     for (llvm::BasicBlock &block : llvm::make_early_inc_range(function)) {
-      auto *branch =
-          llvm::dyn_cast_or_null<llvm::BranchInst>(block.getTerminator());
-      if (branch != nullptr && eraseStackCanaryCheck(*branch, summary)) {
-        changed = true;
+      if (!blockOnlyCallsStackCheckFail(block)) {
+        continue;
+      }
+
+      // Treat the fail call as the anchor, then validate each incoming edge as
+      // a real canary compare.  This keeps shared fail blocks natural: removing
+      // one matching predecessor must not force unrelated predecessors to match.
+      std::vector<llvm::BranchInst *> predecessors;
+      for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
+        auto *branch = llvm::dyn_cast_or_null<llvm::BranchInst>(
+            predecessor->getTerminator());
+        if (branch != nullptr) {
+          predecessors.push_back(branch);
+        }
+      }
+      for (llvm::BranchInst *branch : predecessors) {
+        if (eraseStackCanaryPredecessor(*branch, block, stackPointerRegister,
+                                        summary)) {
+          changed = true;
+          break;
+        }
+      }
+      if (changed) {
         break;
       }
     }
@@ -719,12 +946,16 @@ void eraseStackCanaryChecks(llvm::Function &function,
 NativeStackCanaryCleanupSummary runNativeStackCanaryCleanup(
     llvm::Module &module, const NativeStackCanaryCleanupOptions &options) {
   NativeStackCanaryCleanupSummary summary;
+  std::string stackPointerRegister;
+  if (std::optional<NativeAbiSpec> abi = readNativeAbiMetadata(module)) {
+    stackPointerRegister = abi->StackPointerRegister;
+  }
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;
     }
     ++summary.FunctionsSeen;
-    eraseStackCanaryChecks(function, summary);
+    eraseStackCanaryChecks(function, stackPointerRegister, summary);
   }
   if (options.PrintSummary) {
     printNativeStackCanaryCleanupSummary(summary, llvm::errs());
