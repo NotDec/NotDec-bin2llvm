@@ -291,6 +291,16 @@ bool moduleHasOverflowIntrinsicDeclaration(const llvm::Module &module) {
   return false;
 }
 
+bool functionHasZeroDemandOperandMetadata(const llvm::Function &function) {
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    if (inst.getMetadata(
+            "notdec.register.summary_ssa.zero_demand_operand") != nullptr) {
+      return true;
+    }
+  }
+  return false;
+}
+
 llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
                                                uint64_t fsOffset,
                                                bool useZextCondition,
@@ -3343,6 +3353,40 @@ bool testPartialKeepHighStoreIsDemandRewritten() {
                   "module failed verifier after partial demand rewrite test");
 }
 
+bool testPartialDemandZeroReplacementIsMarked() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-demand-zero-metadata", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage,
+      "partial_zero_metadata", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *old = loadRegister(builder, rdx, "RDX", "old");
+  llvm::Value *keep = builder.CreateAnd(
+      old, llvm::ConstantInt::get(
+               rdx->getValueType(), llvm::APInt::getBitsSet(64, 8, 64)),
+      "keep_high");
+  llvm::Value *low = llvm::ConstantInt::get(rdx->getValueType(), 7);
+  storeRegister(builder, rdx, builder.CreateOr(keep, low, "merged"), "RDX");
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnablePostRewriteInstCombine = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+
+  return expect(summary.PartialDemandMatched >= 1,
+                "partial zero replacement was not applied") &&
+         expect(functionHasZeroDemandOperandMetadata(*function),
+                "partial zero replacement was not marked") &&
+         verifyOk(module,
+                  "module failed verifier after partial zero metadata test");
+}
+
 bool testPartialZmmKeepHighStoreIsDemandRewritten() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-zmm-demand", context);
@@ -3729,6 +3773,7 @@ int main() {
   ok &= testKnownPowUsesFloatAbiSlots();
   ok &= testKnownUnaryLibmUsesFloatAbiSlots();
   ok &= testPartialKeepHighStoreIsDemandRewritten();
+  ok &= testPartialDemandZeroReplacementIsMarked();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();

@@ -246,6 +246,53 @@ llvm::Value *frozenPoisonAt(llvm::IRBuilder<> &builder, llvm::Type *type,
   return builder.CreateFreeze(llvm::PoisonValue::get(type), name);
 }
 
+std::string llvmTypeName(llvm::Type *type) {
+  std::string result;
+  llvm::raw_string_ostream os(result);
+  if (type != nullptr) {
+    type->print(os);
+  } else {
+    os << "<null>";
+  }
+  return os.str();
+}
+
+void attachZeroDemandOperandMetadata(llvm::Instruction &instruction,
+                                     unsigned operandIndex,
+                                     llvm::Value &original) {
+  llvm::LLVMContext &context = instruction.getContext();
+  std::vector<llvm::Metadata *> entries;
+  if (llvm::MDNode *existing = instruction.getMetadata(
+          "notdec.register.summary_ssa.zero_demand_operand")) {
+    for (const llvm::MDOperand &operand : existing->operands()) {
+      if (llvm::Metadata *metadata = operand.get()) {
+        entries.push_back(metadata);
+      }
+    }
+  }
+
+  // The zero constant cannot carry metadata.  Mark the user instruction instead
+  // so leaked synthetic zeros can be traced without changing the optimized IR.
+  std::vector<llvm::Metadata *> fields = {
+      llvm::MDString::get(context,
+                          "operand=" + std::to_string(operandIndex)),
+      llvm::MDString::get(context,
+                          "original_type=" + llvmTypeName(original.getType())),
+  };
+  if (original.hasName()) {
+    fields.push_back(
+        llvm::MDString::get(context, "original_name=" + original.getName().str()));
+  }
+  if (auto *originalInst = llvm::dyn_cast<llvm::Instruction>(&original)) {
+    fields.push_back(llvm::MDString::get(
+        context, std::string("original_opcode=") + originalInst->getOpcodeName()));
+  }
+
+  entries.push_back(llvm::MDNode::get(context, fields));
+  instruction.setMetadata("notdec.register.summary_ssa.zero_demand_operand",
+                          llvm::MDNode::get(context, entries));
+}
+
 const std::map<llvm::StringRef, KnownExternalPrototype> &
 knownExternalPrototypes() {
   using ValueType = KnownExternalPrototype::ValueType;
@@ -1642,7 +1689,9 @@ private:
     }
 
     bool changed = false;
+    unsigned operandIndex = 0;
     for (llvm::Use &operandUse : inst->operands()) {
+      unsigned currentOperandIndex = operandIndex++;
       llvm::Value *operand = operandUse.get();
       if (llvm::isa<llvm::Constant>(operand)) {
         continue;
@@ -1663,6 +1712,7 @@ private:
         continue;
       }
 
+      attachZeroDemandOperandMetadata(*inst, currentOperandIndex, *operand);
       operandUse.set(zero);
       if (auto *operandInst = llvm::dyn_cast<llvm::Instruction>(operand)) {
         eraseTriviallyDeadNonPhiTree(operandInst);
