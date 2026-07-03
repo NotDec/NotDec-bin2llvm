@@ -126,6 +126,71 @@ OUT=/tmp/notdec-bin2llvm-fortune-arity-20260703065713
   `inferred_unknown_external_arity=3`
 - 本次 fortune native run `elapsed=5.88s`。
 
+### clobber 参数不再作为 unknown external arity 强证据
+
+继续检查 fortune 残留 `summary_clobber` 后，发现 `recode_scan_request` 被推成 3 参数并不是
+来自真实调用点设置了 `RDX`，而是 `__sprintf_chk` 后的 `RDX.clobber` 被
+`callsiteBoundArgPrefix(...)` 当成连续第 3 个参数。反汇编中该调用前只设置了
+`RDI/RSI`，没有设置 `RDX`。
+
+实现：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1493`：
+  新增 `isDirectSummaryClobberValue(...)`，识别 `notdec.register.summary_clobber.*`
+  helper 直接产生的值。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1503`：
+  新增 `mayDependOnSummaryClobberValue(...)`，对 PHI、select、cast 做轻量追踪，识别
+  间接来自 clobber helper 的值。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1532`：
+  `callsiteBoundArgPrefix(...)` 遇到 clobber-derived 值时停止计数。clobber 只说明前一个
+  call 破坏了寄存器，不作为未知外部函数真实参数的强证据。
+- `tests/native_register_summary_ssa_test.cpp:2591`：
+  新增 `testUnknownExternalArityStopsAtClobberArg`。测试先调用已知外部 `free`
+  产生 `RDX` clobber，再只设置 `RDI/RSI` 调未知外部函数，检查最终 arity 为 2。
+- `tests/native_register_summary_ssa_test.cpp:2665`：
+  新增 `testUnknownExternalArityStopsAtPhiClobberArg`，覆盖 clobber 经 PHI 汇合后再作为
+  未知外部函数候选参数的场景。
+- `tests/native_register_summary_ssa_test.cpp:4266`、`tests/native_register_summary_ssa_test.cpp:4267`：
+  接入两个新测试。
+
+验证：
+
+```bash
+cmake --build build --target native_register_summary_ssa_test -j4
+./build/bin/native_register_summary_ssa_test
+cmake --build build --target notdec-native-llvm -j4
+```
+
+fortune smoke：
+
+```bash
+OUT=/tmp/notdec-bin2llvm-fortune-clobber-arity-phi-20260703115627
+./build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --skip-runtime \
+  --summary-json-out "$OUT/summary.json" \
+  --register-ssa-warning-out "$OUT/register-ssa-warnings.tsv" \
+  -o "$OUT/fortune.native.ll"
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as "$OUT/fortune.native.ll" -o "$OUT/fortune.native.bc"
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify "$OUT/fortune.native.bc" -o /dev/null
+```
+
+结果：
+
+- IR：`/tmp/notdec-bin2llvm-fortune-clobber-arity-phi-20260703115627/fortune.native.ll`
+- warning TSV：`/tmp/notdec-bin2llvm-fortune-clobber-arity-phi-20260703115627/register-ssa-warnings.tsv`
+- `recode_scan_request` 从 `declare void @recode_scan_request(i64, i64, i64)` 收敛到
+  `declare void @recode_scan_request(i64, i64)`。
+- `recode_scan_request` warning 从 `arity=3..3/final=3` 变为 `arity=2..2/final=2`。
+- `recode_new_outer` 从 `declare i64 @recode_new_outer(i64, i64, i64, i64, i64, i64)`
+  收敛到 `declare i64 @recode_new_outer(i64, i64)`。
+- `recode_string` 从 `declare i64 @recode_string(i64, i64, i64, i64, i64, i64)`
+  收敛到 `declare i64 @recode_string(i64, i64)`。
+- `recode_string` warning 从 `arity=2..6/final=6` 变为 `arity=2..2/final=2`。
+- `summary_clobber refs=23`，`summary_return refs=0`。
+- `llvm-as` 和 `opt -passes=verify` 通过。
+- 本次 fortune native run `elapsed=5.99s`，和上一轮 `5.88s` 同级，未见明显性能回退。
+
 ## 评估
 
 - 实现效果：8/10。fortune 的 `summary_return` 和 `RDX.return` 已清零，剩余 clobber 有 warning 文件可查。

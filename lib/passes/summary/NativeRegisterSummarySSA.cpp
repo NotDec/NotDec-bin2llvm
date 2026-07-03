@@ -1490,11 +1490,56 @@ void addDemandedExternalReturns(
   }
 }
 
+bool isDirectSummaryClobberValue(const llvm::Value *value) {
+  auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
+  if (call == nullptr) {
+    return false;
+  }
+  llvm::Function *callee = call->getCalledFunction();
+  return callee != nullptr &&
+         callee->getName().starts_with("notdec.register.summary_clobber");
+}
+
+bool mayDependOnSummaryClobberValue(
+    const llvm::Value *value,
+    llvm::SmallPtrSetImpl<const llvm::Value *> &visiting) {
+  if (value == nullptr || !visiting.insert(value).second) {
+    return false;
+  }
+  if (isDirectSummaryClobberValue(value)) {
+    return true;
+  }
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+    return llvm::any_of(phi->incoming_values(), [&](const llvm::Value *incoming) {
+      return mayDependOnSummaryClobberValue(incoming, visiting);
+    });
+  }
+  if (auto *select = llvm::dyn_cast<llvm::SelectInst>(value)) {
+    return mayDependOnSummaryClobberValue(select->getTrueValue(), visiting) ||
+           mayDependOnSummaryClobberValue(select->getFalseValue(), visiting);
+  }
+  if (auto *cast = llvm::dyn_cast<llvm::CastInst>(value)) {
+    return mayDependOnSummaryClobberValue(cast->getOperand(0), visiting);
+  }
+  return false;
+}
+
+bool mayDependOnSummaryClobberValue(const llvm::Value *value) {
+  llvm::SmallPtrSet<const llvm::Value *, 8> visiting;
+  return mayDependOnSummaryClobberValue(value, visiting);
+}
+
 unsigned callsiteBoundArgPrefix(
     const std::vector<CallArgStoreBinding> &bindings) {
   unsigned prefix = 0;
   for (const CallArgStoreBinding &binding : bindings) {
     if (binding.Index != prefix) {
+      break;
+    }
+    // A clobber helper means the register only came from a previous call's
+    // caller-clobbered state.  It is not strong evidence that this call really
+    // has that ABI argument.
+    if (mayDependOnSummaryClobberValue(binding.RegisterValue)) {
       break;
     }
     ++prefix;

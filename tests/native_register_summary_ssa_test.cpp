@@ -2588,6 +2588,172 @@ bool testUnknownExternalArityUsesMaxCallsitePrefix() {
                   "module failed verifier after unknown external arity test");
 }
 
+bool testUnknownExternalArityStopsAtClobberArg() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unknown-external-clobber-arity", context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_unknown_external_clobber_arity_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  for (llvm::StringRef name : {"RDI", "RSI", "RDX"}) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 1;
+    input.MaxSize = 8;
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = name.str();
+    abi.Inputs.push_back(input);
+  }
+  for (llvm::StringRef name : {"RAX", "RDX"}) {
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = name.str();
+    abi.Effects.push_back(killed);
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  (void)rdx;
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *knownClobber = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "free", module);
+  llvm::Function *unknown = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage,
+      "unknown_external_clobber_arity", module);
+  llvm::Function *function =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external_clobber_arity_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 99),
+                "RDI");
+  builder.CreateCall(voidType, knownClobber);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  builder.CreateCall(voidType, unknown);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten =
+      module.getFunction("unknown_external_clobber_arity");
+  bool hasInferredArityWarning = false;
+  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+       summary.Warnings) {
+    hasInferredArityWarning |=
+        warning.CalleeName == "unknown_external_clobber_arity" &&
+        warning.Reason == "inferred_unknown_external_arity";
+  }
+
+  return expect(rewritten != nullptr,
+                "unknown external clobber arity callee missing") &&
+         expect(rewritten->arg_size() == 2,
+                "unknown external arity counted clobber as argument") &&
+         expect(hasInferredArityWarning,
+                "unknown external clobber arity warning missing") &&
+         verifyOk(module,
+                  "module failed verifier after clobber arity test");
+}
+
+bool testUnknownExternalArityStopsAtPhiClobberArg() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unknown-external-phi-clobber-arity", context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_unknown_external_phi_clobber_arity_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  for (llvm::StringRef name : {"RDI", "RSI", "RDX"}) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 1;
+    input.MaxSize = 8;
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = name.str();
+    abi.Inputs.push_back(input);
+  }
+  for (llvm::StringRef name : {"RAX", "RDX"}) {
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = name.str();
+    abi.Effects.push_back(killed);
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *knownClobber = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "free", module);
+  llvm::Function *unknown = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage,
+      "unknown_external_phi_clobber_arity", module);
+  llvm::Function *function =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external_phi_clobber_arity_caller",
+                             module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *clobberPath =
+      llvm::BasicBlock::Create(context, "clobber_path", function);
+  llvm::BasicBlock *cleanPath =
+      llvm::BasicBlock::Create(context, "clean_path", function);
+  llvm::BasicBlock *join =
+      llvm::BasicBlock::Create(context, "join", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), clobberPath,
+                       cleanPath);
+
+  builder.SetInsertPoint(clobberPath);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 99),
+                "RDI");
+  builder.CreateCall(voidType, knownClobber);
+  builder.CreateBr(join);
+
+  builder.SetInsertPoint(cleanPath);
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 0),
+                "RDX");
+  builder.CreateBr(join);
+
+  builder.SetInsertPoint(join);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  builder.CreateCall(voidType, unknown);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten =
+      module.getFunction("unknown_external_phi_clobber_arity");
+  bool hasInferredArityWarning = false;
+  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+       summary.Warnings) {
+    hasInferredArityWarning |=
+        warning.CalleeName == "unknown_external_phi_clobber_arity" &&
+        warning.Reason == "inferred_unknown_external_arity";
+  }
+
+  return expect(rewritten != nullptr,
+                "unknown external phi clobber arity callee missing") &&
+         expect(rewritten->arg_size() == 2,
+                "unknown external arity counted phi clobber as argument") &&
+         expect(hasInferredArityWarning,
+                "unknown external phi clobber arity warning missing") &&
+         verifyOk(module,
+                  "module failed verifier after phi clobber arity test");
+}
+
 bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-call-arg-value-survives-cleanup", context);
@@ -4097,6 +4263,8 @@ int main() {
   ok &= testKnownExternalUsesSingleIntegerReturn();
   ok &= testUnknownExternalTreatsRdxAsClobberNotReturn();
   ok &= testUnknownExternalArityUsesMaxCallsitePrefix();
+  ok &= testUnknownExternalArityStopsAtClobberArg();
+  ok &= testUnknownExternalArityStopsAtPhiClobberArg();
   ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
   ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
