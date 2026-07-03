@@ -1576,6 +1576,50 @@ bool testKnownZeroArgExternalDropsAbiInputs() {
                   "module failed verifier after zero-arg external rewrite");
 }
 
+bool testKnownZeroArgExternalTypedReturnIsMaterialized() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-zero-arg-typed-return", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *voidCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      voidCalleeType, llvm::GlobalValue::ExternalLinkage, "__ctype_b_loc",
+      module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "known_zero_arg_typed_return",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(voidCalleeType, callee);
+  llvm::LoadInst *raxLoad = loadRegister(builder, rax, "RAX", "rax.after");
+  builder.CreateRet(raxLoad);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("__ctype_b_loc");
+  llvm::CallInst *call = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (candidate != nullptr && candidate->getCalledFunction() == rewritten) {
+      call = candidate;
+    }
+  }
+
+  return expect(rewritten != nullptr, "typed zero-arg external missing") &&
+         expect(rewritten->getReturnType()->isIntegerTy(64),
+                "typed zero-arg external kept void return") &&
+         expect(call != nullptr, "typed zero-arg external call missing") &&
+         expect(call->getType()->isIntegerTy(64),
+                "typed zero-arg external call kept void return") &&
+         expect(summary.Warnings.empty(),
+                "typed zero-arg external left register SSA warning") &&
+         verifyOk(module,
+                  "module failed verifier after typed zero-arg external rewrite");
+}
+
 bool testKnownFixedArgExternalTruncatesAbiInputs() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-known-fixed-arg-external", context);
@@ -2415,6 +2459,65 @@ bool testKnownExternalUsesSingleIntegerReturn() {
                 "known external fclose was widened to a multi-register return") &&
          verifyOk(module,
                   "module failed verifier after known external return rewrite");
+}
+
+bool testUnknownExternalTreatsRdxAsClobberNotReturn() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unknown-external-rdx-clobber", context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_unknown_external_rdx_clobber_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  for (llvm::StringRef name : {"RAX", "RDX"}) {
+    notdec::bin2llvm::NativeAbiParamEntry output;
+    output.MinSize = 1;
+    output.MaxSize = 8;
+    output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    output.Storage.Name = name.str();
+    abi.Outputs.push_back(output);
+
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = name.str();
+    abi.Effects.push_back(killed);
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "unknown_external", module);
+  llvm::Function *function =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external_rdx_after", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(voidType, callee);
+  llvm::LoadInst *rdxLoad = loadRegister(builder, rdx, "RDX", "rdx.after");
+  (void)rdxLoad;
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool hasRdxClobberWarning = false;
+  bool hasRdxReturnWarning = false;
+  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+       summary.Warnings) {
+    if (warning.RegisterName != "RDX") {
+      continue;
+    }
+    hasRdxClobberWarning |= warning.Kind == "clobber";
+    hasRdxReturnWarning |= warning.Kind == "return";
+  }
+
+  return expect(hasRdxClobberWarning,
+                "unknown external RDX did not become clobber warning") &&
+         expect(!hasRdxReturnWarning,
+                "unknown external RDX was still treated as return") &&
+         verifyOk(module,
+                  "module failed verifier after unknown external RDX test");
 }
 
 bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
@@ -3918,11 +4021,13 @@ int main() {
   ok &= testDeadFlagStoreBeforeCallIsRemoved();
   ok &= testFlagStoreReadAfterCallIsKept();
   ok &= testPostRewriteInstCombineExposesDeadFlagStore();
+  ok &= testKnownZeroArgExternalTypedReturnIsMaterialized();
   ok &= testKnownFiveArgExternalUsesFiveInputs();
   ok &= testKnownFixedExternalArities();
   ok &= testKnownVarArgExternalKeepsAbiInputs();
   ok &= testMismatchedDirectCallUseUsesReturnExtract();
   ok &= testKnownExternalUsesSingleIntegerReturn();
+  ok &= testUnknownExternalTreatsRdxAsClobberNotReturn();
   ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
   ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();

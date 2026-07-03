@@ -60,6 +60,7 @@ struct CliOptions {
   bool AllConfirmed = false;
   std::string OutputPath;
   std::string SummaryJsonPath;
+  std::string RegisterSSAWarningPath;
   notdec::bin2llvm::NativeDecodeMode DecodeMode =
       notdec::bin2llvm::NativeDecodeMode::Gtirb;
   notdec::bin2llvm::NativeSleighDecodeOptions DecodeOptions;
@@ -83,6 +84,7 @@ void printUsage(const char *argv0) {
                "(-a <address> -l <length> | -f <entry> | -n <name> | "
                "--all-confirmed) "
                "-o <output.ll> [--summary-json-out <path>] "
+               "[--register-ssa-warning-out <path>] "
                "[--no-instcombine-pass] "
                "[--no-register-ssa-pass] [--heritage-register-ssa-pass] "
                "[--summary-register-ssa-pass] "
@@ -219,6 +221,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.OutputPath = std::move(value);
     } else if (flag == "--summary-json-out") {
       options.SummaryJsonPath = std::move(value);
+    } else if (flag == "--register-ssa-warning-out") {
+      options.RegisterSSAWarningPath = std::move(value);
     } else if (flag == "--native-decode-mode") {
       if (value == "gtirb") {
         options.DecodeMode = notdec::bin2llvm::NativeDecodeMode::Gtirb;
@@ -514,6 +518,40 @@ bool writeSummaryJson(const notdec::bin2llvm::NativeProgramState &state,
   output << "  },\n";
   output << "  \"notes\": " << state.notes().size() << "\n";
   output << "}\n";
+  return true;
+}
+
+std::string tsvEscape(const std::string &text) {
+  std::string escaped;
+  escaped.reserve(text.size());
+  for (char ch : text) {
+    if (ch == '\t' || ch == '\n' || ch == '\r') {
+      escaped += ' ';
+    } else {
+      escaped += ch;
+    }
+  }
+  return escaped;
+}
+
+bool writeRegisterSSAWarnings(
+    const notdec::bin2llvm::NativeRegisterSummarySSASummary &summary,
+    const std::string &path) {
+  std::ofstream output(path);
+  if (!output) {
+    std::cerr << "failed to open register SSA warning file: " << path << '\n';
+    return false;
+  }
+
+  output << "function\tcallee\tregister\tkind\treason\tuses\n";
+  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+       summary.Warnings) {
+    output << tsvEscape(warning.FunctionName) << '\t'
+           << tsvEscape(warning.CalleeName) << '\t'
+           << tsvEscape(warning.RegisterName) << '\t'
+           << tsvEscape(warning.Kind) << '\t'
+           << tsvEscape(warning.Reason) << '\t' << warning.Uses << '\n';
+  }
   return true;
 }
 
@@ -919,6 +957,13 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
     passOptions.EnableRewrite = true;
     passOptions.PrintSummary = options.PrintRegisterSSASummary;
     notdec::bin2llvm::runNativeHeritageSSA(module, passOptions);
+    if (!options.RegisterSSAWarningPath.empty()) {
+      notdec::bin2llvm::NativeRegisterSummarySSASummary emptySummary;
+      if (!writeRegisterSSAWarnings(emptySummary,
+                                    options.RegisterSSAWarningPath)) {
+        return false;
+      }
+    }
     if (llvm::verifyModule(module, &llvm::errs())) {
       std::cerr << "module verification failed after heritage SSA pass\n";
       return false;
@@ -932,7 +977,12 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
       !options.DisableSummaryRegisterResidueRemoval;
   passOptions.EnablePostRewriteInstCombine = !options.DisableInstCombinePass;
   passOptions.PrintSummary = options.PrintRegisterSSASummary;
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module, passOptions);
+  notdec::bin2llvm::NativeRegisterSummarySSASummary summary =
+      notdec::bin2llvm::runNativeRegisterSummarySSA(module, passOptions);
+  if (!options.RegisterSSAWarningPath.empty() &&
+      !writeRegisterSSAWarnings(summary, options.RegisterSSAWarningPath)) {
+    return false;
+  }
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after summary register SSA pass\n";
     return false;

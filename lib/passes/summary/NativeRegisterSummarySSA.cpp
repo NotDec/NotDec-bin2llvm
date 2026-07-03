@@ -298,9 +298,9 @@ knownExternalPrototypes() {
   using ValueType = KnownExternalPrototype::ValueType;
   static const std::map<llvm::StringRef, KnownExternalPrototype> prototypes = {
       {"__assert_fail", {4, false, true}},
-      {"__ctype_b_loc", {0, false, false}},
-      {"__ctype_tolower_loc", {0, false, false}},
-      {"__ctype_toupper_loc", {0, false, false}},
+      {"__ctype_b_loc", {0, false, false, 1, {}, ValueType::I64}},
+      {"__ctype_tolower_loc", {0, false, false, 1, {}, ValueType::I64}},
+      {"__ctype_toupper_loc", {0, false, false, 1, {}, ValueType::I64}},
       {"__cxa_atexit", {3, false, false}},
       {"__cxa_finalize", {1, false, false}},
       {"__errno_location", {0, false, false}},
@@ -464,7 +464,7 @@ knownExternalPrototypes() {
       {"getloadavg", {2, false}},
       {"getpagesize", {0, false}},
       {"getpeername", {3, false}},
-      {"getpid", {0, false}},
+      {"getpid", {0, false, false, 1, {}, ValueType::I64}},
       {"getpgrp", {0, false}},
       {"getppid", {0, false}},
       {"getpriority", {2, false}},
@@ -639,7 +639,7 @@ knownExternalPrototypes() {
       {"qsort", {4, false}},
       {"raise", {1, false}},
       {"rand", {0, false}},
-      {"random", {0, false}},
+      {"random", {0, false, false, 1, {}, ValueType::I64}},
       {"read", {3, false}},
       {"readv", {3, false}},
       {"readdir", {1, false}},
@@ -1364,6 +1364,23 @@ std::optional<NativeSignatureSlot> typedReturnSlot(
                               NativeSignatureSlotKind::IntegerRegister);
 }
 
+bool isIntegerAbiOutput(const AbiFacts &abi, llvm::StringRef name) {
+  return std::any_of(abi.IntegerOutputsInOrder.begin(),
+                     abi.IntegerOutputsInOrder.end(),
+                     [&](const AbiFacts::RegisterSlot &slot) {
+                       return slot.UnitName == name;
+                     });
+}
+
+bool isLikelyNonReturnIntegerAbiOutput(const AbiFacts &abi,
+                                       llvm::StringRef name) {
+  // On x86-64 SysV, RDX is listed as call-clobbered and sometimes appears in
+  // ABI output metadata, but ordinary libc calls rarely return a second integer
+  // value there.  Without a stronger prototype, keep it as clobber evidence.
+  return abi.IntegerOutputsInOrder.size() > 1 &&
+         abi.IntegerOutputsInOrder.front().UnitName != name && name == "RDX";
+}
+
 SignatureShape shapeForKnownExternal(
     llvm::Function &function,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -1375,7 +1392,7 @@ SignatureShape shapeForKnownExternal(
     count = abi.InputsInOrder.size();
   } else {
     const KnownExternalPrototype &known = knownIt->second;
-    if (!known.TypedParams.empty()) {
+    if (!known.TypedParams.empty() || known.TypedReturn) {
       unsigned integerIndex = 0;
       unsigned floatIndex = 0;
       for (KnownExternalPrototype::ValueType type : known.TypedParams) {
@@ -1435,6 +1452,12 @@ void addDemandedExternalReturns(
     for (const std::string &name : abi.OutputsInOrder) {
       if (maxReturnRegisters.has_value() &&
           returnIndex >= *maxReturnRegisters) {
+        break;
+      }
+      // Without a strong external prototype on x86-64, RDX is usually
+      // caller-clobbered, not a second return value.
+      if (!maxReturnRegisters.has_value() &&
+          isLikelyNonReturnIntegerAbiOutput(abi, name)) {
         break;
       }
       if (helpers.count(name) == 0) {
@@ -2583,7 +2606,9 @@ private:
     if (Abi.Unaffected.count(unit.Name) != 0) {
       return CallRegisterEffect::Preserve;
     }
-    if (Abi.Outputs.count(unit.Name) != 0) {
+    if (signatureReturnUsesUnit(const_cast<llvm::CallBase &>(call), unit) ||
+        (isIntegerAbiOutput(Abi, unit.Name) &&
+         !isLikelyNonReturnIntegerAbiOutput(Abi, unit.Name))) {
       return CallRegisterEffect::ReturnValue;
     }
     if (Abi.KilledByCall.count(unit.Name) != 0) {
@@ -2761,7 +2786,7 @@ private:
     if (insertBefore == nullptr) {
       return llvm::UndefValue::get(unit.Global->getValueType());
     }
-    if (kind == "return" && !isIntegerAbiOutput(unit) &&
+    if (kind == "return" && !isIntegerAbiOutput(Abi, unit.Name) &&
         !signatureReturnUsesUnit(call, unit)) {
       return frozenPoisonBefore(*insertBefore, unit.Global->getValueType(),
                                 unit.Name + ".return_unknown");
@@ -2782,12 +2807,6 @@ private:
       ++Summary.CallClobberValues;
     }
     return value;
-  }
-
-  bool isIntegerAbiOutput(const RegisterUnit &unit) const {
-    return Abi.OutputsInOrder.end() !=
-           std::find(Abi.OutputsInOrder.begin(), Abi.OutputsInOrder.end(),
-                     unit.Name);
   }
 
   bool signatureReturnUsesUnit(llvm::CallBase &call,
@@ -3440,6 +3459,95 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
   }
 }
 
+std::string metadataField(const llvm::MDNode &node, llvm::StringRef key) {
+  std::string prefix = (key + "=").str();
+  for (const llvm::MDOperand &operand : node.operands()) {
+    auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+    if (text == nullptr) {
+      continue;
+    }
+    llvm::StringRef value = text->getString();
+    if (value.consume_front(prefix)) {
+      return value.str();
+    }
+  }
+  return "";
+}
+
+std::string warningReasonForHelper(const llvm::CallInst &helper,
+                                   llvm::StringRef kind,
+                                   llvm::StringRef regName,
+                                   const llvm::Function *callee) {
+  if (kind == "return") {
+    if (callee != nullptr && callee->isDeclaration()) {
+      if (regName == "RDX") {
+        return "non_primary_external_return_register";
+      }
+      return "missing_external_return_prototype";
+    }
+    return "unresolved_return_register";
+  }
+  if (kind == "clobber") {
+    return "callee_clobber_still_used";
+  }
+  return "unresolved_register_helper";
+}
+
+std::vector<NativeRegisterSummarySSAWarning>
+collectRemainingCallValueWarnings(const llvm::Module &module) {
+  std::vector<NativeRegisterSummarySSAWarning> warnings;
+  for (const llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (const llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *helper = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (helper == nullptr) {
+        continue;
+      }
+      llvm::Function *helperCallee = helper->getCalledFunction();
+      if (helperCallee == nullptr ||
+          !helperCallee->getName().starts_with("notdec.register.summary_")) {
+        continue;
+      }
+      llvm::MDNode *metadata =
+          helper->getMetadata("notdec.register.summary_ssa.call_value");
+      std::string regName =
+          metadata == nullptr ? "" : metadataField(*metadata, "name");
+      std::string kind =
+          metadata == nullptr ? "" : metadataField(*metadata, "kind");
+
+      const llvm::CallBase *sourceCall = nullptr;
+      const llvm::Instruction *previous = helper->getPrevNode();
+      while (previous != nullptr) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(previous);
+        if (call != nullptr) {
+          llvm::Function *callee = call->getCalledFunction();
+          if (callee == nullptr ||
+              !callee->getName().starts_with("notdec.register.summary_")) {
+            sourceCall = call;
+            break;
+          }
+        }
+        previous = previous->getPrevNode();
+      }
+      const llvm::Function *callee =
+          sourceCall == nullptr ? nullptr : sourceCall->getCalledFunction();
+
+      NativeRegisterSummarySSAWarning warning;
+      warning.FunctionName = function.getName().str();
+      warning.CalleeName =
+          callee == nullptr ? "<indirect>" : callee->getName().str();
+      warning.RegisterName = regName;
+      warning.Kind = kind;
+      warning.Reason = warningReasonForHelper(*helper, kind, regName, callee);
+      warning.Uses = helper->getNumUses();
+      warnings.push_back(std::move(warning));
+    }
+  }
+  return warnings;
+}
+
 } // namespace
 
 NativeRegisterSummarySSASummary
@@ -3541,6 +3649,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
     }
   }
   summary.FunctionsSeen = summary.Functions.size();
+  summary.Warnings = collectRemainingCallValueWarnings(module);
   if (options.PrintSummary) {
     printNativeRegisterSummarySSASummary(summary, llvm::errs());
   }
@@ -3583,7 +3692,17 @@ void printNativeRegisterSummarySSASummary(
      << " partial_demand_candidates=" << summary.PartialDemandCandidates
      << " partial_demand_matched=" << summary.PartialDemandMatched
      << " partial_demand_rejected=" << summary.PartialDemandRejected
+     << " warnings=" << summary.Warnings.size()
      << "\n";
+  for (const NativeRegisterSummarySSAWarning &warning : summary.Warnings) {
+    os << "  warning"
+       << " function=" << warning.FunctionName
+       << " callee=" << warning.CalleeName
+       << " register=" << warning.RegisterName
+       << " kind=" << warning.Kind
+       << " reason=" << warning.Reason
+       << " uses=" << warning.Uses << "\n";
+  }
   for (const NativeRegisterSummarySSAFunctionSummary &function :
        summary.Functions) {
     os << "  " << function.FunctionName << ": loads=" << function.LoadsSeen

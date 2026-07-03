@@ -53,6 +53,18 @@ struct NativeRegisterSummarySSAFunctionSummary {
   uint64_t PartialDemandRejected = 0;
 };
 
+// Leftover call-value helpers are kept in the IR when SummarySSA cannot prove a
+// concrete register value.  Emit them as diagnostics so missing prototypes or
+// suspicious clobber uses are visible in batch runs.
+struct NativeRegisterSummarySSAWarning {
+  std::string FunctionName;
+  std::string CalleeName;
+  std::string RegisterName;
+  std::string Kind;
+  std::string Reason;
+  uint64_t Uses = 0;
+};
+
 struct NativeRegisterSummarySSASummary {
   uint64_t FunctionsSeen = 0;
   uint64_t LoadsSeen = 0;
@@ -83,6 +95,7 @@ struct NativeRegisterSummarySSASummary {
   uint64_t PartialDemandMatched = 0;
   uint64_t PartialDemandRejected = 0;
   std::vector<NativeRegisterSummarySSAFunctionSummary> Functions;
+  std::vector<NativeRegisterSummarySSAWarning> Warnings;
 };
 
 NativeRegisterSummarySSASummary runNativeRegisterSummarySSA(
