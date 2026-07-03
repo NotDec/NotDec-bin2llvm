@@ -4,8 +4,8 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
-#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -269,7 +269,8 @@ bool hasStoreInstruction(const llvm::Function &function) {
 
 bool functionHasAnyRegisterSummaryMetadata(const llvm::Function &function) {
   return function.getMetadata("notdec.register.summary") != nullptr ||
-         function.getMetadata("notdec.register.summary.read_entry") != nullptr ||
+         function.getMetadata("notdec.register.summary.read_entry") !=
+             nullptr ||
          function.getMetadata("notdec.register.summary.preserves") != nullptr ||
          function.getMetadata("notdec.register.summary.modifies") != nullptr ||
          function.getMetadata("notdec.register.summary.demanded_returns") !=
@@ -293,8 +294,8 @@ bool moduleHasOverflowIntrinsicDeclaration(const llvm::Module &module) {
 
 bool functionHasZeroDemandOperandMetadata(const llvm::Function &function) {
   for (const llvm::Instruction &inst : llvm::instructions(function)) {
-    if (inst.getMetadata(
-            "notdec.register.summary_ssa.zero_demand_operand") != nullptr) {
+    if (inst.getMetadata("notdec.register.summary_ssa.zero_demand_operand") !=
+        nullptr) {
       return true;
     }
   }
@@ -314,9 +315,9 @@ llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
       failType, llvm::GlobalValue::ExternalLinkage, "__stack_chk_fail", module);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "stack_canary_epilogue",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "stack_canary_epilogue", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::BasicBlock *success =
@@ -332,27 +333,21 @@ llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
       llvm::Type::getInt8Ty(context), stack,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
       "saved_canary_ptr");
-  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0),
-                      savedPointer);
-  llvm::LoadInst *savedCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
-                         "saved_canary");
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), savedPointer);
+  llvm::LoadInst *savedCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
   llvm::LoadInst *fsBase =
       loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
   llvm::Value *fsCanaryAddress = builder.CreateAdd(
-      fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                     fsOffset),
+      fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), fsOffset),
       "fs_canary_addr");
-  llvm::Value *fsCanaryPointer =
-      builder.CreateIntToPtr(fsCanaryAddress, llvm::PointerType::get(context, 0),
-                             "fs_canary_ptr");
-  llvm::LoadInst *fsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
-                         "fs_canary");
-  llvm::ICmpInst *same =
-      llvm::cast<llvm::ICmpInst>(builder.CreateICmpEQ(savedCanary, fsCanary,
-                                                       "canary_same"));
+  llvm::Value *fsCanaryPointer = builder.CreateIntToPtr(
+      fsCanaryAddress, llvm::PointerType::get(context, 0), "fs_canary_ptr");
+  llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                                fsCanaryPointer, "fs_canary");
+  llvm::ICmpInst *same = llvm::cast<llvm::ICmpInst>(
+      builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same"));
   llvm::Value *condition = same;
   if (useZextCondition) {
     llvm::Value *wide =
@@ -392,8 +387,7 @@ llvm::Function *createRawRspStackCanaryCheckFunction(llvm::Module &module) {
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "raw_rsp_stack_canary",
-      module);
+      type, llvm::GlobalValue::ExternalLinkage, "raw_rsp_stack_canary", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::BasicBlock *success =
@@ -406,23 +400,19 @@ llvm::Function *createRawRspStackCanaryCheckFunction(llvm::Module &module) {
   llvm::Value *savedAddress = builder.CreateAdd(
       rspBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), -24),
       "saved_canary_addr");
-  llvm::Value *savedPointer =
-      builder.CreateIntToPtr(savedAddress, llvm::PointerType::get(context, 0),
-                             "saved_canary_ptr");
-  llvm::LoadInst *savedCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
-                         "saved_canary");
+  llvm::Value *savedPointer = builder.CreateIntToPtr(
+      savedAddress, llvm::PointerType::get(context, 0), "saved_canary_ptr");
+  llvm::LoadInst *savedCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
   llvm::LoadInst *fsBase =
       loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
   llvm::Value *fsCanaryAddress = builder.CreateAdd(
       fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
       "fs_canary_addr");
-  llvm::Value *fsCanaryPointer =
-      builder.CreateIntToPtr(fsCanaryAddress, llvm::PointerType::get(context, 0),
-                             "fs_canary_ptr");
-  llvm::LoadInst *fsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
-                         "fs_canary");
+  llvm::Value *fsCanaryPointer = builder.CreateIntToPtr(
+      fsCanaryAddress, llvm::PointerType::get(context, 0), "fs_canary_ptr");
+  llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                                fsCanaryPointer, "fs_canary");
   llvm::Value *same =
       builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same");
   builder.CreateCondBr(same, success, failBlock);
@@ -439,8 +429,8 @@ llvm::Function *createRawRspStackCanaryCheckFunction(llvm::Module &module) {
 llvm::Function *createRawRspZfStackCanaryCheckFunction(llvm::Module &module) {
   llvm::LLVMContext &context = module.getContext();
   llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
-  llvm::GlobalVariable *zf = createRegisterGlobal(
-      module, "ZF", llvm::Type::getInt8Ty(context), 0, 1);
+  llvm::GlobalVariable *zf =
+      createRegisterGlobal(module, "ZF", llvm::Type::getInt8Ty(context), 0, 1);
   llvm::GlobalVariable *fsOffsetRegister =
       createRegisterGlobal(module, "FS_OFFSET");
 
@@ -449,9 +439,9 @@ llvm::Function *createRawRspZfStackCanaryCheckFunction(llvm::Module &module) {
       failType, llvm::GlobalValue::ExternalLinkage, "__stack_chk_fail", module);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "raw_rsp_zf_stack_canary",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "raw_rsp_zf_stack_canary", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::BasicBlock *success =
@@ -464,23 +454,19 @@ llvm::Function *createRawRspZfStackCanaryCheckFunction(llvm::Module &module) {
   llvm::Value *savedAddress = builder.CreateAdd(
       rspBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8200),
       "saved_canary_addr");
-  llvm::Value *savedPointer =
-      builder.CreateIntToPtr(savedAddress, llvm::PointerType::get(context, 0),
-                             "saved_canary_ptr");
-  llvm::LoadInst *savedCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
-                         "saved_canary");
+  llvm::Value *savedPointer = builder.CreateIntToPtr(
+      savedAddress, llvm::PointerType::get(context, 0), "saved_canary_ptr");
+  llvm::LoadInst *savedCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
   llvm::LoadInst *fsBase =
       loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
   llvm::Value *fsCanaryAddress = builder.CreateAdd(
       fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
       "fs_canary_addr");
-  llvm::Value *fsCanaryPointer =
-      builder.CreateIntToPtr(fsCanaryAddress, llvm::PointerType::get(context, 0),
-                             "fs_canary_ptr");
-  llvm::LoadInst *fsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
-                         "fs_canary");
+  llvm::Value *fsCanaryPointer = builder.CreateIntToPtr(
+      fsCanaryAddress, llvm::PointerType::get(context, 0), "fs_canary_ptr");
+  llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                                fsCanaryPointer, "fs_canary");
   llvm::Value *same =
       builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same");
   llvm::Value *flag =
@@ -512,8 +498,7 @@ llvm::Function *createPhiFsBaseStackCanaryCheckFunction(llvm::Module &module) {
 
   auto *type = llvm::FunctionType::get(
       llvm::Type::getVoidTy(context),
-      {llvm::Type::getInt1Ty(context), llvm::Type::getInt1Ty(context)},
-      false);
+      {llvm::Type::getInt1Ty(context), llvm::Type::getInt1Ty(context)}, false);
   llvm::Function *function = llvm::Function::Create(
       type, llvm::GlobalValue::ExternalLinkage, "phi_fs_stack_canary", module);
   llvm::BasicBlock *entry =
@@ -547,9 +532,8 @@ llvm::Function *createPhiFsBaseStackCanaryCheckFunction(llvm::Module &module) {
       llvm::Type::getInt8Ty(context), stack,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
       "saved_canary_ptr");
-  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0),
-                      savedPointer);
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), savedPointer);
   llvm::LoadInst *fsBase =
       loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base_entry");
   builder.CreateCondBr(function->getArg(0), directEdge, outerSelect);
@@ -563,10 +547,9 @@ llvm::Function *createPhiFsBaseStackCanaryCheckFunction(llvm::Module &module) {
   builder.SetInsertPoint(fsEdge);
   builder.CreateBr(innerMerge);
   builder.SetInsertPoint(zeroEdge);
-  llvm::Value *unknownInnerFs =
-      builder.CreateFreeze(llvm::PoisonValue::get(
-                               llvm::Type::getInt64Ty(context)),
-                           "fs_base_inner_unknown");
+  llvm::Value *unknownInnerFs = builder.CreateFreeze(
+      llvm::PoisonValue::get(llvm::Type::getInt64Ty(context)),
+      "fs_base_inner_unknown");
   builder.CreateBr(innerMerge);
   builder.SetInsertPoint(innerMerge);
   llvm::PHINode *innerPhi =
@@ -575,10 +558,9 @@ llvm::Function *createPhiFsBaseStackCanaryCheckFunction(llvm::Module &module) {
   innerPhi->addIncoming(unknownInnerFs, zeroEdge);
   builder.CreateBr(merge);
   builder.SetInsertPoint(outerZeroEdge);
-  llvm::Value *unknownOuterFs =
-      builder.CreateFreeze(llvm::PoisonValue::get(
-                               llvm::Type::getInt64Ty(context)),
-                           "fs_base_outer_unknown");
+  llvm::Value *unknownOuterFs = builder.CreateFreeze(
+      llvm::PoisonValue::get(llvm::Type::getInt64Ty(context)),
+      "fs_base_outer_unknown");
   builder.CreateBr(merge);
 
   builder.SetInsertPoint(merge);
@@ -587,18 +569,15 @@ llvm::Function *createPhiFsBaseStackCanaryCheckFunction(llvm::Module &module) {
   fsBasePhi->addIncoming(fsBase, directEdge);
   fsBasePhi->addIncoming(innerPhi, innerMerge);
   fsBasePhi->addIncoming(unknownOuterFs, outerZeroEdge);
-  llvm::LoadInst *savedCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
-                         "saved_canary");
+  llvm::LoadInst *savedCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
   llvm::Value *fsCanaryAddress = builder.CreateAdd(
       fsBasePhi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
       "fs_canary_addr");
-  llvm::Value *fsCanaryPointer =
-      builder.CreateIntToPtr(fsCanaryAddress, llvm::PointerType::get(context, 0),
-                             "fs_canary_ptr");
-  llvm::LoadInst *fsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
-                         "fs_canary");
+  llvm::Value *fsCanaryPointer = builder.CreateIntToPtr(
+      fsCanaryAddress, llvm::PointerType::get(context, 0), "fs_canary_ptr");
+  llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                                fsCanaryPointer, "fs_canary");
   llvm::Value *same =
       builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same");
   builder.CreateCondBr(same, success, failBlock);
@@ -620,9 +599,9 @@ llvm::Function *createZeroBaseStackCanaryCheckFunction(llvm::Module &module) {
       failType, llvm::GlobalValue::ExternalLinkage, "__stack_chk_fail", module);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "zero_base_stack_canary",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "zero_base_stack_canary", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::BasicBlock *success =
@@ -638,18 +617,15 @@ llvm::Function *createZeroBaseStackCanaryCheckFunction(llvm::Module &module) {
       llvm::Type::getInt8Ty(context), stack,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
       "saved_canary_ptr");
-  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0),
-                      savedPointer);
-  llvm::LoadInst *savedCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
-                         "saved_canary");
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), savedPointer);
+  llvm::LoadInst *savedCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
   llvm::Value *fsCanaryPointer = builder.CreateIntToPtr(
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
       llvm::PointerType::get(context, 0), "fs_canary_ptr");
-  llvm::LoadInst *fsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
-                         "fs_canary");
+  llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                                fsCanaryPointer, "fs_canary");
   llvm::Value *same =
       builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same");
   builder.CreateCondBr(same, success, failBlock);
@@ -673,9 +649,9 @@ llvm::Function *createSharedFailStackCanaryCheckFunction(llvm::Module &module) {
       failType, llvm::GlobalValue::ExternalLinkage, "__stack_chk_fail", module);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "shared_fail_stack_canary",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "shared_fail_stack_canary", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::BasicBlock *secondCheck =
@@ -697,26 +673,24 @@ llvm::Function *createSharedFailStackCanaryCheckFunction(llvm::Module &module) {
       llvm::Type::getInt8Ty(context), stack,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32),
       "second_saved_canary_ptr");
-  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0),
-                      firstSavedPointer);
-  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0),
-                      secondSavedPointer);
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0),
+      firstSavedPointer);
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0),
+      secondSavedPointer);
   llvm::LoadInst *fsBase =
       loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
   llvm::Value *fsCanaryAddress = builder.CreateAdd(
       fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
       "fs_canary_addr");
-  llvm::LoadInst *firstSavedCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), firstSavedPointer,
-                         "first_saved_canary");
+  llvm::LoadInst *firstSavedCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), firstSavedPointer, "first_saved_canary");
   llvm::Value *firstCanaryPointer = builder.CreateIntToPtr(
       fsCanaryAddress, llvm::PointerType::get(context, 0),
       "first_fs_canary_ptr");
-  llvm::LoadInst *firstFsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), firstCanaryPointer,
-                         "first_fs_canary");
+  llvm::LoadInst *firstFsCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), firstCanaryPointer, "first_fs_canary");
   llvm::Value *firstSame =
       builder.CreateICmpEQ(firstSavedCanary, firstFsCanary, "first_same");
   builder.CreateCondBr(firstSame, secondCheck, failBlock);
@@ -731,9 +705,8 @@ llvm::Function *createSharedFailStackCanaryCheckFunction(llvm::Module &module) {
   llvm::Value *secondCanaryPointer = builder.CreateIntToPtr(
       secondFsCanaryAddress, llvm::PointerType::get(context, 0),
       "second_fs_canary_ptr");
-  llvm::LoadInst *secondFsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), secondCanaryPointer,
-                         "second_fs_canary");
+  llvm::LoadInst *secondFsCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), secondCanaryPointer, "second_fs_canary");
   llvm::Value *secondSame =
       builder.CreateICmpEQ(secondSavedCanary, secondFsCanary, "second_same");
   builder.CreateCondBr(secondSame, success, failBlock);
@@ -747,8 +720,7 @@ llvm::Function *createSharedFailStackCanaryCheckFunction(llvm::Module &module) {
   failStack->addIncoming(
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 64), entry);
   failStack->addIncoming(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 72),
-      secondCheck);
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 72), secondCheck);
   llvm::Value *returnSlot = builder.CreateAdd(
       failStack, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), -8),
       "return_slot");
@@ -774,9 +746,9 @@ createMixedFailPredecessorStackCanaryCheckFunction(llvm::Module &module) {
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
                                        {llvm::Type::getInt1Ty(context)}, false);
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage,
-      "mixed_fail_predecessor_stack_canary", module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "mixed_fail_predecessor_stack_canary", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::BasicBlock *canaryCheck =
@@ -799,32 +771,27 @@ createMixedFailPredecessorStackCanaryCheckFunction(llvm::Module &module) {
       llvm::Type::getInt8Ty(context), stack,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
       "saved_canary_ptr");
-  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0),
-                      savedPointer);
-  llvm::LoadInst *savedCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
-                         "saved_canary");
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), savedPointer);
+  llvm::LoadInst *savedCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
   llvm::LoadInst *fsBase =
       loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
   llvm::Value *fsCanaryAddress = builder.CreateAdd(
       fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
       "fs_canary_addr");
-  llvm::Value *fsCanaryPointer =
-      builder.CreateIntToPtr(fsCanaryAddress, llvm::PointerType::get(context, 0),
-                             "fs_canary_ptr");
-  llvm::LoadInst *fsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
-                         "fs_canary");
+  llvm::Value *fsCanaryPointer = builder.CreateIntToPtr(
+      fsCanaryAddress, llvm::PointerType::get(context, 0), "fs_canary_ptr");
+  llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                                fsCanaryPointer, "fs_canary");
   llvm::Value *same =
       builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same");
   builder.CreateCondBr(same, success, failBlock);
 
   builder.SetInsertPoint(ordinaryCheck);
-  llvm::Value *ordinaryError =
-      builder.CreateICmpEQ(function->getArg(0),
-                           llvm::ConstantInt::getFalse(context),
-                           "ordinary_error");
+  llvm::Value *ordinaryError = builder.CreateICmpEQ(
+      function->getArg(0), llvm::ConstantInt::getFalse(context),
+      "ordinary_error");
   builder.CreateCondBr(ordinaryError, failBlock, success);
 
   builder.SetInsertPoint(success);
@@ -836,8 +803,8 @@ createMixedFailPredecessorStackCanaryCheckFunction(llvm::Module &module) {
   return function;
 }
 
-llvm::Function *createPhiFsCanaryAddressStackCanaryCheckFunction(
-    llvm::Module &module) {
+llvm::Function *
+createPhiFsCanaryAddressStackCanaryCheckFunction(llvm::Module &module) {
   llvm::LLVMContext &context = module.getContext();
   llvm::GlobalVariable *fsOffsetRegister =
       createRegisterGlobal(module, "FS_OFFSET");
@@ -848,9 +815,9 @@ llvm::Function *createPhiFsCanaryAddressStackCanaryCheckFunction(
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
                                        {llvm::Type::getInt1Ty(context)}, false);
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "phi_fs_canary_address",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "phi_fs_canary_address", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::BasicBlock *directEdge =
@@ -872,9 +839,8 @@ llvm::Function *createPhiFsCanaryAddressStackCanaryCheckFunction(
       llvm::Type::getInt8Ty(context), stack,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
       "saved_canary_ptr");
-  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0),
-                      savedPointer);
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), savedPointer);
   llvm::LoadInst *fsBase =
       loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
   llvm::Value *fsCanaryAddress = builder.CreateAdd(
@@ -885,27 +851,22 @@ llvm::Function *createPhiFsCanaryAddressStackCanaryCheckFunction(
   builder.SetInsertPoint(directEdge);
   builder.CreateBr(merge);
   builder.SetInsertPoint(zeroBaseEdge);
-  llvm::Value *unknownCanaryAddress =
-      builder.CreateFreeze(llvm::PoisonValue::get(
-                               llvm::Type::getInt64Ty(context)),
-                           "fs_canary_addr_unknown");
+  llvm::Value *unknownCanaryAddress = builder.CreateFreeze(
+      llvm::PoisonValue::get(llvm::Type::getInt64Ty(context)),
+      "fs_canary_addr_unknown");
   builder.CreateBr(merge);
 
   builder.SetInsertPoint(merge);
-  llvm::PHINode *canaryAddress =
-      builder.CreatePHI(llvm::Type::getInt64Ty(context), 2,
-                        "fs_canary_addr_phi");
+  llvm::PHINode *canaryAddress = builder.CreatePHI(
+      llvm::Type::getInt64Ty(context), 2, "fs_canary_addr_phi");
   canaryAddress->addIncoming(fsCanaryAddress, directEdge);
   canaryAddress->addIncoming(unknownCanaryAddress, zeroBaseEdge);
-  llvm::LoadInst *savedCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
-                         "saved_canary");
-  llvm::Value *fsCanaryPointer =
-      builder.CreateIntToPtr(canaryAddress, llvm::PointerType::get(context, 0),
-                             "fs_canary_ptr");
-  llvm::LoadInst *fsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
-                         "fs_canary");
+  llvm::LoadInst *savedCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
+  llvm::Value *fsCanaryPointer = builder.CreateIntToPtr(
+      canaryAddress, llvm::PointerType::get(context, 0), "fs_canary_ptr");
+  llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                                fsCanaryPointer, "fs_canary");
   llvm::Value *same =
       builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same");
   builder.CreateCondBr(same, success, failBlock);
@@ -919,8 +880,8 @@ llvm::Function *createPhiFsCanaryAddressStackCanaryCheckFunction(
   return function;
 }
 
-llvm::Function *createSelfPhiFsCanaryAddressStackCanaryCheckFunction(
-    llvm::Module &module) {
+llvm::Function *
+createSelfPhiFsCanaryAddressStackCanaryCheckFunction(llvm::Module &module) {
   llvm::LLVMContext &context = module.getContext();
   llvm::GlobalVariable *fsOffsetRegister =
       createRegisterGlobal(module, "FS_OFFSET");
@@ -931,13 +892,12 @@ llvm::Function *createSelfPhiFsCanaryAddressStackCanaryCheckFunction(
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
                                        {llvm::Type::getInt1Ty(context)}, false);
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "self_phi_fs_canary_address",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "self_phi_fs_canary_address", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
-  llvm::BasicBlock *loop =
-      llvm::BasicBlock::Create(context, "loop", function);
+  llvm::BasicBlock *loop = llvm::BasicBlock::Create(context, "loop", function);
   llvm::BasicBlock *check =
       llvm::BasicBlock::Create(context, "check", function);
   llvm::BasicBlock *success =
@@ -953,9 +913,8 @@ llvm::Function *createSelfPhiFsCanaryAddressStackCanaryCheckFunction(
       llvm::Type::getInt8Ty(context), stack,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
       "saved_canary_ptr");
-  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0),
-                      savedPointer);
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), savedPointer);
   llvm::LoadInst *fsBase =
       loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
   llvm::Value *fsCanaryAddress = builder.CreateAdd(
@@ -964,23 +923,19 @@ llvm::Function *createSelfPhiFsCanaryAddressStackCanaryCheckFunction(
   builder.CreateBr(loop);
 
   builder.SetInsertPoint(loop);
-  llvm::PHINode *canaryAddress =
-      builder.CreatePHI(llvm::Type::getInt64Ty(context), 2,
-                        "fs_canary_addr_phi");
+  llvm::PHINode *canaryAddress = builder.CreatePHI(
+      llvm::Type::getInt64Ty(context), 2, "fs_canary_addr_phi");
   canaryAddress->addIncoming(fsCanaryAddress, entry);
   builder.CreateCondBr(function->getArg(0), loop, check);
   canaryAddress->addIncoming(canaryAddress, loop);
 
   builder.SetInsertPoint(check);
-  llvm::LoadInst *savedCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
-                         "saved_canary");
-  llvm::Value *fsCanaryPointer =
-      builder.CreateIntToPtr(canaryAddress, llvm::PointerType::get(context, 0),
-                             "fs_canary_ptr");
-  llvm::LoadInst *fsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
-                         "fs_canary");
+  llvm::LoadInst *savedCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
+  llvm::Value *fsCanaryPointer = builder.CreateIntToPtr(
+      canaryAddress, llvm::PointerType::get(context, 0), "fs_canary_ptr");
+  llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                                fsCanaryPointer, "fs_canary");
   llvm::Value *same =
       builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same");
   builder.CreateCondBr(same, success, failBlock);
@@ -994,8 +949,8 @@ llvm::Function *createSelfPhiFsCanaryAddressStackCanaryCheckFunction(
   return function;
 }
 
-llvm::Function *createSelfPhiFsBaseStackCanaryCheckFunction(
-    llvm::Module &module) {
+llvm::Function *
+createSelfPhiFsBaseStackCanaryCheckFunction(llvm::Module &module) {
   llvm::LLVMContext &context = module.getContext();
   llvm::GlobalVariable *fsOffsetRegister =
       createRegisterGlobal(module, "FS_OFFSET");
@@ -1006,13 +961,12 @@ llvm::Function *createSelfPhiFsBaseStackCanaryCheckFunction(
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
                                        {llvm::Type::getInt1Ty(context)}, false);
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "self_phi_fs_base_canary",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "self_phi_fs_base_canary", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
-  llvm::BasicBlock *loop =
-      llvm::BasicBlock::Create(context, "loop", function);
+  llvm::BasicBlock *loop = llvm::BasicBlock::Create(context, "loop", function);
   llvm::BasicBlock *check =
       llvm::BasicBlock::Create(context, "check", function);
   llvm::BasicBlock *success =
@@ -1028,9 +982,8 @@ llvm::Function *createSelfPhiFsBaseStackCanaryCheckFunction(
       llvm::Type::getInt8Ty(context), stack,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
       "saved_canary_ptr");
-  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0),
-                      savedPointer);
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), savedPointer);
   llvm::LoadInst *fsBase =
       loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
   builder.CreateBr(loop);
@@ -1043,18 +996,15 @@ llvm::Function *createSelfPhiFsBaseStackCanaryCheckFunction(
   fsBasePhi->addIncoming(fsBasePhi, loop);
 
   builder.SetInsertPoint(check);
-  llvm::LoadInst *savedCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), savedPointer,
-                         "saved_canary");
+  llvm::LoadInst *savedCanary = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
   llvm::Value *fsCanaryAddress = builder.CreateAdd(
       fsBasePhi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
       "fs_canary_addr");
-  llvm::Value *fsCanaryPointer =
-      builder.CreateIntToPtr(fsCanaryAddress, llvm::PointerType::get(context, 0),
-                             "fs_canary_ptr");
-  llvm::LoadInst *fsCanary =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsCanaryPointer,
-                         "fs_canary");
+  llvm::Value *fsCanaryPointer = builder.CreateIntToPtr(
+      fsCanaryAddress, llvm::PointerType::get(context, 0), "fs_canary_ptr");
+  llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                                fsCanaryPointer, "fs_canary");
   llvm::Value *same =
       builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same");
   builder.CreateCondBr(same, success, failBlock);
@@ -1113,9 +1063,9 @@ bool testDuplicatePredecessorEdgesKeepPhiComplete() {
   attachTestAbi(module);
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
 
-  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
-                                       {llvm::Type::getInt32Ty(context)},
-                                       false);
+  auto *type =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
+                              {llvm::Type::getInt32Ty(context)}, false);
   llvm::Function *function = llvm::Function::Create(
       type, llvm::GlobalValue::ExternalLinkage, "duplicate_edge_phi", module);
   llvm::BasicBlock *entry =
@@ -1125,8 +1075,8 @@ bool testDuplicatePredecessorEdgesKeepPhiComplete() {
   llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
 
   llvm::IRBuilder<> builder(entry);
-  llvm::SwitchInst *switchInst = builder.CreateSwitch(function->getArg(0),
-                                                      join, 2);
+  llvm::SwitchInst *switchInst =
+      builder.CreateSwitch(function->getArg(0), join, 2);
   switchInst->addCase(
       llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 1), join);
   switchInst->addCase(
@@ -1207,10 +1157,8 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
                 "unknown call effect was not observed") &&
          expect(hasFrozenIncoming,
                 "unknown incoming was not materialized as freeze poison") &&
-         expect(!hasUndefIncoming,
-                "unknown incoming still used bare undef") &&
-         expect(!hasZeroIncoming,
-                "unknown incoming was folded to zero") &&
+         expect(!hasUndefIncoming, "unknown incoming still used bare undef") &&
+         expect(!hasZeroIncoming, "unknown incoming was folded to zero") &&
          verifyOk(module,
                   "module failed verifier after frozen unknown incoming test");
 }
@@ -1222,8 +1170,7 @@ bool testSelfOnlyPhiBecomesFrozenPoison() {
   llvm::GlobalVariable *r10 = createRegisterGlobal(module, "R10");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
-                                       {llvm::Type::getInt1Ty(context)},
-                                       false);
+                                       {llvm::Type::getInt1Ty(context)}, false);
   llvm::Function *function = llvm::Function::Create(
       type, llvm::GlobalValue::ExternalLinkage, "self_only_phi", module);
   llvm::BasicBlock *entry =
@@ -1239,8 +1186,7 @@ bool testSelfOnlyPhiBecomesFrozenPoison() {
   llvm::LoadInst *loaded = loadRegister(builder, r10, "R10", "known_value");
   builder.CreateRet(loaded);
   builder.SetInsertPoint(exit);
-  builder.CreateRet(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
+  builder.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
   builder.SetInsertPoint(unreachableLoop);
   llvm::LoadInst *selfLoaded =
       loadRegister(builder, r10, "R10", "self_loop_value");
@@ -1280,8 +1226,7 @@ bool testFsOffsetPreservedAcrossExternalCall() {
       voidType, llvm::GlobalValue::ExternalLinkage, "unknown_external", module);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
-                                       {llvm::Type::getInt1Ty(context)},
-                                       false);
+                                       {llvm::Type::getInt1Ty(context)}, false);
   llvm::Function *function = llvm::Function::Create(
       type, llvm::GlobalValue::ExternalLinkage, "fs_preserved", module);
   llvm::BasicBlock *entry =
@@ -1584,13 +1529,13 @@ bool testKnownZeroArgExternalTypedReturnIsMaterialized() {
 
   auto *voidCalleeType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *callee = llvm::Function::Create(
-      voidCalleeType, llvm::GlobalValue::ExternalLinkage, "__ctype_b_loc",
-      module);
+  llvm::Function *callee =
+      llvm::Function::Create(voidCalleeType, llvm::GlobalValue::ExternalLinkage,
+                             "__ctype_b_loc", module);
   auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "known_zero_arg_typed_return",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "known_zero_arg_typed_return", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -1616,8 +1561,9 @@ bool testKnownZeroArgExternalTypedReturnIsMaterialized() {
                 "typed zero-arg external call kept void return") &&
          expect(summary.Warnings.empty(),
                 "typed zero-arg external left register SSA warning") &&
-         verifyOk(module,
-                  "module failed verifier after typed zero-arg external rewrite");
+         verifyOk(
+             module,
+             "module failed verifier after typed zero-arg external rewrite");
 }
 
 bool testKnownFixedArgExternalTruncatesAbiInputs() {
@@ -1697,8 +1643,7 @@ bool testDeadFlagStoreBeforeCallIsRemoved() {
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   return expect(summary.DeadStoresRemoved == 1,
                 "dead flag store before call was not removed") &&
-         verifyOk(module,
-                  "module failed verifier after dead flag store test");
+         verifyOk(module, "module failed verifier after dead flag store test");
 }
 
 bool testFlagStoreReadAfterCallIsKept() {
@@ -1730,8 +1675,7 @@ bool testFlagStoreReadAfterCallIsKept() {
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   return expect(summary.DeadStoresRemoved == 0,
                 "live flag store after call was removed") &&
-         verifyOk(module,
-                  "module failed verifier after live flag store test");
+         verifyOk(module, "module failed verifier after live flag store test");
 }
 
 bool testPostRewriteInstCombineExposesDeadFlagStore() {
@@ -1758,9 +1702,9 @@ bool testPostRewriteInstCombineExposesDeadFlagStore() {
                 "OF");
   builder.CreateCall(calleeType, callee);
   llvm::LoadInst *loaded = loadRegister(builder, of, "OF", "of.after");
-  llvm::Value *deadUse = builder.CreateSelect(
-      llvm::ConstantInt::getFalse(context), loaded,
-      llvm::ConstantInt::get(of->getValueType(), 0));
+  llvm::Value *deadUse =
+      builder.CreateSelect(llvm::ConstantInt::getFalse(context), loaded,
+                           llvm::ConstantInt::get(of->getValueType(), 0));
   builder.CreateRet(deadUse);
 
   notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
@@ -1879,7 +1823,9 @@ bool testKnownFixedExternalArities() {
       {"cfmakeraw", 1},
       {"chmod", 2},
       {"chown", 3},
-      {"closedir", 1},    {"closelog", 0},    {"fork", 0},
+      {"closedir", 1},
+      {"closelog", 0},
+      {"fork", 0},
       {"clock_getres", 2},
       {"dlclose", 1},
       {"dlerror", 0},
@@ -2168,9 +2114,8 @@ bool testKnownFixedExternalArities() {
 
     auto *calleeType =
         llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
-    llvm::Function *callee =
-        llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
-                               testCase.Name, module);
+    llvm::Function *callee = llvm::Function::Create(
+        calleeType, llvm::GlobalValue::ExternalLinkage, testCase.Name, module);
     auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
     llvm::Function *function = llvm::Function::Create(
         type, llvm::GlobalValue::ExternalLinkage,
@@ -2227,20 +2172,15 @@ bool testKnownVarArgExternalKeepsAbiInputs() {
     unsigned FixedArgs;
   };
   const KnownVarArgCase cases[] = {
-      {"__isoc23_sscanf", 2},
-      {"__isoc99_sscanf", 2},
-      {"__asprintf_chk", 3},
-      {"__snprintf_chk", 4},
-      {"__syslog_chk", 2},
-      {"fscanf", 2},
+      {"__isoc23_sscanf", 2}, {"__isoc99_sscanf", 2}, {"__asprintf_chk", 3},
+      {"__snprintf_chk", 4},  {"__syslog_chk", 2},    {"fscanf", 2},
       {"prctl", 1},
   };
 
   for (const KnownVarArgCase &testCase : cases) {
     llvm::LLVMContext context;
-    llvm::Module module(std::string("summary-ssa-known-vararg-") +
-                            testCase.Name,
-                        context);
+    llvm::Module module(
+        std::string("summary-ssa-known-vararg-") + testCase.Name, context);
     attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
     llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
     llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
@@ -2251,9 +2191,8 @@ bool testKnownVarArgExternalKeepsAbiInputs() {
 
     auto *calleeType =
         llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
-    llvm::Function *callee =
-        llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
-                               testCase.Name, module);
+    llvm::Function *callee = llvm::Function::Create(
+        calleeType, llvm::GlobalValue::ExternalLinkage, testCase.Name, module);
     auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
     llvm::Function *function = llvm::Function::Create(
         type, llvm::GlobalValue::ExternalLinkage,
@@ -2346,13 +2285,13 @@ bool testMismatchedDirectCallUseUsesReturnExtract() {
 
   auto *calleeType =
       llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
-  llvm::Function *callee = llvm::Function::Create(
-      calleeType, llvm::GlobalValue::ExternalLinkage, "unknown_external",
-      module);
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external", module);
   auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "uses_direct_call_result",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "uses_direct_call_result", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -2431,9 +2370,9 @@ bool testKnownExternalUsesSingleIntegerReturn() {
   llvm::Function *callee = llvm::Function::Create(
       calleeType, llvm::GlobalValue::ExternalLinkage, "fclose", module);
   auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "uses_fclose_rdx_after",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "uses_fclose_rdx_after", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -2455,8 +2394,9 @@ bool testKnownExternalUsesSingleIntegerReturn() {
   }
 
   return expect(call != nullptr, "known external fclose call missing") &&
-         expect(call->getType()->isIntegerTy(64),
-                "known external fclose was widened to a multi-register return") &&
+         expect(
+             call->getType()->isIntegerTy(64),
+             "known external fclose was widened to a multi-register return") &&
          verifyOk(module,
                   "module failed verifier after known external return rewrite");
 }
@@ -2531,9 +2471,9 @@ bool testUnknownExternalArityUsesMaxCallsitePrefix() {
 
   auto *calleeType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *callee = llvm::Function::Create(
-      calleeType, llvm::GlobalValue::ExternalLinkage,
-      "unknown_external_arity", module);
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external_arity", module);
   llvm::Function *function =
       llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
                              "unknown_external_arity_callers", module);
@@ -2543,8 +2483,7 @@ bool testUnknownExternalArityUsesMaxCallsitePrefix() {
       llvm::BasicBlock::Create(context, "short_call", function);
   llvm::BasicBlock *longCall =
       llvm::BasicBlock::Create(context, "long_call", function);
-  llvm::BasicBlock *done =
-      llvm::BasicBlock::Create(context, "done", function);
+  llvm::BasicBlock *done = llvm::BasicBlock::Create(context, "done", function);
 
   llvm::IRBuilder<> builder(entry);
   builder.CreateCondBr(llvm::ConstantInt::getTrue(context), shortCall,
@@ -2579,7 +2518,8 @@ bool testUnknownExternalArityUsesMaxCallsitePrefix() {
         warning.Reason == "inconsistent_unknown_external_arity";
   }
 
-  return expect(rewritten != nullptr, "unknown external arity callee missing") &&
+  return expect(rewritten != nullptr,
+                "unknown external arity callee missing") &&
          expect(rewritten->arg_size() == 3,
                 "unknown external arity did not use max callsite prefix") &&
          expect(hasInconsistentArityWarning,
@@ -2621,9 +2561,9 @@ bool testUnknownExternalArityStopsAtClobberArg() {
   auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *knownClobber = llvm::Function::Create(
       voidType, llvm::GlobalValue::ExternalLinkage, "free", module);
-  llvm::Function *unknown = llvm::Function::Create(
-      voidType, llvm::GlobalValue::ExternalLinkage,
-      "unknown_external_clobber_arity", module);
+  llvm::Function *unknown =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external_clobber_arity", module);
   llvm::Function *function =
       llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
                              "unknown_external_clobber_arity_caller", module);
@@ -2658,13 +2598,13 @@ bool testUnknownExternalArityStopsAtClobberArg() {
                 "unknown external arity counted clobber as argument") &&
          expect(hasInferredArityWarning,
                 "unknown external clobber arity warning missing") &&
-         verifyOk(module,
-                  "module failed verifier after clobber arity test");
+         verifyOk(module, "module failed verifier after clobber arity test");
 }
 
 bool testUnknownExternalArityStopsAtPhiClobberArg() {
   llvm::LLVMContext context;
-  llvm::Module module("summary-ssa-unknown-external-phi-clobber-arity", context);
+  llvm::Module module("summary-ssa-unknown-external-phi-clobber-arity",
+                      context);
 
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__summary_ssa_unknown_external_phi_clobber_arity_test";
@@ -2694,21 +2634,19 @@ bool testUnknownExternalArityStopsAtPhiClobberArg() {
   auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *knownClobber = llvm::Function::Create(
       voidType, llvm::GlobalValue::ExternalLinkage, "free", module);
-  llvm::Function *unknown = llvm::Function::Create(
-      voidType, llvm::GlobalValue::ExternalLinkage,
-      "unknown_external_phi_clobber_arity", module);
-  llvm::Function *function =
+  llvm::Function *unknown =
       llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
-                             "unknown_external_phi_clobber_arity_caller",
-                             module);
+                             "unknown_external_phi_clobber_arity", module);
+  llvm::Function *function = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage,
+      "unknown_external_phi_clobber_arity_caller", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::BasicBlock *clobberPath =
       llvm::BasicBlock::Create(context, "clobber_path", function);
   llvm::BasicBlock *cleanPath =
       llvm::BasicBlock::Create(context, "clean_path", function);
-  llvm::BasicBlock *join =
-      llvm::BasicBlock::Create(context, "join", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
 
   llvm::IRBuilder<> builder(entry);
   builder.CreateCondBr(llvm::ConstantInt::getTrue(context), clobberPath,
@@ -2765,16 +2703,16 @@ bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
       llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
   llvm::Function *callee = llvm::Function::Create(
       calleeType, llvm::GlobalValue::ExternalLinkage, "unlink", module);
-  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
-                                       {llvm::Type::getInt64Ty(context)}, false);
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
   llvm::Function *function = llvm::Function::Create(
       type, llvm::GlobalValue::ExternalLinkage, "call_arg_cleanup", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
-  llvm::Value *path = builder.CreateAdd(
-      function->getArg(0), llvm::ConstantInt::get(rdi->getValueType(), 7),
-      "path");
+  llvm::Value *path =
+      builder.CreateAdd(function->getArg(0),
+                        llvm::ConstantInt::get(rdi->getValueType(), 7), "path");
   llvm::Value *deadValue = builder.CreateXor(
       path, llvm::ConstantInt::get(rdi->getValueType(), 1), "dead.value");
   storeRegister(builder, rbx, deadValue, "RBX");
@@ -2901,7 +2839,8 @@ bool testInternalSignatureRewriteUsesNonAbiReturn() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  llvm::Function *rewritten = module.getFunction("notdec_native_non_abi_return");
+  llvm::Function *rewritten =
+      module.getFunction("notdec_native_non_abi_return");
   bool helperLeft = false;
   bool callReturnsRBX = false;
   for (llvm::Function &function : module) {
@@ -2948,8 +2887,8 @@ bool testInternalSignatureRewriteUsesZmmArgAndReturn() {
       llvm::BasicBlock::Create(context, "entry", callee);
   llvm::IRBuilder<> builder(calleeEntry);
   llvm::LoadInst *input = loadRegister(builder, zmm0, "ZMM0", "input");
-  llvm::Value *result = builder.CreateXor(
-      input, llvm::ConstantInt::get(zmmType, 1), "result");
+  llvm::Value *result =
+      builder.CreateXor(input, llvm::ConstantInt::get(zmmType, 1), "result");
   storeRegister(builder, zmm0, result, "ZMM0");
   builder.CreateRetVoid();
 
@@ -3016,21 +2955,19 @@ bool testForeignArgumentInMovedBodyIsReplaced() {
   attachTestAbi(module);
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
 
-  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
-                                       {llvm::Type::getInt64Ty(context)}, false);
-  llvm::Function *callee = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "notdec_native_foreign_arg",
-      module);
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *callee =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_foreign_arg", module);
   callee->getArg(0)->setName("R8.arg");
-  llvm::BasicBlock *entry =
-      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", callee);
   llvm::IRBuilder<> builder(entry);
   storeRegister(builder, rax, callee->getArg(0), "RAX");
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  llvm::Function *rewritten =
-      module.getFunction("notdec_native_foreign_arg");
+  llvm::Function *rewritten = module.getFunction("notdec_native_foreign_arg");
   bool hasForeignArgumentOperand = false;
   bool hasForeignInstructionOperand = false;
   if (rewritten != nullptr) {
@@ -3133,9 +3070,9 @@ bool testInternalCallArgBindingsKeepLaterArgsAfterEntryInput() {
 
   auto *calleeType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *callee = llvm::Function::Create(
-      calleeType, llvm::GlobalValue::ExternalLinkage, "notdec_native_child",
-      module);
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_child", module);
   llvm::BasicBlock *calleeEntry =
       llvm::BasicBlock::Create(context, "entry", callee);
   llvm::IRBuilder<> calleeBuilder(calleeEntry);
@@ -3147,16 +3084,14 @@ bool testInternalCallArgBindingsKeepLaterArgsAfterEntryInput() {
 
   auto *parentType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *parent = llvm::Function::Create(
-      parentType, llvm::GlobalValue::ExternalLinkage, "notdec_native_parent",
-      module);
-  llvm::BasicBlock *entry =
-      llvm::BasicBlock::Create(context, "entry", parent);
+  llvm::Function *parent =
+      llvm::Function::Create(parentType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_parent", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", parent);
   llvm::IRBuilder<> builder(entry);
   llvm::LoadInst *rdiEntry = loadRegister(builder, rdi, "RDI", "rdi.entry");
-  llvm::Value *rsiValue =
-      builder.CreateAdd(rdiEntry, llvm::ConstantInt::get(rsi->getValueType(), 7),
-                        "rsi.value");
+  llvm::Value *rsiValue = builder.CreateAdd(
+      rdiEntry, llvm::ConstantInt::get(rsi->getValueType(), 7), "rsi.value");
   storeRegister(builder, rsi, rsiValue, "RSI");
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
@@ -3164,11 +3099,11 @@ bool testInternalCallArgBindingsKeepLaterArgsAfterEntryInput() {
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   llvm::Function *rewritten = module.getFunction("notdec_native_child");
   llvm::CallInst *call = nullptr;
-  if (llvm::Function *rewrittenParent = module.getFunction("notdec_native_parent")) {
+  if (llvm::Function *rewrittenParent =
+          module.getFunction("notdec_native_parent")) {
     for (llvm::Instruction &inst : llvm::instructions(*rewrittenParent)) {
       auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
-      if (candidate != nullptr &&
-          candidate->getCalledFunction() == rewritten) {
+      if (candidate != nullptr && candidate->getCalledFunction() == rewritten) {
         call = candidate;
       }
     }
@@ -3176,12 +3111,14 @@ bool testInternalCallArgBindingsKeepLaterArgsAfterEntryInput() {
 
   return expect(rewritten != nullptr, "internal child callee missing") &&
          expect(call != nullptr, "internal child call missing") &&
-         expect(call->arg_size() == 2,
-                "internal child call did not keep later arg after entry input") &&
+         expect(
+             call->arg_size() == 2,
+             "internal child call did not keep later arg after entry input") &&
          expect(call->getArgOperand(1) != nullptr,
                 "internal child later arg was dropped") &&
-        verifyOk(module,
-                  "module failed verifier after internal entry-input call arg test");
+         verifyOk(
+             module,
+             "module failed verifier after internal entry-input call arg test");
 }
 
 bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
@@ -3192,9 +3129,8 @@ bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
   llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function =
-      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
-                             "stack_save_rbx", module);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "stack_save_rbx", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -3214,7 +3150,8 @@ bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
   options.IgnoredRegisters = stackSummary.IgnoredRegisters;
   auto summary = notdec::bin2llvm::runNativeRegisterSummary(module, options);
   const auto *fn = functionSummary(summary, "stack_save_rbx");
-  const auto *rbxSummary = fn == nullptr ? nullptr : registerSummary(*fn, "RBX");
+  const auto *rbxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RBX");
 
   return expect(stackSummary.AccessesRewritten >= 1,
                 "RSP stack save was not localized") &&
@@ -3222,7 +3159,8 @@ bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
                 "RSP was not marked ignored after stack rewrite") &&
          expect(hasNamedAlloca(*function, "notdec_stack.native"),
                 "native stack alloca was not created") &&
-         expect(rbxSummary != nullptr, "missing RBX summary after stack rewrite") &&
+         expect(rbxSummary != nullptr,
+                "missing RBX summary after stack rewrite") &&
          expect(rbxSummary->MayEntry && !rbxSummary->MayNonEntry,
                 "saved RBX was not preserved through native stack alloca") &&
          verifyOk(module, "module failed verifier after stack rewrite test");
@@ -3236,9 +3174,8 @@ bool testFramePointerLoadFeedsStackRewriteAndIgnoredSet() {
   llvm::GlobalVariable *rbp = createRegisterGlobal(module, "RBP");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function =
-      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
-                             "rbp_frame_stack", module);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "rbp_frame_stack", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -3263,7 +3200,8 @@ bool testFramePointerLoadFeedsStackRewriteAndIgnoredSet() {
                 "RBP was not marked ignored after frame-base match") &&
          expect(hasNamedAlloca(*function, "notdec_stack.native"),
                 "frame-pointer stack alloca was not created") &&
-         verifyOk(module, "module failed verifier after RBP stack rewrite test");
+         verifyOk(module,
+                  "module failed verifier after RBP stack rewrite test");
 }
 
 bool testSummarySSARemovesDeadStackFrameStore() {
@@ -3302,8 +3240,7 @@ bool testStackFrameAddressPassedToCallIsLocalized() {
   llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
 
   auto *calleeType = llvm::FunctionType::get(
-      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)},
-      false);
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
   llvm::Function *callee =
       llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
                              "takes_stack_pointer", module);
@@ -3333,9 +3270,11 @@ bool testStackFrameAddressPassedToCallIsLocalized() {
   return expect(summary.AccessesRewritten >= 2,
                 "stack-derived call argument was not localized") &&
          expect(call != nullptr, "missing call after stack rewrite") &&
-         expect(llvm::isa<llvm::PtrToIntInst>(call->getArgOperand(0)),
-                "stack call argument was not rewritten through native alloca") &&
-         verifyOk(module, "module failed verifier after stack call arg rewrite");
+         expect(
+             llvm::isa<llvm::PtrToIntInst>(call->getArgOperand(0)),
+             "stack call argument was not rewritten through native alloca") &&
+         verifyOk(module,
+                  "module failed verifier after stack call arg rewrite");
 }
 
 bool testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall() {
@@ -3345,8 +3284,7 @@ bool testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall() {
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
 
   auto *calleeType = llvm::FunctionType::get(
-      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)},
-      false);
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
   llvm::Function *callee =
       llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
                              "unrewritten_external", module);
@@ -3392,9 +3330,9 @@ bool testNoReturnExternalDoesNotCreateSummaryReturn() {
 
   auto *noreturnType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *stackChkFail = llvm::Function::Create(
-      noreturnType, llvm::GlobalValue::ExternalLinkage, "__stack_chk_fail",
-      module);
+  llvm::Function *stackChkFail =
+      llvm::Function::Create(noreturnType, llvm::GlobalValue::ExternalLinkage,
+                             "__stack_chk_fail", module);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
   llvm::Function *function = llvm::Function::Create(
@@ -3404,8 +3342,7 @@ bool testNoReturnExternalDoesNotCreateSummaryReturn() {
 
   llvm::IRBuilder<> builder(entry);
   builder.CreateCall(stackChkFail->getFunctionType(), stackChkFail, {});
-  llvm::LoadInst *loaded =
-      loadRegister(builder, rax, "RAX", "unreachable_rax");
+  llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "unreachable_rax");
   builder.CreateRet(loaded);
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
@@ -3654,8 +3591,8 @@ bool testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn() {
   llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
   llvm::GlobalVariable *zmm0 =
       createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
-  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
-                                             {}, false);
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
   llvm::Function *external =
       llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
                              "external_float_return", module);
@@ -3669,8 +3606,8 @@ bool testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn() {
   builder.CreateCall(external);
   llvm::Value *old = builder.CreateLoad(zmmType, zmm0);
   llvm::Value *keep = builder.CreateAnd(
-      old, llvm::ConstantInt::get(
-               zmmType, llvm::APInt::getBitsSet(512, 64, 512)));
+      old,
+      llvm::ConstantInt::get(zmmType, llvm::APInt::getBitsSet(512, 64, 512)));
   llvm::Value *low = llvm::ConstantInt::get(zmmType, 7);
   storeRegister(builder, zmm0, builder.CreateOr(keep, low), "ZMM0");
   builder.CreateRetVoid();
@@ -3679,8 +3616,8 @@ bool testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn() {
   unsigned zmmStores = 0;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
-    if (store != nullptr && store->getPointerOperand()->stripPointerCasts() ==
-                                zmm0) {
+    if (store != nullptr &&
+        store->getPointerOperand()->stripPointerCasts() == zmm0) {
       ++zmmStores;
     }
   }
@@ -3692,6 +3629,43 @@ bool testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn() {
          expect(summary.CallReturnValues == 0,
                 "float ABI output created a summary return helper") &&
          verifyOk(module, "module failed verifier after ZMM ABI effect test");
+}
+
+bool testUnknownExternalFloatAbiClobberDoesNotUseWholeZmm() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unknown-float-clobber", context);
+  attachTestFloatAbi(module, 1);
+
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *external =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external_float_clobber", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "reads_zmm_after_unknown_external", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::AllocaInst *sink = builder.CreateAlloca(zmmType);
+  builder.CreateCall(external);
+  llvm::Value *loaded = loadRegister(builder, zmm0, "ZMM0", "after");
+  builder.CreateStore(loaded, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.CallClobberValues == 0,
+                "float ABI clobber created a whole-ZMM helper") &&
+         expect(!moduleHasFunctionNamed(module,
+                                        "notdec.register.summary_clobber.i512"),
+                "whole-ZMM summary clobber declaration remained") &&
+         verifyOk(
+             module,
+             "module failed verifier after float clobber suppression test");
 }
 
 bool testKnownPowUsesFloatAbiSlots() {
@@ -3772,9 +3746,9 @@ bool testKnownUnaryLibmUsesFloatAbiSlots() {
     llvm::Function *callee = llvm::Function::Create(
         oldCalleeType, llvm::GlobalValue::ExternalLinkage, calleeName, module);
     auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
-    llvm::Function *function = llvm::Function::Create(
-        type, llvm::GlobalValue::ExternalLinkage,
-        calleeName + "_float_slots", module);
+    llvm::Function *function =
+        llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                               calleeName + "_float_slots", module);
     llvm::BasicBlock *entry =
         llvm::BasicBlock::Create(context, "entry", function);
     llvm::IRBuilder<> builder(entry);
@@ -3836,8 +3810,8 @@ bool testPartialKeepHighStoreIsDemandRewritten() {
   llvm::IRBuilder<> builder(entry);
   llvm::Value *old = loadRegister(builder, rdx, "RDX", "old");
   llvm::Value *keep = builder.CreateAnd(
-      old, llvm::ConstantInt::get(
-               rdx->getValueType(), llvm::APInt::getBitsSet(64, 8, 64)));
+      old, llvm::ConstantInt::get(rdx->getValueType(),
+                                  llvm::APInt::getBitsSet(64, 8, 64)));
   llvm::Value *low = llvm::ConstantInt::get(rdx->getValueType(), 7);
   storeRegister(builder, rdx, builder.CreateOr(keep, low), "RDX");
   builder.CreateRetVoid();
@@ -3862,8 +3836,7 @@ bool testPartialKeepHighStoreIsDemandRewritten() {
                 "partial keep-high store was not seen as a candidate") &&
          expect(summary.PartialDemandMatched >= 1,
                 "partial keep-high store was not demand rewritten") &&
-         expect(rdxLoads == 0,
-                "partial keep-high old load was not removed") &&
+         expect(rdxLoads == 0, "partial keep-high old load was not removed") &&
          verifyOk(module,
                   "module failed verifier after partial demand rewrite test");
 }
@@ -3875,16 +3848,17 @@ bool testPartialDemandZeroReplacementIsMarked() {
   llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage,
-      "partial_zero_metadata", module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "partial_zero_metadata", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   llvm::Value *old = loadRegister(builder, rdx, "RDX", "old");
   llvm::Value *keep = builder.CreateAnd(
-      old, llvm::ConstantInt::get(
-               rdx->getValueType(), llvm::APInt::getBitsSet(64, 8, 64)),
+      old,
+      llvm::ConstantInt::get(rdx->getValueType(),
+                             llvm::APInt::getBitsSet(64, 8, 64)),
       "keep_high");
   llvm::Value *low = llvm::ConstantInt::get(rdx->getValueType(), 7);
   storeRegister(builder, rdx, builder.CreateOr(keep, low, "merged"), "RDX");
@@ -3911,16 +3885,16 @@ bool testPartialZmmKeepHighStoreIsDemandRewritten() {
       createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "partial_zmm_keep_high",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "partial_zmm_keep_high", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   llvm::Value *old = loadRegister(builder, zmm0, "ZMM0", "old");
   llvm::Value *keep = builder.CreateAnd(
-      old, llvm::ConstantInt::get(
-               zmmType, llvm::APInt::getBitsSet(512, 128, 512)));
+      old,
+      llvm::ConstantInt::get(zmmType, llvm::APInt::getBitsSet(512, 128, 512)));
   llvm::Value *low = llvm::ConstantInt::get(zmmType, 7);
   storeRegister(builder, zmm0, builder.CreateOr(keep, low), "ZMM0");
   builder.CreateRetVoid();
@@ -3954,16 +3928,16 @@ bool testPartialZmmNakedKeepHighStoreIsDemandRewritten() {
       createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage,
-      "partial_zmm_naked_keep_high", module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "partial_zmm_naked_keep_high", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   llvm::Value *old = loadRegister(builder, zmm0, "ZMM0", "old");
   llvm::Value *keep = builder.CreateAnd(
-      old, llvm::ConstantInt::get(
-               zmmType, llvm::APInt::getBitsSet(512, 128, 512)));
+      old,
+      llvm::ConstantInt::get(zmmType, llvm::APInt::getBitsSet(512, 128, 512)));
   storeRegister(builder, zmm0, keep, "ZMM0");
   builder.CreateRetVoid();
 
@@ -3983,8 +3957,9 @@ bool testPartialZmmNakedKeepHighStoreIsDemandRewritten() {
     }
   }
 
-  return expect(summary.PartialDemandCandidates >= 1,
-                "partial zmm naked keep-high store was not seen as a candidate") &&
+  return expect(
+             summary.PartialDemandCandidates >= 1,
+             "partial zmm naked keep-high store was not seen as a candidate") &&
          expect(summary.PartialDemandMatched >= 1,
                 "partial zmm naked keep-high store was not demand rewritten") &&
          expect(zmmLoads == 0,
@@ -4004,20 +3979,20 @@ bool testPartialZmmDisjointLaneChainIsDemandRewritten() {
       createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "partial_zmm_lane_chain",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "partial_zmm_lane_chain", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   llvm::Value *old = loadRegister(builder, zmm0, "ZMM0", "old");
   llvm::Value *keep = builder.CreateAnd(
-      old, llvm::ConstantInt::get(
-               zmmType, llvm::APInt::getBitsSet(512, 128, 512)));
+      old,
+      llvm::ConstantInt::get(zmmType, llvm::APInt::getBitsSet(512, 128, 512)));
   llvm::Value *low = llvm::ConstantInt::get(zmmType, 7);
   llvm::Value *mid = builder.CreateOr(keep, low, "mid", /*IsDisjoint=*/true);
-  llvm::Value *lane1 = builder.CreateShl(
-      llvm::ConstantInt::get(zmmType, 11), llvm::ConstantInt::get(zmmType, 64));
+  llvm::Value *lane1 = builder.CreateShl(llvm::ConstantInt::get(zmmType, 11),
+                                         llvm::ConstantInt::get(zmmType, 64));
   llvm::Value *combined =
       builder.CreateOr(mid, lane1, "combined", /*IsDisjoint=*/true);
   storeRegister(builder, zmm0, combined, "ZMM0");
@@ -4060,9 +4035,9 @@ bool testPartialDemandKeepsMemoryPointerRegisterAddress() {
       llvm::GlobalValue::ExternalLinkage, nullptr, "ordinary_memory_sink");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage,
-      "partial_memory_pointer_demand", module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "partial_memory_pointer_demand", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -4071,15 +4046,16 @@ bool testPartialDemandKeepsMemoryPointerRegisterAddress() {
       base, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 40),
       "mem_addr");
   auto *pointerType = llvm::PointerType::get(context, 0);
-  llvm::Value *pointer = builder.CreateIntToPtr(address, pointerType, "mem_ptr");
+  llvm::Value *pointer =
+      builder.CreateIntToPtr(address, pointerType, "mem_ptr");
   llvm::Value *memoryValue =
       builder.CreateLoad(llvm::Type::getInt64Ty(context), pointer, "mem_value");
   builder.CreateStore(memoryValue, sink);
 
   llvm::Value *old = loadRegister(builder, rdx, "RDX", "old_rdx");
   llvm::Value *keep = builder.CreateAnd(
-      old, llvm::ConstantInt::get(
-               rdx->getValueType(), llvm::APInt::getBitsSet(64, 8, 64)));
+      old, llvm::ConstantInt::get(rdx->getValueType(),
+                                  llvm::APInt::getBitsSet(64, 8, 64)));
   storeRegister(builder, rdx, builder.CreateOr(keep, memoryValue), "RDX");
   builder.CreateRetVoid();
 
@@ -4132,8 +4108,8 @@ bool testPartialDemandKeepsMemoryPointerRegisterAddress() {
                 "partial memory pointer store was not demand rewritten") &&
          expect(memoryPointer != nullptr,
                 "ordinary memory inttoptr was removed") &&
-         expect(!addressWasZero,
-                "ordinary memory pointer register address was rewritten to zero") &&
+         expect(!addressWasZero, "ordinary memory pointer register address was "
+                                 "rewritten to zero") &&
          verifyOk(module,
                   "module failed verifier after partial memory pointer test");
 }
@@ -4145,9 +4121,8 @@ bool testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata() {
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function =
-      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
-                             "final_cleanup_clean", module);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "final_cleanup_clean", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -4159,7 +4134,8 @@ bool testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata() {
   bool hadMetadata = functionHasAnyRegisterSummaryMetadata(*function);
   auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
 
-  return expect(hadMetadata, "summary SSA did not attach metadata before cleanup") &&
+  return expect(hadMetadata,
+                "summary SSA did not attach metadata before cleanup") &&
          expect(module.getGlobalVariable("RDI") == nullptr,
                 "dead RDI global remained after final cleanup") &&
          expect(!functionHasAnyRegisterSummaryMetadata(*function),
@@ -4208,11 +4184,11 @@ bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-globaldce", context);
 
-  llvm::Intrinsic::getOrInsertDeclaration(
-      &module, llvm::Intrinsic::ssub_with_overflow,
-      {llvm::Type::getInt8Ty(context)});
-  auto *helperType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
-                                             {}, false);
+  llvm::Intrinsic::getOrInsertDeclaration(&module,
+                                          llvm::Intrinsic::ssub_with_overflow,
+                                          {llvm::Type::getInt8Ty(context)});
+  auto *helperType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {}, false);
   llvm::Function::Create(helperType, llvm::GlobalValue::ExternalLinkage,
                          "notdec.register.summary_return.i64", module);
 
@@ -4232,7 +4208,8 @@ bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
          expect(!moduleHasFunctionNamed(module,
                                         "notdec.register.summary_return.i64"),
                 "unused register summary helper declaration remained") &&
-         verifyOk(module, "module failed verifier after globaldce cleanup test");
+         verifyOk(module,
+                  "module failed verifier after globaldce cleanup test");
 }
 
 } // namespace
@@ -4292,6 +4269,7 @@ int main() {
   ok &= testSelfPhiFsCanaryAddressStackCanaryCheckIsRemoved();
   ok &= testSelfPhiFsBaseStackCanaryCheckIsRemoved();
   ok &= testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn();
+  ok &= testUnknownExternalFloatAbiClobberDoesNotUseWholeZmm();
   ok &= testKnownPowUsesFloatAbiSlots();
   ok &= testKnownUnaryLibmUsesFloatAbiSlots();
   ok &= testPartialKeepHighStoreIsDemandRewritten();

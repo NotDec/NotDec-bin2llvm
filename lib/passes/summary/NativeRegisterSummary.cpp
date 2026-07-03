@@ -2,17 +2,19 @@
 
 #include "notdec-bin2llvm/NativeAbi.h"
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
-#include "llvm/IR/Operator.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -39,6 +41,10 @@ struct RegisterUnit {
 struct RegisterAccess {
   const RegisterUnit *Unit = nullptr;
 };
+
+RegisterAccess
+registerStore(llvm::StoreInst &store,
+              const std::map<llvm::GlobalVariable *, RegisterUnit> &units);
 
 struct StackSlotKey {
   llvm::Value *Base = nullptr;
@@ -95,8 +101,8 @@ struct FunctionEffect {
 // callers, plus an audit value for entry registers that feed those
 // observations.
 struct FunctionDemand {
-  std::set<llvm::GlobalVariable *> ExitDemand;
-  std::set<llvm::GlobalVariable *> EntryDemand;
+  std::map<llvm::GlobalVariable *, llvm::APInt> ExitDemand;
+  std::map<llvm::GlobalVariable *, llvm::APInt> EntryDemand;
 
   bool operator==(const FunctionDemand &other) const {
     return ExitDemand == other.ExitDemand && EntryDemand == other.EntryDemand;
@@ -107,12 +113,18 @@ struct FunctionDemand {
 // prototype order so root demand can seed only the regular first return value.
 struct AbiFacts {
   std::set<std::string> Inputs;
+  std::map<std::string, llvm::APInt> InputMasks;
   std::set<std::string> Outputs;
+  std::map<std::string, llvm::APInt> OutputMasks;
   std::vector<std::string> OutputOrder;
+  std::vector<std::string> IntegerOutputOrder;
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
+  std::map<std::string, llvm::APInt> KilledByCallMasks;
   std::string StackPointer;
 };
+
+using RegisterDemand = std::map<llvm::GlobalVariable *, llvm::APInt>;
 
 std::optional<std::string> mdField(const llvm::MDNode *node,
                                    llvm::StringRef key) {
@@ -196,9 +208,305 @@ registersByName(const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
   return byName;
 }
 
-std::string storageUnitName(
-    const NativeAbiStorage &storage,
+unsigned registerBitWidth(const RegisterUnit &unit) {
+  llvm::Type *type = unit.Global->getValueType();
+  if (auto *integer = llvm::dyn_cast<llvm::IntegerType>(type)) {
+    return integer->getBitWidth();
+  }
+  if (type != nullptr && type->isSized()) {
+    return type->getScalarSizeInBits();
+  }
+  return static_cast<unsigned>(unit.Size * 8);
+}
+
+llvm::APInt fullMask(const RegisterUnit &unit) {
+  unsigned width = registerBitWidth(unit);
+  if (width == 0) {
+    return llvm::APInt();
+  }
+  return llvm::APInt::getAllOnes(width);
+}
+
+llvm::APInt storageMaskForUnit(const NativeAbiStorage &storage,
+                               const RegisterUnit &unit, uint64_t sizeBytes) {
+  unsigned width = registerBitWidth(unit);
+  if (width == 0) {
+    return llvm::APInt();
+  }
+  if (sizeBytes == 0) {
+    return llvm::APInt::getAllOnes(width);
+  }
+  uint64_t offsetBits = 0;
+  if (storage.Space.empty()) {
+    // ABI aliases like XMM0_Qa are mapped to the lifted ZMM0 unit by name.
+    // Cspec metadata often omits the storage space for those aliases, so treat
+    // them as low-lane accesses instead of falling back to whole-ZMM demand.
+    offsetBits = 0;
+  } else if (storage.Space == unit.Space && storage.Offset >= unit.Offset &&
+             storage.Offset < unit.Offset + unit.Size) {
+    offsetBits = (storage.Offset - unit.Offset) * 8;
+  } else {
+    return llvm::APInt::getAllOnes(width);
+  }
+  uint64_t sizeBits = sizeBytes * 8;
+  if (offsetBits >= width || sizeBits == 0) {
+    return llvm::APInt(width, 0);
+  }
+  uint64_t count = std::min<uint64_t>(sizeBits, width - offsetBits);
+  return llvm::APInt::getBitsSet(width, offsetBits, offsetBits + count);
+}
+
+std::string maskToHex(const llvm::APInt &mask) {
+  if (mask.getBitWidth() == 0) {
+    return "";
+  }
+  llvm::SmallVector<char, 64> text;
+  mask.toStringUnsigned(text, 16);
+  return std::string(text.begin(), text.end());
+}
+
+bool addDemand(RegisterDemand &demand, llvm::GlobalVariable *global,
+               llvm::APInt mask) {
+  if (global == nullptr || mask.getBitWidth() == 0 || mask.isZero()) {
+    return false;
+  }
+  auto it = demand.find(global);
+  if (it == demand.end()) {
+    demand.emplace(global, std::move(mask));
+    return true;
+  }
+  if (it->second.getBitWidth() == 0) {
+    it->second = std::move(mask);
+    return true;
+  }
+  llvm::APInt old = it->second;
+  it->second |= mask.zextOrTrunc(it->second.getBitWidth());
+  return it->second != old;
+}
+
+void eraseDemand(RegisterDemand &demand, llvm::GlobalVariable *global) {
+  demand.erase(global);
+}
+
+llvm::APInt demandFor(const RegisterDemand &demand,
+                      llvm::GlobalVariable *global) {
+  auto it = demand.find(global);
+  if (it == demand.end()) {
+    return llvm::APInt();
+  }
+  return it->second;
+}
+
+bool mergeDemand(RegisterDemand &target, const RegisterDemand &source) {
+  bool changed = false;
+  for (const auto &[global, mask] : source) {
+    changed |= addDemand(target, global, mask);
+  }
+  return changed;
+}
+
+void mergeNamedMask(std::map<std::string, llvm::APInt> &masks,
+                    const std::string &name, const llvm::APInt &mask) {
+  if (mask.getBitWidth() == 0 || mask.isZero()) {
+    return;
+  }
+  auto it = masks.find(name);
+  if (it == masks.end() || it->second.getBitWidth() == 0) {
+    masks[name] = mask;
+    return;
+  }
+  it->second |= mask.zextOrTrunc(it->second.getBitWidth());
+}
+
+llvm::APInt namedMaskOrFull(const std::map<std::string, llvm::APInt> &masks,
+                            const RegisterUnit &unit) {
+  auto it = masks.find(unit.Name);
+  if (it != masks.end() && it->second.getBitWidth() != 0) {
+    return it->second.zextOrTrunc(registerBitWidth(unit));
+  }
+  return fullMask(unit);
+}
+
+unsigned valueBitWidth(llvm::Value *value) {
+  if (value == nullptr || value->getType() == nullptr ||
+      !value->getType()->isSized()) {
+    return 0;
+  }
+  if (auto *integer = llvm::dyn_cast<llvm::IntegerType>(value->getType())) {
+    return integer->getBitWidth();
+  }
+  return value->getType()->getScalarSizeInBits();
+}
+
+llvm::APInt fullMaskForValue(llvm::Value *value) {
+  unsigned width = valueBitWidth(value);
+  if (width == 0) {
+    return llvm::APInt();
+  }
+  return llvm::APInt::getAllOnes(width);
+}
+
+llvm::APInt lowBitsMask(unsigned width, unsigned bits) {
+  if (width == 0 || bits == 0) {
+    return llvm::APInt(width, 0);
+  }
+  return llvm::APInt::getLowBitsSet(width, std::min(width, bits));
+}
+
+llvm::APInt trimmedMask(const llvm::APInt &mask, unsigned width) {
+  if (width == 0) {
+    return llvm::APInt();
+  }
+  return mask.zextOrTrunc(width);
+}
+
+std::map<llvm::Value *, llvm::APInt> computeValueDemands(
+    llvm::Function &function,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  std::map<llvm::Value *, llvm::APInt> demands;
+  std::vector<llvm::Value *> worklist;
+
+  auto enqueue = [&](llvm::Value *value, llvm::APInt demand) {
+    unsigned width = valueBitWidth(value);
+    if (value == nullptr || width == 0 || demand.getBitWidth() == 0) {
+      return;
+    }
+    demand = trimmedMask(demand, width);
+    if (demand.isZero()) {
+      return;
+    }
+    auto it = demands.find(value);
+    if (it == demands.end()) {
+      demands.emplace(value, demand);
+      worklist.push_back(value);
+      return;
+    }
+    llvm::APInt merged =
+        it->second | demand.zextOrTrunc(it->second.getBitWidth());
+    if (merged != it->second) {
+      it->second = merged;
+      worklist.push_back(value);
+    }
+  };
+
+  auto seed = [&](llvm::Value *value) {
+    enqueue(value, fullMaskForValue(value));
+  };
+
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&inst)) {
+      if (llvm::Value *value = ret->getReturnValue()) {
+        seed(value);
+      }
+      continue;
+    }
+    if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+      for (llvm::Use &arg : call->args()) {
+        seed(arg.get());
+      }
+      continue;
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      RegisterAccess access = registerStore(*store, units);
+      if (access.Unit == nullptr) {
+        seed(store->getValueOperand());
+      }
+      continue;
+    }
+    if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(&inst)) {
+      if (!branch->isUnconditional()) {
+        seed(branch->getCondition());
+      }
+      continue;
+    }
+    if (auto *sw = llvm::dyn_cast<llvm::SwitchInst>(&inst)) {
+      seed(sw->getCondition());
+      continue;
+    }
+    if (auto *icmp = llvm::dyn_cast<llvm::ICmpInst>(&inst)) {
+      seed(icmp->getOperand(0));
+      seed(icmp->getOperand(1));
+      continue;
+    }
+  }
+
+  while (!worklist.empty()) {
+    llvm::Value *value = worklist.back();
+    worklist.pop_back();
+    llvm::APInt demand = demands[value];
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
+    if (inst == nullptr) {
+      continue;
+    }
+
+    switch (inst->getOpcode()) {
+    case llvm::Instruction::Trunc:
+      enqueue(inst->getOperand(0), demand);
+      break;
+    case llvm::Instruction::ZExt:
+      enqueue(inst->getOperand(0),
+              trimmedMask(demand, valueBitWidth(inst->getOperand(0))));
+      break;
+    case llvm::Instruction::SExt: {
+      unsigned srcWidth = valueBitWidth(inst->getOperand(0));
+      llvm::APInt srcDemand = trimmedMask(demand, srcWidth);
+      llvm::APInt high = demand & ~lowBitsMask(valueBitWidth(inst), srcWidth);
+      if (!high.isZero() && srcWidth != 0) {
+        srcDemand |= llvm::APInt::getSignMask(srcWidth);
+      }
+      enqueue(inst->getOperand(0), srcDemand);
+      break;
+    }
+    case llvm::Instruction::BitCast:
+    case llvm::Instruction::Freeze:
+      enqueue(inst->getOperand(0), demand);
+      break;
+    case llvm::Instruction::PHI:
+      for (llvm::Value *incoming : inst->operand_values()) {
+        enqueue(incoming, demand);
+      }
+      break;
+    case llvm::Instruction::Select:
+      enqueue(inst->getOperand(1), demand);
+      enqueue(inst->getOperand(2), demand);
+      break;
+    case llvm::Instruction::And:
+      if (auto *lhs = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(0))) {
+        enqueue(inst->getOperand(1), demand & lhs->getValue());
+      } else if (auto *rhs =
+                     llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+        enqueue(inst->getOperand(0), demand & rhs->getValue());
+      } else {
+        enqueue(inst->getOperand(0), demand);
+        enqueue(inst->getOperand(1), demand);
+      }
+      break;
+    case llvm::Instruction::LShr:
+      if (auto *shift =
+              llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+        unsigned srcWidth = valueBitWidth(inst->getOperand(0));
+        unsigned amount = shift->getLimitedValue();
+        if (amount < srcWidth) {
+          enqueue(inst->getOperand(0),
+                  demand.shl(amount).zextOrTrunc(srcWidth));
+        }
+      } else {
+        enqueue(inst->getOperand(0), demand);
+      }
+      break;
+    default:
+      for (llvm::Value *operand : inst->operand_values()) {
+        enqueue(operand, demand);
+      }
+      break;
+    }
+  }
+  return demands;
+}
+
+std::string
+storageUnitName(const NativeAbiStorage &storage,
+                const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
   // ABI records may mention partial names such as XMM0_Qa while lifting keeps
   // only the largest overlapping register global such as ZMM0.
   for (const auto &[global, unit] : units) {
@@ -207,16 +515,15 @@ std::string storageUnitName(
       return unit.Name;
     }
   }
-  for (llvm::StringRef prefix : {llvm::StringRef("XMM"),
-                                llvm::StringRef("YMM")}) {
+  for (llvm::StringRef prefix :
+       {llvm::StringRef("XMM"), llvm::StringRef("YMM")}) {
     llvm::StringRef name(storage.Name);
     if (!name.starts_with(prefix)) {
       continue;
     }
     llvm::StringRef rest = name.drop_front(prefix.size());
     size_t digits = 0;
-    while (digits < rest.size() && rest[digits] >= '0' &&
-           rest[digits] <= '9') {
+    while (digits < rest.size() && rest[digits] >= '0' && rest[digits] <= '9') {
       ++digits;
     }
     if (digits == 0) {
@@ -238,6 +545,19 @@ std::string storageUnitName(
     }
   }
   return storage.Name;
+}
+
+std::optional<std::pair<std::string, llvm::APInt>>
+storageUnitMask(const NativeAbiStorage &storage, uint64_t sizeBytes,
+                const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  std::string name = storageUnitName(storage, units);
+  for (const auto &[global, unit] : units) {
+    (void)global;
+    if (unit.Name == name) {
+      return std::make_pair(name, storageMaskForUnit(storage, unit, sizeBytes));
+    }
+  }
+  return std::nullopt;
 }
 
 RegisterAccess
@@ -292,9 +612,9 @@ bool isAnalyzableCall(const llvm::Instruction &inst) {
   return callee == nullptr || !callee->isIntrinsic();
 }
 
-AbiFacts collectAbiFacts(
-    const llvm::Module &module,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+AbiFacts
+collectAbiFacts(const llvm::Module &module,
+                const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
   AbiFacts facts;
   std::optional<NativeAbiSpec> abi = readNativeAbiMetadata(module);
   if (!abi) {
@@ -303,15 +623,23 @@ AbiFacts collectAbiFacts(
   for (const NativeAbiParamEntry &entry : abi->Inputs) {
     if (entry.Storage.Kind == NativeAbiStorageKind::Register &&
         !entry.Storage.Name.empty()) {
-      facts.Inputs.insert(storageUnitName(entry.Storage, units));
+      if (auto slot = storageUnitMask(entry.Storage, entry.MaxSize, units)) {
+        facts.Inputs.insert(slot->first);
+        mergeNamedMask(facts.InputMasks, slot->first, slot->second);
+      }
     }
   }
   for (const NativeAbiParamEntry &entry : abi->Outputs) {
     if (entry.Storage.Kind == NativeAbiStorageKind::Register &&
         !entry.Storage.Name.empty()) {
-      std::string name = storageUnitName(entry.Storage, units);
-      facts.Outputs.insert(name);
-      facts.OutputOrder.push_back(std::move(name));
+      if (auto slot = storageUnitMask(entry.Storage, entry.MaxSize, units)) {
+        facts.Outputs.insert(slot->first);
+        mergeNamedMask(facts.OutputMasks, slot->first, slot->second);
+        facts.OutputOrder.push_back(slot->first);
+        if (entry.MetaType != "float") {
+          facts.IntegerOutputOrder.push_back(slot->first);
+        }
+      }
     }
   }
   for (const NativeAbiEffect &effect : abi->Effects) {
@@ -322,7 +650,10 @@ AbiFacts collectAbiFacts(
     if (effect.Kind == NativeAbiEffectKind::Unaffected) {
       facts.Unaffected.insert(storageUnitName(effect.Storage, units));
     } else if (effect.Kind == NativeAbiEffectKind::KilledByCall) {
-      facts.KilledByCall.insert(storageUnitName(effect.Storage, units));
+      if (auto slot = storageUnitMask(effect.Storage, 0, units)) {
+        facts.KilledByCall.insert(slot->first);
+        mergeNamedMask(facts.KilledByCallMasks, slot->first, slot->second);
+      }
     }
   }
   facts.StackPointer = abi->StackPointerRegister;
@@ -489,7 +820,8 @@ class Analyzer {
 public:
   Analyzer(llvm::Module &module, NativeRegisterSummaryOptions options)
       : Module(module), Options(std::move(options)),
-        Units(collectRegisterUnits(module)), UnitsByName(registersByName(Units)),
+        Units(collectRegisterUnits(module)),
+        UnitsByName(registersByName(Units)),
         Abi(collectAbiFacts(module, Units)) {
     for (llvm::Function &function : Module) {
       if (!function.isDeclaration()) {
@@ -692,8 +1024,7 @@ private:
       RegisterAccess access = registerLoad(*load, Units);
       if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
         Cell before = cellIn(state, access.Unit->Global);
-        bool keepHighUse =
-            isKeepHighPartialLoadUse(*load, access.Unit->Global);
+        bool keepHighUse = isKeepHighPartialLoadUse(*load, access.Unit->Global);
         if (!keepHighUse) {
           readRegister(state, access.Unit->Global);
         }
@@ -827,7 +1158,8 @@ private:
     return StackSlotKey{stackPointer, address->second};
   }
 
-  std::optional<StackSlotKey> nativeStackAllocaSlot(llvm::Value *pointer) const {
+  std::optional<StackSlotKey>
+  nativeStackAllocaSlot(llvm::Value *pointer) const {
     auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(pointer);
     if (gep == nullptr || gep->getNumIndices() != 1) {
       return std::nullopt;
@@ -926,49 +1258,63 @@ private:
     while (changed) {
       changed = false;
       for (llvm::Function *function : Functions) {
-        std::map<llvm::Function *, std::set<llvm::GlobalVariable *>> additions =
+        std::map<llvm::Function *, RegisterDemand> additions =
             analyzeCallerDemand(*function);
-        for (auto &[callee, registers] : additions) {
-          std::set<llvm::GlobalVariable *> &demand = Demands[callee].ExitDemand;
-          size_t oldSize = demand.size();
-          demand.insert(registers.begin(), registers.end());
-          changed |= demand.size() != oldSize;
+        for (auto &[callee, demand] : additions) {
+          changed |= mergeDemand(Demands[callee].ExitDemand, demand);
         }
       }
     }
   }
 
   void seedAbiReturns(FunctionDemand &demand) const {
-    if (Abi.OutputOrder.empty()) {
+    if (Abi.IntegerOutputOrder.empty()) {
       return;
     }
-    auto it = UnitsByName.find(Abi.OutputOrder.front());
-    if (it != UnitsByName.end()) {
-      demand.ExitDemand.insert(it->second);
+    auto it = UnitsByName.find(Abi.IntegerOutputOrder.front());
+    if (it == UnitsByName.end()) {
+      return;
     }
+    const RegisterUnit &unit = Units.at(it->second);
+    addDemand(demand.ExitDemand, it->second,
+              namedMaskOrFull(Abi.OutputMasks, unit));
   }
 
-  std::map<llvm::Function *, std::set<llvm::GlobalVariable *>>
+  llvm::APInt
+  valueDemand(llvm::Value *value,
+              const std::map<llvm::Value *, llvm::APInt> &valueDemands) const {
+    unsigned width = valueBitWidth(value);
+    if (width == 0) {
+      return llvm::APInt();
+    }
+    auto it = valueDemands.find(value);
+    if (it == valueDemands.end()) {
+      return llvm::APInt::getAllOnes(width);
+    }
+    return it->second.zextOrTrunc(width);
+  }
+
+  std::map<llvm::Function *, RegisterDemand>
   analyzeCallerDemand(llvm::Function &function) {
-    std::map<llvm::BasicBlock *, std::set<llvm::GlobalVariable *>> in;
-    std::map<llvm::BasicBlock *, std::set<llvm::GlobalVariable *>> out;
-    std::map<llvm::Function *, std::set<llvm::GlobalVariable *>> additions;
+    std::map<llvm::Value *, llvm::APInt> valueDemands =
+        computeValueDemands(function, Units);
+    std::map<llvm::BasicBlock *, RegisterDemand> in;
+    std::map<llvm::BasicBlock *, RegisterDemand> out;
+    std::map<llvm::Function *, RegisterDemand> additions;
 
     bool changed = true;
     while (changed) {
       changed = false;
       for (llvm::BasicBlock &block : llvm::reverse(function)) {
-        std::set<llvm::GlobalVariable *> liveOut;
+        RegisterDemand liveOut;
         for (llvm::BasicBlock *succ : llvm::successors(&block)) {
-          liveOut.insert(in[succ].begin(), in[succ].end());
+          mergeDemand(liveOut, in[succ]);
         }
         if (llvm::isa<llvm::ReturnInst>(block.getTerminator())) {
-          const std::set<llvm::GlobalVariable *> &exit =
-              Demands[&function].ExitDemand;
-          liveOut.insert(exit.begin(), exit.end());
+          mergeDemand(liveOut, Demands[&function].ExitDemand);
         }
-        std::set<llvm::GlobalVariable *> live =
-            liveBeforeBlock(block, liveOut, additions);
+        RegisterDemand live =
+            liveBeforeBlock(block, liveOut, additions, valueDemands);
         if (out[&block] != liveOut) {
           out[&block] = std::move(liveOut);
           changed = true;
@@ -983,9 +1329,10 @@ private:
     return additions;
   }
 
-  std::set<llvm::GlobalVariable *> liveBeforeBlock(
-      llvm::BasicBlock &block, std::set<llvm::GlobalVariable *> live,
-      std::map<llvm::Function *, std::set<llvm::GlobalVariable *>> &additions) {
+  RegisterDemand
+  liveBeforeBlock(llvm::BasicBlock &block, RegisterDemand live,
+                  std::map<llvm::Function *, RegisterDemand> &additions,
+                  const std::map<llvm::Value *, llvm::APInt> &valueDemands) {
     for (llvm::Instruction &inst : llvm::reverse(block)) {
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
         if (!isNotDecRegisterHelperCall(*call)) {
@@ -996,14 +1343,14 @@ private:
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
         RegisterAccess access = registerStore(*store, Units);
         if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
-          live.erase(access.Unit->Global);
+          eraseDemand(live, access.Unit->Global);
         }
         continue;
       }
       if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
         RegisterAccess access = registerLoad(*load, Units);
         if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
-          live.insert(access.Unit->Global);
+          addDemand(live, access.Unit->Global, valueDemand(load, valueDemands));
         }
       }
     }
@@ -1011,34 +1358,38 @@ private:
   }
 
   void applyBackwardCallDemand(
-      llvm::CallBase &call, std::set<llvm::GlobalVariable *> &live,
-      std::map<llvm::Function *, std::set<llvm::GlobalVariable *>> &additions) {
+      llvm::CallBase &call, RegisterDemand &live,
+      std::map<llvm::Function *, RegisterDemand> &additions) {
     llvm::Function *callee = call.getCalledFunction();
     if (callee != nullptr && !callee->isDeclaration() &&
         Effects.count(callee) != 0) {
       const FunctionEffect &effect = Effects[callee];
       for (const auto &[global, unit] : Units) {
-        if (isIgnored(unit, Options) || live.count(global) == 0) {
+        llvm::APInt mask = demandFor(live, global);
+        if (isIgnored(unit, Options) || mask.getBitWidth() == 0 ||
+            mask.isZero()) {
           continue;
         }
         Cell calleeCell = cellIn(effect, global);
         if (calleeCell.MayNonEntry) {
-          additions[callee].insert(global);
+          addDemand(additions[callee], global, mask);
         }
         if (!calleeCell.MayEntry) {
-          live.erase(global);
+          eraseDemand(live, global);
         }
       }
       return;
     }
 
     for (const auto &[global, unit] : Units) {
-      if (isIgnored(unit, Options) || live.count(global) == 0) {
+      llvm::APInt mask = demandFor(live, global);
+      if (isIgnored(unit, Options) || mask.getBitWidth() == 0 ||
+          mask.isZero()) {
         continue;
       }
       if (Abi.Outputs.count(unit.Name) != 0 ||
           Abi.KilledByCall.count(unit.Name) != 0) {
-        live.erase(global);
+        eraseDemand(live, global);
       }
     }
   }
@@ -1053,9 +1404,11 @@ private:
 
   llvm::MDNode *registerSummaryNode(llvm::LLVMContext &context,
                                     llvm::GlobalVariable *global,
-                                    const Cell &cell, bool exitDemand) const {
+                                    const Cell &cell,
+                                    const FunctionDemand &demand) const {
     const RegisterUnit &unit = Units.at(global);
-    llvm::Metadata *fields[] = {
+    bool exitDemand = demand.ExitDemand.count(global) != 0;
+    std::vector<llvm::Metadata *> fields{
         llvm::MDString::get(context, "name=" + unit.Name),
         llvm::MDString::get(context, std::string("read_entry=") +
                                          (cell.ReadEntry ? "true" : "false")),
@@ -1066,6 +1419,16 @@ private:
         llvm::MDString::get(context, std::string("exit_demand=") +
                                          (exitDemand ? "true" : "false")),
     };
+    llvm::APInt entryMask = demandFor(demand.EntryDemand, global);
+    if (entryMask.getBitWidth() != 0 && !entryMask.isZero()) {
+      fields.push_back(llvm::MDString::get(context, "entry_demand_mask=0x" +
+                                                        maskToHex(entryMask)));
+    }
+    llvm::APInt exitMask = demandFor(demand.ExitDemand, global);
+    if (exitMask.getBitWidth() != 0 && !exitMask.isZero()) {
+      fields.push_back(llvm::MDString::get(context, "exit_demand_mask=0x" +
+                                                        maskToHex(exitMask)));
+    }
     return llvm::MDNode::get(context, fields);
   }
 
@@ -1085,7 +1448,7 @@ private:
         }
         Cell cell = cellIn(effect, global);
         bool exitDemand = demand.ExitDemand.count(global) != 0;
-        all.push_back(registerSummaryNode(context, global, cell, exitDemand));
+        all.push_back(registerSummaryNode(context, global, cell, demand));
         if (cell.ReadEntry) {
           reads.push_back(registerNode(context, unit));
         }
@@ -1152,6 +1515,9 @@ private:
         reg.MayEntry = cell.MayEntry;
         reg.MayNonEntry = cell.MayNonEntry;
         reg.ExitDemand = exitDemand;
+        reg.EntryDemandMaskHex =
+            maskToHex(demandFor(demand.EntryDemand, global));
+        reg.ExitDemandMaskHex = maskToHex(demandFor(demand.ExitDemand, global));
         fn.Registers.push_back(reg);
         if (cell.ReadEntry) {
           ++fn.ReadEntryRegisters;

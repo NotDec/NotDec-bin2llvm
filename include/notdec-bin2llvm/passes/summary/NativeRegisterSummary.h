@@ -29,6 +29,10 @@ struct NativeRegisterSummaryRegister {
   bool MayEntry = true;
   bool MayNonEntry = false;
   bool ExitDemand = false;
+  // Bit-level demand refines ReadEntry/ExitDemand for wide backing registers.
+  // Empty masks mean the old whole-register boolean is the only known fact.
+  std::string EntryDemandMaskHex;
+  std::string ExitDemandMaskHex;
 };
 
 // Function-level public summary. The counters are derived from Registers and

@@ -5,9 +5,9 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
-#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
@@ -23,10 +23,10 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Passes/PassBuilder.h"
-#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 #include <algorithm>
 #include <map>
@@ -59,6 +59,8 @@ struct SummaryRegisterFact {
   bool MayEntry = true;
   bool MayNonEntry = false;
   bool ExitDemand = false;
+  llvm::APInt EntryDemandMask;
+  llvm::APInt ExitDemandMask;
 };
 
 struct FunctionSummaryFacts {
@@ -111,8 +113,8 @@ struct CallArgStoreBinding {
 
 // Backward bit demand for values produced while lowering partial register
 // writes.  A set bit means some later real observer needs that bit.  Register
-// stores are not observers by themselves; later loads, calls, returns, branches,
-// and ordinary memory stores seed the demand.
+// stores are not observers by themselves; later loads, calls, returns,
+// branches, and ordinary memory stores seed the demand.
 struct PartialDemandState {
   std::map<llvm::Value *, llvm::APInt> Demands;
   std::vector<llvm::Value *> Worklist;
@@ -121,8 +123,7 @@ struct PartialDemandState {
     return llvm::APInt::getAllOnes(bitWidth);
   }
 
-  static llvm::APInt trimmedMask(const llvm::APInt &mask,
-                                 unsigned bitWidth) {
+  static llvm::APInt trimmedMask(const llvm::APInt &mask, unsigned bitWidth) {
     if (bitWidth == 0) {
       return llvm::APInt();
     }
@@ -275,18 +276,18 @@ void attachZeroDemandOperandMetadata(llvm::Instruction &instruction,
   // The zero constant cannot carry metadata.  Mark the user instruction instead
   // so leaked synthetic zeros can be traced without changing the optimized IR.
   std::vector<llvm::Metadata *> fields = {
-      llvm::MDString::get(context,
-                          "operand=" + std::to_string(operandIndex)),
+      llvm::MDString::get(context, "operand=" + std::to_string(operandIndex)),
       llvm::MDString::get(context,
                           "original_type=" + llvmTypeName(original.getType())),
   };
   if (original.hasName()) {
-    fields.push_back(
-        llvm::MDString::get(context, "original_name=" + original.getName().str()));
+    fields.push_back(llvm::MDString::get(
+        context, "original_name=" + original.getName().str()));
   }
   if (auto *originalInst = llvm::dyn_cast<llvm::Instruction>(&original)) {
-    fields.push_back(llvm::MDString::get(
-        context, std::string("original_opcode=") + originalInst->getOpcodeName()));
+    fields.push_back(
+        llvm::MDString::get(context, std::string("original_opcode=") +
+                                         originalInst->getOpcodeName()));
   }
 
   entries.push_back(llvm::MDNode::get(context, fields));
@@ -371,8 +372,7 @@ knownExternalPrototypes() {
       {"closelog", {0, false}},
       {"cfmakeraw", {1, false}},
       {"connect", {3, false}},
-      {"cos",
-       {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
+      {"cos", {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"EC_GROUP_get_order", {3, false}},
       {"EC_KEY_set_private_key", {2, false}},
       {"dcgettext", {3, false}},
@@ -408,8 +408,7 @@ knownExternalPrototypes() {
       {"event_once", {5, false}},
       {"event_set", {5, false}},
       {"exit", {1, false, true}},
-      {"exp",
-       {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
+      {"exp", {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"fclose", {1, false}},
       {"fcntl", {2, true}},
       {"fcntl64", {2, true}},
@@ -505,8 +504,7 @@ knownExternalPrototypes() {
       {"listen", {2, false}},
       {"localtime", {1, false}},
       {"localtime_r", {2, false}},
-      {"log",
-       {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
+      {"log", {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"lstat", {2, false}},
       {"lstat64", {2, false}},
       {"lseek", {3, false}},
@@ -722,8 +720,7 @@ knownExternalPrototypes() {
       {"__sysv_signal", {2, false}},
       {"signal", {2, false}},
       {"sigprocmask", {3, false}},
-      {"sin",
-       {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
+      {"sin", {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"snprintf", {3, true}},
       {"av_usleep", {1, false}},
       {"socket", {3, false}},
@@ -743,8 +740,7 @@ knownExternalPrototypes() {
       {"splice", {6, false}},
       {"srandom", {1, false}},
       {"srand", {1, false}},
-      {"sqrt",
-       {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
+      {"sqrt", {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"sscanf", {2, true}},
       {"stat", {2, false}},
       {"stat64", {2, false}},
@@ -1003,9 +999,9 @@ bool isSegmentBaseUnit(llvm::StringRef name) {
   return name == "FS_OFFSET" || name == "GS_OFFSET";
 }
 
-std::string storageUnitName(
-    const NativeAbiStorage &storage,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+std::string
+storageUnitName(const NativeAbiStorage &storage,
+                const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
   // ABI records may mention partial names such as XMM0_Qa while lifting keeps
   // only the largest overlapping register global such as ZMM0.
   for (const auto &[global, unit] : units) {
@@ -1014,16 +1010,15 @@ std::string storageUnitName(
       return unit.Name;
     }
   }
-  for (llvm::StringRef prefix : {llvm::StringRef("XMM"),
-                                llvm::StringRef("YMM")}) {
+  for (llvm::StringRef prefix :
+       {llvm::StringRef("XMM"), llvm::StringRef("YMM")}) {
     llvm::StringRef name(storage.Name);
     if (!name.starts_with(prefix)) {
       continue;
     }
     llvm::StringRef rest = name.drop_front(prefix.size());
     size_t digits = 0;
-    while (digits < rest.size() && rest[digits] >= '0' &&
-           rest[digits] <= '9') {
+    while (digits < rest.size() && rest[digits] >= '0' && rest[digits] <= '9') {
       ++digits;
     }
     if (digits == 0) {
@@ -1057,9 +1052,9 @@ const RegisterUnit *
 unitByName(const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
            llvm::StringRef name);
 
-AbiFacts::RegisterSlot abiRegisterSlot(
-    const NativeAbiParamEntry &entry, const std::string &unitName,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+AbiFacts::RegisterSlot
+abiRegisterSlot(const NativeAbiParamEntry &entry, const std::string &unitName,
+                const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
   AbiFacts::RegisterSlot slot;
   slot.UnitName = unitName;
   slot.AbiName = entry.Storage.Name;
@@ -1074,9 +1069,9 @@ AbiFacts::RegisterSlot abiRegisterSlot(
   return slot;
 }
 
-AbiFacts collectAbiFacts(
-    const llvm::Module &module,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+AbiFacts
+collectAbiFacts(const llvm::Module &module,
+                const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
   AbiFacts facts;
   std::optional<NativeAbiSpec> abi = readNativeAbiMetadata(module);
   if (!abi) {
@@ -1088,8 +1083,7 @@ AbiFacts collectAbiFacts(
       std::string name = storageUnitName(entry.Storage, units);
       facts.Inputs.insert(name);
       if (entry.MetaType == "float") {
-        facts.FloatInputsInOrder.push_back(
-            abiRegisterSlot(entry, name, units));
+        facts.FloatInputsInOrder.push_back(abiRegisterSlot(entry, name, units));
         facts.InternalParamRegisters.insert(name);
         continue;
       }
@@ -1144,9 +1138,23 @@ summaryFactsByFunction(const NativeRegisterSummary &summary,
     }
     FunctionSummaryFacts facts;
     for (const NativeRegisterSummaryRegister &reg : functionSummary.Registers) {
-      facts.Registers.emplace(
-          reg.Name, SummaryRegisterFact{reg.ReadEntry, reg.MayEntry,
-                                        reg.MayNonEntry, reg.ExitDemand});
+      auto parseMask = [](llvm::StringRef text) -> llvm::APInt {
+        if (text.empty()) {
+          return llvm::APInt();
+        }
+        if (text.consume_front("0x") || text.consume_front("0X")) {
+          return llvm::APInt(std::max<unsigned>(1, text.size() * 4), text, 16);
+        }
+        return llvm::APInt(std::max<unsigned>(1, text.size() * 4), text, 16);
+      };
+      SummaryRegisterFact fact;
+      fact.ReadEntry = reg.ReadEntry;
+      fact.MayEntry = reg.MayEntry;
+      fact.MayNonEntry = reg.MayNonEntry;
+      fact.ExitDemand = reg.ExitDemand;
+      fact.EntryDemandMask = parseMask(reg.EntryDemandMaskHex);
+      fact.ExitDemandMask = parseMask(reg.ExitDemandMaskHex);
+      facts.Registers.emplace(reg.Name, std::move(fact));
     }
     result.emplace(function, std::move(facts));
   }
@@ -1195,8 +1203,7 @@ NativeSignatureSlot integerSignatureSlot(const RegisterUnit &unit) {
   slot.Kind = NativeSignatureSlotKind::IntegerRegister;
   slot.Unit = &unit;
   slot.AbiName = unit.Name;
-  slot.SizeBits =
-      unit.Global->getValueType()->getScalarSizeInBits();
+  slot.SizeBits = unit.Global->getValueType()->getScalarSizeInBits();
   slot.LlvmType = unit.Global->getValueType();
   return slot;
 }
@@ -1273,6 +1280,78 @@ bool isFloatAbiOutputUnit(const AbiFacts &abi, llvm::StringRef name) {
                      });
 }
 
+const AbiFacts::RegisterSlot *floatAbiInputSlotForUnit(const AbiFacts &abi,
+                                                       llvm::StringRef name) {
+  auto it =
+      std::find_if(abi.FloatInputsInOrder.begin(), abi.FloatInputsInOrder.end(),
+                   [&](const AbiFacts::RegisterSlot &slot) {
+                     return slot.UnitName == name;
+                   });
+  return it == abi.FloatInputsInOrder.end() ? nullptr : &*it;
+}
+
+const AbiFacts::RegisterSlot *floatAbiOutputSlotForUnit(const AbiFacts &abi,
+                                                        llvm::StringRef name) {
+  auto it = std::find_if(abi.FloatOutputsInOrder.begin(),
+                         abi.FloatOutputsInOrder.end(),
+                         [&](const AbiFacts::RegisterSlot &slot) {
+                           return slot.UnitName == name;
+                         });
+  return it == abi.FloatOutputsInOrder.end() ? nullptr : &*it;
+}
+
+llvm::APInt fullMaskForSlot(unsigned registerBits,
+                            const AbiFacts::RegisterSlot &slot) {
+  if (registerBits == 0 || slot.SizeBits == 0 ||
+      slot.OffsetBits >= registerBits) {
+    return llvm::APInt(registerBits, 0);
+  }
+  unsigned end = std::min(registerBits, slot.OffsetBits + slot.SizeBits);
+  return llvm::APInt::getBitsSet(registerBits, slot.OffsetBits, end);
+}
+
+bool demandFitsSlot(const llvm::APInt &demand,
+                    const AbiFacts::RegisterSlot &slot, unsigned registerBits) {
+  if (demand.getBitWidth() == 0 || demand.isZero()) {
+    return false;
+  }
+  llvm::APInt slotMask = fullMaskForSlot(registerBits, slot);
+  llvm::APInt trimmed = demand.zextOrTrunc(registerBits);
+  return !(trimmed & ~slotMask).getBoolValue();
+}
+
+llvm::Type *floatTypeForSlot(llvm::LLVMContext &context,
+                             const AbiFacts::RegisterSlot &slot) {
+  if (slot.SizeBits <= 32) {
+    return llvm::Type::getFloatTy(context);
+  }
+  if (slot.SizeBits <= 64) {
+    return llvm::Type::getDoubleTy(context);
+  }
+  return nullptr;
+}
+
+std::optional<NativeSignatureSlot>
+floatSlotForDemand(llvm::LLVMContext &context,
+                   const AbiFacts::RegisterSlot &abiSlot,
+                   const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+                   const llvm::APInt &demand) {
+  const RegisterUnit *unit = unitByName(units, abiSlot.UnitName);
+  if (unit == nullptr) {
+    return std::nullopt;
+  }
+  unsigned registerBits = unit->Global->getValueType()->getScalarSizeInBits();
+  if (!demandFitsSlot(demand, abiSlot, registerBits)) {
+    return std::nullopt;
+  }
+  llvm::Type *type = floatTypeForSlot(context, abiSlot);
+  if (type == nullptr) {
+    return std::nullopt;
+  }
+  return signatureSlotFromAbi(abiSlot, units, type,
+                              NativeSignatureSlotKind::FloatRegister);
+}
+
 SignatureShape shapeForInternalFunction(
     llvm::Function &function,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -1308,6 +1387,18 @@ SignatureShape shapeForInternalFunction(
     }
     auto regIt = factsIt->second.Registers.find(unit->Name);
     if (regIt != factsIt->second.Registers.end() && regIt->second.ReadEntry) {
+      if (const AbiFacts::RegisterSlot *slot =
+              floatAbiInputSlotForUnit(abi, unit->Name)) {
+        if (std::optional<NativeSignatureSlot> floatSlot =
+                floatSlotForDemand(function.getContext(), *slot, units,
+                                   regIt->second.EntryDemandMask)) {
+          shape.Params.push_back(*floatSlot);
+        } else if (regIt->second.EntryDemandMask.getBitWidth() != 0 &&
+                   !regIt->second.EntryDemandMask.isZero()) {
+          shape.Params.push_back(integerSignatureSlot(*unit));
+        }
+        continue;
+      }
       shape.Params.push_back(integerSignatureSlot(*unit));
     }
   }
@@ -1324,19 +1415,32 @@ SignatureShape shapeForInternalFunction(
       continue;
     }
     auto regIt = factsIt->second.Registers.find(unit->Name);
-    if (regIt != factsIt->second.Registers.end() &&
-        regIt->second.MayNonEntry && regIt->second.ExitDemand) {
+    if (regIt != factsIt->second.Registers.end() && regIt->second.MayNonEntry &&
+        regIt->second.ExitDemand) {
+      if (const AbiFacts::RegisterSlot *slot =
+              floatAbiOutputSlotForUnit(abi, unit->Name)) {
+        if (std::optional<NativeSignatureSlot> floatSlot =
+                floatSlotForDemand(function.getContext(), *slot, units,
+                                   regIt->second.ExitDemandMask)) {
+          shape.Returns.push_back(*floatSlot);
+        } else if (function.getReturnType()->isVoidTy() &&
+                   regIt->second.ExitDemandMask.getBitWidth() != 0 &&
+                   !regIt->second.ExitDemandMask.isZero()) {
+          shape.Returns.push_back(integerSignatureSlot(*unit));
+        }
+        continue;
+      }
       shape.Returns.push_back(integerSignatureSlot(*unit));
     }
   }
   return shape;
 }
 
-std::optional<NativeSignatureSlot> typedParamSlot(
-    KnownExternalPrototype::ValueType type, unsigned &integerIndex,
-    unsigned &floatIndex, const std::map<llvm::GlobalVariable *, RegisterUnit>
-                              &units,
-    const AbiFacts &abi, llvm::LLVMContext &context) {
+std::optional<NativeSignatureSlot>
+typedParamSlot(KnownExternalPrototype::ValueType type, unsigned &integerIndex,
+               unsigned &floatIndex,
+               const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+               const AbiFacts &abi, llvm::LLVMContext &context) {
   llvm::Type *llvmType = llvmTypeForKnownValue(context, type);
   if (isFloatKnownValue(type)) {
     if (floatIndex >= abi.FloatInputsInOrder.size()) {
@@ -1354,10 +1458,10 @@ std::optional<NativeSignatureSlot> typedParamSlot(
                               NativeSignatureSlotKind::IntegerRegister);
 }
 
-std::optional<NativeSignatureSlot> typedReturnSlot(
-    KnownExternalPrototype::ValueType type,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
-    const AbiFacts &abi, llvm::LLVMContext &context) {
+std::optional<NativeSignatureSlot>
+typedReturnSlot(KnownExternalPrototype::ValueType type,
+                const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+                const AbiFacts &abi, llvm::LLVMContext &context) {
   llvm::Type *llvmType = llvmTypeForKnownValue(context, type);
   if (isFloatKnownValue(type)) {
     if (abi.FloatOutputsInOrder.empty()) {
@@ -1510,9 +1614,10 @@ bool mayDependOnSummaryClobberValue(
     return true;
   }
   if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
-    return llvm::any_of(phi->incoming_values(), [&](const llvm::Value *incoming) {
-      return mayDependOnSummaryClobberValue(incoming, visiting);
-    });
+    return llvm::any_of(
+        phi->incoming_values(), [&](const llvm::Value *incoming) {
+          return mayDependOnSummaryClobberValue(incoming, visiting);
+        });
   }
   if (auto *select = llvm::dyn_cast<llvm::SelectInst>(value)) {
     return mayDependOnSummaryClobberValue(select->getTrueValue(), visiting) ||
@@ -1529,8 +1634,8 @@ bool mayDependOnSummaryClobberValue(const llvm::Value *value) {
   return mayDependOnSummaryClobberValue(value, visiting);
 }
 
-unsigned callsiteBoundArgPrefix(
-    const std::vector<CallArgStoreBinding> &bindings) {
+unsigned
+callsiteBoundArgPrefix(const std::vector<CallArgStoreBinding> &bindings) {
   unsigned prefix = 0;
   for (const CallArgStoreBinding &binding : bindings) {
     if (binding.Index != prefix) {
@@ -1549,10 +1654,8 @@ unsigned callsiteBoundArgPrefix(
 
 void addSignatureWarning(SignatureRewriteState &state,
                          llvm::StringRef functionName,
-                         llvm::StringRef calleeName,
-                         llvm::StringRef detail,
-                         llvm::StringRef reason,
-                         unsigned uses) {
+                         llvm::StringRef calleeName, llvm::StringRef detail,
+                         llvm::StringRef reason, unsigned uses) {
   NativeRegisterSummarySSAWarning warning;
   warning.FunctionName = functionName.str();
   warning.CalleeName = calleeName.str();
@@ -1594,17 +1697,16 @@ void refineUnknownExternalParamShapes(SignatureRewriteState &state) {
       shape.Params.resize(maxArity);
     }
     std::string detail = "arity=" + std::to_string(minArity) + ".." +
-                         std::to_string(maxArity) + "/final=" +
-                         std::to_string(shape.Params.size());
+                         std::to_string(maxArity) +
+                         "/final=" + std::to_string(shape.Params.size());
     if (minArity != maxArity) {
       addSignatureWarning(state, "<external-signature>", callee->getName(),
-                          detail,
-                          "inconsistent_unknown_external_arity",
+                          detail, "inconsistent_unknown_external_arity",
                           arities.size());
     } else if (shape.Params.size() != originalArity) {
       addSignatureWarning(state, "<external-signature>", callee->getName(),
-                          detail,
-                          "inferred_unknown_external_arity", arities.size());
+                          detail, "inferred_unknown_external_arity",
+                          arities.size());
     }
   }
 
@@ -1815,9 +1917,9 @@ private:
     return possiblyDisjoint != nullptr && possiblyDisjoint->isDisjoint();
   }
 
-  llvm::APInt demandedBits(
-      llvm::Value *value,
-      const std::map<llvm::Value *, llvm::APInt> &demands) const {
+  llvm::APInt
+  demandedBits(llvm::Value *value,
+               const std::map<llvm::Value *, llvm::APInt> &demands) const {
     unsigned width = valueBitWidth(value);
     if (width == 0) {
       return llvm::APInt();
@@ -1863,9 +1965,10 @@ private:
     }
   }
 
-  bool rewriteZeroDemandOperands(
-      llvm::Value *value, const std::map<llvm::Value *, llvm::APInt> &demands,
-      llvm::SmallPtrSetImpl<llvm::Value *> &visiting) {
+  bool
+  rewriteZeroDemandOperands(llvm::Value *value,
+                            const std::map<llvm::Value *, llvm::APInt> &demands,
+                            llvm::SmallPtrSetImpl<llvm::Value *> &visiting) {
     auto *inst = llvm::dyn_cast_or_null<llvm::Instruction>(value);
     if (inst == nullptr || !visiting.insert(inst).second) {
       return false;
@@ -1942,11 +2045,13 @@ private:
       };
       switch (inst->getOpcode()) {
       case llvm::Instruction::And:
-        if (auto *lhs = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(0))) {
+        if (auto *lhs =
+                llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(0))) {
           result = PartialDemandState::trimmedMask(lhs->getValue(), width);
           break;
         }
-        if (auto *rhs = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+        if (auto *rhs =
+                llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
           result = PartialDemandState::trimmedMask(rhs->getValue(), width);
           break;
         }
@@ -1970,7 +2075,8 @@ private:
         break;
       }
       case llvm::Instruction::Shl:
-        if (auto *shift = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+        if (auto *shift =
+                llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
           unsigned amount = shift->getLimitedValue();
           if (amount < width) {
             result = shiftedMask(computeUnaryMask(0), amount, width);
@@ -1980,7 +2086,8 @@ private:
         result = fullMaskFor(value);
         break;
       case llvm::Instruction::LShr:
-        if (auto *shift = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+        if (auto *shift =
+                llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
           unsigned amount = shift->getLimitedValue();
           if (amount < width) {
             result = computeUnaryMask(0).lshr(amount).zextOrTrunc(width);
@@ -2108,8 +2215,7 @@ private:
       case llvm::Instruction::ZExt:
         enqueue(inst->getOperand(0),
                 PartialDemandState::trimmedMask(
-                    inputDemand,
-                    valueBitWidth(inst->getOperand(0))));
+                    inputDemand, valueBitWidth(inst->getOperand(0))));
         break;
       case llvm::Instruction::SExt:
         if (auto *srcType = llvm::dyn_cast<llvm::IntegerType>(
@@ -2142,15 +2248,14 @@ private:
         break;
       case llvm::Instruction::And: {
         llvm::ConstantInt *constOp = nullptr;
-        if (auto *lhs = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(0))) {
+        if (auto *lhs =
+                llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(0))) {
           constOp = lhs;
-          enqueue(inst->getOperand(1),
-                  inputDemand & lhs->getValue());
+          enqueue(inst->getOperand(1), inputDemand & lhs->getValue());
         } else if (auto *rhs =
                        llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
           constOp = rhs;
-          enqueue(inst->getOperand(0),
-                  inputDemand & rhs->getValue());
+          enqueue(inst->getOperand(0), inputDemand & rhs->getValue());
         } else {
           enqueue(inst->getOperand(0), inputDemand);
           enqueue(inst->getOperand(1), inputDemand);
@@ -2162,10 +2267,10 @@ private:
       case llvm::Instruction::Xor: {
         llvm::APInt lhsMask = knownValueMask(inst->getOperand(0));
         llvm::APInt rhsMask = knownValueMask(inst->getOperand(1));
-        bool canSplit =
-            inst->getOpcode() == llvm::Instruction::Or &&
-            isDisjointOr(*inst) && lhsMask.getBitWidth() == rhsMask.getBitWidth() &&
-            !lhsMask.isZero() && !rhsMask.isZero();
+        bool canSplit = inst->getOpcode() == llvm::Instruction::Or &&
+                        isDisjointOr(*inst) &&
+                        lhsMask.getBitWidth() == rhsMask.getBitWidth() &&
+                        !lhsMask.isZero() && !rhsMask.isZero();
         if (canSplit) {
           enqueue(inst->getOperand(0), inputDemand & lhsMask);
           enqueue(inst->getOperand(1), inputDemand & rhsMask);
@@ -2179,8 +2284,10 @@ private:
       case llvm::Instruction::Sub:
       case llvm::Instruction::Mul: {
         unsigned srcWidth = valueBitWidth(inst->getOperand(0));
-        llvm::APInt lowDemand = PartialDemandState::trimmedMask(inputDemand, srcWidth);
-        llvm::APInt highDemand = inputDemand & ~maskForLowBits(valueBitWidth(inst), srcWidth);
+        llvm::APInt lowDemand =
+            PartialDemandState::trimmedMask(inputDemand, srcWidth);
+        llvm::APInt highDemand =
+            inputDemand & ~maskForLowBits(valueBitWidth(inst), srcWidth);
         if (!highDemand.isZero()) {
           enqueue(inst->getOperand(0), fullMaskFor(inst->getOperand(0)));
           enqueue(inst->getOperand(1), fullMaskFor(inst->getOperand(1)));
@@ -2191,7 +2298,8 @@ private:
         break;
       }
       case llvm::Instruction::Shl:
-        if (auto *shift = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+        if (auto *shift =
+                llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
           unsigned amount = shift->getLimitedValue();
           enqueue(inst->getOperand(0),
                   shiftedMask(inputDemand, amount,
@@ -2201,7 +2309,8 @@ private:
         }
         break;
       case llvm::Instruction::LShr:
-        if (auto *shift = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
+        if (auto *shift =
+                llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
           unsigned amount = shift->getLimitedValue();
           enqueue(inst->getOperand(0),
                   lshrSourceDemand(inputDemand, amount,
@@ -2436,9 +2545,9 @@ private:
     }
     for (llvm::StoreInst *store : deadStores) {
       llvm::Value *storedValue = store->getValueOperand();
-      bool keepStoredValue =
-          !PostSignatureCleanup || isRecordedCallArgStore(store) ||
-          isRecordedCallArgValue(storedValue);
+      bool keepStoredValue = !PostSignatureCleanup ||
+                             isRecordedCallArgStore(store) ||
+                             isRecordedCallArgValue(storedValue);
       store->eraseFromParent();
       if (!keepStoredValue) {
         if (auto *storedInst = llvm::dyn_cast<llvm::Instruction>(storedValue)) {
@@ -2587,8 +2696,7 @@ private:
   }
 
   llvm::Value *unknownBefore(llvm::Instruction &insertBefore,
-                             const RegisterUnit &unit,
-                             llvm::Twine suffix) {
+                             const RegisterUnit &unit, llvm::Twine suffix) {
     // A missing reaching definition is unknown, not integer zero.  Keep this
     // materialization in one place so special register classes can avoid this
     // path when they need stronger preservation rules.
@@ -2773,6 +2881,9 @@ private:
         (isIntegerAbiOutput(Abi, unit.Name) &&
          !isLikelyNonReturnIntegerAbiOutput(Abi, unit.Name))) {
       return CallRegisterEffect::ReturnValue;
+    }
+    if (isFloatAbiOutputUnit(Abi, unit.Name)) {
+      return CallRegisterEffect::Unknown;
     }
     if (Abi.KilledByCall.count(unit.Name) != 0) {
       return CallRegisterEffect::Clobber;
@@ -3200,10 +3311,9 @@ llvm::Value *extractReturnRegister(llvm::IRBuilder<> &builder,
   return nullptr;
 }
 
-llvm::Value *foreignArgumentReplacement(llvm::Function &function,
-                                        llvm::Argument &argument,
-                                        std::map<llvm::Type *, llvm::Value *>
-                                            &unknownByType) {
+llvm::Value *foreignArgumentReplacement(
+    llvm::Function &function, llvm::Argument &argument,
+    std::map<llvm::Type *, llvm::Value *> &unknownByType) {
   for (llvm::Argument &candidate : function.args()) {
     if (candidate.getName() == argument.getName() &&
         candidate.getType() == argument.getType()) {
@@ -3308,8 +3418,8 @@ llvm::Value *castRegisterValueToSlot(llvm::IRBuilder<> &builder,
         bits, llvm::ConstantInt::get(bits->getType(), slot.OffsetBits),
         slot.Unit->Name + ".arg_shift");
   }
-  llvm::Type *intType = llvm::IntegerType::get(builder.getContext(),
-                                               slot.SizeBits);
+  llvm::Type *intType =
+      llvm::IntegerType::get(builder.getContext(), slot.SizeBits);
   if (bits->getType() != intType) {
     bits = builder.CreateTrunc(bits, intType, slot.Unit->Name + ".arg_bits");
   }
@@ -3351,13 +3461,13 @@ llvm::Value *castSlotValueToRegister(llvm::IRBuilder<> &builder,
       slot.OffsetBits + slot.SizeBits > registerBits) {
     return nullptr;
   }
-  llvm::Type *intType = llvm::IntegerType::get(builder.getContext(),
-                                               slot.SizeBits);
+  llvm::Type *intType =
+      llvm::IntegerType::get(builder.getContext(), slot.SizeBits);
   llvm::Value *bits =
       builder.CreateBitCast(value, intType, slot.Unit->Name + ".ret_bits");
   if (slot.OffsetBits != 0) {
-    bits = builder.CreateZExt(bits, registerType,
-                              slot.Unit->Name + ".ret_wide");
+    bits =
+        builder.CreateZExt(bits, registerType, slot.Unit->Name + ".ret_wide");
     bits = builder.CreateShl(
         bits, llvm::ConstantInt::get(registerType, slot.OffsetBits),
         slot.Unit->Name + ".ret_shift");
@@ -3766,8 +3876,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
     eraseUnusedSummaryHelperDeclarations(module);
     if (options.EnableResidueRemoval) {
       constexpr unsigned maxPostRewriteCleanupIterations = 10;
-      for (unsigned iteration = 0;
-           iteration < maxPostRewriteCleanupIterations; ++iteration) {
+      for (unsigned iteration = 0; iteration < maxPostRewriteCleanupIterations;
+           ++iteration) {
         if (effectiveOptions.EnablePostRewriteInstCombine) {
           runPostRewriteInstCombine(module);
         }
@@ -3791,7 +3901,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
         }
       }
       NativeStackFrameCleanupOptions cleanupOptions;
-      cleanupOptions.StackPointerRegister = stackFrameSummary.StackPointerRegister;
+      cleanupOptions.StackPointerRegister =
+          stackFrameSummary.StackPointerRegister;
       cleanupOptions.Registers = effectiveOptions.IgnoredRegisters;
       NativeStackFrameCleanupSummary cleanupSummary =
           runNativeStackFrameCleanup(module, cleanupOptions);
@@ -3809,15 +3920,15 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       summary.StackFrameAllocasRemoved += cleanupSummary.StackAllocasRemoved;
       NativeStackCanaryCleanupSummary lateCanarySummary =
           runNativeStackCanaryCleanup(module);
-      summary.StackCanaryChecksRemoved +=
-          lateCanarySummary.CanaryChecksRemoved;
+      summary.StackCanaryChecksRemoved += lateCanarySummary.CanaryChecksRemoved;
       summary.StackCanaryFailBlocksRemoved +=
           lateCanarySummary.FailBlocksRemoved;
     }
   }
   summary.FunctionsSeen = summary.Functions.size();
   summary.Warnings = collectRemainingCallValueWarnings(module);
-  summary.Warnings.insert(summary.Warnings.end(), signatureState.Warnings.begin(),
+  summary.Warnings.insert(summary.Warnings.end(),
+                          signatureState.Warnings.begin(),
                           signatureState.Warnings.end());
   if (options.PrintSummary) {
     printNativeRegisterSummarySSASummary(summary, llvm::errs());
@@ -3861,16 +3972,13 @@ void printNativeRegisterSummarySSASummary(
      << " partial_demand_candidates=" << summary.PartialDemandCandidates
      << " partial_demand_matched=" << summary.PartialDemandMatched
      << " partial_demand_rejected=" << summary.PartialDemandRejected
-     << " warnings=" << summary.Warnings.size()
-     << "\n";
+     << " warnings=" << summary.Warnings.size() << "\n";
   for (const NativeRegisterSummarySSAWarning &warning : summary.Warnings) {
     os << "  warning"
        << " function=" << warning.FunctionName
        << " callee=" << warning.CalleeName
-       << " register=" << warning.RegisterName
-       << " kind=" << warning.Kind
-       << " reason=" << warning.Reason
-       << " uses=" << warning.Uses << "\n";
+       << " register=" << warning.RegisterName << " kind=" << warning.Kind
+       << " reason=" << warning.Reason << " uses=" << warning.Uses << "\n";
   }
   for (const NativeRegisterSummarySSAFunctionSummary &function :
        summary.Functions) {
@@ -3891,8 +3999,7 @@ void printNativeRegisterSummarySSASummary(
        << " unknown_call_effects=" << function.UnknownCallEffects
        << " partial_demand_candidates=" << function.PartialDemandCandidates
        << " partial_demand_matched=" << function.PartialDemandMatched
-       << " partial_demand_rejected=" << function.PartialDemandRejected
-       << "\n";
+       << " partial_demand_rejected=" << function.PartialDemandRejected << "\n";
   }
 }
 

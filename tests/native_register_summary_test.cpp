@@ -83,6 +83,46 @@ void attachTestAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachTestFloatOnlyAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_float_only_test";
+
+  notdec::bin2llvm::NativeAbiParamEntry floatOutput;
+  floatOutput.MinSize = 1;
+  floatOutput.MaxSize = 8;
+  floatOutput.MetaType = "float";
+  floatOutput.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  floatOutput.Storage.Name = "XMM0_Qa";
+  abi.Outputs.push_back(floatOutput);
+
+  notdec::bin2llvm::NativeAbiParamEntry integerOutput;
+  integerOutput.MinSize = 1;
+  integerOutput.MaxSize = 8;
+  integerOutput.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  integerOutput.Storage.Name = "RAX";
+  abi.Outputs.push_back(integerOutput);
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
+llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
+                                           const std::string &name,
+                                           llvm::Type *type, uint64_t offset,
+                                           uint64_t size) {
+  auto *global = new llvm::GlobalVariable(
+      module, type, false, llvm::GlobalValue::ExternalLinkage, nullptr, name);
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(module.getContext(), "space=register"),
+      llvm::MDString::get(module.getContext(),
+                          "offset=" + std::to_string(offset)),
+      llvm::MDString::get(module.getContext(), "size=" + std::to_string(size)),
+      llvm::MDString::get(module.getContext(), "name=" + name),
+  };
+  global->setMetadata("notdec.register",
+                      llvm::MDNode::get(module.getContext(), fields));
+  return global;
+}
+
 llvm::StoreInst *storeRegister(llvm::IRBuilder<> &builder,
                                llvm::GlobalVariable *reg, uint64_t value,
                                const std::string &name) {
@@ -291,6 +331,38 @@ bool testTopDownDemandKeepsOnlyUsedReturn() {
                 "unused RDX return was incorrectly marked demanded");
 }
 
+bool testRootDemandSkipsFloatOnlyAbiOutput() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-root-demand-skips-float-output", context);
+  attachTestFloatOnlyAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *zmm0 = createRegisterGlobal(
+      module, "ZMM0", llvm::IntegerType::get(context, 512), 4608, 64);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "root_writes_rax_zmm0", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rax, 1, "RAX");
+  builder.CreateStore(llvm::ConstantInt::get(zmm0->getValueType(), 2), zmm0);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "root_writes_rax_zmm0");
+  const auto *raxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RAX");
+  const auto *zmmSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "ZMM0");
+  return expect(raxSummary != nullptr, "missing root RAX summary") &&
+         expect(zmmSummary != nullptr, "missing root ZMM0 summary") &&
+         expect(raxSummary->ExitDemand,
+                "root integer ABI return was not demanded") &&
+         expect(!zmmSummary->ExitDemand,
+                "root float ABI output was incorrectly demanded");
+}
+
 bool testSavedRegisterRestoreIsPreserved() {
   llvm::LLVMContext context;
   llvm::Module module("summary-saved-register-restore", context);
@@ -405,6 +477,7 @@ int main() {
   ok &= testCalleeReadPropagatesToCallerEntry();
   ok &= testSparseJoinKeepsUntouchedPath();
   ok &= testTopDownDemandKeepsOnlyUsedReturn();
+  ok &= testRootDemandSkipsFloatOnlyAbiOutput();
   ok &= testSavedRegisterRestoreIsPreserved();
   ok &= testOverwrittenSavedRegisterSlotIsNotPreserved();
   ok &= testImplicitCalleeSavedRestoreIsPreserved();
