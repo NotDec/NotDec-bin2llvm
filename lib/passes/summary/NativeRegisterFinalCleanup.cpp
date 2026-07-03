@@ -1,5 +1,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
 
+#include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
+
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -50,7 +52,9 @@ bool isRegisterHelperCall(const llvm::Instruction &inst) {
     return false;
   }
   llvm::Function *callee = call->getCalledFunction();
-  return callee != nullptr && callee->getName().starts_with("notdec.register.");
+  return (callee != nullptr &&
+          callee->getName().starts_with("notdec.register.")) ||
+         parseNativeRegisterPartialWrite(*call).has_value();
 }
 
 bool functionHasRegisterResidue(const llvm::Function &function) {
@@ -81,7 +85,7 @@ uint64_t countRemainingRegisterAccesses(llvm::Module &module) {
       continue;
     }
     for (llvm::Instruction &inst : llvm::instructions(function)) {
-      if (isRegisterLoadOrStore(inst)) {
+      if (isRegisterLoadOrStore(inst) || isRegisterHelperCall(inst)) {
         ++count;
       }
     }

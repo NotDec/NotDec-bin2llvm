@@ -1,6 +1,7 @@
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/LLVMContext.h"
@@ -167,6 +168,16 @@ notdec::bin2llvm::PcodeOpView copyUniqueToUniqueOp(uint64_t address,
   op.OpcodeName = "COPY";
   op.Output = uniqueVarnode(outputOffset, 8);
   op.Inputs.push_back(uniqueVarnode(inputOffset, 8));
+  return op;
+}
+
+notdec::bin2llvm::PcodeOpView copyToPartialRegisterOp(uint64_t address) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  op.OpcodeName = "COPY";
+  op.Output = registerVarnode(0x0, 4, "EAX");
+  op.Inputs.push_back(constVarnode(0x12345678, 4));
   return op;
 }
 
@@ -1316,6 +1327,55 @@ bool testNonX64DoesNotSuppressCallStackEffect() {
                 "module failed verifier after non-x64 call lowering");
 }
 
+bool testPartialRegisterWriteUsesPartialWriteHelper() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Registers.push_back({"register", 0x0, 8, "RAX"});
+  program.Registers.push_back({"register", 0x0, 4, "EAX"});
+  program.Ops.push_back(copyToPartialRegisterOp(0x1000));
+  program.Ops.push_back(returnOp(0x1001));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "partial_register_write_helper";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasPartialWrite = false;
+  bool hasRaxLoad = false;
+  bool hasRaxStore = false;
+  llvm::GlobalVariable *rax =
+      module ? module->getGlobalVariable("RAX") : nullptr;
+  if (function != nullptr) {
+    for (llvm::Instruction &instruction : llvm::instructions(function)) {
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+        llvm::Function *callee = call->getCalledFunction();
+        hasPartialWrite |=
+            callee != nullptr &&
+            callee->getName() == "notdec.partial_write.i64.i32";
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+        hasRaxLoad |= load->getPointerOperand()->stripPointerCasts() == rax;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+        hasRaxStore |= store->getPointerOperand()->stripPointerCasts() == rax;
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "partial register function is missing") &&
+         expect(hasPartialWrite, "partial register write did not use helper") &&
+         expect(!hasRaxLoad, "partial register write kept old-value load") &&
+         expect(!hasRaxStore, "partial register write used full register store") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after partial register helper lowering");
+}
+
 } // namespace
 
 int main() {
@@ -1352,5 +1412,6 @@ int main() {
   ok &= testX64CallSuppressesReturnAddressStackEffect();
   ok &= testX64ReturnSuppressesReturnAddressStackEffect();
   ok &= testNonX64DoesNotSuppressCallStackEffect();
+  ok &= testPartialRegisterWriteUsesPartialWriteHelper();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

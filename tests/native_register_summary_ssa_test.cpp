@@ -1,4 +1,5 @@
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
@@ -231,6 +232,17 @@ bool hasCallTo(const llvm::Function &function, llvm::StringRef calleeName) {
     auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
     if (call != nullptr && call->getCalledFunction() != nullptr &&
         call->getCalledFunction()->getName() == calleeName) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool hasPartialWriteCall(const llvm::Function &function) {
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call != nullptr &&
+        notdec::bin2llvm::parseNativeRegisterPartialWrite(*call)) {
       return true;
     }
   }
@@ -3841,6 +3853,103 @@ bool testPartialKeepHighStoreIsDemandRewritten() {
                   "module failed verifier after partial demand rewrite test");
 }
 
+bool testPartialWriteHelperIsConsumedBySummarySSA() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-write-helper", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *sink = new llvm::GlobalVariable(
+      module, rax->getValueType(), false, llvm::GlobalValue::ExternalLinkage,
+      nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "partial_write_readback",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  builder.CreateCall(partialWrite,
+                     {rax,
+                      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),
+                                             7),
+                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                             0)});
+  llvm::Value *after = loadRegister(builder, rax, "RAX", "after_partial");
+  builder.CreateStore(after, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.LoadsReplaced == 1,
+                "partial write readback load was not replaced") &&
+         expect(!hasPartialWriteCall(*function),
+                "partial write helper call remained after summary SSA") &&
+         expect(!hasRegisterLoad(*function, "RAX"),
+                "raw RAX load remained after partial write rewrite") &&
+         verifyOk(module,
+                  "module failed verifier after partial write helper test");
+}
+
+bool testRecordedReturnValueSurvivesPartialDemandRewrite() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-return-partial-demand", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *condition = new llvm::GlobalVariable(
+      module, llvm::Type::getInt1Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "condition");
+  auto *sink = new llvm::GlobalVariable(
+      module, rax->getValueType(), false, llvm::GlobalValue::ExternalLinkage,
+      nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "return_entry_or_partial",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::BasicBlock *early =
+      llvm::BasicBlock::Create(context, "early", callee);
+  llvm::BasicBlock *write =
+      llvm::BasicBlock::Create(context, "write", callee);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *cond = builder.CreateLoad(condition->getValueType(), condition);
+  builder.CreateCondBr(cond, early, write);
+
+  builder.SetInsertPoint(early);
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(write);
+  llvm::Value *old = loadRegister(builder, rax, "RAX", "old");
+  llvm::Value *keep = builder.CreateAnd(
+      old, llvm::ConstantInt::get(rax->getValueType(),
+                                  llvm::APInt::getBitsSet(64, 8, 64)));
+  llvm::Value *low = llvm::ConstantInt::get(rax->getValueType(), 1);
+  storeRegister(builder, rax, builder.CreateOr(keep, low), "RAX");
+  builder.CreateRetVoid();
+
+  llvm::Function *caller = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "use_partial_return", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  builder.CreateCall(type, callee);
+  llvm::Value *returned = loadRegister(builder, rax, "RAX", "returned");
+  builder.CreateStore(returned, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.FunctionsRewritten >= 1,
+                "callee signature was not rewritten for RAX return") &&
+         expect(summary.PartialDemandCandidates >= 1,
+                "partial return path was not seen by demand rewrite") &&
+         verifyOk(module,
+                  "module failed verifier after return partial-demand test");
+}
+
 bool testPartialDemandZeroReplacementIsMarked() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-demand-zero-metadata", context);
@@ -4180,6 +4289,48 @@ bool testFinalCleanupKeepsMetadataWhenRegisterAccessRemains() {
          verifyOk(module, "module failed verifier after residue cleanup test");
 }
 
+bool testFinalCleanupCountsPartialWriteResidue() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-partial-write", context);
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "final_cleanup_partial_write", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rbx->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  builder.CreateCall(partialWrite,
+                     {rbx,
+                      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),
+                                             7),
+                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                             0)});
+  builder.CreateRetVoid();
+
+  llvm::LLVMContext &moduleContext = module.getContext();
+  llvm::Metadata *field[] = {
+      llvm::MDString::get(moduleContext, "loads_replaced=0"),
+  };
+  function->setMetadata("notdec.register.summary_ssa",
+                        llvm::MDNode::get(moduleContext, field));
+
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+
+  return expect(module.getGlobalVariable("RBX") != nullptr,
+                "partial write RBX global was removed") &&
+         expect(function->getMetadata("notdec.register.summary_ssa") != nullptr,
+                "metadata was cleared while partial write remained") &&
+         expect(cleanup.RemainingRegisterAccesses == 1,
+                "final cleanup did not count partial write residue") &&
+         verifyOk(module,
+                  "module failed verifier after partial write cleanup test");
+}
+
 bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-globaldce", context);
@@ -4273,6 +4424,8 @@ int main() {
   ok &= testKnownPowUsesFloatAbiSlots();
   ok &= testKnownUnaryLibmUsesFloatAbiSlots();
   ok &= testPartialKeepHighStoreIsDemandRewritten();
+  ok &= testPartialWriteHelperIsConsumedBySummarySSA();
+  ok &= testRecordedReturnValueSurvivesPartialDemandRewrite();
   ok &= testPartialDemandZeroReplacementIsMarked();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
@@ -4280,6 +4433,7 @@ int main() {
   ok &= testPartialDemandKeepsMemoryPointerRegisterAddress();
   ok &= testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata();
   ok &= testFinalCleanupKeepsMetadataWhenRegisterAccessRemains();
+  ok &= testFinalCleanupCountsPartialWriteResidue();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

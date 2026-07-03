@@ -1,6 +1,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
@@ -988,7 +989,8 @@ bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
 }
 
 bool isAnalyzableCall(const llvm::CallBase &call) {
-  if (isNotDecRegisterHelperCall(call)) {
+  if (isNotDecRegisterHelperCall(call) ||
+      parseNativeRegisterPartialWrite(call).has_value()) {
     return false;
   }
   llvm::Function *callee = call.getCalledFunction();
@@ -1817,9 +1819,9 @@ public:
     if (Options.EnableRewrite) {
       rewriteLoads();
       collectSignatureCallArgs();
+      collectFunctionReturnValues();
       rewritePartialWrites();
       finalizePendingPhis();
-      collectFunctionReturnValues();
       if (Options.EnableResidueRemoval) {
         removeDeadReplacedLoads();
         removeDeadStoresByLiveness();
@@ -1912,6 +1914,15 @@ private:
     return shiftedMask(resultDemand, shift, sourceWidth);
   }
 
+  static llvm::APInt partialWriteMask(unsigned fullWidth, unsigned writeWidth,
+                                      uint64_t bitOffset) {
+    if (fullWidth == 0 || writeWidth == 0 || bitOffset >= fullWidth ||
+        bitOffset + writeWidth > fullWidth) {
+      return llvm::APInt(fullWidth, 0);
+    }
+    return llvm::APInt::getLowBitsSet(fullWidth, writeWidth).shl(bitOffset);
+  }
+
   static bool isDisjointOr(const llvm::Instruction &inst) {
     auto *possiblyDisjoint = llvm::dyn_cast<llvm::PossiblyDisjointInst>(&inst);
     return possiblyDisjoint != nullptr && possiblyDisjoint->isDisjoint();
@@ -1938,6 +1949,44 @@ private:
     return llvm::ConstantInt::get(type, 0);
   }
 
+  llvm::Value *replacePartialRegisterValue(const RegisterUnit &unit,
+                                           llvm::Value *oldValue,
+                                           llvm::Value *partialValue,
+                                           unsigned writeWidth,
+                                           uint64_t bitOffset,
+                                           llvm::Instruction *before) {
+    if (oldValue == nullptr || partialValue == nullptr || before == nullptr) {
+      return nullptr;
+    }
+    auto *baseType =
+        llvm::dyn_cast<llvm::IntegerType>(unit.Global->getValueType());
+    if (baseType == nullptr || oldValue->getType() != baseType) {
+      return nullptr;
+    }
+    unsigned fullWidth = baseType->getBitWidth();
+    llvm::APInt writeMask = partialWriteMask(fullWidth, writeWidth, bitOffset);
+    if (writeMask.isZero()) {
+      return nullptr;
+    }
+
+    llvm::IRBuilder<> builder(before);
+    llvm::Value *wideValue = builder.CreateZExtOrTrunc(
+        partialValue, baseType, unit.Name + ".partial_wide");
+    if (bitOffset != 0) {
+      wideValue = builder.CreateShl(
+          wideValue, llvm::ConstantInt::get(baseType, bitOffset),
+          unit.Name + ".partial_shift");
+    }
+    wideValue = builder.CreateAnd(wideValue,
+                                  llvm::ConstantInt::get(baseType, writeMask),
+                                  unit.Name + ".partial_bits");
+    llvm::Value *keptValue = builder.CreateAnd(
+        oldValue, llvm::ConstantInt::get(baseType, ~writeMask),
+        unit.Name + ".partial_keep");
+    return builder.CreateOr(keptValue, wideValue,
+                            unit.Name + ".partial_write");
+  }
+
   void eraseTriviallyDeadNonPhiTree(llvm::Instruction *root) {
     std::vector<llvm::Instruction *> worklist;
     worklist.push_back(root);
@@ -1946,6 +1995,7 @@ private:
       worklist.pop_back();
       if (inst == nullptr || inst->getParent() == nullptr ||
           llvm::isa<llvm::PHINode>(inst) ||
+          isRecordedFunctionReturnValue(inst) ||
           !llvm::isInstructionTriviallyDead(inst)) {
         continue;
       }
@@ -1958,7 +2008,8 @@ private:
       }
       inst->eraseFromParent();
       for (llvm::Instruction *operand : operands) {
-        if (operand->use_empty()) {
+        if (operand->use_empty() &&
+            !isRecordedFunctionReturnValue(operand)) {
           worklist.push_back(operand);
         }
       }
@@ -2148,6 +2199,18 @@ private:
         seedOperand(op->getOperand(0));
       }
     };
+
+    if (auto returnsIt = SignatureState.FunctionReturns.find(&Function);
+        returnsIt != SignatureState.FunctionReturns.end()) {
+      for (const auto &[ret, values] : returnsIt->second) {
+        (void)ret;
+        for (llvm::Value *value : values) {
+          if (isRecordedFunctionReturnValue(value)) {
+            seedOperand(resolve(value));
+          }
+        }
+      }
+    }
 
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
       if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&inst)) {
@@ -2349,9 +2412,16 @@ private:
   void rewritePartialWrites() {
     std::map<llvm::Value *, llvm::APInt> demands = computePartialDemands();
     std::vector<llvm::StoreInst *> stores;
+    std::vector<llvm::CallBase *> partialWrites;
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
         stores.push_back(store);
+        continue;
+      }
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (parseNativeRegisterPartialWrite(*call)) {
+          partialWrites.push_back(call);
+        }
       }
     }
     for (llvm::StoreInst *store : stores) {
@@ -2377,6 +2447,36 @@ private:
         ++Summary.PartialDemandRejected;
       }
     }
+    for (llvm::CallBase *call : partialWrites) {
+      if (call->getParent() == nullptr) {
+        continue;
+      }
+      std::optional<NativeRegisterPartialWriteInfo> partial =
+          parseNativeRegisterPartialWrite(*call);
+      if (!partial || Units.count(partial->Global) == 0) {
+        continue;
+      }
+      ++Summary.PartialDemandCandidates;
+      llvm::SmallPtrSet<llvm::Value *, 16> visiting;
+      if (rewriteZeroDemandOperands(partial->Value, demands, visiting)) {
+        ++Summary.PartialDemandMatched;
+      } else {
+        ++Summary.PartialDemandRejected;
+      }
+    }
+  }
+
+  void eraseDeadPartialWriteCall(llvm::CallBase *call) {
+    llvm::Value *partialValue = parseNativeRegisterPartialWrite(*call)->Value;
+    bool keepPartialValue = isRecordedCallArgValue(partialValue) ||
+                            isRecordedFunctionReturnValue(partialValue);
+    call->eraseFromParent();
+    if (!keepPartialValue) {
+      if (auto *partialInst = llvm::dyn_cast<llvm::Instruction>(partialValue)) {
+        llvm::RecursivelyDeleteTriviallyDeadInstructions(partialInst);
+      }
+    }
+    ++Summary.DeadStoresRemoved;
   }
 
   void collectAccesses() {
@@ -2397,6 +2497,14 @@ private:
         if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
           RegisterAccess access = registerStore(*store, Units);
           if (access.Unit != nullptr) {
+            ++Summary.StoresSeen;
+          }
+          continue;
+        }
+        if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+          std::optional<NativeRegisterPartialWriteInfo> partial =
+              parseNativeRegisterPartialWrite(*call);
+          if (partial && Units.count(partial->Global) != 0) {
             ++Summary.StoresSeen;
           }
         }
@@ -2431,7 +2539,7 @@ private:
       if (load->getParent() == nullptr || !load->use_empty()) {
         continue;
       }
-      if (isRecordedCallArgValue(load)) {
+      if (isRecordedCallArgValue(load) || isRecordedFunctionReturnValue(load)) {
         continue;
       }
       load->eraseFromParent();
@@ -2444,10 +2552,37 @@ private:
   }
 
   bool isRecordedCallArgValue(llvm::Value *value) const {
+    value = resolve(value);
     for (const auto &[call, bindings] : SignatureState.CallArgs) {
       (void)call;
       for (const CallArgStoreBinding &binding : bindings) {
-        if (binding.Value == value || binding.RegisterValue == value) {
+        if (resolve(binding.Value) == value ||
+            resolve(binding.RegisterValue) == value) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool isRecordedFunctionReturnValue(llvm::Value *value) const {
+    auto shapeIt = SignatureState.Shapes.find(&Function);
+    if (shapeIt == SignatureState.Shapes.end() ||
+        shapeIt->second.Returns.empty() ||
+        Function.getFunctionType() ==
+            functionTypeForShape(Function.getContext(), shapeIt->second)) {
+      return false;
+    }
+    auto returnsIt = SignatureState.FunctionReturns.find(&Function);
+    if (returnsIt == SignatureState.FunctionReturns.end()) {
+      return false;
+    }
+
+    value = resolve(value);
+    for (const auto &[ret, values] : returnsIt->second) {
+      (void)ret;
+      for (llvm::Value *retValue : values) {
+        if (resolve(retValue) == value) {
           return true;
         }
       }
@@ -2513,6 +2648,9 @@ private:
         continue;
       }
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (transferPartialWriteLiveness(*call, live)) {
+          continue;
+        }
         transferCallLiveness(*call, live);
         continue;
       }
@@ -2523,6 +2661,7 @@ private:
   void eraseDeadStoresInBlock(llvm::BasicBlock &block,
                               std::set<llvm::GlobalVariable *> live) {
     std::vector<llvm::StoreInst *> deadStores;
+    std::vector<llvm::CallBase *> deadPartialWrites;
     for (auto it = block.rbegin(); it != block.rend(); ++it) {
       llvm::Instruction &inst = *it;
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
@@ -2539,6 +2678,15 @@ private:
         continue;
       }
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (std::optional<NativeRegisterPartialWriteInfo> partial =
+                parseNativeRegisterPartialWrite(*call)) {
+          if (Units.count(partial->Global) != 0 &&
+              live.count(partial->Global) == 0) {
+            deadPartialWrites.push_back(call);
+          }
+          transferPartialWriteLiveness(*call, live);
+          continue;
+        }
         transferCallLiveness(*call, live);
         continue;
       }
@@ -2547,7 +2695,8 @@ private:
       llvm::Value *storedValue = store->getValueOperand();
       bool keepStoredValue = !PostSignatureCleanup ||
                              isRecordedCallArgStore(store) ||
-                             isRecordedCallArgValue(storedValue);
+                             isRecordedCallArgValue(storedValue) ||
+                             isRecordedFunctionReturnValue(storedValue);
       store->eraseFromParent();
       if (!keepStoredValue) {
         if (auto *storedInst = llvm::dyn_cast<llvm::Instruction>(storedValue)) {
@@ -2555,6 +2704,9 @@ private:
         }
       }
       ++Summary.DeadStoresRemoved;
+    }
+    for (llvm::CallBase *call : deadPartialWrites) {
+      eraseDeadPartialWriteCall(call);
     }
   }
 
@@ -2580,6 +2732,21 @@ private:
       }
       live.insert(access.Unit->Global);
     }
+  }
+
+  bool transferPartialWriteLiveness(
+      llvm::CallBase &call, std::set<llvm::GlobalVariable *> &live) const {
+    std::optional<NativeRegisterPartialWriteInfo> partial =
+        parseNativeRegisterPartialWrite(call);
+    if (!partial || Units.count(partial->Global) == 0) {
+      return false;
+    }
+    // If the register is live after this helper, the untouched bits may still
+    // come from the previous value.  At whole-register granularity that means
+    // the same register stays live before the helper; if it is not live after,
+    // the helper is dead and does not make the old value live.
+    (void)live;
+    return true;
   }
 
   void transferCallLiveness(llvm::CallBase &call,
@@ -2631,6 +2798,16 @@ private:
         continue;
       }
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (std::optional<NativeRegisterPartialWriteInfo> partial =
+                parseNativeRegisterPartialWrite(*call)) {
+          if (partial->Global != unit.Global) {
+            continue;
+          }
+          llvm::Value *oldValue = readValueBefore(block, unit, call);
+          return replacePartialRegisterValue(
+              unit, oldValue, partial->Value, partial->WriteWidth,
+              partial->BitOffset, call);
+        }
         if (!isAnalyzableCall(*call)) {
           continue;
         }
@@ -2704,6 +2881,26 @@ private:
                               unit.Name + suffix);
   }
 
+  llvm::Value *registerTypedValueOrUnknown(llvm::Value *value,
+                                           const RegisterUnit &unit,
+                                           llvm::Instruction *insertBefore,
+                                           llvm::Twine suffix) {
+    value = resolve(value);
+    if (value == nullptr) {
+      return nullptr;
+    }
+    if (value->getType() == unit.Global->getValueType()) {
+      return value;
+    }
+    // Opaque pointers allow a narrow store through a register global pointer.
+    // That is not a full-register value, so use an unknown full-width value
+    // instead of manufacturing a zero/sign extension.
+    if (insertBefore != nullptr) {
+      return unknownBefore(*insertBefore, unit, suffix);
+    }
+    return llvm::UndefValue::get(unit.Global->getValueType());
+  }
+
   llvm::PHINode *ensurePhi(llvm::BasicBlock &block, const RegisterUnit &unit) {
     BlockRegKey key{&block, unit.Global};
     if (auto existing = PendingPhi.find(key); existing != PendingPhi.end()) {
@@ -2733,7 +2930,9 @@ private:
       if (existingIncoming[pred] >= requiredCount) {
         continue;
       }
-      llvm::Value *incoming = resolve(readBlockExit(*pred, unit));
+      llvm::Value *incoming = registerTypedValueOrUnknown(
+          readBlockExit(*pred, unit), unit, pred->getTerminator(),
+          ".type_mismatch");
       if (incoming == nullptr) {
         llvm::Instruction *terminator = pred->getTerminator();
         incoming = terminator != nullptr
@@ -2816,7 +3015,7 @@ private:
     }
   }
 
-  llvm::Value *resolve(llvm::Value *value) {
+  llvm::Value *resolve(llvm::Value *value) const {
     while (value != nullptr) {
       auto it = Replacement.find(value);
       if (it == Replacement.end() || it->second == value) {
@@ -3024,6 +3223,13 @@ private:
         continue;
       }
       if (auto *otherCall = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (std::optional<NativeRegisterPartialWriteInfo> partial =
+                parseNativeRegisterPartialWrite(*otherCall)) {
+          if (partial->Global == unit.Global) {
+            return nullptr;
+          }
+          continue;
+        }
         llvm::Function *callee = otherCall->getCalledFunction();
         if (isAnalyzableCall(*otherCall) &&
             (callee == nullptr || !callee->isIntrinsic())) {

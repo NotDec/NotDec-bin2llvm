@@ -1,4 +1,5 @@
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 
 #include "llvm/IR/Constants.h"
@@ -207,6 +208,42 @@ bool testKilledReadDoesNotBecomeInput() {
          expect(!rdiSummary->ReadEntry,
                 "killed RDI read was incorrectly marked readEntry") &&
          expect(rdiSummary->MayNonEntry, "RDI write was not marked modified");
+}
+
+bool testPartialWriteDoesNotReadEntryByItself() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-partial-write", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "partial_write_rax", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  builder.CreateCall(partialWrite,
+                     {rax,
+                      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),
+                                             7),
+                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                             0)});
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "partial_write_rax");
+  const auto *raxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RAX");
+  return expect(raxSummary != nullptr, "missing partial write RAX summary") &&
+         expect(!raxSummary->ReadEntry,
+                "partial write helper was incorrectly marked readEntry") &&
+         expect(raxSummary->MayEntry,
+                "partial write did not preserve untouched RAX bits") &&
+         expect(raxSummary->MayNonEntry,
+                "partial write was not marked as modifying RAX");
 }
 
 bool testCalleeReadPropagatesToCallerEntry() {
@@ -474,6 +511,7 @@ bool testImplicitCalleeSavedRestoreIsPreserved() {
 int main() {
   bool ok = true;
   ok &= testKilledReadDoesNotBecomeInput();
+  ok &= testPartialWriteDoesNotReadEntryByItself();
   ok &= testCalleeReadPropagatesToCallerEntry();
   ok &= testSparseJoinKeepsUntouchedPath();
   ok &= testTopDownDemandKeepsOnlyUsedReturn();

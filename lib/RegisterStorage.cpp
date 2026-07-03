@@ -1,6 +1,7 @@
 #include "notdec-bin2llvm/RegisterStorage.h"
 
-#include "llvm/ADT/APInt.h"
+#include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
+
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -224,26 +225,25 @@ void RegisterStorage::write(llvm::IRBuilderBase &builder,
 
   llvm::GlobalVariable *global = globalFor(*unit);
   auto *globalType = llvm::cast<llvm::IntegerType>(global->getValueType());
-  llvm::Value *resized = builder.CreateZExtOrTrunc(value, globalType);
   if (unit->Offset == access.Offset && unit->Size == access.Size) {
+    llvm::Value *resized = builder.CreateZExtOrTrunc(value, globalType);
     llvm::Value *store = builder.CreateStore(resized, global);
     addAccessMetadata(store, *unit, access);
     return;
   }
 
-  llvm::Value *oldValue = builder.CreateLoad(globalType, global);
   uint64_t shift = bitOffset(*unit, access);
-  llvm::APInt mask =
-      llvm::APInt::getLowBitsSet(globalType->getBitWidth(), bitWidth(access.Size))
-          .shl(shift);
-  llvm::Value *cleared =
-      builder.CreateAnd(oldValue, llvm::ConstantInt::get(globalType, ~mask));
-  llvm::Value *shifted = builder.CreateAnd(
-      builder.CreateShl(resized, llvm::ConstantInt::get(globalType, shift)),
-      llvm::ConstantInt::get(globalType, mask));
-  llvm::Value *store = builder.CreateStore(builder.CreateOr(cleared, shifted),
-                                           global);
-  addAccessMetadata(store, *unit, access);
+  uint32_t writeWidth = bitWidth(access.Size);
+  llvm::Type *writeType = llvm::IntegerType::get(Context, writeWidth);
+  llvm::Value *partialValue = builder.CreateZExtOrTrunc(value, writeType);
+  llvm::Function *partialWrite = getOrInsertNativeRegisterPartialWrite(
+      Module, global->getType(), partialValue->getType(),
+      globalType->getBitWidth(), writeWidth);
+  llvm::CallInst *call = builder.CreateCall(
+      partialWrite,
+      {global, partialValue,
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(Context), shift)});
+  addAccessMetadata(call, *unit, access);
 }
 
 } // namespace notdec::bin2llvm

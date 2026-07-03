@@ -1,6 +1,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
@@ -401,6 +402,11 @@ std::map<llvm::Value *, llvm::APInt> computeValueDemands(
       continue;
     }
     if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+      if (std::optional<NativeRegisterPartialWriteInfo> partial =
+              parseNativeRegisterPartialWrite(*call)) {
+        enqueue(partial->Value, fullMaskForValue(partial->Value));
+        continue;
+      }
       for (llvm::Use &arg : call->args()) {
         seed(arg.get());
       }
@@ -600,12 +606,14 @@ registerStore(llvm::StoreInst &store,
 
 bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
   llvm::Function *callee = call.getCalledFunction();
-  return callee != nullptr && callee->getName().starts_with("notdec.register.");
+  return callee != nullptr &&
+         callee->getName().starts_with("notdec.register.");
 }
 
 bool isAnalyzableCall(const llvm::Instruction &inst) {
   auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
-  if (call == nullptr || isNotDecRegisterHelperCall(*call)) {
+  if (call == nullptr || isNotDecRegisterHelperCall(*call) ||
+      parseNativeRegisterPartialWrite(*call).has_value()) {
     return false;
   }
   llvm::Function *callee = call->getCalledFunction();
@@ -739,6 +747,14 @@ void readRegister(State &state, llvm::GlobalVariable *global) {
 void writeRegister(State &state, llvm::GlobalVariable *global) {
   Cell &cell = cellFor(state, global);
   cell.MayEntry = false;
+  cell.MayNonEntry = true;
+}
+
+void partialWriteRegister(State &state, llvm::GlobalVariable *global) {
+  // A partial write replaces only some bits.  At the current whole-register
+  // summary granularity, the untouched bits may still be the entry value, so do
+  // not kill MayEntry.  The call itself is still a non-entry definition.
+  Cell &cell = cellFor(state, global);
   cell.MayNonEntry = true;
 }
 
@@ -1079,6 +1095,19 @@ private:
     }
     if (isAnalyzableCall(inst)) {
       transferCall(llvm::cast<llvm::CallBase>(inst), state);
+      return;
+    }
+    if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+      std::optional<NativeRegisterPartialWriteInfo> partial =
+          parseNativeRegisterPartialWrite(*call);
+      if (partial) {
+        auto unitIt = Units.find(partial->Global);
+        if (unitIt != Units.end() && !isIgnored(unitIt->second, Options)) {
+          partialWriteRegister(state, partial->Global);
+        }
+        state.ValueOrigins.erase(&inst);
+        return;
+      }
     }
   }
 
@@ -1335,6 +1364,12 @@ private:
                   const std::map<llvm::Value *, llvm::APInt> &valueDemands) {
     for (llvm::Instruction &inst : llvm::reverse(block)) {
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (std::optional<NativeRegisterPartialWriteInfo> partial =
+                parseNativeRegisterPartialWrite(*call)) {
+          addDemand(live, partial->Global,
+                    valueDemand(partial->Value, valueDemands));
+          continue;
+        }
         if (!isNotDecRegisterHelperCall(*call)) {
           applyBackwardCallDemand(*call, live, additions);
         }
