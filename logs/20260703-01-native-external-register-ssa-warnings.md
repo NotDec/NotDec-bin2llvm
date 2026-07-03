@@ -32,6 +32,30 @@ SummarySSA 会把调用后的 `RAX` 恢复成 `summary_return` helper；同时�
 - `tests/native_register_summary_ssa_test.cpp:1579`、`2464`、`4024`、`4030`：
   新增 `__ctype_b_loc` typed return 和未知外部 `RDX` clobber 回归测试。
 
+## 追加：未知外部参数数量推断
+
+在 SummarySSA top-down 扫完所有函数后，对没有原型库命中的外部声明综合多个 callsite
+推断参数数量。每个 callsite 只取连续 ABI 参数前缀；同一个 callee 多个 callsite 不一致
+时，最终 arity 取最大值，并输出 `inconsistent_unknown_external_arity` warning。
+
+新增和调整：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:232`：
+  `SignatureRewriteState` 增加 `Warnings`，用于在签名 refine 阶段暂存 warning。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:820`：
+  增加 `isKnownExternalFunction`、`isUnknownExternalFunction`，只对未知外部 declaration 做 arity refine。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1493`：
+  增加 `callsiteBoundArgPrefix`、`addSignatureWarning`、
+  `refineUnknownExternalParamShapes` 和 `markSignatureCallArgStores`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:2781`：
+  已知外部和内部调用仍在函数内扫描阶段立即标记参数 store；未知外部调用延后到 arity refine
+  后按最终签名标记，避免截断签名后误删高位参数 store。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:3697`：
+  `rewriteSignatureShapes` 前先执行未知外部 arity refine，再补外部返回值、标记最终参数 store。
+- `tests/native_register_summary_ssa_test.cpp:2523`：
+  新增 `testUnknownExternalArityUsesMaxCallsitePrefix`，覆盖同一未知外部函数多个 callsite
+  推断结果不一致时取最大连续参数前缀。
+
 ## 验证
 
 编译和单测：
@@ -71,6 +95,36 @@ OUT=/tmp/notdec-bin2llvm-fortune-external-warning-20260703051949
 - `llvm-as` 和 `opt -passes=verify` 通过。
 
 性能：本次 fortune native run `elapsed=5.94s`；上一轮同口径记录约 `6.07s`，未见明显回退。
+
+追加验证：
+
+```bash
+cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j4
+./build/bin/native_register_summary_ssa_test
+
+OUT=/tmp/notdec-bin2llvm-fortune-arity-20260703065713
+./build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  --all-confirmed --skip-runtime --register-ssa-summary \
+  --summary-json-out "$OUT/summary.json" \
+  --register-ssa-warning-out "$OUT/register-ssa-warnings.tsv" \
+  -o "$OUT/fortune.native.ll"
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as "$OUT/fortune.native.ll" -o "$OUT/fortune.native.bc"
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify "$OUT/fortune.native.bc" -o /dev/null
+```
+
+追加结果：
+
+- IR：`/tmp/notdec-bin2llvm-fortune-arity-20260703065713/fortune.native.ll`
+- warning TSV：`/tmp/notdec-bin2llvm-fortune-arity-20260703065713/register-ssa-warnings.tsv`
+- `summary_return refs=0`
+- `summary_clobber refs=23`
+- `RDX.return refs=0`
+- `__ctype i64 declares=3`
+- warning rows：`25`
+- signature warning：`4`，其中 `inconsistent_unknown_external_arity=1`、
+  `inferred_unknown_external_arity=3`
+- 本次 fortune native run `elapsed=5.88s`。
 
 ## 评估
 

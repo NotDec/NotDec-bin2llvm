@@ -229,6 +229,7 @@ struct SignatureRewriteState {
       FunctionReturns;
   std::map<llvm::Value *, llvm::Value *> ValueMap;
   std::set<llvm::StoreInst *> StoresToErase;
+  std::vector<NativeRegisterSummarySSAWarning> Warnings;
   // Calls rebuilt by SummarySSA already carry their ABI inputs as LLVM
   // operands, so the later register-store liveness pass must not treat them as
   // users of @RDI/@RSI/... globals.
@@ -814,6 +815,16 @@ bool isKnownNoReturnExternal(const llvm::Function &function) {
   }
   auto knownIt = knownExternalPrototypes().find(function.getName());
   return knownIt != knownExternalPrototypes().end() && knownIt->second.NoReturn;
+}
+
+bool isKnownExternalFunction(const llvm::Function &function) {
+  return knownExternalPrototypes().count(function.getName()) != 0;
+}
+
+bool isUnknownExternalFunction(const llvm::Function &function) {
+  return function.isDeclaration() && !function.isIntrinsic() &&
+         !function.getName().starts_with("notdec.register.") &&
+         !isKnownExternalFunction(function);
 }
 
 void truncateKnownNoReturnExternalCalls(llvm::Module &module) {
@@ -1475,6 +1486,113 @@ void addDemandedExternalReturns(
         }
       }
       ++returnIndex;
+    }
+  }
+}
+
+unsigned callsiteBoundArgPrefix(
+    const std::vector<CallArgStoreBinding> &bindings) {
+  unsigned prefix = 0;
+  for (const CallArgStoreBinding &binding : bindings) {
+    if (binding.Index != prefix) {
+      break;
+    }
+    ++prefix;
+  }
+  return prefix;
+}
+
+void addSignatureWarning(SignatureRewriteState &state,
+                         llvm::StringRef functionName,
+                         llvm::StringRef calleeName,
+                         llvm::StringRef detail,
+                         llvm::StringRef reason,
+                         unsigned uses) {
+  NativeRegisterSummarySSAWarning warning;
+  warning.FunctionName = functionName.str();
+  warning.CalleeName = calleeName.str();
+  warning.RegisterName = detail.str();
+  warning.Kind = "signature";
+  warning.Reason = reason.str();
+  warning.Uses = uses;
+  state.Warnings.push_back(std::move(warning));
+}
+
+void refineUnknownExternalParamShapes(SignatureRewriteState &state) {
+  std::map<llvm::Function *, std::vector<unsigned>> aritiesByCallee;
+  for (const auto &[call, bindings] : state.CallArgs) {
+    if (call == nullptr || call->getParent() == nullptr) {
+      continue;
+    }
+    llvm::Function *callee = call->getCalledFunction();
+    if (callee == nullptr || !isUnknownExternalFunction(*callee)) {
+      continue;
+    }
+    aritiesByCallee[callee].push_back(callsiteBoundArgPrefix(bindings));
+  }
+
+  for (auto &[callee, arities] : aritiesByCallee) {
+    auto shapeIt = state.Shapes.find(callee);
+    if (shapeIt == state.Shapes.end() || shapeIt->second.VarArg ||
+        arities.empty()) {
+      continue;
+    }
+    unsigned minArity = arities.front();
+    unsigned maxArity = arities.front();
+    for (unsigned arity : arities) {
+      minArity = std::min(minArity, arity);
+      maxArity = std::max(maxArity, arity);
+    }
+    SignatureShape &shape = shapeIt->second;
+    unsigned originalArity = shape.Params.size();
+    if (maxArity < shape.Params.size()) {
+      shape.Params.resize(maxArity);
+    }
+    std::string detail = "arity=" + std::to_string(minArity) + ".." +
+                         std::to_string(maxArity) + "/final=" +
+                         std::to_string(shape.Params.size());
+    if (minArity != maxArity) {
+      addSignatureWarning(state, "<external-signature>", callee->getName(),
+                          detail,
+                          "inconsistent_unknown_external_arity",
+                          arities.size());
+    } else if (shape.Params.size() != originalArity) {
+      addSignatureWarning(state, "<external-signature>", callee->getName(),
+                          detail,
+                          "inferred_unknown_external_arity", arities.size());
+    }
+  }
+
+  for (auto &[call, bindings] : state.CallArgs) {
+    if (call == nullptr || call->getParent() == nullptr) {
+      continue;
+    }
+    llvm::Function *callee = call->getCalledFunction();
+    if (callee == nullptr) {
+      continue;
+    }
+    auto shapeIt = state.Shapes.find(callee);
+    if (shapeIt == state.Shapes.end() || shapeIt->second.VarArg) {
+      continue;
+    }
+    const unsigned finalArity = shapeIt->second.Params.size();
+    bindings.erase(std::remove_if(bindings.begin(), bindings.end(),
+                                  [&](const CallArgStoreBinding &binding) {
+                                    return binding.Index >= finalArity;
+                                  }),
+                   bindings.end());
+  }
+}
+
+void markSignatureCallArgStores(SignatureRewriteState &state,
+                                NativeRegisterSummarySSASummary &summary) {
+  for (const auto &[call, bindings] : state.CallArgs) {
+    (void)call;
+    for (const CallArgStoreBinding &binding : bindings) {
+      if (binding.Store != nullptr &&
+          state.StoresToErase.insert(binding.Store).second) {
+        ++summary.CallArgStoresMarked;
+      }
     }
   }
 }
@@ -2661,10 +2779,12 @@ private:
       }
 
       SignatureState.CallArgs[call] = bindings;
-      for (const CallArgStoreBinding &binding : bindings) {
-        if (binding.Store != nullptr) {
-          SignatureState.StoresToErase.insert(binding.Store);
-          ++Summary.CallArgStoresMarked;
+      if (!isUnknownExternalFunction(*callee)) {
+        for (const CallArgStoreBinding &binding : bindings) {
+          if (binding.Store != nullptr &&
+              SignatureState.StoresToErase.insert(binding.Store).second) {
+            ++Summary.CallArgStoresMarked;
+          }
         }
       }
     }
@@ -3594,7 +3714,9 @@ runNativeRegisterSummarySSA(llvm::Module &module,
     summary.Functions.push_back(std::move(fn));
   }
   if (options.EnableRewrite) {
+    refineUnknownExternalParamShapes(signatureState);
     addDemandedExternalReturns(signatureState, units, abi);
+    markSignatureCallArgStores(signatureState, summary);
     rewriteSignatureShapes(module, signatureState, summary);
     eraseUnusedSummaryHelperDeclarations(module);
     if (options.EnableResidueRemoval) {
@@ -3650,6 +3772,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   }
   summary.FunctionsSeen = summary.Functions.size();
   summary.Warnings = collectRemainingCallValueWarnings(module);
+  summary.Warnings.insert(summary.Warnings.end(), signatureState.Warnings.begin(),
+                          signatureState.Warnings.end());
   if (options.PrintSummary) {
     printNativeRegisterSummarySSASummary(summary, llvm::errs());
   }

@@ -2520,6 +2520,74 @@ bool testUnknownExternalTreatsRdxAsClobberNotReturn() {
                   "module failed verifier after unknown external RDX test");
 }
 
+bool testUnknownExternalArityUsesMaxCallsitePrefix() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unknown-external-max-arity", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX"});
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage,
+      "unknown_external_arity", module);
+  llvm::Function *function =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external_arity_callers", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *shortCall =
+      llvm::BasicBlock::Create(context, "short_call", function);
+  llvm::BasicBlock *longCall =
+      llvm::BasicBlock::Create(context, "long_call", function);
+  llvm::BasicBlock *done =
+      llvm::BasicBlock::Create(context, "done", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), shortCall,
+                       longCall);
+
+  builder.SetInsertPoint(shortCall);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateBr(done);
+
+  builder.SetInsertPoint(longCall);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 2),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 3),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 4),
+                "RDX");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateBr(done);
+
+  builder.SetInsertPoint(done);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("unknown_external_arity");
+  bool hasInconsistentArityWarning = false;
+  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+       summary.Warnings) {
+    hasInconsistentArityWarning |=
+        warning.CalleeName == "unknown_external_arity" &&
+        warning.Reason == "inconsistent_unknown_external_arity";
+  }
+
+  return expect(rewritten != nullptr, "unknown external arity callee missing") &&
+         expect(rewritten->arg_size() == 3,
+                "unknown external arity did not use max callsite prefix") &&
+         expect(hasInconsistentArityWarning,
+                "unknown external arity mismatch warning missing") &&
+         verifyOk(module,
+                  "module failed verifier after unknown external arity test");
+}
+
 bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-call-arg-value-survives-cleanup", context);
@@ -4028,6 +4096,7 @@ int main() {
   ok &= testMismatchedDirectCallUseUsesReturnExtract();
   ok &= testKnownExternalUsesSingleIntegerReturn();
   ok &= testUnknownExternalTreatsRdxAsClobberNotReturn();
+  ok &= testUnknownExternalArityUsesMaxCallsitePrefix();
   ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
   ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
