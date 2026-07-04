@@ -135,6 +135,16 @@ struct CallArgStoreBinding {
   unsigned Index = 0;
 };
 
+const CallArgStoreBinding *
+bindingForIndex(const std::vector<CallArgStoreBinding> &bindings,
+                unsigned index) {
+  auto it = std::find_if(bindings.begin(), bindings.end(),
+                         [&](const CallArgStoreBinding &binding) {
+                           return binding.Index == index;
+                         });
+  return it == bindings.end() ? nullptr : &*it;
+}
+
 // Backward bit demand for values produced while lowering partial register
 // writes.  A set bit means some later real observer needs that bit.  Register
 // stores are not observers by themselves; later loads, calls, returns,
@@ -4005,6 +4015,24 @@ private:
     return load;
   }
 
+  llvm::Value *entryArgument(const RegisterUnit &unit) const {
+    auto shapeIt = SignatureState.Shapes.find(&Function);
+    if (shapeIt == SignatureState.Shapes.end()) {
+      return nullptr;
+    }
+    llvm::Argument *arg = Function.arg_begin();
+    for (const NativeSignatureSlot &slot : shapeIt->second.Params) {
+      if (arg == Function.arg_end()) {
+        return nullptr;
+      }
+      if (slot.Unit == &unit || slot.Unit->Global == unit.Global) {
+        return arg;
+      }
+      ++arg;
+    }
+    return nullptr;
+  }
+
   llvm::Value *entryRangeInput(const RegisterRangeKey &range) {
     if (auto cached = EntryRangeInputs.find(range);
         cached != EntryRangeInputs.end()) {
@@ -4013,6 +4041,18 @@ private:
     const RegisterUnit *unit = unitForRange(range);
     if (unit == nullptr) {
       return nullptr;
+    }
+    if (PostSignatureCleanup) {
+      if (llvm::Value *arg = entryArgument(*unit)) {
+        llvm::Instruction *insertBefore =
+            &*Function.getEntryBlock().getFirstInsertionPt();
+        llvm::Value *value = extractRangeValue(range, arg, 0, insertBefore,
+                                               unit->Name + ".range_entry_arg");
+        if (value != nullptr) {
+          EntryRangeInputs.emplace(range, value);
+          return value;
+        }
+      }
     }
     llvm::LoadInst *fullInput = entryInput(*unit);
     llvm::Instruction *insertBefore = fullInput->getNextNode();
@@ -4167,6 +4207,9 @@ private:
       }
       llvm::Value *value = resolve(readSlotValueBefore(call, slot));
       if (value == nullptr || value->getType() != slotType(slot)) {
+        break;
+      }
+      if (mayDependOnSummaryClobberValue(value)) {
         break;
       }
       llvm::StoreInst *store = findNearestStoreBeforeCall(call, *unit);
@@ -4420,7 +4463,8 @@ private:
         const RegisterUnit *unit = slot.Unit;
         llvm::Value *value = resolve(
             readSlotValueBefore(*ret, slot, unit->Name + ".return_range"));
-        if (value == nullptr || value->getType() != slotType(slot)) {
+        if (value == nullptr || value->getType() != slotType(slot) ||
+            mayDependOnSummaryClobberValue(value)) {
           value = frozenPoisonBefore(*ret, slotType(slot),
                                      unit->Name + ".return_unknown");
         }
@@ -4911,8 +4955,8 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
     llvm::IRBuilder<> oldCallBuilder(oldCall);
     for (unsigned index = 0; index < shape.Params.size(); ++index) {
       const NativeSignatureSlot &slot = shape.Params[index];
-      llvm::Value *value =
-          index < bindings.size() ? bindings[index].Value : nullptr;
+      const CallArgStoreBinding *binding = bindingForIndex(bindings, index);
+      llvm::Value *value = binding == nullptr ? nullptr : binding->Value;
       if (value != nullptr) {
         value = remapValue(value);
         value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);

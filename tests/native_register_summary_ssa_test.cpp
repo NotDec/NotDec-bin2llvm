@@ -336,6 +336,11 @@ bool functionHasInstructionNameContaining(const llvm::Function &function,
   return false;
 }
 
+bool valueNameContains(const llvm::Value *value, llvm::StringRef needle) {
+  return value != nullptr && value->hasName() &&
+         value->getName().contains(needle);
+}
+
 llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
                                                uint64_t fsOffset,
                                                bool useZextCondition,
@@ -2534,8 +2539,12 @@ bool testUnknownExternalTreatsRdxAsClobberNotReturn() {
 
   llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
   auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  auto *sinkType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
   llvm::Function *callee = llvm::Function::Create(
       voidType, llvm::GlobalValue::ExternalLinkage, "unknown_external", module);
+  llvm::Function *sink = llvm::Function::Create(
+      sinkType, llvm::GlobalValue::ExternalLinkage, "consume_rdx", module);
   llvm::Function *function =
       llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
                              "unknown_external_rdx_after", module);
@@ -2544,7 +2553,7 @@ bool testUnknownExternalTreatsRdxAsClobberNotReturn() {
   llvm::IRBuilder<> builder(entry);
   builder.CreateCall(voidType, callee);
   llvm::LoadInst *rdxLoad = loadRegister(builder, rdx, "RDX", "rdx.after");
-  (void)rdxLoad;
+  builder.CreateCall(sinkType, sink, {rdxLoad});
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
@@ -2565,6 +2574,132 @@ bool testUnknownExternalTreatsRdxAsClobberNotReturn() {
                 "unknown external RDX was still treated as return") &&
          verifyOk(module,
                   "module failed verifier after unknown external RDX test");
+}
+
+bool testUnknownExternalClobberArgBecomesUnknown() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unknown-external-clobber-arg", context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_unknown_external_clobber_arg_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  for (llvm::StringRef name : {"RDI", "RSI", "RDX"}) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 1;
+    input.MaxSize = 8;
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = name.str();
+    abi.Inputs.push_back(input);
+  }
+  for (llvm::StringRef name : {"RAX", "RDX"}) {
+    notdec::bin2llvm::NativeAbiParamEntry output;
+    output.MinSize = 1;
+    output.MaxSize = 8;
+    output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    output.Storage.Name = name.str();
+    abi.Outputs.push_back(output);
+
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = name.str();
+    abi.Effects.push_back(killed);
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *first = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "first_unknown", module);
+  llvm::Function *second = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "second_unknown", module);
+  llvm::Function *function =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "clobber_arg_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  builder.CreateCall(voidType, first);
+  llvm::LoadInst *rdxAfter = loadRegister(builder, rdx, "RDX", "rdx.after");
+  storeRegister(builder, rdx, rdxAfter, "RDX");
+  builder.CreateCall(voidType, second);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool secondUsesClobber = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call == nullptr || call->getCalledFunction() == nullptr ||
+        call->getCalledFunction()->getName() != "second_unknown") {
+      continue;
+    }
+    for (llvm::Value *arg : call->args()) {
+      secondUsesClobber |= valueNameContains(arg, "summary_clobber") ||
+                           valueNameContains(arg, "RDX.clobber");
+    }
+  }
+
+  return expect(!secondUsesClobber,
+                "unknown external call kept clobber-derived argument") &&
+         verifyOk(module,
+                  "module failed verifier after clobber arg cleanup test");
+}
+
+bool testInternalReturnDoesNotExposeExternalClobber() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-internal-clobber-return", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "unknown_external", module);
+  llvm::Function *callee =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_clobber_return", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(calleeEntry);
+  storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 7),
+                "RAX");
+  builder.CreateCall(voidType, external);
+  llvm::LoadInst *rdxAfter = loadRegister(builder, rdx, "RDX", "rdx.after");
+  storeRegister(builder, rdx, rdxAfter, "RDX");
+  builder.CreateRetVoid();
+
+  llvm::Function *caller =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_clobber_return_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  builder.CreateCall(voidType, callee);
+  llvm::LoadInst *rdxResult = loadRegister(builder, rdx, "RDX", "rdx.result");
+  llvm::AllocaInst *sink = builder.CreateAlloca(rdx->getValueType());
+  builder.CreateStore(rdxResult, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool helperLeft = false;
+  for (llvm::Function &function : module) {
+    if (function.getName().starts_with("notdec.register.summary_clobber")) {
+      helperLeft = !function.use_empty();
+    }
+  }
+
+  return expect(!helperLeft,
+                "internal return exposed external clobber helper") &&
+         verifyOk(module,
+                  "module failed verifier after clobber return cleanup test");
 }
 
 bool testUnknownExternalArityUsesMaxCallsitePrefix() {
@@ -5379,6 +5514,8 @@ int main() {
   ok &= testMismatchedDirectCallUseUsesReturnExtract();
   ok &= testKnownExternalUsesSingleIntegerReturn();
   ok &= testUnknownExternalTreatsRdxAsClobberNotReturn();
+  ok &= testUnknownExternalClobberArgBecomesUnknown();
+  ok &= testInternalReturnDoesNotExposeExternalClobber();
   ok &= testUnknownExternalArityUsesMaxCallsitePrefix();
   ok &= testUnknownExternalArityStopsAtClobberArg();
   ok &= testUnknownExternalArityStopsAtPhiClobberArg();
