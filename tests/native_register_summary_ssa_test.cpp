@@ -2702,6 +2702,58 @@ bool testInternalReturnDoesNotExposeExternalClobber() {
                   "module failed verifier after clobber return cleanup test");
 }
 
+bool testClobberReturnPhiDoesNotMaterializeHelper() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-clobber-return-phi", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "unknown_external", module);
+  llvm::Function *callee =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_clobber_return_phi", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::BasicBlock *clobberPath =
+      llvm::BasicBlock::Create(context, "clobber_path", callee);
+  llvm::BasicBlock *knownPath =
+      llvm::BasicBlock::Create(context, "known_path", callee);
+  llvm::BasicBlock *done = llvm::BasicBlock::Create(context, "done", callee);
+
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 7),
+                "RAX");
+  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), clobberPath,
+                       knownPath);
+
+  builder.SetInsertPoint(clobberPath);
+  builder.CreateCall(voidType, external);
+  builder.CreateBr(done);
+
+  builder.SetInsertPoint(knownPath);
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                "RDX");
+  builder.CreateBr(done);
+
+  builder.SetInsertPoint(done);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool helperLeft = false;
+  for (llvm::Function &function : module) {
+    if (function.getName().starts_with("notdec.register.summary_clobber")) {
+      helperLeft = !function.use_empty();
+    }
+  }
+
+  return expect(!helperLeft,
+                "clobber return phi materialized summary_clobber helper") &&
+         verifyOk(module,
+                  "module failed verifier after clobber return phi test");
+}
+
 bool testUnknownExternalArityUsesMaxCallsitePrefix() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-unknown-external-max-arity", context);
@@ -5516,6 +5568,7 @@ int main() {
   ok &= testUnknownExternalTreatsRdxAsClobberNotReturn();
   ok &= testUnknownExternalClobberArgBecomesUnknown();
   ok &= testInternalReturnDoesNotExposeExternalClobber();
+  ok &= testClobberReturnPhiDoesNotMaterializeHelper();
   ok &= testUnknownExternalArityUsesMaxCallsitePrefix();
   ok &= testUnknownExternalArityStopsAtClobberArg();
   ok &= testUnknownExternalArityStopsAtPhiClobberArg();

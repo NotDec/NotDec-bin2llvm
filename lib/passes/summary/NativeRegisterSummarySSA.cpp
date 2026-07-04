@@ -4461,8 +4461,11 @@ private:
       values.reserve(shapeIt->second.Returns.size());
       for (const NativeSignatureSlot &slot : shapeIt->second.Returns) {
         const RegisterUnit *unit = slot.Unit;
-        llvm::Value *value = resolve(
-            readSlotValueBefore(*ret, slot, unit->Name + ".return_range"));
+        llvm::Value *value = nullptr;
+        if (!returnSlotMayReadCallClobber(*ret, slot)) {
+          value = resolve(
+              readSlotValueBefore(*ret, slot, unit->Name + ".return_range"));
+        }
         if (value == nullptr || value->getType() != slotType(slot) ||
             mayDependOnSummaryClobberValue(value)) {
           value = frozenPoisonBefore(*ret, slotType(slot),
@@ -4472,6 +4475,80 @@ private:
       }
       SignatureState.FunctionReturns[&Function][ret] = std::move(values);
     }
+  }
+
+  bool returnSlotMayReadCallClobber(llvm::ReturnInst &ret,
+                                    const NativeSignatureSlot &slot) {
+    if (slot.Unit == nullptr || slot.SizeBits == 0) {
+      return false;
+    }
+    std::vector<RegisterRangeKey> ranges = plannedRangesCovering(
+        slot.Unit->Global, slot.OffsetBits, slot.SizeBits);
+    llvm::BasicBlock *block = ret.getParent();
+    if (block == nullptr) {
+      return false;
+    }
+    llvm::SmallPtrSet<llvm::BasicBlock *, 16> seen;
+    std::vector<llvm::BasicBlock *> worklist{block};
+    while (!worklist.empty()) {
+      llvm::BasicBlock *current = worklist.back();
+      worklist.pop_back();
+      if (current == nullptr || !seen.insert(current).second) {
+        continue;
+      }
+      llvm::Instruction *before = current == block
+                                      ? static_cast<llvm::Instruction *>(&ret)
+                                      : current->getTerminator();
+      if (before == nullptr) {
+        continue;
+      }
+      if (blockMayClobberReturnRangesBefore(*current, ranges, before)) {
+        return true;
+      }
+      for (llvm::BasicBlock *pred : llvm::predecessors(current)) {
+        worklist.push_back(pred);
+      }
+    }
+    return false;
+  }
+
+  bool
+  blockMayClobberReturnRangesBefore(llvm::BasicBlock &block,
+                                    llvm::ArrayRef<RegisterRangeKey> ranges,
+                                    llvm::Instruction *before) const {
+    for (auto it = before->getIterator(); it != block.begin();) {
+      --it;
+      llvm::Instruction &inst = *it;
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit != nullptr && access.IsStorageValue &&
+            rangeListUsesGlobal(ranges, access.Unit->Global)) {
+          return false;
+        }
+        continue;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr || !isAnalyzableCall(*call)) {
+        continue;
+      }
+      for (const RegisterRangeKey &range : ranges) {
+        const RegisterUnit *unit = unitForRange(range);
+        if (unit == nullptr) {
+          continue;
+        }
+        if (callEffect(*call, *unit) == CallRegisterEffect::Clobber) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  static bool rangeListUsesGlobal(llvm::ArrayRef<RegisterRangeKey> ranges,
+                                  llvm::GlobalVariable *global) {
+    return llvm::any_of(ranges, [&](const RegisterRangeKey &range) {
+      return range.Global == global;
+    });
   }
 
   llvm::MDNode *markerNode(llvm::StringRef value) const {
