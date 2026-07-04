@@ -102,6 +102,21 @@ enum class CallRegisterEffect {
 };
 
 using BlockRegKey = std::pair<llvm::BasicBlock *, llvm::GlobalVariable *>;
+// A SummarySSA variable is moving from a whole lifted register to a concrete
+// bit range.  The first migration step uses these keys only for partial helper
+// reads, so old whole-register caches can stay in place while range PHIs prove
+// out the Braun construction at narrower types.
+struct RegisterRangeKey {
+  llvm::GlobalVariable *Global = nullptr;
+  uint64_t BitOffset = 0;
+  uint32_t BitWidth = 0;
+
+  bool operator<(const RegisterRangeKey &other) const {
+    return std::tie(Global, BitOffset, BitWidth) <
+           std::tie(other.Global, other.BitOffset, other.BitWidth);
+  }
+};
+using BlockRangeKey = std::pair<llvm::BasicBlock *, RegisterRangeKey>;
 using CallValueKey =
     std::tuple<llvm::Instruction *, llvm::GlobalVariable *, std::string>;
 
@@ -1822,6 +1837,7 @@ public:
   void run() {
     Summary.FunctionName = Function.getName().str();
     collectAccesses();
+    planRegisterRanges();
     if (Options.EnableRewrite) {
       rewritePartialReads();
       if (Options.EnableResidueRemoval) {
@@ -1868,9 +1884,17 @@ private:
   std::map<BlockRegKey, llvm::Value *> ExitValue;
   std::map<BlockRegKey, llvm::PHINode *> PendingPhi;
   std::set<BlockRegKey> ResolvingEntry;
+  std::map<BlockRangeKey, llvm::Value *> EntryRangeValue;
+  std::map<BlockRangeKey, llvm::Value *> ExitRangeValue;
+  std::map<BlockRangeKey, llvm::PHINode *> PendingRangePhi;
+  std::set<BlockRangeKey> ResolvingRangeEntry;
   std::map<llvm::Value *, llvm::Value *> Replacement;
   std::set<llvm::PHINode *> DeadPhis;
   std::map<llvm::GlobalVariable *, llvm::LoadInst *> EntryInputs;
+  std::map<RegisterRangeKey, llvm::Value *> EntryRangeInputs;
+  std::map<llvm::GlobalVariable *, std::set<uint64_t>> RangeBoundaries;
+  std::map<llvm::GlobalVariable *, std::vector<RegisterRangeKey>>
+      PlannedRanges;
   std::map<CallValueKey, llvm::Value *> CallValues;
   bool PostSignatureCleanup = false;
 
@@ -2625,6 +2649,156 @@ private:
     }
   }
 
+  unsigned registerBitWidth(const RegisterUnit &unit) const {
+    auto *type = llvm::dyn_cast<llvm::IntegerType>(unit.Global->getValueType());
+    return type == nullptr ? 0 : type->getBitWidth();
+  }
+
+  void addRangeBoundary(llvm::GlobalVariable *global, uint64_t offset,
+                        uint64_t width) {
+    auto unitIt = Units.find(global);
+    if (unitIt == Units.end() || width == 0) {
+      return;
+    }
+    unsigned fullWidth = registerBitWidth(unitIt->second);
+    if (fullWidth == 0 || offset > fullWidth || offset + width > fullWidth) {
+      return;
+    }
+    std::set<uint64_t> &boundaries = RangeBoundaries[global];
+    boundaries.insert(0);
+    boundaries.insert(fullWidth);
+    boundaries.insert(offset);
+    boundaries.insert(offset + width);
+  }
+
+  void planRegisterRanges() {
+    for (const auto &[global, unit] : Units) {
+      unsigned fullWidth = registerBitWidth(unit);
+      if (fullWidth == 0) {
+        continue;
+      }
+      RangeBoundaries[global].insert(0);
+      RangeBoundaries[global].insert(fullWidth);
+    }
+
+    for (llvm::Instruction &inst : llvm::instructions(Function)) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        RegisterAccess access = registerLoad(*load, Units);
+        if (access.Unit != nullptr && access.IsStorageValue) {
+          addRangeBoundary(access.Unit->Global, 0, registerBitWidth(*access.Unit));
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit != nullptr && access.IsStorageValue) {
+          addRangeBoundary(access.Unit->Global, 0, registerBitWidth(*access.Unit));
+        }
+        continue;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      if (std::optional<NativeRegisterPartialReadInfo> partial =
+              parseNativeRegisterPartialRead(*call)) {
+        addRangeBoundary(partial->Global, partial->BitOffset,
+                         partial->ReadWidth);
+        continue;
+      }
+      if (std::optional<NativeRegisterPartialWriteInfo> partial =
+              parseNativeRegisterPartialWrite(*call)) {
+        addRangeBoundary(partial->Global, partial->BitOffset,
+                         partial->WriteWidth);
+      }
+    }
+
+    for (const auto &[global, boundaries] : RangeBoundaries) {
+      if (boundaries.size() < 2) {
+        continue;
+      }
+      std::vector<RegisterRangeKey> &ranges = PlannedRanges[global];
+      auto previous = boundaries.begin();
+      for (auto current = std::next(previous); current != boundaries.end();
+           previous = current, ++current) {
+        if (*current > *previous) {
+          ranges.push_back(
+              RegisterRangeKey{global, *previous,
+                               static_cast<uint32_t>(*current - *previous)});
+        }
+      }
+    }
+  }
+
+  std::vector<RegisterRangeKey>
+  plannedRangesCovering(llvm::GlobalVariable *global, uint64_t offset,
+                        uint32_t width) const {
+    std::vector<RegisterRangeKey> result;
+    if (width == 0) {
+      return result;
+    }
+    auto rangesIt = PlannedRanges.find(global);
+    if (rangesIt == PlannedRanges.end()) {
+      return result;
+    }
+
+    uint64_t cursor = offset;
+    uint64_t end = offset + width;
+    for (const RegisterRangeKey &range : rangesIt->second) {
+      if (range.BitOffset + range.BitWidth <= cursor) {
+        continue;
+      }
+      if (range.BitOffset > cursor || range.BitOffset >= end) {
+        break;
+      }
+      if (range.BitOffset + range.BitWidth > end) {
+        break;
+      }
+      result.push_back(range);
+      cursor = range.BitOffset + range.BitWidth;
+      if (cursor == end) {
+        return result;
+      }
+    }
+    result.clear();
+    return result;
+  }
+
+  llvm::Value *assembleRangeRead(const std::vector<RegisterRangeKey> &ranges,
+                                 uint64_t readOffset, uint32_t readWidth,
+                                 llvm::Instruction *before,
+                                 llvm::Twine name) {
+    if (ranges.empty() || before == nullptr || readWidth == 0) {
+      return nullptr;
+    }
+    if (ranges.size() == 1 && ranges.front().BitOffset == readOffset &&
+        ranges.front().BitWidth == readWidth) {
+      return readRangeBefore(*before->getParent(), ranges.front(), before);
+    }
+
+    auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
+    llvm::IRBuilder<> builder(before);
+    llvm::Value *result = llvm::ConstantInt::get(resultType, 0);
+    for (const RegisterRangeKey &range : ranges) {
+      llvm::Value *segment =
+          readRangeBefore(*before->getParent(), range, before);
+      segment = resolve(segment);
+      if (segment == nullptr || segment->getType() != rangeType(range)) {
+        return nullptr;
+      }
+      llvm::Value *wide = builder.CreateZExtOrTrunc(segment, resultType,
+                                                    name + ".part_wide");
+      uint64_t shift = range.BitOffset - readOffset;
+      if (shift != 0) {
+        wide = builder.CreateShl(
+            wide, llvm::ConstantInt::get(resultType, shift),
+            name + ".part_shift");
+      }
+      result = builder.CreateOr(result, wide, name + ".part_or");
+    }
+    return result;
+  }
+
   void rewritePartialReads() {
     for (llvm::CallBase *call : PartialReads) {
       if (call->getParent() == nullptr) {
@@ -2639,9 +2813,16 @@ private:
       if (unitIt == Units.end()) {
         continue;
       }
-      llvm::Value *value = readCoveredPartialWriteBefore(
-          *call->getParent(), unitIt->second, partial->ReadWidth,
-          partial->BitOffset, call);
+      llvm::Value *value = nullptr;
+      std::vector<RegisterRangeKey> ranges = plannedRangesCovering(
+          partial->Global, partial->BitOffset, partial->ReadWidth);
+      value = assembleRangeRead(ranges, partial->BitOffset, partial->ReadWidth,
+                                call, unitIt->second.Name + ".partial_range");
+      if (value == nullptr) {
+        value = readCoveredPartialWriteBefore(
+            *call->getParent(), unitIt->second, partial->ReadWidth,
+            partial->BitOffset, call);
+      }
       if (value == nullptr) {
         llvm::Value *fullValue =
             readValueBefore(*call->getParent(), unitIt->second, call);
@@ -2958,6 +3139,264 @@ private:
     }
   }
 
+  const RegisterUnit *unitForRange(const RegisterRangeKey &range) const {
+    auto unitIt = Units.find(range.Global);
+    return unitIt == Units.end() ? nullptr : &unitIt->second;
+  }
+
+  llvm::IntegerType *rangeType(const RegisterRangeKey &range) const {
+    return llvm::IntegerType::get(Function.getContext(), range.BitWidth);
+  }
+
+  llvm::Value *unknownRangeBefore(llvm::Instruction &insertBefore,
+                                  const RegisterRangeKey &range,
+                                  llvm::Twine suffix) {
+    const RegisterUnit *unit = unitForRange(range);
+    if (unit == nullptr || range.BitWidth == 0) {
+      return nullptr;
+    }
+    return frozenPoisonBefore(insertBefore, rangeType(range),
+                              unit->Name + suffix);
+  }
+
+  llvm::Value *rangeTypedValueOrUnknown(llvm::Value *value,
+                                        const RegisterRangeKey &range,
+                                        llvm::Instruction *insertBefore,
+                                        llvm::Twine suffix) {
+    value = resolve(value);
+    if (value == nullptr) {
+      return nullptr;
+    }
+    if (value->getType() == rangeType(range)) {
+      return value;
+    }
+    if (insertBefore != nullptr) {
+      return unknownRangeBefore(*insertBefore, range, suffix);
+    }
+    return llvm::UndefValue::get(rangeType(range));
+  }
+
+  llvm::Value *extractRangeValue(const RegisterRangeKey &range,
+                                 llvm::Value *source,
+                                 uint64_t sourceBitOffset,
+                                 llvm::Instruction *before,
+                                 llvm::Twine name) {
+    if (source == nullptr || before == nullptr || range.BitWidth == 0) {
+      return nullptr;
+    }
+    if (range.BitOffset < sourceBitOffset) {
+      return nullptr;
+    }
+    return extractBitsFromInteger(source, range.BitWidth,
+                                  range.BitOffset - sourceBitOffset, before,
+                                  name);
+  }
+
+  llvm::Value *readRangeBefore(llvm::BasicBlock &block,
+                               const RegisterRangeKey &range,
+                               llvm::Instruction *before) {
+    const RegisterUnit *unit = unitForRange(range);
+    if (unit == nullptr || before == nullptr || range.BitWidth == 0) {
+      return nullptr;
+    }
+
+    for (auto it = before->getIterator(); it != block.begin();) {
+      --it;
+      llvm::Instruction &inst = *it;
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit != nullptr && access.Unit->Global == range.Global &&
+            access.IsStorageValue) {
+          return extractRangeValue(range, resolve(store->getValueOperand()), 0,
+                                   before, unit->Name + ".range_read");
+        }
+        continue;
+      }
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (parseNativeRegisterPartialRead(*call)) {
+          continue;
+        }
+        if (std::optional<NativeRegisterPartialWriteInfo> partial =
+                parseNativeRegisterPartialWrite(*call)) {
+          if (partial->Global != range.Global) {
+            continue;
+          }
+          uint64_t writeEnd = partial->BitOffset + partial->WriteWidth;
+          uint64_t rangeEnd = range.BitOffset + range.BitWidth;
+          if (partial->BitOffset <= range.BitOffset && rangeEnd <= writeEnd) {
+            return extractRangeValue(range, partial->Value, partial->BitOffset,
+                                     call, unit->Name + ".range_read");
+          }
+          if (range.BitOffset < writeEnd && partial->BitOffset < rangeEnd) {
+            return nullptr;
+          }
+          continue;
+        }
+        if (!isAnalyzableCall(*call)) {
+          continue;
+        }
+        CallRegisterEffect effect = callEffect(*call, *unit);
+        if (effect == CallRegisterEffect::Preserve) {
+          ++Summary.PreservedCalls;
+          continue;
+        }
+        if (effect == CallRegisterEffect::ReturnValue ||
+            effect == CallRegisterEffect::Clobber) {
+          llvm::StringRef kind =
+              effect == CallRegisterEffect::ReturnValue ? "return" : "clobber";
+          llvm::Value *full = callValue(*call, *unit, kind);
+          auto *fullInst = llvm::dyn_cast<llvm::Instruction>(full);
+          llvm::Instruction *insertBefore =
+              fullInst != nullptr ? fullInst->getNextNode() : nullptr;
+          if (insertBefore == nullptr) {
+            insertBefore = call->getNextNode();
+          }
+          if (insertBefore == nullptr) {
+            insertBefore = call->getParent()->getTerminator();
+          }
+          return extractRangeValue(range, full, 0, insertBefore,
+                                   unit->Name + ".range_" + kind);
+        }
+        ++Summary.UnknownCallEffects;
+        return nullptr;
+      }
+    }
+    return readRangeEntry(block, range);
+  }
+
+  llvm::Value *readRangeEntry(llvm::BasicBlock &block,
+                              const RegisterRangeKey &range) {
+    BlockRangeKey key{&block, range};
+    if (auto cached = EntryRangeValue.find(key);
+        cached != EntryRangeValue.end()) {
+      return resolve(cached->second);
+    }
+    if (ResolvingRangeEntry.count(key) != 0) {
+      return ensureRangePhi(block, range);
+    }
+
+    ResolvingRangeEntry.insert(key);
+    std::vector<llvm::BasicBlock *> preds(llvm::pred_begin(&block),
+                                          llvm::pred_end(&block));
+    llvm::Value *value = nullptr;
+    if (preds.empty()) {
+      value = entryRangeInput(range);
+    } else if (preds.size() == 1) {
+      value = readRangeExit(*preds.front(), range);
+      if (PendingRangePhi.count(key) != 0) {
+        value = completeRangePhi(block, range);
+      }
+    } else {
+      value = completeRangePhi(block, range);
+    }
+    ResolvingRangeEntry.erase(key);
+    EntryRangeValue[key] = resolve(value);
+    return EntryRangeValue[key];
+  }
+
+  llvm::Value *readRangeExit(llvm::BasicBlock &block,
+                             const RegisterRangeKey &range) {
+    BlockRangeKey key{&block, range};
+    if (auto cached = ExitRangeValue.find(key);
+        cached != ExitRangeValue.end()) {
+      return resolve(cached->second);
+    }
+    llvm::Instruction *terminator = block.getTerminator();
+    llvm::Value *value = terminator == nullptr
+                             ? readRangeEntry(block, range)
+                             : readRangeBefore(block, range, terminator);
+    ExitRangeValue[key] = resolve(value);
+    return ExitRangeValue[key];
+  }
+
+  llvm::PHINode *ensureRangePhi(llvm::BasicBlock &block,
+                                const RegisterRangeKey &range) {
+    const RegisterUnit *unit = unitForRange(range);
+    if (unit == nullptr) {
+      return nullptr;
+    }
+    BlockRangeKey key{&block, range};
+    if (auto existing = PendingRangePhi.find(key);
+        existing != PendingRangePhi.end()) {
+      return existing->second;
+    }
+    llvm::IRBuilder<> builder(&block, block.getFirstNonPHIIt());
+    llvm::PHINode *phi = builder.CreatePHI(
+        rangeType(range), 0, unit->Name + ".range_summary_ssa");
+    phi->setMetadata("notdec.register.summary_ssa.phi", registerNode(*unit));
+    PendingRangePhi.emplace(key, phi);
+    EntryRangeValue[key] = phi;
+    ++Summary.PhisCreated;
+    return phi;
+  }
+
+  llvm::Value *completeRangePhi(llvm::BasicBlock &block,
+                                const RegisterRangeKey &range) {
+    llvm::PHINode *phi = ensureRangePhi(block, range);
+    if (phi == nullptr) {
+      return nullptr;
+    }
+    std::map<llvm::BasicBlock *, unsigned> existingIncoming;
+    for (unsigned index = 0; index < phi->getNumIncomingValues(); ++index) {
+      ++existingIncoming[phi->getIncomingBlock(index)];
+    }
+    std::map<llvm::BasicBlock *, unsigned> requiredIncoming;
+    for (llvm::BasicBlock *pred : llvm::predecessors(&block)) {
+      unsigned requiredCount = ++requiredIncoming[pred];
+      if (existingIncoming[pred] >= requiredCount) {
+        continue;
+      }
+      llvm::Value *incoming = rangeTypedValueOrUnknown(
+          readRangeExit(*pred, range), range, pred->getTerminator(),
+          ".range_type_mismatch");
+      if (incoming == nullptr) {
+        llvm::Instruction *terminator = pred->getTerminator();
+        incoming =
+            terminator != nullptr
+                ? unknownRangeBefore(*terminator, range, ".range_unknown")
+                : llvm::UndefValue::get(rangeType(range));
+      }
+      phi->addIncoming(incoming, pred);
+    }
+    return simplifyRangePhi(*phi, range);
+  }
+
+  llvm::Value *simplifyRangePhi(llvm::PHINode &phi,
+                                const RegisterRangeKey &range) {
+    if (!isCompletePhi(phi)) {
+      return &phi;
+    }
+    llvm::Value *same = nullptr;
+    for (llvm::Value *incoming : phi.incoming_values()) {
+      incoming = resolve(incoming);
+      if (incoming == &phi) {
+        continue;
+      }
+      if (same == nullptr) {
+        same = incoming;
+        continue;
+      }
+      if (same != incoming) {
+        return &phi;
+      }
+    }
+    if (same == nullptr) {
+      auto insertIt = phi.getParent()->getFirstInsertionPt();
+      if (insertIt == phi.getParent()->end()) {
+        return &phi;
+      }
+      same = unknownRangeBefore(*insertIt, range, ".range_phi_unknown");
+      if (same == nullptr) {
+        return &phi;
+      }
+    }
+    Replacement[&phi] = same;
+    phi.replaceAllUsesWith(same);
+    DeadPhis.insert(&phi);
+    ++Summary.PhisSimplified;
+    return same;
+  }
+
   llvm::Value *readValueBefore(llvm::BasicBlock &block,
                                const RegisterUnit &unit,
                                llvm::Instruction *before) {
@@ -3182,6 +3621,18 @@ private:
         (void)completePhi(*block, *unit);
         changed |= phi->getNumIncomingValues() != before;
       }
+      std::vector<std::pair<llvm::BasicBlock *, RegisterRangeKey>> rangeWork;
+      for (const auto &[key, phi] : PendingRangePhi) {
+        if (DeadPhis.count(phi) == 0 && !isCompletePhi(*phi)) {
+          rangeWork.push_back({key.first, key.second});
+        }
+      }
+      for (const auto &[block, range] : rangeWork) {
+        llvm::PHINode *phi = PendingRangePhi[{block, range}];
+        unsigned before = phi->getNumIncomingValues();
+        (void)completeRangePhi(*block, range);
+        changed |= phi->getNumIncomingValues() != before;
+      }
     }
   }
 
@@ -3217,6 +3668,32 @@ private:
     EntryInputs.emplace(unit.Global, load);
     ++Summary.EntryInputs;
     return load;
+  }
+
+  llvm::Value *entryRangeInput(const RegisterRangeKey &range) {
+    if (auto cached = EntryRangeInputs.find(range);
+        cached != EntryRangeInputs.end()) {
+      return resolve(cached->second);
+    }
+    const RegisterUnit *unit = unitForRange(range);
+    if (unit == nullptr) {
+      return nullptr;
+    }
+    llvm::LoadInst *fullInput = entryInput(*unit);
+    llvm::Instruction *insertBefore = fullInput->getNextNode();
+    if (insertBefore == nullptr) {
+      insertBefore = fullInput->getParent()->getTerminator();
+    }
+    if (insertBefore == nullptr) {
+      return nullptr;
+    }
+    llvm::Value *value =
+        extractRangeValue(range, fullInput, 0, insertBefore,
+                          unit->Name + ".range_entry");
+    if (value != nullptr) {
+      EntryRangeInputs.emplace(range, value);
+    }
+    return value;
   }
 
   CallRegisterEffect callEffect(const llvm::CallBase &call,
@@ -3567,6 +4044,11 @@ private:
   void attachMetadata() {
     uint64_t phisRemaining = 0;
     for (const auto &[key, phi] : PendingPhi) {
+      if (DeadPhis.count(phi) == 0 && phi->getParent() != nullptr) {
+        ++phisRemaining;
+      }
+    }
+    for (const auto &[key, phi] : PendingRangePhi) {
       if (DeadPhis.count(phi) == 0 && phi->getParent() != nullptr) {
         ++phisRemaining;
       }

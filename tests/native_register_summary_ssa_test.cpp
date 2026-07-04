@@ -3990,6 +3990,86 @@ bool testConsecutivePartialReadHelpersAreConsumedBySummarySSA() {
                   "module failed verifier after consecutive partial read test");
 }
 
+bool testBranchPartialReadUsesNarrowRangePhi() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-read-range-phi", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *condition = new llvm::GlobalVariable(
+      module, llvm::Type::getInt1Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "condition");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "branch_partial_read_range_phi", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *merge = llvm::BasicBlock::Create(context, "merge", function);
+
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *cond = builder.CreateLoad(llvm::Type::getInt1Ty(context),
+                                         condition, "cond");
+  builder.CreateCondBr(cond, left, right);
+
+  builder.SetInsertPoint(left);
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 7),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(right);
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 11),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(merge);
+  llvm::Value *after = builder.CreateCall(
+      partialRead,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "after_partial");
+  builder.CreateStore(after, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  unsigned i64Phis = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
+    if (phi == nullptr) {
+      continue;
+    }
+    if (phi->getType()->isIntegerTy(64)) {
+      ++i64Phis;
+    }
+  }
+
+  return expect(summary.LoadsReplaced >= 1,
+                "branch partial read was not replaced") &&
+         expect(!hasPartialReadCall(*function),
+                "branch partial read helper call remained") &&
+         expect(summary.PhisCreated >= 1,
+                "branch partial read did not create a range phi") &&
+         expect(i64Phis == 0,
+                "branch partial read created a whole-register i64 phi") &&
+         verifyOk(module,
+                  "module failed verifier after branch range phi test");
+}
+
 bool testPartialWriteHelperNameSurvivesSignatureRewrite() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-write-name", context);
@@ -4660,6 +4740,7 @@ int main() {
   ok &= testPartialWriteHelperIsConsumedBySummarySSA();
   ok &= testPartialReadHelperIsConsumedBySummarySSA();
   ok &= testConsecutivePartialReadHelpersAreConsumedBySummarySSA();
+  ok &= testBranchPartialReadUsesNarrowRangePhi();
   ok &= testPartialWriteHelperNameSurvivesSignatureRewrite();
   ok &= testPartialReadHelperNameSurvivesSignatureRewrite();
   ok &= testRecordedReturnValueSurvivesPartialDemandRewrite();
