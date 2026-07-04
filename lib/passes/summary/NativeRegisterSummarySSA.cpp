@@ -124,6 +124,7 @@ struct RegisterRangeKey {
 };
 using BlockRangeKey = std::pair<llvm::BasicBlock *, RegisterRangeKey>;
 using LiveRegisterRanges = std::set<RegisterRangeKey>;
+enum class RangeEventKind { Read, Write, Clobber };
 using CallValueKey =
     std::tuple<llvm::Instruction *, llvm::GlobalVariable *, std::string>;
 
@@ -2738,7 +2739,114 @@ private:
     boundaries.insert(offset + width);
   }
 
+  const RegisterUnit *unitForName(llvm::StringRef name) const {
+    for (const auto &[global, unit] : Units) {
+      (void)global;
+      if (unit.Name == name) {
+        return &unit;
+      }
+    }
+    return nullptr;
+  }
+
+  void addRangeBoundaryForSlot(const AbiFacts::RegisterSlot &slot) {
+    const RegisterUnit *unit = unitForName(slot.UnitName);
+    if (unit == nullptr) {
+      return;
+    }
+    addRangeBoundary(unit->Global, slot.OffsetBits, slot.SizeBits);
+  }
+
+  void addRangeBoundariesForMask(llvm::GlobalVariable *global,
+                                 const llvm::APInt &mask) {
+    if (mask.getBitWidth() == 0 || mask.isZero()) {
+      return;
+    }
+    auto unitIt = Units.find(global);
+    if (unitIt == Units.end()) {
+      return;
+    }
+    unsigned fullWidth = registerBitWidth(unitIt->second);
+    if (fullWidth == 0) {
+      return;
+    }
+    llvm::APInt trimmed = mask.zextOrTrunc(fullWidth);
+    unsigned bit = 0;
+    while (bit < fullWidth) {
+      while (bit < fullWidth && !trimmed[bit]) {
+        ++bit;
+      }
+      unsigned start = bit;
+      while (bit < fullWidth && trimmed[bit]) {
+        ++bit;
+      }
+      if (start < bit) {
+        addRangeBoundary(global, start, bit - start);
+      }
+    }
+  }
+
+  void recordRangeEvent(llvm::GlobalVariable *global, uint64_t offset,
+                        uint32_t width, RangeEventKind kind) {
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(global, offset, width);
+    uint64_t count = ranges.empty() ? 1 : ranges.size();
+    switch (kind) {
+    case RangeEventKind::Read:
+      Summary.RangeReadEvents += count;
+      break;
+    case RangeEventKind::Write:
+      Summary.RangeWriteEvents += count;
+      break;
+    case RangeEventKind::Clobber:
+      Summary.RangeClobberEvents += count;
+      break;
+    }
+  }
+
+  void addAbiRangeBoundaries() {
+    for (const AbiFacts::RegisterSlot &slot : Abi.IntegerInputsInOrder) {
+      addRangeBoundaryForSlot(slot);
+    }
+    for (const AbiFacts::RegisterSlot &slot : Abi.FloatInputsInOrder) {
+      addRangeBoundaryForSlot(slot);
+    }
+    for (const AbiFacts::RegisterSlot &slot : Abi.IntegerOutputsInOrder) {
+      addRangeBoundaryForSlot(slot);
+    }
+    for (const AbiFacts::RegisterSlot &slot : Abi.FloatOutputsInOrder) {
+      addRangeBoundaryForSlot(slot);
+    }
+    for (const std::string &name : Abi.KilledByCall) {
+      if (const RegisterUnit *unit = unitForName(name)) {
+        addRangeBoundary(unit->Global, 0, registerBitWidth(*unit));
+      }
+    }
+    for (const std::string &name : Abi.Unaffected) {
+      if (const RegisterUnit *unit = unitForName(name)) {
+        addRangeBoundary(unit->Global, 0, registerBitWidth(*unit));
+      }
+    }
+  }
+
+  void addSummaryDemandRangeBoundaries() {
+    auto factsIt = SummaryFacts.find(&Function);
+    if (factsIt == SummaryFacts.end()) {
+      return;
+    }
+    for (const auto &[global, unit] : Units) {
+      auto regIt = factsIt->second.Registers.find(unit.Name);
+      if (regIt == factsIt->second.Registers.end()) {
+        continue;
+      }
+      addRangeBoundariesForMask(global, regIt->second.EntryDemandMask);
+      addRangeBoundariesForMask(global, regIt->second.ExitDemandMask);
+    }
+  }
+
   void planRegisterRanges() {
+    RangeBoundaries.clear();
+    PlannedRanges.clear();
     for (const auto &[global, unit] : Units) {
       unsigned fullWidth = registerBitWidth(unit);
       if (fullWidth == 0) {
@@ -2782,6 +2890,9 @@ private:
       }
     }
 
+    addAbiRangeBoundaries();
+    addSummaryDemandRangeBoundaries();
+
     for (const auto &[global, boundaries] : RangeBoundaries) {
       if (boundaries.size() < 2) {
         continue;
@@ -2793,6 +2904,66 @@ private:
         if (*current > *previous) {
           ranges.push_back(RegisterRangeKey{
               global, *previous, static_cast<uint32_t>(*current - *previous)});
+        }
+      }
+    }
+
+    for (const auto &[global, ranges] : PlannedRanges) {
+      if (!ranges.empty()) {
+        ++Summary.RangeRegistersPlanned;
+        Summary.RangeSegmentsPlanned += ranges.size();
+      }
+    }
+
+    for (llvm::Instruction &inst : llvm::instructions(Function)) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        RegisterAccess access = registerLoad(*load, Units);
+        if (access.Unit != nullptr && access.IsStorageValue) {
+          recordRangeEvent(access.Unit->Global, 0, registerBitWidth(*access.Unit),
+                           RangeEventKind::Read);
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit != nullptr && access.IsStorageValue) {
+          recordRangeEvent(access.Unit->Global, 0,
+                           registerBitWidth(*access.Unit),
+                           RangeEventKind::Write);
+        }
+        continue;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      if (std::optional<NativeRegisterPartialReadInfo> partial =
+              parseNativeRegisterPartialRead(*call)) {
+        recordRangeEvent(partial->Global, partial->BitOffset,
+                         partial->ReadWidth, RangeEventKind::Read);
+        continue;
+      }
+      if (std::optional<NativeRegisterPartialWriteInfo> partial =
+              parseNativeRegisterPartialWrite(*call)) {
+        recordRangeEvent(partial->Global, partial->BitOffset,
+                         partial->WriteWidth, RangeEventKind::Write);
+        continue;
+      }
+      if (!isAnalyzableCall(*call)) {
+        continue;
+      }
+      for (const auto &[global, unit] : Units) {
+        if (callReadsRegister(*call, unit)) {
+          recordRangeEvent(global, 0, registerBitWidth(unit),
+                           RangeEventKind::Read);
+        }
+        CallRegisterEffect effect = callEffect(*call, unit);
+        if (effect == CallRegisterEffect::ReturnValue) {
+          recordRangeEvent(global, 0, registerBitWidth(unit),
+                           RangeEventKind::Write);
+        } else if (effect == CallRegisterEffect::Clobber) {
+          recordRangeEvent(global, 0, registerBitWidth(unit),
+                           RangeEventKind::Clobber);
         }
       }
     }
@@ -4580,6 +4751,21 @@ private:
                                 std::to_string(Summary.LoadsReplaced)),
         llvm::MDString::get(Function.getContext(),
                             "phis_remaining=" + std::to_string(phisRemaining)),
+        llvm::MDString::get(Function.getContext(),
+                            "range_registers_planned=" +
+                                std::to_string(Summary.RangeRegistersPlanned)),
+        llvm::MDString::get(Function.getContext(),
+                            "range_segments_planned=" +
+                                std::to_string(Summary.RangeSegmentsPlanned)),
+        llvm::MDString::get(Function.getContext(),
+                            "range_read_events=" +
+                                std::to_string(Summary.RangeReadEvents)),
+        llvm::MDString::get(Function.getContext(),
+                            "range_write_events=" +
+                                std::to_string(Summary.RangeWriteEvents)),
+        llvm::MDString::get(Function.getContext(),
+                            "range_clobber_events=" +
+                                std::to_string(Summary.RangeClobberEvents)),
     };
     Function.setMetadata("notdec.register.summary_ssa",
                          llvm::MDNode::get(Function.getContext(), fields));
@@ -4613,6 +4799,11 @@ void addFunctionSummary(NativeRegisterSummarySSASummary &total,
   total.PartialDemandCandidates += fn.PartialDemandCandidates;
   total.PartialDemandMatched += fn.PartialDemandMatched;
   total.PartialDemandRejected += fn.PartialDemandRejected;
+  total.RangeRegistersPlanned += fn.RangeRegistersPlanned;
+  total.RangeSegmentsPlanned += fn.RangeSegmentsPlanned;
+  total.RangeReadEvents += fn.RangeReadEvents;
+  total.RangeWriteEvents += fn.RangeWriteEvents;
+  total.RangeClobberEvents += fn.RangeClobberEvents;
 }
 
 llvm::AttributeList attributesForNewFunction(llvm::Function &oldFunction,
@@ -5368,6 +5559,11 @@ void printNativeRegisterSummarySSASummary(
      << " partial_demand_candidates=" << summary.PartialDemandCandidates
      << " partial_demand_matched=" << summary.PartialDemandMatched
      << " partial_demand_rejected=" << summary.PartialDemandRejected
+     << " range_registers_planned=" << summary.RangeRegistersPlanned
+     << " range_segments_planned=" << summary.RangeSegmentsPlanned
+     << " range_read_events=" << summary.RangeReadEvents
+     << " range_write_events=" << summary.RangeWriteEvents
+     << " range_clobber_events=" << summary.RangeClobberEvents
      << " warnings=" << summary.Warnings.size() << "\n";
   for (const NativeRegisterSummarySSAWarning &warning : summary.Warnings) {
     os << "  warning"
@@ -5395,7 +5591,12 @@ void printNativeRegisterSummarySSASummary(
        << " unknown_call_effects=" << function.UnknownCallEffects
        << " partial_demand_candidates=" << function.PartialDemandCandidates
        << " partial_demand_matched=" << function.PartialDemandMatched
-       << " partial_demand_rejected=" << function.PartialDemandRejected << "\n";
+       << " partial_demand_rejected=" << function.PartialDemandRejected
+       << " range_registers_planned=" << function.RangeRegistersPlanned
+       << " range_segments_planned=" << function.RangeSegmentsPlanned
+       << " range_read_events=" << function.RangeReadEvents
+       << " range_write_events=" << function.RangeWriteEvents
+       << " range_clobber_events=" << function.RangeClobberEvents << "\n";
   }
 }
 

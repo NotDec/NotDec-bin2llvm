@@ -302,6 +302,30 @@ bool functionHasAnyRegisterSummaryMetadata(const llvm::Function &function) {
          function.getMetadata("notdec.register.summary_ssa") != nullptr;
 }
 
+uint64_t summarySsaMetadataUInt(const llvm::Function &function,
+                                llvm::StringRef key) {
+  llvm::MDNode *metadata = function.getMetadata("notdec.register.summary_ssa");
+  if (metadata == nullptr) {
+    return 0;
+  }
+  std::string prefix = (key + "=").str();
+  for (const llvm::MDOperand &operand : metadata->operands()) {
+    auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+    if (text == nullptr) {
+      continue;
+    }
+    llvm::StringRef value = text->getString();
+    if (!value.consume_front(prefix)) {
+      continue;
+    }
+    uint64_t parsed = 0;
+    if (!value.getAsInteger(10, parsed)) {
+      return parsed;
+    }
+  }
+  return 0;
+}
+
 bool moduleHasFunctionNamed(const llvm::Module &module, llvm::StringRef name) {
   return module.getFunction(name) != nullptr;
 }
@@ -5063,6 +5087,82 @@ bool testDeadPartialWriteUsesRangeLiveness() {
                   "module failed verifier after partial write liveness test");
 }
 
+bool testPlannerSplitsZmmForFloatAbiSlot() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-zmm-abi-range-planner", context);
+  attachTestFloatAbi(module, 1);
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "planner_zmm_abi_slot", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnableRewrite = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  return expect(summary.RangeSegmentsPlanned >= 2,
+                "float ABI slot did not split backing ZMM range") &&
+         expect(summarySsaMetadataUInt(*function, "range_segments_planned") >=
+                    2,
+                "float ABI slot split was not exposed in metadata") &&
+         verifyOk(module, "module failed verifier after zmm planner test");
+}
+
+bool testPlannerSplitsRegisterForDemandMask() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-demand-mask-range-planner", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "planner_demand_mask_callee", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(calleeEntry);
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 7),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateRetVoid();
+
+  llvm::Function *caller =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "planner_demand_mask_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *after = loadRegister(builder, rax, "RAX", "after");
+  llvm::Value *low =
+      builder.CreateTrunc(after, llvm::Type::getInt32Ty(context), "low");
+  builder.CreateStore(low, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnableRewrite = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  return expect(summary.RangeSegmentsPlanned >= 2,
+                "demand mask did not split RAX range") &&
+         expect(summarySsaMetadataUInt(*callee, "range_segments_planned") >= 2,
+                "demand mask split was not exposed in callee metadata") &&
+         verifyOk(module, "module failed verifier after demand planner test");
+}
+
 bool testPartialWriteHelperNameSurvivesSignatureRewrite() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-write-name", context);
@@ -5744,6 +5844,8 @@ int main() {
   ok &= testBranchPartialReadUsesNarrowRangePhi();
   ok &= testBranchFullLoadAfterPartialWriteUsesNarrowRangePhi();
   ok &= testDeadPartialWriteUsesRangeLiveness();
+  ok &= testPlannerSplitsZmmForFloatAbiSlot();
+  ok &= testPlannerSplitsRegisterForDemandMask();
   ok &= testPartialWriteHelperNameSurvivesSignatureRewrite();
   ok &= testPartialReadHelperNameSurvivesSignatureRewrite();
   ok &= testRecordedReturnValueSurvivesPartialDemandRewrite();

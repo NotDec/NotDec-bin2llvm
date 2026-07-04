@@ -51,6 +51,11 @@ struct NativeRegisterSummarySSAFunctionSummary {
   uint64_t PartialDemandCandidates = 0;
   uint64_t PartialDemandMatched = 0;
   uint64_t PartialDemandRejected = 0;
+  uint64_t RangeRegistersPlanned = 0;
+  uint64_t RangeSegmentsPlanned = 0;
+  uint64_t RangeReadEvents = 0;
+  uint64_t RangeWriteEvents = 0;
+  uint64_t RangeClobberEvents = 0;
 };
 
 // Leftover call-value helpers are kept in the IR when SummarySSA cannot prove a
@@ -94,6 +99,11 @@ struct NativeRegisterSummarySSASummary {
   uint64_t PartialDemandCandidates = 0;
   uint64_t PartialDemandMatched = 0;
   uint64_t PartialDemandRejected = 0;
+  uint64_t RangeRegistersPlanned = 0;
+  uint64_t RangeSegmentsPlanned = 0;
+  uint64_t RangeReadEvents = 0;
+  uint64_t RangeWriteEvents = 0;
+  uint64_t RangeClobberEvents = 0;
   std::vector<NativeRegisterSummarySSAFunctionSummary> Functions;
   std::vector<NativeRegisterSummarySSAWarning> Warnings;
 };
