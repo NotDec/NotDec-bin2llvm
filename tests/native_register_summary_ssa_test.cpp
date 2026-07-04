@@ -326,10 +326,21 @@ bool functionHasZeroDemandOperandMetadata(const llvm::Function &function) {
   return false;
 }
 
+bool functionHasInstructionNameContaining(const llvm::Function &function,
+                                          llvm::StringRef needle) {
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    if (inst.hasName() && inst.getName().contains(needle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
                                                uint64_t fsOffset,
                                                bool useZextCondition,
-                                               bool extraFailSideEffect) {
+                                               bool extraFailSideEffect,
+                                               bool maskSavedCanary = false) {
   llvm::LLVMContext &context = module.getContext();
   llvm::GlobalVariable *fsOffsetRegister =
       createRegisterGlobal(module, "FS_OFFSET");
@@ -370,8 +381,15 @@ llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
       fsCanaryAddress, llvm::PointerType::get(context, 0), "fs_canary_ptr");
   llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
                                                 fsCanaryPointer, "fs_canary");
+  llvm::Value *savedCompareValue = savedCanary;
+  if (maskSavedCanary) {
+    savedCompareValue = builder.CreateAnd(
+        savedCanary,
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0xffffffffULL),
+        "saved_canary_low32");
+  }
   llvm::ICmpInst *same = llvm::cast<llvm::ICmpInst>(
-      builder.CreateICmpEQ(savedCanary, fsCanary, "canary_same"));
+      builder.CreateICmpEQ(savedCompareValue, fsCanary, "canary_same"));
   llvm::Value *condition = same;
   if (useZextCondition) {
     llvm::Value *wide =
@@ -3002,6 +3020,73 @@ bool testInternalSignatureRewriteUsesReadEntryReturnRegisterArg() {
                   "module failed verifier after RAX entry argument test");
 }
 
+bool testPostSignatureCleanupRewritesInternalEntryRawLoad() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-post-signature-entry-load", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_entry_raw_load", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right =
+      llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *merge =
+      llvm::BasicBlock::Create(context, "merge", function);
+
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *input = loadRegister(builder, rdi, "RDI", "input");
+  llvm::Value *loadedPtr = builder.CreateAdd(
+      input, llvm::ConstantInt::get(rdi->getValueType(), 16), "loaded_ptr");
+  llvm::Value *loadedPtrAsPointer = builder.CreateIntToPtr(
+      loadedPtr, llvm::PointerType::get(context, 0), "loaded_ptr_as_pointer");
+  llvm::LoadInst *loaded =
+      builder.CreateLoad(rdi->getValueType(), loadedPtrAsPointer, "loaded");
+  llvm::Value *same = builder.CreateICmpEQ(
+      loaded, llvm::ConstantInt::get(rdi->getValueType(), 0));
+  builder.CreateCondBr(same, left, right);
+
+  builder.SetInsertPoint(left);
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(right);
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(merge);
+  llvm::PHINode *phi = builder.CreatePHI(rdi->getValueType(), 2, "merged");
+  phi->addIncoming(input, left);
+  phi->addIncoming(loaded, right);
+  llvm::AllocaInst *sink = builder.CreateAlloca(rdi->getValueType());
+  builder.CreateStore(phi, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten =
+      module.getFunction("notdec_native_entry_raw_load");
+  unsigned rdiLoads = 0;
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+      if (load != nullptr &&
+          load->getPointerOperand()->stripPointerCasts() == rdi) {
+        ++rdiLoads;
+      }
+    }
+  }
+
+  return expect(rewritten != nullptr, "post-signature callee missing") &&
+         expect(rewritten->arg_size() == 1,
+                "post-signature callee did not get RDI arg") &&
+         expect(rdiLoads == 0, "post-signature cleanup left raw RDI load") &&
+         verifyOk(
+             module,
+             "module failed verifier after post-signature entry load test");
+}
+
 bool testInternalSignatureRewriteUsesZmmArgAndReturn() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-internal-zmm-signature", context);
@@ -3119,8 +3204,8 @@ bool testPreservedZmmEntryIsPassedAsInternalArgument() {
     for (llvm::Instruction &inst : llvm::instructions(*rewrittenPassthrough)) {
       if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
         callUsesPassthroughArg =
-            call->getCalledFunction() == rewrittenLeaf && call->arg_size() == 1 &&
-            rewrittenPassthrough->arg_size() == 1 &&
+            call->getCalledFunction() == rewrittenLeaf &&
+            call->arg_size() == 1 && rewrittenPassthrough->arg_size() == 1 &&
             call->getArgOperand(0) == rewrittenPassthrough->getArg(0);
       }
       if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
@@ -3142,8 +3227,9 @@ bool testPreservedZmmEntryIsPassedAsInternalArgument() {
          expect(callUsesPassthroughArg,
                 "ZMM passthrough call did not use its argument") &&
          expect(zmmLoads == 0, "ZMM passthrough entry load remained") &&
-         verifyOk(module,
-                  "module failed verifier after preserved ZMM entry argument test");
+         verifyOk(
+             module,
+             "module failed verifier after preserved ZMM entry argument test");
 }
 
 bool testInternalSignatureRewriteUsesZmmLowLaneReturn() {
@@ -3164,12 +3250,12 @@ bool testInternalSignatureRewriteUsesZmmLowLaneReturn() {
   llvm::Function *partialWrite =
       notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
           module, zmm0->getType(), llvm::Type::getInt64Ty(context), 512, 64);
-  builder.CreateCall(partialWrite,
-                     {zmm0,
-                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0x3ff0000000000000ULL),
-                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0)});
+  builder.CreateCall(
+      partialWrite,
+      {zmm0,
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                              0x3ff0000000000000ULL),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   builder.CreateRetVoid();
 
   llvm::Function *caller =
@@ -3661,6 +3747,24 @@ bool testStackCanaryZextConditionIsRemoved() {
                   "module failed verifier after zext stack canary removal");
 }
 
+bool testStackCanaryMaskedSavedLoadIsRemoved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-stack-canary-masked-saved-remove", context);
+  attachTestAbi(module);
+  llvm::Function *function =
+      createStackCanaryCheckFunction(module, 40, false, false, true);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.StackCanaryChecksRemoved == 1,
+                "masked saved stack canary check was not counted as removed") &&
+         expect(!hasCallTo(*function, "__stack_chk_fail"),
+                "masked saved stack canary fail call was kept") &&
+         expect(!hasRegisterLoad(*function, "FS_OFFSET"),
+                "masked saved stack canary FS_OFFSET load was kept") &&
+         verifyOk(module,
+                  "module failed verifier after masked stack canary removal");
+}
+
 bool testStackCanaryFailSideEffectIsKept() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-stack-canary-side-effect", context);
@@ -4121,26 +4225,24 @@ bool testPartialWriteHelperIsConsumedBySummarySSA() {
   llvm::Module module("summary-ssa-partial-write-helper", context);
   attachTestAbi(module);
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
-  auto *sink = new llvm::GlobalVariable(
-      module, rax->getValueType(), false, llvm::GlobalValue::ExternalLinkage,
-      nullptr, "sink");
+  auto *sink = new llvm::GlobalVariable(module, rax->getValueType(), false,
+                                        llvm::GlobalValue::ExternalLinkage,
+                                        nullptr, "sink");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "partial_write_readback",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "partial_write_readback", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   llvm::Function *partialWrite =
       notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
           module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
-  builder.CreateCall(partialWrite,
-                     {rax,
-                      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),
-                                             7),
-                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0)});
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 7),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   llvm::Value *after = loadRegister(builder, rax, "RAX", "after_partial");
   builder.CreateStore(after, sink);
   builder.CreateRetVoid();
@@ -4178,12 +4280,10 @@ bool testPartialReadHelperIsConsumedBySummarySSA() {
   llvm::Function *partialRead =
       notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
           module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
-  builder.CreateCall(partialWrite,
-                     {rax,
-                      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),
-                                             7),
-                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0)});
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 7),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   llvm::Value *after = builder.CreateCall(
       partialRead,
       {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
@@ -4213,9 +4313,8 @@ bool testDeadPartialReadHelperIsRemovedBySummarySSA() {
       llvm::Function::Create(externalType, llvm::GlobalValue::ExternalLinkage,
                              "unknown_external", module);
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function =
-      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
-                             "dead_partial_read", module);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "dead_partial_read", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -4379,8 +4478,9 @@ bool testConsecutivePartialReadXorIsZeroedAfterSummarySSA() {
                 "consecutive partial read xor helper call remained") &&
          expect(!hasNonZeroSinkStore,
                 "consecutive partial read xor was not folded to zero") &&
-         verifyOk(module,
-                  "module failed verifier after consecutive partial read xor test");
+         verifyOk(
+             module,
+             "module failed verifier after consecutive partial read xor test");
 }
 
 bool testDuplicatePartialReadXorAfterUnknownCallIsZeroed() {
@@ -4439,8 +4539,9 @@ bool testDuplicatePartialReadXorAfterUnknownCallIsZeroed() {
                 "duplicate partial read xor helper calls remained") &&
          expect(!hasNonZeroSinkStore,
                 "duplicate partial read xor after unknown call was not zero") &&
-         verifyOk(module,
-                  "module failed verifier after unknown call partial read xor test");
+         verifyOk(
+             module,
+             "module failed verifier after unknown call partial read xor test");
 }
 
 bool testBranchPartialReadUsesNarrowRangePhi() {
@@ -4462,8 +4563,10 @@ bool testBranchPartialReadUsesNarrowRangePhi() {
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
-  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", function);
-  llvm::BasicBlock *merge = llvm::BasicBlock::Create(context, "merge", function);
+  llvm::BasicBlock *right =
+      llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *merge =
+      llvm::BasicBlock::Create(context, "merge", function);
 
   llvm::Function *partialWrite =
       notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
@@ -4473,8 +4576,8 @@ bool testBranchPartialReadUsesNarrowRangePhi() {
           module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
 
   llvm::IRBuilder<> builder(entry);
-  llvm::Value *cond = builder.CreateLoad(llvm::Type::getInt1Ty(context),
-                                         condition, "cond");
+  llvm::Value *cond =
+      builder.CreateLoad(llvm::Type::getInt1Ty(context), condition, "cond");
   builder.CreateCondBr(cond, left, right);
 
   builder.SetInsertPoint(left);
@@ -4519,8 +4622,88 @@ bool testBranchPartialReadUsesNarrowRangePhi() {
                 "branch partial read did not create a range phi") &&
          expect(i64Phis == 0,
                 "branch partial read created a whole-register i64 phi") &&
-         verifyOk(module,
-                  "module failed verifier after branch range phi test");
+         verifyOk(module, "module failed verifier after branch range phi test");
+}
+
+bool testBranchFullLoadAfterPartialWriteUsesNarrowRangePhi() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-full-load-range-phi", context);
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_no_return_test";
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *condition = new llvm::GlobalVariable(
+      module, llvm::Type::getInt1Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "condition");
+  auto *sink = new llvm::GlobalVariable(module, rax->getValueType(), false,
+                                        llvm::GlobalValue::ExternalLinkage,
+                                        nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "branch_full_load_range_phi", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right =
+      llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *merge =
+      llvm::BasicBlock::Create(context, "merge", function);
+
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *cond =
+      builder.CreateLoad(llvm::Type::getInt1Ty(context), condition, "cond");
+  builder.CreateCondBr(cond, left, right);
+
+  builder.SetInsertPoint(left);
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 7),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(right);
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 11),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(merge);
+  llvm::LoadInst *after = loadRegister(builder, rax, "RAX", "after_partial");
+  builder.CreateStore(after, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  unsigned i64Phis = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
+    if (phi == nullptr) {
+      continue;
+    }
+    if (phi->getType()->isIntegerTy(64)) {
+      ++i64Phis;
+    }
+  }
+
+  return expect(summary.LoadsReplaced >= 1,
+                "branch full load was not replaced") &&
+         expect(!hasRegisterLoad(*function, "RAX"),
+                "branch full load left raw RAX load") &&
+         expect(!hasPartialWriteCall(*function),
+                "branch full load left partial write helper") &&
+         expect(functionHasInstructionNameContaining(*function, "full_range"),
+                "branch full load did not assemble from ranges") &&
+         expect(i64Phis == 0,
+                "branch full load created a whole-register i64 phi") &&
+         verifyOk(
+             module,
+             "module failed verifier after branch full-load range phi test");
 }
 
 bool testDeadPartialWriteUsesRangeLiveness() {
@@ -4581,9 +4764,9 @@ bool testPartialWriteHelperNameSurvivesSignatureRewrite() {
 
   auto *externalType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
-  llvm::Function *external = llvm::Function::Create(
-      externalType, llvm::GlobalValue::ExternalLinkage, "unknown_external",
-      module);
+  llvm::Function *external =
+      llvm::Function::Create(externalType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external", module);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *function =
@@ -4592,15 +4775,13 @@ bool testPartialWriteHelperNameSurvivesSignatureRewrite() {
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
-  storeRegister(builder, rax,
-                llvm::ConstantInt::get(rax->getValueType(), 11), "RAX");
+  storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 11),
+                "RAX");
   builder.CreateCall(externalType, external);
-  builder.CreateCall(partialWrite,
-                     {rax,
-                      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context),
-                                             7),
-                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0)});
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 7),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   builder.CreateRetVoid();
 
   notdec::bin2llvm::runNativeRegisterSummarySSA(module);
@@ -4627,9 +4808,9 @@ bool testPartialReadHelperNameSurvivesSignatureRewrite() {
 
   auto *externalType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
-  llvm::Function *external = llvm::Function::Create(
-      externalType, llvm::GlobalValue::ExternalLinkage, "unknown_external",
-      module);
+  llvm::Function *external =
+      llvm::Function::Create(externalType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external", module);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *function =
@@ -4638,8 +4819,8 @@ bool testPartialReadHelperNameSurvivesSignatureRewrite() {
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
-  storeRegister(builder, rax,
-                llvm::ConstantInt::get(rax->getValueType(), 11), "RAX");
+  storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 11),
+                "RAX");
   builder.CreateCall(externalType, external);
   llvm::Value *value = builder.CreateCall(
       partialRead,
@@ -4670,20 +4851,17 @@ bool testRecordedReturnValueSurvivesPartialDemandRewrite() {
   auto *condition = new llvm::GlobalVariable(
       module, llvm::Type::getInt1Ty(context), false,
       llvm::GlobalValue::ExternalLinkage, nullptr, "condition");
-  auto *sink = new llvm::GlobalVariable(
-      module, rax->getValueType(), false, llvm::GlobalValue::ExternalLinkage,
-      nullptr, "sink");
+  auto *sink = new llvm::GlobalVariable(module, rax->getValueType(), false,
+                                        llvm::GlobalValue::ExternalLinkage,
+                                        nullptr, "sink");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *callee = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "return_entry_or_partial",
-      module);
-  llvm::BasicBlock *entry =
-      llvm::BasicBlock::Create(context, "entry", callee);
-  llvm::BasicBlock *early =
-      llvm::BasicBlock::Create(context, "early", callee);
-  llvm::BasicBlock *write =
-      llvm::BasicBlock::Create(context, "write", callee);
+  llvm::Function *callee =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "return_entry_or_partial", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::BasicBlock *early = llvm::BasicBlock::Create(context, "early", callee);
+  llvm::BasicBlock *write = llvm::BasicBlock::Create(context, "write", callee);
   llvm::IRBuilder<> builder(entry);
   llvm::Value *cond = builder.CreateLoad(condition->getValueType(), condition);
   builder.CreateCondBr(cond, early, write);
@@ -5073,12 +5251,10 @@ bool testFinalCleanupCountsPartialWriteResidue() {
   llvm::Function *partialWrite =
       notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
           module, rbx->getType(), llvm::Type::getInt32Ty(context), 64, 32);
-  builder.CreateCall(partialWrite,
-                     {rbx,
-                      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),
-                                             7),
-                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0)});
+  builder.CreateCall(
+      partialWrite,
+      {rbx, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 7),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   builder.CreateRetVoid();
 
   llvm::LLVMContext &moduleContext = module.getContext();
@@ -5211,6 +5387,7 @@ int main() {
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testInternalSignatureRewriteUsesReadEntryReturnRegisterArg();
+  ok &= testPostSignatureCleanupRewritesInternalEntryRawLoad();
   ok &= testInternalSignatureRewriteUsesZmmArgAndReturn();
   ok &= testPreservedZmmEntryIsPassedAsInternalArgument();
   ok &= testInternalSignatureRewriteUsesZmmLowLaneReturn();
@@ -5224,6 +5401,7 @@ int main() {
   ok &= testNoReturnExternalDoesNotCreateSummaryReturn();
   ok &= testStackCanaryCheckIsRemoved();
   ok &= testStackCanaryZextConditionIsRemoved();
+  ok &= testStackCanaryMaskedSavedLoadIsRemoved();
   ok &= testStackCanaryFailSideEffectIsKept();
   ok &= testStackCanaryWrongFsOffsetIsKept();
   ok &= testRawRspStackCanaryCheckIsRemovedAfterStackCleanup();
@@ -5248,6 +5426,7 @@ int main() {
   ok &= testConsecutivePartialReadXorIsZeroedAfterSummarySSA();
   ok &= testDuplicatePartialReadXorAfterUnknownCallIsZeroed();
   ok &= testBranchPartialReadUsesNarrowRangePhi();
+  ok &= testBranchFullLoadAfterPartialWriteUsesNarrowRangePhi();
   ok &= testDeadPartialWriteUsesRangeLiveness();
   ok &= testPartialWriteHelperNameSurvivesSignatureRewrite();
   ok &= testPartialReadHelperNameSurvivesSignatureRewrite();

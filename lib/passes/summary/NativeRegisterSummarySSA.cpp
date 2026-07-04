@@ -15,6 +15,7 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -1906,10 +1907,14 @@ public:
   void removeDeadStoresAfterSignatureRewrite() {
     Summary.FunctionName = Function.getName().str();
     PostSignatureCleanup = true;
+    collectAccesses();
+    planRegisterRanges();
     rewritePartialReads();
     foldDuplicatePartialReadXors();
     removeDeadPartialReads();
+    rewriteLoads();
     rewritePartialWrites();
+    removeDeadReplacedLoads();
     removeDeadStoresByLiveness();
   }
 
@@ -1938,8 +1943,7 @@ private:
   std::map<llvm::GlobalVariable *, llvm::LoadInst *> EntryInputs;
   std::map<RegisterRangeKey, llvm::Value *> EntryRangeInputs;
   std::map<llvm::GlobalVariable *, std::set<uint64_t>> RangeBoundaries;
-  std::map<llvm::GlobalVariable *, std::vector<RegisterRangeKey>>
-      PlannedRanges;
+  std::map<llvm::GlobalVariable *, std::vector<RegisterRangeKey>> PlannedRanges;
   std::map<CallValueKey, llvm::Value *> CallValues;
   bool PostSignatureCleanup = false;
 
@@ -2032,12 +2036,10 @@ private:
     return llvm::ConstantInt::get(type, 0);
   }
 
-  llvm::Value *replacePartialRegisterValue(const RegisterUnit &unit,
-                                           llvm::Value *oldValue,
-                                           llvm::Value *partialValue,
-                                           unsigned writeWidth,
-                                           uint64_t bitOffset,
-                                           llvm::Instruction *before) {
+  llvm::Value *
+  replacePartialRegisterValue(const RegisterUnit &unit, llvm::Value *oldValue,
+                              llvm::Value *partialValue, unsigned writeWidth,
+                              uint64_t bitOffset, llvm::Instruction *before) {
     if (oldValue == nullptr || partialValue == nullptr || before == nullptr) {
       return nullptr;
     }
@@ -2056,9 +2058,9 @@ private:
     llvm::Value *wideValue = builder.CreateZExtOrTrunc(
         partialValue, baseType, unit.Name + ".partial_wide");
     if (bitOffset != 0) {
-      wideValue = builder.CreateShl(
-          wideValue, llvm::ConstantInt::get(baseType, bitOffset),
-          unit.Name + ".partial_shift");
+      wideValue = builder.CreateShl(wideValue,
+                                    llvm::ConstantInt::get(baseType, bitOffset),
+                                    unit.Name + ".partial_shift");
     }
     wideValue = builder.CreateAnd(wideValue,
                                   llvm::ConstantInt::get(baseType, writeMask),
@@ -2066,8 +2068,7 @@ private:
     llvm::Value *keptValue = builder.CreateAnd(
         oldValue, llvm::ConstantInt::get(baseType, ~writeMask),
         unit.Name + ".partial_keep");
-    return builder.CreateOr(keptValue, wideValue,
-                            unit.Name + ".partial_write");
+    return builder.CreateOr(keptValue, wideValue, unit.Name + ".partial_write");
   }
 
   llvm::Value *extractPartialRegisterValue(const RegisterUnit &unit,
@@ -2087,13 +2088,12 @@ private:
     llvm::IRBuilder<> builder(before);
     llvm::Value *value = fullValue;
     if (bitOffset != 0) {
-      value = builder.CreateLShr(
-          value, llvm::ConstantInt::get(baseType, bitOffset),
-          unit.Name + ".partial_read_shift");
+      value =
+          builder.CreateLShr(value, llvm::ConstantInt::get(baseType, bitOffset),
+                             unit.Name + ".partial_read_shift");
     }
     auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
-    return builder.CreateTrunc(value, resultType,
-                               unit.Name + ".partial_read");
+    return builder.CreateTrunc(value, resultType, unit.Name + ".partial_read");
   }
 
   llvm::Value *extractBitsFromInteger(llvm::Value *value, unsigned readWidth,
@@ -2111,9 +2111,9 @@ private:
     llvm::IRBuilder<> builder(before);
     llvm::Value *result = value;
     if (bitOffset != 0) {
-      result = builder.CreateLShr(
-          result, llvm::ConstantInt::get(sourceType, bitOffset),
-          name + ".shift");
+      result = builder.CreateLShr(result,
+                                  llvm::ConstantInt::get(sourceType, bitOffset),
+                                  name + ".shift");
     }
     auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
     if (result->getType() == resultType) {
@@ -2183,8 +2183,7 @@ private:
       }
       inst->eraseFromParent();
       for (llvm::Instruction *operand : operands) {
-        if (operand->use_empty() &&
-            !isRecordedFunctionReturnValue(operand)) {
+        if (operand->use_empty() && !isRecordedFunctionReturnValue(operand)) {
           worklist.push_back(operand);
         }
       }
@@ -2739,14 +2738,16 @@ private:
       if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
         RegisterAccess access = registerLoad(*load, Units);
         if (access.Unit != nullptr && access.IsStorageValue) {
-          addRangeBoundary(access.Unit->Global, 0, registerBitWidth(*access.Unit));
+          addRangeBoundary(access.Unit->Global, 0,
+                           registerBitWidth(*access.Unit));
         }
         continue;
       }
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
         RegisterAccess access = registerStore(*store, Units);
         if (access.Unit != nullptr && access.IsStorageValue) {
-          addRangeBoundary(access.Unit->Global, 0, registerBitWidth(*access.Unit));
+          addRangeBoundary(access.Unit->Global, 0,
+                           registerBitWidth(*access.Unit));
         }
         continue;
       }
@@ -2776,9 +2777,8 @@ private:
       for (auto current = std::next(previous); current != boundaries.end();
            previous = current, ++current) {
         if (*current > *previous) {
-          ranges.push_back(
-              RegisterRangeKey{global, *previous,
-                               static_cast<uint32_t>(*current - *previous)});
+          ranges.push_back(RegisterRangeKey{
+              global, *previous, static_cast<uint32_t>(*current - *previous)});
         }
       }
     }
@@ -2820,8 +2820,7 @@ private:
 
   llvm::Value *assembleRangeRead(const std::vector<RegisterRangeKey> &ranges,
                                  uint64_t readOffset, uint32_t readWidth,
-                                 llvm::Instruction *before,
-                                 llvm::Twine name) {
+                                 llvm::Instruction *before, llvm::Twine name) {
     if (ranges.empty() || before == nullptr || readWidth == 0) {
       return nullptr;
     }
@@ -2840,17 +2839,100 @@ private:
       if (segment == nullptr || segment->getType() != rangeType(range)) {
         return nullptr;
       }
-      llvm::Value *wide = builder.CreateZExtOrTrunc(segment, resultType,
-                                                    name + ".part_wide");
+      llvm::Value *wide =
+          builder.CreateZExtOrTrunc(segment, resultType, name + ".part_wide");
       uint64_t shift = range.BitOffset - readOffset;
       if (shift != 0) {
-        wide = builder.CreateShl(
-            wide, llvm::ConstantInt::get(resultType, shift),
-            name + ".part_shift");
+        wide =
+            builder.CreateShl(wide, llvm::ConstantInt::get(resultType, shift),
+                              name + ".part_shift");
       }
       result = builder.CreateOr(result, wide, name + ".part_or");
     }
     return result;
+  }
+
+  bool valueDominatesUse(llvm::Value *value, llvm::Instruction *use,
+                         llvm::DominatorTree *domTree) const {
+    value = resolve(value);
+    if (value == nullptr || use == nullptr) {
+      return false;
+    }
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
+    if (inst == nullptr) {
+      return true;
+    }
+    if (inst->getFunction() != use->getFunction()) {
+      return false;
+    }
+    if (inst->getParent() == use->getParent()) {
+      return inst->comesBefore(use);
+    }
+    return domTree != nullptr &&
+           domTree->dominates(inst->getParent(), use->getParent());
+  }
+
+  llvm::Value *
+  assembleRangeReadIfDominating(const std::vector<RegisterRangeKey> &ranges,
+                                uint64_t readOffset, uint32_t readWidth,
+                                llvm::Instruction *before, llvm::Twine name,
+                                llvm::DominatorTree &domTree) {
+    if (ranges.empty() || before == nullptr || readWidth == 0) {
+      return nullptr;
+    }
+    std::vector<llvm::Value *> segments;
+    segments.reserve(ranges.size());
+    for (const RegisterRangeKey &range : ranges) {
+      llvm::Value *segment = resolve(
+          readRangeBefore(*before->getParent(), range, before, &domTree));
+      if (segment == nullptr || segment->getType() != rangeType(range) ||
+          !valueDominatesUse(segment, before, &domTree)) {
+        return nullptr;
+      }
+      segments.push_back(segment);
+    }
+
+    if (ranges.size() == 1 && ranges.front().BitOffset == readOffset &&
+        ranges.front().BitWidth == readWidth) {
+      return segments.front();
+    }
+
+    auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
+    llvm::IRBuilder<> builder(before);
+    llvm::Value *result = llvm::ConstantInt::get(resultType, 0);
+    for (auto it : llvm::enumerate(ranges)) {
+      const RegisterRangeKey &range = it.value();
+      llvm::Value *wide = builder.CreateZExtOrTrunc(
+          segments[it.index()], resultType, name + ".part_wide");
+      uint64_t shift = range.BitOffset - readOffset;
+      if (shift != 0) {
+        wide =
+            builder.CreateShl(wide, llvm::ConstantInt::get(resultType, shift),
+                              name + ".part_shift");
+      }
+      result = builder.CreateOr(result, wide, name + ".part_or");
+    }
+    return result;
+  }
+
+  llvm::Value *readFullRangeValueBefore(llvm::BasicBlock &block,
+                                        const RegisterUnit &unit,
+                                        llvm::Instruction *before,
+                                        llvm::DominatorTree &domTree) {
+    if (isSegmentBaseUnit(unit.Name) || unit.Name == "RSP") {
+      return nullptr;
+    }
+    unsigned fullWidth = registerBitWidth(unit);
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(unit.Global, 0, fullWidth);
+    llvm::Value *value = assembleRangeReadIfDominating(
+        ranges, 0, fullWidth, before, llvm::Twine(unit.Name) + ".full_range",
+        domTree);
+    value = resolve(value);
+    if (value == nullptr || value->getType() != unit.Global->getValueType()) {
+      return nullptr;
+    }
+    return value;
   }
 
   void rewritePartialReads() {
@@ -2896,13 +2978,17 @@ private:
   }
 
   void rewriteLoads() {
+    llvm::DominatorTree domTree(Function);
     for (llvm::LoadInst *load : Loads) {
       RegisterAccess access = registerLoad(*load, Units);
       if (access.Unit == nullptr || !access.IsStorageValue) {
         continue;
       }
-      llvm::Value *value =
-          readValueBefore(*load->getParent(), *access.Unit, load);
+      llvm::Value *value = readFullRangeValueBefore(
+          *load->getParent(), *access.Unit, load, domTree);
+      if (value == nullptr) {
+        value = readValueBefore(*load->getParent(), *access.Unit, load);
+      }
       value = resolve(value);
       if (value == nullptr || value == load ||
           value->getType() != load->getType()) {
@@ -2980,8 +3066,7 @@ private:
       const std::optional<NativeRegisterPartialReadInfo> &rhs) {
     return lhs && rhs && lhs->Global == rhs->Global &&
            lhs->FullWidth == rhs->FullWidth &&
-           lhs->ReadWidth == rhs->ReadWidth &&
-           lhs->BitOffset == rhs->BitOffset;
+           lhs->ReadWidth == rhs->ReadWidth && lhs->BitOffset == rhs->BitOffset;
   }
 
   bool hasInterveningWriteToPartialReadRange(
@@ -3132,9 +3217,8 @@ private:
     }
   }
 
-  LiveRegisterRanges
-  transferBlockLiveness(llvm::BasicBlock &block,
-                        LiveRegisterRanges live) {
+  LiveRegisterRanges transferBlockLiveness(llvm::BasicBlock &block,
+                                           LiveRegisterRanges live) {
     for (auto it = block.rbegin(); it != block.rend(); ++it) {
       llvm::Instruction &inst = *it;
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
@@ -3239,8 +3323,8 @@ private:
     }
   }
 
-  bool transferPartialReadLiveness(
-      llvm::CallBase &call, LiveRegisterRanges &live) const {
+  bool transferPartialReadLiveness(llvm::CallBase &call,
+                                   LiveRegisterRanges &live) const {
     std::optional<NativeRegisterPartialReadInfo> partial =
         parseNativeRegisterPartialRead(call);
     if (!partial || Units.count(partial->Global) == 0) {
@@ -3251,8 +3335,8 @@ private:
     return true;
   }
 
-  bool transferPartialWriteLiveness(
-      llvm::CallBase &call, LiveRegisterRanges &live) const {
+  bool transferPartialWriteLiveness(llvm::CallBase &call,
+                                    LiveRegisterRanges &live) const {
     std::optional<NativeRegisterPartialWriteInfo> partial =
         parseNativeRegisterPartialWrite(call);
     if (!partial || Units.count(partial->Global) == 0) {
@@ -3327,8 +3411,9 @@ private:
     }
   }
 
-  void insertPartialRanges(LiveRegisterRanges &live, llvm::GlobalVariable *global,
-                           uint64_t offset, uint32_t width) const {
+  void insertPartialRanges(LiveRegisterRanges &live,
+                           llvm::GlobalVariable *global, uint64_t offset,
+                           uint32_t width) const {
     std::vector<RegisterRangeKey> ranges =
         plannedRangesCovering(global, offset, width);
     if (ranges.empty()) {
@@ -3338,8 +3423,9 @@ private:
     live.insert(ranges.begin(), ranges.end());
   }
 
-  void erasePartialRanges(LiveRegisterRanges &live, llvm::GlobalVariable *global,
-                          uint64_t offset, uint32_t width) const {
+  void erasePartialRanges(LiveRegisterRanges &live,
+                          llvm::GlobalVariable *global, uint64_t offset,
+                          uint32_t width) const {
     std::vector<RegisterRangeKey> ranges =
         plannedRangesCovering(global, offset, width);
     if (ranges.empty()) {
@@ -3414,10 +3500,8 @@ private:
   }
 
   llvm::Value *extractRangeValue(const RegisterRangeKey &range,
-                                 llvm::Value *source,
-                                 uint64_t sourceBitOffset,
-                                 llvm::Instruction *before,
-                                 llvm::Twine name) {
+                                 llvm::Value *source, uint64_t sourceBitOffset,
+                                 llvm::Instruction *before, llvm::Twine name) {
     if (source == nullptr || before == nullptr || range.BitWidth == 0) {
       return nullptr;
     }
@@ -3431,7 +3515,8 @@ private:
 
   llvm::Value *readRangeBefore(llvm::BasicBlock &block,
                                const RegisterRangeKey &range,
-                               llvm::Instruction *before) {
+                               llvm::Instruction *before,
+                               llvm::DominatorTree *domTree = nullptr) {
     const RegisterUnit *unit = unitForRange(range);
     if (unit == nullptr || before == nullptr || range.BitWidth == 0) {
       return nullptr;
@@ -3498,11 +3583,12 @@ private:
         return nullptr;
       }
     }
-    return readRangeEntry(block, range);
+    return readRangeEntry(block, range, domTree);
   }
 
   llvm::Value *readRangeEntry(llvm::BasicBlock &block,
-                              const RegisterRangeKey &range) {
+                              const RegisterRangeKey &range,
+                              llvm::DominatorTree *domTree = nullptr) {
     BlockRangeKey key{&block, range};
     if (auto cached = EntryRangeValue.find(key);
         cached != EntryRangeValue.end()) {
@@ -3519,12 +3605,12 @@ private:
     if (preds.empty()) {
       value = entryRangeInput(range);
     } else if (preds.size() == 1) {
-      value = readRangeExit(*preds.front(), range);
+      value = readRangeExit(*preds.front(), range, domTree);
       if (PendingRangePhi.count(key) != 0) {
-        value = completeRangePhi(block, range);
+        value = completeRangePhi(block, range, domTree);
       }
     } else {
-      value = completeRangePhi(block, range);
+      value = completeRangePhi(block, range, domTree);
     }
     ResolvingRangeEntry.erase(key);
     EntryRangeValue[key] = resolve(value);
@@ -3532,18 +3618,24 @@ private:
   }
 
   llvm::Value *readRangeExit(llvm::BasicBlock &block,
-                             const RegisterRangeKey &range) {
+                             const RegisterRangeKey &range,
+                             llvm::DominatorTree *domTree = nullptr) {
     BlockRangeKey key{&block, range};
     if (auto cached = ExitRangeValue.find(key);
         cached != ExitRangeValue.end()) {
       return resolve(cached->second);
     }
     llvm::Instruction *terminator = block.getTerminator();
-    llvm::Value *value = terminator == nullptr
-                             ? readRangeEntry(block, range)
-                             : readRangeBefore(block, range, terminator);
-    ExitRangeValue[key] = resolve(value);
-    return ExitRangeValue[key];
+    llvm::Value *value =
+        terminator == nullptr
+            ? readRangeEntry(block, range, domTree)
+            : readRangeBefore(block, range, terminator, domTree);
+    value = resolve(value);
+    if (terminator == nullptr ||
+        valueDominatesUse(value, terminator, domTree)) {
+      ExitRangeValue[key] = value;
+    }
+    return value;
   }
 
   llvm::PHINode *ensureRangePhi(llvm::BasicBlock &block,
@@ -3558,8 +3650,8 @@ private:
       return existing->second;
     }
     llvm::IRBuilder<> builder(&block, block.getFirstNonPHIIt());
-    llvm::PHINode *phi = builder.CreatePHI(
-        rangeType(range), 0, unit->Name + ".range_summary_ssa");
+    llvm::PHINode *phi = builder.CreatePHI(rangeType(range), 0,
+                                           unit->Name + ".range_summary_ssa");
     phi->setMetadata("notdec.register.summary_ssa.phi", registerNode(*unit));
     PendingRangePhi.emplace(key, phi);
     EntryRangeValue[key] = phi;
@@ -3568,7 +3660,8 @@ private:
   }
 
   llvm::Value *completeRangePhi(llvm::BasicBlock &block,
-                                const RegisterRangeKey &range) {
+                                const RegisterRangeKey &range,
+                                llvm::DominatorTree *domTree = nullptr) {
     llvm::PHINode *phi = ensureRangePhi(block, range);
     if (phi == nullptr) {
       return nullptr;
@@ -3583,11 +3676,15 @@ private:
       if (existingIncoming[pred] >= requiredCount) {
         continue;
       }
-      llvm::Value *incoming = rangeTypedValueOrUnknown(
-          readRangeExit(*pred, range), range, pred->getTerminator(),
-          ".range_type_mismatch");
+      llvm::Instruction *terminator = pred->getTerminator();
+      llvm::Value *incoming =
+          rangeTypedValueOrUnknown(readRangeExit(*pred, range, domTree), range,
+                                   terminator, ".range_type_mismatch");
+      if (incoming != nullptr &&
+          !valueDominatesUse(incoming, terminator, domTree)) {
+        incoming = nullptr;
+      }
       if (incoming == nullptr) {
-        llvm::Instruction *terminator = pred->getTerminator();
         incoming =
             terminator != nullptr
                 ? unknownRangeBefore(*terminator, range, ".range_unknown")
@@ -3658,9 +3755,9 @@ private:
             continue;
           }
           llvm::Value *oldValue = readValueBefore(block, unit, call);
-          return replacePartialRegisterValue(
-              unit, oldValue, partial->Value, partial->WriteWidth,
-              partial->BitOffset, call);
+          return replacePartialRegisterValue(unit, oldValue, partial->Value,
+                                             partial->WriteWidth,
+                                             partial->BitOffset, call);
         }
         if (!isAnalyzableCall(*call)) {
           continue;
@@ -3784,9 +3881,9 @@ private:
       if (existingIncoming[pred] >= requiredCount) {
         continue;
       }
-      llvm::Value *incoming = registerTypedValueOrUnknown(
-          readBlockExit(*pred, unit), unit, pred->getTerminator(),
-          ".type_mismatch");
+      llvm::Value *incoming =
+          registerTypedValueOrUnknown(readBlockExit(*pred, unit), unit,
+                                      pred->getTerminator(), ".type_mismatch");
       if (incoming == nullptr) {
         llvm::Instruction *terminator = pred->getTerminator();
         incoming = terminator != nullptr
@@ -3867,7 +3964,8 @@ private:
       for (const auto &[block, range] : rangeWork) {
         llvm::PHINode *phi = PendingRangePhi[{block, range}];
         unsigned before = phi->getNumIncomingValues();
-        (void)completeRangePhi(*block, range);
+        llvm::DominatorTree domTree(Function);
+        (void)completeRangePhi(*block, range, &domTree);
         changed |= phi->getNumIncomingValues() != before;
       }
     }
@@ -3924,9 +4022,8 @@ private:
     if (insertBefore == nullptr) {
       return nullptr;
     }
-    llvm::Value *value =
-        extractRangeValue(range, fullInput, 0, insertBefore,
-                          unit->Name + ".range_entry");
+    llvm::Value *value = extractRangeValue(range, fullInput, 0, insertBefore,
+                                           unit->Name + ".range_entry");
     if (value != nullptr) {
       EntryRangeInputs.emplace(range, value);
     }
@@ -4088,11 +4185,10 @@ private:
 
   llvm::Value *readSlotValueBefore(llvm::CallBase &call,
                                    const NativeSignatureSlot &slot) {
-    return readSlotValueBefore(static_cast<llvm::Instruction &>(call), slot,
-                               slot.Unit == nullptr
-                                   ? llvm::Twine("slot")
-                                   : llvm::Twine(slot.Unit->Name) +
-                                         ".arg_range");
+    return readSlotValueBefore(
+        static_cast<llvm::Instruction &>(call), slot,
+        slot.Unit == nullptr ? llvm::Twine("slot")
+                             : llvm::Twine(slot.Unit->Name) + ".arg_range");
   }
 
   llvm::Value *readSlotValueBefore(llvm::Instruction &before,
@@ -4123,10 +4219,11 @@ private:
         slot.SizeBits == 0) {
       return nullptr;
     }
-    std::vector<RegisterRangeKey> ranges =
-        plannedRangesCovering(slot.Unit->Global, slot.OffsetBits, slot.SizeBits);
-    llvm::Value *bits = assembleRangeRead(
-        ranges, slot.OffsetBits, slot.SizeBits, &before, name);
+    std::vector<RegisterRangeKey> ranges = plannedRangesCovering(
+        slot.Unit->Global, slot.OffsetBits, slot.SizeBits);
+    llvm::DominatorTree domTree(Function);
+    llvm::Value *bits = assembleRangeReadIfDominating(
+        ranges, slot.OffsetBits, slot.SizeBits, &before, name, domTree);
     bits = resolve(bits);
     if (bits == nullptr) {
       return nullptr;
