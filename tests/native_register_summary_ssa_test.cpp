@@ -4637,6 +4637,47 @@ bool testPartialReadHelperIsConsumedBySummarySSA() {
                   "module failed verifier after partial read helper test");
 }
 
+bool testFullStoreFeedsPartialReadThroughRangeSSA() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-full-store-partial-read", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "full_store_partial_read", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+
+  storeRegister(builder, rax,
+                llvm::ConstantInt::get(rax->getValueType(), 0xb00000007ULL),
+                "RAX");
+  llvm::Value *low = builder.CreateCall(
+      partialRead,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "low");
+  builder.CreateStore(low, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.LoadsReplaced >= 1,
+                "full store partial read was not replaced") &&
+         expect(!hasPartialReadCall(*function),
+                "full store partial read helper call remained") &&
+         expect(!hasRegisterLoad(*function, "RAX"),
+                "full store partial read left raw RAX load") &&
+         verifyOk(module,
+                  "module failed verifier after full store partial read test");
+}
+
 bool testDeadPartialReadHelperIsRemovedBySummarySSA() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-dead-partial-read-helper", context);
@@ -5932,6 +5973,7 @@ int main() {
   ok &= testPartialKeepHighStoreIsDemandRewritten();
   ok &= testPartialWriteHelperIsConsumedBySummarySSA();
   ok &= testPartialReadHelperIsConsumedBySummarySSA();
+  ok &= testFullStoreFeedsPartialReadThroughRangeSSA();
   ok &= testDeadPartialReadHelperIsRemovedBySummarySSA();
   ok &= testDeadSummaryCallValueHelperIsRemovedBySummarySSA();
   ok &= testConsecutivePartialReadHelpersAreConsumedBySummarySSA();

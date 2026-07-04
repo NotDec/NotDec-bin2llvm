@@ -3186,17 +3186,12 @@ private:
   }
 
   void rewriteLoads() {
-    llvm::DominatorTree domTree(Function);
     for (llvm::LoadInst *load : Loads) {
       RegisterAccess access = registerLoad(*load, Units);
       if (access.Unit == nullptr || !access.IsStorageValue) {
         continue;
       }
-      llvm::Value *value = readFullRangeValueBefore(
-          *load->getParent(), *access.Unit, load, domTree);
-      if (value == nullptr) {
-        value = readValueBefore(*load->getParent(), *access.Unit, load);
-      }
+      llvm::Value *value = readValueBefore(*load->getParent(), *access.Unit, load);
       value = resolve(value);
       if (value == nullptr || value == load ||
           value->getType() != load->getType()) {
@@ -3997,6 +3992,17 @@ private:
   llvm::Value *readValueBefore(llvm::BasicBlock &block,
                                const RegisterUnit &unit,
                                llvm::Instruction *before) {
+    if (!isSegmentBaseUnit(unit.Name) && unit.Name != "RSP") {
+      llvm::DominatorTree domTree(Function);
+      llvm::Value *rangeValue =
+          readFullRangeValueBefore(block, unit, before, domTree);
+      rangeValue = resolve(rangeValue);
+      if (rangeValue != nullptr &&
+          rangeValue->getType() == unit.Global->getValueType()) {
+        return rangeValue;
+      }
+    }
+
     for (auto it = before->getIterator(); it != block.begin();) {
       --it;
       llvm::Instruction &inst = *it;
