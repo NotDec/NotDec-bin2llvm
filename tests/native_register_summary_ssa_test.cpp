@@ -4185,6 +4185,66 @@ bool testConsecutivePartialReadXorIsZeroedAfterSummarySSA() {
                   "module failed verifier after consecutive partial read xor test");
 }
 
+bool testDuplicatePartialReadXorAfterUnknownCallIsZeroed() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unknown-call-partial-read-xor", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *r9 = createRegisterGlobal(module, "R9");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *externalType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *unknown =
+      llvm::Function::Create(externalType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_call_partial_read_xor", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, r9->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+
+  builder.CreateCall(unknown);
+  llvm::Value *first = builder.CreateCall(
+      partialRead,
+      {r9, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "first");
+  llvm::Value *second = builder.CreateCall(
+      partialRead,
+      {r9, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "second");
+  llvm::Value *value = builder.CreateXor(first, second, "same_xor");
+  builder.CreateStore(value, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool hasNonZeroSinkStore = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store == nullptr || store->getPointerOperand() != sink) {
+      continue;
+    }
+    auto *constant =
+        llvm::dyn_cast<llvm::ConstantInt>(store->getValueOperand());
+    hasNonZeroSinkStore = constant == nullptr || !constant->isZero();
+  }
+
+  return expect(summary.LoadsReplaced >= 1,
+                "duplicate partial read xor was not folded") &&
+         expect(!hasPartialReadCall(*function),
+                "duplicate partial read xor helper calls remained") &&
+         expect(!hasNonZeroSinkStore,
+                "duplicate partial read xor after unknown call was not zero") &&
+         verifyOk(module,
+                  "module failed verifier after unknown call partial read xor test");
+}
+
 bool testBranchPartialReadUsesNarrowRangePhi() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-read-range-phi", context);
@@ -4984,6 +5044,7 @@ int main() {
   ok &= testPartialReadHelperIsConsumedBySummarySSA();
   ok &= testConsecutivePartialReadHelpersAreConsumedBySummarySSA();
   ok &= testConsecutivePartialReadXorIsZeroedAfterSummarySSA();
+  ok &= testDuplicatePartialReadXorAfterUnknownCallIsZeroed();
   ok &= testBranchPartialReadUsesNarrowRangePhi();
   ok &= testDeadPartialWriteUsesRangeLiveness();
   ok &= testPartialWriteHelperNameSurvivesSignatureRewrite();

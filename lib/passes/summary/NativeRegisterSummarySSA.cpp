@@ -1849,6 +1849,7 @@ public:
       if (Options.EnableResidueRemoval) {
         removeDeadReplacedPartialReads();
       }
+      foldDuplicatePartialReadXors();
       rewriteLoads();
       collectSignatureCallArgs();
       collectFunctionReturnValues();
@@ -1870,6 +1871,7 @@ public:
     PostSignatureCleanup = true;
     rewritePartialReads();
     removeDeadReplacedPartialReads();
+    foldDuplicatePartialReadXors();
     rewritePartialWrites();
     removeDeadStoresByLiveness();
   }
@@ -2886,6 +2888,115 @@ private:
       call->eraseFromParent();
       ++Summary.DeadLoadsRemoved;
     }
+  }
+
+  void foldDuplicatePartialReadXors() {
+    std::vector<llvm::BinaryOperator *> zeroXors;
+    llvm::SmallPtrSet<llvm::CallBase *, 16> maybeDeadReads;
+
+    for (llvm::Instruction &inst : llvm::instructions(Function)) {
+      auto *op = llvm::dyn_cast<llvm::BinaryOperator>(&inst);
+      if (op == nullptr || op->getOpcode() != llvm::Instruction::Xor) {
+        continue;
+      }
+
+      auto *lhs = llvm::dyn_cast<llvm::CallBase>(op->getOperand(0));
+      auto *rhs = llvm::dyn_cast<llvm::CallBase>(op->getOperand(1));
+      if (lhs == nullptr || rhs == nullptr || lhs == rhs ||
+          lhs->getParent() != rhs->getParent() ||
+          lhs->getParent() != op->getParent()) {
+        continue;
+      }
+
+      std::optional<NativeRegisterPartialReadInfo> lhsRead =
+          parseNativeRegisterPartialRead(*lhs);
+      std::optional<NativeRegisterPartialReadInfo> rhsRead =
+          parseNativeRegisterPartialRead(*rhs);
+      if (!samePartialReadRange(lhsRead, rhsRead) ||
+          hasInterveningWriteToPartialReadRange(*lhs, *rhs, *lhsRead)) {
+        continue;
+      }
+
+      zeroXors.push_back(op);
+      maybeDeadReads.insert(lhs);
+      maybeDeadReads.insert(rhs);
+    }
+
+    for (llvm::BinaryOperator *op : zeroXors) {
+      if (op->getParent() == nullptr) {
+        continue;
+      }
+      auto *zero = llvm::ConstantInt::get(op->getType(), 0);
+      Replacement[op] = zero;
+      op->replaceAllUsesWith(zero);
+      op->eraseFromParent();
+      ++Summary.LoadsReplaced;
+    }
+
+    for (llvm::CallBase *call : maybeDeadReads) {
+      if (call->getParent() != nullptr && call->use_empty()) {
+        call->eraseFromParent();
+        ++Summary.DeadLoadsRemoved;
+      }
+    }
+  }
+
+  static bool samePartialReadRange(
+      const std::optional<NativeRegisterPartialReadInfo> &lhs,
+      const std::optional<NativeRegisterPartialReadInfo> &rhs) {
+    return lhs && rhs && lhs->Global == rhs->Global &&
+           lhs->FullWidth == rhs->FullWidth &&
+           lhs->ReadWidth == rhs->ReadWidth &&
+           lhs->BitOffset == rhs->BitOffset;
+  }
+
+  bool hasInterveningWriteToPartialReadRange(
+      llvm::CallBase &first, llvm::CallBase &second,
+      const NativeRegisterPartialReadInfo &read) const {
+    bool afterFirst = false;
+    uint64_t readEnd = read.BitOffset + read.ReadWidth;
+    for (llvm::Instruction &inst : *first.getParent()) {
+      if (&inst == &first) {
+        afterFirst = true;
+        continue;
+      }
+      if (&inst == &second) {
+        return false;
+      }
+      if (!afterFirst) {
+        continue;
+      }
+
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit != nullptr && access.Unit->Global == read.Global &&
+            access.IsStorageValue) {
+          return true;
+        }
+        continue;
+      }
+
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      if (parseNativeRegisterPartialRead(*call)) {
+        continue;
+      }
+      if (std::optional<NativeRegisterPartialWriteInfo> write =
+              parseNativeRegisterPartialWrite(*call)) {
+        uint64_t writeEnd = write->BitOffset + write->WriteWidth;
+        if (write->Global == read.Global && read.BitOffset < writeEnd &&
+            write->BitOffset < readEnd) {
+          return true;
+        }
+        continue;
+      }
+      if (isAnalyzableCall(*call)) {
+        return true;
+      }
+    }
+    return true;
   }
 
   void removeDeadReplacedLoads() {
