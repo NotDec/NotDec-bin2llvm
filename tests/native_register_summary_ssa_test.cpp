@@ -3038,6 +3038,72 @@ bool testInternalSignatureRewriteUsesZmmArgAndReturn() {
          verifyOk(module, "module failed verifier after ZMM signature rewrite");
 }
 
+bool testPreservedZmmEntryIsPassedAsInternalArgument() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-preserved-zmm-entry-arg", context);
+  attachTestFloatAbi(module, 1);
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *leaf =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_zmm_leaf", module);
+  llvm::BasicBlock *leafEntry =
+      llvm::BasicBlock::Create(context, "entry", leaf);
+  llvm::IRBuilder<> builder(leafEntry);
+  llvm::AllocaInst *sink = builder.CreateAlloca(zmmType);
+  llvm::LoadInst *input = loadRegister(builder, zmm0, "ZMM0", "input");
+  builder.CreateStore(input, sink);
+  builder.CreateRetVoid();
+
+  llvm::Function *passthrough =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_zmm_passthrough", module);
+  llvm::BasicBlock *passthroughEntry =
+      llvm::BasicBlock::Create(context, "entry", passthrough);
+  builder.SetInsertPoint(passthroughEntry);
+  builder.CreateCall(voidType, leaf);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenLeaf = module.getFunction("notdec_native_zmm_leaf");
+  llvm::Function *rewrittenPassthrough =
+      module.getFunction("notdec_native_zmm_passthrough");
+  bool callUsesPassthroughArg = false;
+  unsigned zmmLoads = 0;
+  if (rewrittenPassthrough != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenPassthrough)) {
+      if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+        callUsesPassthroughArg =
+            call->getCalledFunction() == rewrittenLeaf && call->arg_size() == 1 &&
+            rewrittenPassthrough->arg_size() == 1 &&
+            call->getArgOperand(0) == rewrittenPassthrough->getArg(0);
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (load->getPointerOperand()->stripPointerCasts() == zmm0) {
+          ++zmmLoads;
+        }
+      }
+    }
+  }
+
+  return expect(rewrittenLeaf != nullptr, "ZMM leaf missing") &&
+         expect(rewrittenPassthrough != nullptr, "ZMM passthrough missing") &&
+         expect(rewrittenLeaf->arg_size() == 1,
+                "ZMM leaf argument was not rewritten") &&
+         expect(rewrittenPassthrough->arg_size() == 1,
+                "ZMM passthrough did not get preserved entry argument") &&
+         expect(rewrittenPassthrough->getArg(0)->getType() == zmmType,
+                "ZMM passthrough argument was not i512") &&
+         expect(callUsesPassthroughArg,
+                "ZMM passthrough call did not use its argument") &&
+         expect(zmmLoads == 0, "ZMM passthrough entry load remained") &&
+         verifyOk(module,
+                  "module failed verifier after preserved ZMM entry argument test");
+}
+
 bool testInternalSignatureRewriteUsesZmmLowLaneReturn() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-internal-zmm-low-lane-return", context);
@@ -5103,6 +5169,7 @@ int main() {
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testInternalSignatureRewriteUsesZmmArgAndReturn();
+  ok &= testPreservedZmmEntryIsPassedAsInternalArgument();
   ok &= testInternalSignatureRewriteUsesZmmLowLaneReturn();
   ok &= testForeignArgumentInMovedBodyIsReplaced();
   ok &= testForeignMappedCallArgumentIsLocalized();

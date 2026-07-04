@@ -1452,6 +1452,12 @@ SignatureShape shapeForInternalFunction(
         } else if (regIt->second.EntryDemandMask.getBitWidth() != 0 &&
                    !regIt->second.EntryDemandMask.isZero()) {
           shape.Params.push_back(integerSignatureSlot(*unit));
+        } else {
+          // ReadEntry already says the internal function needs an incoming
+          // value.  If the demand walker did not recover a float lane mask, use
+          // the backing register type rather than leaving an entry global load
+          // in the IR.
+          shape.Params.push_back(integerSignatureSlot(*unit));
         }
         continue;
       }
