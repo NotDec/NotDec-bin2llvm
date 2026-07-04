@@ -2960,6 +2960,48 @@ bool testInternalSignatureRewriteUsesNonAbiReturn() {
                   "module failed verifier after non-ABI return rewrite");
 }
 
+bool testInternalSignatureRewriteUsesReadEntryReturnRegisterArg() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-entry-return-register-arg", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_read_entry_rax", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::AllocaInst *sink = builder.CreateAlloca(rax->getValueType());
+  llvm::LoadInst *input = loadRegister(builder, rax, "RAX", "input");
+  builder.CreateStore(input, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten =
+      module.getFunction("notdec_native_read_entry_rax");
+  unsigned raxLoads = 0;
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+      if (load != nullptr &&
+          load->getPointerOperand()->stripPointerCasts() == rax) {
+        ++raxLoads;
+      }
+    }
+  }
+
+  return expect(rewritten != nullptr, "RAX entry callee missing") &&
+         expect(rewritten->arg_size() == 1,
+                "read-entry return register was not added as argument") &&
+         expect(rewritten->getArg(0)->getType() == rax->getValueType(),
+                "RAX entry argument had wrong type") &&
+         expect(raxLoads == 0, "RAX entry load remained") &&
+         verifyOk(module,
+                  "module failed verifier after RAX entry argument test");
+}
+
 bool testInternalSignatureRewriteUsesZmmArgAndReturn() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-internal-zmm-signature", context);
@@ -5168,6 +5210,7 @@ int main() {
   ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
+  ok &= testInternalSignatureRewriteUsesReadEntryReturnRegisterArg();
   ok &= testInternalSignatureRewriteUsesZmmArgAndReturn();
   ok &= testPreservedZmmEntryIsPassedAsInternalArgument();
   ok &= testInternalSignatureRewriteUsesZmmLowLaneReturn();

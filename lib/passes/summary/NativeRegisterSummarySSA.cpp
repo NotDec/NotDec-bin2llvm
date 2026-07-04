@@ -1438,31 +1438,33 @@ SignatureShape shapeForInternalFunction(
   // Stay within ABI-described register classes, then let summary facts decide
   // which registers are real inputs and demanded outputs.
   for (const RegisterUnit *unit : orderedUnits) {
-    if (abi.InternalParamRegisters.count(unit->Name) == 0) {
+    auto regIt = factsIt->second.Registers.find(unit->Name);
+    if (regIt == factsIt->second.Registers.end() || !regIt->second.ReadEntry) {
       continue;
     }
-    auto regIt = factsIt->second.Registers.find(unit->Name);
-    if (regIt != factsIt->second.Registers.end() && regIt->second.ReadEntry) {
-      if (const AbiFacts::RegisterSlot *slot =
-              floatAbiInputSlotForUnit(abi, unit->Name)) {
-        if (std::optional<NativeSignatureSlot> floatSlot =
-                floatSlotForDemand(function.getContext(), *slot, units,
-                                   regIt->second.EntryDemandMask)) {
-          shape.Params.push_back(*floatSlot);
-        } else if (regIt->second.EntryDemandMask.getBitWidth() != 0 &&
-                   !regIt->second.EntryDemandMask.isZero()) {
-          shape.Params.push_back(integerSignatureSlot(*unit));
-        } else {
-          // ReadEntry already says the internal function needs an incoming
-          // value.  If the demand walker did not recover a float lane mask, use
-          // the backing register type rather than leaving an entry global load
-          // in the IR.
-          shape.Params.push_back(integerSignatureSlot(*unit));
-        }
-        continue;
-      }
-      shape.Params.push_back(integerSignatureSlot(*unit));
+    if (abi.InternalParamRegisters.count(unit->Name) == 0 &&
+        abi.InternalReturnRegisters.count(unit->Name) == 0) {
+      continue;
     }
+    if (const AbiFacts::RegisterSlot *slot =
+            floatAbiInputSlotForUnit(abi, unit->Name)) {
+      if (std::optional<NativeSignatureSlot> floatSlot =
+              floatSlotForDemand(function.getContext(), *slot, units,
+                                 regIt->second.EntryDemandMask)) {
+        shape.Params.push_back(*floatSlot);
+      } else if (regIt->second.EntryDemandMask.getBitWidth() != 0 &&
+                 !regIt->second.EntryDemandMask.isZero()) {
+        shape.Params.push_back(integerSignatureSlot(*unit));
+      } else {
+        // ReadEntry already says the internal function needs an incoming
+        // value.  If the demand walker did not recover a float lane mask, use
+        // the backing register type rather than leaving an entry global load
+        // in the IR.
+        shape.Params.push_back(integerSignatureSlot(*unit));
+      }
+      continue;
+    }
+    shape.Params.push_back(integerSignatureSlot(*unit));
   }
 
   for (const RegisterUnit *unit : orderedUnits) {
