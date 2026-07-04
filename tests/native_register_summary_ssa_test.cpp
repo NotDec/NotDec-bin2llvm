@@ -4094,6 +4094,42 @@ bool testPartialReadHelperIsConsumedBySummarySSA() {
                   "module failed verifier after partial read helper test");
 }
 
+bool testDeadPartialReadHelperIsRemovedBySummarySSA() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-dead-partial-read-helper", context);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+
+  auto *externalType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *unknown =
+      llvm::Function::Create(externalType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "dead_partial_read", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rdi->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+
+  builder.CreateCall(unknown);
+  builder.CreateCall(
+      partialRead,
+      {rdi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.DeadLoadsRemoved >= 1,
+                "dead partial read helper was not counted") &&
+         expect(!hasPartialReadCall(*function),
+                "dead partial read helper remained") &&
+         verifyOk(module,
+                  "module failed verifier after dead partial read helper test");
+}
+
 bool testConsecutivePartialReadHelpersAreConsumedBySummarySSA() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-consecutive-partial-read-helper", context);
@@ -5042,6 +5078,7 @@ int main() {
   ok &= testPartialKeepHighStoreIsDemandRewritten();
   ok &= testPartialWriteHelperIsConsumedBySummarySSA();
   ok &= testPartialReadHelperIsConsumedBySummarySSA();
+  ok &= testDeadPartialReadHelperIsRemovedBySummarySSA();
   ok &= testConsecutivePartialReadHelpersAreConsumedBySummarySSA();
   ok &= testConsecutivePartialReadXorIsZeroedAfterSummarySSA();
   ok &= testDuplicatePartialReadXorAfterUnknownCallIsZeroed();

@@ -1846,10 +1846,10 @@ public:
     planRegisterRanges();
     if (Options.EnableRewrite) {
       rewritePartialReads();
-      if (Options.EnableResidueRemoval) {
-        removeDeadReplacedPartialReads();
-      }
       foldDuplicatePartialReadXors();
+      if (Options.EnableResidueRemoval) {
+        removeDeadPartialReads();
+      }
       rewriteLoads();
       collectSignatureCallArgs();
       collectFunctionReturnValues();
@@ -1870,8 +1870,8 @@ public:
     Summary.FunctionName = Function.getName().str();
     PostSignatureCleanup = true;
     rewritePartialReads();
-    removeDeadReplacedPartialReads();
     foldDuplicatePartialReadXors();
+    removeDeadPartialReads();
     rewritePartialWrites();
     removeDeadStoresByLiveness();
   }
@@ -2880,8 +2880,15 @@ private:
     }
   }
 
-  void removeDeadReplacedPartialReads() {
+  void removeDeadPartialReads() {
+    llvm::SmallPtrSet<llvm::CallBase *, 16> candidates;
     for (llvm::CallBase *call : ReplacedPartialReads) {
+      candidates.insert(call);
+    }
+    for (llvm::CallBase *call : PartialReads) {
+      candidates.insert(call);
+    }
+    for (llvm::CallBase *call : candidates) {
       if (call->getParent() == nullptr || !call->use_empty()) {
         continue;
       }
@@ -2892,7 +2899,6 @@ private:
 
   void foldDuplicatePartialReadXors() {
     std::vector<llvm::BinaryOperator *> zeroXors;
-    llvm::SmallPtrSet<llvm::CallBase *, 16> maybeDeadReads;
 
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
       auto *op = llvm::dyn_cast<llvm::BinaryOperator>(&inst);
@@ -2918,8 +2924,6 @@ private:
       }
 
       zeroXors.push_back(op);
-      maybeDeadReads.insert(lhs);
-      maybeDeadReads.insert(rhs);
     }
 
     for (llvm::BinaryOperator *op : zeroXors) {
@@ -2931,13 +2935,6 @@ private:
       op->replaceAllUsesWith(zero);
       op->eraseFromParent();
       ++Summary.LoadsReplaced;
-    }
-
-    for (llvm::CallBase *call : maybeDeadReads) {
-      if (call->getParent() != nullptr && call->use_empty()) {
-        call->eraseFromParent();
-        ++Summary.DeadLoadsRemoved;
-      }
     }
   }
 
