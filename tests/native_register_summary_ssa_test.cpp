@@ -4055,6 +4055,58 @@ bool testConsecutivePartialReadHelpersAreConsumedBySummarySSA() {
                   "module failed verifier after consecutive partial read test");
 }
 
+bool testConsecutivePartialReadXorIsZeroedAfterSummarySSA() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-consecutive-partial-read-xor", context);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "consecutive_partial_read_xor", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Value *first = builder.CreateCall(
+      partialRead,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "first");
+  llvm::Value *second = builder.CreateCall(
+      partialRead,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "second");
+  llvm::Value *value = builder.CreateXor(first, second, "same_xor");
+  builder.CreateStore(value, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool hasNonZeroSinkStore = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store == nullptr || store->getPointerOperand() != sink) {
+      continue;
+    }
+    auto *constant =
+        llvm::dyn_cast<llvm::ConstantInt>(store->getValueOperand());
+    hasNonZeroSinkStore = constant == nullptr || !constant->isZero();
+  }
+
+  return expect(summary.LoadsReplaced >= 2,
+                "consecutive partial read xor inputs were not replaced") &&
+         expect(!hasPartialReadCall(*function),
+                "consecutive partial read xor helper call remained") &&
+         expect(!hasNonZeroSinkStore,
+                "consecutive partial read xor was not folded to zero") &&
+         verifyOk(module,
+                  "module failed verifier after consecutive partial read xor test");
+}
+
 bool testBranchPartialReadUsesNarrowRangePhi() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-read-range-phi", context);
@@ -4852,6 +4904,7 @@ int main() {
   ok &= testPartialWriteHelperIsConsumedBySummarySSA();
   ok &= testPartialReadHelperIsConsumedBySummarySSA();
   ok &= testConsecutivePartialReadHelpersAreConsumedBySummarySSA();
+  ok &= testConsecutivePartialReadXorIsZeroedAfterSummarySSA();
   ok &= testBranchPartialReadUsesNarrowRangePhi();
   ok &= testDeadPartialWriteUsesRangeLiveness();
   ok &= testPartialWriteHelperNameSurvivesSignatureRewrite();

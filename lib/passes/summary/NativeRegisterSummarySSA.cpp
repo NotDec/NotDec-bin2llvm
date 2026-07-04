@@ -2246,7 +2246,12 @@ private:
         break;
       case llvm::Instruction::Or:
       case llvm::Instruction::Xor:
-        result = computeUnaryMask(0) | computeUnaryMask(1);
+        if (inst->getOpcode() == llvm::Instruction::Xor &&
+            inst->getOperand(0) == inst->getOperand(1)) {
+          result = llvm::APInt(width, 0);
+        } else {
+          result = computeUnaryMask(0) | computeUnaryMask(1);
+        }
         break;
       case llvm::Instruction::Trunc:
         result = llvm::APInt::getAllOnes(width);
@@ -2464,6 +2469,10 @@ private:
       }
       case llvm::Instruction::Or:
       case llvm::Instruction::Xor: {
+        if (inst->getOpcode() == llvm::Instruction::Xor &&
+            inst->getOperand(0) == inst->getOperand(1)) {
+          break;
+        }
         llvm::APInt lhsMask = knownValueMask(inst->getOperand(0));
         llvm::APInt rhsMask = knownValueMask(inst->getOperand(1));
         bool canSplit = inst->getOpcode() == llvm::Instruction::Or &&

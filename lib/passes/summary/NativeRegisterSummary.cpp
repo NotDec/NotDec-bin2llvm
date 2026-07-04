@@ -522,6 +522,15 @@ std::map<llvm::Value *, llvm::APInt> computeValueDemands(
         enqueue(inst->getOperand(0), demand);
       }
       break;
+    case llvm::Instruction::Xor:
+      // `xor x, x` is a pure zeroing idiom.  Treating it like a normal binary
+      // op would make the cleared register look like a real entry-register
+      // input, especially for XMM/ZMM lanes.
+      if (inst->getOperand(0) != inst->getOperand(1)) {
+        enqueue(inst->getOperand(0), demand);
+        enqueue(inst->getOperand(1), demand);
+      }
+      break;
     default:
       for (llvm::Value *operand : inst->operand_values()) {
         enqueue(operand, demand);
