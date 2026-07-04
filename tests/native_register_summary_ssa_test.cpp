@@ -4070,6 +4070,52 @@ bool testBranchPartialReadUsesNarrowRangePhi() {
                   "module failed verifier after branch range phi test");
 }
 
+bool testDeadPartialWriteUsesRangeLiveness() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-write-range-liveness", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "dead_partial_write_range_liveness", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 7),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  llvm::Value *high = builder.CreateCall(
+      partialRead,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)},
+      "high");
+  builder.CreateStore(high, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.DeadStoresRemoved >= 1,
+                "dead low partial write was not removed") &&
+         expect(!hasPartialWriteCall(*function),
+                "dead low partial write helper remained") &&
+         expect(!hasPartialReadCall(*function),
+                "high partial read helper remained") &&
+         verifyOk(module,
+                  "module failed verifier after partial write liveness test");
+}
+
 bool testPartialWriteHelperNameSurvivesSignatureRewrite() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-write-name", context);
@@ -4741,6 +4787,7 @@ int main() {
   ok &= testPartialReadHelperIsConsumedBySummarySSA();
   ok &= testConsecutivePartialReadHelpersAreConsumedBySummarySSA();
   ok &= testBranchPartialReadUsesNarrowRangePhi();
+  ok &= testDeadPartialWriteUsesRangeLiveness();
   ok &= testPartialWriteHelperNameSurvivesSignatureRewrite();
   ok &= testPartialReadHelperNameSurvivesSignatureRewrite();
   ok &= testRecordedReturnValueSurvivesPartialDemandRewrite();

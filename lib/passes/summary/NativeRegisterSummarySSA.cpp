@@ -115,8 +115,14 @@ struct RegisterRangeKey {
     return std::tie(Global, BitOffset, BitWidth) <
            std::tie(other.Global, other.BitOffset, other.BitWidth);
   }
+
+  bool operator==(const RegisterRangeKey &other) const {
+    return Global == other.Global && BitOffset == other.BitOffset &&
+           BitWidth == other.BitWidth;
+  }
 };
 using BlockRangeKey = std::pair<llvm::BasicBlock *, RegisterRangeKey>;
+using LiveRegisterRanges = std::set<RegisterRangeKey>;
 using CallValueKey =
     std::tuple<llvm::Instruction *, llvm::GlobalVariable *, std::string>;
 
@@ -2930,8 +2936,8 @@ private:
   }
 
   void removeDeadStoresByLiveness() {
-    std::map<llvm::BasicBlock *, std::set<llvm::GlobalVariable *>> liveIn;
-    std::map<llvm::BasicBlock *, std::set<llvm::GlobalVariable *>> liveOut;
+    std::map<llvm::BasicBlock *, LiveRegisterRanges> liveIn;
+    std::map<llvm::BasicBlock *, LiveRegisterRanges> liveOut;
     std::vector<llvm::BasicBlock *> blocks;
     for (llvm::BasicBlock &block : Function) {
       blocks.push_back(&block);
@@ -2943,7 +2949,7 @@ private:
       for (auto blockIt = blocks.rbegin(); blockIt != blocks.rend();
            ++blockIt) {
         llvm::BasicBlock &block = **blockIt;
-        std::set<llvm::GlobalVariable *> out;
+        LiveRegisterRanges out;
         for (llvm::BasicBlock *succ : llvm::successors(&block)) {
           auto succLive = liveIn.find(succ);
           if (succLive != liveIn.end()) {
@@ -2957,7 +2963,7 @@ private:
           addExitLiveRegisters(out);
         }
 
-        std::set<llvm::GlobalVariable *> in = transferBlockLiveness(block, out);
+        LiveRegisterRanges in = transferBlockLiveness(block, out);
         changed |= liveOut[&block] != out || liveIn[&block] != in;
         liveOut[&block] = std::move(out);
         liveIn[&block] = std::move(in);
@@ -2966,16 +2972,15 @@ private:
 
     for (llvm::BasicBlock &block : Function) {
       auto outIt = liveOut.find(&block);
-      std::set<llvm::GlobalVariable *> live =
-          outIt == liveOut.end() ? std::set<llvm::GlobalVariable *>{}
-                                 : outIt->second;
+      LiveRegisterRanges live =
+          outIt == liveOut.end() ? LiveRegisterRanges{} : outIt->second;
       eraseDeadStoresInBlock(block, live);
     }
   }
 
-  std::set<llvm::GlobalVariable *>
+  LiveRegisterRanges
   transferBlockLiveness(llvm::BasicBlock &block,
-                        std::set<llvm::GlobalVariable *> live) {
+                        LiveRegisterRanges live) {
     for (auto it = block.rbegin(); it != block.rend(); ++it) {
       llvm::Instruction &inst = *it;
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
@@ -3001,7 +3006,7 @@ private:
   }
 
   void eraseDeadStoresInBlock(llvm::BasicBlock &block,
-                              std::set<llvm::GlobalVariable *> live) {
+                              LiveRegisterRanges live) {
     std::vector<llvm::StoreInst *> deadStores;
     std::vector<llvm::CallBase *> deadPartialWrites;
     for (auto it = block.rbegin(); it != block.rend(); ++it) {
@@ -3009,7 +3014,7 @@ private:
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
         RegisterAccess access = registerStore(*store, Units);
         if (access.Unit != nullptr && access.IsStorageValue &&
-            live.count(access.Unit->Global) == 0) {
+            !hasLiveGlobalRange(live, access.Unit->Global)) {
           deadStores.push_back(store);
         }
         transferStoreLiveness(*store, live);
@@ -3026,7 +3031,8 @@ private:
         if (std::optional<NativeRegisterPartialWriteInfo> partial =
                 parseNativeRegisterPartialWrite(*call)) {
           if (Units.count(partial->Global) != 0 &&
-              live.count(partial->Global) == 0) {
+              !hasLivePartialRange(live, partial->Global, partial->BitOffset,
+                                   partial->WriteWidth)) {
             deadPartialWrites.push_back(call);
           }
           transferPartialWriteLiveness(*call, live);
@@ -3056,15 +3062,15 @@ private:
   }
 
   void transferStoreLiveness(llvm::StoreInst &store,
-                             std::set<llvm::GlobalVariable *> &live) const {
+                             LiveRegisterRanges &live) const {
     RegisterAccess access = registerStore(store, Units);
     if (access.Unit != nullptr && access.IsStorageValue) {
-      live.erase(access.Unit->Global);
+      eraseGlobalRanges(live, access.Unit->Global);
     }
   }
 
   void transferLoadLiveness(llvm::LoadInst &load,
-                            std::set<llvm::GlobalVariable *> &live) const {
+                            LiveRegisterRanges &live) const {
     RegisterAccess access = registerLoad(load, Units);
     if (access.Unit != nullptr && access.IsStorageValue) {
       // Entry/replaced loads are SummarySSA scaffolding.  After signature
@@ -3075,38 +3081,38 @@ private:
                nullptr)) {
         return;
       }
-      live.insert(access.Unit->Global);
+      insertGlobalRanges(live, access.Unit->Global);
     }
   }
 
   bool transferPartialReadLiveness(
-      llvm::CallBase &call, std::set<llvm::GlobalVariable *> &live) const {
+      llvm::CallBase &call, LiveRegisterRanges &live) const {
     std::optional<NativeRegisterPartialReadInfo> partial =
         parseNativeRegisterPartialRead(call);
     if (!partial || Units.count(partial->Global) == 0) {
       return false;
     }
-    live.insert(partial->Global);
+    insertPartialRanges(live, partial->Global, partial->BitOffset,
+                        partial->ReadWidth);
     return true;
   }
 
   bool transferPartialWriteLiveness(
-      llvm::CallBase &call, std::set<llvm::GlobalVariable *> &live) const {
+      llvm::CallBase &call, LiveRegisterRanges &live) const {
     std::optional<NativeRegisterPartialWriteInfo> partial =
         parseNativeRegisterPartialWrite(call);
     if (!partial || Units.count(partial->Global) == 0) {
       return false;
     }
-    // If the register is live after this helper, the untouched bits may still
-    // come from the previous value.  At whole-register granularity that means
-    // the same register stays live before the helper; if it is not live after,
-    // the helper is dead and does not make the old value live.
-    (void)live;
+    // The helper defines only the written bit range.  Untouched ranges remain
+    // live, but the written range itself no longer needs an earlier definition.
+    erasePartialRanges(live, partial->Global, partial->BitOffset,
+                       partial->WriteWidth);
     return true;
   }
 
   void transferCallLiveness(llvm::CallBase &call,
-                            std::set<llvm::GlobalVariable *> &live) const {
+                            LiveRegisterRanges &live) const {
     if (!isAnalyzableCall(call)) {
       return;
     }
@@ -3114,15 +3120,15 @@ private:
       CallRegisterEffect effect = callEffect(call, unit);
       if (effect == CallRegisterEffect::ReturnValue ||
           effect == CallRegisterEffect::Clobber) {
-        live.erase(global);
+        eraseGlobalRanges(live, global);
       }
       if (callReadsRegister(call, unit)) {
-        live.insert(global);
+        insertGlobalRanges(live, global);
       }
     }
   }
 
-  void addExitLiveRegisters(std::set<llvm::GlobalVariable *> &live) const {
+  void addExitLiveRegisters(LiveRegisterRanges &live) const {
     auto functionFacts = SummaryFacts.find(&Function);
     if (functionFacts == SummaryFacts.end()) {
       return;
@@ -3134,9 +3140,86 @@ private:
       }
       const SummaryRegisterFact &fact = regIt->second;
       if (fact.ExitDemand && fact.MayNonEntry) {
-        live.insert(global);
+        insertGlobalRanges(live, global);
       }
     }
+  }
+
+  void insertGlobalRanges(LiveRegisterRanges &live,
+                          llvm::GlobalVariable *global) const {
+    auto rangesIt = PlannedRanges.find(global);
+    if (rangesIt == PlannedRanges.end() || rangesIt->second.empty()) {
+      auto unitIt = Units.find(global);
+      if (unitIt == Units.end()) {
+        return;
+      }
+      unsigned width = registerBitWidth(unitIt->second);
+      if (width != 0) {
+        live.insert(RegisterRangeKey{global, 0, width});
+      }
+      return;
+    }
+    live.insert(rangesIt->second.begin(), rangesIt->second.end());
+  }
+
+  void eraseGlobalRanges(LiveRegisterRanges &live,
+                         llvm::GlobalVariable *global) const {
+    for (auto it = live.begin(); it != live.end();) {
+      if (it->Global == global) {
+        it = live.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void insertPartialRanges(LiveRegisterRanges &live, llvm::GlobalVariable *global,
+                           uint64_t offset, uint32_t width) const {
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(global, offset, width);
+    if (ranges.empty()) {
+      insertGlobalRanges(live, global);
+      return;
+    }
+    live.insert(ranges.begin(), ranges.end());
+  }
+
+  void erasePartialRanges(LiveRegisterRanges &live, llvm::GlobalVariable *global,
+                          uint64_t offset, uint32_t width) const {
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(global, offset, width);
+    if (ranges.empty()) {
+      return;
+    }
+    for (const RegisterRangeKey &range : ranges) {
+      live.erase(range);
+    }
+  }
+
+  bool hasLiveGlobalRange(const LiveRegisterRanges &live,
+                          llvm::GlobalVariable *global) const {
+    for (const RegisterRangeKey &range : live) {
+      if (range.Global == global) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool hasLivePartialRange(const LiveRegisterRanges &live,
+                           llvm::GlobalVariable *global, uint64_t offset,
+                           uint32_t width) const {
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(global, offset, width);
+    if (ranges.empty()) {
+      return hasLiveGlobalRange(live, global);
+    }
+    for (const RegisterRangeKey &range : ranges) {
+      if (live.count(range) != 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   const RegisterUnit *unitForRange(const RegisterRangeKey &range) const {
