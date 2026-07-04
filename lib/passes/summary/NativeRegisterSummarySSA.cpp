@@ -893,6 +893,35 @@ void eraseUnusedSummaryHelperDeclarations(llvm::Module &module) {
   }
 }
 
+uint64_t eraseDeadSummaryCallValueHelpers(llvm::Module &module) {
+  std::vector<llvm::CallBase *> deadHelpers;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr || !call->use_empty()) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee == nullptr ||
+          !callee->getName().starts_with("notdec.register.summary_")) {
+        continue;
+      }
+      if (call->getMetadata("notdec.register.summary_ssa.call_value") ==
+          nullptr) {
+        continue;
+      }
+      deadHelpers.push_back(call);
+    }
+  }
+  for (llvm::CallBase *call : deadHelpers) {
+    call->eraseFromParent();
+  }
+  return deadHelpers.size();
+}
+
 std::optional<std::string> mdField(const llvm::MDNode *node,
                                    llvm::StringRef key) {
   if (node == nullptr) {
@@ -5058,6 +5087,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       summary.StackCanaryChecksRemoved += lateCanarySummary.CanaryChecksRemoved;
       summary.StackCanaryFailBlocksRemoved +=
           lateCanarySummary.FailBlocksRemoved;
+      eraseDeadSummaryCallValueHelpers(module);
+      eraseUnusedSummaryHelperDeclarations(module);
     }
   }
   summary.FunctionsSeen = summary.Functions.size();

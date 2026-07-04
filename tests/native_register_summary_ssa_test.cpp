@@ -4130,6 +4130,60 @@ bool testDeadPartialReadHelperIsRemovedBySummarySSA() {
                   "module failed verifier after dead partial read helper test");
 }
 
+bool testDeadSummaryCallValueHelperIsRemovedBySummarySSA() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-dead-summary-call-helper", context);
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *helperType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {}, false);
+  llvm::Function *helper =
+      llvm::Function::Create(helperType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec.register.summary_clobber.i64", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "dead_summary_call_helper", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::CallInst *dead = builder.CreateCall(helperType, helper, {}, "dead");
+  llvm::CallInst *live = builder.CreateCall(helperType, helper, {}, "live");
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "name=RDX"),
+      llvm::MDString::get(context, "kind=clobber"),
+  };
+  llvm::MDNode *metadata = llvm::MDNode::get(context, fields);
+  dead->setMetadata("notdec.register.summary_ssa.call_value", metadata);
+  live->setMetadata("notdec.register.summary_ssa.call_value", metadata);
+  builder.CreateStore(live, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+
+  unsigned helperCalls = 0;
+  bool deadCallRemained = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call == nullptr || call->getCalledFunction() != helper) {
+      continue;
+    }
+    ++helperCalls;
+    deadCallRemained |= call->getName() == "dead";
+  }
+
+  return expect(helperCalls == 1,
+                "dead summary call helper was not removed precisely") &&
+         expect(!deadCallRemained, "dead summary call helper remained") &&
+         expect(moduleHasFunctionNamed(module,
+                                       "notdec.register.summary_clobber.i64"),
+                "live summary helper declaration was removed") &&
+         verifyOk(module,
+                  "module failed verifier after dead summary helper test");
+}
+
 bool testConsecutivePartialReadHelpersAreConsumedBySummarySSA() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-consecutive-partial-read-helper", context);
@@ -5079,6 +5133,7 @@ int main() {
   ok &= testPartialWriteHelperIsConsumedBySummarySSA();
   ok &= testPartialReadHelperIsConsumedBySummarySSA();
   ok &= testDeadPartialReadHelperIsRemovedBySummarySSA();
+  ok &= testDeadSummaryCallValueHelperIsRemovedBySummarySSA();
   ok &= testConsecutivePartialReadHelpersAreConsumedBySummarySSA();
   ok &= testConsecutivePartialReadXorIsZeroedAfterSummarySSA();
   ok &= testDuplicatePartialReadXorAfterUnknownCallIsZeroed();
