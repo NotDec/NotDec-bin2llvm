@@ -5041,6 +5041,102 @@ bool testBranchFullLoadAfterPartialWriteUsesNarrowRangePhi() {
              "module failed verifier after branch full-load range phi test");
 }
 
+bool testLoopPartialWriteUsesNarrowRangePhi() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-loop-partial-write-range-phi", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *condition = new llvm::GlobalVariable(
+      module, llvm::Type::getInt1Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "condition");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "loop_partial_write_range_phi", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *header =
+      llvm::BasicBlock::Create(context, "header", function);
+  llvm::BasicBlock *body = llvm::BasicBlock::Create(context, "body", function);
+  llvm::BasicBlock *exit = llvm::BasicBlock::Create(context, "exit", function);
+
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateBr(header);
+
+  builder.SetInsertPoint(header);
+  llvm::Value *cond =
+      builder.CreateLoad(llvm::Type::getInt1Ty(context), condition, "cond");
+  builder.CreateCondBr(cond, body, exit);
+
+  builder.SetInsertPoint(body);
+  llvm::Value *current = builder.CreateCall(
+      partialRead,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "current");
+  llvm::Value *next = builder.CreateAdd(
+      current, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 1),
+      "next");
+  builder.CreateCall(partialWrite,
+                     {rax, next,
+                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                             0)});
+  builder.CreateBr(header);
+
+  builder.SetInsertPoint(exit);
+  llvm::Value *after = builder.CreateCall(
+      partialRead,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "after");
+  builder.CreateStore(after, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  function = module.getFunction("loop_partial_write_range_phi");
+  if (function == nullptr) {
+    return expect(false, "loop partial write function missing after rewrite");
+  }
+  unsigned i32Phis = 0;
+  unsigned i64Phis = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
+    if (phi == nullptr) {
+      continue;
+    }
+    if (phi->getType()->isIntegerTy(32)) {
+      ++i32Phis;
+    }
+    if (phi->getType()->isIntegerTy(64)) {
+      ++i64Phis;
+    }
+  }
+
+  return expect(summary.LoadsReplaced >= 2,
+                "loop partial reads were not replaced") &&
+         expect(!hasPartialReadCall(*function),
+                "loop partial read helper call remained") &&
+         expect(!hasPartialWriteCall(*function),
+                "loop partial write helper call remained") &&
+         expect(i32Phis >= 1, "loop partial write did not create i32 phi") &&
+         expect(i64Phis == 0,
+                "loop partial write created a whole-register i64 phi") &&
+         verifyOk(module, "module failed verifier after loop range phi test");
+}
+
 bool testDeadPartialWriteUsesRangeLiveness() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-write-range-liveness", context);
@@ -5843,6 +5939,7 @@ int main() {
   ok &= testDuplicatePartialReadXorAfterUnknownCallIsZeroed();
   ok &= testBranchPartialReadUsesNarrowRangePhi();
   ok &= testBranchFullLoadAfterPartialWriteUsesNarrowRangePhi();
+  ok &= testLoopPartialWriteUsesNarrowRangePhi();
   ok &= testDeadPartialWriteUsesRangeLiveness();
   ok &= testPlannerSplitsZmmForFloatAbiSlot();
   ok &= testPlannerSplitsRegisterForDemandMask();

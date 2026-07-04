@@ -123,6 +123,7 @@ struct RegisterRangeKey {
   }
 };
 using BlockRangeKey = std::pair<llvm::BasicBlock *, RegisterRangeKey>;
+using InstRangeKey = std::pair<llvm::Instruction *, RegisterRangeKey>;
 using LiveRegisterRanges = std::set<RegisterRangeKey>;
 enum class RangeEventKind { Read, Write, Clobber };
 using CallValueKey =
@@ -1953,6 +1954,11 @@ private:
   std::map<BlockRangeKey, llvm::Value *> ExitRangeValue;
   std::map<BlockRangeKey, llvm::PHINode *> PendingRangePhi;
   std::set<BlockRangeKey> ResolvingRangeEntry;
+  // Segment definitions produced by local writes.  This is the first step away
+  // from treating partial writes as a special read-time matcher: a write now
+  // records the canonical ranges it defines, and later reads consume those
+  // range values through the same cache.
+  std::map<InstRangeKey, llvm::Value *> LocalRangeWrites;
   std::map<llvm::Value *, llvm::Value *> Replacement;
   std::set<llvm::PHINode *> DeadPhis;
   std::map<llvm::GlobalVariable *, llvm::LoadInst *> EntryInputs;
@@ -3037,6 +3043,14 @@ private:
     return result;
   }
 
+  llvm::Value *readAccessRange(llvm::GlobalVariable *global, uint64_t readOffset,
+                               uint32_t readWidth, llvm::Instruction *before,
+                               llvm::Twine name) {
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(global, readOffset, readWidth);
+    return assembleRangeRead(ranges, readOffset, readWidth, before, name);
+  }
+
   bool valueDominatesUse(llvm::Value *value, llvm::Instruction *use,
                          llvm::DominatorTree *domTree) const {
     value = resolve(value);
@@ -3100,6 +3114,18 @@ private:
     return result;
   }
 
+  llvm::Value *readAccessRangeIfDominating(llvm::GlobalVariable *global,
+                                           uint64_t readOffset,
+                                           uint32_t readWidth,
+                                           llvm::Instruction *before,
+                                           llvm::Twine name,
+                                           llvm::DominatorTree &domTree) {
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(global, readOffset, readWidth);
+    return assembleRangeReadIfDominating(ranges, readOffset, readWidth, before,
+                                         name, domTree);
+  }
+
   llvm::Value *readFullRangeValueBefore(llvm::BasicBlock &block,
                                         const RegisterUnit &unit,
                                         llvm::Instruction *before,
@@ -3108,10 +3134,8 @@ private:
       return nullptr;
     }
     unsigned fullWidth = registerBitWidth(unit);
-    std::vector<RegisterRangeKey> ranges =
-        plannedRangesCovering(unit.Global, 0, fullWidth);
-    llvm::Value *value = assembleRangeReadIfDominating(
-        ranges, 0, fullWidth, before, llvm::Twine(unit.Name) + ".full_range",
+    llvm::Value *value = readAccessRangeIfDominating(
+        unit.Global, 0, fullWidth, before, llvm::Twine(unit.Name) + ".full_range",
         domTree);
     value = resolve(value);
     if (value == nullptr || value->getType() != unit.Global->getValueType()) {
@@ -3135,10 +3159,9 @@ private:
         continue;
       }
       llvm::Value *value = nullptr;
-      std::vector<RegisterRangeKey> ranges = plannedRangesCovering(
-          partial->Global, partial->BitOffset, partial->ReadWidth);
-      value = assembleRangeRead(ranges, partial->BitOffset, partial->ReadWidth,
-                                call, unitIt->second.Name + ".partial_range");
+      value = readAccessRange(partial->Global, partial->BitOffset,
+                              partial->ReadWidth, call,
+                              unitIt->second.Name + ".partial_range");
       if (value == nullptr) {
         value = readCoveredPartialWriteBefore(
             *call->getParent(), unitIt->second, partial->ReadWidth,
@@ -3698,6 +3721,54 @@ private:
                                   name);
   }
 
+  llvm::Instruction *rangeWriteInsertPoint(llvm::Instruction &writeInst,
+                                           llvm::Instruction *readBefore) const {
+    if (llvm::Instruction *next = writeInst.getNextNode()) {
+      return next;
+    }
+    return readBefore;
+  }
+
+  llvm::Value *writeSegment(llvm::Instruction &writeInst,
+                            const RegisterRangeKey &range,
+                            llvm::Value *value) {
+    value = resolve(value);
+    if (value == nullptr || value->getType() != rangeType(range)) {
+      return nullptr;
+    }
+    LocalRangeWrites[{&writeInst, range}] = value;
+    return value;
+  }
+
+  bool writeAccessRange(llvm::Instruction &writeInst,
+                        llvm::GlobalVariable *global, uint64_t writeOffset,
+                        uint32_t writeWidth, llvm::Value *source,
+                        uint64_t sourceBitOffset, llvm::Instruction *insertBefore,
+                        llvm::Twine name) {
+    if (source == nullptr || insertBefore == nullptr || writeWidth == 0) {
+      return false;
+    }
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(global, writeOffset, writeWidth);
+    if (ranges.empty()) {
+      return false;
+    }
+    for (const RegisterRangeKey &range : ranges) {
+      llvm::Value *segment =
+          extractRangeValue(range, source, sourceBitOffset, insertBefore, name);
+      if (writeSegment(writeInst, range, segment) == nullptr) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  llvm::Value *writtenSegment(llvm::Instruction &writeInst,
+                              const RegisterRangeKey &range) {
+    auto cached = LocalRangeWrites.find({&writeInst, range});
+    return cached == LocalRangeWrites.end() ? nullptr : resolve(cached->second);
+  }
+
   llvm::Value *readRangeBefore(llvm::BasicBlock &block,
                                const RegisterRangeKey &range,
                                llvm::Instruction *before,
@@ -3714,8 +3785,11 @@ private:
         RegisterAccess access = registerStore(*store, Units);
         if (access.Unit != nullptr && access.Unit->Global == range.Global &&
             access.IsStorageValue) {
-          return extractRangeValue(range, resolve(store->getValueOperand()), 0,
-                                   before, unit->Name + ".range_read");
+          (void)writeAccessRange(
+              *store, range.Global, 0, registerBitWidth(*access.Unit),
+              resolve(store->getValueOperand()), 0,
+              rangeWriteInsertPoint(*store, before), unit->Name + ".range_store");
+          return writtenSegment(*store, range);
         }
         continue;
       }
@@ -3728,11 +3802,15 @@ private:
           if (partial->Global != range.Global) {
             continue;
           }
+          (void)writeAccessRange(
+              *call, partial->Global, partial->BitOffset, partial->WriteWidth,
+              partial->Value, partial->BitOffset,
+              rangeWriteInsertPoint(*call, before),
+              unit->Name + ".range_partial_write");
           uint64_t writeEnd = partial->BitOffset + partial->WriteWidth;
           uint64_t rangeEnd = range.BitOffset + range.BitWidth;
-          if (partial->BitOffset <= range.BitOffset && rangeEnd <= writeEnd) {
-            return extractRangeValue(range, partial->Value, partial->BitOffset,
-                                     call, unit->Name + ".range_read");
+          if (llvm::Value *segment = writtenSegment(*call, range)) {
+            return segment;
           }
           if (range.BitOffset < writeEnd && partial->BitOffset < rangeEnd) {
             return nullptr;
