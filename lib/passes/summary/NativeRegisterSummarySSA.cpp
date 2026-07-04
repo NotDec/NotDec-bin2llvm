@@ -3943,35 +3943,45 @@ private:
 
   llvm::Value *readSlotValueBefore(llvm::CallBase &call,
                                    const NativeSignatureSlot &slot) {
-    if (slot.Unit == nullptr || call.getParent() == nullptr) {
+    return readSlotValueBefore(static_cast<llvm::Instruction &>(call), slot,
+                               slot.Unit == nullptr
+                                   ? llvm::Twine("slot")
+                                   : llvm::Twine(slot.Unit->Name) +
+                                         ".arg_range");
+  }
+
+  llvm::Value *readSlotValueBefore(llvm::Instruction &before,
+                                   const NativeSignatureSlot &slot,
+                                   llvm::Twine rangeName) {
+    if (slot.Unit == nullptr || before.getParent() == nullptr) {
       return nullptr;
     }
-    llvm::Value *rangeValue = readSlotRangeBefore(call, slot);
+    llvm::Value *rangeValue = readSlotRangeBefore(before, slot, rangeName);
     if (rangeValue != nullptr && rangeValue->getType() == slotType(slot)) {
       return rangeValue;
     }
 
     llvm::Value *fullValue =
-        resolve(readValueBefore(*call.getParent(), *slot.Unit, &call));
+        resolve(readValueBefore(*before.getParent(), *slot.Unit, &before));
     if (fullValue == nullptr ||
         fullValue->getType() != slot.Unit->Global->getValueType()) {
       return nullptr;
     }
-    llvm::IRBuilder<> builder(&call);
+    llvm::IRBuilder<> builder(&before);
     return castRegisterValueToSlot(builder, fullValue, slot);
   }
 
-  llvm::Value *readSlotRangeBefore(llvm::CallBase &call,
-                                   const NativeSignatureSlot &slot) {
-    if (slot.Unit == nullptr || call.getParent() == nullptr ||
+  llvm::Value *readSlotRangeBefore(llvm::Instruction &before,
+                                   const NativeSignatureSlot &slot,
+                                   llvm::Twine name) {
+    if (slot.Unit == nullptr || before.getParent() == nullptr ||
         slot.SizeBits == 0) {
       return nullptr;
     }
     std::vector<RegisterRangeKey> ranges =
         plannedRangesCovering(slot.Unit->Global, slot.OffsetBits, slot.SizeBits);
     llvm::Value *bits = assembleRangeRead(
-        ranges, slot.OffsetBits, slot.SizeBits, &call,
-        slot.Unit->Name + ".arg_range");
+        ranges, slot.OffsetBits, slot.SizeBits, &before, name);
     bits = resolve(bits);
     if (bits == nullptr) {
       return nullptr;
@@ -3982,7 +3992,7 @@ private:
       if (!targetType->isIntegerTy() || !bits->getType()->isIntegerTy()) {
         return nullptr;
       }
-      llvm::IRBuilder<> builder(&call);
+      llvm::IRBuilder<> builder(&before);
       return builder.CreateZExtOrTrunc(bits, targetType,
                                        slot.Unit->Name + ".arg_range_cast");
     }
@@ -3992,7 +4002,7 @@ private:
             targetType->getScalarSizeInBits()) {
       return nullptr;
     }
-    llvm::IRBuilder<> builder(&call);
+    llvm::IRBuilder<> builder(&before);
     return builder.CreateBitCast(bits, targetType,
                                  slot.Unit->Name + ".arg_range_float");
   }
@@ -4166,7 +4176,8 @@ private:
       values.reserve(shapeIt->second.Returns.size());
       for (const NativeSignatureSlot &slot : shapeIt->second.Returns) {
         const RegisterUnit *unit = slot.Unit;
-        llvm::Value *value = resolve(readValueBefore(block, *unit, ret));
+        llvm::Value *value = resolve(
+            readSlotValueBefore(*ret, slot, unit->Name + ".return_range"));
         if (value == nullptr || value->getType() != slotType(slot)) {
           value = frozenPoisonBefore(*ret, slotType(slot),
                                      unit->Name + ".return_unknown");

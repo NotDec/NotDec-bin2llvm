@@ -3038,6 +3038,84 @@ bool testInternalSignatureRewriteUsesZmmArgAndReturn() {
          verifyOk(module, "module failed verifier after ZMM signature rewrite");
 }
 
+bool testInternalSignatureRewriteUsesZmmLowLaneReturn() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-internal-zmm-low-lane-return", context);
+  attachTestFloatAbi(module, 0);
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_zmm_low_return", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(calleeEntry);
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, zmm0->getType(), llvm::Type::getInt64Ty(context), 512, 64);
+  builder.CreateCall(partialWrite,
+                     {zmm0,
+                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                             0x3ff0000000000000ULL),
+                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                             0)});
+  builder.CreateRetVoid();
+
+  llvm::Function *caller =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_zmm_low_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  builder.CreateCall(voidType, callee);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, zmm0->getType(), llvm::Type::getInt64Ty(context), 512, 64);
+  llvm::Value *loaded = builder.CreateCall(
+      partialRead,
+      {zmm0, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "loaded");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "zmm_low_sink");
+  builder.CreateStore(loaded, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten =
+      module.getFunction("notdec_native_zmm_low_return");
+  llvm::Function *rewrittenCaller =
+      module.getFunction("notdec_native_zmm_low_caller");
+  bool callReturnsDouble = false;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() == rewritten &&
+          call->arg_empty() && call->getType()->isDoubleTy()) {
+        callReturnsDouble = true;
+      }
+    }
+  }
+
+  return expect(rewritten != nullptr, "ZMM low-lane callee missing") &&
+         expect(rewrittenCaller != nullptr, "ZMM low-lane caller missing") &&
+         expect(rewritten->arg_empty(),
+                "ZMM low-lane return added unexpected argument") &&
+         expect(rewritten->getReturnType()->isDoubleTy(),
+                "ZMM low-lane return was not rewritten to double") &&
+         expect(callReturnsDouble,
+                "ZMM low-lane callsite was not rewritten to double") &&
+         expect(!hasPartialWriteCall(*rewritten),
+                "ZMM low-lane partial write helper remained") &&
+         expect(summary.CallsRewritten >= 1,
+                "ZMM low-lane return call rewrite was not counted") &&
+         verifyOk(module,
+                  "module failed verifier after ZMM low-lane return rewrite");
+}
+
 bool testForeignArgumentInMovedBodyIsReplaced() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-foreign-argument", context);
@@ -4875,6 +4953,7 @@ int main() {
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testInternalSignatureRewriteUsesZmmArgAndReturn();
+  ok &= testInternalSignatureRewriteUsesZmmLowLaneReturn();
   ok &= testForeignArgumentInMovedBodyIsReplaced();
   ok &= testForeignMappedCallArgumentIsLocalized();
   ok &= testStaticRspStackRewriteKeepsSavedRegisterEvidence();
