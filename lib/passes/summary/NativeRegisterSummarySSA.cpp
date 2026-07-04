@@ -821,6 +821,7 @@ bool isKnownExternalFunction(const llvm::Function &function) {
 bool isUnknownExternalFunction(const llvm::Function &function) {
   return function.isDeclaration() && !function.isIntrinsic() &&
          !function.getName().starts_with("notdec.register.") &&
+         !isNativeRegisterPartialWriteName(function.getName()) &&
          !isKnownExternalFunction(function);
 }
 
@@ -1754,7 +1755,8 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
   std::map<llvm::Function *, SignatureShape> shapes;
   for (llvm::Function &function : module) {
     if (function.isIntrinsic() ||
-        function.getName().starts_with("notdec.register.")) {
+        function.getName().starts_with("notdec.register.") ||
+        isNativeRegisterPartialWriteName(function.getName())) {
       continue;
     }
     SignatureShape shape =

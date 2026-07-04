@@ -3893,6 +3893,52 @@ bool testPartialWriteHelperIsConsumedBySummarySSA() {
                   "module failed verifier after partial write helper test");
 }
 
+bool testPartialWriteHelperNameSurvivesSignatureRewrite() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-write-name", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rax->getType(), llvm::Type::getInt8Ty(context), 64, 8);
+
+  auto *externalType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *external = llvm::Function::Create(
+      externalType, llvm::GlobalValue::ExternalLinkage, "unknown_external",
+      module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "partial_write_name_survives", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rax,
+                llvm::ConstantInt::get(rax->getValueType(), 11), "RAX");
+  builder.CreateCall(externalType, external);
+  builder.CreateCall(partialWrite,
+                     {rax,
+                      llvm::ConstantInt::get(llvm::Type::getInt8Ty(context),
+                                             7),
+                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                             0)});
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *keptPartialWrite =
+      module.getFunction("notdec.partial_write.i64.i8");
+
+  return expect(keptPartialWrite == partialWrite,
+                "partial write helper was renamed during signature rewrite") &&
+         expect(module.getFunction("1") == nullptr,
+                "numeric partial write helper declaration was created") &&
+         verifyOk(module,
+                  "module failed verifier after partial write name test");
+}
+
 bool testRecordedReturnValueSurvivesPartialDemandRewrite() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-return-partial-demand", context);
@@ -4425,6 +4471,7 @@ int main() {
   ok &= testKnownUnaryLibmUsesFloatAbiSlots();
   ok &= testPartialKeepHighStoreIsDemandRewritten();
   ok &= testPartialWriteHelperIsConsumedBySummarySSA();
+  ok &= testPartialWriteHelperNameSurvivesSignatureRewrite();
   ok &= testRecordedReturnValueSurvivesPartialDemandRewrite();
   ok &= testPartialDemandZeroReplacementIsMarked();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
