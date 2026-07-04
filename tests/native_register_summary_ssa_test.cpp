@@ -1640,6 +1640,71 @@ bool testKnownFixedArgExternalTruncatesAbiInputs() {
                   "module failed verifier after fixed-arg external rewrite");
 }
 
+bool testCallArgUsesPartialRangeRead() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-call-arg-partial-range", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "external_callee", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "call_arg_partial_range", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rdi->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  builder.CreateCall(
+      partialWrite,
+      {rdi, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 42),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  function = module.getFunction("call_arg_partial_range");
+  llvm::CallInst *call = nullptr;
+  unsigned i64Phis = 0;
+  if (function == nullptr) {
+    return expect(false, "partial range argument function missing");
+  }
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      if (candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "external_callee") {
+        call = candidate;
+      }
+    }
+    if (auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst)) {
+      if (phi->getType()->isIntegerTy(64)) {
+        ++i64Phis;
+      }
+    }
+  }
+
+  return expect(call != nullptr, "partial range argument call missing") &&
+         expect(call->arg_size() == 1,
+                "partial range argument call was not rewritten") &&
+         expect(call->getArgOperand(0)->getType()->isIntegerTy(64),
+                "partial range argument kept wrong type") &&
+         expect(!hasPartialWriteCall(*function),
+                "partial range argument left partial write helper") &&
+         expect(i64Phis == 0,
+                "partial range argument created whole-register phi") &&
+         expect(summary.CallsRewritten >= 1,
+                "partial range argument call was not counted as rewritten") &&
+         verifyOk(module,
+                  "module failed verifier after partial range argument test");
+}
+
 bool testDeadFlagStoreBeforeCallIsRemoved() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-dead-flag-before-call", context);
@@ -4739,6 +4804,7 @@ int main() {
   ok &= testAbiInputStoreBeforeCallIsKept();
   ok &= testKnownZeroArgExternalDropsAbiInputs();
   ok &= testKnownFixedArgExternalTruncatesAbiInputs();
+  ok &= testCallArgUsesPartialRangeRead();
   ok &= testDeadFlagStoreBeforeCallIsRemoved();
   ok &= testFlagStoreReadAfterCallIsKept();
   ok &= testPostRewriteInstCombineExposesDeadFlagStore();

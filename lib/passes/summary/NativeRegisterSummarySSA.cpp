@@ -3899,7 +3899,6 @@ private:
     bool allowEntryInputs = callee != nullptr && !callee->isDeclaration();
     unsigned argCount =
         shape.VarArg ? Abi.InputsInOrder.size() : shape.Params.size();
-    llvm::IRBuilder<> builder(&call);
     for (unsigned index = 0; index < argCount; ++index) {
       NativeSignatureSlot slot;
       if (index < shape.Params.size()) {
@@ -3915,17 +3914,15 @@ private:
       if (unit == nullptr) {
         break;
       }
-      llvm::Value *value =
-          resolve(readValueBefore(*call.getParent(), *unit, &call));
-      if (value == nullptr ||
-          value->getType() != unit->Global->getValueType()) {
+      llvm::Value *value = resolve(readSlotValueBefore(call, slot));
+      if (value == nullptr || value->getType() != slotType(slot)) {
         break;
       }
-      llvm::StoreInst *store = findStoreBeforeCall(call, *unit, value);
-      if (isEntryInputValue(value) && store == nullptr && !allowEntryInputs) {
+      llvm::StoreInst *store = findNearestStoreBeforeCall(call, *unit);
+      if (store == nullptr && isEntryInputValue(value) && !allowEntryInputs) {
         break;
       }
-      llvm::Value *argValue = castRegisterValueToSlot(builder, value, slot);
+      llvm::Value *argValue = value;
       if (argValue == nullptr || argValue->getType() != slotType(slot)) {
         break;
       }
@@ -3935,9 +3932,64 @@ private:
     return bindings;
   }
 
-  llvm::StoreInst *findStoreBeforeCall(llvm::CallBase &call,
-                                       const RegisterUnit &unit,
-                                       llvm::Value *value) {
+  llvm::Value *readSlotValueBefore(llvm::CallBase &call,
+                                   const NativeSignatureSlot &slot) {
+    if (slot.Unit == nullptr || call.getParent() == nullptr) {
+      return nullptr;
+    }
+    llvm::Value *rangeValue = readSlotRangeBefore(call, slot);
+    if (rangeValue != nullptr && rangeValue->getType() == slotType(slot)) {
+      return rangeValue;
+    }
+
+    llvm::Value *fullValue =
+        resolve(readValueBefore(*call.getParent(), *slot.Unit, &call));
+    if (fullValue == nullptr ||
+        fullValue->getType() != slot.Unit->Global->getValueType()) {
+      return nullptr;
+    }
+    llvm::IRBuilder<> builder(&call);
+    return castRegisterValueToSlot(builder, fullValue, slot);
+  }
+
+  llvm::Value *readSlotRangeBefore(llvm::CallBase &call,
+                                   const NativeSignatureSlot &slot) {
+    if (slot.Unit == nullptr || call.getParent() == nullptr ||
+        slot.SizeBits == 0) {
+      return nullptr;
+    }
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(slot.Unit->Global, slot.OffsetBits, slot.SizeBits);
+    llvm::Value *bits = assembleRangeRead(
+        ranges, slot.OffsetBits, slot.SizeBits, &call,
+        slot.Unit->Name + ".arg_range");
+    bits = resolve(bits);
+    if (bits == nullptr) {
+      return nullptr;
+    }
+
+    llvm::Type *targetType = slotType(slot);
+    if (slot.Kind == NativeSignatureSlotKind::IntegerRegister) {
+      if (!targetType->isIntegerTy() || !bits->getType()->isIntegerTy()) {
+        return nullptr;
+      }
+      llvm::IRBuilder<> builder(&call);
+      return builder.CreateZExtOrTrunc(bits, targetType,
+                                       slot.Unit->Name + ".arg_range_cast");
+    }
+
+    if (!targetType->isFloatingPointTy() || !bits->getType()->isIntegerTy() ||
+        bits->getType()->getIntegerBitWidth() !=
+            targetType->getScalarSizeInBits()) {
+      return nullptr;
+    }
+    llvm::IRBuilder<> builder(&call);
+    return builder.CreateBitCast(bits, targetType,
+                                 slot.Unit->Name + ".arg_range_float");
+  }
+
+  llvm::StoreInst *findNearestStoreBeforeCall(llvm::CallBase &call,
+                                              const RegisterUnit &unit) {
     for (auto it = call.getIterator(); it != call.getParent()->begin();) {
       --it;
       llvm::Instruction &inst = *it;
@@ -3945,18 +3997,17 @@ private:
         RegisterAccess access = registerStore(*store, Units);
         if (access.Unit != nullptr && access.Unit->Global == unit.Global &&
             access.IsStorageValue) {
-          return resolve(store->getValueOperand()) == value ? store : nullptr;
+          return store;
         }
         continue;
       }
       if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
         RegisterAccess access = registerLoad(*load, Units);
         if (access.Unit != nullptr && access.Unit->Global == unit.Global &&
-            access.IsStorageValue) {
-          if (load->getMetadata("notdec.register.summary_ssa.replaced") ==
-              nullptr) {
-            return nullptr;
-          }
+            access.IsStorageValue &&
+            load->getMetadata("notdec.register.summary_ssa.replaced") ==
+                nullptr) {
+          return nullptr;
         }
         continue;
       }
