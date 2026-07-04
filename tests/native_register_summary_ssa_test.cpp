@@ -1613,6 +1613,50 @@ bool testKnownZeroArgExternalTypedReturnIsMaterialized() {
              "module failed verifier after typed zero-arg external rewrite");
 }
 
+bool testKnownErrnoLocationReturnIsMaterialized() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-errno-location-return", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *voidCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(voidCalleeType, llvm::GlobalValue::ExternalLinkage,
+                             "__errno_location", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "errno_location_return_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(voidCalleeType, callee);
+  llvm::LoadInst *raxLoad = loadRegister(builder, rax, "RAX", "rax.after");
+  builder.CreateRet(raxLoad);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("__errno_location");
+  llvm::CallInst *call = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (candidate != nullptr && candidate->getCalledFunction() == rewritten) {
+      call = candidate;
+    }
+  }
+
+  return expect(rewritten != nullptr, "errno_location external missing") &&
+         expect(rewritten->getReturnType()->isIntegerTy(64),
+                "errno_location kept void return") &&
+         expect(call != nullptr, "errno_location call missing") &&
+         expect(call->getType()->isIntegerTy(64),
+                "errno_location call kept void return") &&
+         expect(summary.Warnings.empty(),
+                "errno_location left register SSA warning") &&
+         verifyOk(module,
+                  "module failed verifier after errno_location rewrite");
+}
+
 bool testKnownFixedArgExternalTruncatesAbiInputs() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-known-fixed-arg-external", context);
@@ -2984,6 +3028,86 @@ bool testUnknownExternalArityStopsAtPhiClobberArg() {
                 "unknown external phi clobber arity warning missing") &&
          verifyOk(module,
                   "module failed verifier after phi clobber arity test");
+}
+
+bool testUnknownExternalArityStopsAtBinaryClobberArg() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unknown-external-binary-clobber-arity",
+                      context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName =
+      "__summary_ssa_unknown_external_binary_clobber_arity_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  for (llvm::StringRef name : {"RDI", "RSI", "RDX"}) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 1;
+    input.MaxSize = 8;
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = name.str();
+    abi.Inputs.push_back(input);
+  }
+  for (llvm::StringRef name : {"RAX", "RDX"}) {
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = name.str();
+    abi.Effects.push_back(killed);
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *knownClobber = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "free", module);
+  llvm::Function *unknown =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external_binary_clobber_arity", module);
+  llvm::Function *function = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage,
+      "unknown_external_binary_clobber_arity_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 99),
+                "RDI");
+  builder.CreateCall(voidType, knownClobber);
+  llvm::LoadInst *rdxAfter = loadRegister(builder, rdx, "RDX", "rdx.after");
+  llvm::Value *combined = builder.CreateOr(
+      rdxAfter, llvm::ConstantInt::get(rdx->getValueType(), 0x100),
+      "rdx.combined");
+  storeRegister(builder, rdx, combined, "RDX");
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  builder.CreateCall(voidType, unknown);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten =
+      module.getFunction("unknown_external_binary_clobber_arity");
+  bool hasInferredArityWarning = false;
+  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+       summary.Warnings) {
+    hasInferredArityWarning |=
+        warning.CalleeName == "unknown_external_binary_clobber_arity" &&
+        warning.Reason == "inferred_unknown_external_arity";
+  }
+
+  return expect(rewritten != nullptr,
+                "unknown external binary clobber arity callee missing") &&
+         expect(rewritten->arg_size() == 2,
+                "unknown external arity counted binary clobber as argument") &&
+         expect(hasInferredArityWarning,
+                "unknown external binary clobber arity warning missing") &&
+         verifyOk(module,
+                  "module failed verifier after binary clobber arity test");
 }
 
 bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
@@ -5560,6 +5684,7 @@ int main() {
   ok &= testFlagStoreReadAfterCallIsKept();
   ok &= testPostRewriteInstCombineExposesDeadFlagStore();
   ok &= testKnownZeroArgExternalTypedReturnIsMaterialized();
+  ok &= testKnownErrnoLocationReturnIsMaterialized();
   ok &= testKnownFiveArgExternalUsesFiveInputs();
   ok &= testKnownFixedExternalArities();
   ok &= testKnownVarArgExternalKeepsAbiInputs();
@@ -5572,6 +5697,7 @@ int main() {
   ok &= testUnknownExternalArityUsesMaxCallsitePrefix();
   ok &= testUnknownExternalArityStopsAtClobberArg();
   ok &= testUnknownExternalArityStopsAtPhiClobberArg();
+  ok &= testUnknownExternalArityStopsAtBinaryClobberArg();
   ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
   ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();

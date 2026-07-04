@@ -4462,6 +4462,13 @@ public:
     for (auto &[entry, block] : splitBlocks) {
       state.addBasicBlock(entry, std::move(block));
     }
+    std::vector<std::pair<uint64_t, NativeBasicBlock>> targetBlocks;
+    for (const auto &[entry, function] : state.functions()) {
+      appendDecodedDirectTargetBlocks(state, function, targetBlocks);
+    }
+    for (auto &[entry, block] : targetBlocks) {
+      state.addBasicBlock(entry, std::move(block));
+    }
     foldEhFrameOnlyBranchTargets(state);
     for (const auto &[entry, function] : state.functions()) {
       state.removeInvalidBasicBlockSuccessors(entry);
@@ -4586,6 +4593,35 @@ private:
         }
       }
     }
+    for (const auto &[entry, function] : state.functions()) {
+      auto seedIterator = state.functionSeeds().find(entry);
+      if (seedIterator == state.functionSeeds().end() ||
+          !hasSource(seedIterator->second, "eh-frame") ||
+          seedIterator->second.Sources.size() != 1) {
+        continue;
+      }
+      if (function.Source != "gtirb-seed-range-fallback") {
+        continue;
+      }
+      for (const NativeBasicBlock &block : function.Blocks) {
+        const NativeInstruction *terminator = nullptr;
+        for (const NativeInstruction *instruction :
+             state.instructionsInRange(block.Start, block.End)) {
+          terminator = instruction;
+        }
+        if (terminator == nullptr ||
+            terminator->FlowKind !=
+                NativeInstructionFlowKind::UnconditionalBranch) {
+          continue;
+        }
+        for (uint64_t target : terminator->TailFlowTargets) {
+          const NativeFunction *owner = state.functionContaining(target);
+          if (owner != nullptr && owner->Entry != entry) {
+            folds.push_back({owner->Entry, entry});
+          }
+        }
+      }
+    }
 
     for (const auto &[ownerEntry, targetEntry] : folds) {
       const NativeFunction *targetFunction = state.functionAt(targetEntry);
@@ -4596,31 +4632,96 @@ private:
       for (NativeBasicBlock &block : blocks) {
         state.addBasicBlock(ownerEntry, std::move(block));
       }
-      for (const auto &[entry, function] : state.functions()) {
-        if (entry != ownerEntry) {
-          continue;
-        }
-        for (const NativeBasicBlock &block : function.Blocks) {
-          const NativeInstruction *terminator = nullptr;
-          for (const NativeInstruction *instruction :
-               state.instructionsInRange(block.Start, block.End)) {
-            terminator = instruction;
-          }
-          if (terminator == nullptr ||
-              terminator->FlowKind != NativeInstructionFlowKind::ConditionalBranch ||
-              std::find(terminator->TailFlowTargets.begin(),
-                        terminator->TailFlowTargets.end(), targetEntry) ==
-                  terminator->TailFlowTargets.end()) {
-            continue;
-          }
-          state.restoreInstructionTailFlowTarget(terminator->Address,
-                                                 targetEntry);
-          state.addBasicBlockSuccessors(ownerEntry, block.Start, {targetEntry});
-        }
-      }
+      restoreFoldedEhFrameFlowTargets(state, ownerEntry, targetEntry);
       state.demoteFunctionSeedToRangeHint(targetEntry);
       state.removeFunction(targetEntry);
     }
+  }
+
+  static void restoreFoldedEhFrameFlowTargets(NativeProgramState &state,
+                                              uint64_t ownerEntry,
+                                              uint64_t foldedEntry) {
+    const NativeFunction *owner = state.functionAt(ownerEntry);
+    if (owner == nullptr) {
+      return;
+    }
+    // Folding can split copied blocks again, so keep terminator addresses and
+    // resolve their current source blocks only after all needed target splits.
+    struct FoldedEdge {
+      uint64_t TerminatorAddress = 0;
+      uint64_t Target = 0;
+      bool WasTail = false;
+    };
+    std::vector<FoldedEdge> edges;
+    for (const NativeBasicBlock &block : owner->Blocks) {
+      const NativeInstruction *terminator = nullptr;
+      for (const NativeInstruction *instruction :
+           state.instructionsInRange(block.Start, block.End)) {
+        terminator = instruction;
+      }
+      if (terminator == nullptr) {
+        continue;
+      }
+      for (uint64_t target : terminator->DirectFlowTargets) {
+        edges.push_back({terminator->Address, target, false});
+      }
+      const std::vector<uint64_t> tailTargets = terminator->TailFlowTargets;
+      for (uint64_t target : tailTargets) {
+        edges.push_back({terminator->Address, target, true});
+      }
+    }
+    for (const FoldedEdge &edge : edges) {
+      if (edge.Target != foldedEntry) {
+        ensureFunctionBlockStartsAt(state, ownerEntry, edge.Target);
+      }
+    }
+    owner = state.functionAt(ownerEntry);
+    if (owner == nullptr) {
+      return;
+    }
+    for (const FoldedEdge &edge : edges) {
+      if (edge.Target != foldedEntry &&
+          !functionHasBlockStartingAt(*owner, edge.Target)) {
+        continue;
+      }
+      const NativeBasicBlock *sourceBlock =
+          functionBlockContaining(*owner, edge.TerminatorAddress);
+      if (sourceBlock == nullptr) {
+        continue;
+      }
+      if (edge.WasTail) {
+        state.restoreInstructionTailFlowTarget(edge.TerminatorAddress,
+                                               edge.Target);
+      }
+      state.addBasicBlockSuccessors(ownerEntry, sourceBlock->Start,
+                                    {edge.Target});
+    }
+  }
+
+  static bool ensureFunctionBlockStartsAt(NativeProgramState &state,
+                                          uint64_t functionEntry,
+                                          uint64_t address) {
+    const NativeFunction *function = state.functionAt(functionEntry);
+    if (function == nullptr) {
+      return false;
+    }
+    if (functionHasBlockStartingAt(*function, address)) {
+      return true;
+    }
+    const NativeBasicBlock *containing =
+        functionBlockContaining(*function, address);
+    if (containing == nullptr || containing->Start == address) {
+      return false;
+    }
+
+    NativeBasicBlock block;
+    block.Start = address;
+    block.End = containing->End;
+    block.Successors = containing->Successors;
+    state.addBasicBlock(functionEntry, std::move(block));
+
+    function = state.functionAt(functionEntry);
+    return function != nullptr && functionHasBlockStartingAt(*function, address);
   }
 
   static void appendMissingBlocks(
@@ -4678,6 +4779,78 @@ private:
         appendSplitBlockAt(function, *instruction->Fallthrough, result);
       }
     }
+  }
+
+  static void appendDecodedDirectTargetBlocks(
+      const NativeProgramState &state, const NativeFunction &function,
+      std::vector<std::pair<uint64_t, NativeBasicBlock>> &result) {
+    // Some decoded cold blocks are outside the seed range but have already been
+    // reached by a direct edge. Import only unowned decoded targets.
+    for (const NativeInstruction *instruction :
+         state.instructionsInRange(function.RangeStart, function.RangeEnd)) {
+      for (uint64_t target : instruction->DirectFlowTargets) {
+        appendDecodedDirectTargetBlockAt(state, function, target, result);
+      }
+    }
+  }
+
+  static void appendDecodedDirectTargetBlockAt(
+      const NativeProgramState &state, const NativeFunction &function,
+      uint64_t address,
+      std::vector<std::pair<uint64_t, NativeBasicBlock>> &result) {
+    if (!state.isExecutableAddress(address) ||
+        state.instructionAt(address) == nullptr ||
+        functionHasBlockContaining(function, address)) {
+      return;
+    }
+    if (auto owner = state.functionContaining(address)) {
+      if (owner->Entry != function.Entry) {
+        return;
+      }
+    }
+    for (const auto &[entry, block] : result) {
+      if (entry == function.Entry && block.Start == address) {
+        return;
+      }
+    }
+
+    std::vector<const NativeInstruction *> instructions =
+        state.instructionsInRange(address, executableDecodeLimit(state, address));
+    if (instructions.empty() || instructions.front()->Address != address) {
+      return;
+    }
+
+    NativeBasicBlock block;
+    block.Start = address;
+    for (size_t index = 0; index < instructions.size(); ++index) {
+      const NativeInstruction *current = instructions[index];
+      if (index != 0 && functionHasBlockContaining(function, current->Address)) {
+        break;
+      }
+      block.End = current->end();
+      if (current->FlowKind != NativeInstructionFlowKind::None) {
+        break;
+      }
+      if (index + 1 == instructions.size() ||
+          !isInstructionFallthroughTo(*current, instructions[index + 1]->Address)) {
+        break;
+      }
+    }
+    if (block.Start < block.End) {
+      result.push_back({function.Entry, std::move(block)});
+    }
+  }
+
+  static uint64_t executableDecodeLimit(const NativeProgramState &state,
+                                        uint64_t address) {
+    for (const NativeMemoryRange &range : state.memoryRanges()) {
+      if (!range.Executable ||
+          !containsAddress(range.Start, range.Size, address)) {
+        continue;
+      }
+      return range.Start + range.Size;
+    }
+    return address;
   }
 
   static void appendSplitBlockAt(

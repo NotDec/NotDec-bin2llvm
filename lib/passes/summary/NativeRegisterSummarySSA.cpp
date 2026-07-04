@@ -339,7 +339,7 @@ knownExternalPrototypes() {
       {"__ctype_toupper_loc", {0, false, false, 1, {}, ValueType::I64}},
       {"__cxa_atexit", {3, false, false}},
       {"__cxa_finalize", {1, false, false}},
-      {"__errno_location", {0, false, false}},
+      {"__errno_location", {0, false, false, 1, {}, ValueType::I64}},
       {"__explicit_bzero_chk", {3, false, false}},
       {"__fdelt_chk", {1, false, false}},
       {"__fgets_chk", {4, false, false}},
@@ -1700,6 +1700,10 @@ bool mayDependOnSummaryClobberValue(
   }
   if (auto *cast = llvm::dyn_cast<llvm::CastInst>(value)) {
     return mayDependOnSummaryClobberValue(cast->getOperand(0), visiting);
+  }
+  if (auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value)) {
+    return mayDependOnSummaryClobberValue(binary->getOperand(0), visiting) ||
+           mayDependOnSummaryClobberValue(binary->getOperand(1), visiting);
   }
   return false;
 }

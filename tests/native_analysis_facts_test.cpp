@@ -233,6 +233,101 @@ bool testFlowNormalizerFoldsEhFrameOnlyBranchTarget(const char *argv0) {
   return ok;
 }
 
+bool testFlowNormalizerFoldsEhFrameTailBackIntoOwner(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t ownerEntry = *base + 0x1c0;
+  uint64_t ownerJoin = ownerEntry + 0x08;
+  uint64_t coldEntry = ownerEntry - 0x40;
+
+  notdec::bin2llvm::NativeFunction owner;
+  owner.Entry = ownerEntry;
+  owner.RangeStart = ownerEntry;
+  owner.RangeEnd = ownerJoin + 0x02;
+  owner.Source = "native-analysis-facts-test";
+  owner.Blocks.push_back({ownerEntry, ownerEntry + 0x02, {ownerJoin}});
+  owner.Blocks.push_back({ownerJoin, ownerJoin + 0x02, {}});
+  if (!state.addFunction(std::move(owner))) {
+    std::cerr << "failed to add owner function\n";
+    return false;
+  }
+
+  state.addFunctionSeed(coldEntry, 0, "", "eh-frame",
+                        notdec::bin2llvm::NativeFunctionConfidence::High);
+  state.addFunctionRange(coldEntry, coldEntry, coldEntry + 0x04, "eh-frame");
+
+  notdec::bin2llvm::NativeFunction coldFunction;
+  coldFunction.Entry = coldEntry;
+  coldFunction.RangeStart = coldEntry;
+  coldFunction.RangeEnd = coldEntry + 0x04;
+  coldFunction.Source = "gtirb-seed-range-fallback";
+  coldFunction.Blocks.push_back({coldEntry, coldEntry + 0x04, {}});
+  if (!state.addFunction(std::move(coldFunction))) {
+    std::cerr << "failed to add cold function\n";
+    return false;
+  }
+
+  state.addInstruction(makeInstruction(
+      ownerEntry, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::UnconditionalBranch));
+
+  auto coldTail = makeInstruction(
+      coldEntry, 0x04,
+      notdec::bin2llvm::NativeInstructionFlowKind::UnconditionalBranch);
+  coldTail.TailFlowTargets.push_back(ownerJoin);
+  state.addInstruction(std::move(coldTail));
+
+  state.addInstruction(makeInstruction(
+      ownerJoin, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::Return));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeFunction *folded = state.functionAt(ownerEntry);
+  bool sawColdBlock = false;
+  bool coldBranchesToOwnerJoin = false;
+  if (folded != nullptr) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block : folded->Blocks) {
+      if (block.Start == coldEntry && block.End == coldEntry + 0x04) {
+        sawColdBlock = true;
+        coldBranchesToOwnerJoin =
+            block.Successors.size() == 1 &&
+            block.Successors.front() == ownerJoin;
+      }
+    }
+  }
+
+  auto seed = state.functionSeeds().find(coldEntry);
+  const notdec::bin2llvm::NativeInstruction *normalizedTail =
+      state.instructionAt(coldEntry);
+
+  bool ok = true;
+  ok &= expectTrue(state.functionAt(coldEntry) == nullptr,
+                   "eh-frame tail-back block stayed a function");
+  ok &= expectTrue(seed != state.functionSeeds().end() && !seed->second.IsEntry,
+                   "tail-back eh-frame seed stayed an entry");
+  ok &= expectTrue(sawColdBlock, "tail-back cold block was not folded");
+  ok &= expectTrue(coldBranchesToOwnerJoin,
+                   "tail-back cold block did not branch to owner join");
+  ok &= expectTrue(normalizedTail != nullptr &&
+                       normalizedTail->DirectFlowTargets.size() == 1 &&
+                       normalizedTail->DirectFlowTargets.front() == ownerJoin &&
+                       normalizedTail->TailFlowTargets.empty(),
+                   "tail-back branch still carries tail-flow metadata");
+  return ok;
+}
+
 bool testFlowNormalizerMovesNonCfgTargetToTail(const char *argv0) {
   auto binary = parseSelfBinary(argv0);
   if (!binary) {
@@ -829,6 +924,87 @@ bool testFlowNormalizerSplitsFallthroughInsideBlock(const char *argv0) {
   return ok;
 }
 
+bool testFlowNormalizerImportsDecodedColdDirectTarget(const char *argv0) {
+  auto binary = parseSelfBinary(argv0);
+  if (!binary) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeProgramState state(*binary);
+  std::optional<uint64_t> base = firstExecutableAddress(state);
+  if (!base) {
+    std::cerr << "test binary has no executable range\n";
+    return false;
+  }
+
+  uint64_t coldTarget = *base + 0x170;
+  uint64_t entry = coldTarget + 0x40;
+  uint64_t coldJoin = entry + 0x08;
+
+  notdec::bin2llvm::NativeFunction function;
+  function.Entry = entry;
+  function.RangeStart = entry;
+  function.RangeEnd = entry + 0x20;
+  function.Source = "native-analysis-facts-test";
+  function.Blocks.push_back({entry, entry + 0x02, {coldTarget}});
+  function.Blocks.push_back({coldJoin, coldJoin + 0x02, {}});
+  if (!state.addFunction(std::move(function))) {
+    std::cerr << "failed to add test function with decoded cold target\n";
+    return false;
+  }
+
+  auto branch = makeInstruction(
+      entry, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::UnconditionalBranch);
+  branch.DirectFlowTargets.push_back(coldTarget);
+  state.addInstruction(std::move(branch));
+
+  auto coldBody = makeInstruction(
+      coldTarget, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::None);
+  coldBody.Fallthrough = coldTarget + 0x02;
+  state.addInstruction(std::move(coldBody));
+
+  auto coldTerminator = makeInstruction(
+      coldTarget + 0x02, 0x02,
+      notdec::bin2llvm::NativeInstructionFlowKind::UnconditionalBranch);
+  coldTerminator.DirectFlowTargets.push_back(coldJoin);
+  state.addInstruction(std::move(coldTerminator));
+
+  state.addInstruction(makeInstruction(
+      coldJoin, 0x02, notdec::bin2llvm::NativeInstructionFlowKind::Return));
+
+  notdec::bin2llvm::NativeAnalysisManager manager;
+  manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
+  manager.run(state);
+
+  const notdec::bin2llvm::NativeFunction *normalized = state.functionAt(entry);
+  bool sawColdBlock = false;
+  bool sawEntrySuccessor = false;
+  bool sawColdSuccessor = false;
+  if (normalized != nullptr) {
+    for (const notdec::bin2llvm::NativeBasicBlock &block :
+         normalized->Blocks) {
+      if (block.Start == entry && block.Successors.size() == 1 &&
+          block.Successors.front() == coldTarget) {
+        sawEntrySuccessor = true;
+      }
+      if (block.Start == coldTarget && block.End == coldTarget + 0x04) {
+        sawColdBlock = true;
+        sawColdSuccessor = block.Successors.size() == 1 &&
+                           block.Successors.front() == coldJoin;
+      }
+    }
+  }
+
+  bool ok = true;
+  ok &= expectTrue(sawColdBlock, "decoded cold direct target was not imported");
+  ok &= expectTrue(sawEntrySuccessor,
+                   "entry did not keep imported cold target successor");
+  ok &= expectTrue(sawColdSuccessor,
+                   "imported cold target did not keep local successor");
+  return ok;
+}
+
 bool testFlowNormalizerKeepsTrapTerminal(const char *argv0) {
   auto binary = parseSelfBinary(argv0);
   if (!binary) {
@@ -893,6 +1069,7 @@ int main(int argc, char **argv) {
   ok &= testUnresolvedFlowKindStrings();
   ok &= testRuntimeFilterPredicates(argv[0]);
   ok &= testFlowNormalizerFoldsEhFrameOnlyBranchTarget(argv[0]);
+  ok &= testFlowNormalizerFoldsEhFrameTailBackIntoOwner(argv[0]);
   ok &= testFlowNormalizerMovesNonCfgTargetToTail(argv[0]);
   ok &= testFlowNormalizerClassifiesFinalIndirectBranchTailExit(argv[0]);
   ok &= testFlowNormalizerKeepsMiddleIndirectBranchUnresolved(argv[0]);
@@ -902,6 +1079,7 @@ int main(int argc, char **argv) {
   ok &= testFlowNormalizerRemovesInvalidBlockSuccessors(argv[0]);
   ok &= testFlowNormalizerSplitsDirectTargetInsideBlock(argv[0]);
   ok &= testFlowNormalizerSplitsFallthroughInsideBlock(argv[0]);
+  ok &= testFlowNormalizerImportsDecodedColdDirectTarget(argv[0]);
   ok &= testFlowNormalizerKeepsTrapTerminal(argv[0]);
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
