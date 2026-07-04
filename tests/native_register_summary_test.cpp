@@ -1,4 +1,5 @@
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 
@@ -11,6 +12,8 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -244,6 +247,50 @@ bool testPartialWriteDoesNotReadEntryByItself() {
                 "partial write did not preserve untouched RAX bits") &&
          expect(raxSummary->MayNonEntry,
                 "partial write was not marked as modifying RAX");
+}
+
+bool testPartialReadReadsEntry() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-partial-read", context);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "partial_read_rax", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Value *value = builder.CreateCall(
+      partialRead,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateStore(value, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "partial_read_rax");
+  const auto *raxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RAX");
+  std::string entryMask =
+      raxSummary == nullptr ? "" : raxSummary->EntryDemandMaskHex;
+  std::transform(entryMask.begin(), entryMask.end(), entryMask.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  return expect(raxSummary != nullptr, "missing partial read RAX summary") &&
+         expect(raxSummary->ReadEntry,
+                "partial read helper was not marked readEntry") &&
+         expect(entryMask == "ffffffff",
+                "partial read did not keep low 32-bit demand mask") &&
+         expect(raxSummary->MayEntry,
+                "partial read lost entry value preservation") &&
+         expect(!raxSummary->MayNonEntry,
+                "partial read was incorrectly marked as modifying RAX");
 }
 
 bool testCalleeReadPropagatesToCallerEntry() {
@@ -512,6 +559,7 @@ int main() {
   bool ok = true;
   ok &= testKilledReadDoesNotBecomeInput();
   ok &= testPartialWriteDoesNotReadEntryByItself();
+  ok &= testPartialReadReadsEntry();
   ok &= testCalleeReadPropagatesToCallerEntry();
   ok &= testSparseJoinKeepsUntouchedPath();
   ok &= testTopDownDemandKeepsOnlyUsedReturn();

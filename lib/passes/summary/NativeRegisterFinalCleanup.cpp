@@ -1,5 +1,6 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
 
+#include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 
 #include "llvm/ADT/StringRef.h"
@@ -54,6 +55,7 @@ bool isRegisterHelperCall(const llvm::Instruction &inst) {
   llvm::Function *callee = call->getCalledFunction();
   return (callee != nullptr &&
           callee->getName().starts_with("notdec.register.")) ||
+         parseNativeRegisterPartialRead(*call).has_value() ||
          parseNativeRegisterPartialWrite(*call).has_value();
 }
 

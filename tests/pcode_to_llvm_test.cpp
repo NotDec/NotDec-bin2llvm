@@ -181,6 +181,16 @@ notdec::bin2llvm::PcodeOpView copyToPartialRegisterOp(uint64_t address) {
   return op;
 }
 
+notdec::bin2llvm::PcodeOpView copyFromPartialRegisterOp(uint64_t address) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  op.OpcodeName = "COPY";
+  op.Output = uniqueVarnode(0x500, 4);
+  op.Inputs.push_back(registerVarnode(0x0, 4, "EAX"));
+  return op;
+}
+
 notdec::bin2llvm::PcodeOpView returnOp(uint64_t address) {
   notdec::bin2llvm::PcodeOpView op;
   op.Address = address;
@@ -1376,6 +1386,50 @@ bool testPartialRegisterWriteUsesPartialWriteHelper() {
                 "module failed verifier after partial register helper lowering");
 }
 
+bool testPartialRegisterReadUsesPartialReadHelper() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Registers.push_back({"register", 0x0, 8, "RAX"});
+  program.Registers.push_back({"register", 0x0, 4, "EAX"});
+  program.Ops.push_back(copyFromPartialRegisterOp(0x1000));
+  program.Ops.push_back(returnOp(0x1001));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "partial_register_read_helper";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasPartialRead = false;
+  bool hasRaxLoad = false;
+  llvm::GlobalVariable *rax =
+      module ? module->getGlobalVariable("RAX") : nullptr;
+  if (function != nullptr) {
+    for (llvm::Instruction &instruction : llvm::instructions(function)) {
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+        llvm::Function *callee = call->getCalledFunction();
+        hasPartialRead |=
+            callee != nullptr &&
+            callee->getName() == "notdec.partial_read.i64.i32";
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+        hasRaxLoad |= load->getPointerOperand()->stripPointerCasts() == rax;
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "partial register read function is missing") &&
+         expect(hasPartialRead, "partial register read did not use helper") &&
+         expect(!hasRaxLoad, "partial register read kept full register load") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after partial register read lowering");
+}
+
 } // namespace
 
 int main() {
@@ -1413,5 +1467,6 @@ int main() {
   ok &= testX64ReturnSuppressesReturnAddressStackEffect();
   ok &= testNonX64DoesNotSuppressCallStackEffect();
   ok &= testPartialRegisterWriteUsesPartialWriteHelper();
+  ok &= testPartialRegisterReadUsesPartialReadHelper();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

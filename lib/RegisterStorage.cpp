@@ -1,5 +1,6 @@
 #include "notdec-bin2llvm/RegisterStorage.h"
 
+#include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 
 #include "llvm/IR/Constants.h"
@@ -203,17 +204,25 @@ llvm::Value *RegisterStorage::read(llvm::IRBuilderBase &builder,
   }
 
   llvm::GlobalVariable *global = globalFor(*unit);
-  llvm::Value *value =
-      builder.CreateLoad(global->getValueType(), global, access.Name.value_or(""));
-  addAccessMetadata(value, *unit, access);
   if (unit->Offset == access.Offset && unit->Size == access.Size) {
+    llvm::Value *value = builder.CreateLoad(global->getValueType(), global,
+                                            access.Name.value_or(""));
+    addAccessMetadata(value, *unit, access);
     return value;
   }
 
   auto *targetType = llvm::IntegerType::get(Context, bitWidth(access.Size));
-  llvm::Value *shifted = builder.CreateLShr(
-      value, llvm::ConstantInt::get(value->getType(), bitOffset(*unit, access)));
-  return builder.CreateTrunc(shifted, targetType);
+  uint64_t offset = bitOffset(*unit, access);
+  auto *globalType = llvm::cast<llvm::IntegerType>(global->getValueType());
+  llvm::Function *partialRead = getOrInsertNativeRegisterPartialRead(
+      Module, global->getType(), targetType, globalType->getBitWidth(),
+      targetType->getBitWidth());
+  llvm::CallInst *call = builder.CreateCall(
+      partialRead,
+      {global, llvm::ConstantInt::get(llvm::Type::getInt64Ty(Context), offset)},
+      access.Name.value_or(""));
+  addAccessMetadata(call, *unit, access);
+  return call;
 }
 
 void RegisterStorage::write(llvm::IRBuilderBase &builder,

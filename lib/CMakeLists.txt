@@ -4,6 +4,7 @@ add_library(notdec-bin2llvm-core STATIC
   ModuleBuilder.cpp
   NativeAbi.cpp
   NativePrototypeModel.cpp
+  NativeRegisterPartialRead.cpp
   NativeRegisterPartialWrite.cpp
   Pcode.cpp
   PcodeToLLVM.cpp

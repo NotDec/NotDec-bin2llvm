@@ -1,6 +1,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 
 #include "llvm/ADT/APInt.h"
@@ -266,8 +267,26 @@ std::string maskToHex(const llvm::APInt &mask) {
   return std::string(text.begin(), text.end());
 }
 
+unsigned globalBitWidth(llvm::GlobalVariable *global) {
+  if (global == nullptr) {
+    return 0;
+  }
+  llvm::Type *type = global->getValueType();
+  if (auto *integer = llvm::dyn_cast<llvm::IntegerType>(type)) {
+    return integer->getBitWidth();
+  }
+  if (type != nullptr && type->isSized()) {
+    return type->getScalarSizeInBits();
+  }
+  return 0;
+}
+
 bool addDemand(RegisterDemand &demand, llvm::GlobalVariable *global,
                llvm::APInt mask) {
+  unsigned width = globalBitWidth(global);
+  if (width != 0) {
+    mask = mask.zextOrTrunc(width);
+  }
   if (global == nullptr || mask.getBitWidth() == 0 || mask.isZero()) {
     return false;
   }
@@ -402,6 +421,9 @@ std::map<llvm::Value *, llvm::APInt> computeValueDemands(
       continue;
     }
     if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+      if (parseNativeRegisterPartialRead(*call)) {
+        continue;
+      }
       if (std::optional<NativeRegisterPartialWriteInfo> partial =
               parseNativeRegisterPartialWrite(*call)) {
         enqueue(partial->Value, fullMaskForValue(partial->Value));
@@ -613,6 +635,7 @@ bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
 bool isAnalyzableCall(const llvm::Instruction &inst) {
   auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
   if (call == nullptr || isNotDecRegisterHelperCall(*call) ||
+      parseNativeRegisterPartialRead(*call).has_value() ||
       parseNativeRegisterPartialWrite(*call).has_value()) {
     return false;
   }
@@ -1098,6 +1121,16 @@ private:
       return;
     }
     if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+      std::optional<NativeRegisterPartialReadInfo> partialRead =
+          parseNativeRegisterPartialRead(*call);
+      if (partialRead) {
+        auto unitIt = Units.find(partialRead->Global);
+        if (unitIt != Units.end() && !isIgnored(unitIt->second, Options)) {
+          readRegister(state, partialRead->Global);
+        }
+        state.ValueOrigins.erase(&inst);
+        return;
+      }
       std::optional<NativeRegisterPartialWriteInfo> partial =
           parseNativeRegisterPartialWrite(*call);
       if (partial) {
@@ -1364,6 +1397,11 @@ private:
                   const std::map<llvm::Value *, llvm::APInt> &valueDemands) {
     for (llvm::Instruction &inst : llvm::reverse(block)) {
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (std::optional<NativeRegisterPartialReadInfo> partial =
+                parseNativeRegisterPartialRead(*call)) {
+          addDemand(live, partial->Global, valueDemand(call, valueDemands));
+          continue;
+        }
         if (std::optional<NativeRegisterPartialWriteInfo> partial =
                 parseNativeRegisterPartialWrite(*call)) {
           addDemand(live, partial->Global,

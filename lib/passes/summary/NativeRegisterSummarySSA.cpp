@@ -1,6 +1,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
@@ -821,6 +822,7 @@ bool isKnownExternalFunction(const llvm::Function &function) {
 bool isUnknownExternalFunction(const llvm::Function &function) {
   return function.isDeclaration() && !function.isIntrinsic() &&
          !function.getName().starts_with("notdec.register.") &&
+         !isNativeRegisterPartialReadName(function.getName()) &&
          !isNativeRegisterPartialWriteName(function.getName()) &&
          !isKnownExternalFunction(function);
 }
@@ -991,6 +993,7 @@ bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
 
 bool isAnalyzableCall(const llvm::CallBase &call) {
   if (isNotDecRegisterHelperCall(call) ||
+      parseNativeRegisterPartialRead(call).has_value() ||
       parseNativeRegisterPartialWrite(call).has_value()) {
     return false;
   }
@@ -1756,6 +1759,7 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
   for (llvm::Function &function : module) {
     if (function.isIntrinsic() ||
         function.getName().starts_with("notdec.register.") ||
+        isNativeRegisterPartialReadName(function.getName()) ||
         isNativeRegisterPartialWriteName(function.getName())) {
       continue;
     }
@@ -1819,6 +1823,10 @@ public:
     Summary.FunctionName = Function.getName().str();
     collectAccesses();
     if (Options.EnableRewrite) {
+      rewritePartialReads();
+      if (Options.EnableResidueRemoval) {
+        removeDeadReplacedPartialReads();
+      }
       rewriteLoads();
       collectSignatureCallArgs();
       collectFunctionReturnValues();
@@ -1838,6 +1846,8 @@ public:
   void removeDeadStoresAfterSignatureRewrite() {
     Summary.FunctionName = Function.getName().str();
     PostSignatureCleanup = true;
+    rewritePartialReads();
+    removeDeadReplacedPartialReads();
     rewritePartialWrites();
     removeDeadStoresByLiveness();
   }
@@ -1851,7 +1861,9 @@ private:
   NativeRegisterSummarySSAFunctionSummary &Summary;
   SignatureRewriteState &SignatureState;
   std::vector<llvm::LoadInst *> Loads;
+  std::vector<llvm::CallBase *> PartialReads;
   std::vector<llvm::LoadInst *> ReplacedLoads;
+  std::vector<llvm::CallBase *> ReplacedPartialReads;
   std::map<BlockRegKey, llvm::Value *> EntryValue;
   std::map<BlockRegKey, llvm::Value *> ExitValue;
   std::map<BlockRegKey, llvm::PHINode *> PendingPhi;
@@ -1987,6 +1999,98 @@ private:
         unit.Name + ".partial_keep");
     return builder.CreateOr(keptValue, wideValue,
                             unit.Name + ".partial_write");
+  }
+
+  llvm::Value *extractPartialRegisterValue(const RegisterUnit &unit,
+                                           llvm::Value *fullValue,
+                                           unsigned readWidth,
+                                           uint64_t bitOffset,
+                                           llvm::Instruction *before) {
+    if (fullValue == nullptr || before == nullptr) {
+      return nullptr;
+    }
+    auto *baseType =
+        llvm::dyn_cast<llvm::IntegerType>(unit.Global->getValueType());
+    if (baseType == nullptr || fullValue->getType() != baseType ||
+        readWidth == 0 || bitOffset + readWidth > baseType->getBitWidth()) {
+      return nullptr;
+    }
+    llvm::IRBuilder<> builder(before);
+    llvm::Value *value = fullValue;
+    if (bitOffset != 0) {
+      value = builder.CreateLShr(
+          value, llvm::ConstantInt::get(baseType, bitOffset),
+          unit.Name + ".partial_read_shift");
+    }
+    auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
+    return builder.CreateTrunc(value, resultType,
+                               unit.Name + ".partial_read");
+  }
+
+  llvm::Value *extractBitsFromInteger(llvm::Value *value, unsigned readWidth,
+                                      uint64_t bitOffset,
+                                      llvm::Instruction *before,
+                                      llvm::Twine name) {
+    if (value == nullptr || before == nullptr) {
+      return nullptr;
+    }
+    auto *sourceType = llvm::dyn_cast<llvm::IntegerType>(value->getType());
+    if (sourceType == nullptr || readWidth == 0 ||
+        bitOffset + readWidth > sourceType->getBitWidth()) {
+      return nullptr;
+    }
+    llvm::IRBuilder<> builder(before);
+    llvm::Value *result = value;
+    if (bitOffset != 0) {
+      result = builder.CreateLShr(
+          result, llvm::ConstantInt::get(sourceType, bitOffset),
+          name + ".shift");
+    }
+    auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
+    if (result->getType() == resultType) {
+      return result;
+    }
+    return builder.CreateTrunc(result, resultType, name);
+  }
+
+  llvm::Value *readCoveredPartialWriteBefore(llvm::BasicBlock &block,
+                                             const RegisterUnit &unit,
+                                             unsigned readWidth,
+                                             uint64_t bitOffset,
+                                             llvm::Instruction *before) {
+    for (auto it = before->getIterator(); it != block.begin();) {
+      --it;
+      llvm::Instruction &inst = *it;
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (parseNativeRegisterPartialRead(*call)) {
+          continue;
+        }
+        std::optional<NativeRegisterPartialWriteInfo> partial =
+            parseNativeRegisterPartialWrite(*call);
+        if (!partial || partial->Global != unit.Global) {
+          continue;
+        }
+        uint64_t readEnd = bitOffset + readWidth;
+        uint64_t writeEnd = partial->BitOffset + partial->WriteWidth;
+        if (bitOffset < partial->BitOffset || readEnd > writeEnd) {
+          return nullptr;
+        }
+        return extractBitsFromInteger(partial->Value, readWidth,
+                                      bitOffset - partial->BitOffset, before,
+                                      unit.Name + ".partial_read");
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit != nullptr && access.Unit->Global == unit.Global &&
+            access.IsStorageValue) {
+          return nullptr;
+        }
+      }
+      if (inst.mayWriteToMemory()) {
+        return nullptr;
+      }
+    }
+    return nullptr;
   }
 
   void eraseTriviallyDeadNonPhiTree(llvm::Instruction *root) {
@@ -2504,6 +2608,13 @@ private:
           continue;
         }
         if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+          std::optional<NativeRegisterPartialReadInfo> partialRead =
+              parseNativeRegisterPartialRead(*call);
+          if (partialRead && Units.count(partialRead->Global) != 0) {
+            ++Summary.LoadsSeen;
+            PartialReads.push_back(call);
+            continue;
+          }
           std::optional<NativeRegisterPartialWriteInfo> partial =
               parseNativeRegisterPartialWrite(*call);
           if (partial && Units.count(partial->Global) != 0) {
@@ -2511,6 +2622,41 @@ private:
           }
         }
       }
+    }
+  }
+
+  void rewritePartialReads() {
+    for (llvm::CallBase *call : PartialReads) {
+      if (call->getParent() == nullptr) {
+        continue;
+      }
+      std::optional<NativeRegisterPartialReadInfo> partial =
+          parseNativeRegisterPartialRead(*call);
+      if (!partial) {
+        continue;
+      }
+      auto unitIt = Units.find(partial->Global);
+      if (unitIt == Units.end()) {
+        continue;
+      }
+      llvm::Value *value = readCoveredPartialWriteBefore(
+          *call->getParent(), unitIt->second, partial->ReadWidth,
+          partial->BitOffset, call);
+      if (value == nullptr) {
+        llvm::Value *fullValue =
+            readValueBefore(*call->getParent(), unitIt->second, call);
+        fullValue = resolve(fullValue);
+        value = extractPartialRegisterValue(unitIt->second, fullValue,
+                                            partial->ReadWidth,
+                                            partial->BitOffset, call);
+      }
+      if (value == nullptr || value->getType() != call->getType()) {
+        continue;
+      }
+      Replacement[call] = value;
+      call->replaceAllUsesWith(value);
+      ReplacedPartialReads.push_back(call);
+      ++Summary.LoadsReplaced;
     }
   }
 
@@ -2533,6 +2679,16 @@ private:
                         markerNode("true"));
       ReplacedLoads.push_back(load);
       ++Summary.LoadsReplaced;
+    }
+  }
+
+  void removeDeadReplacedPartialReads() {
+    for (llvm::CallBase *call : ReplacedPartialReads) {
+      if (call->getParent() == nullptr || !call->use_empty()) {
+        continue;
+      }
+      call->eraseFromParent();
+      ++Summary.DeadLoadsRemoved;
     }
   }
 
@@ -2650,6 +2806,9 @@ private:
         continue;
       }
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (transferPartialReadLiveness(*call, live)) {
+          continue;
+        }
         if (transferPartialWriteLiveness(*call, live)) {
           continue;
         }
@@ -2680,6 +2839,9 @@ private:
         continue;
       }
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (transferPartialReadLiveness(*call, live)) {
+          continue;
+        }
         if (std::optional<NativeRegisterPartialWriteInfo> partial =
                 parseNativeRegisterPartialWrite(*call)) {
           if (Units.count(partial->Global) != 0 &&
@@ -2734,6 +2896,17 @@ private:
       }
       live.insert(access.Unit->Global);
     }
+  }
+
+  bool transferPartialReadLiveness(
+      llvm::CallBase &call, std::set<llvm::GlobalVariable *> &live) const {
+    std::optional<NativeRegisterPartialReadInfo> partial =
+        parseNativeRegisterPartialRead(call);
+    if (!partial || Units.count(partial->Global) == 0) {
+      return false;
+    }
+    live.insert(partial->Global);
+    return true;
   }
 
   bool transferPartialWriteLiveness(
@@ -2800,6 +2973,9 @@ private:
         continue;
       }
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (parseNativeRegisterPartialRead(*call)) {
+          continue;
+        }
         if (std::optional<NativeRegisterPartialWriteInfo> partial =
                 parseNativeRegisterPartialWrite(*call)) {
           if (partial->Global != unit.Global) {
@@ -3225,6 +3401,13 @@ private:
         continue;
       }
       if (auto *otherCall = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (std::optional<NativeRegisterPartialReadInfo> partial =
+                parseNativeRegisterPartialRead(*otherCall)) {
+          if (partial->Global == unit.Global) {
+            return nullptr;
+          }
+          continue;
+        }
         if (std::optional<NativeRegisterPartialWriteInfo> partial =
                 parseNativeRegisterPartialWrite(*otherCall)) {
           if (partial->Global == unit.Global) {
