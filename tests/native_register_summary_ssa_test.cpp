@@ -4479,7 +4479,10 @@ bool testKnownUnaryLibmUsesFloatAbiSlots() {
     for (llvm::Instruction &inst : llvm::instructions(function)) {
       if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
         if (call->getCalledFunction() != nullptr &&
-            call->getCalledFunction()->getName() == calleeName) {
+            (call->getCalledFunction()->getName() == calleeName ||
+             (calleeName == "log" &&
+              call->getCalledFunction()->getIntrinsicID() ==
+                  llvm::Intrinsic::log))) {
           rewrittenCall = call;
         }
       }
@@ -4503,6 +4506,9 @@ bool testKnownUnaryLibmUsesFloatAbiSlots() {
     }
     ok &= expect(zmmStores == 0,
                  (prefix + "ABI ZMM argument store remained").c_str());
+    ok &= expect(!moduleHasFunctionNamed(module,
+                                         "notdec.register.summary_return.i64"),
+                 (prefix + "range return helper remained").c_str());
     ok &= expect(summary.CallsRewritten >= 1,
                  (prefix + "call was not counted as rewritten").c_str());
     ok &= verifyOk(module, (prefix + "module failed verifier").c_str());
