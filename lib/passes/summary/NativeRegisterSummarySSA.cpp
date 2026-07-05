@@ -122,6 +122,16 @@ struct RegisterRangeKey {
            BitWidth == other.BitWidth;
   }
 };
+
+// A range definition can come from a value that covers exactly this segment
+// today, and later from a wider value after full-register writes are fully
+// folded into range SSA.  Keeping the covered range explicit avoids treating a
+// bare LLVM value as if it always represented the whole register.
+struct RangedSSAValue {
+  llvm::Value *Value = nullptr;
+  RegisterRangeKey CoveredRange;
+};
+
 using BlockRangeKey = std::pair<llvm::BasicBlock *, RegisterRangeKey>;
 using InstRangeKey = std::pair<llvm::Instruction *, RegisterRangeKey>;
 using LiveRegisterRanges = std::set<RegisterRangeKey>;
@@ -2063,6 +2073,11 @@ private:
   std::map<BlockRangeKey, llvm::Value *> ExitRangeValue;
   std::map<BlockRangeKey, llvm::PHINode *> PendingRangePhi;
   std::set<BlockRangeKey> ResolvingRangeEntry;
+  // Block-local range definitions rebuilt from the block entry to the current
+  // read point.  This is the first strict currentDef path: same-block reads no
+  // longer scan backward from the use, and later stages can make this cache
+  // persistent across increasing instruction positions.
+  std::map<BlockRangeKey, RangedSSAValue> CurrentDef;
   // Segment definitions produced by local writes.  This is the first step away
   // from treating partial writes as a special read-time matcher: a write now
   // records the canonical ranges it defines, and later reads consume those
@@ -3916,6 +3931,7 @@ private:
       return nullptr;
     }
     LocalRangeWrites[{&writeInst, range}] = value;
+    CurrentDef[{writeInst.getParent(), range}] = RangedSSAValue{value, range};
     return value;
   }
 
@@ -3948,6 +3964,21 @@ private:
     return cached == LocalRangeWrites.end() ? nullptr : resolve(cached->second);
   }
 
+  llvm::Value *currentSegment(llvm::BasicBlock &block,
+                              const RegisterRangeKey &range) {
+    auto cached = CurrentDef.find({&block, range});
+    if (cached == CurrentDef.end()) {
+      return nullptr;
+    }
+    const RangedSSAValue &def = cached->second;
+    if (!(def.CoveredRange == range)) {
+      return nullptr;
+    }
+    llvm::Value *value = resolve(def.Value);
+    return value != nullptr && value->getType() == rangeType(range) ? value
+                                                                    : nullptr;
+  }
+
   llvm::Value *readRangeBefore(llvm::BasicBlock &block,
                                const RegisterRangeKey &range,
                                llvm::Instruction *before,
@@ -3957,8 +3988,9 @@ private:
       return nullptr;
     }
 
-    for (auto it = before->getIterator(); it != block.begin();) {
-      --it;
+    CurrentDef.erase({&block, range});
+    bool blockedByUnknown = false;
+    for (auto it = block.begin(); it != block.end() && &*it != before; ++it) {
       llvm::Instruction &inst = *it;
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
         RegisterAccess access = registerStore(*store, Units);
@@ -3968,7 +4000,8 @@ private:
               *store, range.Global, 0, registerBitWidth(*access.Unit),
               resolve(store->getValueOperand()), 0,
               rangeWriteInsertPoint(*store, before), unit->Name + ".range_store");
-          return writtenSegment(*store, range);
+          blockedByUnknown = false;
+          continue;
         }
         continue;
       }
@@ -3988,11 +4021,14 @@ private:
               unit->Name + ".range_partial_write");
           uint64_t writeEnd = partial->BitOffset + partial->WriteWidth;
           uint64_t rangeEnd = range.BitOffset + range.BitWidth;
-          if (llvm::Value *segment = writtenSegment(*call, range)) {
-            return segment;
+          if (currentSegment(block, range) == nullptr &&
+              range.BitOffset < writeEnd && partial->BitOffset < rangeEnd) {
+            blockedByUnknown = true;
+            CurrentDef.erase({&block, range});
+            continue;
           }
-          if (range.BitOffset < writeEnd && partial->BitOffset < rangeEnd) {
-            return nullptr;
+          if (currentSegment(block, range) != nullptr) {
+            blockedByUnknown = false;
           }
           continue;
         }
@@ -4011,7 +4047,14 @@ private:
           llvm::Function *callee = call->getCalledFunction();
           if (callee != nullptr && (range.BitOffset != 0 ||
                                     range.BitWidth != registerBitWidth(*unit))) {
-            return callRangeValue(*call, range, kind);
+            llvm::Value *value = callRangeValue(*call, range, kind);
+            value = resolve(value);
+            if (value == nullptr || value->getType() != rangeType(range)) {
+              return nullptr;
+            }
+            CurrentDef[{&block, range}] = RangedSSAValue{value, range};
+            blockedByUnknown = false;
+            continue;
           }
           llvm::Value *full = callValue(*call, *unit, kind);
           auto *fullInst = llvm::dyn_cast<llvm::Instruction>(full);
@@ -4023,12 +4066,27 @@ private:
           if (insertBefore == nullptr) {
             insertBefore = call->getParent()->getTerminator();
           }
-          return extractRangeValue(range, full, 0, insertBefore,
-                                   unit->Name + ".range_" + kind);
+          llvm::Value *value = extractRangeValue(range, full, 0, insertBefore,
+                                                 unit->Name + ".range_" + kind);
+          value = resolve(value);
+          if (value == nullptr || value->getType() != rangeType(range)) {
+            return nullptr;
+          }
+          CurrentDef[{&block, range}] = RangedSSAValue{value, range};
+          blockedByUnknown = false;
+          continue;
         }
         ++Summary.UnknownCallEffects;
-        return nullptr;
+        CurrentDef.erase({&block, range});
+        blockedByUnknown = true;
+        continue;
       }
+    }
+    if (llvm::Value *value = currentSegment(block, range)) {
+      return value;
+    }
+    if (blockedByUnknown) {
+      return nullptr;
     }
     return readRangeEntry(block, range, domTree);
   }
