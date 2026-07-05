@@ -3355,6 +3355,49 @@ bool testInternalSignatureRewriteUsesReadEntryReturnRegisterArg() {
                   "module failed verifier after RAX entry argument test");
 }
 
+bool testInternalSignatureRewriteUsesNarrowEntryRangeArg() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-narrow-entry-range-arg", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rdi->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *function =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_read_entry_rdi32", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *input = builder.CreateCall(
+      partialRead, {rdi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                                0)},
+      "input32");
+  builder.CreateStore(input, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten =
+      module.getFunction("notdec_native_read_entry_rdi32");
+
+  return expect(rewritten != nullptr, "narrow RDI entry callee missing") &&
+         expect(rewritten->arg_size() == 1,
+                "narrow RDI entry was not added as argument") &&
+         expect(rewritten->getArg(0)->getType()->isIntegerTy(32),
+                "narrow RDI entry argument was not i32") &&
+         expect(!hasRegisterLoad(*rewritten, "RDI"),
+                "narrow RDI entry left raw RDI load") &&
+         expect(!hasPartialReadCall(*rewritten),
+                "narrow RDI entry left partial read helper") &&
+         verifyOk(module,
+                  "module failed verifier after narrow RDI entry argument test");
+}
+
 bool testPostSignatureCleanupRewritesInternalEntryRawLoad() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-post-signature-entry-load", context);
@@ -5946,6 +5989,7 @@ int main() {
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testInternalSignatureRewriteUsesReadEntryReturnRegisterArg();
+  ok &= testInternalSignatureRewriteUsesNarrowEntryRangeArg();
   ok &= testPostSignatureCleanupRewritesInternalEntryRawLoad();
   ok &= testInternalSignatureRewriteUsesZmmArgAndReturn();
   ok &= testPreservedZmmEntryIsPassedAsInternalArgument();

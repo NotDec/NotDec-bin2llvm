@@ -293,6 +293,71 @@ bool testPartialReadReadsEntry() {
                 "partial read was incorrectly marked as modifying RAX");
 }
 
+bool testKnownVarArgExternalKeepsFullInputDemand() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-vararg-full-input-demand", context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_vararg_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  for (const char *name : {"RDI", "RSI", "RDX", "RCX"}) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 1;
+    input.MaxSize = 8;
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = name;
+    abi.Inputs.push_back(input);
+  }
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "RAX";
+  abi.Outputs.push_back(output);
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rcx->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  auto *openType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *open = llvm::Function::Create(
+      openType, llvm::GlobalValue::ExternalLinkage, "open", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "partial_rcx_before_open",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *low = builder.CreateCall(
+      partialRead,
+      {rcx, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateStore(low, sink);
+  builder.CreateCall(openType, open);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "partial_rcx_before_open");
+  const auto *rcxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RCX");
+  std::string entryMask =
+      rcxSummary == nullptr ? "" : rcxSummary->EntryDemandMaskHex;
+  std::transform(entryMask.begin(), entryMask.end(), entryMask.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  return expect(rcxSummary != nullptr, "missing vararg RCX summary") &&
+         expect(rcxSummary->ReadEntry,
+                "known vararg call did not read entry RCX") &&
+         expect(entryMask == "ffffffffffffffff",
+                "known vararg call did not keep full RCX demand mask");
+}
+
 bool testCalleeReadPropagatesToCallerEntry() {
   llvm::LLVMContext context;
   llvm::Module module("summary-call-read", context);
@@ -560,6 +625,7 @@ int main() {
   ok &= testKilledReadDoesNotBecomeInput();
   ok &= testPartialWriteDoesNotReadEntryByItself();
   ok &= testPartialReadReadsEntry();
+  ok &= testKnownVarArgExternalKeepsFullInputDemand();
   ok &= testCalleeReadPropagatesToCallerEntry();
   ok &= testSparseJoinKeepsUntouchedPath();
   ok &= testTopDownDemandKeepsOnlyUsedReturn();

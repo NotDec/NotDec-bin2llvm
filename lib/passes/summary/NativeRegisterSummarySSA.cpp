@@ -1288,6 +1288,47 @@ NativeSignatureSlot integerSignatureSlot(const RegisterUnit &unit) {
   return slot;
 }
 
+std::optional<NativeSignatureSlot>
+integerSlotForSingleDemandRange(const RegisterUnit &unit,
+                                const llvm::APInt &demand) {
+  if (demand.getBitWidth() == 0 || demand.isZero()) {
+    return std::nullopt;
+  }
+  auto *registerType =
+      llvm::dyn_cast<llvm::IntegerType>(unit.Global->getValueType());
+  if (registerType == nullptr) {
+    return std::nullopt;
+  }
+  unsigned registerBits = registerType->getBitWidth();
+  llvm::APInt trimmed = demand.zextOrTrunc(registerBits);
+  unsigned start = 0;
+  while (start < registerBits && !trimmed[start]) {
+    ++start;
+  }
+  unsigned end = start;
+  while (end < registerBits && trimmed[end]) {
+    ++end;
+  }
+  if (start == end) {
+    return std::nullopt;
+  }
+  for (unsigned bit = end; bit < registerBits; ++bit) {
+    if (trimmed[bit]) {
+      return std::nullopt;
+    }
+  }
+
+  NativeSignatureSlot slot;
+  slot.Kind = NativeSignatureSlotKind::IntegerRegister;
+  slot.Unit = &unit;
+  slot.AbiName = unit.Name;
+  slot.OffsetBits = start;
+  slot.SizeBits = end - start;
+  slot.LlvmType = llvm::IntegerType::get(unit.Global->getContext(),
+                                         slot.SizeBits);
+  return slot;
+}
+
 std::optional<NativeSignatureSlot> signatureSlotFromAbi(
     const AbiFacts::RegisterSlot &abiSlot,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -1478,7 +1519,13 @@ SignatureShape shapeForInternalFunction(
         shape.Params.push_back(*floatSlot);
       } else if (regIt->second.EntryDemandMask.getBitWidth() != 0 &&
                  !regIt->second.EntryDemandMask.isZero()) {
-        shape.Params.push_back(integerSignatureSlot(*unit));
+        if (std::optional<NativeSignatureSlot> rangeSlot =
+                integerSlotForSingleDemandRange(*unit,
+                                                regIt->second.EntryDemandMask)) {
+          shape.Params.push_back(*rangeSlot);
+        } else {
+          shape.Params.push_back(integerSignatureSlot(*unit));
+        }
       } else {
         // ReadEntry already says the internal function needs an incoming
         // value.  If the demand walker did not recover a float lane mask, use
@@ -1488,7 +1535,13 @@ SignatureShape shapeForInternalFunction(
       }
       continue;
     }
-    shape.Params.push_back(integerSignatureSlot(*unit));
+    if (std::optional<NativeSignatureSlot> rangeSlot =
+            integerSlotForSingleDemandRange(*unit,
+                                            regIt->second.EntryDemandMask)) {
+      shape.Params.push_back(*rangeSlot);
+    } else {
+      shape.Params.push_back(integerSignatureSlot(*unit));
+    }
   }
 
   for (const RegisterUnit *unit : orderedUnits) {
@@ -1514,11 +1567,23 @@ SignatureShape shapeForInternalFunction(
         } else if (function.getReturnType()->isVoidTy() &&
                    regIt->second.ExitDemandMask.getBitWidth() != 0 &&
                    !regIt->second.ExitDemandMask.isZero()) {
-          shape.Returns.push_back(integerSignatureSlot(*unit));
+          if (std::optional<NativeSignatureSlot> rangeSlot =
+                  integerSlotForSingleDemandRange(
+                      *unit, regIt->second.ExitDemandMask)) {
+            shape.Returns.push_back(*rangeSlot);
+          } else {
+            shape.Returns.push_back(integerSignatureSlot(*unit));
+          }
         }
         continue;
       }
-      shape.Returns.push_back(integerSignatureSlot(*unit));
+      if (std::optional<NativeSignatureSlot> rangeSlot =
+              integerSlotForSingleDemandRange(*unit,
+                                              regIt->second.ExitDemandMask)) {
+        shape.Returns.push_back(*rangeSlot);
+      } else {
+        shape.Returns.push_back(integerSignatureSlot(*unit));
+      }
     }
   }
   return shape;
@@ -4324,22 +4389,60 @@ private:
     return load;
   }
 
-  llvm::Value *entryArgument(const RegisterUnit &unit) const {
+  std::pair<llvm::Argument *, const NativeSignatureSlot *>
+  entryArgumentSlot(const RegisterUnit &unit) const {
     auto shapeIt = SignatureState.Shapes.find(&Function);
     if (shapeIt == SignatureState.Shapes.end()) {
-      return nullptr;
+      return {nullptr, nullptr};
     }
     llvm::Argument *arg = Function.arg_begin();
     for (const NativeSignatureSlot &slot : shapeIt->second.Params) {
       if (arg == Function.arg_end()) {
-        return nullptr;
+        return {nullptr, nullptr};
       }
       if (slot.Unit == &unit || slot.Unit->Global == unit.Global) {
-        return arg;
+        return {arg, &slot};
       }
       ++arg;
     }
-    return nullptr;
+    return {nullptr, nullptr};
+  }
+
+  llvm::Value *entryArgument(const RegisterUnit &unit) const {
+    return entryArgumentSlot(unit).first;
+  }
+
+  llvm::Value *entryRangeArgument(const RegisterRangeKey &range,
+                                  llvm::Instruction *insertBefore) {
+    const RegisterUnit *unit = unitForRange(range);
+    if (unit == nullptr || insertBefore == nullptr) {
+      return nullptr;
+    }
+    auto [arg, slot] = entryArgumentSlot(*unit);
+    if (arg == nullptr || slot == nullptr || slot->SizeBits == 0 ||
+        range.BitOffset < slot->OffsetBits ||
+        range.BitOffset + range.BitWidth > slot->OffsetBits + slot->SizeBits) {
+      return nullptr;
+    }
+
+    if (slot->Kind == NativeSignatureSlotKind::FloatRegister) {
+      if (range.BitOffset != slot->OffsetBits ||
+          range.BitWidth != slot->SizeBits ||
+          !arg->getType()->isFloatingPointTy()) {
+        return nullptr;
+      }
+      llvm::IRBuilder<> builder(insertBefore);
+      llvm::Type *bitsType =
+          llvm::IntegerType::get(Function.getContext(), range.BitWidth);
+      return builder.CreateBitCast(arg, bitsType,
+                                   unit->Name + ".range_entry_arg");
+    }
+
+    if (!arg->getType()->isIntegerTy()) {
+      return nullptr;
+    }
+    return extractRangeValue(range, arg, slot->OffsetBits, insertBefore,
+                             unit->Name + ".range_entry_arg");
   }
 
   llvm::Value *entryRangeInput(const RegisterRangeKey &range) {
@@ -4352,15 +4455,11 @@ private:
       return nullptr;
     }
     if (PostSignatureCleanup) {
-      if (llvm::Value *arg = entryArgument(*unit)) {
-        llvm::Instruction *insertBefore =
-            &*Function.getEntryBlock().getFirstInsertionPt();
-        llvm::Value *value = extractRangeValue(range, arg, 0, insertBefore,
-                                               unit->Name + ".range_entry_arg");
-        if (value != nullptr) {
-          EntryRangeInputs.emplace(range, value);
-          return value;
-        }
+      llvm::Instruction *insertBefore =
+          &*Function.getEntryBlock().getFirstInsertionPt();
+      if (llvm::Value *value = entryRangeArgument(range, insertBefore)) {
+        EntryRangeInputs.emplace(range, value);
+        return value;
       }
     }
     llvm::LoadInst *fullInput = entryInput(*unit);
@@ -5379,6 +5478,131 @@ llvm::Value *replacementForOldCallUses(llvm::IRBuilder<> &builder,
   return nullptr;
 }
 
+llvm::Value *integerEntrySlotReplacement(llvm::Instruction &inst,
+                                         llvm::LoadInst &entryLoad,
+                                         const NativeSignatureSlot &slot,
+                                         llvm::Argument &arg,
+                                         llvm::IRBuilder<> &builder) {
+  if (slot.Kind != NativeSignatureSlotKind::IntegerRegister ||
+      !arg.getType()->isIntegerTy()) {
+    return nullptr;
+  }
+  auto *argType = llvm::cast<llvm::IntegerType>(arg.getType());
+  auto buildSubrange = [&](uint64_t offset, unsigned width) -> llvm::Value * {
+    if (width == 0 || offset < slot.OffsetBits ||
+        offset + width > slot.OffsetBits + slot.SizeBits) {
+      return nullptr;
+    }
+    uint64_t argOffset = offset - slot.OffsetBits;
+    if (argOffset + width > argType->getBitWidth()) {
+      return nullptr;
+    }
+    llvm::Value *value = &arg;
+    if (argOffset != 0) {
+      value = builder.CreateLShr(value,
+                                 llvm::ConstantInt::get(argType, argOffset),
+                                 slot.Unit->Name + ".entry_arg_shift");
+    }
+    auto *resultType = llvm::IntegerType::get(arg.getContext(), width);
+    if (value->getType() != resultType) {
+      value = builder.CreateTrunc(value, resultType,
+                                  slot.Unit->Name + ".entry_arg");
+    }
+    return value;
+  };
+
+  if (inst.getType() == arg.getType() && &inst == &entryLoad &&
+      slot.OffsetBits == 0 &&
+      slot.SizeBits == arg.getType()->getIntegerBitWidth()) {
+    return &arg;
+  }
+  auto *trunc = llvm::dyn_cast<llvm::TruncInst>(&inst);
+  if (trunc != nullptr && trunc->getOperand(0) == &entryLoad) {
+    return buildSubrange(0, trunc->getType()->getIntegerBitWidth());
+  }
+  auto *andOp = llvm::dyn_cast<llvm::BinaryOperator>(&inst);
+  if (andOp != nullptr && andOp->getOpcode() == llvm::Instruction::And) {
+    llvm::Value *source = nullptr;
+    llvm::ConstantInt *mask = nullptr;
+    if (andOp->getOperand(0) == &entryLoad) {
+      source = andOp->getOperand(0);
+      mask = llvm::dyn_cast<llvm::ConstantInt>(andOp->getOperand(1));
+    } else if (andOp->getOperand(1) == &entryLoad) {
+      source = andOp->getOperand(1);
+      mask = llvm::dyn_cast<llvm::ConstantInt>(andOp->getOperand(0));
+    }
+    if (source != nullptr && mask != nullptr &&
+        mask->getValue().isMask(mask->getBitWidth())) {
+      unsigned width = mask->getValue().countTrailingOnes();
+      llvm::Value *narrow = buildSubrange(0, width);
+      if (narrow == nullptr) {
+        return nullptr;
+      }
+      return builder.CreateZExtOrTrunc(narrow, inst.getType(),
+                                       slot.Unit->Name + ".entry_arg_wide");
+    }
+    if (source != nullptr && mask != nullptr &&
+        mask->getValue().isShiftedMask()) {
+      unsigned offset = mask->getValue().countr_zero();
+      unsigned width = mask->getValue().getActiveBits() - offset;
+      llvm::Value *narrow = buildSubrange(offset, width);
+      if (narrow == nullptr) {
+        return nullptr;
+      }
+      llvm::Value *wide = builder.CreateZExtOrTrunc(
+          narrow, inst.getType(), slot.Unit->Name + ".entry_arg_wide");
+      return builder.CreateShl(wide, llvm::ConstantInt::get(inst.getType(), offset),
+                               slot.Unit->Name + ".entry_arg_shifted");
+    }
+  }
+  auto *shift = llvm::dyn_cast<llvm::LShrOperator>(&inst);
+  if (shift != nullptr && shift->getOperand(0) == &entryLoad) {
+    auto *amount = llvm::dyn_cast<llvm::ConstantInt>(shift->getOperand(1));
+    if (amount != nullptr) {
+      unsigned width = shift->getType()->getIntegerBitWidth();
+      llvm::Value *narrow = buildSubrange(amount->getZExtValue(), width);
+      if (narrow == nullptr) {
+        return nullptr;
+      }
+      return builder.CreateZExtOrTrunc(narrow, shift->getType(),
+                                       slot.Unit->Name + ".entry_arg_wide");
+    }
+  }
+  if (trunc != nullptr) {
+    auto *shiftOp = llvm::dyn_cast<llvm::LShrOperator>(trunc->getOperand(0));
+    if (shiftOp != nullptr && shiftOp->getOperand(0) == &entryLoad) {
+      auto *amount = llvm::dyn_cast<llvm::ConstantInt>(shiftOp->getOperand(1));
+      if (amount != nullptr) {
+        return buildSubrange(amount->getZExtValue(),
+                             trunc->getType()->getIntegerBitWidth());
+      }
+    }
+  }
+  if (andOp != nullptr && andOp->getOpcode() == llvm::Instruction::And) {
+    auto *shiftOp = llvm::dyn_cast<llvm::LShrOperator>(andOp->getOperand(0));
+    auto *mask = llvm::dyn_cast<llvm::ConstantInt>(andOp->getOperand(1));
+    if (shiftOp == nullptr || mask == nullptr) {
+      shiftOp = llvm::dyn_cast<llvm::LShrOperator>(andOp->getOperand(1));
+      mask = llvm::dyn_cast<llvm::ConstantInt>(andOp->getOperand(0));
+    }
+    if (shiftOp != nullptr && shiftOp->getOperand(0) == &entryLoad &&
+        mask != nullptr && mask->getValue().isMask(mask->getBitWidth())) {
+      auto *amount = llvm::dyn_cast<llvm::ConstantInt>(shiftOp->getOperand(1));
+      if (amount == nullptr) {
+        return nullptr;
+      }
+      unsigned width = mask->getValue().countTrailingOnes();
+      llvm::Value *narrow = buildSubrange(amount->getZExtValue(), width);
+      if (narrow == nullptr) {
+        return nullptr;
+      }
+      return builder.CreateZExtOrTrunc(narrow, inst.getType(),
+                                       slot.Unit->Name + ".entry_arg_wide");
+    }
+  }
+  return nullptr;
+}
+
 void rewriteInternalFunctionBody(llvm::Function &oldFunction,
                                  llvm::Function &newFunction,
                                  const SignatureShape &shape,
@@ -5389,20 +5613,47 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
     if (index >= shape.Params.size()) {
       break;
     }
-    arg.setName(shape.Params[index].Unit->Name + ".arg");
+    const NativeSignatureSlot &slot = shape.Params[index];
+    arg.setName(slot.Unit->Name + ".arg");
+    std::vector<llvm::LoadInst *> entryLoads;
+    if (slot.Unit != nullptr && slot.Unit->Global != nullptr) {
+      for (llvm::Instruction &inst : llvm::instructions(newFunction)) {
+        auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+        if (load != nullptr &&
+            load->getMetadata("notdec.register.summary_ssa.entry") != nullptr &&
+            load->getPointerOperand()->stripPointerCasts() ==
+                slot.Unit->Global) {
+          entryLoads.push_back(load);
+        }
+      }
+    }
     for (llvm::BasicBlock &block : newFunction) {
       for (auto it = block.begin(); it != block.end();) {
         llvm::Instruction &inst = *it++;
         auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
-        if (load == nullptr ||
-            load->getMetadata("notdec.register.summary_ssa.entry") == nullptr) {
+        if (load != nullptr &&
+            load->getMetadata("notdec.register.summary_ssa.entry") != nullptr) {
+          auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+              load->getPointerOperand()->stripPointerCasts());
+          if (global == slot.Unit->Global && load->getType() == arg.getType()) {
+            state.ValueMap[load] = &arg;
+            load->replaceAllUsesWith(&arg);
+          }
           continue;
         }
-        auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
-            load->getPointerOperand()->stripPointerCasts());
-        if (global == shape.Params[index].Unit->Global) {
-          state.ValueMap[load] = &arg;
-          load->replaceAllUsesWith(&arg);
+
+        if (slot.Unit == nullptr || slot.Unit->Global == nullptr) {
+          continue;
+        }
+        for (llvm::LoadInst *entryLoad : entryLoads) {
+          llvm::IRBuilder<> builder(&inst);
+          llvm::Value *replacement =
+              integerEntrySlotReplacement(inst, *entryLoad, slot, arg, builder);
+          if (replacement != nullptr && replacement->getType() == inst.getType()) {
+            state.ValueMap[&inst] = replacement;
+            inst.replaceAllUsesWith(replacement);
+            break;
+          }
         }
       }
     }

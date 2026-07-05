@@ -652,6 +652,22 @@ bool isAnalyzableCall(const llvm::Instruction &inst) {
   return callee == nullptr || !callee->isIntrinsic();
 }
 
+bool isKnownVarArgExternalFunction(const llvm::Function &function) {
+  if (!function.isDeclaration()) {
+    return false;
+  }
+  static const std::set<std::string> names = {
+      "__asprintf_chk", "__fprintf_chk", "__isoc23_sscanf",
+      "__isoc99_sscanf", "__printf_chk", "__snprintf_chk",
+      "__sprintf_chk",  "__syslog_chk",  "__vasprintf_chk",
+      "fcntl",          "fcntl64",       "fprintf",
+      "fscanf",         "ioctl",         "open",
+      "open64",         "printf",        "prctl",
+      "snprintf",       "sscanf",        "syscall",
+  };
+  return names.count(function.getName().str()) != 0;
+}
+
 AbiFacts
 collectAbiFacts(const llvm::Module &module,
                 const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -1463,6 +1479,8 @@ private:
       return;
     }
 
+    bool knownVarArgExternal =
+        callee != nullptr && isKnownVarArgExternalFunction(*callee);
     for (const auto &[global, unit] : Units) {
       llvm::APInt mask = demandFor(live, global);
       if (isIgnored(unit, Options) || mask.getBitWidth() == 0 ||
@@ -1473,6 +1491,19 @@ private:
           Abi.KilledByCall.count(unit.Name) != 0) {
         eraseDemand(live, global);
       }
+    }
+    if (!knownVarArgExternal) {
+      return;
+    }
+    // For known vararg declarations, the fixed prototype does not tell us
+    // which later ABI input registers are consumed.  Keep the complete ABI
+    // input values live before the call so partial writes do not incorrectly
+    // shrink the caller entry demand.
+    for (const auto &[global, unit] : Units) {
+      if (isIgnored(unit, Options) || Abi.Inputs.count(unit.Name) == 0) {
+        continue;
+      }
+      addDemand(live, global, namedMaskOrFull(Abi.InputMasks, unit));
     }
   }
 
