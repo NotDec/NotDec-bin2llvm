@@ -2073,11 +2073,17 @@ private:
   std::map<BlockRangeKey, llvm::Value *> ExitRangeValue;
   std::map<BlockRangeKey, llvm::PHINode *> PendingRangePhi;
   std::set<BlockRangeKey> ResolvingRangeEntry;
-  // Block-local range definitions rebuilt from the block entry to the current
-  // read point.  This is the first strict currentDef path: same-block reads no
-  // longer scan backward from the use, and later stages can make this cache
-  // persistent across increasing instruction positions.
+  // Block-local range definitions.  Each key stores the current SSA value for
+  // one planned register segment while this pass walks a block forward.
   std::map<BlockRangeKey, RangedSSAValue> CurrentDef;
+  // A call with unknown register effect blocks reads from falling back to the
+  // block entry value.  PHI completion can then materialize an explicit unknown
+  // incoming instead of silently reusing an entry register.
+  std::set<BlockRangeKey> UnknownCurrentDef;
+  // The last instruction whose effects have been applied to CurrentDef for a
+  // block.  This lets multiple reads in the same block continue from the
+  // previous transfer point instead of rebuilding the block state each time.
+  std::map<llvm::BasicBlock *, llvm::Instruction *> CurrentDefPosition;
   // Segment definitions produced by local writes.  This is the first step away
   // from treating partial writes as a special read-time matcher: a write now
   // records the canonical ranges it defines, and later reads consume those
@@ -3255,6 +3261,7 @@ private:
                                         const RegisterUnit &unit,
                                         llvm::Instruction *before,
                                         llvm::DominatorTree &domTree) {
+    (void)block;
     if (isSegmentBaseUnit(unit.Name) || unit.Name == "RSP") {
       return nullptr;
     }
@@ -3291,14 +3298,6 @@ private:
         value = readCoveredPartialWriteBefore(
             *call->getParent(), unitIt->second, partial->ReadWidth,
             partial->BitOffset, call);
-      }
-      if (value == nullptr) {
-        llvm::Value *fullValue =
-            readValueBefore(*call->getParent(), unitIt->second, call);
-        fullValue = resolve(fullValue);
-        value = extractPartialRegisterValue(unitIt->second, fullValue,
-                                            partial->ReadWidth,
-                                            partial->BitOffset, call);
       }
       if (value == nullptr || value->getType() != call->getType()) {
         continue;
@@ -3932,6 +3931,7 @@ private:
     }
     LocalRangeWrites[{&writeInst, range}] = value;
     CurrentDef[{writeInst.getParent(), range}] = RangedSSAValue{value, range};
+    UnknownCurrentDef.erase({writeInst.getParent(), range});
     return value;
   }
 
@@ -3979,6 +3979,174 @@ private:
                                                                     : nullptr;
   }
 
+  void clearBlockRangeDefs(llvm::BasicBlock &block,
+                           llvm::GlobalVariable *global) {
+    for (auto it = CurrentDef.begin(); it != CurrentDef.end();) {
+      if (it->first.first == &block && it->first.second.Global == global) {
+        it = CurrentDef.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = UnknownCurrentDef.begin(); it != UnknownCurrentDef.end();) {
+      if (it->first == &block && it->second.Global == global) {
+        it = UnknownCurrentDef.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void clearAllBlockRangeDefs(llvm::BasicBlock &block) {
+    for (auto it = CurrentDef.begin(); it != CurrentDef.end();) {
+      if (it->first.first == &block) {
+        it = CurrentDef.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = UnknownCurrentDef.begin(); it != UnknownCurrentDef.end();) {
+      if (it->first == &block) {
+        it = UnknownCurrentDef.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    CurrentDefPosition.erase(&block);
+  }
+
+  void markBlockRangeUnknown(llvm::BasicBlock &block,
+                             const RegisterRangeKey &range) {
+    CurrentDef.erase({&block, range});
+    UnknownCurrentDef.insert({&block, range});
+  }
+
+  bool transferRangeInstruction(llvm::Instruction &inst,
+                                llvm::Instruction *readBefore) {
+    llvm::BasicBlock &block = *inst.getParent();
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      RegisterAccess access = registerStore(*store, Units);
+      if (access.Unit != nullptr && access.IsStorageValue) {
+        (void)writeAccessRange(
+            *store, access.Unit->Global, 0, registerBitWidth(*access.Unit),
+            resolve(store->getValueOperand()), 0,
+            rangeWriteInsertPoint(*store, readBefore),
+            access.Unit->Name + ".range_store");
+      }
+      return true;
+    }
+
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call == nullptr || parseNativeRegisterPartialRead(*call)) {
+      return true;
+    }
+    if (std::optional<NativeRegisterPartialWriteInfo> partial =
+            parseNativeRegisterPartialWrite(*call)) {
+      auto unitIt = Units.find(partial->Global);
+      if (unitIt != Units.end()) {
+        (void)writeAccessRange(
+            *call, partial->Global, partial->BitOffset, partial->WriteWidth,
+            partial->Value, partial->BitOffset,
+            rangeWriteInsertPoint(*call, readBefore),
+            unitIt->second.Name + ".range_partial_write");
+      }
+      return true;
+    }
+    if (!isAnalyzableCall(*call)) {
+      return true;
+    }
+
+    bool countedUnknownCall = false;
+    for (const auto &[global, unit] : Units) {
+      CallRegisterEffect effect = callEffect(*call, unit);
+      if (effect == CallRegisterEffect::Preserve) {
+        continue;
+      }
+      if (effect != CallRegisterEffect::ReturnValue &&
+          effect != CallRegisterEffect::Clobber) {
+        if (!countedUnknownCall) {
+          ++Summary.UnknownCallEffects;
+          countedUnknownCall = true;
+        }
+        std::vector<RegisterRangeKey> ranges =
+            plannedRangesCovering(global, 0, registerBitWidth(unit));
+        if (ranges.empty()) {
+          clearBlockRangeDefs(block, global);
+          continue;
+        }
+        for (const RegisterRangeKey &range : ranges) {
+          markBlockRangeUnknown(block, range);
+        }
+        continue;
+      }
+
+      llvm::StringRef kind =
+          effect == CallRegisterEffect::ReturnValue ? "return" : "clobber";
+      std::vector<RegisterRangeKey> ranges =
+          plannedRangesCovering(global, 0, registerBitWidth(unit));
+      if (ranges.empty()) {
+        clearBlockRangeDefs(block, global);
+        continue;
+      }
+      for (const RegisterRangeKey &range : ranges) {
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee != nullptr &&
+            (range.BitOffset != 0 ||
+             range.BitWidth != registerBitWidth(unit))) {
+          llvm::Value *value = resolve(callRangeValue(*call, range, kind));
+          if (value != nullptr && value->getType() == rangeType(range)) {
+            CurrentDef[{&block, range}] = RangedSSAValue{value, range};
+            UnknownCurrentDef.erase({&block, range});
+          }
+          continue;
+        }
+
+        llvm::Value *full = callValue(*call, unit, kind);
+        auto *fullInst = llvm::dyn_cast<llvm::Instruction>(full);
+        llvm::Instruction *insertBefore =
+            fullInst != nullptr ? fullInst->getNextNode() : nullptr;
+        if (insertBefore == nullptr) {
+          insertBefore = call->getNextNode();
+        }
+        if (insertBefore == nullptr) {
+          insertBefore = call->getParent()->getTerminator();
+        }
+        llvm::Value *value = extractRangeValue(range, full, 0, insertBefore,
+                                               unit.Name + ".range_" + kind);
+        value = resolve(value);
+        if (value != nullptr && value->getType() == rangeType(range)) {
+          CurrentDef[{&block, range}] = RangedSSAValue{value, range};
+          UnknownCurrentDef.erase({&block, range});
+        }
+      }
+    }
+    return true;
+  }
+
+  bool transferRangeBlockUntil(llvm::BasicBlock &block,
+                               llvm::Instruction *before) {
+    if (before == nullptr || before->getParent() != &block) {
+      return false;
+    }
+
+    llvm::Instruction *position = nullptr;
+    if (auto posIt = CurrentDefPosition.find(&block);
+        posIt != CurrentDefPosition.end()) {
+      position = posIt->second;
+    }
+    if (position != nullptr && !position->comesBefore(before)) {
+      clearAllBlockRangeDefs(block);
+      position = nullptr;
+    }
+    auto it =
+        position == nullptr ? block.begin() : std::next(position->getIterator());
+    for (; it != block.end() && &*it != before; ++it) {
+      (void)transferRangeInstruction(*it, before);
+      CurrentDefPosition[&block] = &*it;
+    }
+    return true;
+  }
+
   llvm::Value *readRangeBefore(llvm::BasicBlock &block,
                                const RegisterRangeKey &range,
                                llvm::Instruction *before,
@@ -3988,104 +4156,13 @@ private:
       return nullptr;
     }
 
-    CurrentDef.erase({&block, range});
-    bool blockedByUnknown = false;
-    for (auto it = block.begin(); it != block.end() && &*it != before; ++it) {
-      llvm::Instruction &inst = *it;
-      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
-        RegisterAccess access = registerStore(*store, Units);
-        if (access.Unit != nullptr && access.Unit->Global == range.Global &&
-            access.IsStorageValue) {
-          (void)writeAccessRange(
-              *store, range.Global, 0, registerBitWidth(*access.Unit),
-              resolve(store->getValueOperand()), 0,
-              rangeWriteInsertPoint(*store, before), unit->Name + ".range_store");
-          blockedByUnknown = false;
-          continue;
-        }
-        continue;
-      }
-      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
-        if (parseNativeRegisterPartialRead(*call)) {
-          continue;
-        }
-        if (std::optional<NativeRegisterPartialWriteInfo> partial =
-                parseNativeRegisterPartialWrite(*call)) {
-          if (partial->Global != range.Global) {
-            continue;
-          }
-          (void)writeAccessRange(
-              *call, partial->Global, partial->BitOffset, partial->WriteWidth,
-              partial->Value, partial->BitOffset,
-              rangeWriteInsertPoint(*call, before),
-              unit->Name + ".range_partial_write");
-          uint64_t writeEnd = partial->BitOffset + partial->WriteWidth;
-          uint64_t rangeEnd = range.BitOffset + range.BitWidth;
-          if (currentSegment(block, range) == nullptr &&
-              range.BitOffset < writeEnd && partial->BitOffset < rangeEnd) {
-            blockedByUnknown = true;
-            CurrentDef.erase({&block, range});
-            continue;
-          }
-          if (currentSegment(block, range) != nullptr) {
-            blockedByUnknown = false;
-          }
-          continue;
-        }
-        if (!isAnalyzableCall(*call)) {
-          continue;
-        }
-        CallRegisterEffect effect = callEffect(*call, *unit);
-        if (effect == CallRegisterEffect::Preserve) {
-          ++Summary.PreservedCalls;
-          continue;
-        }
-        if (effect == CallRegisterEffect::ReturnValue ||
-            effect == CallRegisterEffect::Clobber) {
-          llvm::StringRef kind =
-              effect == CallRegisterEffect::ReturnValue ? "return" : "clobber";
-          llvm::Function *callee = call->getCalledFunction();
-          if (callee != nullptr && (range.BitOffset != 0 ||
-                                    range.BitWidth != registerBitWidth(*unit))) {
-            llvm::Value *value = callRangeValue(*call, range, kind);
-            value = resolve(value);
-            if (value == nullptr || value->getType() != rangeType(range)) {
-              return nullptr;
-            }
-            CurrentDef[{&block, range}] = RangedSSAValue{value, range};
-            blockedByUnknown = false;
-            continue;
-          }
-          llvm::Value *full = callValue(*call, *unit, kind);
-          auto *fullInst = llvm::dyn_cast<llvm::Instruction>(full);
-          llvm::Instruction *insertBefore =
-              fullInst != nullptr ? fullInst->getNextNode() : nullptr;
-          if (insertBefore == nullptr) {
-            insertBefore = call->getNextNode();
-          }
-          if (insertBefore == nullptr) {
-            insertBefore = call->getParent()->getTerminator();
-          }
-          llvm::Value *value = extractRangeValue(range, full, 0, insertBefore,
-                                                 unit->Name + ".range_" + kind);
-          value = resolve(value);
-          if (value == nullptr || value->getType() != rangeType(range)) {
-            return nullptr;
-          }
-          CurrentDef[{&block, range}] = RangedSSAValue{value, range};
-          blockedByUnknown = false;
-          continue;
-        }
-        ++Summary.UnknownCallEffects;
-        CurrentDef.erase({&block, range});
-        blockedByUnknown = true;
-        continue;
-      }
+    if (!transferRangeBlockUntil(block, before)) {
+      return nullptr;
     }
     if (llvm::Value *value = currentSegment(block, range)) {
       return value;
     }
-    if (blockedByUnknown) {
+    if (UnknownCurrentDef.count({&block, range}) != 0) {
       return nullptr;
     }
     return readRangeEntry(block, range, domTree);
@@ -4248,6 +4325,7 @@ private:
           rangeValue->getType() == unit.Global->getValueType()) {
         return rangeValue;
       }
+      return nullptr;
     }
 
     for (auto it = before->getIterator(); it != block.begin();) {
