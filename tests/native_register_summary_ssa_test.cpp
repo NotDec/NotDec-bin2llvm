@@ -282,6 +282,27 @@ bool hasRegisterLoad(const llvm::Function &function, llvm::StringRef name) {
   return false;
 }
 
+bool hasRegisterStore(const llvm::Function &function, llvm::StringRef name) {
+  std::string wanted = ("name=" + name).str();
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store == nullptr) {
+      continue;
+    }
+    llvm::MDNode *metadata = store->getMetadata("notdec.register.access");
+    if (metadata == nullptr) {
+      continue;
+    }
+    for (const llvm::MDOperand &operand : metadata->operands()) {
+      auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+      if (text != nullptr && text->getString() == wanted) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool hasStoreInstruction(const llvm::Function &function) {
   for (const llvm::Instruction &inst : llvm::instructions(function)) {
     if (llvm::isa<llvm::StoreInst>(inst)) {
@@ -5273,6 +5294,39 @@ bool testDeadPartialWriteUsesRangeLiveness() {
                   "module failed verifier after partial write liveness test");
 }
 
+bool testFloatCallEffectUsesRangeLiveness() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-float-call-effect-range-liveness", context);
+  attachTestFloatAbi(module, 1);
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+  llvm::Function *log = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getDoubleTy(context),
+                              {llvm::Type::getDoubleTy(context)}, false),
+      llvm::GlobalValue::ExternalLinkage, "log", module);
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "float_call_effect_range_liveness", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, zmm0, llvm::ConstantInt::get(zmmType, 1), "ZMM0");
+  builder.CreateCall(log, {llvm::ConstantFP::get(llvm::Type::getDoubleTy(context),
+                                                1.0)});
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.DeadStoresRemoved >= 1,
+                "dead full ZMM store before float return was not removed") &&
+         expect(!hasRegisterStore(*function, "ZMM0"),
+                "dead full ZMM store remained before float return") &&
+         verifyOk(module,
+                  "module failed verifier after float call liveness test");
+}
+
 bool testPlannerSplitsZmmForFloatAbiSlot() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-zmm-abi-range-planner", context);
@@ -6033,6 +6087,7 @@ int main() {
   ok &= testBranchFullLoadAfterPartialWriteUsesNarrowRangePhi();
   ok &= testLoopPartialWriteUsesNarrowRangePhi();
   ok &= testDeadPartialWriteUsesRangeLiveness();
+  ok &= testFloatCallEffectUsesRangeLiveness();
   ok &= testPlannerSplitsZmmForFloatAbiSlot();
   ok &= testPlannerSplitsRegisterForDemandMask();
   ok &= testPartialWriteHelperNameSurvivesSignatureRewrite();

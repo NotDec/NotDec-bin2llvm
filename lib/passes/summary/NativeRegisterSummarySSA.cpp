@@ -3565,7 +3565,7 @@ private:
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
         RegisterAccess access = registerStore(*store, Units);
         if (access.Unit != nullptr && access.IsStorageValue &&
-            !hasLiveGlobalRange(live, access.Unit->Global)) {
+            !hasLiveWriteRange(live, *access.Unit)) {
           deadStores.push_back(store);
         }
         transferStoreLiveness(*store, live);
@@ -3671,7 +3671,7 @@ private:
       CallRegisterEffect effect = callEffect(call, unit);
       if (effect == CallRegisterEffect::ReturnValue ||
           effect == CallRegisterEffect::Clobber) {
-        eraseGlobalRanges(live, global);
+        eraseRegisterEffectRanges(live, unit);
       }
       if (callReadsRegister(call, unit)) {
         insertGlobalRanges(live, global);
@@ -3691,9 +3691,62 @@ private:
       }
       const SummaryRegisterFact &fact = regIt->second;
       if (fact.ExitDemand && fact.MayNonEntry) {
-        insertGlobalRanges(live, global);
+        insertMaskRanges(live, global, fact.ExitDemandMask);
       }
     }
+  }
+
+  bool rangesOverlap(const RegisterRangeKey &lhs,
+                     const RegisterRangeKey &rhs) const {
+    if (lhs.Global != rhs.Global) {
+      return false;
+    }
+    uint64_t lhsEnd = lhs.BitOffset + lhs.BitWidth;
+    uint64_t rhsEnd = rhs.BitOffset + rhs.BitWidth;
+    return lhs.BitOffset < rhsEnd && rhs.BitOffset < lhsEnd;
+  }
+
+  void insertMaskRanges(LiveRegisterRanges &live, llvm::GlobalVariable *global,
+                        const llvm::APInt &mask) const {
+    auto unitIt = Units.find(global);
+    if (unitIt == Units.end()) {
+      return;
+    }
+    unsigned width = registerBitWidth(unitIt->second);
+    if (width == 0) {
+      return;
+    }
+    if (mask.getBitWidth() == 0 || mask.isZero()) {
+      insertGlobalRanges(live, global);
+      return;
+    }
+    llvm::APInt trimmed = mask.zextOrTrunc(width);
+    unsigned bit = 0;
+    while (bit < width) {
+      while (bit < width && !trimmed[bit]) {
+        ++bit;
+      }
+      unsigned start = bit;
+      while (bit < width && trimmed[bit]) {
+        ++bit;
+      }
+      if (start < bit) {
+        insertPartialRanges(live, global, start, bit - start);
+      }
+    }
+  }
+
+  void eraseRegisterEffectRanges(LiveRegisterRanges &live,
+                                 const RegisterUnit &unit) const {
+    if (isFloatAbiOutputUnit(Abi, unit.Name)) {
+      if (const AbiFacts::RegisterSlot *slot =
+              floatAbiOutputSlotForUnit(Abi, unit.Name)) {
+        erasePartialRanges(live, unit.Global, slot->OffsetBits,
+                           slot->SizeBits);
+        return;
+      }
+    }
+    eraseGlobalRanges(live, unit.Global);
   }
 
   void insertGlobalRanges(LiveRegisterRanges &live,
@@ -3770,6 +3823,27 @@ private:
     for (const RegisterRangeKey &range : ranges) {
       if (live.count(range) != 0) {
         return true;
+      }
+    }
+    return false;
+  }
+
+  bool hasLiveWriteRange(const LiveRegisterRanges &live,
+                         const RegisterUnit &unit) const {
+    unsigned width = registerBitWidth(unit);
+    if (width == 0) {
+      return false;
+    }
+    std::vector<RegisterRangeKey> written =
+        plannedRangesCovering(unit.Global, 0, width);
+    if (written.empty()) {
+      return hasLiveGlobalRange(live, unit.Global);
+    }
+    for (const RegisterRangeKey &writeRange : written) {
+      for (const RegisterRangeKey &liveRange : live) {
+        if (rangesOverlap(writeRange, liveRange)) {
+          return true;
+        }
       }
     }
     return false;
