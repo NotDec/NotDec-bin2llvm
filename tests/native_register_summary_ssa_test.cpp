@@ -303,6 +303,17 @@ bool hasRegisterStore(const llvm::Function &function, llvm::StringRef name) {
   return false;
 }
 
+bool hasLoadFromPhiPointer(const llvm::Function &function) {
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+    if (load != nullptr &&
+        llvm::isa<llvm::PHINode>(load->getPointerOperand())) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool hasStoreInstruction(const llvm::Function &function) {
   for (const llvm::Instruction &inst : llvm::instructions(function)) {
     if (llvm::isa<llvm::StoreInst>(inst)) {
@@ -1231,6 +1242,51 @@ bool testDuplicatePredecessorEdgesKeepPhiComplete() {
                 "duplicate predecessor edge PHI was not completed") &&
          verifyOk(module,
                   "module failed verifier after duplicate-edge PHI test");
+}
+
+bool testRegisterPointerPhiLoadIsCanonicalized() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-register-pointer-phi-load", context);
+  attachTestAbiWithInputs(module, {"R12", "R13"});
+  llvm::GlobalVariable *r12 = createRegisterGlobal(module, "R12");
+  llvm::GlobalVariable *r13 = createRegisterGlobal(module, "R13");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
+                                       {llvm::Type::getInt1Ty(context)}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "register_pointer_phi_load",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right =
+      llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(function->getArg(0), left, right);
+  builder.SetInsertPoint(left);
+  builder.CreateBr(join);
+  builder.SetInsertPoint(right);
+  builder.CreateBr(join);
+  builder.SetInsertPoint(join);
+  llvm::PHINode *pointerPhi =
+      builder.CreatePHI(llvm::PointerType::get(context, 0), 2, "reg.ptr");
+  pointerPhi->addIncoming(r12, left);
+  pointerPhi->addIncoming(r13, right);
+  llvm::LoadInst *loaded =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), pointerPhi, "merged");
+  loaded->setMetadata("notdec.register.access",
+                      registerAccessMetadata(context, "R12"));
+  builder.CreateRet(loaded);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(!hasLoadFromPhiPointer(*function),
+                "register pointer PHI load remained after SummarySSA") &&
+         expect(summary.LoadsReplaced >= 1,
+                "canonicalized register load was not consumed") &&
+         verifyOk(module,
+                  "module failed verifier after register pointer PHI load test");
 }
 
 bool testUnknownPhiIncomingUsesFrozenPoison() {
@@ -6189,6 +6245,7 @@ int main() {
   bool ok = true;
   ok &= testPhiIncomingMatchesPredecessors();
   ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
+  ok &= testRegisterPointerPhiLoadIsCanonicalized();
   ok &= testUnknownPhiIncomingUsesFrozenPoison();
   ok &= testSelfOnlyPhiBecomesFrozenPoison();
   ok &= testFsOffsetPreservedAcrossExternalCall();

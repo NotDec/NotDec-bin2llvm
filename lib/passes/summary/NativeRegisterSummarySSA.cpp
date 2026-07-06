@@ -530,6 +530,18 @@ collectRegisterUnits(llvm::Module &module) {
   return units;
 }
 
+llvm::MDNode *registerAccessNode(llvm::LLVMContext &context,
+                                 const RegisterUnit &unit) {
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "base=" + unit.Name),
+      llvm::MDString::get(context, "space=" + unit.Space),
+      llvm::MDString::get(context, "offset=" + std::to_string(unit.Offset)),
+      llvm::MDString::get(context, "size=" + std::to_string(unit.Size)),
+      llvm::MDString::get(context, "name=" + unit.Name),
+  };
+  return llvm::MDNode::get(context, fields);
+}
+
 RegisterAccess
 registerLoad(llvm::LoadInst &load,
              const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -569,6 +581,98 @@ registerStore(llvm::StoreInst &store,
   return RegisterAccess{&it->second, true,
                         store.getValueOperand()->getType() ==
                             global->getValueType()};
+}
+
+llvm::GlobalVariable *registerGlobalFromValue(
+    llvm::Value *value,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  auto *global =
+      llvm::dyn_cast<llvm::GlobalVariable>(value->stripPointerCasts());
+  if (global == nullptr || units.find(global) == units.end()) {
+    return nullptr;
+  }
+  return global;
+}
+
+bool valueTypeMatchesRegisterStorage(llvm::Type *valueType,
+                                     const llvm::GlobalVariable &global) {
+  return valueType == global.getValueType();
+}
+
+uint64_t canonicalizeRegisterPointerPhiLoads(
+    llvm::Module &module,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  // InstCombine may turn a value PHI over register loads into
+  // load(phi ptr @REG...).  SummarySSA only understands direct register global
+  // accesses, so expose those loads again before building the register summary.
+  std::vector<llvm::LoadInst *> loads;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+      if (load == nullptr || load->isVolatile() || load->isAtomic()) {
+        continue;
+      }
+      if (llvm::isa<llvm::PHINode>(load->getPointerOperand())) {
+        loads.push_back(load);
+      }
+    }
+  }
+
+  uint64_t rewritten = 0;
+  for (llvm::LoadInst *load : loads) {
+    auto *pointerPhi = llvm::dyn_cast<llvm::PHINode>(load->getPointerOperand());
+    if (pointerPhi == nullptr || pointerPhi->getParent() != load->getParent()) {
+      continue;
+    }
+
+    std::vector<llvm::GlobalVariable *> incomingGlobals;
+    incomingGlobals.reserve(pointerPhi->getNumIncomingValues());
+    bool allRegisterGlobals = true;
+    for (llvm::Value *incoming : pointerPhi->incoming_values()) {
+      llvm::GlobalVariable *global = registerGlobalFromValue(incoming, units);
+      if (global == nullptr ||
+          !valueTypeMatchesRegisterStorage(load->getType(), *global)) {
+        allRegisterGlobals = false;
+        break;
+      }
+      incomingGlobals.push_back(global);
+    }
+    if (!allRegisterGlobals || incomingGlobals.empty()) {
+      continue;
+    }
+
+    auto *valuePhi = llvm::PHINode::Create(
+        load->getType(), pointerPhi->getNumIncomingValues(),
+        load->getName().empty() ? "" : (load->getName() + ".regphi"),
+        pointerPhi->getParent()->getFirstNonPHIIt());
+    for (unsigned index = 0; index < pointerPhi->getNumIncomingValues();
+         ++index) {
+      llvm::BasicBlock *pred = pointerPhi->getIncomingBlock(index);
+      llvm::IRBuilder<> builder(pred->getTerminator());
+      const RegisterUnit &unit = units.find(incomingGlobals[index])->second;
+      auto *incomingLoad =
+          builder.CreateLoad(load->getType(), incomingGlobals[index],
+                             load->getName().empty()
+                                 ? ""
+                                 : (load->getName() + ".regload"));
+      incomingLoad->setAlignment(load->getAlign());
+      incomingLoad->copyMetadata(*load);
+      incomingLoad->setMetadata("notdec.register.access",
+                                registerAccessNode(module.getContext(), unit));
+      valuePhi->addIncoming(incomingLoad, pred);
+    }
+
+    load->replaceAllUsesWith(valuePhi);
+    load->eraseFromParent();
+    if (pointerPhi->use_empty()) {
+      pointerPhi->eraseFromParent();
+    }
+    ++rewritten;
+  }
+  return rewritten;
 }
 
 bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
@@ -5351,12 +5455,13 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       stackFrameSummary.IgnoredRegisters.begin(),
       stackFrameSummary.IgnoredRegisters.end());
   summaryOptions.IgnoredRegisters = effectiveOptions.IgnoredRegisters;
+  std::map<llvm::GlobalVariable *, RegisterUnit> units =
+      collectRegisterUnits(module);
+  (void)canonicalizeRegisterPointerPhiLoads(module, units);
   NativeRegisterSummary registerSummary =
       runNativeRegisterSummary(module, summaryOptions);
   std::map<llvm::Function *, FunctionSummaryFacts> facts =
       summaryFactsByFunction(registerSummary, module);
-  std::map<llvm::GlobalVariable *, RegisterUnit> units =
-      collectRegisterUnits(module);
   AbiFacts abi = collectAbiFacts(module, units);
   SignatureRewriteState signatureState;
   signatureState.ExternalPrototypes = &externalPrototypes;
