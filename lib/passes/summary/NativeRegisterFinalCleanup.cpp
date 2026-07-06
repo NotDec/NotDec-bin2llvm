@@ -15,6 +15,7 @@
 #include "llvm/Transforms/IPO/GlobalDCE.h"
 
 #include <array>
+#include <vector>
 
 namespace notdec::bin2llvm {
 namespace {
@@ -66,6 +67,75 @@ bool isRegisterHelperCall(const llvm::Instruction &inst) {
           callee->getName().starts_with("notdec.register.")) ||
          parseNativeRegisterPartialRead(*call).has_value() ||
          parseNativeRegisterPartialWrite(*call).has_value();
+}
+
+uint64_t eraseDeadRegisterReads(llvm::Module &module) {
+  std::vector<llvm::Instruction *> deadReads;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (!inst.use_empty()) {
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (!load->isVolatile() &&
+            isRegisterGlobalPointer(load->getPointerOperand())) {
+          deadReads.push_back(load);
+        }
+        continue;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call != nullptr && parseNativeRegisterPartialRead(*call)) {
+        deadReads.push_back(call);
+      }
+    }
+  }
+
+  uint64_t removed = 0;
+  for (llvm::Instruction *inst : deadReads) {
+    if (inst->getParent() == nullptr || !inst->use_empty()) {
+      continue;
+    }
+    inst->eraseFromParent();
+    ++removed;
+  }
+  return removed;
+}
+
+uint64_t eraseUnusedRegisterGlobals(llvm::Module &module) {
+  std::vector<llvm::GlobalVariable *> deadGlobals;
+  for (llvm::GlobalVariable &global : module.globals()) {
+    if (isRegisterGlobal(global) && global.use_empty()) {
+      deadGlobals.push_back(&global);
+    }
+  }
+
+  for (llvm::GlobalVariable *global : deadGlobals) {
+    global->eraseFromParent();
+  }
+  return deadGlobals.size();
+}
+
+uint64_t eraseUnusedRegisterHelperDeclarations(llvm::Module &module) {
+  std::vector<llvm::Function *> deadHelpers;
+  for (llvm::Function &function : module) {
+    if (!function.isDeclaration() || !function.use_empty()) {
+      continue;
+    }
+    llvm::StringRef name = function.getName();
+    if (name.starts_with("notdec.register.summary_") ||
+        isNativeRegisterPartialReadName(name) ||
+        isNativeRegisterPartialWriteName(name)) {
+      deadHelpers.push_back(&function);
+    }
+  }
+
+  for (llvm::Function *function : deadHelpers) {
+    function->eraseFromParent();
+  }
+  return deadHelpers.size();
 }
 
 bool functionHasRegisterResidue(const llvm::Function &function) {
@@ -146,6 +216,10 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   if (options.RunGlobalDCE) {
     runGlobalDCE(module);
   }
+  summary.DeadRegisterReadsRemoved += eraseDeadRegisterReads(module);
+  summary.RegisterGlobalsRemoved += eraseUnusedRegisterGlobals(module);
+  summary.HelperDeclarationsRemoved +=
+      eraseUnusedRegisterHelperDeclarations(module);
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;
@@ -161,6 +235,9 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   if (options.RunGlobalDCE) {
     runGlobalDCE(module);
   }
+  summary.RegisterGlobalsRemoved += eraseUnusedRegisterGlobals(module);
+  summary.HelperDeclarationsRemoved +=
+      eraseUnusedRegisterHelperDeclarations(module);
   summary.RemainingRegisterAccesses = countRemainingRegisterAccesses(module);
 
   if (options.PrintSummary) {
@@ -174,6 +251,10 @@ void printNativeRegisterFinalCleanupSummary(
   os << "Native register final cleanup: functions=" << summary.FunctionsSeen
      << " functions_without_register_residue="
      << summary.FunctionsWithoutRegisterResidue
+     << " dead_register_reads_removed="
+     << summary.DeadRegisterReadsRemoved
+     << " register_globals_removed=" << summary.RegisterGlobalsRemoved
+     << " helper_declarations_removed=" << summary.HelperDeclarationsRemoved
      << " function_metadata_cleared=" << summary.FunctionMetadataCleared
      << " instruction_metadata_cleared=" << summary.InstructionMetadataCleared
      << " remaining_register_accesses=" << summary.RemainingRegisterAccesses

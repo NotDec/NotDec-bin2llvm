@@ -432,6 +432,42 @@ void eraseUnusedSummaryHelperDeclarations(llvm::Module &module) {
   }
 }
 
+uint64_t eraseDeadSummarySSAEntryReads(llvm::Module &module) {
+  std::vector<llvm::Instruction *> deadReads;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (!inst.use_empty()) {
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (load->getMetadata("notdec.register.summary_ssa.entry") != nullptr) {
+          deadReads.push_back(load);
+        }
+        continue;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr ||
+          call->getMetadata("notdec.register.summary_ssa.range_entry") ==
+              nullptr ||
+          !parseNativeRegisterPartialRead(*call)) {
+        continue;
+      }
+      deadReads.push_back(call);
+    }
+  }
+
+  for (llvm::Instruction *inst : deadReads) {
+    if (inst->getParent() == nullptr || !inst->use_empty()) {
+      continue;
+    }
+    inst->eraseFromParent();
+  }
+  return deadReads.size();
+}
+
 uint64_t eraseDeadSummaryCallValueHelpers(llvm::Module &module) {
   std::vector<llvm::CallBase *> deadHelpers;
   for (llvm::Function &function : module) {
@@ -1787,6 +1823,7 @@ public:
     rewritePartialWrites();
     removeDeadReplacedLoads();
     removeDeadStoresByLiveness();
+    removeDeadEntryReads();
   }
 
 private:
@@ -1820,6 +1857,11 @@ private:
   std::set<llvm::PHINode *> DeadPhis;
   std::map<RegisterRangeKey, llvm::Value *> EntryRangeInputs;
   std::map<llvm::Value *, RegisterRangeKey> EntryInputRanges;
+  // Canonical entry loads represent real register values at function entry.
+  // Range entry reads are built from these loads or from partial_read helpers
+  // instead of using poison, because stack and pointer registers must keep a
+  // stable symbolic base when stack recovery cannot immediately fold to alloca.
+  std::map<llvm::GlobalVariable *, llvm::LoadInst *> EntryRegisterLoads;
   std::map<llvm::GlobalVariable *, std::set<uint64_t>> RangeBoundaries;
   std::map<llvm::GlobalVariable *, std::vector<RegisterRangeKey>> PlannedRanges;
   std::map<CallRangeValueKey, llvm::Value *> CallRangeValues;
@@ -1907,7 +1949,7 @@ private:
     return PartialDemandState::trimmedMask(it->second, width);
   }
 
-  llvm::Constant *zeroDemandReplacement(llvm::Type *type) const {
+  llvm::Constant *undemandedStoreOperandZero(llvm::Type *type) const {
     if (type == nullptr || !type->isIntegerTy()) {
       return nullptr;
     }
@@ -2029,9 +2071,9 @@ private:
   }
 
   bool
-  rewriteZeroDemandOperands(llvm::Value *value,
-                            const std::map<llvm::Value *, llvm::APInt> &demands,
-                            llvm::SmallPtrSetImpl<llvm::Value *> &visiting) {
+  rewriteUndemandedRegisterStoreOperands(
+      llvm::Value *value, const std::map<llvm::Value *, llvm::APInt> &demands,
+      llvm::SmallPtrSetImpl<llvm::Value *> &visiting) {
     auto *inst = llvm::dyn_cast_or_null<llvm::Instruction>(value);
     if (inst == nullptr || !visiting.insert(inst).second) {
       return false;
@@ -2051,16 +2093,18 @@ private:
 
       llvm::APInt demand = demandedBits(operand, demands);
       if (!demand.isZero()) {
-        changed |= rewriteZeroDemandOperands(operand, demands, visiting);
+        changed |=
+            rewriteUndemandedRegisterStoreOperands(operand, demands, visiting);
         continue;
       }
 
-      // This only rewrites register-store dataflow.  Replacing a zero-demand
+      // This only rewrites register-store dataflow.  Replacing an undemanded
       // integer operand with zero preserves every bit that has a real observer
       // and lets normal DCE remove stale register loads.
-      llvm::Constant *zero = zeroDemandReplacement(operand->getType());
+      llvm::Constant *zero = undemandedStoreOperandZero(operand->getType());
       if (zero == nullptr) {
-        changed |= rewriteZeroDemandOperands(operand, demands, visiting);
+        changed |=
+            rewriteUndemandedRegisterStoreOperands(operand, demands, visiting);
         continue;
       }
 
@@ -2461,8 +2505,8 @@ private:
         continue;
       }
       llvm::SmallPtrSet<llvm::Value *, 16> visiting;
-      if (rewriteZeroDemandOperands(store->getValueOperand(), demands,
-                                    visiting)) {
+      if (rewriteUndemandedRegisterStoreOperands(store->getValueOperand(),
+                                                 demands, visiting)) {
         ++Summary.PartialDemandMatched;
       } else {
         ++Summary.PartialDemandRejected;
@@ -2479,7 +2523,8 @@ private:
       }
       ++Summary.PartialDemandCandidates;
       llvm::SmallPtrSet<llvm::Value *, 16> visiting;
-      if (rewriteZeroDemandOperands(partial->Value, demands, visiting)) {
+      if (rewriteUndemandedRegisterStoreOperands(partial->Value, demands,
+                                                 visiting)) {
         ++Summary.PartialDemandMatched;
       } else {
         ++Summary.PartialDemandRejected;
@@ -2527,6 +2572,10 @@ private:
               parseNativeRegisterPartialRead(*call);
           if (partialRead && Units.count(partialRead->Global) != 0) {
             ++Summary.LoadsSeen;
+            if (call->getMetadata("notdec.register.summary_ssa.range_entry") !=
+                nullptr) {
+              continue;
+            }
             PartialReads.push_back(call);
             continue;
           }
@@ -3024,6 +3073,37 @@ private:
         continue;
       }
       call->eraseFromParent();
+      ++Summary.DeadLoadsRemoved;
+    }
+  }
+
+  void removeDeadEntryReads() {
+    std::vector<llvm::Instruction *> deadReads;
+    for (llvm::Instruction &inst : llvm::instructions(Function)) {
+      if (!inst.use_empty()) {
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (load->getMetadata("notdec.register.summary_ssa.entry") != nullptr) {
+          deadReads.push_back(load);
+        }
+        continue;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr ||
+          call->getMetadata("notdec.register.summary_ssa.range_entry") ==
+              nullptr ||
+          !parseNativeRegisterPartialRead(*call)) {
+        continue;
+      }
+      deadReads.push_back(call);
+    }
+
+    for (llvm::Instruction *inst : deadReads) {
+      if (inst->getParent() == nullptr || !inst->use_empty()) {
+        continue;
+      }
+      inst->eraseFromParent();
       ++Summary.DeadLoadsRemoved;
     }
   }
@@ -4096,6 +4176,48 @@ private:
     return llvm::MDNode::get(Function.getContext(), fields);
   }
 
+  llvm::LoadInst *entryRegisterLoad(const RegisterUnit &unit,
+                                    llvm::Instruction &insertBefore) {
+    if (auto cached = EntryRegisterLoads.find(unit.Global);
+        cached != EntryRegisterLoads.end()) {
+      return cached->second;
+    }
+
+    llvm::IRBuilder<> builder(&insertBefore);
+    llvm::LoadInst *load = builder.CreateLoad(
+        unit.Global->getValueType(), unit.Global, unit.Name + ".entry");
+    load->setMetadata("notdec.register.access",
+                      registerAccessNode(Function.getContext(), unit));
+    load->setMetadata("notdec.register.summary_ssa.entry", markerNode("true"));
+    EntryRegisterLoads.emplace(unit.Global, load);
+    return load;
+  }
+
+  llvm::Value *entryPartialRead(const RegisterUnit &unit,
+                                const RegisterRangeKey &range,
+                                llvm::Instruction &insertBefore) {
+    unsigned fullWidth = registerBitWidth(unit);
+    if (fullWidth == 0 || range.BitOffset + range.BitWidth > fullWidth) {
+      return nullptr;
+    }
+
+    llvm::IRBuilder<> builder(&insertBefore);
+    llvm::Type *ptrType = unit.Global->getType();
+    llvm::Type *resultType = rangeType(range);
+    llvm::Function *callee = getOrInsertNativeRegisterPartialRead(
+        *Function.getParent(), ptrType, resultType, fullWidth, range.BitWidth);
+    llvm::Value *offset =
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(Function.getContext()),
+                               range.BitOffset);
+    llvm::CallInst *call = builder.CreateCall(
+        callee, {unit.Global, offset}, unit.Name + ".range_entry");
+    call->setMetadata("notdec.register.access",
+                      registerAccessNode(Function.getContext(), unit));
+    call->setMetadata("notdec.register.summary_ssa.range_entry",
+                      entryRangeNode(range));
+    return call;
+  }
+
   llvm::Value *entryRangeInput(const RegisterRangeKey &range) {
     if (auto cached = EntryRangeInputs.find(range);
         cached != EntryRangeInputs.end()) {
@@ -4119,11 +4241,15 @@ private:
     if (insertBefore == nullptr) {
       return nullptr;
     }
-    llvm::Value *value = frozenPoisonBefore(*insertBefore, rangeType(range),
-                                            unit->Name + ".range_entry");
-    if (auto *inst = llvm::dyn_cast<llvm::Instruction>(value)) {
-      inst->setMetadata("notdec.register.summary_ssa.range_entry",
-                        entryRangeNode(range));
+    llvm::Value *value = nullptr;
+    unsigned fullWidth = registerBitWidth(*unit);
+    if (range.BitOffset == 0 && range.BitWidth == fullWidth) {
+      value = entryRegisterLoad(*unit, *insertBefore);
+    } else {
+      value = entryPartialRead(*unit, range, *insertBefore);
+    }
+    if (value == nullptr) {
+      return nullptr;
     }
     EntryRangeInputs.emplace(range, value);
     EntryInputRanges.emplace(value, range);
@@ -5718,6 +5844,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       summary.StackCanaryFailBlocksRemoved +=
           lateCanarySummary.FailBlocksRemoved;
       eraseDeadSummaryCallValueHelpers(module);
+      summary.DeadLoadsRemoved += eraseDeadSummarySSAEntryReads(module);
       eraseUnusedSummaryHelperDeclarations(module);
     }
   }
