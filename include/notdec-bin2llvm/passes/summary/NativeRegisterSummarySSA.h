@@ -21,6 +21,7 @@ struct NativeRegisterSummarySSAOptions {
   bool EnablePostRewriteInstCombine = true;
   bool AttachMetadata = true;
   bool PrintSummary = false;
+  std::string ExternalPrototypeJsonPath;
   std::set<std::string> IgnoredRegisters;
 };
 

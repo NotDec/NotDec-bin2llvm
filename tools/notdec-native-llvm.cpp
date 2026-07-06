@@ -61,6 +61,7 @@ struct CliOptions {
   std::string OutputPath;
   std::string SummaryJsonPath;
   std::string RegisterSSAWarningPath;
+  std::string ExternalPrototypeJsonPath;
   notdec::bin2llvm::NativeDecodeMode DecodeMode =
       notdec::bin2llvm::NativeDecodeMode::Gtirb;
   notdec::bin2llvm::NativeSleighDecodeOptions DecodeOptions;
@@ -85,6 +86,7 @@ void printUsage(const char *argv0) {
                "--all-confirmed) "
                "-o <output.ll> [--summary-json-out <path>] "
                "[--register-ssa-warning-out <path>] "
+               "[--external-prototypes <path>] "
                "[--no-instcombine-pass] "
                "[--no-register-ssa-pass] [--heritage-register-ssa-pass] "
                "[--summary-register-ssa-pass] "
@@ -223,6 +225,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.SummaryJsonPath = std::move(value);
     } else if (flag == "--register-ssa-warning-out") {
       options.RegisterSSAWarningPath = std::move(value);
+    } else if (flag == "--external-prototypes") {
+      options.ExternalPrototypeJsonPath = std::move(value);
     } else if (flag == "--native-decode-mode") {
       if (value == "gtirb") {
         options.DecodeMode = notdec::bin2llvm::NativeDecodeMode::Gtirb;
@@ -977,6 +981,7 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
       !options.DisableSummaryRegisterResidueRemoval;
   passOptions.EnablePostRewriteInstCombine = !options.DisableInstCombinePass;
   passOptions.PrintSummary = options.PrintRegisterSSASummary;
+  passOptions.ExternalPrototypeJsonPath = options.ExternalPrototypeJsonPath;
   notdec::bin2llvm::NativeRegisterSummarySSASummary summary =
       notdec::bin2llvm::runNativeRegisterSummarySSA(module, passOptions);
   if (!options.RegisterSSAWarningPath.empty() &&
