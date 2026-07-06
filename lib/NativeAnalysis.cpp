@@ -4476,11 +4476,50 @@ public:
         normalizeBlockSuccessors(state, function, block);
       }
     }
+    resolveCfgBackedIndirectBranches(state);
     classifyIndirectTailExits(state);
     recoverExternalFunctionPointerFlows(state);
   }
 
 private:
+  // GTIRB/ddisasm can resolve an indirect branch through CFG edges even when
+  // SLEIGH p-code still reports BRANCHIND.  Keep the instruction-level flow
+  // facts and unresolved diagnostics aligned with the already-known block CFG.
+  static void resolveCfgBackedIndirectBranches(NativeProgramState &state) {
+    std::vector<NativeUnresolvedFlow> unresolvedFlows = state.unresolvedFlows();
+    for (const NativeUnresolvedFlow &flow : unresolvedFlows) {
+      if (flow.Kind != NativeUnresolvedFlowKind::IndirectBranch) {
+        continue;
+      }
+
+      const NativeFunction *function = state.functionContaining(flow.Address);
+      if (function == nullptr) {
+        continue;
+      }
+      const NativeBasicBlock *block =
+          functionBlockContaining(*function, flow.Address);
+      const NativeInstruction *instruction = state.instructionAt(flow.Address);
+      if (block == nullptr || instruction == nullptr ||
+          instruction->FlowKind != NativeInstructionFlowKind::IndirectBranch ||
+          block->Successors.empty()) {
+        continue;
+      }
+
+      std::vector<uint64_t> localTargets;
+      for (uint64_t successor : block->Successors) {
+        if (functionHasBlockStartingAt(*function, successor)) {
+          localTargets.push_back(successor);
+        }
+      }
+      if (localTargets.empty()) {
+        continue;
+      }
+
+      state.addInstructionDirectFlowTargets(flow.Address, localTargets);
+      state.removeUnresolvedFlow(flow.Address, flow.Kind);
+    }
+  }
+
   static void classifyIndirectTailExits(NativeProgramState &state) {
     std::vector<NativeUnresolvedFlow> unresolvedFlows = state.unresolvedFlows();
     for (const NativeUnresolvedFlow &flow : unresolvedFlows) {
