@@ -262,6 +262,10 @@ struct RangeReturnHelper {
 
 struct SignatureRewriteState {
   std::map<llvm::Function *, SignatureShape> Shapes;
+  // Indirect calls do not have a callee Function to hang a rewritten type on.
+  // Keep their inferred type on the callsite, then rebuild the call with the
+  // typed function pointer during signature rewrite.
+  std::map<llvm::CallBase *, SignatureShape> IndirectCallShapes;
   std::map<llvm::CallBase *, std::vector<CallArgStoreBinding>> CallArgs;
   std::map<llvm::CallBase *, std::map<std::string, llvm::CallInst *>>
       ReturnHelpers;
@@ -653,11 +657,9 @@ uint64_t canonicalizeRegisterPointerPhiLoads(
       llvm::BasicBlock *pred = pointerPhi->getIncomingBlock(index);
       llvm::IRBuilder<> builder(pred->getTerminator());
       const RegisterUnit &unit = units.find(incomingGlobals[index])->second;
-      auto *incomingLoad =
-          builder.CreateLoad(load->getType(), incomingGlobals[index],
-                             load->getName().empty()
-                                 ? ""
-                                 : (load->getName() + ".regload"));
+      auto *incomingLoad = builder.CreateLoad(
+          load->getType(), incomingGlobals[index],
+          load->getName().empty() ? "" : (load->getName() + ".regload"));
       incomingLoad->setAlignment(load->getAlign());
       incomingLoad->copyMetadata(*load);
       incomingLoad->setMetadata("notdec.register.access",
@@ -941,8 +943,8 @@ integerSlotForSingleDemandRange(const RegisterUnit &unit,
   slot.AbiName = unit.Name;
   slot.OffsetBits = start;
   slot.SizeBits = end - start;
-  slot.LlvmType = llvm::IntegerType::get(unit.Global->getContext(),
-                                         slot.SizeBits);
+  slot.LlvmType =
+      llvm::IntegerType::get(unit.Global->getContext(), slot.SizeBits);
   return slot;
 }
 
@@ -1137,8 +1139,8 @@ SignatureShape shapeForInternalFunction(
       } else if (regIt->second.EntryDemandMask.getBitWidth() != 0 &&
                  !regIt->second.EntryDemandMask.isZero()) {
         if (std::optional<NativeSignatureSlot> rangeSlot =
-                integerSlotForSingleDemandRange(*unit,
-                                                regIt->second.EntryDemandMask)) {
+                integerSlotForSingleDemandRange(
+                    *unit, regIt->second.EntryDemandMask)) {
           shape.Params.push_back(*rangeSlot);
         } else {
           shape.Params.push_back(integerSignatureSlot(*unit));
@@ -1323,6 +1325,81 @@ bool rangeReturnHelpersUseRegister(
   return false;
 }
 
+bool signatureHasReturnForRegister(const SignatureShape &shape,
+                                   const RegisterUnit &unit) {
+  for (const NativeSignatureSlot &slot : shape.Returns) {
+    if (slot.Unit == &unit || slot.Unit->Name == unit.Name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void addReturnSlotForRange(
+    SignatureShape &shape, const RegisterRangeKey &range,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  auto unitIt = units.find(range.Global);
+  if (unitIt == units.end()) {
+    return;
+  }
+  const RegisterUnit &unit = unitIt->second;
+  if (signatureHasReturnForRegister(shape, unit)) {
+    return;
+  }
+  // Indirect calls often have several demanded ranges from the same ABI return
+  // register, e.g. RAX[0:32] and RAX[32:64].  Use the whole register return and
+  // let extractReturnRange() split out the exact bits for each helper.
+  shape.Returns.push_back(integerSignatureSlot(unit));
+}
+
+void addAbiInputParamSlots(
+    SignatureShape &shape,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi) {
+  if (!shape.Params.empty()) {
+    return;
+  }
+  for (const std::string &name : abi.InputsInOrder) {
+    const RegisterUnit *unit = unitByName(units, name);
+    if (unit != nullptr) {
+      shape.Params.push_back(integerSignatureSlot(*unit));
+    }
+  }
+}
+
+void addIndirectCallsiteShapes(
+    SignatureRewriteState &state,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi) {
+  for (const auto &[call, helpers] : state.ReturnHelpers) {
+    if (call == nullptr || call->getParent() == nullptr ||
+        call->getCalledFunction() != nullptr) {
+      continue;
+    }
+    SignatureShape &shape = state.IndirectCallShapes[call];
+    addAbiInputParamSlots(shape, units, abi);
+    for (const auto &[name, helper] : helpers) {
+      (void)helper;
+      const RegisterUnit *unit = unitByName(units, name);
+      if (unit != nullptr && !signatureHasReturnForRegister(shape, *unit)) {
+        shape.Returns.push_back(integerSignatureSlot(*unit));
+      }
+    }
+  }
+
+  for (const auto &[call, helpers] : state.RangeReturnHelpers) {
+    if (call == nullptr || call->getParent() == nullptr ||
+        call->getCalledFunction() != nullptr) {
+      continue;
+    }
+    SignatureShape &shape = state.IndirectCallShapes[call];
+    addAbiInputParamSlots(shape, units, abi);
+    for (const RangeReturnHelper &helper : helpers) {
+      addReturnSlotForRange(shape, helper.Range, units);
+    }
+  }
+}
+
 void addDemandedExternalReturns(
     SignatureRewriteState &state,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -1363,8 +1440,7 @@ void addDemandedExternalReturns(
     const KnownExternalPrototype *known =
         knownExternalPrototype(prototypes, callee->getName());
     if (known != nullptr) {
-      maxReturnRegisters =
-          known->NoReturn ? 0 : known->MaxReturnRegisters;
+      maxReturnRegisters = known->NoReturn ? 0 : known->MaxReturnRegisters;
     }
     unsigned returnIndex = 0;
     for (const std::string &name : abi.OutputsInOrder) {
@@ -1473,8 +1549,9 @@ void addSignatureWarning(SignatureRewriteState &state,
   state.Warnings.push_back(std::move(warning));
 }
 
-void refineUnknownExternalParamShapes(SignatureRewriteState &state,
-                                      const NativeExternalPrototypeMap &prototypes) {
+void refineUnknownExternalParamShapes(
+    SignatureRewriteState &state,
+    const NativeExternalPrototypeMap &prototypes) {
   std::map<llvm::Function *, std::vector<unsigned>> aritiesByCallee;
   for (const auto &[call, bindings] : state.CallArgs) {
     if (call == nullptr || call->getParent() == nullptr) {
@@ -1539,6 +1616,30 @@ void refineUnknownExternalParamShapes(SignatureRewriteState &state,
   }
 }
 
+void refineIndirectCallsiteParamShapes(SignatureRewriteState &state) {
+  for (auto &[call, shape] : state.IndirectCallShapes) {
+    if (call == nullptr || call->getParent() == nullptr || shape.VarArg) {
+      continue;
+    }
+    auto bindingsIt = state.CallArgs.find(call);
+    unsigned finalArity = bindingsIt == state.CallArgs.end()
+                              ? 0
+                              : callsiteBoundArgPrefix(bindingsIt->second);
+    if (finalArity < shape.Params.size()) {
+      shape.Params.resize(finalArity);
+    }
+    if (bindingsIt == state.CallArgs.end()) {
+      continue;
+    }
+    bindingsIt->second.erase(
+        std::remove_if(bindingsIt->second.begin(), bindingsIt->second.end(),
+                       [&](const CallArgStoreBinding &binding) {
+                         return binding.Index >= finalArity;
+                       }),
+        bindingsIt->second.end());
+  }
+}
+
 void markSignatureCallArgStores(SignatureRewriteState &state,
                                 NativeRegisterSummarySSASummary &summary) {
   for (const auto &[call, bindings] : state.CallArgs) {
@@ -1574,6 +1675,17 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
     }
   }
   return shapes;
+}
+
+const SignatureShape *shapeForCall(const SignatureRewriteState &state,
+                                   const llvm::CallBase &call) {
+  if (llvm::Function *callee = call.getCalledFunction()) {
+    auto shapeIt = state.Shapes.find(callee);
+    return shapeIt == state.Shapes.end() ? nullptr : &shapeIt->second;
+  }
+  auto shapeIt =
+      state.IndirectCallShapes.find(const_cast<llvm::CallBase *>(&call));
+  return shapeIt == state.IndirectCallShapes.end() ? nullptr : &shapeIt->second;
 }
 
 // Local canonicalization used between signature rewrite and final residue
@@ -1628,6 +1740,7 @@ public:
         removeDeadPartialReads();
       }
       rewriteLoads();
+      addIndirectCallsiteShapes(SignatureState, Units, Abi);
       collectSignatureCallArgs();
       collectFunctionReturnValues();
       rewritePartialWrites();
@@ -2610,7 +2723,8 @@ private:
       if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
         RegisterAccess access = registerLoad(*load, Units);
         if (access.Unit != nullptr && access.IsStorageValue) {
-          recordRangeEvent(access.Unit->Global, 0, registerBitWidth(*access.Unit),
+          recordRangeEvent(access.Unit->Global, 0,
+                           registerBitWidth(*access.Unit),
                            RangeEventKind::Read);
         }
         continue;
@@ -2728,9 +2842,9 @@ private:
     return result;
   }
 
-  llvm::Value *readAccessRange(llvm::GlobalVariable *global, uint64_t readOffset,
-                               uint32_t readWidth, llvm::Instruction *before,
-                               llvm::Twine name) {
+  llvm::Value *readAccessRange(llvm::GlobalVariable *global,
+                               uint64_t readOffset, uint32_t readWidth,
+                               llvm::Instruction *before, llvm::Twine name) {
     std::vector<RegisterRangeKey> ranges =
         plannedRangesCovering(global, readOffset, readWidth);
     return assembleRangeRead(ranges, readOffset, readWidth, before, name);
@@ -2802,12 +2916,10 @@ private:
     return result;
   }
 
-  llvm::Value *readAccessRangeIfDominating(llvm::GlobalVariable *global,
-                                           uint64_t readOffset,
-                                           uint32_t readWidth,
-                                           llvm::Instruction *before,
-                                           llvm::Twine name,
-                                           llvm::DominatorTree &domTree) {
+  llvm::Value *
+  readAccessRangeIfDominating(llvm::GlobalVariable *global, uint64_t readOffset,
+                              uint32_t readWidth, llvm::Instruction *before,
+                              llvm::Twine name, llvm::DominatorTree &domTree) {
     std::vector<RegisterRangeKey> ranges =
         plannedRangesCovering(global, readOffset, readWidth);
     return assembleRangeReadIfDominating(ranges, readOffset, readWidth, before,
@@ -2821,8 +2933,8 @@ private:
     (void)block;
     unsigned fullWidth = registerBitWidth(unit);
     llvm::Value *value = readAccessRangeIfDominating(
-        unit.Global, 0, fullWidth, before, llvm::Twine(unit.Name) + ".full_range",
-        domTree);
+        unit.Global, 0, fullWidth, before,
+        llvm::Twine(unit.Name) + ".full_range", domTree);
     value = resolve(value);
     if (value == nullptr || value->getType() != unit.Global->getValueType()) {
       return nullptr;
@@ -2864,7 +2976,8 @@ private:
       if (access.Unit == nullptr || !access.IsStorageValue) {
         continue;
       }
-      llvm::Value *value = readValueBefore(*load->getParent(), *access.Unit, load);
+      llvm::Value *value =
+          readValueBefore(*load->getParent(), *access.Unit, load);
       value = resolve(value);
       if (value == nullptr || value == load ||
           value->getType() != load->getType()) {
@@ -3304,8 +3417,7 @@ private:
     if (isFloatAbiOutputUnit(Abi, unit.Name)) {
       if (const AbiFacts::RegisterSlot *slot =
               floatAbiOutputSlotForUnit(Abi, unit.Name)) {
-        erasePartialRanges(live, unit.Global, slot->OffsetBits,
-                           slot->SizeBits);
+        erasePartialRanges(live, unit.Global, slot->OffsetBits, slot->SizeBits);
         return;
       }
     }
@@ -3463,8 +3575,9 @@ private:
                                   name);
   }
 
-  llvm::Instruction *rangeWriteInsertPoint(llvm::Instruction &writeInst,
-                                           llvm::Instruction *readBefore) const {
+  llvm::Instruction *
+  rangeWriteInsertPoint(llvm::Instruction &writeInst,
+                        llvm::Instruction *readBefore) const {
     if (llvm::Instruction *next = writeInst.getNextNode()) {
       return next;
     }
@@ -3472,8 +3585,7 @@ private:
   }
 
   llvm::Value *writeSegment(llvm::Instruction &writeInst,
-                            const RegisterRangeKey &range,
-                            llvm::Value *value) {
+                            const RegisterRangeKey &range, llvm::Value *value) {
     value = resolve(value);
     if (value == nullptr || value->getType() != rangeType(range)) {
       return nullptr;
@@ -3486,8 +3598,8 @@ private:
   bool writeAccessRange(llvm::Instruction &writeInst,
                         llvm::GlobalVariable *global, uint64_t writeOffset,
                         uint32_t writeWidth, llvm::Value *source,
-                        uint64_t sourceBitOffset, llvm::Instruction *insertBefore,
-                        llvm::Twine name) {
+                        uint64_t sourceBitOffset,
+                        llvm::Instruction *insertBefore, llvm::Twine name) {
     if (source == nullptr || insertBefore == nullptr || writeWidth == 0) {
       return false;
     }
@@ -3569,11 +3681,11 @@ private:
     if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
       RegisterAccess access = registerStore(*store, Units);
       if (access.Unit != nullptr && access.IsStorageValue) {
-        (void)writeAccessRange(
-            *store, access.Unit->Global, 0, registerBitWidth(*access.Unit),
-            resolve(store->getValueOperand()), 0,
-            rangeWriteInsertPoint(*store, readBefore),
-            access.Unit->Name + ".range_store");
+        (void)writeAccessRange(*store, access.Unit->Global, 0,
+                               registerBitWidth(*access.Unit),
+                               resolve(store->getValueOperand()), 0,
+                               rangeWriteInsertPoint(*store, readBefore),
+                               access.Unit->Name + ".range_store");
       }
       return true;
     }
@@ -3586,11 +3698,11 @@ private:
             parseNativeRegisterPartialWrite(*call)) {
       auto unitIt = Units.find(partial->Global);
       if (unitIt != Units.end()) {
-        (void)writeAccessRange(
-            *call, partial->Global, partial->BitOffset, partial->WriteWidth,
-            partial->Value, partial->BitOffset,
-            rangeWriteInsertPoint(*call, readBefore),
-            unitIt->second.Name + ".range_partial_write");
+        (void)writeAccessRange(*call, partial->Global, partial->BitOffset,
+                               partial->WriteWidth, partial->Value,
+                               partial->BitOffset,
+                               rangeWriteInsertPoint(*call, readBefore),
+                               unitIt->second.Name + ".range_partial_write");
       }
       return true;
     }
@@ -3661,8 +3773,8 @@ private:
       clearAllBlockRangeDefs(block);
       position = nullptr;
     }
-    auto it =
-        position == nullptr ? block.begin() : std::next(position->getIterator());
+    auto it = position == nullptr ? block.begin()
+                                  : std::next(position->getIterator());
     for (; it != block.end() && &*it != before; ++it) {
       (void)transferRangeInstruction(*it, before);
       CurrentDefPosition[&block] = &*it;
@@ -3954,10 +4066,9 @@ private:
   llvm::MDNode *entryRangeNode(const RegisterRangeKey &range) const {
     const RegisterUnit *unit = unitForRange(range);
     llvm::Metadata *fields[] = {
-        llvm::MDString::get(Function.getContext(),
-                            "name=" +
-                                (unit == nullptr ? std::string("")
-                                                 : unit->Name)),
+        llvm::MDString::get(
+            Function.getContext(),
+            "name=" + (unit == nullptr ? std::string("") : unit->Name)),
         llvm::MDString::get(Function.getContext(),
                             "bit_offset=" + std::to_string(range.BitOffset)),
         llvm::MDString::get(Function.getContext(),
@@ -3989,9 +4100,8 @@ private:
     if (insertBefore == nullptr) {
       return nullptr;
     }
-    llvm::Value *value =
-        frozenPoisonBefore(*insertBefore, rangeType(range),
-                           unit->Name + ".range_entry");
+    llvm::Value *value = frozenPoisonBefore(*insertBefore, rangeType(range),
+                                            unit->Name + ".range_entry");
     if (auto *inst = llvm::dyn_cast<llvm::Instruction>(value)) {
       inst->setMetadata("notdec.register.summary_ssa.range_entry",
                         entryRangeNode(range));
@@ -4075,8 +4185,7 @@ private:
       if (call == nullptr || !isAnalyzableCall(*call)) {
         continue;
       }
-      llvm::Function *callee = call->getCalledFunction();
-      if (callee == nullptr || SignatureState.Shapes.count(callee) == 0) {
+      if (shapeForCall(SignatureState, *call) == nullptr) {
         continue;
       }
       calls.push_back(call);
@@ -4087,16 +4196,20 @@ private:
         continue;
       }
       llvm::Function *callee = call->getCalledFunction();
-      const SignatureShape &shape = SignatureState.Shapes.at(callee);
+      const SignatureShape *shape = shapeForCall(SignatureState, *call);
+      if (shape == nullptr) {
+        continue;
+      }
       std::vector<CallArgStoreBinding> bindings =
-          callArgStoreBindings(*call, shape);
-      if (bindings.empty() && shape.Params.empty() && shape.Returns.empty()) {
+          callArgStoreBindings(*call, *shape);
+      if (bindings.empty() && shape->Params.empty() && shape->Returns.empty()) {
         continue;
       }
 
       SignatureState.CallArgs[call] = bindings;
-      if (!isUnknownExternalFunction(*callee,
-                                     externalPrototypesForState(SignatureState))) {
+      if (callee == nullptr ||
+          !isUnknownExternalFunction(
+              *callee, externalPrototypesForState(SignatureState))) {
         for (const CallArgStoreBinding &binding : bindings) {
           if (binding.Store != nullptr &&
               SignatureState.StoresToErase.insert(binding.Store).second) {
@@ -4146,7 +4259,8 @@ private:
         break;
       }
       llvm::StoreInst *store = findNearestStoreBeforeCall(call, *unit);
-      if (store == nullptr && isEntryInputValue(value) && !allowRangeEntryInputs) {
+      if (store == nullptr && isEntryInputValue(value) &&
+          !allowRangeEntryInputs) {
         break;
       }
       llvm::Value *argValue = value;
@@ -4319,8 +4433,8 @@ private:
     }
 
     llvm::IRBuilder<> builder(insertBefore);
-    llvm::CallInst *value = builder.CreateCall(callRangeValueHelper(range, kind),
-                                               {}, unit->Name + "." + kind.str());
+    llvm::CallInst *value = builder.CreateCall(
+        callRangeValueHelper(range, kind), {}, unit->Name + "." + kind.str());
     value->setMetadata("notdec.register.summary_ssa.call_value",
                        callRangeValueNode(range, kind, &call));
     CallRangeValues.emplace(key, value);
@@ -4383,9 +4497,9 @@ private:
       ++index;
     }
     llvm::Metadata *fields[] = {
-        llvm::MDString::get(Function.getContext(),
-                            "name=" + (unit == nullptr ? std::string("")
-                                                       : unit->Name)),
+        llvm::MDString::get(
+            Function.getContext(),
+            "name=" + (unit == nullptr ? std::string("") : unit->Name)),
         llvm::MDString::get(Function.getContext(), "kind=" + kind.str()),
         llvm::MDString::get(Function.getContext(),
                             "bit_offset=" + std::to_string(range.BitOffset)),
@@ -4686,10 +4800,11 @@ llvm::Value *extractReturnRange(llvm::IRBuilder<> &builder,
     if (shape.Returns.size() == 1) {
       slotValue = &call;
     } else {
-      slotValue = builder.CreateExtractValue(
-          &call, {index}, slot.Unit->Name + ".ret_slot");
+      slotValue = builder.CreateExtractValue(&call, {index},
+                                             slot.Unit->Name + ".ret_slot");
     }
-    llvm::Value *registerValue = castSlotValueToRegister(builder, slotValue, slot);
+    llvm::Value *registerValue =
+        castSlotValueToRegister(builder, slotValue, slot);
     if (registerValue == nullptr ||
         registerValue->getType() != slot.Unit->Global->getValueType()) {
       return nullptr;
@@ -4709,8 +4824,8 @@ llvm::Value *extractReturnRange(llvm::IRBuilder<> &builder,
     llvm::Type *rangeType =
         llvm::IntegerType::get(builder.getContext(), range.BitWidth);
     if (bits->getType() != rangeType) {
-      bits = builder.CreateTrunc(bits, rangeType,
-                                 slot.Unit->Name + ".ret_range");
+      bits =
+          builder.CreateTrunc(bits, rangeType, slot.Unit->Name + ".ret_range");
     }
     return bits;
   }
@@ -4897,9 +5012,9 @@ llvm::Value *integerEntrySlotReplacement(llvm::Instruction &inst,
     }
     llvm::Value *value = &arg;
     if (argOffset != 0) {
-      value = builder.CreateLShr(value,
-                                 llvm::ConstantInt::get(argType, argOffset),
-                                 slot.Unit->Name + ".entry_arg_shift");
+      value =
+          builder.CreateLShr(value, llvm::ConstantInt::get(argType, argOffset),
+                             slot.Unit->Name + ".entry_arg_shift");
     }
     auto *resultType = llvm::IntegerType::get(arg.getContext(), width);
     if (value->getType() != resultType) {
@@ -4949,7 +5064,8 @@ llvm::Value *integerEntrySlotReplacement(llvm::Instruction &inst,
       }
       llvm::Value *wide = builder.CreateZExtOrTrunc(
           narrow, inst.getType(), slot.Unit->Name + ".entry_arg_wide");
-      return builder.CreateShl(wide, llvm::ConstantInt::get(inst.getType(), offset),
+      return builder.CreateShl(wide,
+                               llvm::ConstantInt::get(inst.getType(), offset),
                                slot.Unit->Name + ".entry_arg_shifted");
     }
   }
@@ -5047,8 +5163,9 @@ llvm::Value *rangeEntrySlotReplacement(llvm::Instruction &inst,
   }
   llvm::Value *value = &arg;
   if (argOffset != 0) {
-    value = builder.CreateLShr(value, llvm::ConstantInt::get(argType, argOffset),
-                               slot.Unit->Name + ".range_entry_arg_shift");
+    value =
+        builder.CreateLShr(value, llvm::ConstantInt::get(argType, argOffset),
+                           slot.Unit->Name + ".range_entry_arg_shift");
   }
   auto *resultType = llvm::IntegerType::get(arg.getContext(), width);
   if (value->getType() != resultType) {
@@ -5105,7 +5222,8 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
           llvm::IRBuilder<> builder(&inst);
           llvm::Value *replacement =
               rangeEntrySlotReplacement(inst, slot, arg, builder);
-          if (replacement != nullptr && replacement->getType() == inst.getType()) {
+          if (replacement != nullptr &&
+              replacement->getType() == inst.getType()) {
             state.ValueMap[&inst] = replacement;
             inst.replaceAllUsesWith(replacement);
           }
@@ -5115,7 +5233,8 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
           llvm::IRBuilder<> builder(&inst);
           llvm::Value *replacement =
               integerEntrySlotReplacement(inst, *entryLoad, slot, arg, builder);
-          if (replacement != nullptr && replacement->getType() == inst.getType()) {
+          if (replacement != nullptr &&
+              replacement->getType() == inst.getType()) {
             state.ValueMap[&inst] = replacement;
             inst.replaceAllUsesWith(replacement);
             break;
@@ -5206,19 +5325,27 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
     }
     std::vector<CallArgStoreBinding> &bindings = state.CallArgs[oldCall];
     llvm::Function *oldCallee = oldCall->getCalledFunction();
-    if (oldCallee == nullptr || state.Shapes.count(oldCallee) == 0) {
+    const SignatureShape *shape = shapeForCall(state, *oldCall);
+    if (shape == nullptr) {
       continue;
     }
-    const SignatureShape &shape = state.Shapes.at(oldCallee);
-    llvm::Function *newCallee = replacements[oldCallee];
-    if (newCallee == nullptr) {
-      continue;
+    llvm::Value *newCallee = nullptr;
+    llvm::FunctionType *newCallType = nullptr;
+    if (oldCallee != nullptr) {
+      newCallee = replacements[oldCallee];
+      if (newCallee == nullptr) {
+        continue;
+      }
+      newCallType = llvm::cast<llvm::Function>(newCallee)->getFunctionType();
+    } else {
+      newCallee = oldCall->getCalledOperand();
+      newCallType = functionTypeForShape(module.getContext(), *shape);
     }
     std::vector<llvm::Value *> args;
     args.reserve(bindings.size());
     llvm::IRBuilder<> oldCallBuilder(oldCall);
-    for (unsigned index = 0; index < shape.Params.size(); ++index) {
-      const NativeSignatureSlot &slot = shape.Params[index];
+    for (unsigned index = 0; index < shape->Params.size(); ++index) {
+      const NativeSignatureSlot &slot = shape->Params[index];
       const CallArgStoreBinding *binding = bindingForIndex(bindings, index);
       llvm::Value *value = binding == nullptr ? nullptr : binding->Value;
       if (value != nullptr) {
@@ -5231,9 +5358,9 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
       }
       args.push_back(value);
     }
-    if (shape.VarArg) {
+    if (shape->VarArg) {
       for (const CallArgStoreBinding &binding : bindings) {
-        if (binding.Index < shape.Params.size()) {
+        if (binding.Index < shape->Params.size()) {
           continue;
         }
         llvm::Value *value = binding.Value;
@@ -5245,13 +5372,13 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         args.push_back(value);
       }
     }
-    llvm::CallInst *newCall = rewriteCallInst(
-        *oldCall, *newCallee, *newCallee->getFunctionType(), args);
+    llvm::CallInst *newCall =
+        rewriteCallInst(*oldCall, *newCallee, *newCallType, args);
     state.RewrittenCalls.insert(newCall);
     if (!oldCall->use_empty()) {
       llvm::IRBuilder<> builder(newCall->getNextNode());
       llvm::Value *replacement =
-          replacementForOldCallUses(builder, *oldCall, *newCall, shape);
+          replacementForOldCallUses(builder, *oldCall, *newCall, *shape);
       if (replacement != nullptr) {
         oldCall->replaceAllUsesWith(replacement);
         newCall->takeName(oldCall);
@@ -5260,14 +5387,14 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
     valueMap[oldCall] = newCall;
     oldCallsToErase.push_back(oldCall);
     auto helpersIt = state.ReturnHelpers.find(oldCall);
-    if (helpersIt != state.ReturnHelpers.end() && !shape.Returns.empty()) {
+    if (helpersIt != state.ReturnHelpers.end() && !shape->Returns.empty()) {
       llvm::IRBuilder<> builder(newCall->getNextNode());
       for (auto &[name, helper] : helpersIt->second) {
         if (helper->getParent() == nullptr) {
           continue;
         }
         llvm::Value *value =
-            extractReturnRegister(builder, shape, *newCall, name);
+            extractReturnRegister(builder, *shape, *newCall, name);
         if (value == nullptr) {
           value = frozenPoisonAt(builder, helper->getType(),
                                  name + ".return_unknown");
@@ -5281,7 +5408,7 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
     }
     auto rangeHelpersIt = state.RangeReturnHelpers.find(oldCall);
     if (rangeHelpersIt != state.RangeReturnHelpers.end() &&
-        !shape.Returns.empty()) {
+        !shape->Returns.empty()) {
       llvm::IRBuilder<> builder(newCall->getNextNode());
       for (RangeReturnHelper &rangeHelper : rangeHelpersIt->second) {
         llvm::CallInst *helper = rangeHelper.Helper;
@@ -5289,7 +5416,7 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
           continue;
         }
         llvm::Value *value =
-            extractReturnRange(builder, shape, *newCall, rangeHelper.Range);
+            extractReturnRange(builder, *shape, *newCall, rangeHelper.Range);
         if (value == nullptr) {
           value = frozenPoisonAt(builder, helper->getType(),
                                  "range_return_unknown");
@@ -5466,9 +5593,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   SignatureRewriteState signatureState;
   signatureState.ExternalPrototypes = &externalPrototypes;
   if (options.EnableRewrite) {
-    signatureState.Shapes =
-        buildInitialSignatureShapes(module, units, facts, abi,
-                                    externalPrototypes);
+    signatureState.Shapes = buildInitialSignatureShapes(
+        module, units, facts, abi, externalPrototypes);
   }
 
   NativeRegisterSummarySSASummary summary;
@@ -5487,6 +5613,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   }
   if (options.EnableRewrite) {
     refineUnknownExternalParamShapes(signatureState, externalPrototypes);
+    refineIndirectCallsiteParamShapes(signatureState);
     addDemandedExternalReturns(signatureState, units, abi, externalPrototypes);
     markSignatureCallArgStores(signatureState, summary);
     rewriteSignatureShapes(module, signatureState, summary);

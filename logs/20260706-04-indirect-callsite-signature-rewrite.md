@@ -1,0 +1,73 @@
+# Indirect callsite signature rewrite
+
+## 背景
+
+`php calendar.so` 里寄存器全局已经消掉了，但还有 indirect call 后的返回 helper：
+
+```llvm
+call void %3()
+%RAX.return = call i32 @notdec.register.summary_return.i32()
+```
+
+这些 helper 表示“这个 call 后面读取了 RAX 的返回值”。原先签名重写只按 direct callee 的 `Function*` 建 shape，indirect call 没有 `getCalledFunction()`，所以不会进入参数推断和调用重写，helper 会残留。
+
+## 修改
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:263` 在 `SignatureRewriteState` 增加 `IndirectCallShapes`，把 indirect call 的推断签名挂在具体 callsite 上。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1328` 新增 `signatureHasReturnForRegister()`，避免同一个返回寄存器重复加入返回列表。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1338` 新增 `addReturnSlotForRange()`，对 indirect call 的返回 range 使用整寄存器返回，再由 `extractReturnRange()` 拆出低/高位。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1355` 新增 `addAbiInputParamSlots()`，先给 indirect callsite 放入 ABI 输入寄存器槽，后续复用现有参数推断来截断。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1370` 新增 `addIndirectCallsiteShapes()`，从 `ReturnHelpers` / `RangeReturnHelpers` 给 indirect callsite 建返回 shape。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1622` 新增 `refineIndirectCallsiteParamShapes()`，用 `callsiteBoundArgPrefix()` 复用已有参数数量推断。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1684` 新增 `shapeForCall()`，统一 direct function shape 和 indirect callsite shape 的查询。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1745` 在 `rewriteLoads()` 后、`collectSignatureCallArgs()` 前构造 indirect callsite shape。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:4188` 让 `collectSignatureCallArgs()` 支持 indirect callsite shape。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:5322` 让 `rewriteSignatureShapes()` 对 indirect call 使用 `functionTypeForShape()` 重建 typed indirect call，并复用已有 return helper 替换逻辑。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:5616` 在 external arity refine 后增加 indirect callsite arity refine。
+- `tests/native_register_summary_ssa_test.cpp:1584` 新增 `testIndirectCallReturnHelperIsRewritten()`，覆盖 `call void %fp()` 后读取 RAX 的场景。
+- `tests/native_register_summary_ssa_test.cpp:6300` 把新测试接入 `main()`。
+
+## 验证
+
+构建和单测：
+
+```bash
+cmake --build external/NotDec-bin2llvm/build --target notdec-native-llvm native_register_summary_ssa_test -j4
+external/NotDec-bin2llvm/build/bin/native_register_summary_ssa_test
+```
+
+结果：通过。
+
+`php calendar.so`：
+
+```bash
+external/NotDec-bin2llvm/build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/lib/php/20230831/calendar.so \
+  -o /tmp/notdec-bin2llvm-php-calendar-indirect-call-20260706162155/native.ll \
+  --all-confirmed --skip-runtime \
+  --register-ssa-warning-out /tmp/notdec-bin2llvm-php-calendar-indirect-call-20260706162155/register-ssa-warnings.tsv
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-bin2llvm-php-calendar-indirect-call-20260706162155/native.ll -o /tmp/notdec-bin2llvm-php-calendar-indirect-call-20260706162155/native.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-bin2llvm-php-calendar-indirect-call-20260706162155/native.bc -disable-output
+```
+
+结果：
+
+- 输出路径：`/tmp/notdec-bin2llvm-php-calendar-indirect-call-20260706162155/native.ll`
+- 运行时间：`elapsed=17.44`
+- `integer_register_refs=0`
+- `all_register_metadata_globals=0`
+- `summary_helpers=0`
+- `summary_ssa_metadata=0`
+- `raw_notdec_register=0`
+- indirect call 已重写成带真实返回值和参数的 call，例如 `call i64 %3(...)`。
+
+回归：
+
+- `lighttpd-angel` 输出路径：`/tmp/notdec-bin2llvm-lighttpd-angel-indirect-call-20260706162254/native.ll`，`elapsed=1.38`，寄存器和 summary 残留全为 0。
+- `fortune` 输出路径：`/tmp/notdec-bin2llvm-fortune-indirect-call-20260706162255/native.ll`，`elapsed=12.05`，寄存器和 summary 残留全为 0。
+
+## 评价
+
+- 实现效果：5/5。`calendar.so` 的 indirect call return helper 被消除，三个当前关注样例都达到寄存器残留清零。
+- 复杂度：3/5。没有改 SummarySSA 主数据流，只是在签名重写层增加 callsite 级 shape；但 indirect call 参数和返回都进入了同一条重写路径，需要维护 direct/indirect 两种 shape 来源。
+- 维护成本：3/5。后续如果要做更准的函数指针类型合并，可以在 `IndirectCallShapes` 上继续汇总；当前实现按 callsite 保守落地，不强行猜全局函数指针类型。

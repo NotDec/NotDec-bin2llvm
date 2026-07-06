@@ -395,10 +395,8 @@ bool functionHasUsedSummaryCallValueRange(const llvm::Function &function,
         call->getMetadata("notdec.register.summary_ssa.call_value");
     if (metadataHasField(metadata, ("kind=" + kind).str()) &&
         metadataHasField(metadata, ("name=" + name).str()) &&
-        metadataHasField(metadata,
-                         "bit_offset=" + std::to_string(bitOffset)) &&
-        metadataHasField(metadata,
-                         "bit_width=" + std::to_string(bitWidth))) {
+        metadataHasField(metadata, "bit_offset=" + std::to_string(bitOffset)) &&
+        metadataHasField(metadata, "bit_width=" + std::to_string(bitWidth))) {
       return true;
     }
   }
@@ -1253,9 +1251,9 @@ bool testRegisterPointerPhiLoadIsCanonicalized() {
 
   auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
                                        {llvm::Type::getInt1Ty(context)}, false);
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "register_pointer_phi_load",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "register_pointer_phi_load", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
@@ -1285,8 +1283,9 @@ bool testRegisterPointerPhiLoadIsCanonicalized() {
                 "register pointer PHI load remained after SummarySSA") &&
          expect(summary.LoadsReplaced >= 1,
                 "canonicalized register load was not consumed") &&
-         verifyOk(module,
-                  "module failed verifier after register pointer PHI load test");
+         verifyOk(
+             module,
+             "module failed verifier after register pointer PHI load test");
 }
 
 bool testUnknownPhiIncomingUsesFrozenPoison() {
@@ -1555,9 +1554,9 @@ bool testExternalReturnUsesRangeCallValue() {
                              "external_return_range", module);
   auto *callerType =
       llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
-  llvm::Function *caller = llvm::Function::Create(
-      callerType, llvm::GlobalValue::ExternalLinkage, "uses_external_return",
-      module);
+  llvm::Function *caller =
+      llvm::Function::Create(callerType, llvm::GlobalValue::ExternalLinkage,
+                             "uses_external_return", module);
   llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
   llvm::IRBuilder<> builder(entry);
   builder.CreateCall(calleeType, external);
@@ -1580,6 +1579,54 @@ bool testExternalReturnUsesRangeCallValue() {
                 "external return helper did not carry RAX range metadata") &&
          verifyOk(module,
                   "module failed verifier after external return range test");
+}
+
+bool testIndirectCallReturnHelperIsRewritten() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-indirect-call-return", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *caller =
+      llvm::Function::Create(callerType, llvm::GlobalValue::ExternalLinkage,
+                             "uses_indirect_return", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 7),
+                "RDI");
+  llvm::Value *callee = builder.CreateIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x1234),
+      llvm::PointerType::get(context, 0), "callee.ptr");
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  builder.CreateCall(voidType, callee);
+  llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "ret_rax");
+  builder.CreateRet(loaded);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+
+  bool typedIndirectReturn = false;
+  for (llvm::Instruction &inst : llvm::instructions(*caller)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call != nullptr && call->getCalledFunction() == nullptr &&
+        call->getType()->isIntegerTy(64)) {
+      typedIndirectReturn = true;
+    }
+  }
+
+  return expect(summary.CallReturnValues == 1,
+                "indirect call did not create return helper before rewrite") &&
+         expect(summary.CallsRewritten >= 1,
+                "indirect callsite was not rewritten") &&
+         expect(typedIndirectReturn,
+                "indirect call was not rebuilt with integer return type") &&
+         expect(!moduleHasUsedFunctionNamed(
+                    module, "notdec.register.summary_return.i64"),
+                "indirect call return helper remained") &&
+         verifyOk(module,
+                  "module failed verifier after indirect call return rewrite");
 }
 
 bool testIntrinsicDoesNotCreateCallValue() {
@@ -3535,8 +3582,8 @@ bool testInternalSignatureRewriteUsesNarrowEntryRangeArg() {
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   llvm::Value *input = builder.CreateCall(
-      partialRead, {rdi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                                0)},
+      partialRead,
+      {rdi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
       "input32");
   builder.CreateStore(input, sink);
   builder.CreateRetVoid();
@@ -3554,8 +3601,9 @@ bool testInternalSignatureRewriteUsesNarrowEntryRangeArg() {
                 "narrow RDI entry left raw RDI load") &&
          expect(!hasPartialReadCall(*rewritten),
                 "narrow RDI entry left partial read helper") &&
-         verifyOk(module,
-                  "module failed verifier after narrow RDI entry argument test");
+         verifyOk(
+             module,
+             "module failed verifier after narrow RDI entry argument test");
 }
 
 bool testNarrowEntryRangeDoesNotCreateWholeEntryLoad() {
@@ -3578,8 +3626,8 @@ bool testNarrowEntryRangeDoesNotCreateWholeEntryLoad() {
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   llvm::Value *input = builder.CreateCall(
-      partialRead, {rdi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                                0)},
+      partialRead,
+      {rdi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
       "input32");
   builder.CreateStore(input, sink);
   builder.CreateRetVoid();
@@ -4807,9 +4855,9 @@ bool testKnownUnaryLibmUsesFloatAbiSlots() {
     }
     ok &= expect(zmmStores == 0,
                  (prefix + "ABI ZMM argument store remained").c_str());
-    ok &= expect(!moduleHasFunctionNamed(module,
-                                         "notdec.register.summary_return.i64"),
-                 (prefix + "range return helper remained").c_str());
+    ok &= expect(
+        !moduleHasFunctionNamed(module, "notdec.register.summary_return.i64"),
+        (prefix + "range return helper remained").c_str());
     ok &= expect(summary.CallsRewritten >= 1,
                  (prefix + "call was not counted as rewritten").c_str());
     ok &= verifyOk(module, (prefix + "module failed verifier").c_str());
@@ -4969,8 +5017,7 @@ bool testFullStoreFeedsPartialReadThroughRangeSSA() {
                 "RAX");
   llvm::Value *low = builder.CreateCall(
       partialRead,
-      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
-      "low");
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)}, "low");
   builder.CreateStore(low, sink);
   builder.CreateRetVoid();
 
@@ -5439,10 +5486,9 @@ bool testLoopPartialWriteUsesNarrowRangePhi() {
   llvm::Value *next = builder.CreateAdd(
       current, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 1),
       "next");
-  builder.CreateCall(partialWrite,
-                     {rax, next,
-                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0)});
+  builder.CreateCall(
+      partialWrite,
+      {rax, next, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   builder.CreateBr(header);
 
   builder.SetInsertPoint(exit);
@@ -5551,8 +5597,8 @@ bool testFloatCallEffectUsesRangeLiveness() {
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   storeRegister(builder, zmm0, llvm::ConstantInt::get(zmmType, 1), "ZMM0");
-  builder.CreateCall(log, {llvm::ConstantFP::get(llvm::Type::getDoubleTy(context),
-                                                1.0)});
+  builder.CreateCall(
+      log, {llvm::ConstantFP::get(llvm::Type::getDoubleTy(context), 1.0)});
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
@@ -5572,9 +5618,8 @@ bool testPlannerSplitsZmmForFloatAbiSlot() {
   createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function =
-      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
-                             "planner_zmm_abi_slot", module);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "planner_zmm_abi_slot", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -6252,6 +6297,7 @@ int main() {
   ok &= testPreservedCallKeepsPreviousValue();
   ok &= testDemandedReturnCreatesCallValue();
   ok &= testExternalReturnUsesRangeCallValue();
+  ok &= testIndirectCallReturnHelperIsRewritten();
   ok &= testIntrinsicDoesNotCreateCallValue();
   ok &= testOverwrittenStoreIsRemoved();
   ok &= testCrossBlockDeadStoreIsRemoved();
