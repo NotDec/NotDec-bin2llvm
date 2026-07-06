@@ -89,3 +89,49 @@ external/NotDec-bin2llvm/build/bin/notdec-native-llvm \
 
 风险是：如果某个间接跳转的 block successor 跨函数，这里会保守跳过，不会强行清 unresolved。
 这符合当前目标：只修已经能由 GTIRB/ddisasm 明确落在当前函数 CFG 里的 jump table。
+
+## 追加：final cleanup 清理指令级 SummarySSA metadata
+
+继续检查 fortune 最新 IR 时发现，真实寄存器全局访问、`summary_return`、`summary_clobber` 都已清零，
+但仍有大量 `!notdec.register.summary_ssa.*` 指令级 metadata。原因是 final cleanup 只清理了
+函数级 metadata 和死全局，没有清理 PHI、entry value、zero-demand 这类指令上的调试标注。
+
+修改：
+
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h:25`：
+  `NativeRegisterFinalCleanupSummary` 增加 `InstructionMetadataCleared` 统计。
+- `lib/passes/summary/NativeRegisterFinalCleanup.cpp:31`：
+  增加 `InstructionMetadataKeys`，覆盖 `call_value`、`entry`、`phi`、`range_entry`、`replaced`、
+  `zero_demand_operand`。
+- `lib/passes/summary/NativeRegisterFinalCleanup.cpp:92`：
+  增加 `clearInstructionMetadata(...)`，只在函数已经没有寄存器 load/store/helper 残留时清理这些标注。
+- `lib/passes/summary/NativeRegisterFinalCleanup.cpp:159`：
+  final cleanup 清函数级 metadata 后继续清指令级 metadata。
+- `lib/passes/summary/NativeRegisterFinalCleanup.cpp:178`：
+  summary 输出增加 `instruction_metadata_cleared`。
+
+验证：
+
+```bash
+cmake --build external/NotDec-bin2llvm/build --target notdec-native-llvm -j4
+OUT=/tmp/notdec-bin2llvm-fortune-final-metadata-clean-20260706123424
+external/NotDec-bin2llvm/build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  -o "$OUT/fortune.native.ll" --all-confirmed --skip-runtime
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as "$OUT/fortune.native.ll" -o "$OUT/fortune.native.bc"
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify "$OUT/fortune.native.bc" -disable-output
+```
+
+结果：
+
+- IR：`/tmp/notdec-bin2llvm-fortune-final-metadata-clean-20260706123424/fortune.native.ll`。
+- `register_global_refs=0`。
+- `register_global_load_store=0`。
+- `summary_return=0`。
+- `summary_clobber=0`。
+- `summary_ssa_metadata_uses=0`。
+- `summary_ssa_named_metadata_defs=0`。
+- `llvm-as` 和 `opt -passes=verify` 通过。
+- fortune native run `elapsed=12.17s`，和上一轮 `12.10s` 同级。
+
+这次清理的是已经消费完的调试/分析标注，不改变 IR 的计算语义。

@@ -28,6 +28,15 @@ constexpr std::array<llvm::StringRef, 6> FunctionMetadataKeys = {
     "notdec.register.summary_ssa",
 };
 
+constexpr std::array<llvm::StringRef, 6> InstructionMetadataKeys = {
+    "notdec.register.summary_ssa.call_value",
+    "notdec.register.summary_ssa.entry",
+    "notdec.register.summary_ssa.phi",
+    "notdec.register.summary_ssa.range_entry",
+    "notdec.register.summary_ssa.replaced",
+    "notdec.register.summary_ssa.zero_demand_operand",
+};
+
 bool isRegisterGlobal(const llvm::GlobalVariable &global) {
   return global.getMetadata("notdec.register") != nullptr;
 }
@@ -76,6 +85,20 @@ uint64_t clearFunctionMetadata(llvm::Function &function) {
     }
     function.setMetadata(key, nullptr);
     ++cleared;
+  }
+  return cleared;
+}
+
+uint64_t clearInstructionMetadata(llvm::Function &function) {
+  uint64_t cleared = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    for (llvm::StringRef key : InstructionMetadataKeys) {
+      if (inst.getMetadata(key) == nullptr) {
+        continue;
+      }
+      inst.setMetadata(key, nullptr);
+      ++cleared;
+    }
   }
   return cleared;
 }
@@ -133,6 +156,7 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
     }
     ++summary.FunctionsWithoutRegisterResidue;
     summary.FunctionMetadataCleared += clearFunctionMetadata(function);
+    summary.InstructionMetadataCleared += clearInstructionMetadata(function);
   }
   if (options.RunGlobalDCE) {
     runGlobalDCE(module);
@@ -151,6 +175,7 @@ void printNativeRegisterFinalCleanupSummary(
      << " functions_without_register_residue="
      << summary.FunctionsWithoutRegisterResidue
      << " function_metadata_cleared=" << summary.FunctionMetadataCleared
+     << " instruction_metadata_cleared=" << summary.InstructionMetadataCleared
      << " remaining_register_accesses=" << summary.RemainingRegisterAccesses
      << '\n';
 }
