@@ -102,11 +102,8 @@ enum class CallRegisterEffect {
   Unknown,
 };
 
-using BlockRegKey = std::pair<llvm::BasicBlock *, llvm::GlobalVariable *>;
-// A SummarySSA variable is moving from a whole lifted register to a concrete
-// bit range.  The first migration step uses these keys only for partial helper
-// reads, so old whole-register caches can stay in place while range PHIs prove
-// out the Braun construction at narrower types.
+// SummarySSA variables are concrete register bit ranges, not whole lifted
+// register globals.
 struct RegisterRangeKey {
   llvm::GlobalVariable *Global = nullptr;
   uint64_t BitOffset = 0;
@@ -2258,46 +2255,6 @@ private:
     return builder.CreateTrunc(result, resultType, name);
   }
 
-  llvm::Value *readCoveredPartialWriteBefore(llvm::BasicBlock &block,
-                                             const RegisterUnit &unit,
-                                             unsigned readWidth,
-                                             uint64_t bitOffset,
-                                             llvm::Instruction *before) {
-    for (auto it = before->getIterator(); it != block.begin();) {
-      --it;
-      llvm::Instruction &inst = *it;
-      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
-        if (parseNativeRegisterPartialRead(*call)) {
-          continue;
-        }
-        std::optional<NativeRegisterPartialWriteInfo> partial =
-            parseNativeRegisterPartialWrite(*call);
-        if (!partial || partial->Global != unit.Global) {
-          continue;
-        }
-        uint64_t readEnd = bitOffset + readWidth;
-        uint64_t writeEnd = partial->BitOffset + partial->WriteWidth;
-        if (bitOffset < partial->BitOffset || readEnd > writeEnd) {
-          return nullptr;
-        }
-        return extractBitsFromInteger(partial->Value, readWidth,
-                                      bitOffset - partial->BitOffset, before,
-                                      unit.Name + ".partial_read");
-      }
-      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
-        RegisterAccess access = registerStore(*store, Units);
-        if (access.Unit != nullptr && access.Unit->Global == unit.Global &&
-            access.IsStorageValue) {
-          return nullptr;
-        }
-      }
-      if (inst.mayWriteToMemory()) {
-        return nullptr;
-      }
-    }
-    return nullptr;
-  }
-
   void eraseTriviallyDeadNonPhiTree(llvm::Instruction *root) {
     std::vector<llvm::Instruction *> worklist;
     worklist.push_back(root);
@@ -4428,7 +4385,7 @@ private:
     }
     EntryRangeInputs.emplace(range, value);
     EntryInputRanges.emplace(value, range);
-    ++Summary.EntryInputs;
+    ++Summary.RangeEntryInputs;
     return value;
   }
 
@@ -4549,7 +4506,7 @@ private:
   callArgStoreBindings(llvm::CallBase &call, const SignatureShape &shape) {
     std::vector<CallArgStoreBinding> bindings;
     llvm::Function *callee = call.getCalledFunction();
-    bool allowEntryInputs = callee != nullptr && !callee->isDeclaration();
+    bool allowRangeEntryInputs = callee != nullptr && !callee->isDeclaration();
     unsigned argCount =
         shape.VarArg ? Abi.InputsInOrder.size() : shape.Params.size();
     for (unsigned index = 0; index < argCount; ++index) {
@@ -4575,7 +4532,7 @@ private:
         break;
       }
       llvm::StoreInst *store = findNearestStoreBeforeCall(call, *unit);
-      if (store == nullptr && isEntryInputValue(value) && !allowEntryInputs) {
+      if (store == nullptr && isEntryInputValue(value) && !allowRangeEntryInputs) {
         break;
       }
       llvm::Value *argValue = value;
@@ -4982,7 +4939,7 @@ void addFunctionSummary(NativeRegisterSummarySSASummary &total,
   total.DeadStoresRemoved += fn.DeadStoresRemoved;
   total.PhisCreated += fn.PhisCreated;
   total.PhisSimplified += fn.PhisSimplified;
-  total.EntryInputs += fn.EntryInputs;
+  total.RangeEntryInputs += fn.RangeEntryInputs;
   total.CallReturnValues += fn.CallReturnValues;
   total.CallClobberValues += fn.CallClobberValues;
   total.CallArgStoresMarked += fn.CallArgStoresMarked;
@@ -5975,7 +5932,7 @@ void printNativeRegisterSummarySSASummary(
      << " dead_stores_removed=" << summary.DeadStoresRemoved
      << " phis_created=" << summary.PhisCreated
      << " phis_simplified=" << summary.PhisSimplified
-     << " entry_inputs=" << summary.EntryInputs
+     << " range_entry_inputs=" << summary.RangeEntryInputs
      << " call_returns=" << summary.CallReturnValues
      << " call_clobbers=" << summary.CallClobberValues
      << " call_arg_stores_marked=" << summary.CallArgStoresMarked
@@ -6024,7 +5981,7 @@ void printNativeRegisterSummarySSASummary(
        << " dead_stores_removed=" << function.DeadStoresRemoved
        << " phis_created=" << function.PhisCreated
        << " phis_simplified=" << function.PhisSimplified
-       << " entry_inputs=" << function.EntryInputs
+       << " range_entry_inputs=" << function.RangeEntryInputs
        << " call_returns=" << function.CallReturnValues
        << " call_clobbers=" << function.CallClobberValues
        << " call_arg_stores_marked=" << function.CallArgStoresMarked

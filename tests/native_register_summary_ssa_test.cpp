@@ -3532,7 +3532,7 @@ bool testNarrowEntryRangeDoesNotCreateWholeEntryLoad() {
   options.EnableResidueRemoval = false;
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
 
-  return expect(summary.EntryInputs == 1,
+  return expect(summary.RangeEntryInputs == 1,
                 "narrow entry range did not create one segment entry input") &&
          expect(!hasRegisterLoad(*function, "RDI"),
                 "narrow entry range created whole RDI entry load") &&
