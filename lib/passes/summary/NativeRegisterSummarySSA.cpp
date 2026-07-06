@@ -2093,6 +2093,7 @@ private:
   std::set<llvm::PHINode *> DeadPhis;
   std::map<llvm::GlobalVariable *, llvm::LoadInst *> EntryInputs;
   std::map<RegisterRangeKey, llvm::Value *> EntryRangeInputs;
+  std::map<llvm::Value *, RegisterRangeKey> EntryInputRanges;
   std::map<llvm::GlobalVariable *, std::set<uint64_t>> RangeBoundaries;
   std::map<llvm::GlobalVariable *, std::vector<RegisterRangeKey>> PlannedRanges;
   std::map<CallValueKey, llvm::Value *> CallValues;
@@ -3192,6 +3193,9 @@ private:
     if (inst == nullptr) {
       return true;
     }
+    if (inst->getParent() == nullptr || use->getParent() == nullptr) {
+      return false;
+    }
     if (inst->getFunction() != use->getFunction()) {
       return false;
     }
@@ -4089,30 +4093,7 @@ private:
         continue;
       }
       for (const RegisterRangeKey &range : ranges) {
-        llvm::Function *callee = call->getCalledFunction();
-        if (callee != nullptr &&
-            (range.BitOffset != 0 ||
-             range.BitWidth != registerBitWidth(unit))) {
-          llvm::Value *value = resolve(callRangeValue(*call, range, kind));
-          if (value != nullptr && value->getType() == rangeType(range)) {
-            CurrentDef[{&block, range}] = RangedSSAValue{value, range};
-            UnknownCurrentDef.erase({&block, range});
-          }
-          continue;
-        }
-
-        llvm::Value *full = callValue(*call, unit, kind);
-        auto *fullInst = llvm::dyn_cast<llvm::Instruction>(full);
-        llvm::Instruction *insertBefore =
-            fullInst != nullptr ? fullInst->getNextNode() : nullptr;
-        if (insertBefore == nullptr) {
-          insertBefore = call->getNextNode();
-        }
-        if (insertBefore == nullptr) {
-          insertBefore = call->getParent()->getTerminator();
-        }
-        llvm::Value *value = extractRangeValue(range, full, 0, insertBefore,
-                                               unit.Name + ".range_" + kind);
+        llvm::Value *value = callRangeValue(*call, range, kind);
         value = resolve(value);
         if (value != nullptr && value->getType() == rangeType(range)) {
           CurrentDef[{&block, range}] = RangedSSAValue{value, range};
@@ -4133,6 +4114,10 @@ private:
     if (auto posIt = CurrentDefPosition.find(&block);
         posIt != CurrentDefPosition.end()) {
       position = posIt->second;
+    }
+    if (position != nullptr && position->getParent() != &block) {
+      clearAllBlockRangeDefs(block);
+      position = nullptr;
     }
     if (position != nullptr && !position->comesBefore(before)) {
       clearAllBlockRangeDefs(block);
@@ -4655,6 +4640,21 @@ private:
                              unit->Name + ".range_entry_arg");
   }
 
+  llvm::MDNode *entryRangeNode(const RegisterRangeKey &range) const {
+    const RegisterUnit *unit = unitForRange(range);
+    llvm::Metadata *fields[] = {
+        llvm::MDString::get(Function.getContext(),
+                            "name=" +
+                                (unit == nullptr ? std::string("")
+                                                 : unit->Name)),
+        llvm::MDString::get(Function.getContext(),
+                            "bit_offset=" + std::to_string(range.BitOffset)),
+        llvm::MDString::get(Function.getContext(),
+                            "bit_width=" + std::to_string(range.BitWidth)),
+    };
+    return llvm::MDNode::get(Function.getContext(), fields);
+  }
+
   llvm::Value *entryRangeInput(const RegisterRangeKey &range) {
     if (auto cached = EntryRangeInputs.find(range);
         cached != EntryRangeInputs.end()) {
@@ -4669,22 +4669,25 @@ private:
           &*Function.getEntryBlock().getFirstInsertionPt();
       if (llvm::Value *value = entryRangeArgument(range, insertBefore)) {
         EntryRangeInputs.emplace(range, value);
+        EntryInputRanges.emplace(value, range);
         return value;
       }
     }
-    llvm::LoadInst *fullInput = entryInput(*unit);
-    llvm::Instruction *insertBefore = fullInput->getNextNode();
-    if (insertBefore == nullptr) {
-      insertBefore = fullInput->getParent()->getTerminator();
-    }
+    llvm::Instruction *insertBefore =
+        &*Function.getEntryBlock().getFirstInsertionPt();
     if (insertBefore == nullptr) {
       return nullptr;
     }
-    llvm::Value *value = extractRangeValue(range, fullInput, 0, insertBefore,
-                                           unit->Name + ".range_entry");
-    if (value != nullptr) {
-      EntryRangeInputs.emplace(range, value);
+    llvm::Value *value =
+        frozenPoisonBefore(*insertBefore, rangeType(range),
+                           unit->Name + ".range_entry");
+    if (auto *inst = llvm::dyn_cast<llvm::Instruction>(value)) {
+      inst->setMetadata("notdec.register.summary_ssa.range_entry",
+                        entryRangeNode(range));
     }
+    EntryRangeInputs.emplace(range, value);
+    EntryInputRanges.emplace(value, range);
+    ++Summary.EntryInputs;
     return value;
   }
 
@@ -4978,6 +4981,12 @@ private:
     value = resolve(value);
     for (const auto &[global, load] : EntryInputs) {
       if (resolve(load) == value) {
+        return true;
+      }
+    }
+    for (const auto &[entryValue, range] : EntryInputRanges) {
+      (void)range;
+      if (resolve(entryValue) == value) {
         return true;
       }
     }
@@ -5813,6 +5822,63 @@ llvm::Value *integerEntrySlotReplacement(llvm::Instruction &inst,
   return nullptr;
 }
 
+llvm::Value *rangeEntrySlotReplacement(llvm::Instruction &inst,
+                                       const NativeSignatureSlot &slot,
+                                       llvm::Argument &arg,
+                                       llvm::IRBuilder<> &builder) {
+  llvm::MDNode *metadata =
+      inst.getMetadata("notdec.register.summary_ssa.range_entry");
+  if (metadata == nullptr || slot.Unit == nullptr) {
+    return nullptr;
+  }
+  std::optional<std::string> name = mdField(metadata, "name");
+  std::optional<std::string> offsetText = mdField(metadata, "bit_offset");
+  std::optional<std::string> widthText = mdField(metadata, "bit_width");
+  if (!name || *name != slot.Unit->Name || !offsetText || !widthText) {
+    return nullptr;
+  }
+
+  uint64_t offset = 0;
+  uint64_t width = 0;
+  if (llvm::StringRef(*offsetText).getAsInteger(10, offset) ||
+      llvm::StringRef(*widthText).getAsInteger(10, width) || width == 0 ||
+      offset < slot.OffsetBits ||
+      offset + width > slot.OffsetBits + slot.SizeBits) {
+    return nullptr;
+  }
+
+  if (slot.Kind == NativeSignatureSlotKind::FloatRegister) {
+    if (offset != slot.OffsetBits || width != slot.SizeBits ||
+        !arg.getType()->isFloatingPointTy() ||
+        width != arg.getType()->getScalarSizeInBits()) {
+      return nullptr;
+    }
+    auto *bitsType = llvm::IntegerType::get(arg.getContext(), width);
+    return builder.CreateBitCast(&arg, bitsType,
+                                 slot.Unit->Name + ".range_entry_arg");
+  }
+
+  if (!arg.getType()->isIntegerTy()) {
+    return nullptr;
+  }
+  auto *argType = llvm::cast<llvm::IntegerType>(arg.getType());
+  uint64_t argOffset = offset - slot.OffsetBits;
+  if (argOffset + width > argType->getBitWidth()) {
+    return nullptr;
+  }
+  llvm::Value *value = &arg;
+  if (argOffset != 0) {
+    value = builder.CreateLShr(value, llvm::ConstantInt::get(argType, argOffset),
+                               slot.Unit->Name + ".range_entry_arg_shift");
+  }
+  auto *resultType = llvm::IntegerType::get(arg.getContext(), width);
+  if (value->getType() != resultType) {
+    value = builder.CreateTrunc(value, resultType,
+                                slot.Unit->Name + ".range_entry_arg");
+  }
+  return value;
+}
+
 void rewriteInternalFunctionBody(llvm::Function &oldFunction,
                                  llvm::Function &newFunction,
                                  const SignatureShape &shape,
@@ -5853,6 +5919,17 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
         }
 
         if (slot.Unit == nullptr || slot.Unit->Global == nullptr) {
+          continue;
+        }
+        if (inst.getMetadata("notdec.register.summary_ssa.range_entry") !=
+            nullptr) {
+          llvm::IRBuilder<> builder(&inst);
+          llvm::Value *replacement =
+              rangeEntrySlotReplacement(inst, slot, arg, builder);
+          if (replacement != nullptr && replacement->getType() == inst.getType()) {
+            state.ValueMap[&inst] = replacement;
+            inst.replaceAllUsesWith(replacement);
+          }
           continue;
         }
         for (llvm::LoadInst *entryLoad : entryLoads) {

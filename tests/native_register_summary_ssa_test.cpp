@@ -351,6 +351,49 @@ bool moduleHasFunctionNamed(const llvm::Module &module, llvm::StringRef name) {
   return module.getFunction(name) != nullptr;
 }
 
+bool moduleHasUsedFunctionNamed(const llvm::Module &module,
+                                llvm::StringRef name) {
+  const llvm::Function *function = module.getFunction(name);
+  return function != nullptr && !function->use_empty();
+}
+
+bool metadataHasField(const llvm::MDNode *metadata, llvm::StringRef field) {
+  if (metadata == nullptr) {
+    return false;
+  }
+  for (const llvm::MDOperand &operand : metadata->operands()) {
+    auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+    if (text != nullptr && text->getString() == field) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool functionHasUsedSummaryCallValueRange(const llvm::Function &function,
+                                          llvm::StringRef kind,
+                                          llvm::StringRef name,
+                                          uint64_t bitOffset,
+                                          uint64_t bitWidth) {
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call == nullptr || call->use_empty()) {
+      continue;
+    }
+    llvm::MDNode *metadata =
+        call->getMetadata("notdec.register.summary_ssa.call_value");
+    if (metadataHasField(metadata, ("kind=" + kind).str()) &&
+        metadataHasField(metadata, ("name=" + name).str()) &&
+        metadataHasField(metadata,
+                         "bit_offset=" + std::to_string(bitOffset)) &&
+        metadataHasField(metadata,
+                         "bit_width=" + std::to_string(bitWidth))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool moduleHasOverflowIntrinsicDeclaration(const llvm::Module &module) {
   for (const llvm::Function &function : module) {
     if (function.isDeclaration() &&
@@ -1441,6 +1484,46 @@ bool testDemandedReturnCreatesCallValue() {
          expect(summary.DeadLoadsRemoved == 1,
                 "return replaced load was not removed") &&
          verifyOk(module, "module failed verifier after demanded return test");
+}
+
+bool testExternalReturnUsesRangeCallValue() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-external-return-range", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *external =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "external_return_range", module);
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::ExternalLinkage, "uses_external_return",
+      module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(calleeType, external);
+  llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "ret_rax");
+  builder.CreateRet(loaded);
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnableResidueRemoval = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+
+  return expect(summary.CallReturnValues == 1,
+                "external return range helper was not created") &&
+         expect(!hasLiveReplacedRegisterLoad(*caller),
+                "external return range left live raw RAX load") &&
+         expect(moduleHasUsedFunctionNamed(
+                    module, "notdec.register.summary_return.i64"),
+                "external return range helper was not used") &&
+         expect(functionHasUsedSummaryCallValueRange(*caller, "return", "RAX",
+                                                     0, 64),
+                "external return helper did not carry RAX range metadata") &&
+         verifyOk(module,
+                  "module failed verifier after external return range test");
 }
 
 bool testIntrinsicDoesNotCreateCallValue() {
@@ -3419,6 +3502,46 @@ bool testInternalSignatureRewriteUsesNarrowEntryRangeArg() {
                   "module failed verifier after narrow RDI entry argument test");
 }
 
+bool testNarrowEntryRangeDoesNotCreateWholeEntryLoad() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-narrow-entry-range-no-full-load", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rdi->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *function =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_entry_rdi32_no_full_load", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *input = builder.CreateCall(
+      partialRead, {rdi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                                0)},
+      "input32");
+  builder.CreateStore(input, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnableResidueRemoval = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+
+  return expect(summary.EntryInputs == 1,
+                "narrow entry range did not create one segment entry input") &&
+         expect(!hasRegisterLoad(*function, "RDI"),
+                "narrow entry range created whole RDI entry load") &&
+         expect(!hasPartialReadCall(*function),
+                "narrow entry range left partial read helper") &&
+         verifyOk(module,
+                  "module failed verifier after narrow entry range input test");
+}
+
 bool testPostSignatureCleanupRewritesInternalEntryRawLoad() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-post-signature-entry-load", context);
@@ -4444,6 +4567,64 @@ bool testUnknownExternalFloatAbiClobberDoesNotUseWholeZmm() {
          verifyOk(
              module,
              "module failed verifier after float clobber suppression test");
+}
+
+bool testUnknownExternalIntegerClobberUsesRangeCallValue() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-integer-clobber-range", context);
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_clobber_test";
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "RAX";
+  abi.Outputs.push_back(output);
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = "R10";
+  abi.Effects.push_back(killed);
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::GlobalVariable *r10 = createRegisterGlobal(module, "R10");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *external =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_integer_clobber_range", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "reads_rdx_after_unknown_external", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(calleeType, external);
+  llvm::Value *loaded = loadRegister(builder, r10, "R10", "after");
+  builder.CreateStore(loaded, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnableResidueRemoval = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+
+  return expect(summary.CallClobberValues == 1,
+                "integer clobber range helper was not created") &&
+         expect(!hasLiveReplacedRegisterLoad(*function),
+                "integer clobber range left live raw R10 load") &&
+         expect(moduleHasUsedFunctionNamed(
+                    module, "notdec.register.summary_clobber.i64"),
+                "integer clobber range helper was not used") &&
+         expect(functionHasUsedSummaryCallValueRange(*function, "clobber",
+                                                     "R10", 0, 64),
+                "integer clobber helper did not carry R10 range metadata") &&
+         verifyOk(module,
+                  "module failed verifier after integer clobber range test");
 }
 
 bool testKnownPowUsesFloatAbiSlots() {
@@ -6013,6 +6194,7 @@ int main() {
   ok &= testFsOffsetPreservedAcrossExternalCall();
   ok &= testPreservedCallKeepsPreviousValue();
   ok &= testDemandedReturnCreatesCallValue();
+  ok &= testExternalReturnUsesRangeCallValue();
   ok &= testIntrinsicDoesNotCreateCallValue();
   ok &= testOverwrittenStoreIsRemoved();
   ok &= testCrossBlockDeadStoreIsRemoved();
@@ -6044,6 +6226,7 @@ int main() {
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testInternalSignatureRewriteUsesReadEntryReturnRegisterArg();
   ok &= testInternalSignatureRewriteUsesNarrowEntryRangeArg();
+  ok &= testNarrowEntryRangeDoesNotCreateWholeEntryLoad();
   ok &= testPostSignatureCleanupRewritesInternalEntryRawLoad();
   ok &= testInternalSignatureRewriteUsesZmmArgAndReturn();
   ok &= testPreservedZmmEntryIsPassedAsInternalArgument();
@@ -6072,6 +6255,7 @@ int main() {
   ok &= testSelfPhiFsBaseStackCanaryCheckIsRemoved();
   ok &= testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn();
   ok &= testUnknownExternalFloatAbiClobberDoesNotUseWholeZmm();
+  ok &= testUnknownExternalIntegerClobberUsesRangeCallValue();
   ok &= testKnownPowUsesFloatAbiSlots();
   ok &= testKnownUnaryLibmUsesFloatAbiSlots();
   ok &= testPartialKeepHighStoreIsDemandRewritten();
