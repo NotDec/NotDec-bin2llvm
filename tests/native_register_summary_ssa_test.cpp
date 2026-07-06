@@ -1567,16 +1567,26 @@ bool testExternalReturnUsesRangeCallValue() {
   options.EnableResidueRemoval = false;
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
 
+  llvm::Function *rewritten = module.getFunction("external_return_range");
+  bool typedExternalReturn = false;
+  for (llvm::Instruction &inst : llvm::instructions(*caller)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call != nullptr && call->getCalledFunction() == rewritten &&
+        call->getType()->isIntegerTy(64)) {
+      typedExternalReturn = true;
+    }
+  }
+
   return expect(summary.CallReturnValues == 1,
                 "external return range helper was not created") &&
+         expect(rewritten != nullptr, "rewritten external return callee missing") &&
          expect(!hasLiveReplacedRegisterLoad(*caller),
                 "external return range left live raw RAX load") &&
-         expect(moduleHasUsedFunctionNamed(
+         expect(typedExternalReturn,
+                "external return call was not rebuilt with integer return") &&
+         expect(!moduleHasUsedFunctionNamed(
                     module, "notdec.register.summary_return.i64"),
-                "external return range helper was not used") &&
-         expect(functionHasUsedSummaryCallValueRange(*caller, "return", "RAX",
-                                                     0, 64),
-                "external return helper did not carry RAX range metadata") &&
+                "external return helper remained after rewrite") &&
          verifyOk(module,
                   "module failed verifier after external return range test");
 }

@@ -71,3 +71,60 @@ external/NotDec-bin2llvm/build/bin/notdec-native-llvm \
 - 实现效果：5/5。`calendar.so` 的 indirect call return helper 被消除，三个当前关注样例都达到寄存器残留清零。
 - 复杂度：3/5。没有改 SummarySSA 主数据流，只是在签名重写层增加 callsite 级 shape；但 indirect call 参数和返回都进入了同一条重写路径，需要维护 direct/indirect 两种 shape 来源。
 - 维护成本：3/5。后续如果要做更准的函数指针类型合并，可以在 `IndirectCallShapes` 上继续汇总；当前实现按 callsite 保守落地，不强行猜全局函数指针类型。
+
+## Direct external return-only 补充修复
+
+`wrk` 暴露了另一类相近问题：有些 direct external call 没有参数证据，只有后续对返回寄存器 range 的 demand。旧逻辑只重写 `CallArgs` 里出现过的 callsite，所以这类调用会先生成 `summary_return` helper，后续 signature rewrite 又不会把 call 改成真正返回值。
+
+本次只补这个整数返回路径，不处理 `wrk` 里剩余的 x87 `ST*` 和 `ZMM0` partial read/write。
+
+### 修改
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1271` 新增 `integerReturnSlotForUnit()`，优先按 ABI output slot 保留返回寄存器的 offset/size。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1421` 修改 `addDemandedExternalReturns()`，即使 external callee 初始没有 shape，也会为有返回 demand 的 call 建 shape。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1706` 补 `extractReturnRange()` 前置声明，供 cleanup 阶段复用已重写 call 的返回值。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:4134` 修改 `callEffect()`，post-signature cleanup 遇到已重写 call 时，如果签名说明该寄存器是返回值，就继续按 `ReturnValue` 处理。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:4457` 修改 `callRangeValue()`，已重写 call 的 return range 直接从 call 结果拆，不再重新生成 `summary_return` helper。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:4490` 修改 `signatureReturnUsesUnit()`，让 indirect callsite shape 也能参与返回寄存器判断。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:5348` 修改 `rewriteSignatureShapes()`，除了参数证据，也用 `ReturnHelpers` / `RangeReturnHelpers` 决定 call 是否要重写。
+- `tests/native_register_summary_ssa_test.cpp:1570` 更新 `testExternalReturnUsesRangeCallValue()`，要求 direct external call 被重写成真实 integer return，且 `summary_return.i64` 不再残留。
+
+### 验证
+
+构建和单测：
+
+```bash
+cmake --build build --target native_register_summary_ssa_test notdec-native-llvm -j4
+./build/bin/native_register_summary_ssa_test
+```
+
+结果：通过。
+
+`wrk`：
+
+```bash
+external/NotDec-bin2llvm/build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk \
+  -o /tmp/notdec-bin2llvm-wrk-return-rewrite3-20260706165326/native.ll \
+  --all-confirmed --skip-runtime \
+  --register-ssa-warning-out /tmp/notdec-bin2llvm-wrk-return-rewrite3-20260706165326/register-ssa-warnings.tsv
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as /tmp/notdec-bin2llvm-wrk-return-rewrite3-20260706165326/native.ll -o /tmp/notdec-bin2llvm-wrk-return-rewrite3-20260706165326/native.bc
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify /tmp/notdec-bin2llvm-wrk-return-rewrite3-20260706165326/native.bc -disable-output
+```
+
+结果：
+
+- 输出路径：`/tmp/notdec-bin2llvm-wrk-return-rewrite3-20260706165326/native.ll`
+- 运行时间：`elapsed=81.73`
+- `integer_register_refs=0`
+- `summary_helpers=0`
+- `register_metadata_globals=8`
+- `summary_ssa_metadata=65`
+- `raw_notdec_register=95`
+- 剩余寄存器集中在 `@ZMM0` partial read/write 和 x87 `@ST0` 到 `@ST7`，不是这次 direct external integer return 修复范围。
+
+### 评价
+
+- 实现效果：4/5。整数寄存器和 summary helper 已清零，direct external return-only 场景补上了；浮点和 SIMD 残留仍需单独分析。
+- 复杂度：2/5。没有改主数据流，只把返回 demand 纳入已有签名重写和 cleanup 路径。
+- 维护成本：2/5。逻辑仍集中在 signature rewrite 层，后续如果扩展浮点返回，可以沿用同一入口。

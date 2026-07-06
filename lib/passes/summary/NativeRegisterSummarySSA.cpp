@@ -1268,6 +1268,24 @@ bool isLikelyNonReturnIntegerAbiOutput(const AbiFacts &abi,
          abi.IntegerOutputsInOrder.front().UnitName != name && name == "RDX";
 }
 
+std::optional<NativeSignatureSlot>
+integerReturnSlotForUnit(const RegisterUnit &unit, const AbiFacts &abi) {
+  for (const AbiFacts::RegisterSlot &slot : abi.IntegerOutputsInOrder) {
+    if (slot.UnitName == unit.Name) {
+      NativeSignatureSlot result;
+      result.Kind = NativeSignatureSlotKind::IntegerRegister;
+      result.Unit = &unit;
+      result.AbiName = slot.AbiName;
+      result.MetaType = slot.MetaType;
+      result.OffsetBits = slot.OffsetBits;
+      result.SizeBits = slot.SizeBits;
+      result.LlvmType = unit.Global->getValueType();
+      return result;
+    }
+  }
+  return integerSignatureSlot(unit);
+}
+
 SignatureShape shapeForKnownExternal(
     llvm::Function &function,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -1419,13 +1437,7 @@ void addDemandedExternalReturns(
     if (callee == nullptr || !callee->isDeclaration()) {
       continue;
     }
-    auto shapeIt = state.Shapes.find(callee);
-    if (shapeIt == state.Shapes.end()) {
-      continue;
-    }
-    if (state.CallArgs.count(call) == 0) {
-      state.CallArgs.emplace(call, std::vector<CallArgStoreBinding>{});
-    }
+    auto shapeIt = state.Shapes.try_emplace(callee).first;
     auto helpersIt = state.ReturnHelpers.find(call);
     auto rangeHelpersIt = state.RangeReturnHelpers.find(call);
     auto hasDemandedReturn = [&](llvm::StringRef name) {
@@ -1465,7 +1477,10 @@ void addDemandedExternalReturns(
       if (!alreadyPresent) {
         const RegisterUnit *unit = unitByName(units, name);
         if (unit != nullptr) {
-          shapeIt->second.Returns.push_back(integerSignatureSlot(*unit));
+          if (std::optional<NativeSignatureSlot> slot =
+                  integerReturnSlotForUnit(*unit, abi)) {
+            shapeIt->second.Returns.push_back(*slot);
+          }
         }
       }
       ++returnIndex;
@@ -1687,6 +1702,10 @@ const SignatureShape *shapeForCall(const SignatureRewriteState &state,
       state.IndirectCallShapes.find(const_cast<llvm::CallBase *>(&call));
   return shapeIt == state.IndirectCallShapes.end() ? nullptr : &shapeIt->second;
 }
+
+llvm::Value *extractReturnRange(llvm::IRBuilder<> &builder,
+                                const SignatureShape &shape, llvm::Value &call,
+                                const RegisterRangeKey &range);
 
 // Local canonicalization used between signature rewrite and final residue
 // cleanup.  It is intentionally kept at the SummarySSA top level: the per
@@ -4117,6 +4136,9 @@ private:
     llvm::Function *callee = call.getCalledFunction();
     if (PostSignatureCleanup &&
         SignatureState.RewrittenCalls.count(&call) != 0) {
+      if (signatureReturnUsesUnit(const_cast<llvm::CallBase &>(call), unit)) {
+        return CallRegisterEffect::ReturnValue;
+      }
       return CallRegisterEffect::Unknown;
     }
     if (callee != nullptr && !callee->isDeclaration()) {
@@ -4433,6 +4455,22 @@ private:
     }
 
     llvm::IRBuilder<> builder(insertBefore);
+    if (kind == "return" && PostSignatureCleanup &&
+        SignatureState.RewrittenCalls.count(&call) != 0) {
+      const SignatureShape *shape = shapeForCall(SignatureState, call);
+      if (shape != nullptr) {
+        llvm::Value *value = extractReturnRange(builder, *shape, call, range);
+        if (value != nullptr && value->getType() == rangeType(range)) {
+          CallRangeValues.emplace(key, value);
+          return value;
+        }
+      }
+      llvm::Value *value = frozenPoisonAt(builder, rangeType(range),
+                                          unit->Name + ".range_return_unknown");
+      CallRangeValues.emplace(key, value);
+      return value;
+    }
+
     llvm::CallInst *value = builder.CreateCall(
         callRangeValueHelper(range, kind), {}, unit->Name + "." + kind.str());
     value->setMetadata("notdec.register.summary_ssa.call_value",
@@ -4453,6 +4491,15 @@ private:
                                const RegisterUnit &unit) const {
     llvm::Function *callee = call.getCalledFunction();
     if (callee == nullptr) {
+      const SignatureShape *shape = shapeForCall(SignatureState, call);
+      if (shape == nullptr) {
+        return false;
+      }
+      for (const NativeSignatureSlot &slot : shape->Returns) {
+        if (slot.Unit == &unit || slot.Unit->Name == unit.Name) {
+          return true;
+        }
+      }
       return false;
     }
     auto shapeIt = SignatureState.Shapes.find(callee);
@@ -5302,7 +5349,10 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
   for (llvm::Function &function : module) {
     for (llvm::Instruction &inst : llvm::instructions(function)) {
       auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
-      if (call != nullptr && state.CallArgs.count(call) != 0) {
+      if (call != nullptr && shapeForCall(state, *call) != nullptr &&
+          (state.CallArgs.count(call) != 0 ||
+           state.ReturnHelpers.count(call) != 0 ||
+           state.RangeReturnHelpers.count(call) != 0)) {
         callsToRewrite.push_back(call);
       }
     }
