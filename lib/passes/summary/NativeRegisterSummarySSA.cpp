@@ -1928,6 +1928,15 @@ private:
     return shiftedMask(resultDemand, shift, sourceWidth);
   }
 
+  static llvm::APInt shlSourceDemand(const llvm::APInt &resultDemand,
+                                     unsigned shift, unsigned sourceWidth) {
+    if (sourceWidth == 0 || shift >= sourceWidth) {
+      return llvm::APInt(sourceWidth, 0);
+    }
+    return PartialDemandState::trimmedMask(resultDemand.lshr(shift),
+                                           sourceWidth);
+  }
+
   static llvm::APInt partialWriteMask(unsigned fullWidth, unsigned writeWidth,
                                       uint64_t bitOffset) {
     if (fullWidth == 0 || writeWidth == 0 || bitOffset >= fullWidth ||
@@ -2437,8 +2446,8 @@ private:
                 llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
           unsigned amount = shift->getLimitedValue();
           enqueue(inst->getOperand(0),
-                  shiftedMask(inputDemand, amount,
-                              valueBitWidth(inst->getOperand(0))));
+                  shlSourceDemand(inputDemand, amount,
+                                  valueBitWidth(inst->getOperand(0))));
         } else {
           enqueue(inst->getOperand(0), inputDemand);
         }
