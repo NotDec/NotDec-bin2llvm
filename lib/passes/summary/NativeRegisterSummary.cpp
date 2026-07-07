@@ -62,6 +62,17 @@ struct StackSlotKey {
   }
 };
 
+struct ValueOrigin {
+  llvm::GlobalVariable *Base = nullptr;
+  int64_t Offset = 0;
+
+  bool operator==(const ValueOrigin &other) const {
+    return Base == other.Base && Offset == other.Offset;
+  }
+
+  bool operator!=(const ValueOrigin &other) const { return !(*this == other); }
+};
+
 // Forward abstract state for one backing register. Missing map entries use this
 // default value, but only inside a reachable block state.
 struct Cell {
@@ -82,12 +93,19 @@ struct State {
   // fixed entry-SP offsets or notdec_stack.native alloca offsets, not arbitrary
   // memory.
   std::map<StackSlotKey, llvm::GlobalVariable *> StackSlots;
-  // SSA values known to be exactly one function-entry register value.
-  std::map<llvm::Value *, llvm::GlobalVariable *> ValueOrigins;
+  // SSA values known to be a function-entry register plus a constant offset.
+  // Offset 0 is also used for saved register values loaded back from stack.
+  std::map<llvm::Value *, ValueOrigin> ValueOrigins;
+  // Current stack pointer as an entry-SP-relative offset.  This is deliberately
+  // narrow: it only exists so push/pop save slots can be recognized even when
+  // RSP itself is ignored by the register summary.
+  std::optional<int64_t> StackPointerOffset = 0;
 
   bool operator==(const State &other) const {
     return Reachable == other.Reachable && Cells == other.Cells &&
-           StackSlots == other.StackSlots && ValueOrigins == other.ValueOrigins;
+           StackSlots == other.StackSlots &&
+           ValueOrigins == other.ValueOrigins &&
+           StackPointerOffset == other.StackPointerOffset;
   }
 };
 
@@ -790,6 +808,10 @@ bool joinState(State &target, const State &source) {
       ++it;
     }
   }
+  if (target.StackPointerOffset != source.StackPointerOffset) {
+    target.StackPointerOffset = std::nullopt;
+    changed = true;
+  }
   return changed;
 }
 
@@ -810,6 +832,24 @@ void partialWriteRegister(State &state, llvm::GlobalVariable *global) {
   // not kill MayEntry.  The call itself is still a non-entry definition.
   Cell &cell = cellFor(state, global);
   cell.MayNonEntry = true;
+}
+
+bool isX64GprName(llvm::StringRef name) {
+  return name == "RAX" || name == "RBX" || name == "RCX" || name == "RDX" ||
+         name == "RSI" || name == "RDI" || name == "RBP" || name == "RSP" ||
+         name == "R8" || name == "R9" || name == "R10" || name == "R11" ||
+         name == "R12" || name == "R13" || name == "R14" || name == "R15";
+}
+
+bool isX64Low32GprWrite(const NativeRegisterPartialWriteInfo &partial,
+                        const RegisterUnit &unit) {
+  // In x86-64, writing an E* register clears the high 32 bits of the matching
+  // R* register.  Treat this as a full non-entry definition for the coarse
+  // whole-register summary; otherwise zeroing idioms keep a fake entry high
+  // half alive and can turn callee-saved registers into function parameters.
+  return partial.FullWidth == 64 && partial.WriteWidth == 32 &&
+         partial.BitOffset == 0 && registerBitWidth(unit) == 64 &&
+         isX64GprName(unit.Name);
 }
 
 void restoreRegister(State &state, llvm::GlobalVariable *global) {
@@ -1092,14 +1132,25 @@ private:
   void transferInstruction(llvm::Instruction &inst, State &state) {
     if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
       RegisterAccess access = registerLoad(*load, Units);
-      if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
+      if (access.Unit != nullptr) {
         Cell before = cellIn(state, access.Unit->Global);
         bool keepHighUse = isKeepHighPartialLoadUse(*load, access.Unit->Global);
-        if (!keepHighUse) {
+        bool pureEntryValue = before.MayEntry && !before.MayNonEntry;
+        if (!isIgnored(*access.Unit, Options) && !keepHighUse &&
+            !pureEntryValue) {
           readRegister(state, access.Unit->Global);
         }
-        if (before.MayEntry && !before.MayNonEntry) {
-          state.ValueOrigins[load] = access.Unit->Global;
+        if (pureEntryValue) {
+          if (access.Unit->Global == stackPointerGlobal()) {
+            if (state.StackPointerOffset) {
+              state.ValueOrigins[load] =
+                  ValueOrigin{access.Unit->Global, *state.StackPointerOffset};
+            } else {
+              state.ValueOrigins.erase(load);
+            }
+          } else {
+            state.ValueOrigins[load] = ValueOrigin{access.Unit->Global, 0};
+          }
         } else {
           state.ValueOrigins.erase(load);
         }
@@ -1109,7 +1160,7 @@ private:
               fixedEntryStackSlot(load->getPointerOperand(), state)) {
         auto saved = state.StackSlots.find(*slot);
         if (saved != state.StackSlots.end()) {
-          state.ValueOrigins[load] = saved->second;
+          state.ValueOrigins[load] = ValueOrigin{saved->second, 0};
         } else {
           state.ValueOrigins.erase(load);
         }
@@ -1118,18 +1169,32 @@ private:
     }
     if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
       RegisterAccess access = registerStore(*store, Units);
-      if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
+      if (access.Unit != nullptr) {
+        if (isIgnored(*access.Unit, Options)) {
+          if (access.Unit->Global == stackPointerGlobal()) {
+            if (auto origin = entryValueOrigin(store->getValueOperand(), state);
+                origin && origin->Base == access.Unit->Global) {
+              state.StackPointerOffset = origin->Offset;
+            } else {
+              state.StackPointerOffset = std::nullopt;
+            }
+          }
+          state.ValueOrigins.erase(store);
+          return;
+        }
         if (isKeepHighPartialStoreValue(store->getValueOperand(),
                                         access.Unit->Global)) {
           writeRegister(state, access.Unit->Global);
           state.ValueOrigins.erase(store);
           return;
         }
-        llvm::GlobalVariable *origin =
-            entryRegisterOrigin(store->getValueOperand(), state);
-        if (origin == access.Unit->Global) {
+        std::optional<ValueOrigin> origin =
+            entryValueOrigin(store->getValueOperand(), state);
+        if (origin && origin->Base == access.Unit->Global &&
+            origin->Offset == 0) {
           restoreRegister(state, access.Unit->Global);
         } else {
+          markEntryValueRead(store->getValueOperand(), state);
           writeRegister(state, access.Unit->Global);
         }
         state.ValueOrigins.erase(store);
@@ -1137,13 +1202,16 @@ private:
       }
       if (std::optional<StackSlotKey> slot =
               fixedEntryStackSlot(store->getPointerOperand(), state)) {
-        llvm::GlobalVariable *origin =
-            entryRegisterOrigin(store->getValueOperand(), state);
-        if (origin != nullptr) {
-          state.StackSlots[*slot] = origin;
+        std::optional<ValueOrigin> origin =
+            entryValueOrigin(store->getValueOperand(), state);
+        if (origin && origin->Offset == 0) {
+          state.StackSlots[*slot] = origin->Base;
         } else {
+          markEntryValueRead(store->getValueOperand(), state);
           state.StackSlots.erase(*slot);
         }
+      } else {
+        markInstructionEntryValueReads(inst, state);
       }
       return;
     }
@@ -1157,9 +1225,16 @@ private:
       if (partialRead) {
         auto unitIt = Units.find(partialRead->Global);
         if (unitIt != Units.end() && !isIgnored(unitIt->second, Options)) {
-          readRegister(state, partialRead->Global);
+          Cell before = cellIn(state, partialRead->Global);
+          if (before.MayEntry && !before.MayNonEntry) {
+            state.ValueOrigins[&inst] = ValueOrigin{partialRead->Global, 0};
+          } else {
+            readRegister(state, partialRead->Global);
+            state.ValueOrigins.erase(&inst);
+          }
+        } else {
+          state.ValueOrigins.erase(&inst);
         }
-        state.ValueOrigins.erase(&inst);
         return;
       }
       std::optional<NativeRegisterPartialWriteInfo> partial =
@@ -1167,12 +1242,18 @@ private:
       if (partial) {
         auto unitIt = Units.find(partial->Global);
         if (unitIt != Units.end() && !isIgnored(unitIt->second, Options)) {
-          partialWriteRegister(state, partial->Global);
+          markEntryValueRead(partial->Value, state);
+          if (isX64Low32GprWrite(*partial, unitIt->second)) {
+            writeRegister(state, partial->Global);
+          } else {
+            partialWriteRegister(state, partial->Global);
+          }
         }
         state.ValueOrigins.erase(&inst);
         return;
       }
     }
+    markInstructionEntryValueReads(inst, state);
   }
 
   llvm::GlobalVariable *stackPointerGlobal() const {
@@ -1183,21 +1264,75 @@ private:
     return it == UnitsByName.end() ? nullptr : it->second;
   }
 
-  llvm::GlobalVariable *entryRegisterOrigin(llvm::Value *value,
-                                            const State &state) const {
+  std::optional<ValueOrigin> entryValueOrigin(llvm::Value *value,
+                                              const State &state) const {
     value = value->stripPointerCasts();
     auto it = state.ValueOrigins.find(value);
     if (it != state.ValueOrigins.end()) {
       return it->second;
     }
-    return nullptr;
+    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
+    if (binary == nullptr || (binary->getOpcode() != llvm::Instruction::Add &&
+                              binary->getOpcode() != llvm::Instruction::Sub)) {
+      return std::nullopt;
+    }
+
+    auto parseConstantOffset = [](llvm::Value *constant,
+                                  bool negate) -> std::optional<int64_t> {
+      auto *intConstant = llvm::dyn_cast<llvm::ConstantInt>(constant);
+      if (intConstant == nullptr || intConstant->getBitWidth() > 64) {
+        return std::nullopt;
+      }
+      int64_t value = intConstant->getSExtValue();
+      return negate ? -value : value;
+    };
+
+    if (auto origin = entryValueOrigin(binary->getOperand(0), state)) {
+      if (auto offset = parseConstantOffset(binary->getOperand(1),
+                                            binary->getOpcode() ==
+                                                llvm::Instruction::Sub)) {
+        origin->Offset += *offset;
+        return origin;
+      }
+    }
+    if (binary->getOpcode() == llvm::Instruction::Add) {
+      if (auto origin = entryValueOrigin(binary->getOperand(1), state)) {
+        if (auto offset = parseConstantOffset(binary->getOperand(0), false)) {
+          origin->Offset += *offset;
+          return origin;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  llvm::GlobalVariable *entryRegisterOrigin(llvm::Value *value,
+                                            const State &state) const {
+    std::optional<ValueOrigin> origin = entryValueOrigin(value, state);
+    if (!origin || origin->Offset != 0) {
+      return nullptr;
+    }
+    return origin->Base;
+  }
+
+  void markEntryValueRead(llvm::Value *value, State &state) const {
+    if (llvm::GlobalVariable *origin = entryRegisterOrigin(value, state)) {
+      readRegister(state, origin);
+    }
+  }
+
+  void markInstructionEntryValueReads(llvm::Instruction &inst,
+                                      State &state) const {
+    for (llvm::Value *operand : inst.operands()) {
+      markEntryValueRead(operand, state);
+    }
   }
 
   std::optional<std::pair<llvm::GlobalVariable *, int64_t>>
   entryAddressOrigin(llvm::Value *value, const State &state) const {
     value = value->stripPointerCasts();
-    if (llvm::GlobalVariable *origin = entryRegisterOrigin(value, state)) {
-      return std::make_pair(origin, 0);
+    if (std::optional<ValueOrigin> origin = entryValueOrigin(value, state)) {
+      return std::make_pair(origin->Base, origin->Offset);
     }
     auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
     if (binary == nullptr || (binary->getOpcode() != llvm::Instruction::Add &&
@@ -1435,8 +1570,14 @@ private:
         }
         if (std::optional<NativeRegisterPartialWriteInfo> partial =
                 parseNativeRegisterPartialWrite(*call)) {
-          addDemand(live, partial->Global,
-                    valueDemand(partial->Value, valueDemands));
+          auto unitIt = Units.find(partial->Global);
+          if (unitIt != Units.end() &&
+              isX64Low32GprWrite(*partial, unitIt->second)) {
+            eraseDemand(live, partial->Global);
+          } else {
+            addDemand(live, partial->Global,
+                      valueDemand(partial->Value, valueDemands));
+          }
           continue;
         }
         if (!isNotDecRegisterHelperCall(*call)) {
