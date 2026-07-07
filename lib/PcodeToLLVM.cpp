@@ -1430,6 +1430,12 @@ private:
       return false;
     }
 
+    if (op.Opcode == PcodeOpcode::IntXor &&
+        sameVarnode(op.Inputs[0], op.Inputs[1])) {
+      write(*op.Output, llvm::ConstantInt::get(intType(op.Output->Size), 0));
+      return true;
+    }
+
     llvm::Value *lhs = resize(read(op.Inputs[0]), op.Output->Size);
     llvm::Value *rhs = resize(read(op.Inputs[1]), op.Output->Size);
     llvm::Value *result = nullptr;
