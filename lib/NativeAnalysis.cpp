@@ -4617,15 +4617,7 @@ private:
           if (target == entry || functionHasBlockStartingAt(function, target)) {
             continue;
           }
-          const NativeFunction *targetFunction = state.functionAt(target);
-          if (targetFunction == nullptr || targetFunction->Source !=
-                                               "gtirb-seed-range-fallback") {
-            continue;
-          }
-          auto seedIterator = state.functionSeeds().find(target);
-          if (seedIterator == state.functionSeeds().end() ||
-              !hasSource(seedIterator->second, "eh-frame") ||
-              seedIterator->second.Sources.size() != 1) {
+          if (!isFoldableEhFrameBranchTarget(state, entry, target)) {
             continue;
           }
           folds.push_back({entry, target});
@@ -4675,6 +4667,52 @@ private:
       state.demoteFunctionSeedToRangeHint(targetEntry);
       state.removeFunction(targetEntry);
     }
+  }
+
+  static bool isFoldableEhFrameBranchTarget(const NativeProgramState &state,
+                                            uint64_t ownerEntry,
+                                            uint64_t target) {
+    const NativeFunction *targetFunction = state.functionAt(target);
+    if (targetFunction == nullptr) {
+      return false;
+    }
+    auto seedIterator = state.functionSeeds().find(target);
+    if (seedIterator == state.functionSeeds().end() ||
+        !hasSource(seedIterator->second, "eh-frame")) {
+      return false;
+    }
+    if (targetFunction->Source == "gtirb-seed-range-fallback" &&
+        seedIterator->second.Sources.size() == 1) {
+      return true;
+    }
+    if (targetFunction->Source != "gtirb-ddisasm") {
+      return false;
+    }
+    if (isNativeRuntimeFunction(state, *targetFunction)) {
+      return false;
+    }
+
+    // ddisasm may split compiler generated cold blocks into separate
+    // functions when .eh_frame has a separate FDE for the block.  Treat such a
+    // range as a function boundary hint only when there is no real call edge to
+    // the entry; otherwise it may be an address-taken function.
+    std::optional<uint64_t> flowOwner;
+    for (const NativeXref *xref : state.xrefsTo(target)) {
+      if (xref->Kind == NativeXrefKind::Call) {
+        return false;
+      }
+      if (xref->Kind == NativeXrefKind::Flow) {
+        const NativeFunction *owner = state.functionContaining(xref->From);
+        if (owner == nullptr) {
+          return false;
+        }
+        if (flowOwner && *flowOwner != owner->Entry) {
+          return false;
+        }
+        flowOwner = owner->Entry;
+      }
+    }
+    return flowOwner && *flowOwner == ownerEntry;
   }
 
   static void restoreFoldedEhFrameFlowTargets(NativeProgramState &state,

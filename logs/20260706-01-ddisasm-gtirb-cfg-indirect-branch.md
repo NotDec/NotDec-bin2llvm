@@ -135,3 +135,66 @@ external/NotDec-bin2llvm/build/bin/notdec-native-llvm \
 - fortune native run `elapsed=12.17s`，和上一轮 `12.10s` 同级。
 
 这次清理的是已经消费完的调试/分析标注，不改变 IR 的计算语义。
+
+## 追加：折叠 ddisasm 拆出的 eh_frame cold fragment
+
+继续看 fortune 剩余 `@RBX` 残留时，发现 `FUN_27f0` 不是源码函数，而是
+`FUN_4750` 的 cold error block：
+
+```asm
+47d9: js 0x27f0
+27f0: mov rdi, qword ptr [rbx + 0x28]
+```
+
+`0x27f0` 有独立 `.eh_frame` FDE，ddisasm/GTIRB 也把它作为函数导入。这个输入
+不能简单算 ddisasm 错；native 侧应把 `.eh_frame` 函数范围当 boundary hint，
+对只有函数内 direct flow 进入、没有 call 进入的 cold fragment 折回 owner。
+
+修改：
+
+- `lib/NativeAnalysis.cpp:4620`：
+  `foldEhFrameOnlyBranchTargets(...)` 不再只接受
+  `gtirb-seed-range-fallback` + 单一 `eh-frame` source，而是调用统一判断函数。
+- `lib/NativeAnalysis.cpp:4672`：
+  新增 `isFoldableEhFrameBranchTarget(...)`。保留旧的 seed-range fallback 行为；
+  对 `gtirb-ddisasm` 函数，只在目标 seed 带 `eh-frame`、不是 runtime 函数、
+  没有 call xref、且所有 direct-flow xref 都来自同一个 owner 函数时折叠。
+
+验证：
+
+```bash
+cmake --build external/NotDec-bin2llvm/build --target notdec-native-discover notdec-native-llvm -j4
+
+OUT=/tmp/notdec-fortune-fold-ehframe-cold-tight-20260707040700
+external/NotDec-bin2llvm/build/bin/notdec-native-discover \
+  --native-decode-mode gtirb --function-json 0x27f0 \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+external/NotDec-bin2llvm/build/bin/notdec-native-discover \
+  --native-decode-mode gtirb --function-json 0x27b2 \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune
+external/NotDec-bin2llvm/build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  -o "$OUT/fortune.native.ll" --all-confirmed --skip-runtime \
+  --register-ssa-warning-out "$OUT/register-ssa-warnings.tsv"
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as "$OUT/fortune.native.ll" -o "$OUT/fortune.native.bc"
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify "$OUT/fortune.native.bc" -disable-output
+```
+
+结果：
+
+- `0x27f0`：`function-json found=false`，已折入 `FUN_4750`。
+- `0x27b2`：`function-json found=false`，已折入 `FUN_3470`。
+- `FUN_27f0 refs=0`，`FUN_27b2 refs=0`。
+- `@RBX refs=0`，`@R14 refs=0`。
+- 当前 fortune 只剩之前的 `@RCX` 高 32 位 range-entry 残留：`REG_REF RCX=2`。
+- `summary_return=0`，`summary_clobber=0`。
+- `llvm-as` 和 `opt -passes=verify` 通过。
+- fortune native run `elapsed=11.50s`，和前面 `12.10s` / `12.17s` 同级。
+
+评估：
+
+- 实现效果：8/10。解决了 ddisasm/FDE cold fragment 被当作独立源码函数导致的
+  `RBX/R14` 入口寄存器残留。
+- 复杂度：3/10。只扩展已有 folding pass，并用 xref owner 限制避免跨函数误折叠。
+- 维护成本：3/10。后续如果要更严格，可以继续接入 unwind state 兼容性判断；
+  当前先用 no-call + single-flow-owner 约束覆盖已见问题。
