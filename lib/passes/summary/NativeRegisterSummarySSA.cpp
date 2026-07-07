@@ -144,6 +144,7 @@ struct CallArgStoreBinding {
   const RegisterUnit *Unit = nullptr;
   llvm::Value *RegisterValue = nullptr;
   llvm::Value *Value = nullptr;
+  llvm::Type *ValueType = nullptr;
   unsigned Index = 0;
 };
 
@@ -4394,6 +4395,12 @@ private:
           break;
         }
         slot = integerSignatureSlot(*unit);
+        auto *integerType =
+            llvm::dyn_cast<llvm::IntegerType>(slot.Unit->Global->getValueType());
+        if (integerType != nullptr && integerType->getBitWidth() > 32) {
+          slot.SizeBits = 32;
+          slot.LlvmType = llvm::Type::getInt32Ty(Function.getContext());
+        }
       }
       const RegisterUnit *unit = slot.Unit;
       if (unit == nullptr) {
@@ -4416,7 +4423,8 @@ private:
         break;
       }
       bindings.push_back(
-          CallArgStoreBinding{store, unit, value, argValue, index});
+          CallArgStoreBinding{store, unit, value, argValue, slotType(slot),
+                              index});
     }
     return bindings;
   }
@@ -5545,6 +5553,10 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         }
         value = remapValue(value);
         value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);
+        if (binding.ValueType != nullptr &&
+            value->getType() != binding.ValueType) {
+          continue;
+        }
         args.push_back(value);
       }
     }

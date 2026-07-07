@@ -1,6 +1,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/NativeExternalPrototype.h"
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 
@@ -116,6 +117,7 @@ struct FunctionDemand {
 struct AbiFacts {
   std::set<std::string> Inputs;
   std::map<std::string, llvm::APInt> InputMasks;
+  std::vector<std::string> InputOrder;
   std::set<std::string> Outputs;
   std::map<std::string, llvm::APInt> OutputMasks;
   std::vector<std::string> OutputOrder;
@@ -653,19 +655,19 @@ bool isAnalyzableCall(const llvm::Instruction &inst) {
 }
 
 bool isKnownVarArgExternalFunction(const llvm::Function &function) {
-  if (!function.isDeclaration()) {
-    return false;
+  const NativeExternalPrototype *prototype = lookupNativeExternalPrototype(
+      defaultNativeExternalPrototypes(), function.getName());
+  return function.isDeclaration() && prototype != nullptr &&
+         prototype->VarArg;
+}
+
+unsigned knownVarArgFixedArgs(const llvm::Function &function) {
+  const NativeExternalPrototype *prototype = lookupNativeExternalPrototype(
+      defaultNativeExternalPrototypes(), function.getName());
+  if (prototype == nullptr || !prototype->VarArg) {
+    return 0;
   }
-  static const std::set<std::string> names = {
-      "__asprintf_chk", "__fprintf_chk", "__isoc23_sscanf",
-      "__isoc99_sscanf", "__printf_chk", "__snprintf_chk",
-      "__sprintf_chk",  "__syslog_chk",  "__vasprintf_chk",
-      "fcntl",          "fcntl64",       "fprintf",
-      "fscanf",         "ioctl",         "open",
-      "open64",         "printf",        "prctl",
-      "snprintf",       "sscanf",        "syscall",
-  };
-  return names.count(function.getName().str()) != 0;
+  return prototype->FixedArgs;
 }
 
 AbiFacts
@@ -682,6 +684,10 @@ collectAbiFacts(const llvm::Module &module,
       if (auto slot = storageUnitMask(entry.Storage, entry.MaxSize, units)) {
         facts.Inputs.insert(slot->first);
         mergeNamedMask(facts.InputMasks, slot->first, slot->second);
+        if (std::find(facts.InputOrder.begin(), facts.InputOrder.end(),
+                      slot->first) == facts.InputOrder.end()) {
+          facts.InputOrder.push_back(slot->first);
+        }
       }
     }
   }
@@ -1495,15 +1501,26 @@ private:
     if (!knownVarArgExternal) {
       return;
     }
-    // For known vararg declarations, the fixed prototype does not tell us
-    // which later ABI input registers are consumed.  Keep the complete ABI
-    // input values live before the call so partial writes do not incorrectly
-    // shrink the caller entry demand.
-    for (const auto &[global, unit] : Units) {
-      if (isIgnored(unit, Options) || Abi.Inputs.count(unit.Name) == 0) {
+    // Vararg tails do not have a fixed source prototype.  Keep them live, but
+    // use their natural integer argument width instead of forcing the whole
+    // x86-64 backing register.  This avoids inventing demand for high 32 bits
+    // when an E* argument is enough.
+    unsigned fixedArgs = knownVarArgFixedArgs(*callee);
+    for (auto [index, name] : llvm::enumerate(Abi.InputOrder)) {
+      auto unitIt = UnitsByName.find(name);
+      if (unitIt == UnitsByName.end()) {
         continue;
       }
-      addDemand(live, global, namedMaskOrFull(Abi.InputMasks, unit));
+      llvm::GlobalVariable *global = unitIt->second;
+      const RegisterUnit &unit = Units.at(global);
+      if (isIgnored(unit, Options)) {
+        continue;
+      }
+      llvm::APInt mask = namedMaskOrFull(Abi.InputMasks, unit);
+      if (index >= fixedArgs) {
+        mask &= lowBitsMask(registerBitWidth(unit), 32);
+      }
+      addDemand(live, global, mask);
     }
   }
 
