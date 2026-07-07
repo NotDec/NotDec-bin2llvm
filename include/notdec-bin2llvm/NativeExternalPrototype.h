@@ -27,6 +27,9 @@ struct NativeExternalPrototype {
   unsigned MaxReturnRegisters = 1;
   std::vector<ValueType> TypedParams;
   std::optional<ValueType> TypedReturn;
+  // Optional upper bound for bounded varargs such as open(path, flags[, mode]).
+  // Zero means unbounded.
+  unsigned MaxArgs = 0;
 };
 
 using NativeExternalPrototypeMap =

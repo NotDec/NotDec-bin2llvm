@@ -92,6 +92,7 @@ std::optional<Prototype> parsePrototype(const llvm::json::Object &object,
       !readBool(object, "noreturn", prototype.NoReturn, errorMessage) ||
       !readUnsigned(object, "max_return_registers",
                     prototype.MaxReturnRegisters, errorMessage) ||
+      !readUnsigned(object, "max_args", prototype.MaxArgs, errorMessage) ||
       !readTypeArray(object, "params", prototype.TypedParams, errorMessage)) {
     return std::nullopt;
   }
@@ -113,6 +114,10 @@ std::optional<Prototype> parsePrototype(const llvm::json::Object &object,
 
   if (!prototype.TypedParams.empty()) {
     prototype.FixedArgs = static_cast<unsigned>(prototype.TypedParams.size());
+  }
+  if (prototype.MaxArgs != 0 && prototype.MaxArgs < prototype.FixedArgs) {
+    errorMessage = "max_args must be >= fixed_args";
+    return std::nullopt;
   }
   if (prototype.NoReturn) {
     prototype.MaxReturnRegisters = 0;
@@ -288,8 +293,8 @@ const NativeExternalPrototypeMap &defaultNativeExternalPrototypes() {
       {"exit", {1, false, true}},
       {"exp", {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
       {"fclose", {1, false}},
-      {"fcntl", {2, true}},
-      {"fcntl64", {2, true}},
+      {"fcntl", {2, true, false, 1, {}, std::nullopt, 3}},
+      {"fcntl64", {2, true, false, 1, {}, std::nullopt, 3}},
       {"fdatasync", {1, false}},
       {"fdopen", {2, false}},
       {"fflush", {1, false}},
@@ -374,7 +379,7 @@ const NativeExternalPrototypeMap &defaultNativeExternalPrototypes() {
       {"inotify_add_watch", {3, false}},
       {"inotify_init1", {1, false}},
       {"inotify_rm_watch", {2, false}},
-      {"ioctl", {2, true}},
+      {"ioctl", {2, true, false, 1, {}, std::nullopt, 3}},
       {"isatty", {1, false}},
       {"kill", {2, false}},
       {"lchown", {3, false}},
@@ -417,8 +422,8 @@ const NativeExternalPrototypeMap &defaultNativeExternalPrototypes() {
       {"nettle_sha256_update", {3, false}},
       {"nettle_yarrow256_init", {3, false}},
       {"nl_langinfo", {1, false}},
-      {"open", {2, true}},
-      {"open64", {2, true}},
+      {"open", {2, true, false, 1, {}, std::nullopt, 3}},
+      {"open64", {2, true, false, 1, {}, std::nullopt, 3}},
       {"openlog", {3, false}},
       {"opendir", {1, false}},
       {"pathconf", {2, false}},
@@ -453,7 +458,7 @@ const NativeExternalPrototypeMap &defaultNativeExternalPrototypes() {
         {ValueType::Double, ValueType::Double},
         ValueType::Double}},
       {"printf", {1, true}},
-      {"prctl", {1, true}},
+      {"prctl", {1, true, false, 1, {}, std::nullopt, 3}},
       {"popen", {2, false}},
       {"pread64", {4, false}},
       {"pread", {4, false}},

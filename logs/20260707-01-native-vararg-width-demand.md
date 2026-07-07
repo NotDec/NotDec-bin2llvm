@@ -53,3 +53,51 @@ OUT=/tmp/notdec-bin2llvm-fortune-vararg-width3-20260707054325
 - 实现效果：8/10。fortune 的真实寄存器残留清零，且 `open` 仍保留当前签名行为，符合“先修宽度”的范围。
 - 复杂度：6/10。新增逻辑只接入已有外部原型表和 ABI 输入顺序，没有新 pass，但 vararg tail 统一按 32 位仍是 x64 当前链路里的保守规则。
 - 维护成本：5/10。后续修 `open` 多余参数时，需要把参数数量推断和这里的宽度规则统一起来。
+
+## Bounded vararg 最大参数数
+
+`open(path, flags[, mode])` 这类接口不是普通无限 vararg。它在 LLVM 里仍应该保持
+vararg 函数类型，但 native 签名重写时不应该把所有 ABI 输入寄存器都当作实参。
+
+本次补了一个原型字段：
+
+- `include/notdec-bin2llvm/NativeExternalPrototype.h:32` 新增 `MaxArgs`，`0` 表示不限制。
+- `lib/NativeExternalPrototype.cpp:95` 支持 JSON 里的 `max_args`。
+- `lib/NativeExternalPrototype.cpp:118` 校验 `max_args >= fixed_args`。
+- `lib/NativeExternalPrototype.cpp:296`、`:297`、`:382`、`:425`、`:426`、`:461` 给
+  `fcntl/fcntl64/ioctl/open/open64/prctl` 设置 `MaxArgs=3`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:257` 在 `SignatureShape` 保存 `MaxArgs`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1360` 和 `:1365` 从已知外部原型传入
+  `MaxArgs`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:4395` 在 call-arg binding 阶段限制
+  bounded vararg 的最大实参数。
+
+实现时试过把 `MaxArgs` 也接进 `NativeRegisterSummary` 的 backward demand，但 fortune 会回退：
+`FUN_3470` 里重新残留 `@R14` 和 `!notdec.register.summary_ssa`。原因是 bottom-up demand
+仍需要完整看见调用前后的寄存器数据流，过早按外部实参数剪掉 ABI 输入会破坏后面的 SSA
+重写清理。所以最终只在签名/实参重写阶段使用 `MaxArgs`，不改 summary demand。
+
+补充验证：
+
+```bash
+cmake --build build --target notdec-native-llvm -j4
+
+OUT=/tmp/notdec-bin2llvm-fortune-maxargs-rewriteonly-20260707060443
+./build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  -o "$OUT/fortune.native.ll" --all-confirmed --skip-runtime \
+  --register-ssa-warning-out "$OUT/register-ssa-warnings.tsv"
+/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as "$OUT/fortune.native.ll" -o "$OUT/fortune.native.bc"
+/sn640/NotDec/llvm-22.1.0.obj/bin/opt -passes=verify "$OUT/fortune.native.bc" -o /dev/null
+```
+
+结果：
+
+- `elapsed=11.36s`
+- `register_global_defs=0`
+- `partial_read=0`
+- `summary_return=0`
+- `summary_clobber=0`
+- `summary_ssa_metadata=0`
+- `bounded_vararg_tail_refs=0`
+- `open` 仍输出 2 个实参，没有再额外带出 `RCX/R8/R9`。

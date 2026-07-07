@@ -251,6 +251,10 @@ struct SignatureShape {
   std::vector<NativeSignatureSlot> Params;
   std::vector<NativeSignatureSlot> Returns;
   bool VarArg = false;
+  // Bounded varargs, such as open(path, flags[, mode]), should keep the LLVM
+  // vararg type but must not pull in every ABI input register as an argument.
+  // Zero means the vararg tail is unbounded.
+  unsigned MaxArgs = 0;
 };
 
 // A range return helper records a narrow register segment produced by a direct
@@ -1353,10 +1357,12 @@ SignatureShape shapeForKnownExternal(
         }
       }
       shape.VarArg = known->VarArg;
+      shape.MaxArgs = known->MaxArgs;
       return shape;
     }
     count = std::min<unsigned>(known->FixedArgs, abi.InputsInOrder.size());
     shape.VarArg = known->VarArg;
+    shape.MaxArgs = known->MaxArgs;
   }
   for (unsigned index = 0; index < count; ++index) {
     const RegisterUnit *unit = unitByName(units, abi.InputsInOrder[index]);
@@ -4383,8 +4389,13 @@ private:
     std::vector<CallArgStoreBinding> bindings;
     llvm::Function *callee = call.getCalledFunction();
     bool allowRangeEntryInputs = callee != nullptr && !callee->isDeclaration();
-    unsigned argCount =
-        shape.VarArg ? Abi.InputsInOrder.size() : shape.Params.size();
+    unsigned argCount = shape.Params.size();
+    if (shape.VarArg) {
+      argCount = static_cast<unsigned>(Abi.InputsInOrder.size());
+      if (shape.MaxArgs != 0) {
+        argCount = std::min(argCount, shape.MaxArgs);
+      }
+    }
     for (unsigned index = 0; index < argCount; ++index) {
       NativeSignatureSlot slot;
       if (index < shape.Params.size()) {
