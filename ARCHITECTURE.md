@@ -1,549 +1,432 @@
-# NotDec-bin2llvm 代码架构
+# NotDec-bin2llvm Architecture
 
-本文只描述 `external/NotDec-bin2llvm` 当前代码。它现在最重要的链路是：
+本文只描述 `external/NotDec-bin2llvm` 当前主要使用的 native 链路：
 
-1. Ghidra 脚本把二进制里的函数导出成 heritage P-Code JSON。
-2. native 工具读取 JSON。
-3. `HeritageToLLVM.cpp` 把函数和模块 lowered 成 LLVM IR。
+```text
+ELF
+  -> native discovery: DDISASM / GTIRB + ELF facts + .eh_frame hints
+  -> SLEIGH p-code collection
+  -> PcodeToLLVM lowering
+  -> LLVM cleanup
+  -> native register SummarySSA
+  -> LLVM cleanup
+  -> final register cleanup
+  -> .ll / .bc
+```
 
-Sleigh 相关代码仍在，但默认不开启，当前 Bench2 主要不走那条路径。
+旧的 Ghidra heritage JSON 链路还在代码里，但 Bench2 当前重点不是它。本文只在必要时提到
+legacy 入口，避免和 native 主链路混在一起。
 
-## native discovery 状态骨架
+## 1. 入口工具
 
-native 路线的共享分析状态在 `include/notdec-bin2llvm/NativeAnalysis.h` 和
-`lib/NativeAnalysis.cpp`。当前它先复刻 Ghidra Program 里最需要的几类事实，但不做
-Ghidra 那种完整数据库：
+### `notdec-native-discover`
 
-1. `NativeFunctionSeed`：候选函数入口，来自 ELF entry、dynamic init/fini、
-   static symbol、dynamic symbol、PLT、`.eh_frame` 和 executable relocation target。
-2. `NativeFunctionWorkItem`：待递归 decode 的函数入口。新 seed 首次插入时进入这个队列。
-3. `NativeFunction`：已经确认的函数。它和 seed 分开，避免还没 decode 就把候选入口当
-   成真实函数。
-4. `NativeBasicBlock`：函数内的最小 block 范围和 successor 地址。
-5. `NativeXref`：统一记录 flow/call/data/string 四类引用，支持 from/to 查询。
-6. `NativeInstruction`：已接受的指令，保留地址、长度、字节和来源。
+位置：
 
-`NativeProgramState` 现在提供：
+- `tools/notdec-native-discover.cpp`
+- `include/notdec-bin2llvm/NativeAnalysis.h`
+- `lib/NativeAnalysis.cpp`
 
-- `functionAt(...)`、`functionContaining(...)`
-- `functionWorklist()`
-- `xrefsFrom(...)`、`xrefsTo(...)`
-- `instructionAt(...)`、`instructionsInRange(...)`
-- `addFunction(...)`、`addBasicBlock(...)`、`addXref(...)`、`addInstruction(...)`
+作用是只做 native 发现和审计，不生成 LLVM IR。常用输出包括：
 
-`notdec-native-discover` 默认输出文本 report，包含 function seed、worklist、confirmed
-function、basic block、instruction、xref 和 unresolved indirect flow 数量。加
-`--summary-json` 时会跳过文本 report，输出同口径的最小 JSON summary，包含 seed source
-和 confidence 计数，供 Bench2 smoke 做机器检查。`--memory-json` 输出 native loader 看到的 load range 和 section 布局，
-包含地址范围、权限和 loaded size。`--relocations-json` 输出 native relocation 表，
-包含类型、符号、状态和已计算值。`--notes-json` 输出 native 分析过程里的非致命提示。
-`--eh-frame-json` 输出 `.eh_frame` / `.eh_frame_hdr` 解析统计、FDE 列表和 hdr 表。
-`--callgraph-json` 输出 callsite、caller、callee kind 和 external symbol 名字，
-`--callgraph-dot` 输出同一批调用边的 Graphviz DOT。
-`--seeds-json` 输出 function seed 列表，包含地址、名字、
-alias、来源、confidence 和保守 range，方便解释入口发现来源。`--function-json <entry>`
-按入口输出单个 confirmed function 摘要，`--function-xrefs-json <entry>` 输出该函数相关引用。
-`--functions-json` 输出已确认函数列表，
-包含入口、保守范围、名字、来源和 block 数。`--blocks-json` 输出已确认函数里的 basic
-block 起止地址、大小和 successor。`--block-json <start>` 按 confirmed basic block 起点输出单
-block 和其中 instruction。`--cfg-json <entry>` 按 confirmed function 入口输出单函数 CFG，
-`--cfg-dot <entry>` 输出同一份 CFG 的 Graphviz DOT。
-`--xrefs-json` 输出当前 xref 列表，`--xrefs-dot` 输出同一批 xref 的 Graphviz DOT，
-`--xrefs-kind-json <kind>` 按 flow、call、data、
-string 过滤，`--xrefs-from-json <addr>` 和
-`--xrefs-to-json <addr>` 按地址查引用。`--instructions-json` 输出已接受指令的地址、
-大小、字节、显示文本和来源，`--instructions-range-json <start> <end>` 按地址范围过滤同一批
-instruction，`--instructions-function-json <entry>` 按 confirmed function 入口过滤 instruction。
+- `--summary-json`：函数、basic block、instruction、xref、unresolved flow 汇总。
+- `--functions-json` / `--function-json`：确认函数及单函数详情。
+- `--blocks-json` / `--cfg-json` / `--cfg-dot`：CFG 审计。
+- `--instructions-json` / `--block-json`：解码出来的指令。
+- `--xrefs-json` / `--callgraph-json` / `--callgraph-dot`：引用和调用关系。
+- `--eh-frame-json`：`.eh_frame` / `.eh_frame_hdr` 解码结果。
+- `--plt-json`：PLT、GOT slot 和外部符号映射。
+- `--unresolved-json`：未解析的 indirect call / indirect branch。
 
-当前 recursive decode 只接入了一个很小的 Sleigh 线性指令解码入口：
+### `notdec-native-llvm`
 
-- `lib/SleighLift.cpp::collectSleighInstructionSummaries(...)` 用
-  `Sleigh::printAssembly(...)` 解码指令地址、长度和显示文本。
-- `lib/NativeAnalysis.cpp::SleighSeedInstructionAnalyzer` 先从 function worklist 按 confidence
-  分层取前 10 个 seed 入本地队列，顺序是 high、medium、low，同层保留 worklist 原顺序。
-  队列元素区分 function entry 和 block address，每个 block 最多解码
-  8 条 / 64 字节，并写入 `NativeInstruction`。如果当前 function seed 已有 symbol size
-  或 `.eh_frame` FDE 给出的 `[RangeStart, RangeEnd)`，decode 字节数还会被这个已知范围截断。
-  没有 range 的 seed 会被后续最近的非 Low confidence function seed 入口截断，避免线性 decode
-  跨到下一个可信函数入口。
-- analyzer 开始前会把 relocated pointer 里指向 executable memory 的 target 追加成低可信
-  `elf-relocation-code` function seed。它不提供 range，也不作为边界，只作为后续受控 decode 的候选入口。
-- 如果某个 seed 成功解码出指令，它会被保守写成一个 `NativeFunction`，并带一个覆盖已解码
-  指令前缀的 `NativeBasicBlock`。
-- `lib/SleighLift.cpp::collectSleighInstructionDecode(...)` 在同一次 Sleigh 初始化里收集指令摘要
-  和对应 P-Code，避免为了 xref 再解码一次。
-- analyzer 会从 P-Code 里识别直接 `CALL`、`BRANCH`、`CBRANCH`。第一个输入是 `ram` 地址时，
-  写入 `NativeXref`；direct `CALL` 命中 PLT stub 时来源记为 `sleigh-pcode-plt-call`，
-  并且不作为内部 function seed 入队。直接 branch 目标也会写入当前 block 的 `Successors`。
-- analyzer 对 `CALLIND` 会先做一层很窄的来源追踪：如果输入能追到带外部符号名的
-  `X86_64_GLOB_DAT` GOT slot，会记录 `sleigh-pcode-got-indirect-call` call xref，并且
-  不再把该点计入 unresolved。其他 indirect call 仍记录 unresolved。
-- analyzer 对 `BRANCHIND` 也会先识别直接 `ram` GOT slot。如果该 slot 命中已知
-  `NativePltEntry::GotAddress`，会记录 `sleigh-pcode-plt-indirect-branch` flow xref，并且
-  不再把该 PLT stub 计入 unresolved。如果指令是 `.plt` 起始 stub 的 resolver branch，
-  且目标是 `.got + 16`，会记录 `sleigh-pcode-plt0-resolver-branch` flow xref，并且
-  不再把 PLT0 计入 unresolved。未命中 PLT 时，如果输入来源能追到带外部符号名的
-  `X86_64_GLOB_DAT` GOT slot，会记录 `sleigh-pcode-got-indirect-branch` flow xref，并且
-  不再把该点计入 unresolved。普通函数指针和 jump table 仍保留 unresolved。
-- analyzer 也会从非控制流 P-Code 里识别 direct `ram` varnode。如果目标不是 executable
-  address，会记录为 data 或 string xref。目标在可读、不可写、不可执行内存里，并且像
-  NUL 结尾 ASCII C 字符串时，记为 `NativeXrefKind::String`，来源是
-  `sleigh-pcode-direct-string`；否则仍记为 `NativeXrefKind::Data`，来源是
-  `sleigh-pcode-direct-data`。
-- `RelocationPltAnalyzer` 会把已应用的本地 relocated pointer 也写成 xref：relocation
-  slot 是 from，computed pointer 是 to。目标落在 executable memory 时记 flow，来源
-  `elf-relocation-code`；目标像只读 C 字符串时记 string，来源
-  `elf-relocation-string`；其他落在已加载内存里的目标记 data，来源
-  `elf-relocation-pointer`。它还会把 `.plt.sec` / legacy `.plt` 的 `JUMP_SLOT` stub 和
-  `.plt.got` 里可从 `endbr64; jmp *rip+disp32` 机器码反查到外部 `GLOB_DAT` 的 thunk
-  统一记录成 `NativePltEntry`。
-- 当前 block 不是单纯整段线性范围：`SleighSeedInstructionAnalyzer` 会按控制流指令切分已解码
-  前缀。`CBRANCH` block 同时记录直接目标和下一条指令 fallthrough，`BRANCH` block 只记录直接
-  目标，`BRANCHIND` / `RETURN` block 暂不记录 successor。
-- 已解码范围内的 direct branch target 如果正好落在已知指令起点，会被强制作为 basic block
-  起点；追加同函数 block 时也会截断重叠 block，避免同一个函数里出现互相覆盖的 block 范围。
-- `CALLIND` / `BRANCHIND` 会写入 `NativeUnresolvedFlow`，report 按 indirect call / indirect
-  branch 统计。这里不猜普通函数指针和跳表，只保留后续分析需要的样本。
-- direct `CALL` 的可执行目标会作为 `sleigh-direct-call` function seed 写入，并进入同一个本地
-  decode 队列。本轮总 decode 上限是 20 个 seed，已入队或已 decode 的地址不会重复处理。
-- direct `BRANCH` / `CBRANCH` 的可执行 successor 会作为同一个 function entry 下的 block
-  address 入队。追加 block 时，`NativeFunction` 的 decoded range 会随 block 扩展。
-- `NativeProgramState::functionContaining(...)` 按 `NativeFunction::Blocks` 判断地址归属，
-  不再用 `RangeStart/RangeEnd` 把 block 之间的空洞算进函数。
-- 如果 direct branch successor 是已知的其他 function seed 入口，它会保留 direct flow xref，
-  但不会作为当前函数 block successor 或本地 decode block 入队。
-- 这一步只用于受控消费 direct call seed 和 direct branch successor。间接 branch/call 目前只记录，
-  不跟随；函数边界也只处理已知其他函数入口。
+位置：
 
-因此 Bench2 运行时 instruction、confirmed function、basic block、xref 数量应该已经大于 0。
+- `tools/notdec-native-llvm.cpp`
+- `lib/PcodeToLLVM.cpp`
 
-## 目录
+作用是把 native discovery 得到的函数和 CFG 变成 LLVM IR，然后跑 LLVM/native pass。
+
+常用模式：
+
+- `--all-confirmed`：对 discovery 确认的函数整体建 module。
+- `-f <entry>`：按函数入口生成一个函数。
+- `-n <name>`：按函数名生成一个函数。
+- `-a <addr> -l <len>`：手动指定线性地址范围。
+- `--skip-runtime`：跳过 `_start`、init/fini、PLT resolver 等 runtime 辅助函数。
+- `--no-register-ssa-pass`：只看 p-code lowering 后的原始寄存器 IR。
+- `--summary-register-ssa-pass`：默认的新 SummarySSA 链路。
+- `--heritage-register-ssa-pass`：旧的 heritage SSA 链路，只用于对照。
+- `--external-prototypes <json>`：加载额外外部函数原型。
+
+## 2. 整体流程
+
+当前 native 主链路按下面顺序执行：
+
+1. **读取 ELF**
+   - 用 LIEF 解析 ELF。
+   - 建立 `LiefElfLoadImage`，提供按地址读取 section / segment 字节的能力。
+   - 解析 relocation、dynamic symbol、PLT/GOT、memory permission。
+
+2. **native discovery**
+   - 入口：`runNativeDiscovery(...)`。
+   - 默认优先用 DDISASM / GTIRB 导入函数、basic block、CFG edge 和指令。
+   - 同时补充 ELF entry、dynamic init/fini、init/fini array、relocation code target。
+   - 解析 `.eh_frame`，只作为 function boundary / range hint，不把 FDE 单独当源码函数。
+   - 折叠 DDISASM 拆出来的 `.eh_frame` cold fragment，避免把 cold tail 当成独立源码函数。
+   - 记录 xref、callgraph、unresolved indirect flow。
+
+3. **选择要 lower 的函数**
+   - `--all-confirmed`：用 discovery 确认的函数列表。
+   - `-f` / `-n`：用 discovery 解析函数 range、block range、successor。
+   - 手动 `-a/-l`：不依赖 confirmed function，只按线性范围收 p-code。
+
+4. **规划 call target**
+   - 内部 direct call 映射到本 module 里的 LLVM function。
+   - PLT call 映射到外部 LLVM declaration。
+   - GOT 间接外部 call 尽量映射到外部 LLVM declaration。
+   - 未知 indirect call / branch 保守 lower，不猜普通函数指针和 jump table。
+
+5. **收集 SLEIGH p-code**
+   - 按 confirmed basic block range 收集 p-code，保留 DDISASM / GTIRB 给出的 CFG 顺序。
+   - `CALL` / `RET` 指令自身的隐式栈动作在 lifting 中消除；普通显式栈操作仍保留。
+   - x86-64 partial register read/write lower 成 `notdec.partial_read.*` /
+     `notdec.partial_write.*` intrinsic，避免先 load full register 再拼位。
+
+6. **p-code lowering 到 LLVM**
+   - 入口：`buildPcodeModule(...)` / `PcodeToLLVM.cpp`。
+   - 生成 register global、RAM load/store、basic block、branch、call。
+   - direct call 尽量变成 LLVM direct call。
+   - indirect branch 如果 DDISASM / GTIRB 已给出 CFG successor，按已有 CFG lower 成 switch/branch；
+     否则保留 unresolved/tail-call 风格的保守 IR。
+   - 给 module 附加 memory map metadata 和 ABI metadata。
+
+7. **第一次 LLVM cleanup**
+   - 入口：`runInstCombinePassIfEnabled(...)`。
+   - 每个非 declaration 函数跑：
+     - `InstCombine`
+     - `SimplifyCFG`
+   - 目的是先折叠 p-code lowering 产生的局部冗余，给 SummarySSA 更干净的输入。
+
+8. **register SummarySSA**
+   - 默认入口：`runNativeRegisterSummarySSA(...)`。
+   - 这是当前寄存器消除和函数签名重写的主 pass，详细顺序见下一节。
+
+9. **第二次 LLVM cleanup**
+   - 再跑一次 `InstCombine + SimplifyCFG`。
+   - 目的是折叠 SummarySSA/signature rewrite 后暴露出来的局部 IR。
+
+10. **prototype recovery**
+    - 当前只在旧 `--heritage-register-ssa-pass` 路径启用。
+    - 默认 SummarySSA 路径不跑 `NativePrototypeRecovery`。
+
+11. **final register cleanup**
+    - 入口：`runNativeRegisterFinalCleanup(...)`。
+    - 跑 GlobalDCE。
+    - 删除死 register read、未使用 register global、未使用 helper declaration。
+    - 对已经没有 register residue 的函数，清理 `notdec.register.summary*` 和
+      `notdec.register.summary_ssa*` metadata。
+    - 再跑一次 GlobalDCE，并统计剩余寄存器访问。
+
+12. **验证和输出**
+    - 每个关键阶段后用 `llvm::verifyModule(...)`。
+    - 最后写出目标路径，通常是 `.ll`，也可以按工具支持写 `.bc`。
+
+## 3. Native Discovery
+
+核心状态是 `NativeProgramState`。它保存：
+
+- `NativeFunctionSeed`：候选函数入口，带 source 和 confidence。
+- `NativeFunction`：已确认函数，包含入口、名字、range、block。
+- `NativeBasicBlock`：basic block 起止地址和 successor。
+- `NativeInstruction`：地址、长度、字节、反汇编文本、来源。
+- `NativeXref`：flow / call / data / string 引用。
+- `NativeUnresolvedFlow`：未解析的 indirect call / branch。
+- `NativePltEntry`：PLT stub、GOT slot、外部符号名。
+
+当前 discovery 的主要来源：
+
+1. **DDISASM / GTIRB**
+   - 导入 DDISASM 识别的函数、块和 CFG edge。
+   - 这是 Bench2 native 链路的主要 CFG 来源。
+   - 对 jump table，当前原则是使用 DDISASM / GTIRB 已经确认的 successor，不在 p-code
+     lowering 里重新猜跳表。
+
+2. **ELF facts**
+   - ELF entry。
+   - dynamic init/fini。
+   - init/fini array。
+   - relocation 指向 executable memory 的 code target。
+   - PLT/GOT 外部符号映射。
+
+3. **`.eh_frame`**
+   - 解码 FDE range。
+   - 只作为函数 range / boundary hint。
+   - 不把 `.eh_frame` FDE range 单独当成源码函数。
+   - 如果 DDISASM 把 cold fragment 拆成独立函数，native 侧会尝试 fold 回 owner。
+
+4. **SLEIGH fallback decode**
+   - 作为受控补充。
+   - 用于按 seed 或 range 解码 instruction 和 p-code。
+   - 不追普通未知 indirect flow。
+
+## 4. P-code Lifting
+
+### 输入
+
+`PcodeToLLVM` 的输入是：
+
+- load image：按地址读 ELF bytes。
+- SLEIGH spec / pspec / cspec。
+- function block range。
+- block successor。
+- direct call target map。
+- external call target map。
+- indirect external call target map。
+- ABI metadata。
+
+### 输出 IR 形状
+
+初始 IR 仍然显式暴露机器状态：
+
+- register 是 LLVM global，例如 `@RAX`、`@RDI`、`@ZMM0`。
+- RAM 访问用 `inttoptr` 或 global-array memory model。
+- p-code unique varnode 变成局部 SSA value。
+- partial register access 用 intrinsic 表示：
+  - `notdec.partial_read.<full>.<part>(ptr @REG, offset)`
+  - `notdec.partial_write.<full>.<part>(ptr @REG, value, offset)`
+- p-code basic block 映射为 LLVM basic block，名字通常是 `bb_<address>`。
+
+### Call / Return
+
+当前 x86-64 lowering 的约定：
+
+- LLVM `call` 自己已经表达“调用后会返回到下一条 LLVM 指令”。
+- 因此 x86 `CALL` 指令自身 push return address 的隐式栈动作不保留。
+- x86 `RET` 指令自身 pop return address 的隐式栈动作不保留。
+- 函数体里普通 `push/pop/sub/add rsp` 等显式栈操作仍保留，后续由 stack frame pass 恢复。
+- 如果某个 CALL/RET 的隐式栈模式没有被识别，应该发 warning，而不是悄悄生成假栈语义。
+
+## 5. LLVM Pass Pipeline
+
+`notdec-native-llvm` 当前主流程：
+
+```text
+PcodeToLLVM
+  -> attach memory map metadata
+  -> attach ABI metadata
+  -> verify
+  -> InstCombine + SimplifyCFG
+  -> NativeRegisterSummarySSA
+  -> InstCombine + SimplifyCFG
+  -> optional legacy NativePrototypeRecovery
+  -> NativeRegisterFinalCleanup
+  -> verify
+  -> write .ll / .bc
+```
+
+### 5.1 InstCombine + SimplifyCFG
+
+位置：
+
+- `tools/notdec-native-llvm.cpp::runInstCombinePassIfEnabled`
+
+每次运行都只对非 declaration 函数跑：
+
+1. `InstCombine`
+2. `SimplifyCFG`
+
+这一步只做通用 LLVM 局部化简，不负责寄存器语义。
+
+### 5.2 NativeRegisterSummarySSA
+
+位置：
+
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h`
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
+
+这是当前 native register elimination 的主 pass。顶层顺序是：
+
+1. **加载外部原型**
+   - 从内置 `defaultNativeExternalPrototypes()` 开始。
+   - 如果传了 `--external-prototypes <json>`，再加载 JSON 覆盖/扩展。
+   - 原型用于外部函数 signature rewrite、noreturn 截断和 warning。
+
+2. **截断已知 noreturn 外部 call**
+   - 对 `exit`、`__stack_chk_fail` 等已知 noreturn 外部函数，把后继不可达部分截断。
+
+3. **NativeStackFrameRewrite**
+   - 入口：`runNativeStackFrameRewrite(...)`。
+   - 从 ABI metadata 读取 stack pointer register。
+   - 把 RSP/RBP 相关栈访问恢复为 `notdec_stack.native` alloca / GEP 形式。
+   - 把 stack pointer 和已确认 frame pointer 加入 ignored register 集合。
+
+4. **NativeStackCanaryCleanup**
+   - 入口：`runNativeStackCanaryCleanup(...)`。
+   - 匹配 FS canary load、保存、结尾比较、`__stack_chk_fail` 分支。
+   - 删除 canary check 和 fail-only block。
+
+5. **canonicalizeRegisterPointerPhiLoads**
+   - 修 InstCombine 可能生成的 register pointer PHI load。
+   - 让后续 register summary 能继续按 register global 识别访问。
+
+6. **NativeRegisterSummary**
+   - 入口：`runNativeRegisterSummary(...)`。
+   - 做 bottom-up 函数 effect 分析：
+     - `ReadEntry`：函数入口寄存器值是否被读。
+     - `MayEntry`：正常返回时寄存器是否可能仍是入口值。
+     - `MayNonEntry`：正常返回时寄存器是否可能是函数内新值。
+   - 做 top-down demand 分析：
+     - `EntryDemandMask`：入口寄存器哪些 bit 被真实观察。
+     - `ExitDemandMask`：返回寄存器哪些 bit 被 caller 需要。
+   - 处理 call：
+     - 内部 call 用 callee summary effect。
+     - 外部 call 当前 fallback 使用 ABI effect；这里后续需要按外部原型收窄输入寄存器。
+   - 处理 partial write：
+     - x86-64 低 32 位 GPR 写视为整寄存器定义，因为会清高 32 位。
+     - 其他 partial write 保留未写 lane 的 entry 可能性。
+   - 处理保存/恢复：
+     - 跟踪固定 entry-SP offset / native stack alloca slot。
+     - 识别 callee-saved register 保存到栈再恢复的模式。
+
+7. **构建初始 signature shape**
+   - 外部 declaration：
+     - 优先用已知外部原型。
+     - 未知外部函数先按 ABI 输入寄存器给保守形状，后面再用 callsite 收窄。
+   - 内部函数：
+     - 根据 `ReadEntry` 和 ABI register class 决定参数。
+     - 根据 `ExitDemand` 和 ABI return register 决定返回值。
+     - 用 demand mask 收窄整数宽度和 float/double lane。
+
+8. **FunctionBuilder per-function SummarySSA**
+   - 对每个非 declaration 函数运行 `FunctionBuilder::run()`。
+   - 主要细分步骤：
+     - 收集 register load/store/partial read/partial write 事件。
+     - 规划 register range。现在是 range-aware SummarySSA，不再只有整寄存器粒度。
+     - 为入口值创建 canonical entry read 或 range entry read。
+     - 按 CFG 构造 SSA value，必要时插入 PHI。
+     - 用 call effect 生成 return/clobber value。
+     - 用 zero-demand metadata 标记被 demand 剪掉的 lane。
+     - 收集函数返回值。
+     - 收集 callsite argument store binding。
+
+9. **未知外部函数参数数量推断**
+   - 入口：`refineUnknownExternalParamShapes(...)`。
+   - 综合多个 callsite 的连续参数 binding。
+   - 遇到 clobber-derived value 不当作强证据。
+   - 不一致时输出 warning，同时仍选一个可用 arity。
+
+10. **间接 call 参数形状收窄**
+    - 入口：`refineIndirectCallsiteParamShapes(...)`。
+    - 对 indirect call 使用 callsite binding 收窄参数数量。
+
+11. **补外部返回值**
+    - 入口：`addDemandedExternalReturns(...)`。
+    - 如果 call 后有 demanded `summary_return` / range return helper，给外部 declaration
+      增加对应 ABI return slot。
+    - 对 RDX 这类非主返回寄存器保持保守，避免误判为第二返回值。
+
+12. **标记 call 参数 store 可删除**
+    - 入口：`markSignatureCallArgStores(...)`。
+    - 被成功重写进 LLVM call 参数的 register store 可以删除。
+
+13. **重写函数和 call 签名**
+    - 入口：`rewriteSignatureShapes(...)`。
+    - 替换函数类型。
+    - 内部函数 body 中 entry register read 替换为 LLVM argument。
+    - callsite 从“先 store ABI register，再 call void”重写为普通 LLVM call 参数。
+    - call return helper 替换为普通 LLVM call return value。
+
+14. **删除未使用 helper declaration**
+    - 清理 `notdec.register.summary_*`、partial read/write helper 的无用声明。
+
+15. **post-rewrite cleanup loop**
+    - 只在 SummarySSA residue removal 开启时运行。
+    - 最多 10 轮。
+    - 每轮可选跑 `InstCombine`。
+    - 然后 `removeDeadStoresAfterSignatureRewrite()` 删除签名重写后暴露的死 register store。
+    - 如果本轮没有新删 store，停止。
+
+16. **NativeStackFrameCleanup**
+    - 只在 SummarySSA residue removal 开启时运行。
+    - 入口：`runNativeStackFrameCleanup(...)`。
+    - 继续删除 stack/frame pointer bookkeeping。
+    - 删除不用的 native stack alloca load/store/alloca。
+
+17. **late canary cleanup**
+    - 只在 SummarySSA residue removal 开启时运行。
+    - 再跑一次 `runNativeStackCanaryCleanup(...)`。
+    - 处理前面重写后新暴露出来的 canary 形状。
+
+18. **SummarySSA residue cleanup**
+    - 只在 SummarySSA residue removal 开启时运行。
+    - 删除死 `summary_return` / `summary_clobber` helper。
+    - 删除死 canonical entry read / range entry read。
+    - 删除未使用 helper declaration。
+    - 收集剩余 helper warning，写到 `--register-ssa-warning-out`。
+
+### 5.3 NativeRegisterFinalCleanup
+
+位置：
+
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h`
+- `lib/passes/summary/NativeRegisterFinalCleanup.cpp`
+
+顺序：
+
+1. 跑 `GlobalDCE`。
+2. 删除无 use 的 register load 和 partial read。
+3. 删除无 use 的 register global。
+4. 删除无 use 的 register helper declaration。
+5. 扫描每个函数：
+   - 如果还有 register load/store/helper，保留 debug metadata。
+   - 如果没有 register residue，删除函数和指令上的 Summary/SummarySSA metadata。
+6. 再跑一次 `GlobalDCE`。
+7. 再删一次无用 register global/helper。
+8. 统计 `remaining_register_accesses`。
+
+## 6. 关键文件
 
 ```text
 external/NotDec-bin2llvm/
-  ghidra_scripts/   Ghidra headless 导出脚本
-  include/          对外头文件和主要数据结构
-  lib/              JSON 读取、P-Code 表达、LLVM IR lowering
-  scripts/          手动 smoke / 回归脚本
-  tools/            命令行工具
-  cmake/            LLVM 查找逻辑
+  tools/
+    notdec-native-discover.cpp      native discovery 审计入口
+    notdec-native-llvm.cpp          native -> p-code -> LLVM -> pass 主入口
+
+  include/notdec-bin2llvm/
+    NativeAnalysis.h                NativeProgramState 和 discovery 数据结构
+    Pcode.h                         p-code 数据结构
+    PcodeToLLVM.h                   p-code lowering 对外入口
+    NativeAbi.h                     ABI metadata 读写
+    NativeExternalPrototype.h       外部函数原型表
+    NativeRegisterPartialRead.h     partial read intrinsic 解析/生成
+    NativeRegisterPartialWrite.h    partial write intrinsic 解析/生成
+
+  lib/
+    NativeAnalysis.cpp              ELF/DDISASM/GTIRB/.eh_frame/PLT/GOT discovery
+    GtirbNativeAnalysis.cpp         GTIRB 导入
+    NativeEhFrame.cpp               .eh_frame 解码
+    NativeRuntime.cpp               runtime 函数识别和 skip-runtime 策略
+    NativeExternalPrototype.cpp     默认外部原型和 JSON 加载
+    SleighLift.cpp                  SLEIGH instruction / p-code 收集
+    PcodeToLLVM.cpp                 p-code 到 LLVM IR lowering
+
+  lib/passes/summary/
+    NativeStackFrame.cpp            栈帧恢复和 cleanup
+    NativeStackCanaryCleanup.cpp    stack canary 删除
+    NativeRegisterSummary.cpp       bottom-up / top-down register summary
+    NativeRegisterSummarySSA.cpp    range-aware SummarySSA 和签名重写
+    NativeRegisterFinalCleanup.cpp  final GlobalDCE / metadata cleanup
 ```
 
-几个文件的职责：
-
-- `ghidra_scripts/ExportHeritageModule.java`：模块级 JSON 导出入口。遍历 Ghidra 函数，逐个 decompile，成功的写入 `functions[]`，失败的写入 `failures[]`，外部函数写入 `externals[]`。
-- `ghidra_scripts/ExportHeritagePcode.java`：单函数 JSON 导出入口。现在主要用于小样例和定位单个函数问题。
-- `include/notdec-bin2llvm/HeritagePcode.h`：heritage JSON 在 C++ 侧的数据结构。
-- `lib/HeritagePcode.cpp`：读取单函数和模块级 heritage JSON，并建立 id 到对象的索引。
-- `include/notdec-bin2llvm/HeritageToLLVM.h`：heritage lowering 的对外入口。
-- `lib/HeritageToLLVM.cpp`：当前最核心的 lowering 实现。
-- `tools/notdec-heritage-module-llvm.cpp`：模块级 JSON 到 `.ll` 的命令行入口。
-- `tools/notdec-heritage-module-check.cpp`：模块级 JSON 引用关系检查工具。
-- `tools/notdec-heritage-llvm.cpp`：单函数 JSON 到 `.ll` 的命令行入口。
-- `tools/notdec-heritage-check.cpp`：单函数 JSON 检查工具。
-- `tools/notdec-native-discover.cpp`：native discovery smoke 入口。默认打印文本 report，
-  `--summary-json` 打印 function、block、instruction、xref、seed confidence 和 unresolved indirect flow
-  的汇总 JSON，`--memory-json` 打印 load range 和 section 布局 JSON，
-  `--relocations-json` 打印 relocation 表 JSON，`--notes-json` 打印 native 分析提示 JSON，
-  `--eh-frame-json` 打印 `.eh_frame` / `.eh_frame_hdr` 解析统计和 FDE 列表 JSON，
-  `--callgraph-json` 打印 callgraph JSON，`--callgraph-dot` 打印 callgraph DOT，
-  基于 call xref、confirmed function、PLT 和 external relocation 目标，
-  `--cfg-json` 按 confirmed function 入口打印单函数 CFG JSON，`--cfg-dot` 打印 Graphviz DOT，
-  `--seeds-json` 打印 function seed 列表 JSON，`--function-json` 按入口打印单函数信息 JSON，
-  `--function-xrefs-json` 按入口打印单函数引用 JSON，
-  包含地址、range、name、alias、来源和 confidence，
-  `--functions-json` 打印 confirmed function 列表 JSON，`--blocks-json` 打印 confirmed function 下的 basic block 列表 JSON，
-  `--block-json` 按 confirmed basic block 起点打印单 block 和 instruction 列表 JSON，
-  `--xrefs-json` 打印 xref 列表 JSON，`--xrefs-dot` 打印 xref DOT，
-  `--xrefs-kind-json` 按 xref kind 过滤，
-  `--xrefs-from-json` / `--xrefs-to-json` 按地址查 xref，`--instructions-json`
-  打印 instruction 列表 JSON，`--instructions-range-json` 按地址范围打印 instruction
-  列表 JSON，`--instructions-function-json` 按 confirmed function 入口打印 instruction
-  列表 JSON，`--plt-json` 打印 `.plt.sec` / `.plt.got` stub、GOT slot 和外部符号名映射，
-  `--unresolved-json` 打印尚未解析的 indirect call / branch 地址列表。
-- `tools/notdec-native-llvm.cpp`：native P-Code 到 LLVM IR 的入口。可以继续用
-  `-a <address> -l <length>` 手工指定范围，也可以用 `-f <entry>`、`-n <name>` 或
-  `--all-confirmed` 先跑 native discovery，从 confirmed function 取入口到保守 range end，
-  再生成 `.ll`。P-Code lowering 会把 LLVM `%entry` 作为单独跳板，真实机器入口放在
-  `bb_<address>`，所以 CFG 可以有回边跳到机器入口。`--all-confirmed` 会先规划本模块
-  confirmed function 的入口地址到 LLVM symbol 的映射，P-Code direct `CALL` 如果命中这个
-  映射，会生成为普通 LLVM direct call；forward call 先创建的空 declaration 可以在后续
-  lowering 中补成函数体。`CALL` 如果命中已知 PLT stub，会生成为对应外部符号的 LLVM
-  direct call。`-f` / `-n` 单函数模式也会先规划 native discovery 的 confirmed function 和
-  PLT 外部符号映射，所以已知 direct call 仍能落到符号名。`CALLIND` 如果输入来源能追到
-  直接 RAM GOT slot，并且该 slot 是外部 `GLOB_DAT` 符号，会生成为对应外部函数调用。
-  `BRANCHIND` 命中同一类外部 GOT slot 或已知 `NativePltEntry::GotAddress` 时，会生成外部
-  `void ()` call 后结束当前函数，用于保守表达 external tail jump。PLT0 resolver 的
-  `.got + 16` slot 会落到 synthetic 外部符号 `notdec_plt0_resolver`，避免生成匿名
-  `notdec_exit`。PLT stub 地址和 GOT slot 共享同一个外部 LLVM symbol，避免同一符号生成重复声明。
-  x86 `CALLOTHER` userop 17/18（`LOCK` / `UNLOCK`）会 no-op，因为普通内存读写 P-Code 已经保留交换语义。
-  未命中目标和其他 `CALLOTHER` 仍走 helper call。
-- `scripts/bench2-native-smoke.sh`：Bench2 native smoke 入口。它固定跑 `vsftpd`、
-  `libuv.so.1.0.0`、`memcached`，先用 `notdec-native-discover --summary-json` 确认
-  native discovery 至少产出 confirmed function，且当前三目标不再保留 unresolved indirect
-  call / branch；它还会检查入口 source baseline：可执行文件需要有 `elf-entry`，shared
-  object `libuv` 不能有 `elf-entry`，并且三目标都要有 dynamic init/fini、init/fini array
-  和 `.eh_frame` 来源，也要求存在 `elf-relocation-code` seed source，并检查 seed confidence
-  计数之和等于 `function_seeds`。它还会用 `--blocks-json` 检查同函数 block 不重叠，并禁止
-  successor 指向同函数已知 block 的内部；再结合 `--seeds-json` 检查 confirmed block
-  不覆盖其他非 Low confidence function seed 入口，并确认 summary confidence 计数和 seed 列表一致；用 `--xrefs-json` 检查 relocation code/data/string
-  xref source baseline。然后再用 `notdec-native-llvm --all-confirmed`
-  生成 IR，并用本地 LLVM 22 的 `llvm-as` 和 `opt -passes=verify` 验证；输出目录会生成
-  `metrics.tsv`，汇总每个目标的
-  seed confidence、函数数、block 数、instruction 数、xref 数、unresolved 数和耗时；如果 Bench2 IR 目录里已有
-  `module-limit5.json`，还会用 `notdec-heritage-module-check` 生成 `heritage-metrics.tsv`
-  和 `native-heritage-compare.tsv`；随后还会检查
-  若干固定 IR pattern，确认最近补上的 direct call、PLT external call、GOT external
-  indirect call / tail jump 没有退回 helper，并禁止最近清掉的 `CALL` / `CALLIND` /
-  `CALLOTHER` helper 回到 Bench2 smoke 输出；同时禁止 direct `ram` 输入重新 lower 成
-  `freeze poison`，也禁止当前三目标重新出现 `notdec_exit`。
-- `include/notdec-bin2llvm/Pcode.h`、`lib/PcodeToLLVM.cpp`、`tools/SleighBytes.cpp`：Sleigh 字节到 P-Code、再到 LLVM IR 的旧实验路径。默认 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`。
-- `include/notdec-bin2llvm/ModuleBuilder.h`、`lib/ModuleBuilder.cpp`、`tools/notdec-bin2llvm.cpp`：最早的 demo module 入口，只生成一个空函数。
-
-## 当前主执行顺序：模块级 heritage JSON 到 LLVM IR
-
-常用命令：
-
-```bash
-notdec-heritage-module-llvm /tmp/module.json -o /tmp/module.ll
-```
-
-大致顺序如下。
-
-### 1. Ghidra 导出模块 JSON
-
-入口：
-
-- `ExportHeritageModule.run()`
-
-关键步骤：
-
-1. `parseOptions(...)` 读取输出路径、函数数量限制、decompile timeout 和 simplification style。
-2. `createDecompiler(...)` 创建 Ghidra `DecompInterface`，关闭 C 输出，保留 syntax tree，并设置 simplification style。
-3. `selectFunctions(...)` 遍历 `currentProgram.getFunctionManager().getFunctions(true)`，跳过 external 和 thunk，按 `--limit` 或 `--all` 选择内部函数。
-4. 对每个函数调用 `decompile(...)`，拿到 `HighFunction`。
-5. `writeFunctionObject(...)` 写一个函数对象，内容包括函数签名、basic block、op、varnode。
-6. `writeExternals(...)` 写模块级外部函数表。
-7. `writeFailures(...)` 写 decompile 失败的函数。
-
-输出 schema 是 `notdec.heritage-module.v0`，核心字段是：
-
-- `program`：程序名、语言、compiler spec、simplification style。
-- `functions[]`：内部函数，每个元素复用单函数 heritage 字段。
-- `externals[]`：外部函数声明。
-- `failures[]`：Ghidra 导出阶段失败的函数。
-
-### 2. native 工具解析参数
-
-入口：
-
-- `tools/notdec-heritage-module-llvm.cpp::main(...)`
-
-关键函数：
-
-- `parseArgs(...)`：接受 `<heritage-module.json> -o <output.ll>`，可选 `--declarations-only`。
-- `printUsage(...)`：参数错误时打印用法。
-- `writeModule(...)`：最后把 LLVM module 写到 `.ll`。
-
-`main(...)` 的顺序：
-
-1. 解析 CLI。
-2. 调用 `loadHeritageModuleFromJson(...)` 读取 JSON。
-3. 创建 `llvm::LLVMContext`。
-4. 如果是 `--declarations-only`，调用 `buildHeritageDeclarationModule(...)`。
-5. 否则调用 `buildHeritageModuleWithBodies(...)`。
-6. 调用 `llvm::verifyModule(...)`。
-7. 写出 `.ll`。
-
-### 3. 读取 heritage module JSON
-
-入口：
-
-- `lib/HeritagePcode.cpp::loadHeritageModuleFromJson(...)`
-
-关键函数：
-
-- `requireString(...)`：读取必填字符串。
-- `readProgramInfo(...)`：读取 `program`。
-- `readModuleFunction(...)`：读取 `functions[]` 里的一个函数。
-- `readFunctionObject(...)`：读取函数名、入口地址、返回类型和参数。
-- `readBlocks(...)`：读取 basic block 和 CFG 边。
-- `readOps(...)`：读取 P-Code op、输入输出、call target。
-- `readVarnodes(...)`：读取 varnode 的 space、offset、size、寄存器信息和 high variable 信息。
-- `readExternalFunction(...)`：读取 `externals[]`。
-- `readFailure(...)`：读取 `failures[]`。
-- `indexHeritageProgram(...)`：给每个函数建立 `BlockById`、`OpById`、`VarnodeById`、`BlockByStart`。
-
-这里的数据结构尽量贴近 JSON。当前没有再造一套中间 IR，主要是为了让 Ghidra 导出结果和 native lowering 一一对上。
-
-### 4. 规划模块符号名
-
-入口：
-
-- `lib/HeritageToLLVM.cpp::buildHeritageModuleWithBodies(...)`
-
-第一步会调用：
-
-- `planModuleSymbols(...)`
-
-它做三件事：
-
-1. 给内部函数生成 LLVM symbol。
-2. 给外部函数生成 LLVM symbol。
-3. 建立 `NameByEntry` 和 `NameByOriginalName`，后面 `CALL` lowering 用它解析目标函数。
-
-相关辅助函数：
-
-- `sanitizeSymbolName(...)`：把 Ghidra 名字转成 LLVM 里更安全的 symbol。
-- `addressSuffix(...)`：从地址里提取后缀。
-- `uniqueSymbolName(...)`：处理重名，必要时拼地址和序号。
-
-### 5. 先声明所有函数
-
-`buildHeritageModuleWithBodies(...)` 先创建一个空 module，然后分两类声明函数：
-
-1. 内部函数：调用 `declareInternalFunction(...)`。
-2. 外部函数：调用 `module->getOrInsertFunction(...)`，当前使用 vararg function type。
-
-这样做是为了让函数 body lowering 时可以解析内部互调，也让单个函数失败时还能保留 declaration。
-
-函数类型相关逻辑：
-
-- `typeForSourceType(...)`：把 Ghidra 类型字符串粗略映射到 LLVM integer/void 类型。
-- `functionTypeForHeritageFunction(...)`：根据 `HeritageFunction.Params` 和 `ReturnType` 生成内部函数类型。
-- `varargFunctionType(...)`：给外部函数和不稳定 call prototype 用。
-
-### 6. 逐个 lower 函数体
-
-入口：
-
-- `HeritageLowerer::lower(...)`
-
-顺序：
-
-1. `createFunction(...)`：确认或创建当前 LLVM function。
-2. `createBlocks()`：按 heritage block 建 LLVM basic block。
-3. `mapParameters(...)`：把函数参数绑定到对应 varnode。
-4. 遍历 `Program.Blocks`，对每个 block 调 `lowerBlock(...)`。
-5. `finalizePendingPhis(...)`：补完所有 `MULTIEQUAL` 的 incoming value。
-
-`HeritageLowerer` 里几个核心状态：
-
-- `BlockMap`：heritage block id 到 LLVM basic block。
-- `Values`：varnode id 到当前 LLVM value。
-- `PendingPhis`：先创建但还没填 incoming 的 PHI。
-- `Symbols`：模块级函数符号表，用于解析 `CALL`。
-- `Memory`：临时 `notdec_ram` 外部数组，用于表达 LOAD/STORE。
-
-### 7. lower 一个 basic block
-
-入口：
-
-- `HeritageLowerer::lowerBlock(...)`
-
-它的顺序和普通 SSA lowering 一样：
-
-1. 第一遍只处理本 block 里的 `MULTIEQUAL`，调用 `lowerPhi(...)` 创建 LLVM PHI。
-2. 第二遍跳过 `MULTIEQUAL`，按 op 顺序 lower 普通指令。
-3. 如果遇到 `BRANCH`、`CBRANCH`、`BRANCHIND`、`RETURN`，调用 `lowerBranch(...)` 并结束这个 block。
-4. 如果没有显式 terminator，就按 `block.Out` 生成 fallthrough branch；没有 successor 时生成 return。
-
-这也是 `scripts/bin2llvm-dump-module-pcode.py` 当前按 lowering 顺序打印 P-Code 的依据。
-
-### 8. lower 普通 P-Code op
-
-入口：
-
-- `HeritageLowerer::lowerOp(...)`
-
-它按 mnemonic 分发到具体函数：
-
-- 数据移动：`lowerCopy(...)`、`lowerCopyLike(...)`
-- 整数运算：`lowerBinary(...)`、`lowerUnary(...)`
-- 整数比较：`lowerCompare(...)`
-- 溢出判断：`lowerOverflow(...)`
-- 位计数：`lowerCountBits(...)`
-- 扩展/截断：`lowerCast(...)`
-- 布尔运算：`lowerBoolNegate(...)`、`lowerBoolBinary(...)`
-- 浮点运算：`lowerFloatBinary(...)`、`lowerFloatCompare(...)`、`lowerFloatUnary(...)`、`lowerFloatNan(...)`、`lowerFloatCast(...)`
-- 拼接/切片：`lowerPiece(...)`、`lowerSubpiece(...)`
-- 指针加减：`lowerPtrAdd(...)`、`lowerPtrSub(...)`
-- bit range：`lowerInsert(...)`、`lowerExtract(...)`
-- 内存访问：`lowerLoad(...)`、`lowerStore(...)`
-- PHI：`lowerPhi(...)`
-- 调用：`lowerCall(...)`
-- 暂不精确支持的 op：`lowerHelperCall(...)`
-
-读写 varnode 的基础函数：
-
-- `read(...)`：优先从 `Values` 取值；常量 varnode 生成 `ConstantInt`；direct `ram`
-  varnode 会通过现有 `@notdec_ram` 生成 load；其他未初始化 varnode 目前生成
-  `freeze poison` 并打印 warning。
-- `write(...)`：按 varnode size resize 后写回 `Values`。
-- `resize(...)`：用 zero extend 或 truncate 调整 integer bit width。
-
-### 9. 内存、调用和 PHI 的当前处理
-
-内存：
-
-- `memoryGlobal()` 创建外部全局数组 `@notdec_ram`。
-- `memoryPointer(...)` 用地址对 `@notdec_ram` 做 GEP。
-- `lowerLoad(...)` 和 `lowerStore(...)` 只接受常量 address-space selector，按 1 字节对齐生成 load/store。
-- direct `ram` varnode 输入也复用 `memoryPointer(...)`，按 varnode size 从
-  `@notdec_ram` 生成 1 字节对齐的 load。
-
-调用：
-
-- `lowerCall(...)` 先用 `resolveCallTargetName(...)` 查模块符号表。
-- 当前 call prototype 还不稳定，所以用 vararg declaration。
-- 如果是 `CALLIND`、`CALLOTHER`、`SEGMENTOP` 等暂不精确支持的 op，走 `lowerHelperCall(...)`，生成 `notdec_heritage_<opcode>_*` helper call。
-
-PHI：
-
-- `lowerPhi(...)` 只创建 PHI，并把 predecessor block id 和 input varnode id 存到 `PendingPhis`。
-- `finalizePendingPhis(...)` 在所有 block lower 完之后补 incoming。
-- `resizeForPhiIncoming(...)` 会尽量在 predecessor terminator 前插入 zext/trunc。
-- 找不到 incoming value 时当前使用 poison fallback，并打印 warning。
-
-寄存器：
-
-- register space 的全局变量由 `RegisterStorage` 统一管理。
-- 模块级 heritage lowering 先收集整个模块里的 register varnode，再给所有函数共享同一份
-  `RegisterStorage`。同一个寄存器不能因为出现在不同函数里就生成 `@R13`、`@R13.1`
-  这种多份状态。
-- 寄存器内存段拆分按“不会被重叠访问跨过的边界”来切。也就是不能存在一个访问范围把切分边界包在内部。
-  例如 x86-64 的 `RAX/EAX/AX/AL` 都落在 `RAX` 这个最大承载寄存器里，LLVM IR
-  只建一个 `@RAX` global；更小的访问用 shift/trunc/mask 访问它的一部分。
-- `EAX` 写入会清空 `RAX` 高位这类语义由 P-Code 表达，这里不要用额外规则重复模拟。
-- register varnode 的写入默认只进入函数内 SSA `Values`，不再同步写回 `@RAX/@RDX`
-  这类 module-global register。只有读一个没有 SSA 值的 register input 时，才从
-  `RegisterStorage` 兜底读全局寄存器。
-
-栈：
-
-- heritage 输出里普通 prologue/epilogue 的 `RSP` 加减通常已经被 Ghidra 抽成
-  `Stack[-offset]` 这类 frame-relative varnode。
-- `HeritageLowerer` 会扫描每个函数的负偏移 stack varnode，按覆盖范围在函数入口生成一个
-  byte-addressed `alloca`。例如最低访问到 `Stack[-0x38]` 时，栈帧至少覆盖 0x38 字节。
-- `Stack[-offset]` 的读写直接落到这个 alloca 的 GEP 上，不再通过 `@RSP + offset`
-  访问临时内存模型。
-- 正偏移 stack varnode 先不放进这个 alloca，避免把调用者栈参数或返回地址混成本函数本地栈。
-
-### 10. 函数失败时恢复成 declaration
-
-`buildHeritageModuleWithBodies(...)` 对每个 `status == "ok"` 的函数尝试填 body。
-
-如果 `HeritageLowerer::lower(...)` 失败，或 `llvm::verifyFunction(...)` 失败，会调用局部 lambda `restoreDeclaration(...)`：
-
-1. 删除当前半成品 LLVM function。
-2. 用同一个 symbol 重新声明函数。
-3. 把失败信息写入 `HeritageModuleLoweringStats::Failures`。
-4. 继续处理后面的函数。
-
-这保证一个坏函数不会导致整个 module 没有输出。
-
-## 单函数 heritage 路径
-
-常用命令：
-
-```bash
-notdec-heritage-llvm /tmp/function.json -o /tmp/function.ll
-```
-
-顺序：
-
-1. `tools/notdec-heritage-llvm.cpp::main(...)` 解析参数。
-2. `loadHeritageProgramFromJson(...)` 读取单函数 JSON。
-3. `buildHeritageModule(...)` 创建 module。
-4. `HeritageLowerer::lower(...)` lower 一个函数体。
-5. `llvm::verifyModule(...)` 检查。
-6. 写出 `.ll`。
-
-这条路径和模块级路径共用 `HeritageProgram`、`HeritageLowerer` 和大部分 lowering 逻辑。
-
-## 检查工具
-
-### `notdec-heritage-module-check`
-
-入口：
-
-- `tools/notdec-heritage-module-check.cpp::main(...)`
-
-主要检查：
-
-- schema 是否是 `notdec.heritage-module.v0`。
-- 内部函数 name 和 entry 是否重复。
-- block 的 `in/out/ops` 引用是否存在。
-- op 的 parent、input、output varnode 是否存在。
-- direct call 能否解析到内部函数或外部函数。
-
-关键函数：
-
-- `checkModuleSymbols(...)`
-- `checkFunctionRefs(...)`
-- `countCalls(...)`
-- `printSummary(...)`
-
-### `notdec-heritage-check`
-
-入口：
-
-- `tools/notdec-heritage-check.cpp::main(...)`
-
-主要检查单函数 JSON：
-
-- schema 是否是 `notdec.heritage-pcode.v0`。
-- 参数 varnode 是否存在。
-- block/op/varnode 引用是否完整。
-- `MULTIEQUAL` 输入数量是否等于 predecessor 数量。
-- 统计 register varnode 和 direct call。
-
-## Sleigh 实验路径
-
-默认构建时 `NOTDEC_BIN2LLVM_ENABLE_SLEIGH=OFF`，所以这条路径通常不会进 Bench2 当前验证。
-
-Sleigh 依赖会从 `lifting-bits/sleigh` 拉取，Ghidra 源码统一使用
-`NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR` 指向的 checkout。当前本机默认是
-`/sn640/ghidra`，需要 checkout 到 sleigh pin 的 Ghidra tag。不要混用旧
-Ghidra release 目录里的 `.sla/.pspec`；native pcode 工具应优先使用
-`/sn640/ghidra/Ghidra/Processors/.../data/languages/` 下同版本的 spec。
-
-如果开启 Sleigh，入口大致是：
-
-```bash
-notdec-sleigh-pcode ...
-notdec-sleigh-llvm ...
-notdec-native-pcode ...
-notdec-native-llvm ...
-```
-
-`notdec-native-llvm` 对 x86-64 ELF 可以自动选择 spec，默认使用
-`/sn640/ghidra/Ghidra/Processors/x86/data/languages/x86-64.sla` 和同目录的
-`x86-64.pspec`。手动传入 `[sla-file]` 和 `-s <pspec-file>` 时仍会覆盖默认选择。
-
-执行顺序：
-
-1. `tools/SleighBytes.cpp` 用 Sleigh 从字节生成 `PcodeProgram`。
-2. `PcodeCollector::dump(...)` 收集每条 P-Code op。
-3. `buildPcodeModule(...)` 创建一个 void LLVM function。
-4. `PcodeLowerer::lower(...)` 按线性 P-Code 建 basic block 并 lower op。
-
-这条路径使用的是 `Pcode.h` 里的简化结构：
-
-- `VarnodeView`
-- `PcodeOpView`
-- `PcodeProgram`
-
-它没有 Ghidra HighFunction 的 SSA、block、high variable 信息，所以能力弱于 heritage 路径。
-
-## 主要限制
-
-当前代码能生成结构上可验证的 LLVM IR，但还不是完整语义恢复：
-
-1. 源类型到 LLVM 类型的映射很粗，很多类型都落到整数。
-2. 外部函数和 call-site prototype 仍使用 vararg。
-3. `notdec_ram` 只是临时内存模型，还没表达真实 ELF section、stack object、GOT/PLT 和 relocation。
-   direct `ram` 输入已经会从这里 load，但内容仍由外部环境决定。
-4. 未初始化 varnode、部分 PHI incoming、间接跳转失败路径会使用 poison fallback。
-5. 部分 P-Code op 通过 helper call 保留，不是精确 lowering。
-6. 模块级 lowering 能隔离单函数失败，但失败函数只有 declaration，没有 body。
+## 7. 现在已知的设计边界
+
+- DDISASM / GTIRB 是当前 CFG 主来源。p-code lowering 不主动猜 jump table。
+- `.eh_frame` 是 range / boundary hint，不是源码函数来源。
+- 外部函数原型会影响 signature rewrite；但 bottom-up register summary 目前还没有完整按原型收窄
+  external call input，这是接下来要修的点。
+- `main` 在 executable 里会保留 external linkage，其他 lifted 函数默认 internal linkage。
+- register metadata 是 debug 辅助，不是 cleanup 后的新事实。final cleanup 只在函数没有剩余
+  register residue 时清掉它。
+- `--no-register-ssa-pass` 是排查 lifting 原始语义的关键开关。
+- `--register-ssa-warning-out` 用来审计残留 summary helper、未知外部签名和未消除寄存器访问。
