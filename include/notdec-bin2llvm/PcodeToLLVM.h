@@ -2,6 +2,8 @@
 
 #include "notdec-bin2llvm/Pcode.h"
 
+#include "llvm/IR/GlobalValue.h"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -25,6 +27,8 @@ struct PcodeLoweringConfig {
   std::string ModuleName = "notdec.bin2llvm.pcode";
   std::string EntryFunctionName = "notdec_pcode";
   std::optional<uint64_t> EntryAddress;
+  llvm::GlobalValue::LinkageTypes EntryFunctionLinkage =
+      llvm::GlobalValue::ExternalLinkage;
 
   // GlobalArray keeps the old synthetic @notdec_ram object.  IntToPtr maps
   // P-Code RAM addresses to real LLVM pointers, which is better for native ELF

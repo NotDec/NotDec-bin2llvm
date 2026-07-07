@@ -10,6 +10,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -78,6 +79,24 @@ struct CliOptions {
   bool RewritePrototypeSignatures = false;
   bool SkipRuntimeFunctions = false;
 };
+
+bool isSharedLibrary(const LIEF::ELF::Binary &binary) {
+  return binary.header().file_type() == LIEF::ELF::Header::FILE_TYPE::DYN &&
+         !binary.is_pie();
+}
+
+llvm::GlobalValue::LinkageTypes
+nativeFunctionLinkage(const notdec::bin2llvm::NativeProgramState &state,
+                      const notdec::bin2llvm::NativeFunction &function) {
+  if (isSharedLibrary(state.binary())) {
+    return function.IsExternallyVisible ? llvm::GlobalValue::ExternalLinkage
+                                        : llvm::GlobalValue::InternalLinkage;
+  }
+  if (function.Name == "main") {
+    return llvm::GlobalValue::ExternalLinkage;
+  }
+  return llvm::GlobalValue::InternalLinkage;
+}
 
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0
@@ -879,6 +898,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
       continue;
     }
     config.EntryFunctionName = nameIt->second;
+    config.EntryFunctionLinkage = nativeFunctionLinkage(state, function);
     config.DirectCallTargets = callTargets.Direct;
     config.ExternalCallTargets = callTargets.External;
     config.IndirectExternalCallTargets = callTargets.IndirectExternal;
@@ -1176,6 +1196,13 @@ int main(int argc, char **argv) {
                           : planNativeCallTargets(
                                 runNativeDiscovery(*binary, *options),
                                 options->SkipRuntimeFunctions);
+        if (selectedState) {
+          if (const notdec::bin2llvm::NativeFunction *function =
+                  selectedState->functionAt(*options->FunctionEntry)) {
+            config.EntryFunctionLinkage =
+                nativeFunctionLinkage(*selectedState, *function);
+          }
+        }
         callTargets.Direct[*options->FunctionEntry] = config.EntryFunctionName;
         config.DirectCallTargets = std::move(callTargets.Direct);
         config.ExternalCallTargets = std::move(callTargets.External);

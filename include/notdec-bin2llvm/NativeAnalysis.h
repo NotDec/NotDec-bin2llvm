@@ -50,6 +50,10 @@ struct NativeFunctionSeed {
   std::string PrimaryName;
   std::vector<std::string> Aliases;
   std::vector<std::string> Sources;
+  // ELF dynamic/exported symbols can be called from outside the lifted module.
+  // Keep that fact on the seed so GTIRB and internal decode paths can copy it
+  // into confirmed functions without depending on where the function came from.
+  bool IsExternallyVisible = false;
   NativeFunctionConfidence Confidence = NativeFunctionConfidence::Low;
 };
 
@@ -167,6 +171,7 @@ struct NativeFunction {
   std::string Name;
   std::vector<NativeBasicBlock> Blocks;
   std::string Source;
+  bool IsExternallyVisible = false;
 };
 
 // Runtime filtering keeps ELF/glibc startup, teardown, and PLT stubs out of
@@ -305,6 +310,7 @@ public:
 
   bool addFunctionSeed(uint64_t address, uint64_t size, std::string name,
                        std::string source, NativeFunctionConfidence confidence);
+  bool markFunctionSeedExternallyVisible(uint64_t address);
   bool demoteFunctionSeedToRangeHint(uint64_t address);
   bool addFunction(NativeFunction function);
   bool removeFunction(uint64_t entry);

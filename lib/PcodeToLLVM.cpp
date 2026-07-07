@@ -2278,10 +2278,11 @@ bool appendPcodeFunction(llvm::LLVMContext &context, llvm::Module &module,
           "function declaration type mismatch: " + config.EntryFunctionName;
       return false;
     }
+    function->setLinkage(config.EntryFunctionLinkage);
   } else {
-    function =
-        llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
-                               config.EntryFunctionName, &module);
+    function = llvm::Function::Create(functionType,
+                                      config.EntryFunctionLinkage,
+                                      config.EntryFunctionName, &module);
   }
 
   auto *entryBlock = llvm::BasicBlock::Create(context, "entry", function);

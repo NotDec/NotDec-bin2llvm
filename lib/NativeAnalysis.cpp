@@ -697,6 +697,9 @@ private:
     }
     state.addFunctionSeed(address, symbol.size(), std::move(name), source,
                           NativeFunctionConfidence::High);
+    if (symbol.is_exported()) {
+      state.markFunctionSeedExternallyVisible(address);
+    }
   }
 
   NativeRuntimeFilterOptions Options;
@@ -2919,6 +2922,7 @@ private:
       function.Name = seed.PrimaryName;
       function.Blocks.push_back(std::move(block));
       function.Source = "gtirb-seed-range-fallback";
+      function.IsExternallyVisible = seed.IsExternallyVisible;
       if (state.addFunction(std::move(function))) {
         ++imported;
       }
@@ -3643,6 +3647,7 @@ private:
     auto seedIterator = state.functionSeeds().find(entry);
     if (seedIterator != state.functionSeeds().end()) {
       function.Name = seedIterator->second.PrimaryName;
+      function.IsExternallyVisible = seedIterator->second.IsExternallyVisible;
     }
 
     function.Blocks = std::move(blocks);
@@ -5351,6 +5356,11 @@ bool NativeProgramState::addFunction(NativeFunction function) {
   if (Functions.find(function.Entry) != Functions.end()) {
     return false;
   }
+  auto seedIterator = FunctionSeeds.find(function.Entry);
+  if (seedIterator != FunctionSeeds.end()) {
+    function.IsExternallyVisible =
+        function.IsExternallyVisible || seedIterator->second.IsExternallyVisible;
+  }
 
   for (const NativeBasicBlock &block : function.Blocks) {
     if (block.Start < function.RangeStart || block.End > function.RangeEnd ||
@@ -5362,6 +5372,15 @@ bool NativeProgramState::addFunction(NativeFunction function) {
   }
 
   Functions.emplace(function.Entry, std::move(function));
+  return true;
+}
+
+bool NativeProgramState::markFunctionSeedExternallyVisible(uint64_t address) {
+  auto iterator = FunctionSeeds.find(address);
+  if (iterator == FunctionSeeds.end()) {
+    return false;
+  }
+  iterator->second.IsExternallyVisible = true;
   return true;
 }
 
