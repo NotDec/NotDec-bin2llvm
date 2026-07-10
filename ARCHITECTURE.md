@@ -258,8 +258,9 @@ PcodeToLLVM
 3. **NativeStackFrameRewrite**
    - 入口：`runNativeStackFrameRewrite(...)`。
    - 从 ABI metadata 读取 stack pointer register。
-   - 把 RSP/RBP 相关栈访问恢复为 `notdec_stack.native` alloca / GEP 形式。
-   - 把 stack pointer 和已确认 frame pointer 加入 ignored register 集合。
+   - 把 RSP 相关栈访问恢复为 `notdec_stack.native` alloca / GEP 形式。
+   - 对 RBP 只替换当前值已证明来自 RSP 的局部 load；RBP 仍可能承载参数或普通局部值。
+   - ignored register 集合只加入由这条链路完整接管的 stack pointer，当前 x86-64 为 RSP。
 
 4. **NativeStackCanaryCleanup**
    - 入口：`runNativeStackCanaryCleanup(...)`。

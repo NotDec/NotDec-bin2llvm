@@ -679,7 +679,10 @@ NativeStackFrameRewriteSummary runNativeStackFrameRewrite(
           function, framePointer, abi->StackPointerRegister);
       if (replaced != 0) {
         summary.FramePointerLoadsReplaced += replaced;
-        summary.IgnoredRegisters.insert(framePointer);
+        // The replacement is path-sensitive: it only changes loads whose
+        // current value is proven to come from RSP.  The same register may
+        // still carry arguments or ordinary local values elsewhere in this
+        // function or another function, so it cannot be ignored module-wide.
         rewritten = true;
       }
     }

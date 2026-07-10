@@ -4230,7 +4230,7 @@ bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
          verifyOk(module, "module failed verifier after stack rewrite test");
 }
 
-bool testFramePointerLoadFeedsStackRewriteAndIgnoredSet() {
+bool testFramePointerLoadFeedsStackRewriteWithoutGlobalIgnore() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-frame-pointer-stack", context);
   attachTestAbi(module);
@@ -4260,12 +4260,71 @@ bool testFramePointerLoadFeedsStackRewriteAndIgnoredSet() {
                 "RBP frame load was not replaced") &&
          expect(summary.AccessesRewritten >= 1,
                 "RBP-derived stack access was not localized") &&
-         expect(summary.IgnoredRegisters.count("RBP") != 0,
-                "RBP was not marked ignored after frame-base match") &&
+         expect(
+             summary.IgnoredRegisters.count("RBP") == 0,
+             "local RBP frame-base match incorrectly ignored RBP globally") &&
          expect(hasNamedAlloca(*function, "notdec_stack.native"),
                 "frame-pointer stack alloca was not created") &&
          verifyOk(module,
                   "module failed verifier after RBP stack rewrite test");
+}
+
+bool testFramePointerRewriteDoesNotHideRbpRegisterFlow() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-local-frame-pointer-ignore", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  llvm::GlobalVariable *rbp = createRegisterGlobal(module, "RBP");
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *frameFunction = llvm::Function::Create(
+      type, llvm::GlobalValue::InternalLinkage, "local_rbp_frame", module);
+  llvm::BasicBlock *frameEntry =
+      llvm::BasicBlock::Create(context, "entry", frameFunction);
+  llvm::IRBuilder<> frameBuilder(frameEntry);
+  llvm::LoadInst *rspEntry =
+      loadRegister(frameBuilder, rsp, "RSP", "rsp.entry");
+  llvm::Value *frameBase = frameBuilder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -32, true));
+  storeRegister(frameBuilder, rbp, frameBase, "RBP");
+  llvm::LoadInst *rbpLoad = loadRegister(frameBuilder, rbp, "RBP", "rbp.frame");
+  llvm::Value *slotAddress = frameBuilder.CreateAdd(
+      rbpLoad, llvm::ConstantInt::get(rbp->getValueType(), -8, true));
+  llvm::Value *slot = frameBuilder.CreateIntToPtr(
+      slotAddress, llvm::PointerType::get(context, 0));
+  frameBuilder.CreateStore(llvm::ConstantInt::get(rbp->getValueType(), 7),
+                           slot);
+  frameBuilder.CreateRetVoid();
+
+  llvm::Function *registerFunction = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "rbp_register_flow", module);
+  llvm::BasicBlock *registerEntry =
+      llvm::BasicBlock::Create(context, "entry", registerFunction);
+  llvm::IRBuilder<> registerBuilder(registerEntry);
+  llvm::LoadInst *rdiEntry =
+      loadRegister(registerBuilder, rdi, "RDI", "rdi.entry");
+  storeRegister(registerBuilder, rbp, rdiEntry, "RBP");
+  registerBuilder.CreateRetVoid();
+
+  auto stackSummary = notdec::bin2llvm::runNativeStackFrameRewrite(module);
+  notdec::bin2llvm::NativeRegisterSummaryOptions options;
+  options.IgnoredRegisters = stackSummary.IgnoredRegisters;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module, options);
+  const auto *functionSummary = ::functionSummary(summary, "rbp_register_flow");
+  const auto *rdiSummary = functionSummary == nullptr
+                               ? nullptr
+                               : registerSummary(*functionSummary, "RDI");
+
+  return expect(stackSummary.FramePointerLoadsReplaced == 1,
+                "local RBP frame load was not replaced") &&
+         expect(stackSummary.IgnoredRegisters.count("RBP") == 0,
+                "local RBP frame use leaked into module ignored registers") &&
+         expect(rdiSummary != nullptr,
+                "missing RDI summary after local RBP frame rewrite") &&
+         expect(rdiSummary->ReadEntry,
+                "RDI entry flow through ordinary RBP store was hidden") &&
+         verifyOk(module, "module failed verifier after local RBP ignore test");
 }
 
 bool testSummarySSARemovesDeadStackFrameStore() {
@@ -6423,7 +6482,8 @@ int main() {
   ok &= testForeignArgumentInMovedBodyIsReplaced();
   ok &= testForeignMappedCallArgumentIsLocalized();
   ok &= testStaticRspStackRewriteKeepsSavedRegisterEvidence();
-  ok &= testFramePointerLoadFeedsStackRewriteAndIgnoredSet();
+  ok &= testFramePointerLoadFeedsStackRewriteWithoutGlobalIgnore();
+  ok &= testFramePointerRewriteDoesNotHideRbpRegisterFlow();
   ok &= testSummarySSARemovesDeadStackFrameStore();
   ok &= testStackFrameAddressPassedToCallIsLocalized();
   ok &= testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall();
