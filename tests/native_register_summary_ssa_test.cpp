@@ -2566,7 +2566,7 @@ bool testKnownFixedExternalArities() {
   return true;
 }
 
-bool testKnownVarArgExternalKeepsAbiInputs() {
+bool testKnownVarArgExternalInfersDefinedAbiInputs() {
   struct KnownVarArgCase {
     const char *Name;
     unsigned FixedArgs;
@@ -2648,6 +2648,130 @@ bool testKnownVarArgExternalKeepsAbiInputs() {
     }
   }
   return true;
+}
+
+bool testKnownVarArgFixedOnlyCallDoesNotReadTail() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-vararg-fixed-only", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  (void)createRegisterGlobal(module, "RCX");
+  (void)createRegisterGlobal(module, "R8");
+  (void)createRegisterGlobal(module, "R9");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__fprintf_chk", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "vararg_fixed_only_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                "RDX");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenCaller =
+      module.getFunction("vararg_fixed_only_caller");
+  llvm::CallInst *rewrittenCall = nullptr;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenCaller)) {
+      auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (candidate != nullptr && candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "__fprintf_chk") {
+        rewrittenCall = candidate;
+      }
+    }
+  }
+
+  return expect(rewrittenCaller != nullptr,
+                "known vararg fixed-only caller missing") &&
+         expect(
+             rewrittenCaller->arg_empty(),
+             "known vararg fixed-only call leaked a tail register argument") &&
+         expect(rewrittenCall != nullptr,
+                "known vararg fixed-only call missing") &&
+         expect(rewrittenCall->arg_size() == 3,
+                "known vararg fixed-only call used wrong arity") &&
+         verifyOk(module,
+                  "module failed verifier after fixed-only vararg rewrite");
+}
+
+bool testKnownVarArgCallsitesKeepIndependentArities() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-vararg-callsite-arities", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+  llvm::GlobalVariable *r9 = createRegisterGlobal(module, "R9");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__fprintf_chk", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "vararg_two_calls", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                "RDX");
+  builder.CreateCall(calleeType, callee);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 4),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 5),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 6),
+                "RDX");
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 7),
+                "RCX");
+  storeRegister(builder, r8, llvm::ConstantInt::get(r8->getValueType(), 8),
+                "R8");
+  storeRegister(builder, r9, llvm::ConstantInt::get(r9->getValueType(), 9),
+                "R9");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenCaller = module.getFunction("vararg_two_calls");
+  std::vector<unsigned> arities;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() != nullptr &&
+          call->getCalledFunction()->getName() == "__fprintf_chk") {
+        arities.push_back(call->arg_size());
+      }
+    }
+  }
+
+  return expect(arities.size() == 2,
+                "known vararg callsite test lost a call") &&
+         expect(arities[0] == 3,
+                "known vararg fixed-only callsite used wrong arity") &&
+         expect(arities[1] == 6,
+                "known vararg extended callsite used wrong arity") &&
+         verifyOk(module,
+                  "module failed verifier after per-callsite vararg rewrite");
 }
 
 bool testMismatchedDirectCallUseUsesReturnExtract() {
@@ -6456,7 +6580,9 @@ int main() {
   ok &= testKnownErrnoLocationReturnIsMaterialized();
   ok &= testKnownFiveArgExternalUsesFiveInputs();
   ok &= testKnownFixedExternalArities();
-  ok &= testKnownVarArgExternalKeepsAbiInputs();
+  ok &= testKnownVarArgExternalInfersDefinedAbiInputs();
+  ok &= testKnownVarArgFixedOnlyCallDoesNotReadTail();
+  ok &= testKnownVarArgCallsitesKeepIndependentArities();
   ok &= testMismatchedDirectCallUseUsesReturnExtract();
   ok &= testKnownExternalUsesSingleIntegerReturn();
   ok &= testUnknownExternalTreatsRdxAsClobberNotReturn();

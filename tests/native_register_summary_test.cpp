@@ -209,11 +209,13 @@ registerSummary(const notdec::bin2llvm::NativeRegisterSummaryFunction &function,
   return nullptr;
 }
 
-const notdec::bin2llvm::NativeRegisterUnknownExternalCallsite *
+const notdec::bin2llvm::NativeRegisterExternalCallsite *
 unknownExternalCallsite(const notdec::bin2llvm::NativeRegisterSummary &summary,
                         const std::string &calleeName) {
-  for (const auto &callsite : summary.UnknownExternalCallsites) {
-    if (callsite.CalleeName == calleeName) {
+  for (const auto &callsite : summary.ExternalCallsites) {
+    if (callsite.Kind == notdec::bin2llvm::NativeRegisterExternalCallsiteKind::
+                             UnknownExternal &&
+        callsite.CalleeName == calleeName) {
       return &callsite;
     }
   }
@@ -469,6 +471,86 @@ bool testKnownExternalShapeReadsOnlyDeclaredRegister() {
                 "known external shape did not read declared RSI");
 }
 
+bool testKnownVarArgUsesFixedThenCallsiteInputs() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-known-vararg-callsite-shape", context);
+  attachExternalEvidenceAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *callType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external = llvm::Function::Create(
+      callType, llvm::GlobalValue::ExternalLinkage, "known_vararg", module);
+  llvm::Function *function =
+      llvm::Function::Create(callType, llvm::GlobalValue::ExternalLinkage,
+                             "calls_known_vararg", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::CallInst *call = builder.CreateCall(callType, external);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeExternalCallShape fixedShape;
+  fixedShape.Inputs.push_back({"RDI", 0, 64});
+  fixedShape.VarArgInputs.push_back({"RSI", 0, 64});
+  fixedShape.VarArgInputs.push_back({"RDX", 0, 64});
+  fixedShape.FixedArgs = 1;
+  fixedShape.VarArg = true;
+
+  notdec::bin2llvm::NativeRegisterSummaryOptions baseOptions;
+  baseOptions.AttachMetadata = false;
+  baseOptions.ExternalCallShapes.emplace("known_vararg", fixedShape);
+  baseOptions.UnknownExternalInputPolicy =
+      notdec::bin2llvm::NativeRegisterUnknownExternalInputPolicy::NoInputs;
+  baseOptions.CollectExternalCallsiteEvidence = true;
+  auto baseSummary =
+      notdec::bin2llvm::runNativeRegisterSummary(module, baseOptions);
+  const auto *baseFn = functionSummary(baseSummary, "calls_known_vararg");
+  const auto *baseRdi = baseFn == nullptr
+                            ? nullptr
+                            : registerSummary(*baseFn, rdi->getName().str());
+  const auto *baseRsi = baseFn == nullptr
+                            ? nullptr
+                            : registerSummary(*baseFn, rsi->getName().str());
+
+  const notdec::bin2llvm::NativeRegisterExternalCallsite *evidence = nullptr;
+  for (const auto &candidate : baseSummary.ExternalCallsites) {
+    if (candidate.Call == call &&
+        candidate.Kind ==
+            notdec::bin2llvm::NativeRegisterExternalCallsiteKind::KnownVarArg) {
+      evidence = &candidate;
+    }
+  }
+  if (!expect(baseRdi != nullptr && baseRdi->ReadEntry,
+              "known vararg base summary did not read fixed RDI") ||
+      !expect(baseRsi != nullptr && !baseRsi->ReadEntry,
+              "known vararg base summary read RSI tail") ||
+      !expect(evidence != nullptr && evidence->Slots.size() == 2,
+              "known vararg base summary did not collect tail evidence")) {
+    return false;
+  }
+
+  notdec::bin2llvm::NativeExternalCallShape callsiteShape = fixedShape;
+  callsiteShape.Inputs.push_back({"RSI", 0, 64});
+  notdec::bin2llvm::NativeRegisterSummaryOptions finalOptions = baseOptions;
+  finalOptions.CollectExternalCallsiteEvidence = false;
+  finalOptions.ExternalCallsiteShapes.emplace(call, std::move(callsiteShape));
+  auto finalSummary =
+      notdec::bin2llvm::runNativeRegisterSummary(module, finalOptions);
+  const auto *finalFn = functionSummary(finalSummary, "calls_known_vararg");
+  const auto *finalRsi = finalFn == nullptr
+                             ? nullptr
+                             : registerSummary(*finalFn, rsi->getName().str());
+  const auto *finalRdx = finalFn == nullptr
+                             ? nullptr
+                             : registerSummary(*finalFn, rdx->getName().str());
+  return expect(finalRsi != nullptr && finalRsi->ReadEntry,
+                "known vararg final summary did not read inferred RSI") &&
+         expect(finalRdx != nullptr && !finalRdx->ReadEntry,
+                "known vararg final summary read uninferred RDX");
+}
+
 bool testUnknownExternalCallsiteEvidenceClassifiesOrigins() {
   llvm::LLVMContext context;
   llvm::Module module("summary-unknown-external-evidence", context);
@@ -495,8 +577,8 @@ bool testUnknownExternalCallsiteEvidenceClassifiesOrigins() {
   notdec::bin2llvm::NativeRegisterSummaryOptions options;
   options.UnknownExternalInputPolicy =
       notdec::bin2llvm::NativeRegisterUnknownExternalInputPolicy::NoInputs;
-  options.CollectUnknownExternalCallsiteEvidence = true;
-  options.UnknownExternalEvidenceSlots = {
+  options.CollectExternalCallsiteEvidence = true;
+  options.ExternalEvidenceSlots = {
       {"RDI", 0, 64},
       {"RSI", 0, 64},
       {"RDX", 0, 64},
@@ -791,6 +873,7 @@ int main() {
   ok &= testKnownVarArgExternalKeepsFullInputDemand();
   ok &= testUnknownExternalNoInputsDoesNotReadAbiArguments();
   ok &= testKnownExternalShapeReadsOnlyDeclaredRegister();
+  ok &= testKnownVarArgUsesFixedThenCallsiteInputs();
   ok &= testUnknownExternalCallsiteEvidenceClassifiesOrigins();
   ok &= testCalleeReadPropagatesToCallerEntry();
   ok &= testSparseJoinKeepsUntouchedPath();

@@ -7,6 +7,7 @@
 #include <vector>
 
 namespace llvm {
+class CallBase;
 class Module;
 class raw_ostream;
 } // namespace llvm
@@ -21,12 +22,19 @@ struct NativeRegisterCallInputSlot {
 
 struct NativeExternalCallShape {
   std::vector<NativeRegisterCallInputSlot> Inputs;
+  // Known vararg calls read only Inputs during the preliminary summary.
+  // Candidate tails are inspected after the bottom-up state has stabilized.
+  std::vector<NativeRegisterCallInputSlot> VarArgInputs;
+  unsigned FixedArgs = 0;
   bool VarArg = false;
   unsigned MaxArgs = 0;
+  bool FixedInputsComplete = true;
 };
 
 using NativeExternalCallShapeMap =
     std::map<std::string, NativeExternalCallShape, std::less<>>;
+using NativeExternalCallsiteShapeMap =
+    std::map<const llvm::CallBase *, NativeExternalCallShape>;
 
 enum class NativeRegisterUnknownExternalInputPolicy {
   AbiInputs,
@@ -50,10 +58,24 @@ struct NativeRegisterCallsiteSlotEvidence {
       NativeRegisterCallsiteValueOrigin::Unknown;
 };
 
-struct NativeRegisterUnknownExternalCallsite {
+enum class NativeRegisterExternalCallsiteKind {
+  UnknownExternal,
+  KnownVarArg,
+};
+
+// Evidence is tied to the original call instruction and is only valid until
+// SummarySSA starts rewriting calls.
+struct NativeRegisterExternalCallsite {
+  const llvm::CallBase *Call = nullptr;
+  NativeRegisterExternalCallsiteKind Kind =
+      NativeRegisterExternalCallsiteKind::UnknownExternal;
   std::string CallerName;
   std::string CalleeName;
   bool Indirect = false;
+  std::vector<NativeRegisterCallInputSlot> FixedInputs;
+  unsigned FixedArgs = 0;
+  unsigned MaxArgs = 0;
+  bool FixedInputsComplete = true;
   std::vector<NativeRegisterCallsiteSlotEvidence> Slots;
 };
 
@@ -66,13 +88,14 @@ struct NativeRegisterSummaryOptions {
   // Prototype lowering stays in SummarySSA.  RegisterSummary only consumes
   // already-mapped register ranges so both passes use one ABI mapping.
   NativeExternalCallShapeMap ExternalCallShapes;
+  NativeExternalCallsiteShapeMap ExternalCallsiteShapes;
   NativeRegisterUnknownExternalInputPolicy UnknownExternalInputPolicy =
       NativeRegisterUnknownExternalInputPolicy::AbiInputs;
   // Callsite evidence only needs the stable bottom-up states.  The preliminary
-  // unknown-external pass can skip return-demand propagation.
+  // external-call pass can skip return-demand propagation.
   bool RunTopDownDemand = true;
-  bool CollectUnknownExternalCallsiteEvidence = false;
-  std::vector<NativeRegisterCallInputSlot> UnknownExternalEvidenceSlots;
+  bool CollectExternalCallsiteEvidence = false;
+  std::vector<NativeRegisterCallInputSlot> ExternalEvidenceSlots;
 };
 
 // Per-register result for one function. MayEntry/MayNonEntry describe the value
@@ -116,7 +139,7 @@ struct NativeRegisterSummary {
   uint64_t PreservedRegisters = 0;
   uint64_t DemandedReturns = 0;
   std::vector<NativeRegisterSummaryFunction> Functions;
-  std::vector<NativeRegisterUnknownExternalCallsite> UnknownExternalCallsites;
+  std::vector<NativeRegisterExternalCallsite> ExternalCallsites;
 };
 
 NativeRegisterSummary

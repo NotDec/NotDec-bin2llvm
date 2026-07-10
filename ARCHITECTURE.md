@@ -273,7 +273,8 @@ PcodeToLLVM
 
 6. **第一遍 NativeRegisterSummary**
    - 入口：`runNativeRegisterSummary(...)`。
-   - known external 使用内置或 JSON prototype 映射后的准确输入 slot。
+   - known non-vararg external 使用内置或 JSON prototype 映射后的准确输入 slot。
+   - known vararg external 只读取固定参数，不读取任何额外参数。
    - unknown external 假设不读取 ABI 输入，但仍应用 ABI caller-saved clobber。
    - 只跑 bottom-up effect fixpoint，不跑 top-down demand，也不附最终 metadata。
    - effect 域仍是 `ReadEntry`、`MayEntry`、`MayNonEntry`。
@@ -285,16 +286,24 @@ PcodeToLLVM
    - bottom-up 最后一轮已经得到稳定 block `In/Out`；callsite evidence 直接复用该状态，
      不重新求解 CFG。
 
-7. **未知外部函数参数数量推断**
-   - 入口：`inferUnknownExternalPrototypes(...)`。
-   - 内置和 JSON prototype 优先，不参与自动推断。
-   - 每个 callsite 只统计从 arg0 开始连续的 `LocalDefinition` 前缀。
-   - 同一 external 有多个 callsite 时取最大前缀。
-   - 不一致、成功推断和零证据分别输出 warning。
-   - 这一步只推输入参数数量，不猜复杂类型，也不限制后续返回值 demand。
+7. **外部调用参数推断**
+   - 入口：`inferExternalCallShapes(...)`。
+   - unknown external：
+     - 每个 callsite 只统计从 arg0 开始连续的 `LocalDefinition` 前缀。
+     - 同一 callee 有多个 callsite 时取最大前缀，生成临时 fixed prototype。
+     - 不一致、成功推断和零证据分别输出 warning。
+   - known vararg：
+     - declaration prototype 只保存固定参数。
+     - 从未被固定参数占用的整数 ABI slot 开始，逐 callsite 统计连续
+       `LocalDefinition` tail。
+     - 每个 callsite 单独保存最终输入 shape，不在 callee 级取最大值。
+     - bounded vararg 使用 `MaxArgs - FixedArgs` 限制额外参数数。
+   - 当前只推断整数 vararg tail。额外浮点参数的源码顺序无法仅凭 XMM 写入恢复，
+     不在这里猜测。
 
 8. **第二遍 NativeRegisterSummary**
-   - 使用 known + inferred external prototype。
+   - 使用 known + inferred external prototype，以及 known vararg 的 callsite shape。
+   - external call 查询顺序是 callsite shape、callee fixed shape、unknown policy。
    - 未推断成功的 external 仍按零输入处理。
    - 重新做 bottom-up effect 和 top-down demand：
      - `EntryDemandMask`：入口寄存器哪些 bit 被真实观察。
@@ -305,6 +314,7 @@ PcodeToLLVM
 
 9. **构建初始 signature shape**
    - 外部 declaration 使用最终 prototype；unknown external 使用零参数 shape。
+   - known vararg declaration 仍是固定参数加 `...`，额外参数只挂在具体 callsite。
    - 内部函数根据最终 `ReadEntry`、`ExitDemand` 和 ABI register class 决定参数与返回值。
    - demand mask 用于收窄整数宽度和 float/double lane。
 
@@ -318,7 +328,7 @@ PcodeToLLVM
      - 用 call effect 生成 return/clobber value。
      - 用 zero-demand metadata 标记被 demand 剪掉的 lane。
      - 收集函数返回值。
-     - 收集 callsite argument store binding。
+     - 按最终 callsite shape 收集 argument store binding。
 
 11. **间接 call 参数形状收窄**
     - 入口：`refineIndirectCallsiteParamShapes(...)`。
@@ -339,6 +349,7 @@ PcodeToLLVM
     - 替换函数类型。
     - 内部函数 body 中 entry register read 替换为 LLVM argument。
     - callsite 从“先 store ABI register，再 call void”重写为普通 LLVM call 参数。
+    - known vararg 的实际参数列表使用固定参数加本 callsite 推断出的 tail。
     - call return helper 替换为普通 LLVM call return value。
 
 15. **删除未使用 helper declaration**

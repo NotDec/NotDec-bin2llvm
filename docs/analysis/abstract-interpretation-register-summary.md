@@ -304,7 +304,8 @@ known external 的输入由 prototype 精确给出：
 ```text
 fixed integer 参数 -> 对应 GPR slot
 float/double 参数   -> 对应 XMM/ZMM backing range
-vararg              -> fixed 参数后按 MaxArgs 限制 ABI fallback
+vararg 第一遍       -> 只读取 fixed 参数
+vararg 第二遍       -> fixed 参数加本 callsite 推断出的整数 tail
 ```
 
 `NativeRegisterSummary` 不重新解析 C 类型。
@@ -316,16 +317,19 @@ unknown external 默认仍保留旧的 `AbiInputs` 策略，保证单独调用
 `runNativeRegisterSummary()` 的代码不静默改变。
 两遍 SummarySSA 链路显式选择 `NoInputs`。
 
-## 未知外部函数的两遍分析
+## 外部调用参数的两遍分析
 
-unknown external 没有函数体，也没有可靠 prototype。
-如果第一遍直接假设它读取全部 ABI 参数，caller 的 `ReadEntry` 会被放大。
+unknown external 没有函数体，也没有可靠 prototype。known vararg 虽然有固定 prototype，
+但不同 callsite 的额外参数数量不同。如果第一遍直接假设它们读取全部 ABI 参数，caller
+的 `ReadEntry` 会被放大。
 当前链路改成固定两遍：
 
 ```text
-第一遍 bottom-up summary，unknown external 零输入
+第一遍 bottom-up summary
+  unknown external 零输入
+  known vararg 只读 fixed 参数
 -> 收集 callsite 参数来源
--> 聚合临时 external prototype
+-> 推断 unknown prototype 和 known vararg callsite shape
 -> 第二遍完整 summary
 -> SummarySSA 和 signature rewrite
 ```
@@ -334,7 +338,8 @@ unknown external 没有函数体，也没有可靠 prototype。
 
 第一遍只需要稳定的 forward effect：
 
-- known external 按 prototype 读取输入。
+- known non-vararg external 按 prototype 读取输入。
+- known vararg external 只读取固定输入。
 - unknown external 不读取 ABI 输入。
 - 所有 external 仍应用 ABI clobber。
 - 不跑 top-down demand。
@@ -357,12 +362,13 @@ CallProduced
 ```
 
 不同来源混合时是 `Mixed`，无法判断时是 `Unknown`。
-这套来源信息不改变 `Cell` 抽象域，只服务于 callsite 证据。
+这套来源信息不改变 `Cell` 抽象域，只服务于 unknown external 和 known vararg 的
+callsite 证据。
 
 SCC bottom-up 最后一轮已经在稳定 callee effect 下得到每个 block 的 `In/Out`。
 实现直接保存这轮状态并 replay 指令，不再额外调用一次 CFG solver。
 
-### 聚合 callsite
+### unknown external 聚合
 
 对每个 unknown external callsite，从 arg0 开始统计连续的
 `LocalDefinition` 前缀：
@@ -381,9 +387,40 @@ callsite 不一致会输出 warning；所有 callsite 都是零前缀时保持�
 unresolved warning。
 内置和用户 JSON prototype 始终优先，不参与自动推断。
 
+### known vararg callsite
+
+known vararg 不能按 callee 合并参数数量。两个 `fprintf` call 可以分别只有固定参数和多个
+额外参数，取最大值会让较小的 callsite 读取不存在的 RCX、R8、R9。
+
+基础 summary 为每个 known vararg call 保存：
+
+- prototype 的固定输入 slot。
+- 固定参数之后仍可使用的整数 ABI slot。
+- call 前每个候选 slot 的来源。
+- `FixedArgs` 和可选的 `MaxArgs`。
+
+固定浮点参数不消耗 GPR。候选整数 tail 是从实际 fixed slot 中排除已占用 GPR 后得到的，
+不能直接用固定参数总数索引 GPR。
+
+每个 callsite 从第一个候选 GPR 开始统计连续 `LocalDefinition`：
+
+```text
+fixed + Local, Local, Entry -> fixed + 2
+fixed + Entry, Local        -> fixed
+```
+
+遇到 `ForwardedEntry`、`Mixed`、`CallProduced` 或 `Unknown` 就停止。
+`MaxArgs` 限制源码层总参数数，因此额外参数上限是 `MaxArgs - FixedArgs`。
+
+结果保存在 callsite shape map 中，不写回 declaration prototype。declaration 仍保持固定
+参数加 vararg，最终 LLVM call 只追加本 callsite 推断出的整数 tail。
+
+当前不推断浮点 vararg。整数和浮点参数使用独立 ABI register 序列，仅凭寄存器写入无法
+恢复两者在源码参数列表中的交错顺序，因此这里不根据 XMM 写入猜测。
+
 ### 第二遍
 
-第二遍使用 known + inferred prototype：
+第二遍使用 known + inferred prototype，以及 known vararg callsite shape：
 
 - 重新做 bottom-up effect。
 - 做 top-down entry/exit demand。
@@ -391,7 +428,9 @@ unresolved warning。
 - 未推断成功的 external 仍按零输入。
 
 第二遍结果是后续 internal signature shape、range planning 和 SummarySSA 的唯一 facts。
+external call 的输入查询顺序是 callsite shape、callee fixed shape、unknown policy。
 参数数量在进入 `FunctionBuilder` 前已经确定，后置流程不再修改 direct external arity。
+`callReadsRegister()`、argument binding 和最终 call rewrite 使用同一份 callsite shape。
 
 ## Fixpoint
 

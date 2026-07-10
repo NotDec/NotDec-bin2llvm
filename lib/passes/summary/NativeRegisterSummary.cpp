@@ -1069,8 +1069,8 @@ public:
 
   NativeRegisterSummary run() {
     runBottomUp();
-    if (Options.CollectUnknownExternalCallsiteEvidence) {
-      collectUnknownExternalCallsiteEvidence();
+    if (Options.CollectExternalCallsiteEvidence) {
+      collectExternalCallsiteEvidence();
     }
     if (Options.RunTopDownDemand) {
       runTopDownDemand();
@@ -1095,7 +1095,7 @@ private:
   // The last SCC iteration is already solved against stable callee effects.
   // Keep those block states only for the preliminary callsite-evidence pass.
   std::map<llvm::Function *, FunctionFlow> StableFlows;
-  std::vector<NativeRegisterUnknownExternalCallsite> UnknownExternalCallsites;
+  std::vector<NativeRegisterExternalCallsite> ExternalCallsites;
 
   void buildCallGraph() {
     std::set<llvm::Function *> defined(Functions.begin(), Functions.end());
@@ -1205,7 +1205,7 @@ private:
             Effects[function] = std::move(next);
             changed = true;
           }
-          if (Options.CollectUnknownExternalCallsiteEvidence) {
+          if (Options.CollectExternalCallsiteEvidence) {
             StableFlows[function] = std::move(flow);
           }
         }
@@ -1256,15 +1256,43 @@ private:
     return flow;
   }
 
-  bool isUnknownExternalCall(const llvm::CallBase &call) const {
+  const NativeExternalCallShape *
+  externalCallShape(const llvm::CallBase &call) const {
+    auto callsiteIt = Options.ExternalCallsiteShapes.find(&call);
+    if (callsiteIt != Options.ExternalCallsiteShapes.end()) {
+      return &callsiteIt->second;
+    }
     llvm::Function *callee = call.getCalledFunction();
     if (callee == nullptr) {
-      return true;
+      return nullptr;
     }
-    if (!callee->isDeclaration() || callee->isIntrinsic()) {
+    auto shapeIt = Options.ExternalCallShapes.find(callee->getName().str());
+    return shapeIt == Options.ExternalCallShapes.end() ? nullptr
+                                                       : &shapeIt->second;
+  }
+
+  bool isUnknownExternalCall(const llvm::CallBase &call) const {
+    llvm::Function *callee = call.getCalledFunction();
+    if (callee != nullptr &&
+        (!callee->isDeclaration() || callee->isIntrinsic())) {
       return false;
     }
-    return Options.ExternalCallShapes.count(callee->getName().str()) == 0;
+    return externalCallShape(call) == nullptr;
+  }
+
+  const NativeExternalCallShape *
+  knownVarArgExternalShape(const llvm::CallBase &call) const {
+    llvm::Function *callee = call.getCalledFunction();
+    if (callee == nullptr || !callee->isDeclaration() ||
+        callee->isIntrinsic()) {
+      return nullptr;
+    }
+    auto shapeIt = Options.ExternalCallShapes.find(callee->getName().str());
+    if (shapeIt == Options.ExternalCallShapes.end() ||
+        !shapeIt->second.VarArg) {
+      return nullptr;
+    }
+    return &shapeIt->second;
   }
 
   NativeRegisterCallsiteValueOrigin
@@ -1293,29 +1321,49 @@ private:
     return NativeRegisterCallsiteValueOrigin::Mixed;
   }
 
-  void recordUnknownExternalCallsite(llvm::Function &caller,
-                                     llvm::CallBase &call, const State &state) {
-    NativeRegisterUnknownExternalCallsite evidence;
+  std::vector<NativeRegisterCallsiteSlotEvidence>
+  callsiteEvidence(const State &state,
+                   llvm::ArrayRef<NativeRegisterCallInputSlot> slots) const {
+    std::vector<NativeRegisterCallsiteSlotEvidence> result;
+    result.reserve(slots.size());
+    for (auto [index, slot] : llvm::enumerate(slots)) {
+      NativeRegisterCallsiteSlotEvidence evidence;
+      evidence.Index = index;
+      evidence.UnitName = slot.UnitName;
+      evidence.OffsetBits = slot.OffsetBits;
+      evidence.SizeBits = slot.SizeBits;
+      evidence.Origin = callsiteOrigin(state, slot);
+      result.push_back(std::move(evidence));
+    }
+    return result;
+  }
+
+  void recordExternalCallsite(llvm::Function &caller, llvm::CallBase &call,
+                              const State &state) {
+    NativeRegisterExternalCallsite evidence;
+    evidence.Call = &call;
     evidence.CallerName = caller.getName().str();
     llvm::Function *callee = call.getCalledFunction();
     evidence.Indirect = callee == nullptr;
     evidence.CalleeName =
         callee == nullptr ? "<indirect>" : callee->getName().str();
-    for (auto [index, slot] :
-         llvm::enumerate(Options.UnknownExternalEvidenceSlots)) {
-      NativeRegisterCallsiteSlotEvidence slotEvidence;
-      slotEvidence.Index = index;
-      slotEvidence.UnitName = slot.UnitName;
-      slotEvidence.OffsetBits = slot.OffsetBits;
-      slotEvidence.SizeBits = slot.SizeBits;
-      slotEvidence.Origin = callsiteOrigin(state, slot);
-      evidence.Slots.push_back(std::move(slotEvidence));
+
+    if (const NativeExternalCallShape *shape = knownVarArgExternalShape(call)) {
+      evidence.Kind = NativeRegisterExternalCallsiteKind::KnownVarArg;
+      evidence.FixedInputs = shape->Inputs;
+      evidence.FixedArgs = shape->FixedArgs;
+      evidence.MaxArgs = shape->MaxArgs;
+      evidence.FixedInputsComplete = shape->FixedInputsComplete;
+      evidence.Slots = callsiteEvidence(state, shape->VarArgInputs);
+    } else {
+      evidence.Kind = NativeRegisterExternalCallsiteKind::UnknownExternal;
+      evidence.Slots = callsiteEvidence(state, Options.ExternalEvidenceSlots);
     }
-    UnknownExternalCallsites.push_back(std::move(evidence));
+    ExternalCallsites.push_back(std::move(evidence));
   }
 
-  void collectUnknownExternalCallsiteEvidence() {
-    UnknownExternalCallsites.clear();
+  void collectExternalCallsiteEvidence() {
+    ExternalCallsites.clear();
     for (llvm::Function *function : Functions) {
       auto flowIt = StableFlows.find(function);
       if (flowIt == StableFlows.end()) {
@@ -1334,8 +1382,9 @@ private:
         for (llvm::Instruction &inst : block) {
           if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
               call != nullptr && isAnalyzableCall(inst) &&
-              isUnknownExternalCall(*call)) {
-            recordUnknownExternalCallsite(*function, *call, state);
+              (isUnknownExternalCall(*call) ||
+               knownVarArgExternalShape(*call) != nullptr)) {
+            recordExternalCallsite(*function, *call, state);
           }
           transferInstruction(inst, state);
         }
@@ -1743,12 +1792,8 @@ private:
       applyFunctionEffect(Effects[callee], state);
       return;
     }
-    auto shapeIt =
-        callee == nullptr
-            ? Options.ExternalCallShapes.end()
-            : Options.ExternalCallShapes.find(callee->getName().str());
-    if (shapeIt != Options.ExternalCallShapes.end()) {
-      applyExternalCallEffect(state, shapeIt->second);
+    if (const NativeExternalCallShape *shape = externalCallShape(call)) {
+      applyExternalCallEffect(state, *shape);
       return;
     }
     applyUnknownExternalCallEffect(state);
@@ -2036,12 +2081,8 @@ private:
       addDemand(live, global, mask);
     };
 
-    auto shapeIt =
-        callee == nullptr
-            ? Options.ExternalCallShapes.end()
-            : Options.ExternalCallShapes.find(callee->getName().str());
-    if (shapeIt != Options.ExternalCallShapes.end()) {
-      for (const NativeRegisterCallInputSlot &input : shapeIt->second.Inputs) {
+    if (const NativeExternalCallShape *shape = externalCallShape(call)) {
+      for (const NativeRegisterCallInputSlot &input : shape->Inputs) {
         addInputDemand(input);
       }
       return;
@@ -2147,7 +2188,7 @@ private:
   NativeRegisterSummary buildPublicSummary() const {
     NativeRegisterSummary summary;
     summary.FunctionsSeen = Functions.size();
-    summary.UnknownExternalCallsites = UnknownExternalCallsites;
+    summary.ExternalCallsites = ExternalCallsites;
     for (llvm::Function *function : Functions) {
       NativeRegisterSummaryFunction fn;
       fn.FunctionName = function->getName().str();

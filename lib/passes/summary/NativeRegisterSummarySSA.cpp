@@ -286,6 +286,9 @@ struct SignatureRewriteState {
   // overlay.  Keep one shared map so every signature decision classifies known
   // and unknown declarations the same way.
   const NativeExternalPrototypeMap *ExternalPrototypes = nullptr;
+  // Known vararg tails are inferred per callsite between the two register
+  // summary runs.  The declaration shape still contains fixed parameters only.
+  const NativeExternalCallsiteShapeMap *ExternalCallsiteShapes = nullptr;
   // Calls rebuilt by SummarySSA already carry their ABI inputs as LLVM
   // operands, so the later register-store liveness pass must not treat them as
   // users of @RDI/@RSI/... globals.
@@ -298,6 +301,16 @@ externalPrototypesForState(const SignatureRewriteState &state) {
     return *state.ExternalPrototypes;
   }
   return defaultNativeExternalPrototypes();
+}
+
+const NativeExternalCallShape *
+externalCallsiteShapeForCall(const SignatureRewriteState &state,
+                             const llvm::CallBase &call) {
+  if (state.ExternalCallsiteShapes == nullptr) {
+    return nullptr;
+  }
+  auto it = state.ExternalCallsiteShapes->find(&call);
+  return it == state.ExternalCallsiteShapes->end() ? nullptr : &it->second;
 }
 
 llvm::Value *frozenPoisonBefore(llvm::Instruction &insertBefore,
@@ -1407,31 +1420,34 @@ NativeExternalCallShapeMap buildExternalCallShapes(
     }
     SignatureShape signature =
         shapeForKnownExternal(function, units, abi, prototypes);
+    const KnownExternalPrototype *known =
+        knownExternalPrototype(prototypes, function.getName());
     NativeExternalCallShape callShape;
-    callShape.VarArg = signature.VarArg;
-    callShape.MaxArgs = signature.MaxArgs;
+    callShape.FixedArgs = known->FixedArgs;
+    callShape.VarArg = known->VarArg;
+    callShape.MaxArgs = known->MaxArgs;
+    callShape.FixedInputsComplete = signature.Params.size() == known->FixedArgs;
     for (const NativeSignatureSlot &slot : signature.Params) {
       if (slot.Unit != nullptr) {
         callShape.Inputs.push_back(callInputSlot(slot));
       }
     }
 
-    // Vararg tails have no typed prototype slots.  Keep the existing integer
-    // ABI fallback, but bound it when the prototype provides MaxArgs.
+    // The preliminary summary reads only fixed inputs.  Keep the remaining ABI
+    // slots as evidence candidates for the per-callsite inference step.
     if (callShape.VarArg) {
-      unsigned limit = abi.IntegerInputsInOrder.size();
-      if (callShape.MaxArgs != 0) {
-        limit = std::min(limit, callShape.MaxArgs);
-      }
-      for (unsigned index = 0; index < limit; ++index) {
-        NativeRegisterCallInputSlot input =
-            callInputSlot(abi.IntegerInputsInOrder[index]);
+      auto addRemaining = [&](const AbiFacts::RegisterSlot &slot,
+                              std::vector<NativeRegisterCallInputSlot> &tail) {
+        NativeRegisterCallInputSlot input = callInputSlot(slot);
         if (std::none_of(callShape.Inputs.begin(), callShape.Inputs.end(),
                          [&](const NativeRegisterCallInputSlot &existing) {
                            return sameCallInputSlot(existing, input);
                          })) {
-          callShape.Inputs.push_back(std::move(input));
+          tail.push_back(std::move(input));
         }
+      };
+      for (const AbiFacts::RegisterSlot &slot : abi.IntegerInputsInOrder) {
+        addRemaining(slot, callShape.VarArgInputs);
       }
     }
     result.emplace(function.getName().str(), std::move(callShape));
@@ -1449,8 +1465,7 @@ unknownExternalEvidenceSlots(const AbiFacts &abi) {
   return result;
 }
 
-unsigned
-localDefinitionPrefix(const NativeRegisterUnknownExternalCallsite &callsite) {
+unsigned localDefinitionPrefix(const NativeRegisterExternalCallsite &callsite) {
   unsigned prefix = 0;
   for (const NativeRegisterCallsiteSlotEvidence &slot : callsite.Slots) {
     if (slot.Index != prefix ||
@@ -1460,6 +1475,25 @@ localDefinitionPrefix(const NativeRegisterUnknownExternalCallsite &callsite) {
     ++prefix;
   }
   return prefix;
+}
+
+bool hasLocalDefinitionAfter(
+    llvm::ArrayRef<NativeRegisterCallsiteSlotEvidence> slots, unsigned prefix) {
+  return llvm::any_of(
+      slots.drop_front(std::min<size_t>(prefix, slots.size())),
+      [](const NativeRegisterCallsiteSlotEvidence &slot) {
+        return slot.Origin ==
+               NativeRegisterCallsiteValueOrigin::LocalDefinition;
+      });
+}
+
+NativeRegisterCallInputSlot
+callInputSlot(const NativeRegisterCallsiteSlotEvidence &slot) {
+  NativeRegisterCallInputSlot input;
+  input.UnitName = slot.UnitName;
+  input.OffsetBits = slot.OffsetBits;
+  input.SizeBits = slot.SizeBits;
+  return input;
 }
 
 NativeRegisterSummarySSAWarning externalInferenceWarning(llvm::StringRef callee,
@@ -1476,20 +1510,77 @@ NativeRegisterSummarySSAWarning externalInferenceWarning(llvm::StringRef callee,
   return warning;
 }
 
-NativeExternalPrototypeMap inferUnknownExternalPrototypes(
-    const NativeExternalPrototypeMap &prototypes,
+NativeRegisterSummarySSAWarning
+varArgInferenceWarning(const NativeRegisterExternalCallsite &callsite,
+                       llvm::StringRef detail, llvm::StringRef reason) {
+  NativeRegisterSummarySSAWarning warning;
+  warning.FunctionName = callsite.CallerName;
+  warning.CalleeName = callsite.CalleeName;
+  warning.RegisterName = detail.str();
+  warning.Kind = "signature";
+  warning.Reason = reason.str();
+  warning.Uses = 1;
+  return warning;
+}
+
+NativeExternalCallsiteShapeMap inferExternalCallShapes(
+    NativeExternalPrototypeMap &prototypes,
     const NativeRegisterSummary &baseSummary,
     std::vector<NativeRegisterSummarySSAWarning> &warnings) {
-  NativeExternalPrototypeMap inferred = prototypes;
+  NativeExternalCallsiteShapeMap callsiteShapes;
   std::map<std::string, std::vector<unsigned>> aritiesByCallee;
-  for (const NativeRegisterUnknownExternalCallsite &callsite :
-       baseSummary.UnknownExternalCallsites) {
-    if (callsite.Indirect || lookupNativeExternalPrototype(
-                                 prototypes, callsite.CalleeName) != nullptr) {
+  for (const NativeRegisterExternalCallsite &callsite :
+       baseSummary.ExternalCallsites) {
+    if (callsite.Kind == NativeRegisterExternalCallsiteKind::UnknownExternal) {
+      if (!callsite.Indirect) {
+        aritiesByCallee[callsite.CalleeName].push_back(
+            localDefinitionPrefix(callsite));
+      }
       continue;
     }
-    aritiesByCallee[callsite.CalleeName].push_back(
-        localDefinitionPrefix(callsite));
+
+    if (callsite.Call == nullptr) {
+      continue;
+    }
+    NativeExternalCallShape shape;
+    shape.Inputs = callsite.FixedInputs;
+    shape.FixedArgs = callsite.FixedArgs;
+    shape.VarArg = true;
+    shape.MaxArgs = callsite.MaxArgs;
+    shape.FixedInputsComplete = callsite.FixedInputsComplete;
+
+    if (!callsite.FixedInputsComplete) {
+      warnings.push_back(varArgInferenceWarning(
+          callsite, "fixed=" + std::to_string(callsite.FixedArgs),
+          "incomplete_fixed_vararg_mapping"));
+      callsiteShapes.emplace(callsite.Call, std::move(shape));
+      continue;
+    }
+    unsigned rawPrefix = localDefinitionPrefix(callsite);
+    unsigned allowed = callsite.Slots.size();
+    if (callsite.MaxArgs != 0) {
+      unsigned maxTail = callsite.MaxArgs > callsite.FixedArgs
+                             ? callsite.MaxArgs - callsite.FixedArgs
+                             : 0;
+      allowed = std::min(allowed, maxTail);
+    }
+    unsigned inferredTail = std::min(rawPrefix, allowed);
+    for (unsigned index = 0; index < inferredTail; ++index) {
+      shape.Inputs.push_back(callInputSlot(callsite.Slots[index]));
+    }
+    if (rawPrefix > allowed) {
+      warnings.push_back(
+          varArgInferenceWarning(callsite,
+                                 "tail=" + std::to_string(rawPrefix) +
+                                     "/max=" + std::to_string(allowed),
+                                 "vararg_evidence_truncated_by_max_args"));
+    }
+    if (hasLocalDefinitionAfter(callsite.Slots, rawPrefix + 1)) {
+      warnings.push_back(varArgInferenceWarning(
+          callsite, "tail=" + std::to_string(inferredTail),
+          "non_contiguous_vararg_evidence"));
+    }
+    callsiteShapes.emplace(callsite.Call, std::move(shape));
   }
 
   for (const auto &[callee, arities] : aritiesByCallee) {
@@ -1514,11 +1605,11 @@ NativeExternalPrototypeMap inferUnknownExternalPrototypes(
     // The first pass only infers input arity.  Do not cap unknown external
     // returns to the built-in one-register default; later demand decides them.
     prototype.MaxReturnRegisters = std::numeric_limits<unsigned>::max();
-    inferred[callee] = std::move(prototype);
+    prototypes[callee] = std::move(prototype);
     warnings.push_back(externalInferenceWarning(
         callee, detail, "inferred_unknown_external_arity", arities.size()));
   }
-  return inferred;
+  return callsiteShapes;
 }
 
 bool rangeReturnHelpersUseRegister(
@@ -4413,20 +4504,15 @@ private:
     if (shape == nullptr) {
       return false;
     }
+    if (const NativeExternalCallShape *callsiteShape =
+            externalCallsiteShapeForCall(SignatureState, call)) {
+      return llvm::any_of(callsiteShape->Inputs,
+                          [&](const NativeRegisterCallInputSlot &input) {
+                            return input.UnitName == unit.Name;
+                          });
+    }
     for (const NativeSignatureSlot &slot : shape->Params) {
       if (slot.Unit != nullptr && slot.Unit->Name == unit.Name) {
-        return true;
-      }
-    }
-    if (!shape->VarArg) {
-      return false;
-    }
-    unsigned argCount = Abi.InputsInOrder.size();
-    if (shape->MaxArgs != 0) {
-      argCount = std::min(argCount, shape->MaxArgs);
-    }
-    for (unsigned index = shape->Params.size(); index < argCount; ++index) {
-      if (Abi.InputsInOrder[index] == unit.Name) {
         return true;
       }
     }
@@ -4484,29 +4570,37 @@ private:
     return nullptr;
   }
 
+  std::vector<NativeSignatureSlot> callParamSlots(llvm::CallBase &call,
+                                                  const SignatureShape &shape) {
+    std::vector<NativeSignatureSlot> slots = shape.Params;
+    if (!shape.VarArg) {
+      return slots;
+    }
+    const NativeExternalCallShape *callsiteShape =
+        externalCallsiteShapeForCall(SignatureState, call);
+    if (callsiteShape == nullptr ||
+        callsiteShape->Inputs.size() <= shape.Params.size()) {
+      return slots;
+    }
+    for (unsigned index = shape.Params.size();
+         index < callsiteShape->Inputs.size(); ++index) {
+      const NativeRegisterCallInputSlot &input = callsiteShape->Inputs[index];
+      const RegisterUnit *unit = unitByName(input.UnitName);
+      if (unit == nullptr) {
+        break;
+      }
+      slots.push_back(integerSignatureSlot(*unit));
+    }
+    return slots;
+  }
+
   std::vector<CallArgStoreBinding>
   callArgStoreBindings(llvm::CallBase &call, const SignatureShape &shape) {
     std::vector<CallArgStoreBinding> bindings;
     llvm::Function *callee = call.getCalledFunction();
     bool allowRangeEntryInputs = callee != nullptr && !callee->isDeclaration();
-    unsigned argCount = shape.Params.size();
-    if (shape.VarArg) {
-      argCount = static_cast<unsigned>(Abi.InputsInOrder.size());
-      if (shape.MaxArgs != 0) {
-        argCount = std::min(argCount, shape.MaxArgs);
-      }
-    }
-    for (unsigned index = 0; index < argCount; ++index) {
-      NativeSignatureSlot slot;
-      if (index < shape.Params.size()) {
-        slot = shape.Params[index];
-      } else {
-        const RegisterUnit *unit = unitByName(Abi.InputsInOrder[index]);
-        if (unit == nullptr) {
-          break;
-        }
-        slot = integerSignatureSlot(*unit);
-      }
+    std::vector<NativeSignatureSlot> slots = callParamSlots(call, shape);
+    for (auto [index, slot] : llvm::enumerate(slots)) {
       const RegisterUnit *unit = slot.Unit;
       if (unit == nullptr) {
         break;
@@ -4527,9 +4621,9 @@ private:
       if (argValue == nullptr || argValue->getType() != slotType(slot)) {
         break;
       }
-      bindings.push_back(
-          CallArgStoreBinding{store, unit, value, argValue, slotType(slot),
-                              index});
+      bindings.push_back(CallArgStoreBinding{store, unit, value, argValue,
+                                             slotType(slot),
+                                             static_cast<unsigned>(index)});
     }
     return bindings;
   }
@@ -5885,29 +5979,31 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   baseSummaryOptions.UnknownExternalInputPolicy =
       NativeRegisterUnknownExternalInputPolicy::NoInputs;
   baseSummaryOptions.RunTopDownDemand = false;
-  baseSummaryOptions.CollectUnknownExternalCallsiteEvidence = true;
-  baseSummaryOptions.UnknownExternalEvidenceSlots =
-      unknownExternalEvidenceSlots(abi);
+  baseSummaryOptions.CollectExternalCallsiteEvidence = true;
+  baseSummaryOptions.ExternalEvidenceSlots = unknownExternalEvidenceSlots(abi);
   NativeRegisterSummary baseRegisterSummary =
       runNativeRegisterSummary(module, baseSummaryOptions);
 
   std::vector<NativeRegisterSummarySSAWarning> inferenceWarnings;
-  externalPrototypes = inferUnknownExternalPrototypes(
-      externalPrototypes, baseRegisterSummary, inferenceWarnings);
+  NativeExternalCallsiteShapeMap externalCallsiteShapes =
+      inferExternalCallShapes(externalPrototypes, baseRegisterSummary,
+                              inferenceWarnings);
 
   NativeRegisterSummaryOptions finalSummaryOptions = baseSummaryOptions;
   finalSummaryOptions.AttachMetadata = options.AttachMetadata;
   finalSummaryOptions.RunTopDownDemand = true;
   finalSummaryOptions.ExternalCallShapes =
       buildExternalCallShapes(module, units, abi, externalPrototypes);
-  finalSummaryOptions.CollectUnknownExternalCallsiteEvidence = false;
-  finalSummaryOptions.UnknownExternalEvidenceSlots.clear();
+  finalSummaryOptions.ExternalCallsiteShapes = externalCallsiteShapes;
+  finalSummaryOptions.CollectExternalCallsiteEvidence = false;
+  finalSummaryOptions.ExternalEvidenceSlots.clear();
   NativeRegisterSummary registerSummary =
       runNativeRegisterSummary(module, finalSummaryOptions);
   std::map<llvm::Function *, FunctionSummaryFacts> facts =
       summaryFactsByFunction(registerSummary, module);
   SignatureRewriteState signatureState;
   signatureState.ExternalPrototypes = &externalPrototypes;
+  signatureState.ExternalCallsiteShapes = &externalCallsiteShapes;
   signatureState.Warnings = std::move(inferenceWarnings);
   if (options.EnableRewrite) {
     signatureState.Shapes = buildInitialSignatureShapes(
