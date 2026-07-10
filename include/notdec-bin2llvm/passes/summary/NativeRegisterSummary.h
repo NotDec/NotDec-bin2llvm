@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -12,12 +13,66 @@ class raw_ostream;
 
 namespace notdec::bin2llvm {
 
+struct NativeRegisterCallInputSlot {
+  std::string UnitName;
+  unsigned OffsetBits = 0;
+  unsigned SizeBits = 0;
+};
+
+struct NativeExternalCallShape {
+  std::vector<NativeRegisterCallInputSlot> Inputs;
+  bool VarArg = false;
+  unsigned MaxArgs = 0;
+};
+
+using NativeExternalCallShapeMap =
+    std::map<std::string, NativeExternalCallShape, std::less<>>;
+
+enum class NativeRegisterUnknownExternalInputPolicy {
+  AbiInputs,
+  NoInputs,
+};
+
+enum class NativeRegisterCallsiteValueOrigin {
+  LocalDefinition,
+  ForwardedEntry,
+  Mixed,
+  CallProduced,
+  Unknown,
+};
+
+struct NativeRegisterCallsiteSlotEvidence {
+  unsigned Index = 0;
+  std::string UnitName;
+  unsigned OffsetBits = 0;
+  unsigned SizeBits = 0;
+  NativeRegisterCallsiteValueOrigin Origin =
+      NativeRegisterCallsiteValueOrigin::Unknown;
+};
+
+struct NativeRegisterUnknownExternalCallsite {
+  std::string CallerName;
+  std::string CalleeName;
+  bool Indirect = false;
+  std::vector<NativeRegisterCallsiteSlotEvidence> Slots;
+};
+
 struct NativeRegisterSummaryOptions {
   bool AttachMetadata = true;
   bool PrintSummary = false;
   // Registers handled by a dedicated pass, such as stack/frame pointers, can be
   // excluded from this summary without changing the abstract domain.
   std::set<std::string> IgnoredRegisters;
+  // Prototype lowering stays in SummarySSA.  RegisterSummary only consumes
+  // already-mapped register ranges so both passes use one ABI mapping.
+  NativeExternalCallShapeMap ExternalCallShapes;
+  NativeRegisterUnknownExternalInputPolicy UnknownExternalInputPolicy =
+      NativeRegisterUnknownExternalInputPolicy::AbiInputs;
+  // Callsite evidence only needs the stable bottom-up states.  The preliminary
+  // unknown-external pass can skip return-demand propagation.
+  bool RunTopDownDemand = true;
+  bool CollectUnknownExternalCallsiteEvidence = false;
+  std::vector<NativeRegisterCallInputSlot> UnknownExternalEvidenceSlots;
 };
 
 // Per-register result for one function. MayEntry/MayNonEntry describe the value
@@ -61,6 +116,7 @@ struct NativeRegisterSummary {
   uint64_t PreservedRegisters = 0;
   uint64_t DemandedReturns = 0;
   std::vector<NativeRegisterSummaryFunction> Functions;
+  std::vector<NativeRegisterUnknownExternalCallsite> UnknownExternalCallsites;
 };
 
 NativeRegisterSummary

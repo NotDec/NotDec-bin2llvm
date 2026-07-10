@@ -252,7 +252,8 @@ block transfer 是多条指令 transfer 的组合。
 ## Call transfer
 
 direct internal call 使用 callee summary。
-external / indirect call 使用 ABI fallback 构造 synthetic summary。
+known external 使用已经映射到 ABI register range 的 prototype。
+unknown external 的输入读取由分析选项决定，但 caller-saved clobber 始终按 ABI 处理。
 
 设 callee 对 register `R` 的出口 summary 是：
 
@@ -284,6 +285,113 @@ post.mayNonEntry[R] =
 
 这个 call transfer 也是用 OR、条件选择和常量组成的。
 在 callee summary 固定时，它对 caller state 的 `join` 仍然可分配。
+
+### 外部 call 的输入与 clobber 分开处理
+
+外部函数有两类信息：
+
+```text
+输入：call 是否读取某个 ABI 参数 register range
+输出：call 是否覆盖 caller-saved register range
+```
+
+这两类信息不能绑在一起。
+unknown external 在第一遍可以假设零输入，但不能因此假设它不 clobber RAX、RDX 等
+caller-saved register。
+
+known external 的输入由 prototype 精确给出：
+
+```text
+fixed integer 参数 -> 对应 GPR slot
+float/double 参数   -> 对应 XMM/ZMM backing range
+vararg              -> fixed 参数后按 MaxArgs 限制 ABI fallback
+```
+
+`NativeRegisterSummary` 不重新解析 C 类型。
+prototype 到 register slot 的映射由 SummarySSA 侧统一完成，再以
+`NativeExternalCallShape` 传给 summary。
+这样 summary 和最终 LLVM signature 使用同一套 ABI 映射。
+
+unknown external 默认仍保留旧的 `AbiInputs` 策略，保证单独调用
+`runNativeRegisterSummary()` 的代码不静默改变。
+两遍 SummarySSA 链路显式选择 `NoInputs`。
+
+## 未知外部函数的两遍分析
+
+unknown external 没有函数体，也没有可靠 prototype。
+如果第一遍直接假设它读取全部 ABI 参数，caller 的 `ReadEntry` 会被放大。
+当前链路改成固定两遍：
+
+```text
+第一遍 bottom-up summary，unknown external 零输入
+-> 收集 callsite 参数来源
+-> 聚合临时 external prototype
+-> 第二遍完整 summary
+-> SummarySSA 和 signature rewrite
+```
+
+### 第一遍
+
+第一遍只需要稳定的 forward effect：
+
+- known external 按 prototype 读取输入。
+- unknown external 不读取 ABI 输入。
+- 所有 external 仍应用 ABI clobber。
+- 不跑 top-down demand。
+- 不附最终 metadata。
+
+forward solver 同时维护按 bit 的来源状态：
+
+```text
+Entry         来自函数入口
+Local         本函数明确写入
+CallProduced  前一个 call 的返回值或 clobber
+```
+
+一个 ABI slot 的全部 bit 都来自同一来源时，分别映射为：
+
+```text
+ForwardedEntry
+LocalDefinition
+CallProduced
+```
+
+不同来源混合时是 `Mixed`，无法判断时是 `Unknown`。
+这套来源信息不改变 `Cell` 抽象域，只服务于 callsite 证据。
+
+SCC bottom-up 最后一轮已经在稳定 callee effect 下得到每个 block 的 `In/Out`。
+实现直接保存这轮状态并 replay 指令，不再额外调用一次 CFG solver。
+
+### 聚合 callsite
+
+对每个 unknown external callsite，从 arg0 开始统计连续的
+`LocalDefinition` 前缀：
+
+```text
+Local, Local, Entry -> 2
+Local, CallProduced -> 1
+Entry, Local        -> 0
+```
+
+同一 external 的最终参数数量取所有 callsite 前缀的最大值。
+这样不会因为某个条件分支少设置一个可选参数而取到过小结果。
+
+`ForwardedEntry`、`Mixed`、`CallProduced` 和 `Unknown` 不作为强证据。
+callsite 不一致会输出 warning；所有 callsite 都是零前缀时保持零参数假设并输出
+unresolved warning。
+内置和用户 JSON prototype 始终优先，不参与自动推断。
+
+### 第二遍
+
+第二遍使用 known + inferred prototype：
+
+- 重新做 bottom-up effect。
+- 做 top-down entry/exit demand。
+- 生成最终 metadata。
+- 未推断成功的 external 仍按零输入。
+
+第二遍结果是后续 internal signature shape、range planning 和 SummarySSA 的唯一 facts。
+参数数量在进入 `FunctionBuilder` 前已经确定，后置流程不再修改 direct external arity。
 
 ## Fixpoint
 

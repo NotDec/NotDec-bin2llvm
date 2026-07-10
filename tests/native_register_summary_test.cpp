@@ -109,6 +109,36 @@ void attachTestFloatOnlyAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachExternalEvidenceAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_external_evidence_test";
+  for (const char *name : {"RDI", "RSI", "RDX"}) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 1;
+    input.MaxSize = 8;
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = name;
+    abi.Inputs.push_back(input);
+  }
+
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "RAX";
+  abi.Outputs.push_back(output);
+
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = "RAX";
+  abi.Effects.push_back(killed);
+  killed.Storage.Name = "RDX";
+  abi.Effects.push_back(killed);
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
                                            const std::string &name,
                                            llvm::Type *type, uint64_t offset,
@@ -179,6 +209,17 @@ registerSummary(const notdec::bin2llvm::NativeRegisterSummaryFunction &function,
   return nullptr;
 }
 
+const notdec::bin2llvm::NativeRegisterUnknownExternalCallsite *
+unknownExternalCallsite(const notdec::bin2llvm::NativeRegisterSummary &summary,
+                        const std::string &calleeName) {
+  for (const auto &callsite : summary.UnknownExternalCallsites) {
+    if (callsite.CalleeName == calleeName) {
+      return &callsite;
+    }
+  }
+  return nullptr;
+}
+
 bool expect(bool condition, const char *message) {
   if (!condition) {
     std::cerr << message << '\n';
@@ -228,12 +269,10 @@ bool testPartialWriteDoesNotReadEntryByItself() {
   llvm::Function *partialWrite =
       notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
           module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
-  builder.CreateCall(partialWrite,
-                     {rax,
-                      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context),
-                                             7),
-                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             0)});
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 7),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)});
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
@@ -358,6 +397,126 @@ bool testKnownVarArgExternalKeepsFullInputDemand() {
                 "known vararg call did not keep full RCX demand mask");
 }
 
+bool testUnknownExternalNoInputsDoesNotReadAbiArguments() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-unknown-external-no-inputs", context);
+  attachExternalEvidenceAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+
+  auto *callType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external = llvm::Function::Create(
+      callType, llvm::GlobalValue::ExternalLinkage, "unknown_external", module);
+  llvm::Function *function = llvm::Function::Create(
+      callType, llvm::GlobalValue::ExternalLinkage, "calls_unknown", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callType, external);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummaryOptions options;
+  options.UnknownExternalInputPolicy =
+      notdec::bin2llvm::NativeRegisterUnknownExternalInputPolicy::NoInputs;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module, options);
+  const auto *fn = functionSummary(summary, "calls_unknown");
+  const auto *rdiSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, rdi->getName().str());
+  const auto *rsiSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, rsi->getName().str());
+  return expect(rdiSummary != nullptr, "missing no-input RDI summary") &&
+         expect(rsiSummary != nullptr, "missing no-input RSI summary") &&
+         expect(!rdiSummary->ReadEntry,
+                "unknown no-input call read entry RDI") &&
+         expect(!rsiSummary->ReadEntry, "unknown no-input call read entry RSI");
+}
+
+bool testKnownExternalShapeReadsOnlyDeclaredRegister() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-known-external-shape", context);
+  attachExternalEvidenceAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+
+  auto *callType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external = llvm::Function::Create(
+      callType, llvm::GlobalValue::ExternalLinkage, "known_external", module);
+  llvm::Function *function = llvm::Function::Create(
+      callType, llvm::GlobalValue::ExternalLinkage, "calls_known", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callType, external);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummaryOptions options;
+  notdec::bin2llvm::NativeExternalCallShape shape;
+  shape.Inputs.push_back({"RSI", 0, 64});
+  options.ExternalCallShapes.emplace("known_external", std::move(shape));
+  options.UnknownExternalInputPolicy =
+      notdec::bin2llvm::NativeRegisterUnknownExternalInputPolicy::NoInputs;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module, options);
+  const auto *fn = functionSummary(summary, "calls_known");
+  const auto *rdiSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, rdi->getName().str());
+  const auto *rsiSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, rsi->getName().str());
+  return expect(rdiSummary != nullptr, "missing known-shape RDI summary") &&
+         expect(rsiSummary != nullptr, "missing known-shape RSI summary") &&
+         expect(!rdiSummary->ReadEntry,
+                "known external shape read undeclared RDI") &&
+         expect(rsiSummary->ReadEntry,
+                "known external shape did not read declared RSI");
+}
+
+bool testUnknownExternalCallsiteEvidenceClassifiesOrigins() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-unknown-external-evidence", context);
+  attachExternalEvidenceAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  (void)createRegisterGlobal(module, "RSI");
+  (void)createRegisterGlobal(module, "RDX");
+
+  auto *callType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *producer = llvm::Function::Create(
+      callType, llvm::GlobalValue::ExternalLinkage, "unknown_producer", module);
+  llvm::Function *target = llvm::Function::Create(
+      callType, llvm::GlobalValue::ExternalLinkage, "unknown_target", module);
+  llvm::Function *function = llvm::Function::Create(
+      callType, llvm::GlobalValue::ExternalLinkage, "evidence_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(callType, producer);
+  storeRegister(builder, rdi, 7, "RDI");
+  builder.CreateCall(callType, target);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummaryOptions options;
+  options.UnknownExternalInputPolicy =
+      notdec::bin2llvm::NativeRegisterUnknownExternalInputPolicy::NoInputs;
+  options.CollectUnknownExternalCallsiteEvidence = true;
+  options.UnknownExternalEvidenceSlots = {
+      {"RDI", 0, 64},
+      {"RSI", 0, 64},
+      {"RDX", 0, 64},
+  };
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module, options);
+  const auto *callsite = unknownExternalCallsite(summary, "unknown_target");
+  if (!expect(callsite != nullptr, "missing unknown target evidence") ||
+      !expect(callsite->Slots.size() == 3,
+              "unknown target evidence slot count mismatch")) {
+    return false;
+  }
+  using Origin = notdec::bin2llvm::NativeRegisterCallsiteValueOrigin;
+  return expect(callsite->Slots[0].Origin == Origin::LocalDefinition,
+                "RDI evidence was not classified as local") &&
+         expect(callsite->Slots[1].Origin == Origin::ForwardedEntry,
+                "RSI evidence was not classified as forwarded entry") &&
+         expect(callsite->Slots[2].Origin == Origin::CallProduced,
+                "RDX evidence was not classified as call produced");
+}
+
 bool testCalleeReadPropagatesToCallerEntry() {
   llvm::LLVMContext context;
   llvm::Module module("summary-call-read", context);
@@ -370,7 +529,11 @@ bool testCalleeReadPropagatesToCallerEntry() {
   llvm::BasicBlock *calleeEntry =
       llvm::BasicBlock::Create(context, "entry", callee);
   llvm::IRBuilder<> calleeBuilder(calleeEntry);
-  (void)loadRegister(calleeBuilder, rdi, "RDI", "arg");
+  llvm::LoadInst *arg = loadRegister(calleeBuilder, rdi, "RDI", "arg");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+  calleeBuilder.CreateStore(arg, sink);
   calleeBuilder.CreateRetVoid();
 
   llvm::Function *caller =
@@ -626,6 +789,9 @@ int main() {
   ok &= testPartialWriteDoesNotReadEntryByItself();
   ok &= testPartialReadReadsEntry();
   ok &= testKnownVarArgExternalKeepsFullInputDemand();
+  ok &= testUnknownExternalNoInputsDoesNotReadAbiArguments();
+  ok &= testKnownExternalShapeReadsOnlyDeclaredRegister();
+  ok &= testUnknownExternalCallsiteEvidenceClassifiesOrigins();
   ok &= testCalleeReadPropagatesToCallerEntry();
   ok &= testSparseJoinKeepsUntouchedPath();
   ok &= testTopDownDemandKeepsOnlyUsedReturn();

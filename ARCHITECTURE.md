@@ -270,35 +270,44 @@ PcodeToLLVM
    - 修 InstCombine 可能生成的 register pointer PHI load。
    - 让后续 register summary 能继续按 register global 识别访问。
 
-6. **NativeRegisterSummary**
+6. **第一遍 NativeRegisterSummary**
    - 入口：`runNativeRegisterSummary(...)`。
-   - 做 bottom-up 函数 effect 分析：
-     - `ReadEntry`：函数入口寄存器值是否被读。
-     - `MayEntry`：正常返回时寄存器是否可能仍是入口值。
-     - `MayNonEntry`：正常返回时寄存器是否可能是函数内新值。
-   - 做 top-down demand 分析：
+   - known external 使用内置或 JSON prototype 映射后的准确输入 slot。
+   - unknown external 假设不读取 ABI 输入，但仍应用 ABI caller-saved clobber。
+   - 只跑 bottom-up effect fixpoint，不跑 top-down demand，也不附最终 metadata。
+   - effect 域仍是 `ReadEntry`、`MayEntry`、`MayNonEntry`。
+   - 额外按 bit 跟踪 callsite 前寄存器来源：
+     - `LocalDefinition`
+     - `ForwardedEntry`
+     - `Mixed`
+     - `CallProduced`
+   - bottom-up 最后一轮已经得到稳定 block `In/Out`；callsite evidence 直接复用该状态，
+     不重新求解 CFG。
+
+7. **未知外部函数参数数量推断**
+   - 入口：`inferUnknownExternalPrototypes(...)`。
+   - 内置和 JSON prototype 优先，不参与自动推断。
+   - 每个 callsite 只统计从 arg0 开始连续的 `LocalDefinition` 前缀。
+   - 同一 external 有多个 callsite 时取最大前缀。
+   - 不一致、成功推断和零证据分别输出 warning。
+   - 这一步只推输入参数数量，不猜复杂类型，也不限制后续返回值 demand。
+
+8. **第二遍 NativeRegisterSummary**
+   - 使用 known + inferred external prototype。
+   - 未推断成功的 external 仍按零输入处理。
+   - 重新做 bottom-up effect 和 top-down demand：
      - `EntryDemandMask`：入口寄存器哪些 bit 被真实观察。
      - `ExitDemandMask`：返回寄存器哪些 bit 被 caller 需要。
-   - 处理 call：
-     - 内部 call 用 callee summary effect。
-     - 外部 call 当前 fallback 使用 ABI effect；这里后续需要按外部原型收窄输入寄存器。
-   - 处理 partial write：
-     - x86-64 低 32 位 GPR 写视为整寄存器定义，因为会清高 32 位。
-     - 其他 partial write 保留未写 lane 的 entry 可能性。
-   - 处理保存/恢复：
-     - 跟踪固定 entry-SP offset / native stack alloca slot。
-     - 识别 callee-saved register 保存到栈再恢复的模式。
+   - 这一遍附最终 metadata，并作为后续唯一的 summary facts。
+   - partial write、x86-64 低 32 位零扩展和 callee-saved save/restore 都在同一 solver
+     中处理。
 
-7. **构建初始 signature shape**
-   - 外部 declaration：
-     - 优先用已知外部原型。
-     - 未知外部函数先按 ABI 输入寄存器给保守形状，后面再用 callsite 收窄。
-   - 内部函数：
-     - 根据 `ReadEntry` 和 ABI register class 决定参数。
-     - 根据 `ExitDemand` 和 ABI return register 决定返回值。
-     - 用 demand mask 收窄整数宽度和 float/double lane。
+9. **构建初始 signature shape**
+   - 外部 declaration 使用最终 prototype；unknown external 使用零参数 shape。
+   - 内部函数根据最终 `ReadEntry`、`ExitDemand` 和 ABI register class 决定参数与返回值。
+   - demand mask 用于收窄整数宽度和 float/double lane。
 
-8. **FunctionBuilder per-function SummarySSA**
+10. **FunctionBuilder per-function SummarySSA**
    - 对每个非 declaration 函数运行 `FunctionBuilder::run()`。
    - 主要细分步骤：
      - 收集 register load/store/partial read/partial write 事件。
@@ -310,55 +319,49 @@ PcodeToLLVM
      - 收集函数返回值。
      - 收集 callsite argument store binding。
 
-9. **未知外部函数参数数量推断**
-   - 入口：`refineUnknownExternalParamShapes(...)`。
-   - 综合多个 callsite 的连续参数 binding。
-   - 遇到 clobber-derived value 不当作强证据。
-   - 不一致时输出 warning，同时仍选一个可用 arity。
-
-10. **间接 call 参数形状收窄**
+11. **间接 call 参数形状收窄**
     - 入口：`refineIndirectCallsiteParamShapes(...)`。
     - 对 indirect call 使用 callsite binding 收窄参数数量。
 
-11. **补外部返回值**
+12. **补外部返回值**
     - 入口：`addDemandedExternalReturns(...)`。
     - 如果 call 后有 demanded `summary_return` / range return helper，给外部 declaration
       增加对应 ABI return slot。
     - 对 RDX 这类非主返回寄存器保持保守，避免误判为第二返回值。
 
-12. **标记 call 参数 store 可删除**
+13. **标记 call 参数 store 可删除**
     - 入口：`markSignatureCallArgStores(...)`。
     - 被成功重写进 LLVM call 参数的 register store 可以删除。
 
-13. **重写函数和 call 签名**
+14. **重写函数和 call 签名**
     - 入口：`rewriteSignatureShapes(...)`。
     - 替换函数类型。
     - 内部函数 body 中 entry register read 替换为 LLVM argument。
     - callsite 从“先 store ABI register，再 call void”重写为普通 LLVM call 参数。
     - call return helper 替换为普通 LLVM call return value。
 
-14. **删除未使用 helper declaration**
+15. **删除未使用 helper declaration**
     - 清理 `notdec.register.summary_*`、partial read/write helper 的无用声明。
 
-15. **post-rewrite cleanup loop**
+16. **post-rewrite cleanup loop**
     - 只在 SummarySSA residue removal 开启时运行。
     - 最多 10 轮。
     - 每轮可选跑 `InstCombine`。
     - 然后 `removeDeadStoresAfterSignatureRewrite()` 删除签名重写后暴露的死 register store。
     - 如果本轮没有新删 store，停止。
 
-16. **NativeStackFrameCleanup**
+17. **NativeStackFrameCleanup**
     - 只在 SummarySSA residue removal 开启时运行。
     - 入口：`runNativeStackFrameCleanup(...)`。
     - 继续删除 stack/frame pointer bookkeeping。
     - 删除不用的 native stack alloca load/store/alloca。
 
-17. **late canary cleanup**
+18. **late canary cleanup**
     - 只在 SummarySSA residue removal 开启时运行。
     - 再跑一次 `runNativeStackCanaryCleanup(...)`。
     - 处理前面重写后新暴露出来的 canary 形状。
 
-18. **SummarySSA residue cleanup**
+19. **SummarySSA residue cleanup**
     - 只在 SummarySSA residue removal 开启时运行。
     - 删除死 `summary_return` / `summary_clobber` helper。
     - 删除死 canonical entry read / range entry read。

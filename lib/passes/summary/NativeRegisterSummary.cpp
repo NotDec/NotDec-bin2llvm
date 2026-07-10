@@ -86,9 +86,24 @@ struct Cell {
   }
 };
 
+// Callsite inference needs to distinguish explicit argument definitions from
+// entry forwarding and previous-call clobbers.  Keep that information beside
+// the existing Cell domain so it cannot change the summary lattice itself.
+struct RegisterOriginBits {
+  llvm::APInt Entry;
+  llvm::APInt Local;
+  llvm::APInt CallProduced;
+
+  bool operator==(const RegisterOriginBits &other) const {
+    return Entry == other.Entry && Local == other.Local &&
+           CallProduced == other.CallProduced;
+  }
+};
+
 struct State {
   bool Reachable = false;
   std::map<llvm::GlobalVariable *, Cell> Cells;
+  std::map<llvm::GlobalVariable *, RegisterOriginBits> Origins;
   // Narrow frame-local model for saved-register recognition.  It only tracks
   // fixed entry-SP offsets or notdec_stack.native alloca offsets, not arbitrary
   // memory.
@@ -96,6 +111,10 @@ struct State {
   // SSA values known to be a function-entry register plus a constant offset.
   // Offset 0 is also used for saved register values loaded back from stack.
   std::map<llvm::Value *, ValueOrigin> ValueOrigins;
+  // Values that directly or transitively come from a register value produced
+  // by a call.  The evidence replay only needs this negative fact to avoid
+  // treating clobber-derived argument stores as local definitions.
+  std::set<llvm::Value *> CallProducedValues;
   // Current stack pointer as an entry-SP-relative offset.  This is deliberately
   // narrow: it only exists so push/pop save slots can be recognized even when
   // RSP itself is ignored by the register summary.
@@ -103,8 +122,9 @@ struct State {
 
   bool operator==(const State &other) const {
     return Reachable == other.Reachable && Cells == other.Cells &&
-           StackSlots == other.StackSlots &&
+           Origins == other.Origins && StackSlots == other.StackSlots &&
            ValueOrigins == other.ValueOrigins &&
+           CallProducedValues == other.CallProducedValues &&
            StackPointerOffset == other.StackPointerOffset;
   }
 };
@@ -116,6 +136,12 @@ struct FunctionEffect {
   bool operator==(const FunctionEffect &other) const {
     return Registers == other.Registers;
   }
+};
+
+struct FunctionFlow {
+  std::map<llvm::BasicBlock *, State> In;
+  std::map<llvm::BasicBlock *, State> Out;
+  FunctionEffect Effect;
 };
 
 // Top-down summary: which changed exit registers are actually observed by
@@ -326,6 +352,19 @@ bool addDemand(RegisterDemand &demand, llvm::GlobalVariable *global,
 
 void eraseDemand(RegisterDemand &demand, llvm::GlobalVariable *global) {
   demand.erase(global);
+}
+
+void eraseDemand(RegisterDemand &demand, llvm::GlobalVariable *global,
+                 llvm::APInt mask) {
+  auto it = demand.find(global);
+  if (it == demand.end() || mask.getBitWidth() == 0 || mask.isZero()) {
+    return;
+  }
+  mask = mask.zextOrTrunc(it->second.getBitWidth());
+  it->second &= ~mask;
+  if (it->second.isZero()) {
+    demand.erase(it);
+  }
 }
 
 llvm::APInt demandFor(const RegisterDemand &demand,
@@ -672,22 +711,6 @@ bool isAnalyzableCall(const llvm::Instruction &inst) {
   return callee == nullptr || !callee->isIntrinsic();
 }
 
-bool isKnownVarArgExternalFunction(const llvm::Function &function) {
-  const NativeExternalPrototype *prototype = lookupNativeExternalPrototype(
-      defaultNativeExternalPrototypes(), function.getName());
-  return function.isDeclaration() && prototype != nullptr &&
-         prototype->VarArg;
-}
-
-unsigned knownVarArgFixedArgs(const llvm::Function &function) {
-  const NativeExternalPrototype *prototype = lookupNativeExternalPrototype(
-      defaultNativeExternalPrototypes(), function.getName());
-  if (prototype == nullptr || !prototype->VarArg) {
-    return 0;
-  }
-  return prototype->FixedArgs;
-}
-
 AbiFacts
 collectAbiFacts(const llvm::Module &module,
                 const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -768,6 +791,78 @@ bool joinCell(Cell &lhs, const Cell &rhs) {
   return !(lhs == old);
 }
 
+unsigned registerBitWidth(llvm::GlobalVariable *global) {
+  if (global == nullptr) {
+    return 0;
+  }
+  llvm::Type *type = global->getValueType();
+  if (auto *integer = llvm::dyn_cast<llvm::IntegerType>(type)) {
+    return integer->getBitWidth();
+  }
+  return type->isSized() ? type->getScalarSizeInBits() : 0;
+}
+
+RegisterOriginBits defaultOrigin(llvm::GlobalVariable *global) {
+  unsigned width = registerBitWidth(global);
+  if (width == 0) {
+    return {llvm::APInt(), llvm::APInt(), llvm::APInt()};
+  }
+  return {llvm::APInt::getAllOnes(width), llvm::APInt(width, 0),
+          llvm::APInt(width, 0)};
+}
+
+RegisterOriginBits originIn(const State &state, llvm::GlobalVariable *global) {
+  auto it = state.Origins.find(global);
+  return it == state.Origins.end() ? defaultOrigin(global) : it->second;
+}
+
+llvm::APInt registerRangeMask(llvm::GlobalVariable *global, unsigned offsetBits,
+                              unsigned sizeBits) {
+  unsigned width = registerBitWidth(global);
+  if (width == 0 || offsetBits >= width) {
+    return llvm::APInt();
+  }
+  unsigned boundedSize = sizeBits == 0 ? width - offsetBits
+                                       : std::min(sizeBits, width - offsetBits);
+  return llvm::APInt::getLowBitsSet(width, boundedSize).shl(offsetBits);
+}
+
+enum class RegisterOriginKind {
+  Entry,
+  Local,
+  CallProduced,
+  Mixed,
+};
+
+void setRegisterOrigin(State &state, llvm::GlobalVariable *global,
+                       const llvm::APInt &mask, RegisterOriginKind kind) {
+  unsigned width = registerBitWidth(global);
+  if (width == 0 || mask.getBitWidth() == 0 || mask.isZero()) {
+    return;
+  }
+  llvm::APInt boundedMask = mask.zextOrTrunc(width);
+  RegisterOriginBits bits = originIn(state, global);
+  bits.Entry &= ~boundedMask;
+  bits.Local &= ~boundedMask;
+  bits.CallProduced &= ~boundedMask;
+  if (kind == RegisterOriginKind::Entry) {
+    bits.Entry |= boundedMask;
+  } else if (kind == RegisterOriginKind::Local) {
+    bits.Local |= boundedMask;
+  } else if (kind == RegisterOriginKind::CallProduced) {
+    bits.CallProduced |= boundedMask;
+  }
+  state.Origins[global] = std::move(bits);
+}
+
+void setFullRegisterOrigin(State &state, llvm::GlobalVariable *global,
+                           RegisterOriginKind kind) {
+  unsigned width = registerBitWidth(global);
+  if (width != 0) {
+    setRegisterOrigin(state, global, llvm::APInt::getAllOnes(width), kind);
+  }
+}
+
 bool joinState(State &target, const State &source) {
   if (!source.Reachable) {
     return false;
@@ -788,6 +883,28 @@ bool joinState(State &target, const State &source) {
       changed |= joinCell(cell, Cell{});
     }
   }
+  std::set<llvm::GlobalVariable *> originGlobals;
+  for (const auto &[global, bits] : target.Origins) {
+    (void)bits;
+    originGlobals.insert(global);
+  }
+  for (const auto &[global, bits] : source.Origins) {
+    (void)bits;
+    originGlobals.insert(global);
+  }
+  for (llvm::GlobalVariable *global : originGlobals) {
+    RegisterOriginBits before = originIn(target, global);
+    RegisterOriginBits incoming = originIn(source, global);
+    RegisterOriginBits joined = {
+        before.Entry & incoming.Entry,
+        before.Local & incoming.Local,
+        before.CallProduced & incoming.CallProduced,
+    };
+    if (!(joined == before)) {
+      target.Origins[global] = std::move(joined);
+      changed = true;
+    }
+  }
   for (auto it = target.StackSlots.begin(); it != target.StackSlots.end();) {
     auto sourceIt = source.StackSlots.find(it->first);
     if (sourceIt == source.StackSlots.end() || sourceIt->second != it->second) {
@@ -803,6 +920,15 @@ bool joinState(State &target, const State &source) {
     if (sourceIt == source.ValueOrigins.end() ||
         sourceIt->second != it->second) {
       it = target.ValueOrigins.erase(it);
+      changed = true;
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = target.CallProducedValues.begin();
+       it != target.CallProducedValues.end();) {
+    if (source.CallProducedValues.count(*it) == 0) {
+      it = target.CallProducedValues.erase(it);
       changed = true;
     } else {
       ++it;
@@ -943,7 +1069,12 @@ public:
 
   NativeRegisterSummary run() {
     runBottomUp();
-    runTopDownDemand();
+    if (Options.CollectUnknownExternalCallsiteEvidence) {
+      collectUnknownExternalCallsiteEvidence();
+    }
+    if (Options.RunTopDownDemand) {
+      runTopDownDemand();
+    }
     if (Options.AttachMetadata) {
       attachMetadata();
     }
@@ -961,6 +1092,10 @@ private:
   std::map<llvm::Function *, std::set<llvm::Function *>> Callers;
   std::map<llvm::Function *, FunctionEffect> Effects;
   std::map<llvm::Function *, FunctionDemand> Demands;
+  // The last SCC iteration is already solved against stable callee effects.
+  // Keep those block states only for the preliminary callsite-evidence pass.
+  std::map<llvm::Function *, FunctionFlow> StableFlows;
+  std::vector<NativeRegisterUnknownExternalCallsite> UnknownExternalCallsites;
 
   void buildCallGraph() {
     std::set<llvm::Function *> defined(Functions.begin(), Functions.end());
@@ -1064,10 +1199,14 @@ private:
       while (changed) {
         changed = false;
         for (llvm::Function *function : components[id]) {
-          FunctionEffect next = analyzeFunction(*function);
+          FunctionFlow flow = solveFunction(*function);
+          FunctionEffect next = std::move(flow.Effect);
           if (!(Effects[function] == next)) {
             Effects[function] = std::move(next);
             changed = true;
+          }
+          if (Options.CollectUnknownExternalCallsiteEvidence) {
+            StableFlows[function] = std::move(flow);
           }
         }
       }
@@ -1079,10 +1218,9 @@ private:
     }
   }
 
-  FunctionEffect analyzeFunction(llvm::Function &function) {
-    std::map<llvm::BasicBlock *, State> in;
-    std::map<llvm::BasicBlock *, State> out;
-    in[&function.getEntryBlock()].Reachable = true;
+  FunctionFlow solveFunction(llvm::Function &function) {
+    FunctionFlow flow;
+    flow.In[&function.getEntryBlock()].Reachable = true;
 
     bool changed = true;
     while (changed) {
@@ -1091,16 +1229,16 @@ private:
         if (&block != &function.getEntryBlock()) {
           State joined;
           for (llvm::BasicBlock *pred : llvm::predecessors(&block)) {
-            joinState(joined, out[pred]);
+            joinState(joined, flow.Out[pred]);
           }
-          if (!(in[&block] == joined)) {
-            in[&block] = std::move(joined);
+          if (!(flow.In[&block] == joined)) {
+            flow.In[&block] = std::move(joined);
             changed = true;
           }
         }
-        State next = transferBlock(block, in[&block]);
-        if (!(out[&block] == next)) {
-          out[&block] = std::move(next);
+        State next = transferBlock(block, flow.In[&block]);
+        if (!(flow.Out[&block] == next)) {
+          flow.Out[&block] = std::move(next);
           changed = true;
         }
       }
@@ -1109,14 +1247,100 @@ private:
     State exits;
     for (llvm::BasicBlock &block : function) {
       if (llvm::isa<llvm::ReturnInst>(block.getTerminator())) {
-        joinState(exits, exitStateWithSavedRegisters(out[&block]));
+        joinState(exits, exitStateWithSavedRegisters(flow.Out[&block]));
       }
     }
-    FunctionEffect effect;
     if (exits.Reachable) {
-      effect.Registers = std::move(exits.Cells);
+      flow.Effect.Registers = std::move(exits.Cells);
     }
-    return effect;
+    return flow;
+  }
+
+  bool isUnknownExternalCall(const llvm::CallBase &call) const {
+    llvm::Function *callee = call.getCalledFunction();
+    if (callee == nullptr) {
+      return true;
+    }
+    if (!callee->isDeclaration() || callee->isIntrinsic()) {
+      return false;
+    }
+    return Options.ExternalCallShapes.count(callee->getName().str()) == 0;
+  }
+
+  NativeRegisterCallsiteValueOrigin
+  callsiteOrigin(const State &state,
+                 const NativeRegisterCallInputSlot &slot) const {
+    auto unitIt = UnitsByName.find(slot.UnitName);
+    if (unitIt == UnitsByName.end()) {
+      return NativeRegisterCallsiteValueOrigin::Unknown;
+    }
+    llvm::GlobalVariable *global = unitIt->second;
+    llvm::APInt mask =
+        registerRangeMask(global, slot.OffsetBits, slot.SizeBits);
+    if (mask.getBitWidth() == 0 || mask.isZero()) {
+      return NativeRegisterCallsiteValueOrigin::Unknown;
+    }
+    RegisterOriginBits bits = originIn(state, global);
+    if ((bits.Local & mask) == mask) {
+      return NativeRegisterCallsiteValueOrigin::LocalDefinition;
+    }
+    if ((bits.Entry & mask) == mask) {
+      return NativeRegisterCallsiteValueOrigin::ForwardedEntry;
+    }
+    if ((bits.CallProduced & mask) == mask) {
+      return NativeRegisterCallsiteValueOrigin::CallProduced;
+    }
+    return NativeRegisterCallsiteValueOrigin::Mixed;
+  }
+
+  void recordUnknownExternalCallsite(llvm::Function &caller,
+                                     llvm::CallBase &call, const State &state) {
+    NativeRegisterUnknownExternalCallsite evidence;
+    evidence.CallerName = caller.getName().str();
+    llvm::Function *callee = call.getCalledFunction();
+    evidence.Indirect = callee == nullptr;
+    evidence.CalleeName =
+        callee == nullptr ? "<indirect>" : callee->getName().str();
+    for (auto [index, slot] :
+         llvm::enumerate(Options.UnknownExternalEvidenceSlots)) {
+      NativeRegisterCallsiteSlotEvidence slotEvidence;
+      slotEvidence.Index = index;
+      slotEvidence.UnitName = slot.UnitName;
+      slotEvidence.OffsetBits = slot.OffsetBits;
+      slotEvidence.SizeBits = slot.SizeBits;
+      slotEvidence.Origin = callsiteOrigin(state, slot);
+      evidence.Slots.push_back(std::move(slotEvidence));
+    }
+    UnknownExternalCallsites.push_back(std::move(evidence));
+  }
+
+  void collectUnknownExternalCallsiteEvidence() {
+    UnknownExternalCallsites.clear();
+    for (llvm::Function *function : Functions) {
+      auto flowIt = StableFlows.find(function);
+      if (flowIt == StableFlows.end()) {
+        continue;
+      }
+      const FunctionFlow &flow = flowIt->second;
+      for (llvm::BasicBlock &block : *function) {
+        auto stateIt = flow.In.find(&block);
+        if (stateIt == flow.In.end()) {
+          continue;
+        }
+        State state = stateIt->second;
+        if (!state.Reachable) {
+          continue;
+        }
+        for (llvm::Instruction &inst : block) {
+          if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+              call != nullptr && isAnalyzableCall(inst) &&
+              isUnknownExternalCall(*call)) {
+            recordUnknownExternalCallsite(*function, *call, state);
+          }
+          transferInstruction(inst, state);
+        }
+      }
+    }
   }
 
   State transferBlock(llvm::BasicBlock &block, State state) {
@@ -1154,6 +1378,15 @@ private:
         } else {
           state.ValueOrigins.erase(load);
         }
+        RegisterOriginBits origins = originIn(state, access.Unit->Global);
+        unsigned width = registerBitWidth(access.Unit->Global);
+        llvm::APInt mask =
+            width == 0 ? llvm::APInt() : llvm::APInt::getAllOnes(width);
+        if (mask.getBitWidth() != 0 && (origins.CallProduced & mask) == mask) {
+          state.CallProducedValues.insert(load);
+        } else {
+          state.CallProducedValues.erase(load);
+        }
         return;
       }
       if (std::optional<StackSlotKey> slot =
@@ -1164,6 +1397,7 @@ private:
         } else {
           state.ValueOrigins.erase(load);
         }
+        state.CallProducedValues.erase(load);
       }
       return;
     }
@@ -1185,6 +1419,8 @@ private:
         if (isKeepHighPartialStoreValue(store->getValueOperand(),
                                         access.Unit->Global)) {
           writeRegister(state, access.Unit->Global);
+          setFullRegisterOrigin(state, access.Unit->Global,
+                                RegisterOriginKind::Mixed);
           state.ValueOrigins.erase(store);
           return;
         }
@@ -1193,9 +1429,14 @@ private:
         if (origin && origin->Base == access.Unit->Global &&
             origin->Offset == 0) {
           restoreRegister(state, access.Unit->Global);
+          setFullRegisterOrigin(state, access.Unit->Global,
+                                RegisterOriginKind::Entry);
         } else {
           markEntryValueRead(store->getValueOperand(), state);
           writeRegister(state, access.Unit->Global);
+          setFullRegisterOrigin(state, access.Unit->Global,
+                                registerOriginKindForStoredValue(
+                                    store->getValueOperand(), state));
         }
         state.ValueOrigins.erase(store);
         return;
@@ -1228,12 +1469,24 @@ private:
           Cell before = cellIn(state, partialRead->Global);
           if (before.MayEntry && !before.MayNonEntry) {
             state.ValueOrigins[&inst] = ValueOrigin{partialRead->Global, 0};
+            state.CallProducedValues.erase(&inst);
           } else {
             readRegister(state, partialRead->Global);
             state.ValueOrigins.erase(&inst);
+            RegisterOriginBits origins = originIn(state, partialRead->Global);
+            llvm::APInt mask =
+                registerRangeMask(partialRead->Global, partialRead->BitOffset,
+                                  partialRead->ReadWidth);
+            if (mask.getBitWidth() != 0 &&
+                (origins.CallProduced & mask) == mask) {
+              state.CallProducedValues.insert(&inst);
+            } else {
+              state.CallProducedValues.erase(&inst);
+            }
           }
         } else {
           state.ValueOrigins.erase(&inst);
+          state.CallProducedValues.erase(&inst);
         }
         return;
       }
@@ -1245,11 +1498,20 @@ private:
           markEntryValueRead(partial->Value, state);
           if (isX64Low32GprWrite(*partial, unitIt->second)) {
             writeRegister(state, partial->Global);
+            setFullRegisterOrigin(
+                state, partial->Global,
+                registerOriginKindForStoredValue(partial->Value, state));
           } else {
             partialWriteRegister(state, partial->Global);
+            llvm::APInt mask = registerRangeMask(
+                partial->Global, partial->BitOffset, partial->WriteWidth);
+            setRegisterOrigin(
+                state, partial->Global, mask,
+                registerOriginKindForStoredValue(partial->Value, state));
           }
         }
         state.ValueOrigins.erase(&inst);
+        state.CallProducedValues.erase(&inst);
         return;
       }
     }
@@ -1304,6 +1566,49 @@ private:
       }
     }
     return std::nullopt;
+  }
+
+  bool valueDependsOnCallProduced(llvm::Value *value, const State &state,
+                                  std::set<llvm::Value *> &visiting) const {
+    value = value->stripPointerCasts();
+    if (state.CallProducedValues.count(value) != 0) {
+      return true;
+    }
+    if (llvm::isa<llvm::Constant>(value) || !visiting.insert(value).second) {
+      return false;
+    }
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
+    if (inst == nullptr || llvm::isa<llvm::CallBase>(inst) ||
+        llvm::isa<llvm::LoadInst>(inst)) {
+      visiting.erase(value);
+      return false;
+    }
+    for (llvm::Value *operand : inst->operands()) {
+      if (valueDependsOnCallProduced(operand, state, visiting)) {
+        visiting.erase(value);
+        return true;
+      }
+    }
+    visiting.erase(value);
+    return false;
+  }
+
+  bool valueDependsOnCallProduced(llvm::Value *value,
+                                  const State &state) const {
+    std::set<llvm::Value *> visiting;
+    return valueDependsOnCallProduced(value, state, visiting);
+  }
+
+  RegisterOriginKind
+  registerOriginKindForStoredValue(llvm::Value *value,
+                                   const State &state) const {
+    if (entryValueOrigin(value, state)) {
+      return RegisterOriginKind::Entry;
+    }
+    if (valueDependsOnCallProduced(value, state)) {
+      return RegisterOriginKind::CallProduced;
+    }
+    return RegisterOriginKind::Local;
   }
 
   llvm::GlobalVariable *entryRegisterOrigin(llvm::Value *value,
@@ -1438,7 +1743,15 @@ private:
       applyFunctionEffect(Effects[callee], state);
       return;
     }
-    applyAbiCallEffect(state);
+    auto shapeIt =
+        callee == nullptr
+            ? Options.ExternalCallShapes.end()
+            : Options.ExternalCallShapes.find(callee->getName().str());
+    if (shapeIt != Options.ExternalCallShapes.end()) {
+      applyExternalCallEffect(state, shapeIt->second);
+      return;
+    }
+    applyUnknownExternalCallEffect(state);
   }
 
   void applyFunctionEffect(const FunctionEffect &effect, State &state) {
@@ -1454,10 +1767,29 @@ private:
       post.MayNonEntry =
           (callee.MayEntry && pre.MayNonEntry) || callee.MayNonEntry;
       state.Cells[global] = post;
+      if (!callee.MayEntry && callee.MayNonEntry) {
+        setFullRegisterOrigin(state, global, RegisterOriginKind::CallProduced);
+      } else if (callee.MayEntry && callee.MayNonEntry) {
+        setFullRegisterOrigin(state, global, RegisterOriginKind::Mixed);
+      }
     }
   }
 
-  void applyAbiCallEffect(State &state) {
+  void applyCallInputs(State &state,
+                       const std::vector<NativeRegisterCallInputSlot> &inputs) {
+    for (const NativeRegisterCallInputSlot &input : inputs) {
+      auto unitIt = UnitsByName.find(input.UnitName);
+      if (unitIt == UnitsByName.end()) {
+        continue;
+      }
+      const RegisterUnit &unit = Units.at(unitIt->second);
+      if (!isIgnored(unit, Options)) {
+        readRegister(state, unit.Global);
+      }
+    }
+  }
+
+  void applyAbiInputs(State &state) {
     for (const auto &[global, unit] : Units) {
       if (isIgnored(unit, Options)) {
         continue;
@@ -1465,14 +1797,54 @@ private:
       if (Abi.Inputs.count(unit.Name) != 0) {
         readRegister(state, global);
       }
-      if (Abi.Unaffected.count(unit.Name) != 0) {
+    }
+  }
+
+  void applyAbiCallClobbers(State &state) {
+    for (const auto &[global, unit] : Units) {
+      if (isIgnored(unit, Options) || Abi.Unaffected.count(unit.Name) != 0) {
         continue;
+      }
+      std::optional<llvm::APInt> clobberMask;
+      auto outputIt = Abi.OutputMasks.find(unit.Name);
+      if (outputIt != Abi.OutputMasks.end()) {
+        clobberMask = outputIt->second;
+      }
+      auto killedIt = Abi.KilledByCallMasks.find(unit.Name);
+      if (killedIt != Abi.KilledByCallMasks.end()) {
+        if (!clobberMask) {
+          clobberMask = killedIt->second;
+        } else {
+          *clobberMask |=
+              killedIt->second.zextOrTrunc(clobberMask->getBitWidth());
+        }
       }
       if (Abi.Outputs.count(unit.Name) != 0 ||
           Abi.KilledByCall.count(unit.Name) != 0) {
         writeRegister(state, global);
+        if (!clobberMask || clobberMask->isZero()) {
+          setFullRegisterOrigin(state, global,
+                                RegisterOriginKind::CallProduced);
+        } else {
+          setRegisterOrigin(state, global, *clobberMask,
+                            RegisterOriginKind::CallProduced);
+        }
       }
     }
+  }
+
+  void applyExternalCallEffect(State &state,
+                               const NativeExternalCallShape &shape) {
+    applyCallInputs(state, shape.Inputs);
+    applyAbiCallClobbers(state);
+  }
+
+  void applyUnknownExternalCallEffect(State &state) {
+    if (Options.UnknownExternalInputPolicy ==
+        NativeRegisterUnknownExternalInputPolicy::AbiInputs) {
+      applyAbiInputs(state);
+    }
+    applyAbiCallClobbers(state);
   }
 
   void runTopDownDemand() {
@@ -1626,42 +1998,67 @@ private:
       return;
     }
 
-    bool knownVarArgExternal =
-        callee != nullptr && isKnownVarArgExternalFunction(*callee);
     for (const auto &[global, unit] : Units) {
-      llvm::APInt mask = demandFor(live, global);
-      if (isIgnored(unit, Options) || mask.getBitWidth() == 0 ||
-          mask.isZero()) {
+      if (isIgnored(unit, Options)) {
         continue;
       }
-      if (Abi.Outputs.count(unit.Name) != 0 ||
-          Abi.KilledByCall.count(unit.Name) != 0) {
-        eraseDemand(live, global);
+      std::optional<llvm::APInt> clobberMask;
+      auto outputIt = Abi.OutputMasks.find(unit.Name);
+      if (outputIt != Abi.OutputMasks.end()) {
+        clobberMask = outputIt->second;
+      }
+      auto killedIt = Abi.KilledByCallMasks.find(unit.Name);
+      if (killedIt != Abi.KilledByCallMasks.end()) {
+        if (!clobberMask) {
+          clobberMask = killedIt->second;
+        } else {
+          *clobberMask |=
+              killedIt->second.zextOrTrunc(clobberMask->getBitWidth());
+        }
+      }
+      if (clobberMask && !clobberMask->isZero()) {
+        eraseDemand(live, global, *clobberMask);
       }
     }
-    if (!knownVarArgExternal) {
-      return;
-    }
-    // Vararg tails do not have a fixed source prototype.  Keep them live, but
-    // use their natural integer argument width instead of forcing the whole
-    // x86-64 backing register.  This avoids inventing demand for high 32 bits
-    // when an E* argument is enough.
-    unsigned fixedArgs = knownVarArgFixedArgs(*callee);
-    for (auto [index, name] : llvm::enumerate(Abi.InputOrder)) {
-      auto unitIt = UnitsByName.find(name);
+
+    auto addInputDemand = [&](const NativeRegisterCallInputSlot &input) {
+      auto unitIt = UnitsByName.find(input.UnitName);
       if (unitIt == UnitsByName.end()) {
-        continue;
+        return;
       }
       llvm::GlobalVariable *global = unitIt->second;
       const RegisterUnit &unit = Units.at(global);
       if (isIgnored(unit, Options)) {
+        return;
+      }
+      llvm::APInt mask =
+          registerRangeMask(global, input.OffsetBits, input.SizeBits);
+      addDemand(live, global, mask);
+    };
+
+    auto shapeIt =
+        callee == nullptr
+            ? Options.ExternalCallShapes.end()
+            : Options.ExternalCallShapes.find(callee->getName().str());
+    if (shapeIt != Options.ExternalCallShapes.end()) {
+      for (const NativeRegisterCallInputSlot &input : shapeIt->second.Inputs) {
+        addInputDemand(input);
+      }
+      return;
+    }
+    if (Options.UnknownExternalInputPolicy !=
+        NativeRegisterUnknownExternalInputPolicy::AbiInputs) {
+      return;
+    }
+    for (const std::string &name : Abi.InputOrder) {
+      auto unitIt = UnitsByName.find(name);
+      if (unitIt == UnitsByName.end()) {
         continue;
       }
-      llvm::APInt mask = namedMaskOrFull(Abi.InputMasks, unit);
-      if (index >= fixedArgs) {
-        mask &= lowBitsMask(registerBitWidth(unit), 32);
+      const RegisterUnit &unit = Units.at(unitIt->second);
+      if (!isIgnored(unit, Options)) {
+        addDemand(live, unit.Global, namedMaskOrFull(Abi.InputMasks, unit));
       }
-      addDemand(live, global, mask);
     }
   }
 
@@ -1750,6 +2147,7 @@ private:
   NativeRegisterSummary buildPublicSummary() const {
     NativeRegisterSummary summary;
     summary.FunctionsSeen = Functions.size();
+    summary.UnknownExternalCallsites = UnknownExternalCallsites;
     for (llvm::Function *function : Functions) {
       NativeRegisterSummaryFunction fn;
       fn.FunctionName = function->getName().str();

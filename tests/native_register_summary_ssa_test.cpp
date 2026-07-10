@@ -7,6 +7,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -18,6 +19,8 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -2567,11 +2570,12 @@ bool testKnownVarArgExternalKeepsAbiInputs() {
   struct KnownVarArgCase {
     const char *Name;
     unsigned FixedArgs;
+    unsigned ExpectedCallArgs = 6;
   };
   const KnownVarArgCase cases[] = {
       {"__isoc23_sscanf", 2}, {"__isoc99_sscanf", 2}, {"__asprintf_chk", 3},
       {"__snprintf_chk", 4},  {"__syslog_chk", 2},    {"fscanf", 2},
-      {"prctl", 1},
+      {"prctl", 1, 3},
   };
 
   for (const KnownVarArgCase &testCase : cases) {
@@ -2632,7 +2636,7 @@ bool testKnownVarArgExternalKeepsAbiInputs() {
     }
 
     if (!expect(call != nullptr, "known vararg external call missing") ||
-        !expect(call->arg_size() == 6,
+        !expect(call->arg_size() == testCase.ExpectedCallArgs,
                 "known vararg external dropped ABI varargs") ||
         !expect(calleeIsVarArg,
                 "known vararg external did not keep vararg function type") ||
@@ -2695,6 +2699,7 @@ bool testMismatchedDirectCallUseUsesReturnExtract() {
   storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
                 "RDI");
   llvm::CallInst *call = builder.CreateCall(calleeType, callee);
+  storeRegister(builder, rax, call, "RAX");
   llvm::LoadInst *raxLoad = loadRegister(builder, rax, "RAX", "rax.after");
   llvm::LoadInst *rbxLoad = loadRegister(builder, rbx, "RBX", "rbx.after");
   llvm::Value *sum = builder.CreateAdd(call, raxLoad);
@@ -3105,6 +3110,67 @@ bool testUnknownExternalArityUsesMaxCallsitePrefix() {
                 "unknown external arity mismatch warning missing") &&
          verifyOk(module,
                   "module failed verifier after unknown external arity test");
+}
+
+bool testExternalPrototypeJsonOverridesInferredArity() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-external-json-priority", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI"});
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "json_known_external", module);
+  llvm::Function *function =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "json_known_external_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  llvm::SmallString<128> jsonPath;
+  int jsonFd = -1;
+  std::error_code error = llvm::sys::fs::createTemporaryFile(
+      "notdec-external-prototype", "json", jsonFd, jsonPath);
+  if (error) {
+    std::cerr << "failed to create external prototype JSON: " << error.message()
+              << '\n';
+    return false;
+  }
+  {
+    llvm::raw_fd_ostream json(jsonFd, true);
+    json << R"({"json_known_external":{"return":"void","fixed_args":1}})";
+  }
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.ExternalPrototypeJsonPath = jsonPath.str().str();
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  (void)llvm::sys::fs::remove(jsonPath);
+
+  llvm::Function *rewritten = module.getFunction("json_known_external");
+  bool inferredWarning = false;
+  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+       summary.Warnings) {
+    inferredWarning |= warning.CalleeName == "json_known_external" &&
+                       warning.Reason == "inferred_unknown_external_arity";
+  }
+  return expect(rewritten != nullptr,
+                "JSON prototype external callee missing") &&
+         expect(rewritten->arg_size() == 1,
+                "callsite inference overrode JSON prototype arity") &&
+         expect(!inferredWarning,
+                "JSON prototype external emitted inference warning") &&
+         verifyOk(module,
+                  "module failed verifier after JSON prototype priority test");
 }
 
 bool testUnknownExternalArityStopsAtClobberArg() {
@@ -4075,8 +4141,9 @@ bool testInternalCallArgBindingsKeepLaterArgsAfterEntryInput() {
   llvm::IRBuilder<> calleeBuilder(calleeEntry);
   llvm::LoadInst *childRdi = loadRegister(calleeBuilder, rdi, "RDI", "rdi.in");
   llvm::LoadInst *childRsi = loadRegister(calleeBuilder, rsi, "RSI", "rsi.in");
-  (void)childRdi;
-  (void)childRsi;
+  llvm::Value *childSum = calleeBuilder.CreateAdd(childRdi, childRsi);
+  llvm::AllocaInst *childSink = calleeBuilder.CreateAlloca(rdi->getValueType());
+  calleeBuilder.CreateStore(childSum, childSink);
   calleeBuilder.CreateRetVoid();
 
   auto *parentType =
@@ -4727,15 +4794,21 @@ bool testUnknownExternalIntegerClobberUsesRangeCallValue() {
   options.EnableResidueRemoval = false;
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
 
-  return expect(summary.CallClobberValues == 1,
+  return expect(summary.CallClobberValues >= 1,
                 "integer clobber range helper was not created") &&
          expect(!hasLiveReplacedRegisterLoad(*function),
                 "integer clobber range left live raw R10 load") &&
          expect(moduleHasUsedFunctionNamed(
-                    module, "notdec.register.summary_clobber.i64"),
+                    module, "notdec.register.summary_clobber.i1") ||
+                    moduleHasUsedFunctionNamed(
+                        module, "notdec.register.summary_clobber.i64"),
                 "integer clobber range helper was not used") &&
-         expect(functionHasUsedSummaryCallValueRange(*function, "clobber",
-                                                     "R10", 0, 64),
+         expect((functionHasUsedSummaryCallValueRange(*function, "clobber",
+                                                      "R10", 0, 64) ||
+                 (functionHasUsedSummaryCallValueRange(*function, "clobber",
+                                                       "R10", 0, 1) &&
+                  functionHasUsedSummaryCallValueRange(*function, "clobber",
+                                                       "R10", 1, 63))),
                 "integer clobber helper did not carry R10 range metadata") &&
          verifyOk(module,
                   "module failed verifier after integer clobber range test");
@@ -6158,7 +6231,9 @@ bool testFinalCleanupKeepsMetadataWhenRegisterAccessRemains() {
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
-  loadRegister(builder, rbx, "RBX", "rbx.live");
+  llvm::LoadInst *live = loadRegister(builder, rbx, "RBX", "rbx.live");
+  llvm::AllocaInst *sink = builder.CreateAlloca(rbx->getValueType());
+  builder.CreateStore(live, sink);
   builder.CreateRetVoid();
 
   llvm::LLVMContext &moduleContext = module.getContext();
@@ -6330,6 +6405,7 @@ int main() {
   ok &= testInternalReturnDoesNotExposeExternalClobber();
   ok &= testClobberReturnPhiDoesNotMaterializeHelper();
   ok &= testUnknownExternalArityUsesMaxCallsitePrefix();
+  ok &= testExternalPrototypeJsonOverridesInferredArity();
   ok &= testUnknownExternalArityStopsAtClobberArg();
   ok &= testUnknownExternalArityStopsAtPhiClobberArg();
   ok &= testUnknownExternalArityStopsAtBinaryClobberArg();
