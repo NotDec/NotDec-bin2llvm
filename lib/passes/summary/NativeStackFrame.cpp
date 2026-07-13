@@ -23,6 +23,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace notdec::bin2llvm {
@@ -192,16 +193,6 @@ llvm::Value *createStackFramePointer(llvm::IRBuilder<> &builder,
       static_cast<uint64_t>(offset - frameLow));
   return builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(storage.getContext()),
                                    &storage, byteOffset, name);
-}
-
-llvm::Value *createStackFrameInteger(llvm::IRBuilder<> &builder,
-                                     llvm::AllocaInst &storage,
-                                     int64_t frameLow, int64_t offset,
-                                     llvm::Type *integerType) {
-  llvm::Value *pointer = createStackFramePointer(
-      builder, storage, frameLow, offset, "notdec_stack.native.ptr");
-  return builder.CreatePtrToInt(pointer, integerType,
-                                "notdec_stack.native.int");
 }
 
 bool hasExistingStackAlloca(const llvm::Function &function) {
@@ -405,15 +396,41 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
       entryBuilder.CreateAlloca(arrayType, nullptr, "notdec_stack.native");
   storage->setAlignment(llvm::Align(16));
 
+  // Keep one entry-dominating pointer per concrete native stack offset.  The
+  // cleanup pass may compare rewritten stack accesses by pointer identity, so
+  // repeated offsets should not produce unrelated GEP values.
+  llvm::IRBuilder<> stackValueBuilder(storage->getNextNode());
+  std::map<int64_t, llvm::Value *> stackPointers;
+  std::map<std::pair<int64_t, llvm::Type *>, llvm::Value *> stackIntegers;
+  auto stackPointerForOffset = [&](int64_t offset) -> llvm::Value * {
+    auto found = stackPointers.find(offset);
+    if (found != stackPointers.end()) {
+      return found->second;
+    }
+    llvm::Value *pointer = createStackFramePointer(
+        stackValueBuilder, *storage, *low, offset, "notdec_stack.native.ptr");
+    stackPointers[offset] = pointer;
+    return pointer;
+  };
+  auto stackIntegerForOffset = [&](int64_t offset,
+                                   llvm::Type *integerType) -> llvm::Value * {
+    auto key = std::make_pair(offset, integerType);
+    auto found = stackIntegers.find(key);
+    if (found != stackIntegers.end()) {
+      return found->second;
+    }
+    llvm::Value *integer = stackValueBuilder.CreatePtrToInt(
+        stackPointerForOffset(offset), integerType, "notdec_stack.native.int");
+    stackIntegers[key] = integer;
+    return integer;
+  };
+
   uint64_t rewritten = 0;
   for (const StackFrameAddressValue &address : pointerAddresses) {
     if (address.Instruction->getParent() == nullptr) {
       continue;
     }
-    llvm::IRBuilder<> builder(address.Instruction);
-    llvm::Value *localPointer =
-        createStackFramePointer(builder, *storage, *low, address.Offset,
-                                "notdec_stack.native.ptr");
+    llvm::Value *localPointer = stackPointerForOffset(address.Offset);
     address.Instruction->replaceAllUsesWith(localPointer);
     ++rewritten;
   }
@@ -423,9 +440,8 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
         address.Instruction->use_empty()) {
       continue;
     }
-    llvm::IRBuilder<> builder(address.Instruction);
-    llvm::Value *localInteger = createStackFrameInteger(
-        builder, *storage, *low, address.Offset, address.Instruction->getType());
+    llvm::Value *localInteger = stackIntegerForOffset(
+        address.Offset, address.Instruction->getType());
     address.Instruction->replaceAllUsesWith(localInteger);
     ++rewritten;
   }
