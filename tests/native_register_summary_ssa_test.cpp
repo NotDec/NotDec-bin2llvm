@@ -1,6 +1,7 @@
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
+#include "notdec-bin2llvm/NativeRegisterValueRange.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
@@ -445,7 +446,8 @@ llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
                                                uint64_t fsOffset,
                                                bool useZextCondition,
                                                bool extraFailSideEffect,
-                                               bool maskSavedCanary = false) {
+                                               bool maskSavedCanary = false,
+                                               bool saveRealCanary = false) {
   llvm::LLVMContext &context = module.getContext();
   llvm::GlobalVariable *fsOffsetRegister =
       createRegisterGlobal(module, "FS_OFFSET");
@@ -473,8 +475,23 @@ llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
       llvm::Type::getInt8Ty(context), stack,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
       "saved_canary_ptr");
-  builder.CreateStore(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), savedPointer);
+  llvm::Value *initialSavedCanary =
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+  if (saveRealCanary) {
+    llvm::LoadInst *savedFsBase =
+        loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base_save");
+    llvm::Value *savedFsCanaryAddress = builder.CreateAdd(
+        savedFsBase,
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), fsOffset),
+        "fs_canary_save_addr");
+    llvm::Value *savedFsCanaryPointer = builder.CreateIntToPtr(
+        savedFsCanaryAddress, llvm::PointerType::get(context, 0),
+        "fs_canary_save_ptr");
+    initialSavedCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                            savedFsCanaryPointer,
+                                            "fs_canary_save");
+  }
+  builder.CreateStore(initialSavedCanary, savedPointer);
   llvm::LoadInst *savedCanary = builder.CreateLoad(
       llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
   llvm::LoadInst *fsBase =
@@ -1507,6 +1524,51 @@ bool testPreservedCallKeepsPreviousValue() {
          expect(summary.DeadLoadsRemoved == 1,
                 "preserved call replaced load was not removed") &&
          verifyOk(module, "module failed verifier after preserved call test");
+}
+
+bool testRewrittenExternalCallPreservesUnaffectedRegister() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-rewritten-external-preserve", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__errno_location",
+      module);
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::ExternalLinkage,
+      "rewritten_external_preserves_rbx", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rbx, llvm::ConstantInt::get(rbx->getValueType(), 42),
+                "RBX");
+  builder.CreateCall(calleeType, callee);
+  llvm::LoadInst *raxValue = loadRegister(builder, rax, "RAX", "rax.ret");
+  llvm::LoadInst *rbxValue = loadRegister(builder, rbx, "RBX", "rbx.after");
+  builder.CreateRet(builder.CreateAdd(raxValue, rbxValue));
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenCaller =
+      module.getFunction("rewritten_external_preserves_rbx");
+  llvm::Function *rewrittenCallee = module.getFunction("__errno_location");
+
+  return expect(rewrittenCaller != nullptr, "rewritten caller missing") &&
+         expect(rewrittenCallee != nullptr, "rewritten errno callee missing") &&
+         expect(rewrittenCallee->getReturnType()->isIntegerTy(64),
+                "errno call was not rewritten to a typed return") &&
+         expect(!hasRegisterLoad(*rewrittenCaller, "RBX"),
+                "RBX load remained after rewritten preserved call") &&
+         expect(!hasRegisterStore(*rewrittenCaller, "RBX"),
+                "RBX store remained after rewritten preserved call") &&
+         expect(summary.CallsRewritten >= 1,
+                "external call rewrite was not counted") &&
+         verifyOk(module,
+                  "module failed verifier after rewritten preserved call test");
 }
 
 bool testDemandedReturnCreatesCallValue() {
@@ -4354,6 +4416,41 @@ bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
          verifyOk(module, "module failed verifier after stack rewrite test");
 }
 
+bool testCallerSavedEntryStackSpillCountsAsReadEntry() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-caller-saved-stack-spill", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "caller_saved_stack_spill",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *stackType = llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 16);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(stackType, nullptr, "notdec_stack.native");
+  llvm::Value *slot = builder.CreateInBoundsGEP(
+      llvm::Type::getInt8Ty(context), stack,
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
+  llvm::LoadInst *entryValue = loadRegister(builder, rdi, "RDI", "rdi.entry");
+  builder.CreateStore(entryValue, slot);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "caller_saved_stack_spill");
+  const auto *rdiSummary = fn == nullptr ? nullptr : registerSummary(*fn, "RDI");
+
+  return expect(rdiSummary != nullptr,
+                "missing RDI summary for caller-saved stack spill") &&
+         expect(rdiSummary->ReadEntry,
+                "caller-saved stack spill did not count as ReadEntry") &&
+         verifyOk(module,
+                  "module failed verifier after caller-saved spill test");
+}
+
 bool testFramePointerLoadFeedsStackRewriteWithoutGlobalIgnore() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-frame-pointer-stack", context);
@@ -4615,6 +4712,24 @@ bool testStackCanaryCheckIsRemoved() {
          expect(!hasRegisterLoad(*function, "FS_OFFSET"),
                 "stack canary FS_OFFSET load was kept") &&
          verifyOk(module, "module failed verifier after stack canary removal");
+}
+
+bool testStackCanaryPrologueSaveIsRemoved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-stack-canary-prologue-save-remove", context);
+  attachTestAbi(module);
+  llvm::Function *function =
+      createStackCanaryCheckFunction(module, 40, false, false, false, true);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.StackCanaryChecksRemoved == 1,
+                "stack canary check with prologue save was not removed") &&
+         expect(!hasCallTo(*function, "__stack_chk_fail"),
+                "stack canary fail call with prologue save was kept") &&
+         expect(!hasRegisterLoad(*function, "FS_OFFSET"),
+                "stack canary prologue FS_OFFSET load was kept") &&
+         verifyOk(module,
+                  "module failed verifier after canary prologue save removal");
 }
 
 bool testStackCanaryZextConditionIsRemoved() {
@@ -6520,6 +6635,65 @@ bool testFinalCleanupCountsPartialReadResidue() {
                   "module failed verifier after partial read cleanup test");
 }
 
+bool testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-dead-value-range", context);
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "final_cleanup_dead_value_range", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rbx->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *insert =
+      notdec::bin2llvm::getOrInsertNativeRegisterValueInsert(
+          module, llvm::Type::getInt64Ty(context),
+          llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Value *low = builder.CreateCall(
+      partialRead,
+      {rbx, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  llvm::Value *high = builder.CreateCall(
+      partialRead,
+      {rbx, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)});
+  llvm::Value *full = builder.CreateCall(
+      insert,
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), low,
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  full = builder.CreateCall(
+      insert,
+      {full, high,
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)});
+  (void)full;
+  builder.CreateRetVoid();
+
+  llvm::LLVMContext &moduleContext = module.getContext();
+  llvm::Metadata *field[] = {
+      llvm::MDString::get(moduleContext, "loads_replaced=0"),
+  };
+  function->setMetadata("notdec.register.summary_ssa",
+                        llvm::MDNode::get(moduleContext, field));
+
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+
+  return expect(cleanup.ValueRangeHelpersLowered == 2,
+                "dead value range helpers were not lowered") &&
+         expect(cleanup.DeadRegisterReadsRemoved == 2,
+                "dead partial reads after value range lowering remained") &&
+         expect(module.getGlobalVariable("RBX") == nullptr,
+                "dead RBX global remained after value range cleanup") &&
+         expect(!functionHasAnyRegisterSummaryMetadata(*function),
+                "metadata remained after dead value range cleanup") &&
+         expect(cleanup.RemainingRegisterAccesses == 0,
+                "dead value range cleanup left register residue") &&
+         verifyOk(module,
+                  "module failed verifier after dead value range cleanup test");
+}
+
 bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-globaldce", context);
@@ -6552,6 +6726,62 @@ bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
                   "module failed verifier after globaldce cleanup test");
 }
 
+bool testFinalCleanupLowersValueRangeHelpers() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-value-range", context);
+
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)},
+      false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage,
+      "final_cleanup_value_range", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Argument *arg = function->getArg(0);
+  llvm::Function *extract =
+      notdec::bin2llvm::getOrInsertNativeRegisterValueExtract(
+          module, llvm::Type::getInt64Ty(context),
+          llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *insert =
+      notdec::bin2llvm::getOrInsertNativeRegisterValueInsert(
+          module, llvm::Type::getInt64Ty(context),
+          llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Value *low = builder.CreateCall(
+      extract,
+      {arg, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  llvm::Value *full = builder.CreateCall(
+      insert,
+      {arg, low, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateStore(full, sink);
+  builder.CreateRetVoid();
+
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+
+  bool hasValueRangeCall = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    hasValueRangeCall |=
+        call != nullptr && call->getCalledFunction() != nullptr &&
+        notdec::bin2llvm::isNativeRegisterValueRangeName(
+            call->getCalledFunction()->getName());
+  }
+
+  return expect(cleanup.ValueRangeHelpersLowered == 2,
+                "value range helpers were not lowered") &&
+         expect(!hasValueRangeCall, "value range helper call remained") &&
+         expect(!moduleHasFunctionNamed(module, "notdec.reg.extract.i64.i32"),
+                "value range extract declaration remained") &&
+         expect(!moduleHasFunctionNamed(module, "notdec.reg.insert.i64.i32"),
+                "value range insert declaration remained") &&
+         verifyOk(module,
+                  "module failed verifier after value range helper cleanup");
+}
+
 } // namespace
 
 int main() {
@@ -6563,6 +6793,7 @@ int main() {
   ok &= testSelfOnlyPhiBecomesFrozenPoison();
   ok &= testFsOffsetPreservedAcrossExternalCall();
   ok &= testPreservedCallKeepsPreviousValue();
+  ok &= testRewrittenExternalCallPreservesUnaffectedRegister();
   ok &= testDemandedReturnCreatesCallValue();
   ok &= testExternalReturnUsesRangeCallValue();
   ok &= testIndirectCallReturnHelperIsRewritten();
@@ -6608,6 +6839,7 @@ int main() {
   ok &= testForeignArgumentInMovedBodyIsReplaced();
   ok &= testForeignMappedCallArgumentIsLocalized();
   ok &= testStaticRspStackRewriteKeepsSavedRegisterEvidence();
+  ok &= testCallerSavedEntryStackSpillCountsAsReadEntry();
   ok &= testFramePointerLoadFeedsStackRewriteWithoutGlobalIgnore();
   ok &= testFramePointerRewriteDoesNotHideRbpRegisterFlow();
   ok &= testSummarySSARemovesDeadStackFrameStore();
@@ -6615,6 +6847,7 @@ int main() {
   ok &= testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall();
   ok &= testNoReturnExternalDoesNotCreateSummaryReturn();
   ok &= testStackCanaryCheckIsRemoved();
+  ok &= testStackCanaryPrologueSaveIsRemoved();
   ok &= testStackCanaryZextConditionIsRemoved();
   ok &= testStackCanaryMaskedSavedLoadIsRemoved();
   ok &= testStackCanaryFailSideEffectIsKept();
@@ -6661,6 +6894,8 @@ int main() {
   ok &= testFinalCleanupKeepsMetadataWhenRegisterAccessRemains();
   ok &= testFinalCleanupCountsPartialWriteResidue();
   ok &= testFinalCleanupCountsPartialReadResidue();
+  ok &= testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
+  ok &= testFinalCleanupLowersValueRangeHelpers();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

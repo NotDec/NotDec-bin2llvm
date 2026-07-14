@@ -4,6 +4,7 @@
 #include "notdec-bin2llvm/NativeExternalPrototype.h"
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
+#include "notdec-bin2llvm/NativeRegisterValueRange.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
@@ -480,6 +481,10 @@ std::map<llvm::Value *, llvm::APInt> computeValueDemands(
       continue;
     }
     if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+      if (parseNativeRegisterValueExtract(*call) ||
+          parseNativeRegisterValueInsert(*call)) {
+        continue;
+      }
       if (parseNativeRegisterPartialRead(*call)) {
         continue;
       }
@@ -697,7 +702,8 @@ registerStore(llvm::StoreInst &store,
 bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
   llvm::Function *callee = call.getCalledFunction();
   return callee != nullptr &&
-         callee->getName().starts_with("notdec.register.");
+         (callee->getName().starts_with("notdec.register.") ||
+          isNativeRegisterValueRangeName(callee->getName()));
 }
 
 bool isAnalyzableCall(const llvm::Instruction &inst) {
@@ -1494,7 +1500,8 @@ private:
               fixedEntryStackSlot(store->getPointerOperand(), state)) {
         std::optional<ValueOrigin> origin =
             entryValueOrigin(store->getValueOperand(), state);
-        if (origin && origin->Offset == 0) {
+        if (origin && origin->Offset == 0 &&
+            canTrackSavedEntryRegister(origin->Base)) {
           state.StackSlots[*slot] = origin->Base;
         } else {
           markEntryValueRead(store->getValueOperand(), state);
@@ -1573,6 +1580,16 @@ private:
     }
     auto it = UnitsByName.find(Abi.StackPointer);
     return it == UnitsByName.end() ? nullptr : it->second;
+  }
+
+  bool canTrackSavedEntryRegister(llvm::GlobalVariable *global) const {
+    auto unitIt = Units.find(global);
+    if (unitIt == Units.end()) {
+      return false;
+    }
+    const RegisterUnit &unit = unitIt->second;
+    return unit.Name != Abi.StackPointer &&
+           Abi.Unaffected.count(unit.Name) != 0;
   }
 
   std::optional<ValueOrigin> entryValueOrigin(llvm::Value *value,

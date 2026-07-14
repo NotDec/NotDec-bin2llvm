@@ -5,13 +5,16 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
 
@@ -843,6 +846,58 @@ void eraseDeadLoadAndPointer(llvm::LoadInst &load) {
   llvm::RecursivelyDeleteTriviallyDeadInstructions(pointer);
 }
 
+bool samePointerValue(llvm::Value *lhs, llvm::Value *rhs) {
+  return lhs != nullptr && rhs != nullptr &&
+         lhs->stripPointerCasts() == rhs->stripPointerCasts();
+}
+
+llvm::StoreInst *findSavedCanaryStore(llvm::LoadInst &savedLoad) {
+  if (savedLoad.getParent() == nullptr) {
+    return nullptr;
+  }
+  llvm::Function *function = savedLoad.getFunction();
+  if (function == nullptr) {
+    return nullptr;
+  }
+
+  llvm::DominatorTree dominators(*function);
+  llvm::StoreInst *match = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store == nullptr || store->isVolatile() || store->isAtomic()) {
+      continue;
+    }
+    if (!samePointerValue(store->getPointerOperand(),
+                          savedLoad.getPointerOperand())) {
+      continue;
+    }
+    if (!dominators.dominates(store, &savedLoad)) {
+      continue;
+    }
+    auto *storedLoad = llvm::dyn_cast<llvm::LoadInst>(store->getValueOperand());
+    if (storedLoad == nullptr || !findFsCanaryAddress(*storedLoad)) {
+      continue;
+    }
+    if (match != nullptr) {
+      return nullptr;
+    }
+    match = store;
+  }
+  return match;
+}
+
+void eraseSavedCanaryStore(llvm::LoadInst &savedLoad) {
+  llvm::StoreInst *store = findSavedCanaryStore(savedLoad);
+  if (store == nullptr || store->getParent() == nullptr) {
+    return;
+  }
+  auto *storedLoad = llvm::dyn_cast<llvm::LoadInst>(store->getValueOperand());
+  store->eraseFromParent();
+  if (storedLoad != nullptr) {
+    eraseDeadLoadAndPointer(*storedLoad);
+  }
+}
+
 void eraseDeadFlagStoreAndValue(llvm::StoreInst &store) {
   if (store.getParent() == nullptr) {
     return;
@@ -919,6 +974,9 @@ bool eraseStackCanaryPredecessor(llvm::BranchInst &branch,
 
   llvm::BasicBlock *checkBlock = branch.getParent();
   llvm::Value *oldCondition = branch.getCondition();
+  llvm::WeakTrackingVH savedLoadHandle(savedLoad);
+  llvm::WeakTrackingVH fsCanaryLoadHandle(fsCanaryLoad);
+  eraseSavedCanaryStore(*savedLoad);
   fail.removePredecessor(checkBlock);
   llvm::IRBuilder<> builder(&branch);
   builder.CreateBr(success);
@@ -928,8 +986,14 @@ bool eraseStackCanaryPredecessor(llvm::BranchInst &branch,
   if (condition->FlagStore != nullptr) {
     eraseDeadFlagStoreAndValue(*condition->FlagStore);
   }
-  eraseDeadLoadAndPointer(*savedLoad);
-  eraseDeadLoadAndPointer(*fsCanaryLoad);
+  if (auto *remainingSavedLoad =
+          llvm::dyn_cast_or_null<llvm::LoadInst>(savedLoadHandle)) {
+    eraseDeadLoadAndPointer(*remainingSavedLoad);
+  }
+  if (auto *remainingFsCanaryLoad =
+          llvm::dyn_cast_or_null<llvm::LoadInst>(fsCanaryLoadHandle)) {
+    eraseDeadLoadAndPointer(*remainingFsCanaryLoad);
+  }
 
   size_t blockCountBefore = function->size();
   if (llvm::removeUnreachableBlocks(*function) &&

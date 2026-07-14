@@ -7,6 +7,7 @@ add_library(notdec-bin2llvm-core STATIC
   NativePrototypeModel.cpp
   NativeRegisterPartialRead.cpp
   NativeRegisterPartialWrite.cpp
+  NativeRegisterValueRange.cpp
   Pcode.cpp
   PcodeToLLVM.cpp
   passes/heritage/NativePrototypeRecovery.cpp

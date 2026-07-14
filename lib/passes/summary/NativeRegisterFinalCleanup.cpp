@@ -2,10 +2,13 @@
 
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
+#include "notdec-bin2llvm/NativeRegisterValueRange.h"
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -13,6 +16,8 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/GlobalDCE.h"
+#include "llvm/Transforms/Scalar/ADCE.h"
+#include "llvm/Transforms/Scalar/DCE.h"
 
 #include <array>
 #include <vector>
@@ -65,8 +70,117 @@ bool isRegisterHelperCall(const llvm::Instruction &inst) {
   llvm::Function *callee = call->getCalledFunction();
   return (callee != nullptr &&
           callee->getName().starts_with("notdec.register.")) ||
+         parseNativeRegisterValueExtract(*call).has_value() ||
+         parseNativeRegisterValueInsert(*call).has_value() ||
          parseNativeRegisterPartialRead(*call).has_value() ||
          parseNativeRegisterPartialWrite(*call).has_value();
+}
+
+llvm::APInt partialWriteMask(unsigned fullWidth, unsigned writeWidth,
+                             uint64_t bitOffset) {
+  if (fullWidth == 0 || writeWidth == 0 || bitOffset >= fullWidth ||
+      bitOffset + writeWidth > fullWidth) {
+    return llvm::APInt(fullWidth, 0);
+  }
+  return llvm::APInt::getLowBitsSet(fullWidth, writeWidth).shl(bitOffset);
+}
+
+llvm::Value *lowerValueExtract(llvm::CallBase &call,
+                               const NativeRegisterValueExtractInfo &info) {
+  auto *sourceType = llvm::dyn_cast<llvm::IntegerType>(info.FullValue->getType());
+  auto *resultType = llvm::dyn_cast<llvm::IntegerType>(call.getType());
+  if (sourceType == nullptr || resultType == nullptr ||
+      sourceType->getBitWidth() != info.FullWidth ||
+      resultType->getBitWidth() != info.ReadWidth) {
+    return nullptr;
+  }
+  if (info.BitOffset == 0 && info.ReadWidth == info.FullWidth) {
+    return info.FullValue;
+  }
+  llvm::IRBuilder<> builder(&call);
+  llvm::Value *bits = info.FullValue;
+  if (info.BitOffset != 0) {
+    bits = builder.CreateLShr(
+        bits, llvm::ConstantInt::get(sourceType, info.BitOffset),
+        "notdec.reg.extract.lower.shift");
+  }
+  if (bits->getType() != resultType) {
+    bits = builder.CreateTrunc(bits, resultType,
+                               "notdec.reg.extract.lower");
+  }
+  return bits;
+}
+
+llvm::Value *lowerValueInsert(llvm::CallBase &call,
+                              const NativeRegisterValueInsertInfo &info) {
+  auto *baseType = llvm::dyn_cast<llvm::IntegerType>(info.Base->getType());
+  auto *valueType = llvm::dyn_cast<llvm::IntegerType>(info.Value->getType());
+  if (baseType == nullptr || valueType == nullptr ||
+      call.getType() != baseType || baseType->getBitWidth() != info.FullWidth ||
+      valueType->getBitWidth() != info.WriteWidth) {
+    return nullptr;
+  }
+  if (info.BitOffset == 0 && info.WriteWidth == info.FullWidth &&
+      info.Value->getType() == baseType) {
+    return info.Value;
+  }
+  llvm::APInt writeMask =
+      partialWriteMask(info.FullWidth, info.WriteWidth, info.BitOffset);
+  if (writeMask.isZero()) {
+    return nullptr;
+  }
+  llvm::IRBuilder<> builder(&call);
+  llvm::Value *wide = builder.CreateZExtOrTrunc(
+      info.Value, baseType, "notdec.reg.insert.lower.wide");
+  if (info.BitOffset != 0) {
+    wide = builder.CreateShl(
+        wide, llvm::ConstantInt::get(baseType, info.BitOffset),
+        "notdec.reg.insert.lower.shift");
+  }
+  wide = builder.CreateAnd(wide, llvm::ConstantInt::get(baseType, writeMask),
+                           "notdec.reg.insert.lower.bits");
+  llvm::Value *kept = builder.CreateAnd(
+      info.Base, llvm::ConstantInt::get(baseType, ~writeMask),
+      "notdec.reg.insert.lower.keep");
+  return builder.CreateOr(kept, wide, "notdec.reg.insert.lower");
+}
+
+uint64_t lowerValueRangeHelpers(llvm::Module &module) {
+  std::vector<llvm::CallBase *> calls;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call != nullptr && (parseNativeRegisterValueExtract(*call) ||
+                              parseNativeRegisterValueInsert(*call))) {
+        calls.push_back(call);
+      }
+    }
+  }
+
+  uint64_t lowered = 0;
+  for (llvm::CallBase *call : calls) {
+    if (call->getParent() == nullptr) {
+      continue;
+    }
+    llvm::Value *replacement = nullptr;
+    if (std::optional<NativeRegisterValueExtractInfo> extract =
+            parseNativeRegisterValueExtract(*call)) {
+      replacement = lowerValueExtract(*call, *extract);
+    } else if (std::optional<NativeRegisterValueInsertInfo> insert =
+                   parseNativeRegisterValueInsert(*call)) {
+      replacement = lowerValueInsert(*call, *insert);
+    }
+    if (replacement == nullptr) {
+      continue;
+    }
+    call->replaceAllUsesWith(replacement);
+    call->eraseFromParent();
+    ++lowered;
+  }
+  return lowered;
 }
 
 uint64_t eraseDeadRegisterReads(llvm::Module &module) {
@@ -126,6 +240,7 @@ uint64_t eraseUnusedRegisterHelperDeclarations(llvm::Module &module) {
     }
     llvm::StringRef name = function.getName();
     if (name.starts_with("notdec.register.summary_") ||
+        isNativeRegisterValueRangeName(name) ||
         isNativeRegisterPartialReadName(name) ||
         isNativeRegisterPartialWriteName(name)) {
       deadHelpers.push_back(&function);
@@ -207,6 +322,30 @@ void runGlobalDCE(llvm::Module &module) {
   passes.run(module, moduleAnalysis);
 }
 
+void runLocalDeadCodeCleanup(llvm::Module &module) {
+  llvm::LoopAnalysisManager loopAnalysis;
+  llvm::FunctionAnalysisManager functionAnalysis;
+  llvm::CGSCCAnalysisManager cgsccAnalysis;
+  llvm::ModuleAnalysisManager moduleAnalysis;
+
+  llvm::PassBuilder builder;
+  builder.registerModuleAnalyses(moduleAnalysis);
+  builder.registerCGSCCAnalyses(cgsccAnalysis);
+  builder.registerFunctionAnalyses(functionAnalysis);
+  builder.registerLoopAnalyses(loopAnalysis);
+  builder.crossRegisterProxies(loopAnalysis, functionAnalysis, cgsccAnalysis,
+                               moduleAnalysis);
+
+  llvm::FunctionPassManager passes;
+  passes.addPass(llvm::DCEPass());
+  passes.addPass(llvm::ADCEPass());
+  for (llvm::Function &function : module) {
+    if (!function.isDeclaration()) {
+      passes.run(function, functionAnalysis);
+    }
+  }
+}
+
 } // namespace
 
 NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
@@ -216,7 +355,10 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   if (options.RunGlobalDCE) {
     runGlobalDCE(module);
   }
+  summary.ValueRangeHelpersLowered += lowerValueRangeHelpers(module);
+  runLocalDeadCodeCleanup(module);
   summary.DeadRegisterReadsRemoved += eraseDeadRegisterReads(module);
+  runLocalDeadCodeCleanup(module);
   summary.RegisterGlobalsRemoved += eraseUnusedRegisterGlobals(module);
   summary.HelperDeclarationsRemoved +=
       eraseUnusedRegisterHelperDeclarations(module);
@@ -255,6 +397,7 @@ void printNativeRegisterFinalCleanupSummary(
      << summary.DeadRegisterReadsRemoved
      << " register_globals_removed=" << summary.RegisterGlobalsRemoved
      << " helper_declarations_removed=" << summary.HelperDeclarationsRemoved
+     << " value_range_helpers_lowered=" << summary.ValueRangeHelpersLowered
      << " function_metadata_cleared=" << summary.FunctionMetadataCleared
      << " instruction_metadata_cleared=" << summary.InstructionMetadataCleared
      << " remaining_register_accesses=" << summary.RemainingRegisterAccesses

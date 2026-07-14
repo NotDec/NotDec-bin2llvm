@@ -4,6 +4,7 @@
 #include "notdec-bin2llvm/NativeExternalPrototype.h"
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
+#include "notdec-bin2llvm/NativeRegisterValueRange.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
@@ -399,6 +400,7 @@ bool isUnknownExternalFunction(const llvm::Function &function,
                                const NativeExternalPrototypeMap &prototypes) {
   return function.isDeclaration() && !function.isIntrinsic() &&
          !function.getName().starts_with("notdec.register.") &&
+         !isNativeRegisterValueRangeName(function.getName()) &&
          !isNativeRegisterPartialReadName(function.getName()) &&
          !isNativeRegisterPartialWriteName(function.getName()) &&
          !isKnownExternalFunction(function, prototypes);
@@ -739,6 +741,8 @@ bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
 
 bool isAnalyzableCall(const llvm::CallBase &call) {
   if (isNotDecRegisterHelperCall(call) ||
+      parseNativeRegisterValueExtract(call).has_value() ||
+      parseNativeRegisterValueInsert(call).has_value() ||
       parseNativeRegisterPartialRead(call).has_value() ||
       parseNativeRegisterPartialWrite(call).has_value()) {
     return false;
@@ -1878,6 +1882,7 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
   for (llvm::Function &function : module) {
     if (function.isIntrinsic() ||
         function.getName().starts_with("notdec.register.") ||
+        isNativeRegisterValueRangeName(function.getName()) ||
         isNativeRegisterPartialReadName(function.getName()) ||
         isNativeRegisterPartialWriteName(function.getName())) {
       continue;
@@ -2148,21 +2153,65 @@ private:
       return nullptr;
     }
 
-    llvm::IRBuilder<> builder(before);
-    llvm::Value *wideValue = builder.CreateZExtOrTrunc(
-        partialValue, baseType, unit.Name + ".partial_wide");
-    if (bitOffset != 0) {
-      wideValue = builder.CreateShl(wideValue,
-                                    llvm::ConstantInt::get(baseType, bitOffset),
-                                    unit.Name + ".partial_shift");
+    (void)writeMask;
+    return insertBitsIntoInteger(oldValue, partialValue, writeWidth, bitOffset,
+                                 before, unit.Name + ".partial_write");
+  }
+
+  llvm::Value *insertBitsIntoInteger(llvm::Value *base, llvm::Value *value,
+                                     unsigned writeWidth, uint64_t bitOffset,
+                                     llvm::Instruction *before,
+                                     llvm::Twine name) {
+    if (base == nullptr || value == nullptr || before == nullptr ||
+        writeWidth == 0) {
+      return nullptr;
     }
-    wideValue = builder.CreateAnd(wideValue,
-                                  llvm::ConstantInt::get(baseType, writeMask),
-                                  unit.Name + ".partial_bits");
-    llvm::Value *keptValue = builder.CreateAnd(
-        oldValue, llvm::ConstantInt::get(baseType, ~writeMask),
-        unit.Name + ".partial_keep");
-    return builder.CreateOr(keptValue, wideValue, unit.Name + ".partial_write");
+    auto *baseType = llvm::dyn_cast<llvm::IntegerType>(base->getType());
+    if (baseType == nullptr || value->getType() == nullptr ||
+        !value->getType()->isIntegerTy() ||
+        value->getType()->getIntegerBitWidth() != writeWidth ||
+        bitOffset + writeWidth > baseType->getBitWidth()) {
+      return nullptr;
+    }
+    if (bitOffset == 0 && writeWidth == baseType->getBitWidth() &&
+        value->getType() == baseType) {
+      return value;
+    }
+
+    llvm::IRBuilder<> builder(before);
+    llvm::Function *callee = getOrInsertNativeRegisterValueInsert(
+        *Function.getParent(), baseType, value->getType(),
+        baseType->getBitWidth(), writeWidth);
+    llvm::Value *offset = llvm::ConstantInt::get(
+        llvm::Type::getInt64Ty(Function.getContext()), bitOffset);
+    return builder.CreateCall(callee, {base, value, offset}, name);
+  }
+
+  llvm::Value *extractBitsFromIntegerValue(llvm::Value *value,
+                                           unsigned readWidth,
+                                           uint64_t bitOffset,
+                                           llvm::Instruction *before,
+                                           llvm::Twine name) {
+    if (value == nullptr || before == nullptr) {
+      return nullptr;
+    }
+    auto *sourceType = llvm::dyn_cast<llvm::IntegerType>(value->getType());
+    if (sourceType == nullptr || readWidth == 0 ||
+        bitOffset + readWidth > sourceType->getBitWidth()) {
+      return nullptr;
+    }
+    auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
+    if (bitOffset == 0 && resultType == sourceType) {
+      return value;
+    }
+
+    llvm::IRBuilder<> builder(before);
+    llvm::Function *callee = getOrInsertNativeRegisterValueExtract(
+        *Function.getParent(), sourceType, resultType,
+        sourceType->getBitWidth(), readWidth);
+    llvm::Value *offset = llvm::ConstantInt::get(
+        llvm::Type::getInt64Ty(Function.getContext()), bitOffset);
+    return builder.CreateCall(callee, {value, offset}, name);
   }
 
   llvm::Value *extractPartialRegisterValue(const RegisterUnit &unit,
@@ -2179,15 +2228,8 @@ private:
         readWidth == 0 || bitOffset + readWidth > baseType->getBitWidth()) {
       return nullptr;
     }
-    llvm::IRBuilder<> builder(before);
-    llvm::Value *value = fullValue;
-    if (bitOffset != 0) {
-      value =
-          builder.CreateLShr(value, llvm::ConstantInt::get(baseType, bitOffset),
-                             unit.Name + ".partial_read_shift");
-    }
-    auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
-    return builder.CreateTrunc(value, resultType, unit.Name + ".partial_read");
+    return extractBitsFromIntegerValue(fullValue, readWidth, bitOffset, before,
+                                       unit.Name + ".partial_read");
   }
 
   llvm::Value *extractBitsFromInteger(llvm::Value *value, unsigned readWidth,
@@ -2202,18 +2244,8 @@ private:
         bitOffset + readWidth > sourceType->getBitWidth()) {
       return nullptr;
     }
-    llvm::IRBuilder<> builder(before);
-    llvm::Value *result = value;
-    if (bitOffset != 0) {
-      result = builder.CreateLShr(result,
-                                  llvm::ConstantInt::get(sourceType, bitOffset),
-                                  name + ".shift");
-    }
-    auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
-    if (result->getType() == resultType) {
-      return result;
-    }
-    return builder.CreateTrunc(result, resultType, name);
+    return extractBitsFromIntegerValue(value, readWidth, bitOffset, before,
+                                       name);
   }
 
   void eraseTriviallyDeadNonPhiTree(llvm::Instruction *root) {
@@ -2320,6 +2352,26 @@ private:
         result = fullMaskFor(value);
         knownMasks.emplace(value, result);
         return result;
+      }
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(inst)) {
+        if (std::optional<NativeRegisterValueExtractInfo> extract =
+                parseNativeRegisterValueExtract(*call)) {
+          result = fullMaskFor(value);
+          knownMasks.emplace(value, result);
+          return result;
+        }
+        if (std::optional<NativeRegisterValueInsertInfo> insert =
+                parseNativeRegisterValueInsert(*call)) {
+          llvm::APInt baseMask = knownValueMask(insert->Base);
+          llvm::APInt valueMask = knownValueMask(insert->Value);
+          llvm::APInt writeMask = partialWriteMask(
+              insert->FullWidth, insert->WriteWidth, insert->BitOffset);
+          result = (baseMask & ~writeMask) |
+                   shiftedMask(valueMask, insert->BitOffset,
+                               insert->FullWidth);
+          knownMasks.emplace(value, result);
+          return result;
+        }
       }
       auto computeUnaryMask = [&](unsigned operandIndex) -> llvm::APInt {
         return knownValueMask(inst->getOperand(operandIndex));
@@ -2455,6 +2507,10 @@ private:
         continue;
       }
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (parseNativeRegisterValueExtract(*call) ||
+            parseNativeRegisterValueInsert(*call)) {
+          continue;
+        }
         for (llvm::Use &operand : call->args()) {
           seedOperand(operand.get());
         }
@@ -2506,6 +2562,25 @@ private:
         continue;
       }
       llvm::APInt inputDemand = demand;
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(inst)) {
+        if (std::optional<NativeRegisterValueExtractInfo> extract =
+                parseNativeRegisterValueExtract(*call)) {
+          enqueue(extract->FullValue,
+                  shiftedMask(inputDemand, extract->BitOffset,
+                              extract->FullWidth));
+          continue;
+        }
+        if (std::optional<NativeRegisterValueInsertInfo> insert =
+                parseNativeRegisterValueInsert(*call)) {
+          llvm::APInt writeMask = partialWriteMask(
+              insert->FullWidth, insert->WriteWidth, insert->BitOffset);
+          enqueue(insert->Base, inputDemand & ~writeMask);
+          enqueue(insert->Value,
+                  shlSourceDemand(inputDemand & writeMask, insert->BitOffset,
+                                  insert->WriteWidth));
+          continue;
+        }
+      }
       switch (inst->getOpcode()) {
       case llvm::Instruction::Trunc:
         enqueue(inst->getOperand(0), inputDemand);
@@ -3050,6 +3125,130 @@ private:
     return result;
   }
 
+  static bool rangeContains(const RegisterRangeKey &outer,
+                            const RegisterRangeKey &inner) {
+    return outer.Global == inner.Global && outer.BitOffset <= inner.BitOffset &&
+           inner.BitOffset + inner.BitWidth <= outer.BitOffset + outer.BitWidth;
+  }
+
+  static bool rangeContainsAccess(const RegisterRangeKey &range,
+                                  llvm::GlobalVariable *global,
+                                  uint64_t offset, uint32_t width) {
+    return range.Global == global && range.BitOffset <= offset &&
+           offset + width <= range.BitOffset + range.BitWidth;
+  }
+
+  llvm::Value *materializeCoveredAccess(const RangedSSAValue &def,
+                                        uint64_t readOffset,
+                                        uint32_t readWidth,
+                                        llvm::Instruction *before,
+                                        llvm::Twine name) {
+    llvm::Value *value = resolve(def.Value);
+    if (value == nullptr || before == nullptr ||
+        valueBitWidth(value) != def.CoveredRange.BitWidth ||
+        !rangeContainsAccess(def.CoveredRange, def.CoveredRange.Global,
+                             readOffset, readWidth)) {
+      return nullptr;
+    }
+    if (def.CoveredRange.BitOffset == readOffset &&
+        def.CoveredRange.BitWidth == readWidth) {
+      return value;
+    }
+    return extractBitsFromIntegerValue(
+        value, readWidth, readOffset - def.CoveredRange.BitOffset, before,
+        name);
+  }
+
+  llvm::Value *tryCurrentCoveredAccess(llvm::GlobalVariable *global,
+                                       uint64_t readOffset,
+                                       uint32_t readWidth,
+                                       llvm::Instruction *before,
+                                       llvm::Twine name) {
+    if (global == nullptr || before == nullptr || readWidth == 0 ||
+        before->getParent() == nullptr) {
+      return nullptr;
+    }
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(global, readOffset, readWidth);
+    if (ranges.empty() ||
+        !transferRangeBlockUntil(*before->getParent(), before)) {
+      return nullptr;
+    }
+
+    const RangedSSAValue *first = nullptr;
+    llvm::Value *firstValue = nullptr;
+    for (const RegisterRangeKey &range : ranges) {
+      auto it = CurrentDef.find({before->getParent(), range});
+      if (it == CurrentDef.end()) {
+        return nullptr;
+      }
+      llvm::Value *value = resolve(it->second.Value);
+      if (value == nullptr ||
+          !rangeContainsAccess(it->second.CoveredRange, global, readOffset,
+                               readWidth)) {
+        return nullptr;
+      }
+      if (first == nullptr) {
+        first = &it->second;
+        firstValue = value;
+        continue;
+      }
+      if (firstValue != value ||
+          !(first->CoveredRange == it->second.CoveredRange)) {
+        return nullptr;
+      }
+    }
+    return first == nullptr ? nullptr
+                            : materializeCoveredAccess(*first, readOffset,
+                                                        readWidth, before,
+                                                        name);
+  }
+
+  llvm::Value *tryCommonExtractSourceAccess(
+      llvm::ArrayRef<RegisterRangeKey> ranges,
+      llvm::ArrayRef<llvm::Value *> segments, uint64_t readOffset,
+      uint32_t readWidth, llvm::Instruction *before, llvm::Twine name) {
+    if (ranges.empty() || ranges.size() != segments.size() ||
+        before == nullptr || readWidth == 0) {
+      return nullptr;
+    }
+    llvm::Value *source = nullptr;
+    uint32_t sourceWidth = 0;
+    for (auto it : llvm::enumerate(ranges)) {
+      llvm::Value *segment = resolve(segments[it.index()]);
+      auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(segment);
+      if (call == nullptr) {
+        return nullptr;
+      }
+      std::optional<NativeRegisterValueExtractInfo> extract =
+          parseNativeRegisterValueExtract(*call);
+      if (!extract || extract->BitOffset != it.value().BitOffset ||
+          extract->ReadWidth != it.value().BitWidth) {
+        return nullptr;
+      }
+      llvm::Value *candidate = resolve(extract->FullValue);
+      if (candidate == nullptr) {
+        return nullptr;
+      }
+      if (source == nullptr) {
+        source = candidate;
+        sourceWidth = extract->FullWidth;
+        continue;
+      }
+      if (source != candidate || sourceWidth != extract->FullWidth) {
+        return nullptr;
+      }
+    }
+    if (source == nullptr || readOffset + readWidth > sourceWidth) {
+      return nullptr;
+    }
+    if (readOffset == 0 && readWidth == sourceWidth) {
+      return source;
+    }
+    return extractBitsFromIntegerValue(source, readWidth, readOffset, before,
+                                       name);
+  }
+
   llvm::Value *assembleRangeRead(const std::vector<RegisterRangeKey> &ranges,
                                  uint64_t readOffset, uint32_t readWidth,
                                  llvm::Instruction *before, llvm::Twine name) {
@@ -3062,8 +3261,9 @@ private:
     }
 
     auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
-    llvm::IRBuilder<> builder(before);
     llvm::Value *result = llvm::ConstantInt::get(resultType, 0);
+    std::vector<llvm::Value *> segments;
+    segments.reserve(ranges.size());
     for (const RegisterRangeKey &range : ranges) {
       llvm::Value *segment =
           readRangeBefore(*before->getParent(), range, before);
@@ -3071,15 +3271,21 @@ private:
       if (segment == nullptr || segment->getType() != rangeType(range)) {
         return nullptr;
       }
-      llvm::Value *wide =
-          builder.CreateZExtOrTrunc(segment, resultType, name + ".part_wide");
-      uint64_t shift = range.BitOffset - readOffset;
-      if (shift != 0) {
-        wide =
-            builder.CreateShl(wide, llvm::ConstantInt::get(resultType, shift),
-                              name + ".part_shift");
+      segments.push_back(segment);
+    }
+    if (llvm::Value *common = tryCommonExtractSourceAccess(
+            ranges, segments, readOffset, readWidth, before,
+            name + ".common_extract")) {
+      return common;
+    }
+    for (auto it : llvm::enumerate(ranges)) {
+      const RegisterRangeKey &range = it.value();
+      result = insertBitsIntoInteger(result, segments[it.index()], range.BitWidth,
+                                     range.BitOffset - readOffset, before,
+                                     name + ".part_insert");
+      if (result == nullptr) {
+        return nullptr;
       }
-      result = builder.CreateOr(result, wide, name + ".part_or");
     }
     return result;
   }
@@ -3087,6 +3293,11 @@ private:
   llvm::Value *readAccessRange(llvm::GlobalVariable *global,
                                uint64_t readOffset, uint32_t readWidth,
                                llvm::Instruction *before, llvm::Twine name) {
+    if (llvm::Value *covered =
+            tryCurrentCoveredAccess(global, readOffset, readWidth, before,
+                                    name + ".covered")) {
+      return covered;
+    }
     std::vector<RegisterRangeKey> ranges =
         plannedRangesCovering(global, readOffset, readWidth);
     return assembleRangeRead(ranges, readOffset, readWidth, before, name);
@@ -3140,20 +3351,23 @@ private:
       return segments.front();
     }
 
+    if (llvm::Value *common = tryCommonExtractSourceAccess(
+            ranges, segments, readOffset, readWidth, before,
+            name + ".common_extract")) {
+      return common;
+    }
+
     auto *resultType = llvm::IntegerType::get(Function.getContext(), readWidth);
-    llvm::IRBuilder<> builder(before);
     llvm::Value *result = llvm::ConstantInt::get(resultType, 0);
     for (auto it : llvm::enumerate(ranges)) {
       const RegisterRangeKey &range = it.value();
-      llvm::Value *wide = builder.CreateZExtOrTrunc(
-          segments[it.index()], resultType, name + ".part_wide");
-      uint64_t shift = range.BitOffset - readOffset;
-      if (shift != 0) {
-        wide =
-            builder.CreateShl(wide, llvm::ConstantInt::get(resultType, shift),
-                              name + ".part_shift");
+      result = insertBitsIntoInteger(result, segments[it.index()],
+                                     range.BitWidth,
+                                     range.BitOffset - readOffset, before,
+                                     name + ".part_insert");
+      if (result == nullptr) {
+        return nullptr;
       }
-      result = builder.CreateOr(result, wide, name + ".part_or");
     }
     return result;
   }
@@ -3162,6 +3376,11 @@ private:
   readAccessRangeIfDominating(llvm::GlobalVariable *global, uint64_t readOffset,
                               uint32_t readWidth, llvm::Instruction *before,
                               llvm::Twine name, llvm::DominatorTree &domTree) {
+    if (llvm::Value *covered =
+            tryCurrentCoveredAccess(global, readOffset, readWidth, before,
+                                    name + ".covered")) {
+      return covered;
+    }
     std::vector<RegisterRangeKey> ranges =
         plannedRangesCovering(global, readOffset, readWidth);
     return assembleRangeReadIfDominating(ranges, readOffset, readWidth, before,
@@ -3868,6 +4087,26 @@ private:
     return value;
   }
 
+  bool writeCoveredValue(llvm::Instruction &writeInst,
+                         const RegisterRangeKey &coveredRange,
+                         llvm::Value *value) {
+    value = resolve(value);
+    if (value == nullptr || valueBitWidth(value) != coveredRange.BitWidth) {
+      return false;
+    }
+    std::vector<RegisterRangeKey> ranges = plannedRangesCovering(
+        coveredRange.Global, coveredRange.BitOffset, coveredRange.BitWidth);
+    if (ranges.empty()) {
+      return false;
+    }
+    for (const RegisterRangeKey &range : ranges) {
+      CurrentDef[{writeInst.getParent(), range}] =
+          RangedSSAValue{value, coveredRange};
+      UnknownCurrentDef.erase({writeInst.getParent(), range});
+    }
+    return true;
+  }
+
   bool writeAccessRange(llvm::Instruction &writeInst,
                         llvm::GlobalVariable *global, uint64_t writeOffset,
                         uint32_t writeWidth, llvm::Value *source,
@@ -3881,6 +4120,12 @@ private:
     if (ranges.empty()) {
       return false;
     }
+    if (valueBitWidth(source) == writeWidth && sourceBitOffset == writeOffset) {
+      RegisterRangeKey coveredRange{global, writeOffset, writeWidth};
+      if (writeCoveredValue(writeInst, coveredRange, source)) {
+        return true;
+      }
+    }
     for (const RegisterRangeKey &range : ranges) {
       llvm::Value *segment =
           extractRangeValue(range, source, sourceBitOffset, insertBefore, name);
@@ -3892,18 +4137,25 @@ private:
   }
 
   llvm::Value *currentSegment(llvm::BasicBlock &block,
-                              const RegisterRangeKey &range) {
+                              const RegisterRangeKey &range,
+                              llvm::Instruction *before) {
     auto cached = CurrentDef.find({&block, range});
     if (cached == CurrentDef.end()) {
       return nullptr;
     }
     const RangedSSAValue &def = cached->second;
-    if (!(def.CoveredRange == range)) {
+    llvm::Value *value = resolve(def.Value);
+    if (value == nullptr) {
       return nullptr;
     }
-    llvm::Value *value = resolve(def.Value);
-    return value != nullptr && value->getType() == rangeType(range) ? value
-                                                                    : nullptr;
+    if (def.CoveredRange == range) {
+      return value->getType() == rangeType(range) ? value : nullptr;
+    }
+    if (!rangeContains(def.CoveredRange, range)) {
+      return nullptr;
+    }
+    return materializeCoveredAccess(def, range.BitOffset, range.BitWidth,
+                                    before, "range_segment");
   }
 
   void clearBlockRangeDefs(llvm::BasicBlock &block,
@@ -4067,7 +4319,7 @@ private:
     if (!transferRangeBlockUntil(block, before)) {
       return nullptr;
     }
-    if (llvm::Value *value = currentSegment(block, range)) {
+    if (llvm::Value *value = currentSegment(block, range, before)) {
       return value;
     }
     if (UnknownCurrentDef.count({&block, range}) != 0) {
@@ -4438,6 +4690,13 @@ private:
         SignatureState.RewrittenCalls.count(&call) != 0) {
       if (signatureReturnUsesUnit(const_cast<llvm::CallBase &>(call), unit)) {
         return CallRegisterEffect::ReturnValue;
+      }
+      if (isSegmentBaseUnit(unit.Name) ||
+          Abi.Unaffected.count(unit.Name) != 0) {
+        return CallRegisterEffect::Preserve;
+      }
+      if (Abi.KilledByCall.count(unit.Name) != 0) {
+        return CallRegisterEffect::Clobber;
       }
       return CallRegisterEffect::Unknown;
     }
@@ -5162,6 +5421,65 @@ llvm::Value *extractReturnRegister(llvm::IRBuilder<> &builder,
   return nullptr;
 }
 
+llvm::Module *moduleForBuilder(llvm::IRBuilder<> &builder) {
+  llvm::BasicBlock *block = builder.GetInsertBlock();
+  return block == nullptr ? nullptr : block->getModule();
+}
+
+llvm::Value *createValueRangeExtract(llvm::IRBuilder<> &builder,
+                                     llvm::Value *source, unsigned readWidth,
+                                     uint64_t bitOffset, llvm::Twine name) {
+  if (source == nullptr || !source->getType()->isIntegerTy() ||
+      readWidth == 0) {
+    return nullptr;
+  }
+  auto *sourceType = llvm::cast<llvm::IntegerType>(source->getType());
+  if (bitOffset + readWidth > sourceType->getBitWidth()) {
+    return nullptr;
+  }
+  auto *resultType = llvm::IntegerType::get(builder.getContext(), readWidth);
+  if (bitOffset == 0 && sourceType == resultType) {
+    return source;
+  }
+  llvm::Module *module = moduleForBuilder(builder);
+  if (module == nullptr) {
+    return nullptr;
+  }
+  llvm::Function *callee = getOrInsertNativeRegisterValueExtract(
+      *module, sourceType, resultType, sourceType->getBitWidth(), readWidth);
+  llvm::Value *offset = llvm::ConstantInt::get(
+      llvm::Type::getInt64Ty(builder.getContext()), bitOffset);
+  return builder.CreateCall(callee, {source, offset}, name);
+}
+
+llvm::Value *createValueRangeInsert(llvm::IRBuilder<> &builder,
+                                    llvm::Value *base, llvm::Value *value,
+                                    unsigned writeWidth,
+                                    uint64_t bitOffset, llvm::Twine name) {
+  if (base == nullptr || value == nullptr || !base->getType()->isIntegerTy() ||
+      !value->getType()->isIntegerTy() || writeWidth == 0 ||
+      value->getType()->getIntegerBitWidth() != writeWidth) {
+    return nullptr;
+  }
+  auto *baseType = llvm::cast<llvm::IntegerType>(base->getType());
+  if (bitOffset + writeWidth > baseType->getBitWidth()) {
+    return nullptr;
+  }
+  if (bitOffset == 0 && writeWidth == baseType->getBitWidth() &&
+      value->getType() == baseType) {
+    return value;
+  }
+  llvm::Module *module = moduleForBuilder(builder);
+  if (module == nullptr) {
+    return nullptr;
+  }
+  llvm::Function *callee = getOrInsertNativeRegisterValueInsert(
+      *module, baseType, value->getType(), baseType->getBitWidth(), writeWidth);
+  llvm::Value *offset = llvm::ConstantInt::get(
+      llvm::Type::getInt64Ty(builder.getContext()), bitOffset);
+  return builder.CreateCall(callee, {base, value, offset}, name);
+}
+
 llvm::Value *extractReturnRange(llvm::IRBuilder<> &builder,
                                 const SignatureShape &shape, llvm::Value &call,
                                 const RegisterRangeKey &range) {
@@ -5195,19 +5513,9 @@ llvm::Value *extractReturnRange(llvm::IRBuilder<> &builder,
         range.BitOffset + range.BitWidth > registerType->getBitWidth()) {
       return nullptr;
     }
-    llvm::Value *bits = registerValue;
-    if (range.BitOffset != 0) {
-      bits = builder.CreateLShr(
-          bits, llvm::ConstantInt::get(registerType, range.BitOffset),
-          slot.Unit->Name + ".ret_range_shift");
-    }
-    llvm::Type *rangeType =
-        llvm::IntegerType::get(builder.getContext(), range.BitWidth);
-    if (bits->getType() != rangeType) {
-      bits =
-          builder.CreateTrunc(bits, rangeType, slot.Unit->Name + ".ret_range");
-    }
-    return bits;
+    return createValueRangeExtract(builder, registerValue, range.BitWidth,
+                                   range.BitOffset,
+                                   slot.Unit->Name + ".ret_range");
   }
   return nullptr;
 }
@@ -5317,15 +5625,10 @@ llvm::Value *castSlotValueToRegister(llvm::IRBuilder<> &builder,
       llvm::IntegerType::get(builder.getContext(), slot.SizeBits);
   llvm::Value *bits =
       builder.CreateBitCast(value, intType, slot.Unit->Name + ".ret_bits");
-  if (slot.OffsetBits != 0) {
-    bits =
-        builder.CreateZExt(bits, registerType, slot.Unit->Name + ".ret_wide");
-    bits = builder.CreateShl(
-        bits, llvm::ConstantInt::get(registerType, slot.OffsetBits),
-        slot.Unit->Name + ".ret_shift");
-    return bits;
-  }
-  return builder.CreateZExt(bits, registerType, slot.Unit->Name + ".ret_wide");
+  llvm::Value *zero = llvm::ConstantInt::get(registerType, 0);
+  return createValueRangeInsert(builder, zero, bits, slot.SizeBits,
+                                slot.OffsetBits,
+                                slot.Unit->Name + ".ret_insert");
 }
 
 llvm::CallInst *rewriteCallInst(llvm::CallBase &oldCall, llvm::Value &callee,
@@ -5390,18 +5693,8 @@ llvm::Value *integerEntrySlotReplacement(llvm::Instruction &inst,
     if (argOffset + width > argType->getBitWidth()) {
       return nullptr;
     }
-    llvm::Value *value = &arg;
-    if (argOffset != 0) {
-      value =
-          builder.CreateLShr(value, llvm::ConstantInt::get(argType, argOffset),
-                             slot.Unit->Name + ".entry_arg_shift");
-    }
-    auto *resultType = llvm::IntegerType::get(arg.getContext(), width);
-    if (value->getType() != resultType) {
-      value = builder.CreateTrunc(value, resultType,
-                                  slot.Unit->Name + ".entry_arg");
-    }
-    return value;
+    return createValueRangeExtract(builder, &arg, width, argOffset,
+                                   slot.Unit->Name + ".entry_arg");
   };
 
   if (inst.getType() == arg.getType() && &inst == &entryLoad &&
@@ -5442,11 +5735,13 @@ llvm::Value *integerEntrySlotReplacement(llvm::Instruction &inst,
       if (narrow == nullptr) {
         return nullptr;
       }
-      llvm::Value *wide = builder.CreateZExtOrTrunc(
-          narrow, inst.getType(), slot.Unit->Name + ".entry_arg_wide");
-      return builder.CreateShl(wide,
-                               llvm::ConstantInt::get(inst.getType(), offset),
-                               slot.Unit->Name + ".entry_arg_shifted");
+      auto *instType = llvm::dyn_cast<llvm::IntegerType>(inst.getType());
+      if (instType == nullptr) {
+        return nullptr;
+      }
+      llvm::Value *zero = llvm::ConstantInt::get(instType, 0);
+      return createValueRangeInsert(builder, zero, narrow, width, offset,
+                                    slot.Unit->Name + ".entry_arg_shifted");
     }
   }
   auto *shift = llvm::dyn_cast<llvm::LShrOperator>(&inst);
@@ -5541,18 +5836,8 @@ llvm::Value *rangeEntrySlotReplacement(llvm::Instruction &inst,
   if (argOffset + width > argType->getBitWidth()) {
     return nullptr;
   }
-  llvm::Value *value = &arg;
-  if (argOffset != 0) {
-    value =
-        builder.CreateLShr(value, llvm::ConstantInt::get(argType, argOffset),
-                           slot.Unit->Name + ".range_entry_arg_shift");
-  }
-  auto *resultType = llvm::IntegerType::get(arg.getContext(), width);
-  if (value->getType() != resultType) {
-    value = builder.CreateTrunc(value, resultType,
-                                slot.Unit->Name + ".range_entry_arg");
-  }
-  return value;
+  return createValueRangeExtract(builder, &arg, width, argOffset,
+                                 slot.Unit->Name + ".range_entry_arg");
 }
 
 void rewriteInternalFunctionBody(llvm::Function &oldFunction,
@@ -5657,6 +5942,89 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
   }
 }
 
+unsigned integerBitWidthOf(llvm::Value *value) {
+  if (value == nullptr || value->getType() == nullptr ||
+      !value->getType()->isIntegerTy()) {
+    return 0;
+  }
+  return value->getType()->getIntegerBitWidth();
+}
+
+llvm::Value *resolveValueMap(llvm::Value *value,
+                             std::map<llvm::Value *, llvm::Value *> &valueMap) {
+  while (value != nullptr && valueMap.count(value) != 0 &&
+         valueMap[value] != value) {
+    value = valueMap[value];
+  }
+  return value;
+}
+
+bool collectInsertedExtractPieces(
+    llvm::Value *value, unsigned fullWidth,
+    std::map<llvm::Value *, llvm::Value *> &valueMap, llvm::Value *&source,
+    llvm::APInt &covered) {
+  value = resolveValueMap(value, valueMap);
+  if (auto *constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(value)) {
+    return constant->isZero() && constant->getBitWidth() == fullWidth;
+  }
+  auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
+  if (call == nullptr) {
+    return false;
+  }
+  std::optional<NativeRegisterValueInsertInfo> insert =
+      parseNativeRegisterValueInsert(*call);
+  if (!insert || insert->FullWidth != fullWidth) {
+    return false;
+  }
+  if (!collectInsertedExtractPieces(insert->Base, fullWidth, valueMap, source,
+                                    covered)) {
+    return false;
+  }
+
+  llvm::Value *piece = resolveValueMap(insert->Value, valueMap);
+  auto *extractCall = llvm::dyn_cast_or_null<llvm::CallBase>(piece);
+  std::optional<NativeRegisterValueExtractInfo> extract =
+      extractCall == nullptr ? std::nullopt
+                             : parseNativeRegisterValueExtract(*extractCall);
+  if (!extract || extract->FullWidth != fullWidth ||
+      extract->ReadWidth != insert->WriteWidth ||
+      extract->BitOffset != insert->BitOffset) {
+    return false;
+  }
+  llvm::Value *candidate = resolveValueMap(extract->FullValue, valueMap);
+  if (candidate == nullptr || integerBitWidthOf(candidate) != fullWidth) {
+    return false;
+  }
+  if (source == nullptr) {
+    source = candidate;
+  } else if (source != candidate) {
+    return false;
+  }
+  covered |= llvm::APInt::getLowBitsSet(fullWidth, insert->WriteWidth)
+                 .shl(insert->BitOffset);
+  return true;
+}
+
+llvm::Value *foldFullInsertOfExtracts(
+    llvm::Value *value, std::map<llvm::Value *, llvm::Value *> &valueMap) {
+  value = resolveValueMap(value, valueMap);
+  auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
+  std::optional<NativeRegisterValueInsertInfo> insert =
+      call == nullptr ? std::nullopt : parseNativeRegisterValueInsert(*call);
+  if (!insert || insert->FullWidth == 0) {
+    return value;
+  }
+  llvm::Value *source = nullptr;
+  llvm::APInt covered(insert->FullWidth, 0);
+  if (!collectInsertedExtractPieces(value, insert->FullWidth, valueMap, source,
+                                    covered) ||
+      source == nullptr || !covered.isAllOnes()) {
+    return value;
+  }
+  valueMap[value] = source;
+  return source;
+}
+
 void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
                             NativeRegisterSummarySSASummary &summary) {
   std::map<llvm::Function *, llvm::Function *> replacements;
@@ -5696,10 +6064,8 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
   std::vector<llvm::CallBase *> oldCallsToErase;
   std::vector<llvm::CallInst *> helpersToErase;
   auto remapValue = [&](llvm::Value *value) -> llvm::Value * {
-    while (valueMap.count(value) != 0 && valueMap[value] != value) {
-      value = valueMap[value];
-    }
-    return value;
+    value = resolveValueMap(value, valueMap);
+    return foldFullInsertOfExtracts(value, valueMap);
   };
 
   for (llvm::CallBase *oldCall : callsToRewrite) {
