@@ -1176,50 +1176,69 @@ SignatureShape shapeForInternalFunction(
               return lhs->Name < rhs->Name;
             });
 
+  const FunctionSummaryFacts &facts = factsIt->second;
+  std::set<std::string> addedParamUnits;
+
   // Internal native functions can be compiled with interprocedural register
   // allocation, so their real interface is not limited to the external ABI.
-  // Stay within ABI-described register classes, then let summary facts decide
-  // which registers are real inputs and demanded outputs.
-  for (const RegisterUnit *unit : orderedUnits) {
-    auto regIt = factsIt->second.Registers.find(unit->Name);
-    if (regIt == factsIt->second.Registers.end() || !regIt->second.ReadEntry) {
-      continue;
+  // The register summary decides which registers are real inputs; ABI order
+  // decides where those inputs appear in the rewritten LLVM function type.
+  auto addParamForUnit = [&](const RegisterUnit &unit,
+                             const AbiFacts::RegisterSlot *floatSlot) {
+    if (addedParamUnits.count(unit.Name) != 0) {
+      return;
     }
-    if (abi.InternalParamRegisters.count(unit->Name) == 0 &&
-        abi.InternalReturnRegisters.count(unit->Name) == 0) {
-      continue;
+    auto regIt = facts.Registers.find(unit.Name);
+    if (regIt == facts.Registers.end() || !regIt->second.ReadEntry) {
+      return;
     }
-    if (const AbiFacts::RegisterSlot *slot =
-            floatAbiInputSlotForUnit(abi, unit->Name)) {
-      if (std::optional<NativeSignatureSlot> floatSlot =
-              floatSlotForDemand(function.getContext(), *slot, units,
-                                 regIt->second.EntryDemandMask)) {
-        shape.Params.push_back(*floatSlot);
+    if (abi.InternalParamRegisters.count(unit.Name) == 0 &&
+        abi.InternalReturnRegisters.count(unit.Name) == 0) {
+      return;
+    }
+    if (floatSlot != nullptr) {
+      if (std::optional<NativeSignatureSlot> slot = floatSlotForDemand(
+              function.getContext(), *floatSlot, units,
+              regIt->second.EntryDemandMask)) {
+        shape.Params.push_back(*slot);
       } else if (regIt->second.EntryDemandMask.getBitWidth() != 0 &&
                  !regIt->second.EntryDemandMask.isZero()) {
         if (std::optional<NativeSignatureSlot> rangeSlot =
                 integerSlotForSingleDemandRange(
-                    *unit, regIt->second.EntryDemandMask)) {
+                    unit, regIt->second.EntryDemandMask)) {
           shape.Params.push_back(*rangeSlot);
         } else {
-          shape.Params.push_back(integerSignatureSlot(*unit));
+          shape.Params.push_back(integerSignatureSlot(unit));
         }
       } else {
         // ReadEntry already says the internal function needs an incoming
         // value.  If the demand walker did not recover a float lane mask, use
         // the backing register type rather than leaving an entry global load
         // in the IR.
-        shape.Params.push_back(integerSignatureSlot(*unit));
+        shape.Params.push_back(integerSignatureSlot(unit));
       }
-      continue;
-    }
-    if (std::optional<NativeSignatureSlot> rangeSlot =
-            integerSlotForSingleDemandRange(*unit,
-                                            regIt->second.EntryDemandMask)) {
+    } else if (std::optional<NativeSignatureSlot> rangeSlot =
+                   integerSlotForSingleDemandRange(
+                       unit, regIt->second.EntryDemandMask)) {
       shape.Params.push_back(*rangeSlot);
     } else {
-      shape.Params.push_back(integerSignatureSlot(*unit));
+      shape.Params.push_back(integerSignatureSlot(unit));
     }
+    addedParamUnits.insert(unit.Name);
+  };
+
+  for (const AbiFacts::RegisterSlot &slot : abi.IntegerInputsInOrder) {
+    if (const RegisterUnit *unit = unitByName(units, slot.UnitName)) {
+      addParamForUnit(*unit, nullptr);
+    }
+  }
+  for (const AbiFacts::RegisterSlot &slot : abi.FloatInputsInOrder) {
+    if (const RegisterUnit *unit = unitByName(units, slot.UnitName)) {
+      addParamForUnit(*unit, &slot);
+    }
+  }
+  for (const RegisterUnit *unit : orderedUnits) {
+    addParamForUnit(*unit, floatAbiInputSlotForUnit(abi, unit->Name));
   }
 
   for (const RegisterUnit *unit : orderedUnits) {

@@ -4371,6 +4371,60 @@ bool testInternalCallArgBindingsKeepLaterArgsAfterEntryInput() {
              "module failed verifier after internal entry-input call arg test");
 }
 
+bool testInternalSignatureParamsUseAbiOrder() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-internal-param-abi-order", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+  llvm::GlobalVariable *r9 = createRegisterGlobal(module, "R9");
+  llvm::GlobalVariable *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage,
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "notdec_native_param_order",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  llvm::Value *sum = loadRegister(builder, rcx, "RCX", "rcx.in");
+  sum = builder.CreateAdd(sum, loadRegister(builder, rdx, "RDX", "rdx.in"));
+  sum = builder.CreateAdd(sum, loadRegister(builder, rsi, "RSI", "rsi.in"));
+  sum = builder.CreateAdd(sum, loadRegister(builder, rdi, "RDI", "rdi.in"));
+  sum = builder.CreateAdd(sum, loadRegister(builder, r8, "R8", "r8.in"));
+  sum = builder.CreateAdd(sum, loadRegister(builder, r9, "R9", "r9.in"));
+  builder.CreateStore(sum, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("notdec_native_param_order");
+  std::vector<llvm::StringRef> expected = {"RDI.arg", "RSI.arg", "RDX.arg",
+                                           "RCX.arg", "R8.arg",  "R9.arg"};
+  bool arityOk = rewritten != nullptr && rewritten->arg_size() == 6;
+  bool orderOk = rewritten != nullptr && rewritten->arg_size() == expected.size();
+  if (orderOk) {
+    for (unsigned index = 0; index < expected.size(); ++index) {
+      orderOk &=
+          rewritten->getArg(index)->getName() == expected[index];
+    }
+  }
+
+  return expect(rewritten != nullptr, "internal ABI order function missing") &&
+         expect(arityOk, "internal ABI order function used wrong arity") &&
+         expect(orderOk, "internal params were not ordered by ABI") &&
+         expect(summary.FunctionsRewritten >= 1,
+                "internal ABI order function was not rewritten") &&
+         verifyOk(module,
+                  "module failed verifier after internal ABI order param test");
+}
+
 bool testStaticRspStackRewriteKeepsSavedRegisterEvidence() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-stack-saved-register", context);
@@ -6827,6 +6881,7 @@ int main() {
   ok &= testUnknownExternalArityStopsAtBinaryClobberArg();
   ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
   ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
+  ok &= testInternalSignatureParamsUseAbiOrder();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testInternalSignatureRewriteUsesReadEntryReturnRegisterArg();
