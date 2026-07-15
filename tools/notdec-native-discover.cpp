@@ -1419,9 +1419,8 @@ int main(int argc, char **argv) {
       manager.addAnalyzer(notdec::bin2llvm::createSleighSeedInstructionAnalyzer(
           options->DecodeOptions));
     } else {
-      manager.addAnalyzer(notdec::bin2llvm::createSleighSeedInstructionAnalyzer(
-          options->DecodeOptions));
-      manager.addAnalyzer(notdec::bin2llvm::createX86JumpTableAnalyzer());
+      state.addNote("native internal seed-linear CFG discovery is disabled; "
+                    "use --native-decode-mode gtirb");
     }
     manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
     if (options->Mode == OutputMode::TextReport) {

@@ -216,6 +216,11 @@ enum class NativeDecodeMode {
   Internal,
 };
 
+enum class NativeControlFlowAuthority {
+  Unknown,
+  Gtirb,
+};
+
 // GTIRB mode treats ddisasm as the owner of function boundaries and machine
 // CFG.  Sleigh is still used later for instruction semantics, but it should not
 // rediscover functions when this mode is active.
@@ -295,6 +300,12 @@ public:
     return Instructions;
   }
   const std::vector<std::string> &notes() const { return Notes; }
+  NativeControlFlowAuthority controlFlowAuthority() const {
+    return ControlFlowAuthority;
+  }
+  bool hasGtirbControlFlowAuthority() const {
+    return ControlFlowAuthority == NativeControlFlowAuthority::Gtirb;
+  }
 
   bool isExecutableAddress(uint64_t address) const;
   std::optional<uint64_t> readPointer(uint64_t address) const;
@@ -328,6 +339,7 @@ public:
   bool addInstruction(NativeInstruction instruction);
   void addFunctionRange(uint64_t address, uint64_t start, uint64_t end,
                         std::string source);
+  void setControlFlowAuthority(NativeControlFlowAuthority authority);
   void addRelocation(NativeRelocationInfo relocation);
   void addRelocatedPointer(uint64_t address, uint64_t value);
   void addPltEntry(NativePltEntry entry);
@@ -352,6 +364,8 @@ private:
   std::map<uint64_t, std::vector<size_t>> XrefsByTo;
   std::map<uint64_t, NativeInstruction> Instructions;
   std::vector<std::string> Notes;
+  NativeControlFlowAuthority ControlFlowAuthority =
+      NativeControlFlowAuthority::Unknown;
 };
 
 class NativeAnalysisManager;

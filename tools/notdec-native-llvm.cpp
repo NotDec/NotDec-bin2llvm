@@ -449,9 +449,8 @@ runNativeDiscovery(const LIEF::ELF::Binary &binary,
     manager.addAnalyzer(
         notdec::bin2llvm::createSleighSeedInstructionAnalyzer(decodeOptions));
   } else {
-    manager.addAnalyzer(
-        notdec::bin2llvm::createSleighSeedInstructionAnalyzer(decodeOptions));
-    manager.addAnalyzer(notdec::bin2llvm::createX86JumpTableAnalyzer());
+    state.addNote("native internal seed-linear CFG discovery is disabled; "
+                  "use --native-decode-mode gtirb");
   }
   manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
   manager.run(state);

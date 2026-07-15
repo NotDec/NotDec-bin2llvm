@@ -128,6 +128,10 @@ struct State {
            CallProducedValues == other.CallProducedValues &&
            StackPointerOffset == other.StackPointerOffset;
   }
+
+  bool sameSummaryLattice(const State &other) const {
+    return Reachable == other.Reachable && Cells == other.Cells;
+  }
 };
 
 // Bottom-up summary: the CFG-level effect visible at normal function exits.
@@ -1071,6 +1075,7 @@ public:
       }
     }
     buildCallGraph();
+    collectCrossBlockValues();
   }
 
   NativeRegisterSummary run() {
@@ -1098,6 +1103,10 @@ private:
   std::map<llvm::Function *, std::set<llvm::Function *>> Callers;
   std::map<llvm::Function *, FunctionEffect> Effects;
   std::map<llvm::Function *, FunctionDemand> Demands;
+  // ValueOrigins and CallProducedValues are forward facts for LLVM SSA values.
+  // A value defined and fully used inside one basic block is already consumed
+  // during transferBlock(); carrying it around loops only slows convergence.
+  std::set<llvm::Value *> CrossBlockValues;
   // The last SCC iteration is already solved against stable callee effects.
   // Keep those block states only for the preliminary callsite-evidence pass.
   std::map<llvm::Function *, FunctionFlow> StableFlows;
@@ -1118,6 +1127,21 @@ private:
           }
           Calls[function].insert(callee);
           Callers[callee].insert(function);
+        }
+      }
+    }
+  }
+
+  void collectCrossBlockValues() {
+    for (llvm::Function *function : Functions) {
+      for (llvm::Instruction &inst : llvm::instructions(function)) {
+        llvm::BasicBlock *parent = inst.getParent();
+        for (llvm::User *user : inst.users()) {
+          auto *userInst = llvm::dyn_cast<llvm::Instruction>(user);
+          if (userInst != nullptr && userInst->getParent() != parent) {
+            CrossBlockValues.insert(&inst);
+            break;
+          }
         }
       }
     }
@@ -1237,15 +1261,19 @@ private:
           for (llvm::BasicBlock *pred : llvm::predecessors(&block)) {
             joinState(joined, flow.Out[pred]);
           }
-          if (!(flow.In[&block] == joined)) {
+          if (!flow.In[&block].sameSummaryLattice(joined)) {
             flow.In[&block] = std::move(joined);
             changed = true;
+          } else {
+            flow.In[&block] = std::move(joined);
           }
         }
         State next = transferBlock(block, flow.In[&block]);
-        if (!(flow.Out[&block] == next)) {
+        if (!flow.Out[&block].sameSummaryLattice(next)) {
           flow.Out[&block] = std::move(next);
           changed = true;
+        } else {
+          flow.Out[&block] = std::move(next);
         }
       }
     }
@@ -1405,7 +1433,27 @@ private:
     for (llvm::Instruction &inst : block) {
       transferInstruction(inst, state);
     }
+    pruneBlockLocalValueFacts(state);
     return state;
+  }
+
+  void pruneBlockLocalValueFacts(State &state) const {
+    for (auto it = state.ValueOrigins.begin();
+         it != state.ValueOrigins.end();) {
+      if (CrossBlockValues.count(it->first) == 0) {
+        it = state.ValueOrigins.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = state.CallProducedValues.begin();
+         it != state.CallProducedValues.end();) {
+      if (CrossBlockValues.count(*it) == 0) {
+        it = state.CallProducedValues.erase(it);
+      } else {
+        ++it;
+      }
+    }
   }
 
   void transferInstruction(llvm::Instruction &inst, State &state) {

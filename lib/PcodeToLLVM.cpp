@@ -683,6 +683,30 @@ private:
     return blockAddressForStart(start);
   }
 
+  const std::vector<uint64_t> *
+  nativeSuccessorsForBlockIndex(size_t blockIndex,
+                                uint64_t &factBlockAddress) const {
+    factBlockAddress = blockAddressForIndex(blockIndex);
+    auto successorIt = Config.BlockSuccessors.find(factBlockAddress);
+    if (successorIt != Config.BlockSuccessors.end()) {
+      return &successorIt->second;
+    }
+
+    // Native CFG facts are keyed by machine block start. P-code can split that
+    // block internally for instruction semantics, so internal blocks must read
+    // the parent machine block's successors.
+    uint64_t parentAddress = parentBlockAddressForIndex(blockIndex);
+    if (parentAddress == factBlockAddress) {
+      return nullptr;
+    }
+    successorIt = Config.BlockSuccessors.find(parentAddress);
+    if (successorIt == Config.BlockSuccessors.end()) {
+      return nullptr;
+    }
+    factBlockAddress = parentAddress;
+    return &successorIt->second;
+  }
+
   bool isInternalPcodeBlock(size_t blockIndex) const {
     return NativeInternalPcodeStarts.count(BlockStarts[blockIndex]) != 0;
   }
@@ -848,18 +872,20 @@ private:
     }
 
     uint64_t blockAddress = blockAddressForIndex(blockIndex);
-    auto successorIt = Config.BlockSuccessors.find(blockAddress);
-    if (successorIt == Config.BlockSuccessors.end()) {
+    uint64_t factBlockAddress = blockAddress;
+    const std::vector<uint64_t> *successors =
+        nativeSuccessorsForBlockIndex(blockIndex, factBlockAddress);
+    if (successors == nullptr) {
       std::ostringstream os;
       os << "native indirect branch block 0x" << std::hex << blockAddress
          << " is missing successor facts";
       errorMessage = os.str();
       return false;
     }
-    if (successorIt->second.empty()) {
+    if (successors->empty()) {
       return true;
     }
-    for (uint64_t successor : successorIt->second) {
+    for (uint64_t successor : *successors) {
       llvm::BasicBlock *block = blockForNativeTarget(successor, errorMessage);
       if (block == nullptr) {
         return false;
@@ -928,20 +954,22 @@ private:
       return false;
     }
     uint64_t blockAddress = blockAddressForIndex(blockIndex);
-    auto successorIt = Config.BlockSuccessors.find(blockAddress);
-    if (successorIt == Config.BlockSuccessors.end()) {
+    uint64_t factBlockAddress = blockAddress;
+    const std::vector<uint64_t> *successors =
+        nativeSuccessorsForBlockIndex(blockIndex, factBlockAddress);
+    if (successors == nullptr) {
       std::ostringstream os;
       os << "native direct branch block 0x" << std::hex << blockAddress
          << " is missing successor facts";
       errorMessage = os.str();
       return false;
     }
-    if (std::find(successorIt->second.begin(), successorIt->second.end(),
-                  target) != successorIt->second.end()) {
+    if (std::find(successors->begin(), successors->end(), target) !=
+        successors->end()) {
       return true;
     }
     std::ostringstream os;
-    os << "native direct branch block 0x" << std::hex << blockAddress
+    os << "native direct branch block 0x" << std::hex << factBlockAddress
        << " is missing successor 0x" << target;
     errorMessage = os.str();
     return false;

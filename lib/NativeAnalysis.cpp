@@ -2645,6 +2645,7 @@ public:
         importCfgEdges(state, module, edgeCount);
       }
       uint64_t fallbackCount = importSeedRanges(state, Options.RuntimeFilter);
+      state.setControlFlowAuthority(NativeControlFlowAuthority::Gtirb);
       state.addNote("gtirb frontend imported from " + std::string(source) +
                     ": " + std::to_string(functionCount) + " functions, " +
                     std::to_string(blockCount) + " blocks, " +
@@ -2878,7 +2879,23 @@ private:
           uint64_t target = static_cast<uint64_t>(*successor->getAddress());
           if (type == gtirb::EdgeType::Branch ||
               type == gtirb::EdgeType::Fallthrough) {
-            successors.push_back(target);
+            bool localTarget = false;
+            for (const NativeBasicBlock &candidate : function.Blocks) {
+              if (candidate.Start == target) {
+                localTarget = true;
+                break;
+              }
+            }
+            if (localTarget) {
+              successors.push_back(target);
+            } else {
+              NativeXref xref;
+              xref.From = block.Start;
+              xref.To = target;
+              xref.Kind = NativeXrefKind::Flow;
+              xref.Source = "gtirb-ddisasm-flow";
+              state.addXref(std::move(xref));
+            }
             ++edgeCount;
           } else if (type == gtirb::EdgeType::Call) {
             NativeXref xref;
@@ -3121,12 +3138,15 @@ private:
       (void)readBytes(state, summary.Address, summary.Size, instruction.Bytes);
       decodedInstructions.push_back(std::move(instruction));
     }
+    bool collectMachineFlow = !state.hasGtirbControlFlowAuthority();
     DirectControlFlowResult flowResult =
-        collectDirectControlFlow(state, decode.Pcode);
+        collectDirectControlFlow(state, decode.Pcode, collectMachineFlow);
     annotateDecodedInstructionFlows(decodedInstructions, flowResult.FlowInfos);
     std::vector<uint64_t> tailBranchTargets;
-    collectTailBranchTargets(state, functionEntry, decodedInstructions,
-                             tailBranchTargets);
+    if (collectMachineFlow) {
+      collectTailBranchTargets(state, functionEntry, decodedInstructions,
+                               tailBranchTargets);
+    }
     for (const NativeInstruction &instruction : decodedInstructions) {
       state.addInstruction(instruction);
     }
@@ -3136,7 +3156,7 @@ private:
     for (const NativeUnresolvedFlow &flow : flowResult.UnresolvedFlows) {
       state.addUnresolvedFlow(flow);
     }
-    if (!decodedInstructions.empty()) {
+    if (collectMachineFlow && !decodedInstructions.empty()) {
       uint64_t rangeStart = decodedInstructions.front().Address;
       uint64_t rangeEnd =
           decodedInstructions.back().Address + decodedInstructions.back().Size;
@@ -3303,7 +3323,8 @@ private:
     DirectControlFlowResult flowResult;
     std::map<uint64_t, DecodedFlowInfo> flowInfos;
     if (rangeStart == address && rangeStart < rangeEnd) {
-      flowResult = collectDirectControlFlow(state, decode.Pcode);
+      flowResult = collectDirectControlFlow(state, decode.Pcode,
+                                            /*collectMachineFlow=*/true);
       flowInfos = flowResult.FlowInfos;
     }
     annotateDecodedInstructionFlows(decodedInstructions, flowInfos);
@@ -3656,7 +3677,8 @@ private:
 
   static DirectControlFlowResult
   collectDirectControlFlow(NativeProgramState &state,
-                           const PcodeProgram &program) {
+                           const PcodeProgram &program,
+                           bool collectMachineFlow) {
     DirectControlFlowResult result;
     std::set<std::tuple<uint64_t, uint64_t, NativeXrefKind>> seenXrefs;
     // This is intentionally local to one decoded P-Code range.  It only keeps
@@ -3716,6 +3738,9 @@ private:
         result.UnresolvedFlows.push_back(std::move(flow));
       } else if (op.Opcode == PcodeOpcode::Branch ||
                  op.Opcode == PcodeOpcode::CBranch) {
+        if (!collectMachineFlow) {
+          continue;
+        }
         DecodedFlowInfo &info = result.FlowInfos[op.Address];
         if (op.Opcode == PcodeOpcode::CBranch) {
           info.HasConditionalBranch = true;
@@ -3735,6 +3760,9 @@ private:
           addUniqueAddress(info.BranchTargets, *target);
         }
       } else if (op.Opcode == PcodeOpcode::BranchInd) {
+        if (!collectMachineFlow) {
+          continue;
+        }
         result.FlowInfos[op.Address].HasIndirectBranch = true;
         if (op.Inputs.size() == 1 && op.Inputs[0].Space == "ram") {
           if (auto pointerTarget =
@@ -3783,7 +3811,9 @@ private:
         flow.Source = "sleigh-pcode-indirect-flow";
         result.UnresolvedFlows.push_back(std::move(flow));
       } else if (op.Opcode == PcodeOpcode::Return) {
-        result.FlowInfos[op.Address].HasReturn = true;
+        if (collectMachineFlow) {
+          result.FlowInfos[op.Address].HasReturn = true;
+        }
       } else {
         addPendingDirectDataXrefs(state, result.Xrefs, seenXrefs, op);
       }
@@ -4453,6 +4483,16 @@ public:
   int priority() const override { return 80; }
 
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
+    if (state.hasGtirbControlFlowAuthority()) {
+      foldEhFrameOnlyBranchTargets(state);
+      for (const auto &[entry, function] : state.functions()) {
+        (void)function;
+        state.removeInvalidBasicBlockSuccessors(entry);
+      }
+      recoverExternalFunctionPointerFlows(state);
+      return;
+    }
+
     std::vector<std::pair<uint64_t, NativeBasicBlock>> missingBlocks;
     for (const auto &[entry, function] : state.functions()) {
       appendMissingBlocks(state, function, missingBlocks);
@@ -4629,6 +4669,17 @@ private:
         }
       }
     }
+    for (const NativeXref &xref : state.xrefs()) {
+      if (xref.Kind != NativeXrefKind::Flow) {
+        continue;
+      }
+      const NativeFunction *owner = state.functionContaining(xref.From);
+      if (owner == nullptr ||
+          !isFoldableEhFrameBranchTarget(state, owner->Entry, xref.To)) {
+        continue;
+      }
+      folds.push_back({owner->Entry, xref.To});
+    }
     for (const auto &[entry, function] : state.functions()) {
       auto seedIterator = state.functionSeeds().find(entry);
       if (seedIterator == state.functionSeeds().end() ||
@@ -4672,6 +4723,7 @@ private:
       state.demoteFunctionSeedToRangeHint(targetEntry);
       state.removeFunction(targetEntry);
     }
+    restoreIntraFunctionFlowXrefSuccessors(state);
   }
 
   static bool isFoldableEhFrameBranchTarget(const NativeProgramState &state,
@@ -4777,6 +4829,45 @@ private:
       }
       state.addBasicBlockSuccessors(ownerEntry, sourceBlock->Start,
                                     {edge.Target});
+    }
+    for (const NativeXref *xref : state.xrefsTo(foldedEntry)) {
+      if (xref->Kind != NativeXrefKind::Flow) {
+        continue;
+      }
+      const NativeFunction *sourceOwner = state.functionContaining(xref->From);
+      if (sourceOwner == nullptr || sourceOwner->Entry != ownerEntry) {
+        continue;
+      }
+      const NativeBasicBlock *sourceBlock =
+          functionBlockContaining(*owner, xref->From);
+      if (sourceBlock == nullptr) {
+        continue;
+      }
+      state.addBasicBlockSuccessors(ownerEntry, sourceBlock->Start,
+                                    {foldedEntry});
+    }
+  }
+
+  static void restoreIntraFunctionFlowXrefSuccessors(
+      NativeProgramState &state) {
+    for (const NativeXref &xref : state.xrefs()) {
+      if (xref.Kind != NativeXrefKind::Flow) {
+        continue;
+      }
+      const NativeFunction *sourceOwner = state.functionContaining(xref.From);
+      const NativeFunction *targetOwner = state.functionContaining(xref.To);
+      if (sourceOwner == nullptr || targetOwner == nullptr ||
+          sourceOwner->Entry != targetOwner->Entry ||
+          !functionHasBlockStartingAt(*sourceOwner, xref.To)) {
+        continue;
+      }
+      const NativeBasicBlock *sourceBlock =
+          functionBlockContaining(*sourceOwner, xref.From);
+      if (sourceBlock == nullptr) {
+        continue;
+      }
+      state.addBasicBlockSuccessors(sourceOwner->Entry, sourceBlock->Start,
+                                    {xref.To});
     }
   }
 
@@ -5767,6 +5858,19 @@ void NativeProgramState::addFunctionRange(uint64_t address, uint64_t start,
                   hexAddress(seed.RangeStart) + ", " +
                   hexAddress(seed.RangeEnd) + "), new " + source + " [" +
                   hexAddress(start) + ", " + hexAddress(end) + ")");
+}
+
+void NativeProgramState::setControlFlowAuthority(
+    NativeControlFlowAuthority authority) {
+  if (authority == NativeControlFlowAuthority::Unknown ||
+      ControlFlowAuthority == authority) {
+    return;
+  }
+  if (ControlFlowAuthority != NativeControlFlowAuthority::Unknown) {
+    Notes.push_back("native control-flow authority already set");
+    return;
+  }
+  ControlFlowAuthority = authority;
 }
 
 void NativeProgramState::addRelocation(NativeRelocationInfo relocation) {
