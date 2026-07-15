@@ -10,6 +10,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -238,6 +239,16 @@ bool hasCallTo(const llvm::Function &function, llvm::StringRef calleeName) {
     if (call != nullptr && call->getCalledFunction() != nullptr &&
         call->getCalledFunction()->getName() == calleeName) {
       return true;
+    }
+  }
+  return false;
+}
+
+bool blockEndsWithUnreachable(const llvm::Function &function,
+                              llvm::StringRef blockName) {
+  for (const llvm::BasicBlock &block : function) {
+    if (block.getName() == blockName) {
+      return llvm::isa<llvm::UnreachableInst>(block.getTerminator());
     }
   }
   return false;
@@ -487,9 +498,9 @@ llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
     llvm::Value *savedFsCanaryPointer = builder.CreateIntToPtr(
         savedFsCanaryAddress, llvm::PointerType::get(context, 0),
         "fs_canary_save_ptr");
-    initialSavedCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
-                                            savedFsCanaryPointer,
-                                            "fs_canary_save");
+    initialSavedCanary =
+        builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                           savedFsCanaryPointer, "fs_canary_save");
   }
   builder.CreateStore(initialSavedCanary, savedPointer);
   llvm::LoadInst *savedCanary = builder.CreateLoad(
@@ -1535,14 +1546,14 @@ bool testRewrittenExternalCallPreservesUnaffectedRegister() {
 
   auto *calleeType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *callee = llvm::Function::Create(
-      calleeType, llvm::GlobalValue::ExternalLinkage, "__errno_location",
-      module);
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "__errno_location", module);
   auto *callerType =
       llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
-  llvm::Function *caller = llvm::Function::Create(
-      callerType, llvm::GlobalValue::ExternalLinkage,
-      "rewritten_external_preserves_rbx", module);
+  llvm::Function *caller =
+      llvm::Function::Create(callerType, llvm::GlobalValue::ExternalLinkage,
+                             "rewritten_external_preserves_rbx", module);
   llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
   llvm::IRBuilder<> builder(entry);
   storeRegister(builder, rbx, llvm::ConstantInt::get(rbx->getValueType(), 42),
@@ -1644,7 +1655,8 @@ bool testExternalReturnUsesRangeCallValue() {
 
   return expect(summary.CallReturnValues == 1,
                 "external return range helper was not created") &&
-         expect(rewritten != nullptr, "rewritten external return callee missing") &&
+         expect(rewritten != nullptr,
+                "rewritten external return callee missing") &&
          expect(!hasLiveReplacedRegisterLoad(*caller),
                 "external return range left live raw RAX load") &&
          expect(typedExternalReturn,
@@ -4387,9 +4399,9 @@ bool testInternalSignatureParamsUseAbiOrder() {
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), "sink");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "notdec_native_param_order",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_param_order", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -4408,11 +4420,11 @@ bool testInternalSignatureParamsUseAbiOrder() {
   std::vector<llvm::StringRef> expected = {"RDI.arg", "RSI.arg", "RDX.arg",
                                            "RCX.arg", "R8.arg",  "R9.arg"};
   bool arityOk = rewritten != nullptr && rewritten->arg_size() == 6;
-  bool orderOk = rewritten != nullptr && rewritten->arg_size() == expected.size();
+  bool orderOk =
+      rewritten != nullptr && rewritten->arg_size() == expected.size();
   if (orderOk) {
     for (unsigned index = 0; index < expected.size(); ++index) {
-      orderOk &=
-          rewritten->getArg(index)->getName() == expected[index];
+      orderOk &= rewritten->getArg(index)->getName() == expected[index];
     }
   }
 
@@ -4477,9 +4489,9 @@ bool testCallerSavedEntryStackSpillCountsAsReadEntry() {
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "caller_saved_stack_spill",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "caller_saved_stack_spill", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -4495,7 +4507,8 @@ bool testCallerSavedEntryStackSpillCountsAsReadEntry() {
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
   const auto *fn = functionSummary(summary, "caller_saved_stack_spill");
-  const auto *rdiSummary = fn == nullptr ? nullptr : registerSummary(*fn, "RDI");
+  const auto *rdiSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RDI");
 
   return expect(rdiSummary != nullptr,
                 "missing RDI summary for caller-saved stack spill") &&
@@ -4747,6 +4760,102 @@ bool testNoReturnExternalDoesNotCreateSummaryReturn() {
   return expect(summary.CallReturnValues == 0,
                 "noreturn external path created a summary return helper") &&
          verifyOk(module, "module failed verifier after noreturn cleanup test");
+}
+
+bool testExternalPrototypeJsonOverlaysDefaultNoReturn() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-external-json-overlay-noreturn", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *exitType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *exit = llvm::Function::Create(
+      exitType, llvm::GlobalValue::ExternalLinkage, "exit", module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "json_overlay_keeps_exit", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(
+      exitType, exit,
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1)});
+  llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "unreachable_rax");
+  builder.CreateRet(loaded);
+
+  llvm::SmallString<128> jsonPath;
+  int jsonFd = -1;
+  std::error_code error = llvm::sys::fs::createTemporaryFile(
+      "notdec-external-prototype-overlay", "json", jsonFd, jsonPath);
+  if (error) {
+    std::cerr << "failed to create external prototype JSON: " << error.message()
+              << '\n';
+    return false;
+  }
+  {
+    llvm::raw_fd_ostream json(jsonFd, true);
+    json << R"({"json_known_external":{"return":"void","fixed_args":0}})";
+  }
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.ExternalPrototypeJsonPath = jsonPath.str().str();
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  (void)llvm::sys::fs::remove(jsonPath);
+
+  return expect(summary.CallReturnValues == 0,
+                "custom prototype JSON replaced default exit noreturn") &&
+         expect(blockEndsWithUnreachable(*function, "entry"),
+                "default exit noreturn was not preserved under JSON overlay") &&
+         verifyOk(module, "module failed verifier after JSON overlay noreturn");
+}
+
+bool testInternalNoReturnCallFallthroughIsTruncated() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-internal-noreturn-call", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *exitType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *exit = llvm::Function::Create(
+      exitType, llvm::GlobalValue::ExternalLinkage, "exit", module);
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+
+  llvm::Function *helper = llvm::Function::Create(
+      voidType, llvm::GlobalValue::InternalLinkage, "local_fail", module);
+  llvm::BasicBlock *helperEntry =
+      llvm::BasicBlock::Create(context, "entry", helper);
+  llvm::IRBuilder<> builder(helperEntry);
+  builder.CreateCall(
+      exitType, exit,
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1)});
+  builder.CreateRetVoid();
+
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *caller =
+      llvm::Function::Create(callerType, llvm::GlobalValue::ExternalLinkage,
+                             "calls_local_fail", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  builder.CreateCall(voidType, helper, {});
+  llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "unreachable_rax");
+  builder.CreateRet(loaded);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.CallReturnValues == 0,
+                "internal noreturn call created a summary return helper") &&
+         expect(helper->hasFnAttribute(llvm::Attribute::NoReturn),
+                "internal helper was not marked noreturn") &&
+         expect(blockEndsWithUnreachable(*caller, "entry"),
+                "internal noreturn call kept fallthrough terminator") &&
+         verifyOk(module,
+                  "module failed verifier after internal noreturn test");
 }
 
 bool testStackCanaryCheckIsRemoved() {
@@ -6715,13 +6824,11 @@ bool testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering() {
       partialRead,
       {rbx, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)});
   llvm::Value *full = builder.CreateCall(
-      insert,
-      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), low,
-       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+      insert, {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), low,
+               llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   full = builder.CreateCall(
-      insert,
-      {full, high,
-       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)});
+      insert, {full, high,
+               llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)});
   (void)full;
   builder.CreateRetVoid();
 
@@ -6788,11 +6895,10 @@ bool testFinalCleanupLowersValueRangeHelpers() {
       module, llvm::Type::getInt64Ty(context), false,
       llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
   auto *type = llvm::FunctionType::get(
-      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)},
-      false);
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage,
-      "final_cleanup_value_range", module);
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "final_cleanup_value_range", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -6819,10 +6925,10 @@ bool testFinalCleanupLowersValueRangeHelpers() {
   bool hasValueRangeCall = false;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
-    hasValueRangeCall |=
-        call != nullptr && call->getCalledFunction() != nullptr &&
-        notdec::bin2llvm::isNativeRegisterValueRangeName(
-            call->getCalledFunction()->getName());
+    hasValueRangeCall |= call != nullptr &&
+                         call->getCalledFunction() != nullptr &&
+                         notdec::bin2llvm::isNativeRegisterValueRangeName(
+                             call->getCalledFunction()->getName());
   }
 
   return expect(cleanup.ValueRangeHelpersLowered == 2,
@@ -6901,6 +7007,8 @@ int main() {
   ok &= testStackFrameAddressPassedToCallIsLocalized();
   ok &= testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall();
   ok &= testNoReturnExternalDoesNotCreateSummaryReturn();
+  ok &= testExternalPrototypeJsonOverlaysDefaultNoReturn();
+  ok &= testInternalNoReturnCallFallthroughIsTruncated();
   ok &= testStackCanaryCheckIsRemoved();
   ok &= testStackCanaryPrologueSaveIsRemoved();
   ok &= testStackCanaryZextConditionIsRemoved();

@@ -27,6 +27,7 @@ struct NativeExternalCallShape {
   std::vector<NativeRegisterCallInputSlot> VarArgInputs;
   unsigned FixedArgs = 0;
   bool VarArg = false;
+  bool NoReturn = false;
   unsigned MaxArgs = 0;
   bool FixedInputsComplete = true;
 };
@@ -118,6 +119,7 @@ struct NativeRegisterSummaryRegister {
 // the same scans.
 struct NativeRegisterSummaryFunction {
   std::string FunctionName;
+  bool NoReturn = false;
   uint64_t LoadsSeen = 0;
   uint64_t StoresSeen = 0;
   uint64_t CallsSeen = 0;
@@ -131,6 +133,7 @@ struct NativeRegisterSummaryFunction {
 // Module-level summary for the new SCC/fixpoint register analysis chain.
 struct NativeRegisterSummary {
   uint64_t FunctionsSeen = 0;
+  uint64_t NoReturnFunctions = 0;
   uint64_t LoadsSeen = 0;
   uint64_t StoresSeen = 0;
   uint64_t CallsSeen = 0;

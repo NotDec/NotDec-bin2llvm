@@ -8,6 +8,7 @@
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -103,6 +104,7 @@ struct RegisterOriginBits {
 
 struct State {
   bool Reachable = false;
+  bool EndsInNoReturn = false;
   std::map<llvm::GlobalVariable *, Cell> Cells;
   std::map<llvm::GlobalVariable *, RegisterOriginBits> Origins;
   // Narrow frame-local model for saved-register recognition.  It only tracks
@@ -122,7 +124,8 @@ struct State {
   std::optional<int64_t> StackPointerOffset = 0;
 
   bool operator==(const State &other) const {
-    return Reachable == other.Reachable && Cells == other.Cells &&
+    return Reachable == other.Reachable &&
+           EndsInNoReturn == other.EndsInNoReturn && Cells == other.Cells &&
            Origins == other.Origins && StackSlots == other.StackSlots &&
            ValueOrigins == other.ValueOrigins &&
            CallProducedValues == other.CallProducedValues &&
@@ -130,16 +133,18 @@ struct State {
   }
 
   bool sameSummaryLattice(const State &other) const {
-    return Reachable == other.Reachable && Cells == other.Cells;
+    return Reachable == other.Reachable &&
+           EndsInNoReturn == other.EndsInNoReturn && Cells == other.Cells;
   }
 };
 
 // Bottom-up summary: the CFG-level effect visible at normal function exits.
 struct FunctionEffect {
   std::map<llvm::GlobalVariable *, Cell> Registers;
+  bool NoReturn = false;
 
   bool operator==(const FunctionEffect &other) const {
-    return Registers == other.Registers;
+    return Registers == other.Registers && NoReturn == other.NoReturn;
   }
 };
 
@@ -801,6 +806,15 @@ bool joinCell(Cell &lhs, const Cell &rhs) {
   return !(lhs == old);
 }
 
+void joinReadEntryOnly(std::map<llvm::GlobalVariable *, Cell> &target,
+                       const State &source) {
+  for (const auto &[global, cell] : source.Cells) {
+    if (cell.ReadEntry) {
+      target[global].ReadEntry = true;
+    }
+  }
+}
+
 unsigned registerBitWidth(llvm::GlobalVariable *global) {
   if (global == nullptr) {
     return 0;
@@ -1279,13 +1293,28 @@ private:
     }
 
     State exits;
+    bool sawNoReturnExit = false;
+    std::map<llvm::GlobalVariable *, Cell> noReturnReads;
     for (llvm::BasicBlock &block : function) {
       if (llvm::isa<llvm::ReturnInst>(block.getTerminator())) {
         joinState(exits, exitStateWithSavedRegisters(flow.Out[&block]));
       }
+      const State &out = flow.Out[&block];
+      if (out.EndsInNoReturn) {
+        sawNoReturnExit = true;
+        joinReadEntryOnly(noReturnReads, out);
+      }
     }
     if (exits.Reachable) {
       flow.Effect.Registers = std::move(exits.Cells);
+      for (const auto &[global, cell] : noReturnReads) {
+        if (cell.ReadEntry) {
+          flow.Effect.Registers[global].ReadEntry = true;
+        }
+      }
+    } else if (sawNoReturnExit) {
+      flow.Effect.Registers = std::move(noReturnReads);
+      flow.Effect.NoReturn = true;
     }
     return flow;
   }
@@ -1414,6 +1443,9 @@ private:
           continue;
         }
         for (llvm::Instruction &inst : block) {
+          if (!state.Reachable) {
+            break;
+          }
           if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
               call != nullptr && isAnalyzableCall(inst) &&
               (isUnknownExternalCall(*call) ||
@@ -1431,6 +1463,9 @@ private:
       return state;
     }
     for (llvm::Instruction &inst : block) {
+      if (!state.Reachable) {
+        break;
+      }
       transferInstruction(inst, state);
     }
     pruneBlockLocalValueFacts(state);
@@ -1854,14 +1889,30 @@ private:
     llvm::Function *callee = call.getCalledFunction();
     if (callee != nullptr && !callee->isDeclaration() &&
         Effects.count(callee) != 0) {
-      applyFunctionEffect(Effects[callee], state);
+      const FunctionEffect &effect = Effects[callee];
+      applyFunctionEffect(effect, state);
+      if (effect.NoReturn) {
+        markNoReturnExit(state);
+      }
       return;
     }
     if (const NativeExternalCallShape *shape = externalCallShape(call)) {
       applyExternalCallEffect(state, *shape);
+      if (shape->NoReturn) {
+        markNoReturnExit(state);
+      }
       return;
     }
     applyUnknownExternalCallEffect(state);
+    if (callee != nullptr && callee->isDeclaration() &&
+        callee->hasFnAttribute(llvm::Attribute::NoReturn)) {
+      markNoReturnExit(state);
+    }
+  }
+
+  void markNoReturnExit(State &state) const {
+    state.Reachable = false;
+    state.EndsInNoReturn = true;
   }
 
   void applyFunctionEffect(const FunctionEffect &effect, State &state) {
@@ -2091,6 +2142,10 @@ private:
     if (callee != nullptr && !callee->isDeclaration() &&
         Effects.count(callee) != 0) {
       const FunctionEffect &effect = Effects[callee];
+      if (effect.NoReturn) {
+        live.clear();
+        return;
+      }
       for (const auto &[global, unit] : Units) {
         llvm::APInt mask = demandFor(live, global);
         if (isIgnored(unit, Options) || mask.getBitWidth() == 0 ||
@@ -2147,10 +2202,17 @@ private:
     };
 
     if (const NativeExternalCallShape *shape = externalCallShape(call)) {
+      if (shape->NoReturn) {
+        live.clear();
+      }
       for (const NativeRegisterCallInputSlot &input : shape->Inputs) {
         addInputDemand(input);
       }
       return;
+    }
+    if (callee != nullptr && callee->isDeclaration() &&
+        callee->hasFnAttribute(llvm::Attribute::NoReturn)) {
+      live.clear();
     }
     if (Options.UnknownExternalInputPolicy !=
         NativeRegisterUnknownExternalInputPolicy::AbiInputs) {
@@ -2247,6 +2309,11 @@ private:
                             llvm::MDNode::get(context, modifies));
       function->setMetadata("notdec.register.summary.demanded_returns",
                             llvm::MDNode::get(context, demandedReturns));
+      if (effect.NoReturn) {
+        function->addFnAttr(llvm::Attribute::NoReturn);
+        function->setMetadata("notdec.register.summary.noreturn",
+                              llvm::MDNode::get(context, {}));
+      }
     }
   }
 
@@ -2276,6 +2343,7 @@ private:
       }
 
       const FunctionEffect &effect = Effects.at(function);
+      fn.NoReturn = effect.NoReturn;
       const FunctionDemand &demand =
           Demands.count(function) == 0 ? EmptyDemand : Demands.at(function);
       for (const auto &[global, unit] : Units) {
@@ -2310,6 +2378,9 @@ private:
       summary.LoadsSeen += fn.LoadsSeen;
       summary.StoresSeen += fn.StoresSeen;
       summary.CallsSeen += fn.CallsSeen;
+      if (fn.NoReturn) {
+        ++summary.NoReturnFunctions;
+      }
       summary.ReadEntryRegisters += fn.ReadEntryRegisters;
       summary.ModifiedRegisters += fn.ModifiedRegisters;
       summary.PreservedRegisters += fn.PreservedRegisters;
@@ -2340,6 +2411,7 @@ runNativeRegisterSummary(llvm::Module &module,
 void printNativeRegisterSummary(const NativeRegisterSummary &summary,
                                 llvm::raw_ostream &os) {
   os << "Native register summary: functions=" << summary.FunctionsSeen
+     << " noreturn=" << summary.NoReturnFunctions
      << " loads=" << summary.LoadsSeen << " stores=" << summary.StoresSeen
      << " calls=" << summary.CallsSeen
      << " read_entry=" << summary.ReadEntryRegisters
@@ -2349,6 +2421,7 @@ void printNativeRegisterSummary(const NativeRegisterSummary &summary,
   for (const NativeRegisterSummaryFunction &function : summary.Functions) {
     os << "  " << function.FunctionName << ": loads=" << function.LoadsSeen
        << " stores=" << function.StoresSeen << " calls=" << function.CallsSeen
+       << " noreturn=" << (function.NoReturn ? "true" : "false")
        << " read_entry=" << function.ReadEntryRegisters
        << " modified=" << function.ModifiedRegisters
        << " preserved=" << function.PreservedRegisters

@@ -72,6 +72,7 @@ struct SummaryRegisterFact {
 };
 
 struct FunctionSummaryFacts {
+  bool NoReturn = false;
   std::map<std::string, SummaryRegisterFact> Registers;
 };
 
@@ -406,8 +407,22 @@ bool isUnknownExternalFunction(const llvm::Function &function,
          !isKnownExternalFunction(function, prototypes);
 }
 
-void truncateKnownNoReturnExternalCalls(
-    llvm::Module &module, const NativeExternalPrototypeMap &prototypes) {
+bool isKnownNoReturnCall(
+    const llvm::Function &callee, const NativeExternalPrototypeMap &prototypes,
+    const std::map<llvm::Function *, FunctionSummaryFacts> *facts) {
+  if (isKnownNoReturnExternal(callee, prototypes)) {
+    return true;
+  }
+  if (facts == nullptr || callee.isDeclaration()) {
+    return false;
+  }
+  auto factIt = facts->find(const_cast<llvm::Function *>(&callee));
+  return factIt != facts->end() && factIt->second.NoReturn;
+}
+
+void truncateKnownNoReturnCalls(
+    llvm::Module &module, const NativeExternalPrototypeMap &prototypes,
+    const std::map<llvm::Function *, FunctionSummaryFacts> *facts = nullptr) {
   std::vector<std::pair<llvm::Instruction *, llvm::Function *>> work;
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
@@ -421,7 +436,7 @@ void truncateKnownNoReturnExternalCalls(
         }
         llvm::Function *callee = call->getCalledFunction();
         if (callee == nullptr ||
-            !isKnownNoReturnExternal(*callee, prototypes)) {
+            !isKnownNoReturnCall(*callee, prototypes, facts)) {
           continue;
         }
         work.push_back({call->getNextNode(), &function});
@@ -893,6 +908,7 @@ summaryFactsByFunction(const NativeRegisterSummary &summary,
       continue;
     }
     FunctionSummaryFacts facts;
+    facts.NoReturn = functionSummary.NoReturn;
     for (const NativeRegisterSummaryRegister &reg : functionSummary.Registers) {
       auto parseMask = [](llvm::StringRef text) -> llvm::APInt {
         if (text.empty()) {
@@ -1197,9 +1213,9 @@ SignatureShape shapeForInternalFunction(
       return;
     }
     if (floatSlot != nullptr) {
-      if (std::optional<NativeSignatureSlot> slot = floatSlotForDemand(
-              function.getContext(), *floatSlot, units,
-              regIt->second.EntryDemandMask)) {
+      if (std::optional<NativeSignatureSlot> slot =
+              floatSlotForDemand(function.getContext(), *floatSlot, units,
+                                 regIt->second.EntryDemandMask)) {
         shape.Params.push_back(*slot);
       } else if (regIt->second.EntryDemandMask.getBitWidth() != 0 &&
                  !regIt->second.EntryDemandMask.isZero()) {
@@ -1448,6 +1464,7 @@ NativeExternalCallShapeMap buildExternalCallShapes(
     NativeExternalCallShape callShape;
     callShape.FixedArgs = known->FixedArgs;
     callShape.VarArg = known->VarArg;
+    callShape.NoReturn = known->NoReturn;
     callShape.MaxArgs = known->MaxArgs;
     callShape.FixedInputsComplete = signature.Params.size() == known->FixedArgs;
     for (const NativeSignatureSlot &slot : signature.Params) {
@@ -2295,8 +2312,7 @@ private:
     }
   }
 
-  bool
-  rewriteUndemandedRegisterStoreOperands(
+  bool rewriteUndemandedRegisterStoreOperands(
       llvm::Value *value, const std::map<llvm::Value *, llvm::APInt> &demands,
       llvm::SmallPtrSetImpl<llvm::Value *> &visiting) {
     auto *inst = llvm::dyn_cast_or_null<llvm::Instruction>(value);
@@ -2386,8 +2402,7 @@ private:
           llvm::APInt writeMask = partialWriteMask(
               insert->FullWidth, insert->WriteWidth, insert->BitOffset);
           result = (baseMask & ~writeMask) |
-                   shiftedMask(valueMask, insert->BitOffset,
-                               insert->FullWidth);
+                   shiftedMask(valueMask, insert->BitOffset, insert->FullWidth);
           knownMasks.emplace(value, result);
           return result;
         }
@@ -2584,9 +2599,9 @@ private:
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(inst)) {
         if (std::optional<NativeRegisterValueExtractInfo> extract =
                 parseNativeRegisterValueExtract(*call)) {
-          enqueue(extract->FullValue,
-                  shiftedMask(inputDemand, extract->BitOffset,
-                              extract->FullWidth));
+          enqueue(
+              extract->FullValue,
+              shiftedMask(inputDemand, extract->BitOffset, extract->FullWidth));
           continue;
         }
         if (std::optional<NativeRegisterValueInsertInfo> insert =
@@ -3151,15 +3166,14 @@ private:
   }
 
   static bool rangeContainsAccess(const RegisterRangeKey &range,
-                                  llvm::GlobalVariable *global,
-                                  uint64_t offset, uint32_t width) {
+                                  llvm::GlobalVariable *global, uint64_t offset,
+                                  uint32_t width) {
     return range.Global == global && range.BitOffset <= offset &&
            offset + width <= range.BitOffset + range.BitWidth;
   }
 
   llvm::Value *materializeCoveredAccess(const RangedSSAValue &def,
-                                        uint64_t readOffset,
-                                        uint32_t readWidth,
+                                        uint64_t readOffset, uint32_t readWidth,
                                         llvm::Instruction *before,
                                         llvm::Twine name) {
     llvm::Value *value = resolve(def.Value);
@@ -3173,14 +3187,13 @@ private:
         def.CoveredRange.BitWidth == readWidth) {
       return value;
     }
-    return extractBitsFromIntegerValue(
-        value, readWidth, readOffset - def.CoveredRange.BitOffset, before,
-        name);
+    return extractBitsFromIntegerValue(value, readWidth,
+                                       readOffset - def.CoveredRange.BitOffset,
+                                       before, name);
   }
 
   llvm::Value *tryCurrentCoveredAccess(llvm::GlobalVariable *global,
-                                       uint64_t readOffset,
-                                       uint32_t readWidth,
+                                       uint64_t readOffset, uint32_t readWidth,
                                        llvm::Instruction *before,
                                        llvm::Twine name) {
     if (global == nullptr || before == nullptr || readWidth == 0 ||
@@ -3219,14 +3232,14 @@ private:
     }
     return first == nullptr ? nullptr
                             : materializeCoveredAccess(*first, readOffset,
-                                                        readWidth, before,
-                                                        name);
+                                                       readWidth, before, name);
   }
 
-  llvm::Value *tryCommonExtractSourceAccess(
-      llvm::ArrayRef<RegisterRangeKey> ranges,
-      llvm::ArrayRef<llvm::Value *> segments, uint64_t readOffset,
-      uint32_t readWidth, llvm::Instruction *before, llvm::Twine name) {
+  llvm::Value *
+  tryCommonExtractSourceAccess(llvm::ArrayRef<RegisterRangeKey> ranges,
+                               llvm::ArrayRef<llvm::Value *> segments,
+                               uint64_t readOffset, uint32_t readWidth,
+                               llvm::Instruction *before, llvm::Twine name) {
     if (ranges.empty() || ranges.size() != segments.size() ||
         before == nullptr || readWidth == 0) {
       return nullptr;
@@ -3299,9 +3312,9 @@ private:
     }
     for (auto it : llvm::enumerate(ranges)) {
       const RegisterRangeKey &range = it.value();
-      result = insertBitsIntoInteger(result, segments[it.index()], range.BitWidth,
-                                     range.BitOffset - readOffset, before,
-                                     name + ".part_insert");
+      result = insertBitsIntoInteger(
+          result, segments[it.index()], range.BitWidth,
+          range.BitOffset - readOffset, before, name + ".part_insert");
       if (result == nullptr) {
         return nullptr;
       }
@@ -3312,9 +3325,8 @@ private:
   llvm::Value *readAccessRange(llvm::GlobalVariable *global,
                                uint64_t readOffset, uint32_t readWidth,
                                llvm::Instruction *before, llvm::Twine name) {
-    if (llvm::Value *covered =
-            tryCurrentCoveredAccess(global, readOffset, readWidth, before,
-                                    name + ".covered")) {
+    if (llvm::Value *covered = tryCurrentCoveredAccess(
+            global, readOffset, readWidth, before, name + ".covered")) {
       return covered;
     }
     std::vector<RegisterRangeKey> ranges =
@@ -3380,10 +3392,9 @@ private:
     llvm::Value *result = llvm::ConstantInt::get(resultType, 0);
     for (auto it : llvm::enumerate(ranges)) {
       const RegisterRangeKey &range = it.value();
-      result = insertBitsIntoInteger(result, segments[it.index()],
-                                     range.BitWidth,
-                                     range.BitOffset - readOffset, before,
-                                     name + ".part_insert");
+      result = insertBitsIntoInteger(
+          result, segments[it.index()], range.BitWidth,
+          range.BitOffset - readOffset, before, name + ".part_insert");
       if (result == nullptr) {
         return nullptr;
       }
@@ -3395,9 +3406,8 @@ private:
   readAccessRangeIfDominating(llvm::GlobalVariable *global, uint64_t readOffset,
                               uint32_t readWidth, llvm::Instruction *before,
                               llvm::Twine name, llvm::DominatorTree &domTree) {
-    if (llvm::Value *covered =
-            tryCurrentCoveredAccess(global, readOffset, readWidth, before,
-                                    name + ".covered")) {
+    if (llvm::Value *covered = tryCurrentCoveredAccess(
+            global, readOffset, readWidth, before, name + ".covered")) {
       return covered;
     }
     std::vector<RegisterRangeKey> ranges =
@@ -4651,11 +4661,10 @@ private:
     llvm::Type *resultType = rangeType(range);
     llvm::Function *callee = getOrInsertNativeRegisterPartialRead(
         *Function.getParent(), ptrType, resultType, fullWidth, range.BitWidth);
-    llvm::Value *offset =
-        llvm::ConstantInt::get(llvm::Type::getInt64Ty(Function.getContext()),
-                               range.BitOffset);
-    llvm::CallInst *call = builder.CreateCall(
-        callee, {unit.Global, offset}, unit.Name + ".range_entry");
+    llvm::Value *offset = llvm::ConstantInt::get(
+        llvm::Type::getInt64Ty(Function.getContext()), range.BitOffset);
+    llvm::CallInst *call = builder.CreateCall(callee, {unit.Global, offset},
+                                              unit.Name + ".range_entry");
     call->setMetadata("notdec.register.access",
                       registerAccessNode(Function.getContext(), unit));
     call->setMetadata("notdec.register.summary_ssa.range_entry",
@@ -5473,8 +5482,8 @@ llvm::Value *createValueRangeExtract(llvm::IRBuilder<> &builder,
 
 llvm::Value *createValueRangeInsert(llvm::IRBuilder<> &builder,
                                     llvm::Value *base, llvm::Value *value,
-                                    unsigned writeWidth,
-                                    uint64_t bitOffset, llvm::Twine name) {
+                                    unsigned writeWidth, uint64_t bitOffset,
+                                    llvm::Twine name) {
   if (base == nullptr || value == nullptr || !base->getType()->isIntegerTy() ||
       !value->getType()->isIntegerTy() || writeWidth == 0 ||
       value->getType()->getIntegerBitWidth() != writeWidth) {
@@ -6024,8 +6033,9 @@ bool collectInsertedExtractPieces(
   return true;
 }
 
-llvm::Value *foldFullInsertOfExtracts(
-    llvm::Value *value, std::map<llvm::Value *, llvm::Value *> &valueMap) {
+llvm::Value *
+foldFullInsertOfExtracts(llvm::Value *value,
+                         std::map<llvm::Value *, llvm::Value *> &valueMap) {
   value = resolveValueMap(value, valueMap);
   auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
   std::optional<NativeRegisterValueInsertInfo> insert =
@@ -6334,14 +6344,16 @@ runNativeRegisterSummarySSA(llvm::Module &module,
         loadNativeExternalPrototypesJson(options.ExternalPrototypeJsonPath,
                                          errorMessage);
     if (loadedPrototypes) {
-      externalPrototypes = std::move(*loadedPrototypes);
+      for (auto &[name, prototype] : *loadedPrototypes) {
+        externalPrototypes[name] = std::move(prototype);
+      }
     } else {
       llvm::errs() << "warning: failed to load external prototypes: "
                    << errorMessage << '\n';
     }
   }
 
-  truncateKnownNoReturnExternalCalls(module, externalPrototypes);
+  truncateKnownNoReturnCalls(module, externalPrototypes);
 
   NativeStackFrameRewriteSummary stackFrameSummary =
       runNativeStackFrameRewrite(module);
@@ -6368,6 +6380,9 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   baseSummaryOptions.ExternalEvidenceSlots = unknownExternalEvidenceSlots(abi);
   NativeRegisterSummary baseRegisterSummary =
       runNativeRegisterSummary(module, baseSummaryOptions);
+  std::map<llvm::Function *, FunctionSummaryFacts> baseFacts =
+      summaryFactsByFunction(baseRegisterSummary, module);
+  truncateKnownNoReturnCalls(module, externalPrototypes, &baseFacts);
 
   std::vector<NativeRegisterSummarySSAWarning> inferenceWarnings;
   NativeExternalCallsiteShapeMap externalCallsiteShapes =
@@ -6386,6 +6401,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       runNativeRegisterSummary(module, finalSummaryOptions);
   std::map<llvm::Function *, FunctionSummaryFacts> facts =
       summaryFactsByFunction(registerSummary, module);
+  truncateKnownNoReturnCalls(module, externalPrototypes, &facts);
   SignatureRewriteState signatureState;
   signatureState.ExternalPrototypes = &externalPrototypes;
   signatureState.ExternalCallsiteShapes = &externalCallsiteShapes;
