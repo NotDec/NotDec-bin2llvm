@@ -3,6 +3,7 @@
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterLowBitDemandPeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
@@ -27,6 +28,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -274,6 +276,25 @@ bool hasPartialReadCall(const llvm::Function &function) {
     }
   }
   return false;
+}
+
+unsigned countPartialReadCalls(const llvm::Function &function,
+                               llvm::GlobalVariable *global, uint64_t bitOffset,
+                               uint32_t readWidth) {
+  unsigned count = 0;
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call == nullptr) {
+      continue;
+    }
+    std::optional<notdec::bin2llvm::NativeRegisterPartialReadInfo> read =
+        notdec::bin2llvm::parseNativeRegisterPartialRead(*call);
+    if (read && read->Global == global && read->BitOffset == bitOffset &&
+        read->ReadWidth == readWidth) {
+      ++count;
+    }
+  }
+  return count;
 }
 
 bool hasRegisterLoad(const llvm::Function &function, llvm::StringRef name) {
@@ -6647,6 +6668,116 @@ bool testPartialDemandKeepsMemoryPointerRegisterAddress() {
                   "module failed verifier after partial memory pointer test");
 }
 
+bool testLowBitPeepholeRewritesFullLoadTrunc() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-low-bit-peephole-trunc", context);
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "low_bit_trunc", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *full = loadRegister(builder, rsi, "RSI", "full_rsi");
+  llvm::Value *low =
+      builder.CreateTrunc(full, llvm::Type::getInt32Ty(context), "low_rsi");
+  builder.CreateStore(low, sink);
+  builder.CreateRetVoid();
+
+  auto summary =
+      notdec::bin2llvm::runNativeRegisterLowBitDemandPeephole(module);
+
+  return expect(summary.Rewrites == 1,
+                "low-bit peephole did not rewrite full load trunc") &&
+         expect(summary.DirectTruncRewrites == 1,
+                "low-bit peephole did not count direct trunc rewrite") &&
+         expect(!hasRegisterLoad(*function, "RSI"),
+                "low-bit peephole left full RSI load") &&
+         expect(countPartialReadCalls(*function, rsi, 0, 32) == 1,
+                "low-bit peephole did not create low32 partial read") &&
+         verifyOk(module, "module failed verifier after low-bit trunc test");
+}
+
+bool testLowBitPeepholeRewritesShiftTrunc() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-low-bit-peephole-shift-trunc", context);
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "low_bit_shift_trunc", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *full = loadRegister(builder, rsi, "RSI", "full_rsi");
+  llvm::Value *shifted = builder.CreateLShr(
+      full, llvm::ConstantInt::get(rsi->getValueType(), 32), "high_shift");
+  llvm::Value *high =
+      builder.CreateTrunc(shifted, llvm::Type::getInt32Ty(context), "high_rsi");
+  builder.CreateStore(high, sink);
+  builder.CreateRetVoid();
+
+  auto summary =
+      notdec::bin2llvm::runNativeRegisterLowBitDemandPeephole(module);
+
+  return expect(summary.Rewrites == 1,
+                "low-bit peephole did not rewrite shift trunc") &&
+         expect(summary.ShiftTruncRewrites == 1,
+                "low-bit peephole did not count shift trunc rewrite") &&
+         expect(!hasRegisterLoad(*function, "RSI"),
+                "low-bit peephole left shifted full RSI load") &&
+         expect(countPartialReadCalls(*function, rsi, 32, 32) == 1,
+                "low-bit peephole did not create high32 partial read") &&
+         verifyOk(module,
+                  "module failed verifier after low-bit shift trunc test");
+}
+
+bool testLowBitPeepholeSkipsMultiUseFullLoad() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-low-bit-peephole-multi-use", context);
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  auto *narrowSink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "narrow_sink");
+  auto *fullSink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "full_sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "low_bit_multi_use", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *full = loadRegister(builder, rsi, "RSI", "full_rsi");
+  llvm::Value *low =
+      builder.CreateTrunc(full, llvm::Type::getInt32Ty(context), "low_rsi");
+  builder.CreateStore(low, narrowSink);
+  builder.CreateStore(full, fullSink);
+  builder.CreateRetVoid();
+
+  auto summary =
+      notdec::bin2llvm::runNativeRegisterLowBitDemandPeephole(module);
+
+  return expect(summary.Rewrites == 0,
+                "low-bit peephole rewrote a multi-use full load") &&
+         expect(summary.MultiUseLoadsSkipped == 1,
+                "low-bit peephole did not count multi-use skip") &&
+         expect(hasRegisterLoad(*function, "RSI"),
+                "low-bit peephole removed full load with live full use") &&
+         expect(!hasPartialReadCall(*function),
+                "low-bit peephole created partial read for multi-use load") &&
+         verifyOk(module,
+                  "module failed verifier after low-bit multi-use test");
+}
+
 bool testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-clean", context);
@@ -6855,6 +6986,69 @@ bool testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering() {
                   "module failed verifier after dead value range cleanup test");
 }
 
+bool testFinalCleanupSimplifiesExtractFromInsertedRange() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-inserted-extract", context);
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt32Ty(context)}, false);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "final_cleanup_inserted_extract", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Argument *lowArg = function->getArg(0);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rbx->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *insert =
+      notdec::bin2llvm::getOrInsertNativeRegisterValueInsert(
+          module, llvm::Type::getInt64Ty(context),
+          llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Value *high = builder.CreateCall(
+      partialRead,
+      {rbx, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)});
+  llvm::Value *full = builder.CreateCall(
+      insert,
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0), lowArg,
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  full = builder.CreateCall(
+      insert, {full, high,
+               llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)});
+  llvm::Value *lowAgain =
+      builder.CreateTrunc(full, llvm::Type::getInt32Ty(context), "low_again");
+  builder.CreateStore(lowAgain, sink);
+  builder.CreateRetVoid();
+
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+
+  bool storeUsesArg = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    storeUsesArg |= store != nullptr && store->getPointerOperand() == sink &&
+                    store->getValueOperand() == lowArg;
+  }
+
+  return expect(cleanup.ValueRangeExtractsSimplified == 1,
+                "inserted range extract was not simplified") &&
+         expect(storeUsesArg,
+                "low range did not rewrite to the inserted value") &&
+         expect(
+             cleanup.DeadRegisterReadsRemoved == 1,
+             "dead high partial read remained after extract simplification") &&
+         expect(module.getGlobalVariable("RBX") == nullptr,
+                "dead RBX global remained after inserted extract cleanup") &&
+         expect(cleanup.RemainingRegisterAccesses == 0,
+                "inserted extract cleanup left register residue") &&
+         verifyOk(module,
+                  "module failed verifier after inserted extract cleanup test");
+}
+
 bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-globaldce", context);
@@ -7053,11 +7247,15 @@ int main() {
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();
   ok &= testPartialDemandKeepsMemoryPointerRegisterAddress();
+  ok &= testLowBitPeepholeRewritesFullLoadTrunc();
+  ok &= testLowBitPeepholeRewritesShiftTrunc();
+  ok &= testLowBitPeepholeSkipsMultiUseFullLoad();
   ok &= testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata();
   ok &= testFinalCleanupKeepsMetadataWhenRegisterAccessRemains();
   ok &= testFinalCleanupCountsPartialWriteResidue();
   ok &= testFinalCleanupCountsPartialReadResidue();
   ok &= testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering();
+  ok &= testFinalCleanupSimplifiesExtractFromInsertedRange();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
   ok &= testFinalCleanupLowersValueRangeHelpers();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
