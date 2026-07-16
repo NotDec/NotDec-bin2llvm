@@ -7,6 +7,7 @@
 #include "notdec-bin2llvm/passes/heritage/NativePrototypeRecovery.h"
 #include "notdec-bin2llvm/passes/heritage/NativeHeritageSSA.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 
 #include "llvm/IR/LLVMContext.h"
@@ -1078,6 +1079,20 @@ bool runFinalCleanupPass(llvm::Module &module) {
   return true;
 }
 
+bool runPostRewritePeepholePass(llvm::Module &module,
+                                const CliOptions &options) {
+  auto summary = notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+  if (options.PrintRegisterSSASummary) {
+    notdec::bin2llvm::printNativeRegisterPostRewritePeepholeSummary(
+        summary, llvm::errs());
+  }
+  if (llvm::verifyModule(module, &llvm::errs())) {
+    std::cerr << "module verification failed after post-rewrite peephole pass\n";
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1110,6 +1125,9 @@ int main(int argc, char **argv) {
         return 1;
       }
       if (!runPrototypeRecoveryPassIfEnabled(*module, *options)) {
+        return 1;
+      }
+      if (!runPostRewritePeepholePass(*module, *options)) {
         return 1;
       }
       if (!runFinalCleanupPass(*module)) {
@@ -1242,6 +1260,9 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (!runPrototypeRecoveryPassIfEnabled(*module, *options)) {
+      return 1;
+    }
+    if (!runPostRewritePeepholePass(*module, *options)) {
       return 1;
     }
     if (!runFinalCleanupPass(*module)) {

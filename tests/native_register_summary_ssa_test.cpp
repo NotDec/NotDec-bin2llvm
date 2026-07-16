@@ -3,7 +3,7 @@
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterLowBitDemandPeephole.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
@@ -6689,7 +6689,7 @@ bool testLowBitPeepholeRewritesFullLoadTrunc() {
   builder.CreateRetVoid();
 
   auto summary =
-      notdec::bin2llvm::runNativeRegisterLowBitDemandPeephole(module);
+      notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
 
   return expect(summary.Rewrites == 1,
                 "low-bit peephole did not rewrite full load trunc") &&
@@ -6725,7 +6725,7 @@ bool testLowBitPeepholeRewritesShiftTrunc() {
   builder.CreateRetVoid();
 
   auto summary =
-      notdec::bin2llvm::runNativeRegisterLowBitDemandPeephole(module);
+      notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
 
   return expect(summary.Rewrites == 1,
                 "low-bit peephole did not rewrite shift trunc") &&
@@ -6764,7 +6764,7 @@ bool testLowBitPeepholeSkipsMultiUseFullLoad() {
   builder.CreateRetVoid();
 
   auto summary =
-      notdec::bin2llvm::runNativeRegisterLowBitDemandPeephole(module);
+      notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
 
   return expect(summary.Rewrites == 0,
                 "low-bit peephole rewrote a multi-use full load") &&
@@ -6986,9 +6986,10 @@ bool testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering() {
                   "module failed verifier after dead value range cleanup test");
 }
 
-bool testFinalCleanupSimplifiesExtractFromInsertedRange() {
+bool testPostRewritePeepholeSimplifiesExtractFromInsertedRange() {
   llvm::LLVMContext context;
-  llvm::Module module("summary-ssa-final-cleanup-inserted-extract", context);
+  llvm::Module module("summary-ssa-post-rewrite-peephole-inserted-extract",
+                      context);
   llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
 
   auto *sink = new llvm::GlobalVariable(
@@ -7025,6 +7026,8 @@ bool testFinalCleanupSimplifiesExtractFromInsertedRange() {
   builder.CreateStore(lowAgain, sink);
   builder.CreateRetVoid();
 
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
   auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
 
   bool storeUsesArg = false;
@@ -7034,7 +7037,7 @@ bool testFinalCleanupSimplifiesExtractFromInsertedRange() {
                     store->getValueOperand() == lowArg;
   }
 
-  return expect(cleanup.ValueRangeExtractsSimplified == 1,
+  return expect(peephole.ValueRangeExtractsSimplified == 1,
                 "inserted range extract was not simplified") &&
          expect(storeUsesArg,
                 "low range did not rewrite to the inserted value") &&
@@ -7255,7 +7258,7 @@ int main() {
   ok &= testFinalCleanupCountsPartialWriteResidue();
   ok &= testFinalCleanupCountsPartialReadResidue();
   ok &= testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering();
-  ok &= testFinalCleanupSimplifiesExtractFromInsertedRange();
+  ok &= testPostRewritePeepholeSimplifiesExtractFromInsertedRange();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
   ok &= testFinalCleanupLowersValueRangeHelpers();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;

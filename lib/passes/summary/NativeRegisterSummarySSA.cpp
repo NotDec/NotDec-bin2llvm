@@ -5,6 +5,7 @@
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
@@ -6366,6 +6367,12 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   std::map<llvm::GlobalVariable *, RegisterUnit> units =
       collectRegisterUnits(module);
   (void)canonicalizeRegisterPointerPhiLoads(module, units);
+  NativeRegisterPreSummaryPeepholeSummary peepholeSummary =
+      runNativeRegisterPreSummaryPeephole(module);
+  if (options.PrintSummary) {
+    printNativeRegisterPreSummaryPeepholeSummary(peepholeSummary,
+                                                 llvm::errs());
+  }
   AbiFacts abi = collectAbiFacts(module, units);
 
   NativeRegisterSummaryOptions baseSummaryOptions;

@@ -5,7 +5,6 @@
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
 
 #include "llvm/ADT/APInt.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -146,137 +145,6 @@ llvm::Value *lowerValueInsert(llvm::CallBase &call,
       builder.CreateAnd(info.Base, llvm::ConstantInt::get(baseType, ~writeMask),
                         "notdec.reg.insert.lower.keep");
   return builder.CreateOr(kept, wide, "notdec.reg.insert.lower");
-}
-
-bool rangesOverlap(uint64_t lhsOffset, uint64_t lhsWidth, uint64_t rhsOffset,
-                   uint64_t rhsWidth) {
-  uint64_t lhsEnd = lhsOffset + lhsWidth;
-  uint64_t rhsEnd = rhsOffset + rhsWidth;
-  return lhsOffset < rhsEnd && rhsOffset < lhsEnd;
-}
-
-std::optional<uint64_t> constantShiftAmount(llvm::Value *value) {
-  auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value);
-  if (constant == nullptr || constant->getValue().getActiveBits() > 64) {
-    return std::nullopt;
-  }
-  return constant->getZExtValue();
-}
-
-llvm::Value *
-findInsertedRangePiece(llvm::Value *value, unsigned fullWidth,
-                       uint64_t bitOffset, unsigned readWidth,
-                       llvm::Type *readType,
-                       llvm::SmallPtrSetImpl<llvm::Value *> &seen) {
-  if (value == nullptr || !seen.insert(value).second) {
-    return nullptr;
-  }
-
-  if (auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value)) {
-    if (constant->isZero() && constant->getBitWidth() == fullWidth) {
-      return llvm::ConstantInt::get(readType, 0);
-    }
-    return nullptr;
-  }
-
-  auto *call = llvm::dyn_cast<llvm::CallBase>(value);
-  std::optional<NativeRegisterValueInsertInfo> insert =
-      call == nullptr ? std::nullopt : parseNativeRegisterValueInsert(*call);
-  if (!insert || insert->FullWidth != fullWidth) {
-    return nullptr;
-  }
-
-  uint64_t insertOffset = insert->BitOffset;
-  uint64_t insertWidth = insert->WriteWidth;
-  if (bitOffset >= insertOffset &&
-      bitOffset + readWidth <= insertOffset + insertWidth) {
-    if (bitOffset == insertOffset && readWidth == insertWidth &&
-        insert->Value->getType() == readType) {
-      return insert->Value;
-    }
-    return nullptr;
-  }
-
-  if (rangesOverlap(bitOffset, readWidth, insertOffset, insertWidth)) {
-    return nullptr;
-  }
-  return findInsertedRangePiece(insert->Base, fullWidth, bitOffset, readWidth,
-                                readType, seen);
-}
-
-llvm::Value *simplifyInsertedValueExtract(llvm::TruncInst &trunc) {
-  if (trunc.use_empty()) {
-    return nullptr;
-  }
-  auto *sourceType =
-      llvm::dyn_cast<llvm::IntegerType>(trunc.getOperand(0)->getType());
-  auto *readType = llvm::dyn_cast<llvm::IntegerType>(trunc.getType());
-  if (sourceType == nullptr || readType == nullptr) {
-    return nullptr;
-  }
-
-  llvm::Value *fullValue = trunc.getOperand(0);
-  uint64_t bitOffset = 0;
-  if (auto *shift = llvm::dyn_cast<llvm::BinaryOperator>(fullValue)) {
-    if (shift->getOpcode() != llvm::Instruction::LShr) {
-      return nullptr;
-    }
-    std::optional<uint64_t> amount = constantShiftAmount(shift->getOperand(1));
-    if (!amount) {
-      return nullptr;
-    }
-    bitOffset = *amount;
-    fullValue = shift->getOperand(0);
-    sourceType = llvm::dyn_cast<llvm::IntegerType>(fullValue->getType());
-    if (sourceType == nullptr) {
-      return nullptr;
-    }
-  }
-
-  unsigned fullWidth = sourceType->getBitWidth();
-  unsigned readWidth = readType->getBitWidth();
-  if (readWidth == 0 || readWidth >= fullWidth || bitOffset >= fullWidth ||
-      readWidth > fullWidth - bitOffset) {
-    return nullptr;
-  }
-
-  llvm::SmallPtrSet<llvm::Value *, 8> seen;
-  return findInsertedRangePiece(fullValue, fullWidth, bitOffset, readWidth,
-                                readType, seen);
-}
-
-uint64_t simplifyInsertedValueExtracts(llvm::Module &module) {
-  std::vector<llvm::TruncInst *> truncs;
-  for (llvm::Function &function : module) {
-    if (function.isDeclaration()) {
-      continue;
-    }
-    for (llvm::Instruction &inst : llvm::instructions(function)) {
-      if (auto *trunc = llvm::dyn_cast<llvm::TruncInst>(&inst)) {
-        truncs.push_back(trunc);
-      }
-    }
-  }
-
-  uint64_t simplified = 0;
-  for (llvm::TruncInst *trunc : truncs) {
-    if (trunc->getParent() == nullptr) {
-      continue;
-    }
-    llvm::Instruction *middle =
-        llvm::dyn_cast<llvm::Instruction>(trunc->getOperand(0));
-    llvm::Value *replacement = simplifyInsertedValueExtract(*trunc);
-    if (replacement == nullptr) {
-      continue;
-    }
-    trunc->replaceAllUsesWith(replacement);
-    trunc->eraseFromParent();
-    if (middle != nullptr && middle->use_empty()) {
-      middle->eraseFromParent();
-    }
-    ++simplified;
-  }
-  return simplified;
 }
 
 uint64_t lowerValueRangeHelpers(llvm::Module &module) {
@@ -489,7 +357,6 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   if (options.RunGlobalDCE) {
     runGlobalDCE(module);
   }
-  summary.ValueRangeExtractsSimplified += simplifyInsertedValueExtracts(module);
   summary.ValueRangeHelpersLowered += lowerValueRangeHelpers(module);
   runLocalDeadCodeCleanup(module);
   summary.DeadRegisterReadsRemoved += eraseDeadRegisterReads(module);
@@ -531,8 +398,6 @@ void printNativeRegisterFinalCleanupSummary(
      << " dead_register_reads_removed=" << summary.DeadRegisterReadsRemoved
      << " register_globals_removed=" << summary.RegisterGlobalsRemoved
      << " helper_declarations_removed=" << summary.HelperDeclarationsRemoved
-     << " value_range_extracts_simplified="
-     << summary.ValueRangeExtractsSimplified
      << " value_range_helpers_lowered=" << summary.ValueRangeHelpersLowered
      << " function_metadata_cleared=" << summary.FunctionMetadataCleared
      << " instruction_metadata_cleared=" << summary.InstructionMetadataCleared
