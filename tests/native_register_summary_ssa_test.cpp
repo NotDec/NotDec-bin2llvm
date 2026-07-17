@@ -152,6 +152,47 @@ void attachTestFloatAbi(llvm::Module &module, unsigned floatInputs) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachTestIntegerAndFloatVarArgAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_mixed_vararg_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+
+  for (llvm::StringRef name : {"RDI", "RSI", "RDX", "RCX", "R8", "R9"}) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 1;
+    input.MaxSize = 8;
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = name.str();
+    abi.Inputs.push_back(input);
+  }
+
+  notdec::bin2llvm::NativeAbiParamEntry floatInput;
+  floatInput.MinSize = 4;
+  floatInput.MaxSize = 8;
+  floatInput.MetaType = "float";
+  floatInput.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  floatInput.Storage.Name = "XMM0_Qa";
+  abi.Inputs.push_back(floatInput);
+
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "RAX";
+  abi.Outputs.push_back(output);
+
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = "RAX";
+  abi.Effects.push_back(killed);
+  killed.Storage.Name = "XMM0";
+  abi.Effects.push_back(killed);
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 llvm::StoreInst *storeRegister(llvm::IRBuilder<> &builder,
                                llvm::GlobalVariable *reg, llvm::Value *value,
                                const std::string &name) {
@@ -2867,6 +2908,217 @@ bool testKnownVarArgCallsitesKeepIndependentArities() {
                 "known vararg extended callsite used wrong arity") &&
          verifyOk(module,
                   "module failed verifier after per-callsite vararg rewrite");
+}
+
+bool testKnownVarArgUsesSseCountForFloatTail() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-vararg-float-tail", context);
+  attachTestIntegerAndFloatVarArgAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__fprintf_chk", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "vararg_float_tail_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                "RDX");
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 0),
+                "RCX");
+  storeRegister(builder, r8, llvm::ConstantInt::get(r8->getValueType(), 0),
+                "R8");
+  storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 1),
+                "RAX");
+  storeRegister(builder, zmm0,
+                llvm::ConstantInt::get(
+                    zmmType, llvm::APInt(512, 0x3ff0000000000000ULL)),
+                "ZMM0");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenCaller = module.getFunction("vararg_float_tail_caller");
+  llvm::CallInst *rewrittenCall = nullptr;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenCaller)) {
+      auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (candidate != nullptr && candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "__fprintf_chk") {
+        rewrittenCall = candidate;
+      }
+    }
+  }
+
+  return expect(rewrittenCall != nullptr, "known vararg float call missing") &&
+         expect(rewrittenCall->arg_size() == 4,
+                "known vararg float call used wrong arity") &&
+         expect(rewrittenCall->getArgOperand(3)->getType()->isDoubleTy(),
+                "known vararg float tail was not rewritten to double") &&
+         verifyOk(module,
+                  "module failed verifier after known vararg float rewrite");
+}
+
+bool testKnownVarArgZeroTailUsesPoison() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-vararg-zero-tail-poison", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__fprintf_chk", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "vararg_zero_tail_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                "RDX");
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 0),
+                "RCX");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+  llvm::Function *rewrittenCaller = module.getFunction("vararg_zero_tail_caller");
+  llvm::CallInst *rewrittenCall = nullptr;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenCaller)) {
+      auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (candidate != nullptr && candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "__fprintf_chk") {
+        rewrittenCall = candidate;
+      }
+    }
+  }
+  return expect(rewrittenCall != nullptr, "known vararg zero call missing") &&
+         expect(rewrittenCall->arg_size() == 4,
+                "known vararg zero call used wrong arity") &&
+         expect(llvm::isa<llvm::PoisonValue>(rewrittenCall->getArgOperand(3)),
+                "known vararg zero tail was not rewritten to poison") &&
+         expect(cleanup.VarArgUnknownHelpersLowered == 1,
+                "vararg unknown helper was not lowered") &&
+         verifyOk(module,
+                  "module failed verifier after known vararg poison rewrite");
+}
+
+bool testKnownVarArgUnknownPhiTailUsesPoison() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-vararg-unknown-phi-tail-poison",
+                      context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__fprintf_chk", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "vararg_unknown_phi_tail_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *unknownBlock =
+      llvm::BasicBlock::Create(context, "unknown", function);
+  llvm::BasicBlock *zeroBlock =
+      llvm::BasicBlock::Create(context, "zero", function);
+  llvm::BasicBlock *merge =
+      llvm::BasicBlock::Create(context, "merge", function);
+
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                "RDX");
+  llvm::Value *cond =
+      builder.CreateFreeze(llvm::PoisonValue::get(llvm::Type::getInt1Ty(context)),
+                           "unknown_cond");
+  builder.CreateCondBr(cond, unknownBlock, zeroBlock);
+
+  builder.SetInsertPoint(unknownBlock);
+  auto *tail32Type = llvm::Type::getInt32Ty(context);
+  llvm::Value *unknown =
+      builder.CreateFreeze(llvm::PoisonValue::get(tail32Type), "tail_unknown");
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(zeroBlock);
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(merge);
+  llvm::PHINode *tail = builder.CreatePHI(tail32Type, 2, "tail");
+  tail->addIncoming(unknown, unknownBlock);
+  tail->addIncoming(llvm::ConstantInt::get(tail32Type, 0), zeroBlock);
+  llvm::Function *insert = notdec::bin2llvm::getOrInsertNativeRegisterValueInsert(
+      module, rcx->getValueType(), tail32Type, 64, 32);
+  llvm::Value *tail64 = builder.CreateCall(
+      insert,
+      {llvm::ConstantInt::get(rcx->getValueType(), 0), tail,
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "tail_insert");
+  storeRegister(builder, rcx, tail64, "RCX");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+  llvm::Function *rewrittenCaller =
+      module.getFunction("vararg_unknown_phi_tail_caller");
+  llvm::CallInst *rewrittenCall = nullptr;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenCaller)) {
+      auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (candidate != nullptr && candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "__fprintf_chk") {
+        rewrittenCall = candidate;
+      }
+    }
+  }
+
+  return expect(rewrittenCall != nullptr,
+                "known vararg unknown-phi call missing") &&
+         expect(rewrittenCall->arg_size() == 4,
+                "known vararg unknown-phi call used wrong arity") &&
+         expect(llvm::isa<llvm::PoisonValue>(rewrittenCall->getArgOperand(3)),
+                "known vararg unknown-phi tail was not rewritten to poison") &&
+         expect(cleanup.VarArgUnknownHelpersLowered == 1,
+                "unknown-phi vararg helper was not lowered") &&
+         verifyOk(module,
+                  "module failed verifier after unknown-phi vararg rewrite");
 }
 
 bool testMismatchedDirectCallUseUsesReturnExtract() {
@@ -7171,6 +7423,9 @@ int main() {
   ok &= testKnownVarArgExternalInfersDefinedAbiInputs();
   ok &= testKnownVarArgFixedOnlyCallDoesNotReadTail();
   ok &= testKnownVarArgCallsitesKeepIndependentArities();
+  ok &= testKnownVarArgUsesSseCountForFloatTail();
+  ok &= testKnownVarArgZeroTailUsesPoison();
+  ok &= testKnownVarArgUnknownPhiTailUsesPoison();
   ok &= testMismatchedDirectCallUseUsesReturnExtract();
   ok &= testKnownExternalUsesSingleIntegerReturn();
   ok &= testUnknownExternalTreatsRdxAsClobberNotReturn();

@@ -1395,6 +1395,7 @@ private:
       evidence.UnitName = slot.UnitName;
       evidence.OffsetBits = slot.OffsetBits;
       evidence.SizeBits = slot.SizeBits;
+      evidence.Float = slot.Float;
       evidence.Origin = callsiteOrigin(state, slot);
       result.push_back(std::move(evidence));
     }

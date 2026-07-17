@@ -18,6 +18,8 @@ struct NativeRegisterCallInputSlot {
   std::string UnitName;
   unsigned OffsetBits = 0;
   unsigned SizeBits = 0;
+  // True for ABI floating-point slots backed by a lifted integer register.
+  bool Float = false;
 };
 
 struct NativeExternalCallShape {
@@ -55,6 +57,7 @@ struct NativeRegisterCallsiteSlotEvidence {
   std::string UnitName;
   unsigned OffsetBits = 0;
   unsigned SizeBits = 0;
+  bool Float = false;
   NativeRegisterCallsiteValueOrigin Origin =
       NativeRegisterCallsiteValueOrigin::Unknown;
 };

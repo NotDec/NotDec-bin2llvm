@@ -10,6 +10,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringRef.h"
@@ -337,6 +338,15 @@ std::string llvmTypeName(llvm::Type *type) {
     os << "<null>";
   }
   return os.str();
+}
+
+llvm::Function *getOrInsertVarArgUnknownHelper(llvm::Module &module,
+                                               llvm::Type *type) {
+  std::string name = "notdec.register.vararg_unknown." + llvmTypeName(type);
+  llvm::FunctionType *functionType =
+      llvm::FunctionType::get(type, {}, false);
+  return llvm::cast<llvm::Function>(
+      module.getOrInsertFunction(name, functionType).getCallee());
 }
 
 void attachZeroDemandOperandMetadata(llvm::Instruction &instruction,
@@ -1137,15 +1147,20 @@ bool demandFitsSlot(const llvm::APInt &demand,
   return !(trimmed & ~slotMask).getBoolValue();
 }
 
-llvm::Type *floatTypeForSlot(llvm::LLVMContext &context,
-                             const AbiFacts::RegisterSlot &slot) {
-  if (slot.SizeBits <= 32) {
+llvm::Type *floatTypeForSizeBits(llvm::LLVMContext &context,
+                                 unsigned sizeBits) {
+  if (sizeBits <= 32) {
     return llvm::Type::getFloatTy(context);
   }
-  if (slot.SizeBits <= 64) {
+  if (sizeBits <= 64) {
     return llvm::Type::getDoubleTy(context);
   }
   return nullptr;
+}
+
+llvm::Type *floatTypeForSlot(llvm::LLVMContext &context,
+                             const AbiFacts::RegisterSlot &slot) {
+  return floatTypeForSizeBits(context, slot.SizeBits);
 }
 
 std::optional<NativeSignatureSlot>
@@ -1432,6 +1447,7 @@ NativeRegisterCallInputSlot callInputSlot(const NativeSignatureSlot &slot) {
   input.UnitName = slot.Unit->Name;
   input.OffsetBits = slot.OffsetBits;
   input.SizeBits = slot.SizeBits;
+  input.Float = slot.Kind == NativeSignatureSlotKind::FloatRegister;
   return input;
 }
 
@@ -1440,13 +1456,14 @@ NativeRegisterCallInputSlot callInputSlot(const AbiFacts::RegisterSlot &slot) {
   input.UnitName = slot.UnitName;
   input.OffsetBits = slot.OffsetBits;
   input.SizeBits = slot.SizeBits;
+  input.Float = slot.MetaType == "float";
   return input;
 }
 
 bool sameCallInputSlot(const NativeRegisterCallInputSlot &lhs,
                        const NativeRegisterCallInputSlot &rhs) {
   return lhs.UnitName == rhs.UnitName && lhs.OffsetBits == rhs.OffsetBits &&
-         lhs.SizeBits == rhs.SizeBits;
+         lhs.SizeBits == rhs.SizeBits && lhs.Float == rhs.Float;
 }
 
 NativeExternalCallShapeMap buildExternalCallShapes(
@@ -1491,6 +1508,9 @@ NativeExternalCallShapeMap buildExternalCallShapes(
       for (const AbiFacts::RegisterSlot &slot : abi.IntegerInputsInOrder) {
         addRemaining(slot, callShape.VarArgInputs);
       }
+      for (const AbiFacts::RegisterSlot &slot : abi.FloatInputsInOrder) {
+        addRemaining(slot, callShape.VarArgInputs);
+      }
     }
     result.emplace(function.getName().str(), std::move(callShape));
   }
@@ -1507,9 +1527,10 @@ unknownExternalEvidenceSlots(const AbiFacts &abi) {
   return result;
 }
 
-unsigned localDefinitionPrefix(const NativeRegisterExternalCallsite &callsite) {
+unsigned localDefinitionPrefix(
+    llvm::ArrayRef<NativeRegisterCallsiteSlotEvidence> slots) {
   unsigned prefix = 0;
-  for (const NativeRegisterCallsiteSlotEvidence &slot : callsite.Slots) {
+  for (const NativeRegisterCallsiteSlotEvidence &slot : slots) {
     if (slot.Index != prefix ||
         slot.Origin != NativeRegisterCallsiteValueOrigin::LocalDefinition) {
       break;
@@ -1517,6 +1538,24 @@ unsigned localDefinitionPrefix(const NativeRegisterExternalCallsite &callsite) {
     ++prefix;
   }
   return prefix;
+}
+
+unsigned localDefinitionPrefix(const NativeRegisterExternalCallsite &callsite) {
+  return localDefinitionPrefix(callsite.Slots);
+}
+
+std::vector<NativeRegisterCallsiteSlotEvidence>
+renumberedSlotsByKind(const NativeRegisterExternalCallsite &callsite,
+                      bool wantFloat) {
+  std::vector<NativeRegisterCallsiteSlotEvidence> result;
+  for (NativeRegisterCallsiteSlotEvidence slot : callsite.Slots) {
+    if (slot.Float != wantFloat) {
+      continue;
+    }
+    slot.Index = result.size();
+    result.push_back(std::move(slot));
+  }
+  return result;
 }
 
 bool hasLocalDefinitionAfter(
@@ -1535,7 +1574,59 @@ callInputSlot(const NativeRegisterCallsiteSlotEvidence &slot) {
   input.UnitName = slot.UnitName;
   input.OffsetBits = slot.OffsetBits;
   input.SizeBits = slot.SizeBits;
+  input.Float = slot.Float;
   return input;
+}
+
+std::optional<unsigned> constantLowByteBeforeCall(
+    const NativeRegisterExternalCallsite &callsite,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    llvm::StringRef registerName) {
+  auto unitIt = std::find_if(units.begin(), units.end(), [&](const auto &entry) {
+    return entry.second.Name == registerName;
+  });
+  if (unitIt == units.end() || callsite.Call == nullptr ||
+      callsite.Call->getParent() == nullptr) {
+    return std::nullopt;
+  }
+  llvm::GlobalVariable *global = unitIt->first;
+  for (auto it = callsite.Call->getIterator();
+       it != callsite.Call->getParent()->begin();) {
+    --it;
+    llvm::Instruction &inst = const_cast<llvm::Instruction &>(*it);
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      RegisterAccess access = registerStore(*store, units);
+      if (access.Unit == nullptr || access.Unit->Global != global) {
+        continue;
+      }
+      auto *constant =
+          llvm::dyn_cast<llvm::ConstantInt>(store->getValueOperand());
+      if (constant == nullptr) {
+        return std::nullopt;
+      }
+      return static_cast<unsigned>(constant->getZExtValue() & 0xffu);
+    }
+    if (auto *otherCall = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+      if (std::optional<NativeRegisterPartialWriteInfo> partial =
+              parseNativeRegisterPartialWrite(*otherCall)) {
+        if (partial->Global != global) {
+          continue;
+        }
+        if (partial->BitOffset != 0 || partial->WriteWidth < 8) {
+          return std::nullopt;
+        }
+        auto *constant = llvm::dyn_cast<llvm::ConstantInt>(partial->Value);
+        if (constant == nullptr) {
+          return std::nullopt;
+        }
+        return static_cast<unsigned>(constant->getZExtValue() & 0xffu);
+      }
+      if (isAnalyzableCall(*otherCall)) {
+        return std::nullopt;
+      }
+    }
+  }
+  return std::nullopt;
 }
 
 NativeRegisterSummarySSAWarning externalInferenceWarning(llvm::StringRef callee,
@@ -1568,6 +1659,7 @@ varArgInferenceWarning(const NativeRegisterExternalCallsite &callsite,
 NativeExternalCallsiteShapeMap inferExternalCallShapes(
     NativeExternalPrototypeMap &prototypes,
     const NativeRegisterSummary &baseSummary,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     std::vector<NativeRegisterSummarySSAWarning> &warnings) {
   NativeExternalCallsiteShapeMap callsiteShapes;
   std::map<std::string, std::vector<unsigned>> aritiesByCallee;
@@ -1598,8 +1690,36 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
       callsiteShapes.emplace(callsite.Call, std::move(shape));
       continue;
     }
-    unsigned rawPrefix = localDefinitionPrefix(callsite);
-    unsigned allowed = callsite.Slots.size();
+    std::vector<NativeRegisterCallsiteSlotEvidence> integerSlots =
+        renumberedSlotsByKind(callsite, false);
+    std::vector<NativeRegisterCallsiteSlotEvidence> floatSlots =
+        renumberedSlotsByKind(callsite, true);
+    std::optional<unsigned> sseVarArgs =
+        constantLowByteBeforeCall(callsite, units, "RAX");
+    if (sseVarArgs && *sseVarArgs != 0) {
+      unsigned wanted = std::min<unsigned>(*sseVarArgs, floatSlots.size());
+      unsigned added = 0;
+      for (const NativeRegisterCallsiteSlotEvidence &slot : floatSlots) {
+        if (added >= wanted ||
+            slot.Origin != NativeRegisterCallsiteValueOrigin::LocalDefinition) {
+          break;
+        }
+        shape.Inputs.push_back(callInputSlot(slot));
+        ++added;
+      }
+      if (added < *sseVarArgs) {
+        warnings.push_back(varArgInferenceWarning(
+            callsite,
+            "float_tail=" + std::to_string(added) + "/" +
+                std::to_string(*sseVarArgs),
+            "incomplete_float_vararg_mapping"));
+      }
+      callsiteShapes.emplace(callsite.Call, std::move(shape));
+      continue;
+    }
+
+    unsigned rawPrefix = localDefinitionPrefix(integerSlots);
+    unsigned allowed = integerSlots.size();
     if (callsite.MaxArgs != 0) {
       unsigned maxTail = callsite.MaxArgs > callsite.FixedArgs
                              ? callsite.MaxArgs - callsite.FixedArgs
@@ -1608,7 +1728,7 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
     }
     unsigned inferredTail = std::min(rawPrefix, allowed);
     for (unsigned index = 0; index < inferredTail; ++index) {
-      shape.Inputs.push_back(callInputSlot(callsite.Slots[index]));
+      shape.Inputs.push_back(callInputSlot(integerSlots[index]));
     }
     if (rawPrefix > allowed) {
       warnings.push_back(
@@ -1617,7 +1737,7 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
                                      "/max=" + std::to_string(allowed),
                                  "vararg_evidence_truncated_by_max_args"));
     }
-    if (hasLocalDefinitionAfter(callsite.Slots, rawPrefix + 1)) {
+    if (hasLocalDefinitionAfter(integerSlots, rawPrefix + 1)) {
       warnings.push_back(varArgInferenceWarning(
           callsite, "tail=" + std::to_string(inferredTail),
           "non_contiguous_vararg_evidence"));
@@ -4948,6 +5068,32 @@ private:
     return nullptr;
   }
 
+  std::optional<NativeSignatureSlot>
+  signatureSlotForCallInput(const NativeRegisterCallInputSlot &input) const {
+    const RegisterUnit *unit = unitByName(input.UnitName);
+    if (unit == nullptr) {
+      return std::nullopt;
+    }
+    if (!input.Float) {
+      return integerSignatureSlot(*unit);
+    }
+
+    llvm::Type *type = floatTypeForSizeBits(Function.getContext(),
+                                            input.SizeBits);
+    if (type == nullptr) {
+      return std::nullopt;
+    }
+    NativeSignatureSlot slot;
+    slot.Kind = NativeSignatureSlotKind::FloatRegister;
+    slot.Unit = unit;
+    slot.AbiName = input.UnitName;
+    slot.MetaType = "float";
+    slot.OffsetBits = input.OffsetBits;
+    slot.SizeBits = input.SizeBits;
+    slot.LlvmType = type;
+    return slot;
+  }
+
   std::vector<NativeSignatureSlot> callParamSlots(llvm::CallBase &call,
                                                   const SignatureShape &shape) {
     std::vector<NativeSignatureSlot> slots = shape.Params;
@@ -4963,11 +5109,12 @@ private:
     for (unsigned index = shape.Params.size();
          index < callsiteShape->Inputs.size(); ++index) {
       const NativeRegisterCallInputSlot &input = callsiteShape->Inputs[index];
-      const RegisterUnit *unit = unitByName(input.UnitName);
-      if (unit == nullptr) {
+      std::optional<NativeSignatureSlot> slot =
+          signatureSlotForCallInput(input);
+      if (!slot) {
         break;
       }
-      slots.push_back(integerSignatureSlot(*unit));
+      slots.push_back(*slot);
     }
     return slots;
   }
@@ -6083,6 +6230,88 @@ llvm::Value *resolveValueMap(llvm::Value *value,
   return value;
 }
 
+bool valueMayDependOnUnknownPlaceholder(
+    llvm::Value *value, llvm::SmallPtrSetImpl<llvm::Value *> &seen) {
+  if (value == nullptr) {
+    return false;
+  }
+  if (llvm::isa<llvm::PoisonValue>(value) || llvm::isa<llvm::UndefValue>(value)) {
+    return true;
+  }
+  if (llvm::isa<llvm::Constant>(value)) {
+    return false;
+  }
+  if (!seen.insert(value).second) {
+    return false;
+  }
+
+  if (auto *freeze = llvm::dyn_cast<llvm::FreezeInst>(value)) {
+    return valueMayDependOnUnknownPlaceholder(freeze->getOperand(0), seen);
+  }
+  if (auto *call = llvm::dyn_cast<llvm::CallBase>(value)) {
+    llvm::Function *callee = call->getCalledFunction();
+    if (callee != nullptr &&
+        callee->getName().starts_with("notdec.register.vararg_unknown.")) {
+      return true;
+    }
+    if (std::optional<NativeRegisterValueInsertInfo> insert =
+            parseNativeRegisterValueInsert(*call)) {
+      return valueMayDependOnUnknownPlaceholder(insert->Base, seen) ||
+             valueMayDependOnUnknownPlaceholder(insert->Value, seen);
+    }
+    if (std::optional<NativeRegisterValueExtractInfo> extract =
+            parseNativeRegisterValueExtract(*call)) {
+      return valueMayDependOnUnknownPlaceholder(extract->FullValue, seen);
+    }
+    return false;
+  }
+
+  // These are value-only glue nodes created while rebuilding register ranges.  If
+  // any piece comes from a freeze-poison placeholder, the final vararg value is
+  // not a real source value even if InstCombine can later pick 0 for it.
+  bool shouldInspectOperands =
+      llvm::isa<llvm::PHINode>(value) || llvm::isa<llvm::SelectInst>(value) ||
+      llvm::isa<llvm::CastInst>(value) ||
+      llvm::isa<llvm::BinaryOperator>(value) ||
+      llvm::isa<llvm::UnaryOperator>(value) ||
+      llvm::isa<llvm::ExtractValueInst>(value) ||
+      llvm::isa<llvm::InsertValueInst>(value);
+  if (!shouldInspectOperands) {
+    return false;
+  }
+  auto *user = llvm::cast<llvm::User>(value);
+  for (llvm::Value *operand : user->operands()) {
+    if (valueMayDependOnUnknownPlaceholder(operand, seen)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool valueMayDependOnUnknownPlaceholder(llvm::Value *value) {
+  llvm::SmallPtrSet<llvm::Value *, 16> seen;
+  return valueMayDependOnUnknownPlaceholder(value, seen);
+}
+
+bool shouldPoisonUnprovenVarArg(const CallArgStoreBinding &binding,
+                                llvm::Value *value,
+                                const llvm::DataLayout &layout,
+                                const llvm::Instruction *context) {
+  (void)binding;
+  if (valueMayDependOnUnknownPlaceholder(value)) {
+    return true;
+  }
+  auto *constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(value);
+  if (constant != nullptr) {
+    return constant->isZero();
+  }
+  if (value == nullptr || !value->getType()->isIntegerTy()) {
+    return false;
+  }
+  llvm::KnownBits known = llvm::computeKnownBits(value, layout, nullptr, context);
+  return known.isZero();
+}
+
 bool collectInsertedExtractPieces(
     llvm::Value *value, unsigned fullWidth,
     std::map<llvm::Value *, llvm::Value *> &valueMap, llvm::Value *&source,
@@ -6243,6 +6472,12 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         }
         value = remapValue(value);
         value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);
+        if (shouldPoisonUnprovenVarArg(binding, value, module.getDataLayout(),
+                                       oldCall)) {
+          llvm::Function *unknown =
+              getOrInsertVarArgUnknownHelper(module, value->getType());
+          value = oldCallBuilder.CreateCall(unknown);
+        }
         if (binding.ValueType != nullptr &&
             value->getType() != binding.ValueType) {
           continue;
@@ -6488,7 +6723,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
 
   std::vector<NativeRegisterSummarySSAWarning> inferenceWarnings;
   NativeExternalCallsiteShapeMap externalCallsiteShapes =
-      inferExternalCallShapes(externalPrototypes, baseRegisterSummary,
+      inferExternalCallShapes(externalPrototypes, baseRegisterSummary, units,
                               inferenceWarnings);
 
   NativeRegisterSummaryOptions finalSummaryOptions = baseSummaryOptions;

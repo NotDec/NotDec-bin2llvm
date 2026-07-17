@@ -6,6 +6,7 @@
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -76,6 +77,10 @@ bool isRegisterHelperCall(const llvm::Instruction &inst) {
          parseNativeRegisterValueInsert(*call).has_value() ||
          parseNativeRegisterPartialRead(*call).has_value() ||
          parseNativeRegisterPartialWrite(*call).has_value();
+}
+
+bool isVarArgUnknownHelperName(llvm::StringRef name) {
+  return name.starts_with("notdec.register.vararg_unknown.");
 }
 
 llvm::APInt partialWriteMask(unsigned fullWidth, unsigned writeWidth,
@@ -185,6 +190,34 @@ uint64_t lowerValueRangeHelpers(llvm::Module &module) {
   return lowered;
 }
 
+uint64_t lowerVarArgUnknownHelpers(llvm::Module &module) {
+  std::vector<llvm::CallBase *> calls;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      llvm::Function *callee =
+          call == nullptr ? nullptr : call->getCalledFunction();
+      if (callee != nullptr && isVarArgUnknownHelperName(callee->getName())) {
+        calls.push_back(call);
+      }
+    }
+  }
+
+  uint64_t lowered = 0;
+  for (llvm::CallBase *call : calls) {
+    if (call->getParent() == nullptr || call->getType()->isVoidTy()) {
+      continue;
+    }
+    call->replaceAllUsesWith(llvm::PoisonValue::get(call->getType()));
+    call->eraseFromParent();
+    ++lowered;
+  }
+  return lowered;
+}
+
 uint64_t eraseDeadRegisterReads(llvm::Module &module) {
   std::vector<llvm::Instruction *> deadReads;
   for (llvm::Function &function : module) {
@@ -242,6 +275,7 @@ uint64_t eraseUnusedRegisterHelperDeclarations(llvm::Module &module) {
     }
     llvm::StringRef name = function.getName();
     if (name.starts_with("notdec.register.summary_") ||
+        isVarArgUnknownHelperName(name) ||
         isNativeRegisterValueRangeName(name) ||
         isNativeRegisterPartialReadName(name) ||
         isNativeRegisterPartialWriteName(name)) {
@@ -358,6 +392,7 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
     runGlobalDCE(module);
   }
   summary.ValueRangeHelpersLowered += lowerValueRangeHelpers(module);
+  summary.VarArgUnknownHelpersLowered += lowerVarArgUnknownHelpers(module);
   runLocalDeadCodeCleanup(module);
   summary.DeadRegisterReadsRemoved += eraseDeadRegisterReads(module);
   runLocalDeadCodeCleanup(module);
@@ -399,6 +434,8 @@ void printNativeRegisterFinalCleanupSummary(
      << " register_globals_removed=" << summary.RegisterGlobalsRemoved
      << " helper_declarations_removed=" << summary.HelperDeclarationsRemoved
      << " value_range_helpers_lowered=" << summary.ValueRangeHelpersLowered
+     << " vararg_unknown_helpers_lowered="
+     << summary.VarArgUnknownHelpersLowered
      << " function_metadata_cleared=" << summary.FunctionMetadataCleared
      << " instruction_metadata_cleared=" << summary.InstructionMetadataCleared
      << " remaining_register_accesses=" << summary.RemainingRegisterAccesses
