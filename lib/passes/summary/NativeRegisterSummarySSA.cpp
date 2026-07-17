@@ -28,6 +28,7 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
@@ -1998,9 +1999,6 @@ public:
     if (Options.EnableRewrite) {
       rewritePartialReads();
       foldDuplicatePartialReadXors();
-      if (Options.EnableResidueRemoval) {
-        removeDeadPartialReads();
-      }
       rewriteLoads();
       addIndirectCallsiteShapes(SignatureState, Units, Abi);
       collectSignatureCallArgs();
@@ -2008,8 +2006,15 @@ public:
       rewritePartialWrites();
       finalizePendingPhis();
       if (Options.EnableResidueRemoval) {
-        removeDeadReplacedLoads();
         removeDeadStoresByLiveness();
+        // Keep replaced reads/xors/loads physically alive until every range
+        // read and call binding is done.  They stay as Replacement keys while
+        // the builder is active; deleting them earlier can leave stale keys if
+        // LLVM later reuses the same address for a new helper.
+        removeDeadPartialReads();
+        removeDeadFoldedZeroXors();
+        removeDeadReplacedLoads();
+        removeDeadEntryReads();
       }
       eraseDeadPhis();
     }
@@ -2025,11 +2030,14 @@ public:
     planRegisterRanges();
     rewritePartialReads();
     foldDuplicatePartialReadXors();
-    removeDeadPartialReads();
     rewriteLoads();
     rewritePartialWrites();
-    removeDeadReplacedLoads();
+    // This cleanup run still creates new range helper calls while rewriting
+    // loads/writes, so physical deletion stays after liveness cleanup.
     removeDeadStoresByLiveness();
+    removeDeadPartialReads();
+    removeDeadFoldedZeroXors();
+    removeDeadReplacedLoads();
     removeDeadEntryReads();
   }
 
@@ -2042,9 +2050,10 @@ private:
   NativeRegisterSummarySSAFunctionSummary &Summary;
   SignatureRewriteState &SignatureState;
   std::vector<llvm::LoadInst *> Loads;
-  std::vector<llvm::CallBase *> PartialReads;
-  std::vector<llvm::LoadInst *> ReplacedLoads;
-  std::vector<llvm::CallBase *> ReplacedPartialReads;
+  std::vector<llvm::WeakVH> PartialReads;
+  std::vector<llvm::WeakVH> ReplacedLoads;
+  std::vector<llvm::WeakVH> ReplacedPartialReads;
+  std::vector<llvm::WeakVH> FoldedZeroXors;
   std::map<BlockRangeKey, llvm::Value *> EntryRangeValue;
   std::map<BlockRangeKey, llvm::Value *> ExitRangeValue;
   std::map<BlockRangeKey, llvm::PHINode *> PendingRangePhi;
@@ -2817,15 +2826,7 @@ private:
   }
 
   void eraseDeadPartialWriteCall(llvm::CallBase *call) {
-    llvm::Value *partialValue = parseNativeRegisterPartialWrite(*call)->Value;
-    bool keepPartialValue = isRecordedCallArgValue(partialValue) ||
-                            isRecordedFunctionReturnValue(partialValue);
-    call->eraseFromParent();
-    if (!keepPartialValue) {
-      if (auto *partialInst = llvm::dyn_cast<llvm::Instruction>(partialValue)) {
-        llvm::RecursivelyDeleteTriviallyDeadInstructions(partialInst);
-      }
-    }
+    eraseInstructionFromParent(*call);
     ++Summary.DeadStoresRemoved;
   }
 
@@ -3362,7 +3363,8 @@ private:
   assembleRangeReadIfDominating(const std::vector<RegisterRangeKey> &ranges,
                                 uint64_t readOffset, uint32_t readWidth,
                                 llvm::Instruction *before, llvm::Twine name,
-                                llvm::DominatorTree &domTree) {
+                                llvm::DominatorTree &domTree,
+                                bool allowUnknownSegments = false) {
     if (ranges.empty() || before == nullptr || readWidth == 0) {
       return nullptr;
     }
@@ -3373,7 +3375,15 @@ private:
           readRangeBefore(*before->getParent(), range, before, &domTree));
       if (segment == nullptr || segment->getType() != rangeType(range) ||
           !valueDominatesUse(segment, before, &domTree)) {
-        return nullptr;
+        if (!allowUnknownSegments ||
+            UnknownCurrentDef.count({before->getParent(), range}) != 0) {
+          return nullptr;
+        }
+        segment = unknownRangeBefore(*before, range, ".range_unknown");
+        if (segment == nullptr || segment->getType() != rangeType(range) ||
+            !valueDominatesUse(segment, before, &domTree)) {
+          return nullptr;
+        }
       }
       segments.push_back(segment);
     }
@@ -3406,7 +3416,8 @@ private:
   llvm::Value *
   readAccessRangeIfDominating(llvm::GlobalVariable *global, uint64_t readOffset,
                               uint32_t readWidth, llvm::Instruction *before,
-                              llvm::Twine name, llvm::DominatorTree &domTree) {
+                              llvm::Twine name, llvm::DominatorTree &domTree,
+                              bool allowUnknownSegments = false) {
     if (llvm::Value *covered = tryCurrentCoveredAccess(
             global, readOffset, readWidth, before, name + ".covered")) {
       return covered;
@@ -3414,18 +3425,20 @@ private:
     std::vector<RegisterRangeKey> ranges =
         plannedRangesCovering(global, readOffset, readWidth);
     return assembleRangeReadIfDominating(ranges, readOffset, readWidth, before,
-                                         name, domTree);
+                                         name, domTree, allowUnknownSegments);
   }
 
   llvm::Value *readFullRangeValueBefore(llvm::BasicBlock &block,
                                         const RegisterUnit &unit,
                                         llvm::Instruction *before,
-                                        llvm::DominatorTree &domTree) {
+                                        llvm::DominatorTree &domTree,
+                                        bool allowUnknownSegments = false) {
     (void)block;
     unsigned fullWidth = registerBitWidth(unit);
     llvm::Value *value = readAccessRangeIfDominating(
         unit.Global, 0, fullWidth, before,
-        llvm::Twine(unit.Name) + ".full_range", domTree);
+        llvm::Twine(unit.Name) + ".full_range", domTree,
+        allowUnknownSegments);
     value = resolve(value);
     if (value == nullptr || value->getType() != unit.Global->getValueType()) {
       return nullptr;
@@ -3433,8 +3446,31 @@ private:
     return value;
   }
 
+  bool hasReplacementMetadata(const llvm::Instruction &inst) const {
+    return inst.getMetadata("notdec.register.summary_ssa.replaced") != nullptr;
+  }
+
+  void forgetReplacementValue(llvm::Value *value) {
+    for (auto it = Replacement.begin(); it != Replacement.end();) {
+      if (it->first == value || it->second == value) {
+        it = Replacement.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void eraseInstructionFromParent(llvm::Instruction &inst) {
+    forgetReplacementValue(&inst);
+    inst.eraseFromParent();
+  }
+
   void rewritePartialReads() {
-    for (llvm::CallBase *call : PartialReads) {
+    for (llvm::WeakVH &handle : PartialReads) {
+      auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(handle);
+      if (call == nullptr) {
+        continue;
+      }
       if (call->getParent() == nullptr) {
         continue;
       }
@@ -3456,6 +3492,8 @@ private:
       }
       Replacement[call] = value;
       call->replaceAllUsesWith(value);
+      call->setMetadata("notdec.register.summary_ssa.replaced",
+                        markerNode("true"));
       ReplacedPartialReads.push_back(call);
       ++Summary.LoadsReplaced;
     }
@@ -3485,19 +3523,40 @@ private:
 
   void removeDeadPartialReads() {
     llvm::SmallPtrSet<llvm::CallBase *, 16> candidates;
-    for (llvm::CallBase *call : ReplacedPartialReads) {
-      candidates.insert(call);
+    for (llvm::WeakVH &handle : ReplacedPartialReads) {
+      if (auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(handle)) {
+        candidates.insert(call);
+      }
     }
-    for (llvm::CallBase *call : PartialReads) {
-      candidates.insert(call);
+    for (llvm::WeakVH &handle : PartialReads) {
+      if (auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(handle)) {
+        candidates.insert(call);
+      }
     }
     for (llvm::CallBase *call : candidates) {
       if (call->getParent() == nullptr || !call->use_empty()) {
         continue;
       }
-      call->eraseFromParent();
+      if (isRecordedCallArgValue(call) || isRecordedFunctionReturnValue(call)) {
+        continue;
+      }
+      eraseInstructionFromParent(*call);
       ++Summary.DeadLoadsRemoved;
     }
+  }
+
+  void removeDeadFoldedZeroXors() {
+    for (llvm::WeakVH &handle : FoldedZeroXors) {
+      auto *op = llvm::dyn_cast_or_null<llvm::BinaryOperator>(handle);
+      if (op == nullptr) {
+        continue;
+      }
+      if (op->getParent() == nullptr || !op->use_empty()) {
+        continue;
+      }
+      eraseInstructionFromParent(*op);
+    }
+    FoldedZeroXors.clear();
   }
 
   void removeDeadEntryReads() {
@@ -3526,7 +3585,10 @@ private:
       if (inst->getParent() == nullptr || !inst->use_empty()) {
         continue;
       }
-      inst->eraseFromParent();
+      if (isRecordedCallArgValue(inst) || isRecordedFunctionReturnValue(inst)) {
+        continue;
+      }
+      eraseInstructionFromParent(*inst);
       ++Summary.DeadLoadsRemoved;
     }
   }
@@ -3567,7 +3629,7 @@ private:
       auto *zero = llvm::ConstantInt::get(op->getType(), 0);
       Replacement[op] = zero;
       op->replaceAllUsesWith(zero);
-      op->eraseFromParent();
+      FoldedZeroXors.push_back(op);
       ++Summary.LoadsReplaced;
     }
   }
@@ -3630,20 +3692,35 @@ private:
   }
 
   void removeDeadReplacedLoads() {
-    for (llvm::LoadInst *load : ReplacedLoads) {
+    for (llvm::WeakVH &handle : ReplacedLoads) {
+      auto *load = llvm::dyn_cast_or_null<llvm::LoadInst>(handle);
+      if (load == nullptr) {
+        continue;
+      }
       if (load->getParent() == nullptr || !load->use_empty()) {
         continue;
       }
       if (isRecordedCallArgValue(load) || isRecordedFunctionReturnValue(load)) {
         continue;
       }
-      load->eraseFromParent();
+      eraseInstructionFromParent(*load);
       ++Summary.DeadLoadsRemoved;
     }
   }
 
   bool isRecordedCallArgStore(llvm::StoreInst *store) const {
-    return SignatureState.StoresToErase.count(store) != 0;
+    if (SignatureState.StoresToErase.count(store) != 0) {
+      return true;
+    }
+    for (const auto &[call, bindings] : SignatureState.CallArgs) {
+      (void)call;
+      for (const CallArgStoreBinding &binding : bindings) {
+        if (binding.Store == store) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   bool isRecordedCallArgValue(llvm::Value *value) const {
@@ -3763,7 +3840,8 @@ private:
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
         RegisterAccess access = registerStore(*store, Units);
         if (access.Unit != nullptr && access.IsStorageValue &&
-            !hasLiveWriteRange(live, *access.Unit)) {
+            !hasLiveWriteRange(live, *access.Unit) &&
+            !isRecordedCallArgStore(store)) {
           deadStores.push_back(store);
         }
         transferStoreLiveness(*store, live);
@@ -3792,17 +3870,7 @@ private:
       }
     }
     for (llvm::StoreInst *store : deadStores) {
-      llvm::Value *storedValue = store->getValueOperand();
-      bool keepStoredValue = !PostSignatureCleanup ||
-                             isRecordedCallArgStore(store) ||
-                             isRecordedCallArgValue(storedValue) ||
-                             isRecordedFunctionReturnValue(storedValue);
-      store->eraseFromParent();
-      if (!keepStoredValue) {
-        if (auto *storedInst = llvm::dyn_cast<llvm::Instruction>(storedValue)) {
-          llvm::RecursivelyDeleteTriviallyDeadInstructions(storedInst);
-        }
-      }
+      eraseInstructionFromParent(*store);
       ++Summary.DeadStoresRemoved;
     }
     for (llvm::CallBase *call : deadPartialWrites) {
@@ -3822,12 +3890,10 @@ private:
                             LiveRegisterRanges &live) const {
     RegisterAccess access = registerLoad(load, Units);
     if (access.Unit != nullptr && access.IsStorageValue) {
-      // Entry/replaced loads are SummarySSA scaffolding.  After signature
-      // rewrite, only still-raw register loads require keeping global stores.
-      if (PostSignatureCleanup &&
-          (load.getMetadata("notdec.register.summary_ssa.entry") != nullptr ||
-           load.getMetadata("notdec.register.summary_ssa.replaced") !=
-               nullptr)) {
+      // Entry/replaced loads are SummarySSA scaffolding.  Only still-raw
+      // register loads should keep earlier register stores live.
+      if (load.getMetadata("notdec.register.summary_ssa.entry") != nullptr ||
+          hasReplacementMetadata(load)) {
         return;
       }
       insertGlobalRanges(live, access.Unit->Global);
@@ -3840,6 +3906,11 @@ private:
         parseNativeRegisterPartialRead(call);
     if (!partial || Units.count(partial->Global) == 0) {
       return false;
+    }
+    if (hasReplacementMetadata(call) ||
+        call.getMetadata("notdec.register.summary_ssa.range_entry") !=
+            nullptr) {
+      return true;
     }
     insertPartialRanges(live, partial->Global, partial->BitOffset,
                         partial->ReadWidth);
@@ -4507,8 +4578,8 @@ private:
                                const RegisterUnit &unit,
                                llvm::Instruction *before) {
     llvm::DominatorTree domTree(Function);
-    llvm::Value *rangeValue =
-        readFullRangeValueBefore(block, unit, before, domTree);
+    llvm::Value *rangeValue = readFullRangeValueBefore(
+        block, unit, before, domTree, /*allowUnknownSegments=*/true);
     rangeValue = resolve(rangeValue);
     if (rangeValue != nullptr &&
         rangeValue->getType() == unit.Global->getValueType()) {
@@ -4673,6 +4744,22 @@ private:
     return call;
   }
 
+  bool rangeMayComeFromEntry(const RegisterRangeKey &range) const {
+    const RegisterUnit *unit = unitForRange(range);
+    if (unit == nullptr) {
+      return false;
+    }
+    auto fnIt = SummaryFacts.find(&Function);
+    if (fnIt == SummaryFacts.end()) {
+      return true;
+    }
+    auto regIt = fnIt->second.Registers.find(unit->Name);
+    if (regIt == fnIt->second.Registers.end()) {
+      return true;
+    }
+    return regIt->second.MayEntry;
+  }
+
   llvm::Value *entryRangeInput(const RegisterRangeKey &range) {
     if (auto cached = EntryRangeInputs.find(range);
         cached != EntryRangeInputs.end()) {
@@ -4690,6 +4777,9 @@ private:
         EntryInputRanges.emplace(value, range);
         return value;
       }
+    }
+    if (!rangeMayComeFromEntry(range)) {
+      return nullptr;
     }
     llvm::Instruction *insertBefore =
         &*Function.getEntryBlock().getFirstInsertionPt();
@@ -4926,11 +5016,13 @@ private:
 
   llvm::Value *readSlotValueBefore(llvm::Instruction &before,
                                    const NativeSignatureSlot &slot,
-                                   llvm::Twine rangeName) {
+                                   llvm::Twine rangeName,
+                                   bool allowUnknownSegments = false) {
     if (slot.Unit == nullptr || before.getParent() == nullptr) {
       return nullptr;
     }
-    llvm::Value *rangeValue = readSlotRangeBefore(before, slot, rangeName);
+    llvm::Value *rangeValue =
+        readSlotRangeBefore(before, slot, rangeName, allowUnknownSegments);
     if (rangeValue != nullptr && rangeValue->getType() == slotType(slot)) {
       return rangeValue;
     }
@@ -4939,7 +5031,8 @@ private:
 
   llvm::Value *readSlotRangeBefore(llvm::Instruction &before,
                                    const NativeSignatureSlot &slot,
-                                   llvm::Twine name) {
+                                   llvm::Twine name,
+                                   bool allowUnknownSegments = false) {
     if (slot.Unit == nullptr || before.getParent() == nullptr ||
         slot.SizeBits == 0) {
       return nullptr;
@@ -4948,7 +5041,8 @@ private:
         slot.Unit->Global, slot.OffsetBits, slot.SizeBits);
     llvm::DominatorTree domTree(Function);
     llvm::Value *bits = assembleRangeReadIfDominating(
-        ranges, slot.OffsetBits, slot.SizeBits, &before, name, domTree);
+        ranges, slot.OffsetBits, slot.SizeBits, &before, name, domTree,
+        allowUnknownSegments);
     bits = resolve(bits);
     if (bits == nullptr) {
       return nullptr;
@@ -5197,8 +5291,9 @@ private:
         const RegisterUnit *unit = slot.Unit;
         llvm::Value *value = nullptr;
         if (!returnSlotMayReadCallClobber(*ret, slot)) {
-          value = resolve(
-              readSlotValueBefore(*ret, slot, unit->Name + ".return_range"));
+          value = resolve(readSlotValueBefore(
+              *ret, slot, unit->Name + ".return_range",
+              /*allowUnknownSegments=*/true));
         }
         if (value == nullptr || value->getType() != slotType(slot) ||
             mayDependOnSummaryClobberValue(value)) {
