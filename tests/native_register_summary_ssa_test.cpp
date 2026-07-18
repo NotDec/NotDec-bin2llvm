@@ -2921,6 +2921,70 @@ bool testKnownVarArgCallsitesKeepIndependentArities() {
                   "module failed verifier after per-callsite vararg rewrite");
 }
 
+bool testKnownVarArgDoesNotReuseStaleCallerSavedTail() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-known-vararg-stale-tail", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__fprintf_chk", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "vararg_stale_tail", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
+                "RDX");
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 4),
+                "RCX");
+  storeRegister(builder, r8, llvm::ConstantInt::get(r8->getValueType(), 5),
+                "R8");
+  builder.CreateCall(calleeType, callee);
+
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 6),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 7),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 8),
+                "RDX");
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 9),
+                "RCX");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenCaller = module.getFunction("vararg_stale_tail");
+  std::vector<unsigned> arities;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() != nullptr &&
+          call->getCalledFunction()->getName() == "__fprintf_chk") {
+        arities.push_back(call->arg_size());
+      }
+    }
+  }
+
+  return expect(arities.size() == 2, "stale-tail test lost a call") &&
+         expect(arities[0] == 5, "first vararg call used wrong arity") &&
+         expect(arities[1] == 4,
+                "second vararg call reused stale R8 as an argument") &&
+         verifyOk(module, "module failed verifier after stale-tail rewrite");
+}
+
 bool testKnownVarArgUsesSseCountForFloatTail() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-known-vararg-float-tail", context);
@@ -7438,6 +7502,7 @@ int main() {
   ok &= testKnownVarArgExternalInfersDefinedAbiInputs();
   ok &= testKnownVarArgFixedOnlyCallDoesNotReadTail();
   ok &= testKnownVarArgCallsitesKeepIndependentArities();
+  ok &= testKnownVarArgDoesNotReuseStaleCallerSavedTail();
   ok &= testKnownVarArgUsesSseCountForFloatTail();
   ok &= testKnownVarArgZeroTailUsesPoison();
   ok &= testKnownVarArgUnknownPhiTailUsesPoison();

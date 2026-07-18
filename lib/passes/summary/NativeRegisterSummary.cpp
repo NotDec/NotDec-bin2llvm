@@ -416,6 +416,10 @@ llvm::APInt namedMaskOrFull(const std::map<std::string, llvm::APInt> &masks,
   return fullMask(unit);
 }
 
+bool isSegmentBaseUnit(llvm::StringRef name) {
+  return name == "FS_OFFSET" || name == "GS_OFFSET";
+}
+
 unsigned valueBitWidth(llvm::Value *value) {
   if (value == nullptr || value->getType() == nullptr ||
       !value->getType()->isSized()) {
@@ -1964,34 +1968,17 @@ private:
 
   void applyAbiCallClobbers(State &state) {
     for (const auto &[global, unit] : Units) {
-      if (isIgnored(unit, Options) || Abi.Unaffected.count(unit.Name) != 0) {
+      if (isIgnored(unit, Options) || Abi.Unaffected.count(unit.Name) != 0 ||
+          isSegmentBaseUnit(unit.Name)) {
         continue;
       }
-      std::optional<llvm::APInt> clobberMask;
-      auto outputIt = Abi.OutputMasks.find(unit.Name);
-      if (outputIt != Abi.OutputMasks.end()) {
-        clobberMask = outputIt->second;
+      llvm::APInt clobberMask = fullMask(unit);
+      if (clobberMask.getBitWidth() == 0 || clobberMask.isZero()) {
+        continue;
       }
-      auto killedIt = Abi.KilledByCallMasks.find(unit.Name);
-      if (killedIt != Abi.KilledByCallMasks.end()) {
-        if (!clobberMask) {
-          clobberMask = killedIt->second;
-        } else {
-          *clobberMask |=
-              killedIt->second.zextOrTrunc(clobberMask->getBitWidth());
-        }
-      }
-      if (Abi.Outputs.count(unit.Name) != 0 ||
-          Abi.KilledByCall.count(unit.Name) != 0) {
-        writeRegister(state, global);
-        if (!clobberMask || clobberMask->isZero()) {
-          setFullRegisterOrigin(state, global,
-                                RegisterOriginKind::CallProduced);
-        } else {
-          setRegisterOrigin(state, global, *clobberMask,
-                            RegisterOriginKind::CallProduced);
-        }
-      }
+      writeRegister(state, global);
+      setRegisterOrigin(state, global, clobberMask,
+                        RegisterOriginKind::CallProduced);
     }
   }
 
@@ -2165,25 +2152,13 @@ private:
     }
 
     for (const auto &[global, unit] : Units) {
-      if (isIgnored(unit, Options)) {
+      if (isIgnored(unit, Options) || Abi.Unaffected.count(unit.Name) != 0 ||
+          isSegmentBaseUnit(unit.Name)) {
         continue;
       }
-      std::optional<llvm::APInt> clobberMask;
-      auto outputIt = Abi.OutputMasks.find(unit.Name);
-      if (outputIt != Abi.OutputMasks.end()) {
-        clobberMask = outputIt->second;
-      }
-      auto killedIt = Abi.KilledByCallMasks.find(unit.Name);
-      if (killedIt != Abi.KilledByCallMasks.end()) {
-        if (!clobberMask) {
-          clobberMask = killedIt->second;
-        } else {
-          *clobberMask |=
-              killedIt->second.zextOrTrunc(clobberMask->getBitWidth());
-        }
-      }
-      if (clobberMask && !clobberMask->isZero()) {
-        eraseDemand(live, global, *clobberMask);
+      llvm::APInt clobberMask = fullMask(unit);
+      if (clobberMask.getBitWidth() != 0 && !clobberMask.isZero()) {
+        eraseDemand(live, global, clobberMask);
       }
     }
 

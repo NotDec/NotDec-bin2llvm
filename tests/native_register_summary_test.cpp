@@ -593,8 +593,8 @@ bool testUnknownExternalCallsiteEvidenceClassifiesOrigins() {
   using Origin = notdec::bin2llvm::NativeRegisterCallsiteValueOrigin;
   return expect(callsite->Slots[0].Origin == Origin::LocalDefinition,
                 "RDI evidence was not classified as local") &&
-         expect(callsite->Slots[1].Origin == Origin::ForwardedEntry,
-                "RSI evidence was not classified as forwarded entry") &&
+         expect(callsite->Slots[1].Origin == Origin::CallProduced,
+                "RSI evidence crossed an external call as entry") &&
          expect(callsite->Slots[2].Origin == Origin::CallProduced,
                 "RDX evidence was not classified as call produced");
 }
