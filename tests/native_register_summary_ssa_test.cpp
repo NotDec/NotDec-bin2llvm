@@ -445,6 +445,15 @@ bool moduleHasUsedFunctionNamed(const llvm::Module &module,
   return function != nullptr && !function->use_empty();
 }
 
+bool isUnknownValueCall(const llvm::Value *value) {
+  auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
+  if (call == nullptr) {
+    return false;
+  }
+  const llvm::Function *callee = call->getCalledFunction();
+  return callee != nullptr && callee->getName().starts_with("notdec.unknown.");
+}
+
 bool metadataHasField(const llvm::MDNode *metadata, llvm::StringRef field) {
   if (metadata == nullptr) {
     return false;
@@ -1287,9 +1296,11 @@ bool testPhiIncomingMatchesPredecessors() {
   builder.CreateRet(loaded);
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("branch_merge");
   return expect(summary.LoadsReplaced == 1, "branch load was not replaced") &&
          expect(summary.PhisCreated >= 1, "complete PHI was not created") &&
-         expect(!hasLiveReplacedRegisterLoad(*function),
+         expect(rewritten != nullptr, "branch function was not preserved") &&
+         expect(!hasLiveReplacedRegisterLoad(*rewritten),
                 "replaced load was reused by completed PHI") &&
          verifyOk(module, "module failed verifier after summary SSA PHI test");
 }
@@ -1418,7 +1429,7 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
   options.EnableResidueRemoval = false;
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
 
-  bool hasFrozenIncoming = false;
+  bool hasUnknownIncoming = false;
   bool hasUndefIncoming = false;
   bool hasZeroIncoming = false;
   for (llvm::Instruction &inst : llvm::instructions(*function)) {
@@ -1427,7 +1438,7 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
       continue;
     }
     for (llvm::Value *incoming : phi->incoming_values()) {
-      hasFrozenIncoming |= llvm::isa<llvm::FreezeInst>(incoming);
+      hasUnknownIncoming |= isUnknownValueCall(incoming);
       hasUndefIncoming |= llvm::isa<llvm::UndefValue>(incoming);
       auto *constant = llvm::dyn_cast<llvm::ConstantInt>(incoming);
       hasZeroIncoming |= constant != nullptr && constant->isZero();
@@ -1438,15 +1449,15 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
                 "unknown incoming load was not replaced") &&
          expect(summary.UnknownCallEffects >= 1,
                 "unknown call effect was not observed") &&
-         expect(hasFrozenIncoming,
-                "unknown incoming was not materialized as freeze poison") &&
+         expect(hasUnknownIncoming,
+                "unknown incoming was not materialized as opaque unknown") &&
          expect(!hasUndefIncoming, "unknown incoming still used bare undef") &&
          expect(!hasZeroIncoming, "unknown incoming was folded to zero") &&
          verifyOk(module,
-                  "module failed verifier after frozen unknown incoming test");
+                  "module failed verifier after opaque unknown incoming test");
 }
 
-bool testSelfOnlyPhiBecomesFrozenPoison() {
+bool testSelfOnlyPhiBecomesOpaqueUnknown() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-self-only-phi", context);
   attachTestAbi(module);
@@ -1483,17 +1494,17 @@ bool testSelfOnlyPhiBecomesFrozenPoison() {
   options.EnableResidueRemoval = false;
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
 
-  bool hasSelfLoopFreeze = false;
+  bool hasSelfLoopUnknown = false;
   for (llvm::Instruction &inst : *unreachableLoop) {
-    hasSelfLoopFreeze |= llvm::isa<llvm::FreezeInst>(&inst);
+    hasSelfLoopUnknown |= isUnknownValueCall(&inst);
   }
 
   return expect(summary.LoadsReplaced >= 1,
                 "self-only PHI test did not replace any load") &&
          expect(summary.PhisSimplified >= 1,
                 "self-only PHI was not simplified") &&
-         expect(hasSelfLoopFreeze,
-                "self-only PHI did not become frozen poison") &&
+         expect(hasSelfLoopUnknown,
+                "self-only PHI did not become opaque unknown") &&
          verifyOk(module,
                   "module failed verifier after self-only PHI unknown test");
 }
@@ -5527,10 +5538,14 @@ bool testUnknownExternalIntegerClobberUsesRangeCallValue() {
   notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
   options.EnableResidueRemoval = false;
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  llvm::Function *rewritten =
+      module.getFunction("reads_rdx_after_unknown_external");
 
   return expect(summary.CallClobberValues >= 1,
                 "integer clobber range helper was not created") &&
-         expect(!hasLiveReplacedRegisterLoad(*function),
+         expect(rewritten != nullptr,
+                "integer clobber test function was not preserved") &&
+         expect(!hasLiveReplacedRegisterLoad(*rewritten),
                 "integer clobber range left live raw R10 load") &&
          expect(moduleHasUsedFunctionNamed(
                     module, "notdec.register.summary_clobber.i1") ||
@@ -7399,7 +7414,7 @@ int main() {
   ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();
   ok &= testUnknownPhiIncomingUsesFrozenPoison();
-  ok &= testSelfOnlyPhiBecomesFrozenPoison();
+  ok &= testSelfOnlyPhiBecomesOpaqueUnknown();
   ok &= testFsOffsetPreservedAcrossExternalCall();
   ok &= testPreservedCallKeepsPreviousValue();
   ok &= testRewrittenExternalCallPreservesUnaffectedRegister();

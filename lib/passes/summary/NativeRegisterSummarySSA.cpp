@@ -318,17 +318,6 @@ externalCallsiteShapeForCall(const SignatureRewriteState &state,
   return it == state.ExternalCallsiteShapes->end() ? nullptr : &it->second;
 }
 
-llvm::Value *frozenPoisonBefore(llvm::Instruction &insertBefore,
-                                llvm::Type *type, llvm::Twine name) {
-  llvm::IRBuilder<> builder(&insertBefore);
-  return builder.CreateFreeze(llvm::PoisonValue::get(type), name);
-}
-
-llvm::Value *frozenPoisonAt(llvm::IRBuilder<> &builder, llvm::Type *type,
-                            llvm::Twine name) {
-  return builder.CreateFreeze(llvm::PoisonValue::get(type), name);
-}
-
 std::string llvmTypeName(llvm::Type *type) {
   std::string result;
   llvm::raw_string_ostream os(result);
@@ -338,6 +327,47 @@ std::string llvmTypeName(llvm::Type *type) {
     os << "<null>";
   }
   return os.str();
+}
+
+llvm::Function *getOrInsertUnknownValueHelper(llvm::Module &module,
+                                              llvm::Type *type) {
+  std::string name = "notdec.unknown." + llvmTypeName(type);
+  llvm::FunctionType *functionType =
+      llvm::FunctionType::get(type, {}, false);
+  if (auto *function = module.getFunction(name)) {
+    if (function->getFunctionType() == functionType) {
+      return function;
+    }
+  }
+  std::string prefix = name + ".";
+  for (llvm::Function &function : module.functions()) {
+    if (function.getName().starts_with(prefix) &&
+        function.getFunctionType() == functionType) {
+      return &function;
+    }
+  }
+  if (module.getNamedValue(name) != nullptr) {
+    name += ".typed";
+  }
+  return llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
+                                name, module);
+}
+
+llvm::Value *unknownValueAt(llvm::IRBuilder<> &builder, llvm::Type *type,
+                            llvm::Twine name) {
+  llvm::BasicBlock *block = builder.GetInsertBlock();
+  if (block == nullptr || block->getModule() == nullptr) {
+    return llvm::PoisonValue::get(type);
+  }
+  return builder.CreateCall(getOrInsertUnknownValueHelper(*block->getModule(),
+                                                          type),
+                            {}, name);
+}
+
+llvm::Value *unknownValueBefore(llvm::Instruction &insertBefore,
+                                llvm::Type *type, llvm::Twine name) {
+  llvm::IRBuilder<> builder(&insertBefore);
+  return unknownValueAt(builder, type, name);
 }
 
 llvm::Function *getOrInsertVarArgUnknownHelper(llvm::Module &module,
@@ -391,6 +421,10 @@ knownExternalPrototype(const NativeExternalPrototypeMap &prototypes,
   return lookupNativeExternalPrototype(prototypes, name);
 }
 
+bool isNotDecOpaqueUnknownName(llvm::StringRef name) {
+  return name.starts_with("notdec.unknown.");
+}
+
 bool isKnownNoReturnExternal(const llvm::Function &function,
                              const NativeExternalPrototypeMap &prototypes) {
   if (!function.isDeclaration()) {
@@ -413,6 +447,7 @@ bool isUnknownExternalFunction(const llvm::Function &function,
                                const NativeExternalPrototypeMap &prototypes) {
   return function.isDeclaration() && !function.isIntrinsic() &&
          !function.getName().starts_with("notdec.register.") &&
+         !isNotDecOpaqueUnknownName(function.getName()) &&
          !isNativeRegisterValueRangeName(function.getName()) &&
          !isNativeRegisterPartialReadName(function.getName()) &&
          !isNativeRegisterPartialWriteName(function.getName()) &&
@@ -763,7 +798,9 @@ uint64_t canonicalizeRegisterPointerPhiLoads(
 
 bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
   llvm::Function *callee = call.getCalledFunction();
-  return callee != nullptr && callee->getName().starts_with("notdec.register.");
+  return callee != nullptr &&
+         (callee->getName().starts_with("notdec.register.") ||
+          isNotDecOpaqueUnknownName(callee->getName()));
 }
 
 bool isAnalyzableCall(const llvm::CallBase &call) {
@@ -2040,6 +2077,7 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
   for (llvm::Function &function : module) {
     if (function.isIntrinsic() ||
         function.getName().starts_with("notdec.register.") ||
+        isNotDecOpaqueUnknownName(function.getName()) ||
         isNativeRegisterValueRangeName(function.getName()) ||
         isNativeRegisterPartialReadName(function.getName()) ||
         isNativeRegisterPartialWriteName(function.getName())) {
@@ -4253,7 +4291,7 @@ private:
     if (unit == nullptr || range.BitWidth == 0) {
       return nullptr;
     }
-    return frozenPoisonBefore(insertBefore, rangeType(range),
+    return unknownValueBefore(insertBefore, rangeType(range),
                               unit->Name + suffix);
   }
 
@@ -5312,7 +5350,7 @@ private:
     }
     if (kind == "return" && !isIntegerAbiOutput(Abi, unit->Name) &&
         !signatureReturnUsesUnit(call, *unit)) {
-      return frozenPoisonBefore(*insertBefore, rangeType(range),
+      return unknownValueBefore(*insertBefore, rangeType(range),
                                 unit->Name + ".range_return_unknown");
     }
 
@@ -5327,7 +5365,7 @@ private:
           return value;
         }
       }
-      llvm::Value *value = frozenPoisonAt(builder, rangeType(range),
+      llvm::Value *value = unknownValueAt(builder, rangeType(range),
                                           unit->Name + ".range_return_unknown");
       CallRangeValues.emplace(key, value);
       return value;
@@ -5444,7 +5482,7 @@ private:
         }
         if (value == nullptr || value->getType() != slotType(slot) ||
             mayDependOnSummaryClobberValue(value)) {
-          value = frozenPoisonBefore(*ret, slotType(slot),
+          value = unknownValueBefore(*ret, slotType(slot),
                                      unit->Name + ".return_unknown");
         }
         values.push_back(value);
@@ -5646,7 +5684,7 @@ llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
   if (shape.Returns.size() == 1) {
     llvm::Type *retTy = singleReturnType(shape);
     if (values.empty() || values.front()->getType() != retTy) {
-      return frozenPoisonAt(builder, retTy, "notdec.return_unknown");
+      return unknownValueAt(builder, retTy, "notdec.return_unknown");
     }
     return values.front();
   }
@@ -5657,10 +5695,10 @@ llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
     llvm::Value *value =
         index < values.size()
             ? values[index]
-            : frozenPoisonAt(builder, slotType(slot),
+            : unknownValueAt(builder, slotType(slot),
                              slot.Unit->Name + ".return_unknown");
     if (value->getType() != slotType(slot)) {
-      value = frozenPoisonAt(builder, slotType(slot),
+      value = unknownValueAt(builder, slotType(slot),
                              slot.Unit->Name + ".return_unknown");
     }
     result = builder.CreateInsertValue(result, value, {index});
@@ -5807,7 +5845,7 @@ llvm::Value *foreignArgumentReplacement(
   llvm::IRBuilder<> builder(&function.getEntryBlock(),
                             function.getEntryBlock().getFirstNonPHIIt());
   llvm::Value *unknown =
-      frozenPoisonAt(builder, argument.getType(), argument.getName() + ".old");
+      unknownValueAt(builder, argument.getType(), argument.getName() + ".old");
   unknownByType.emplace(argument.getType(), unknown);
   return unknown;
 }
@@ -5836,7 +5874,7 @@ llvm::Value *localizeReturnValue(llvm::Function &function,
   }
   auto *instruction = llvm::dyn_cast<llvm::Instruction>(value);
   if (instruction != nullptr && instruction->getFunction() != &function) {
-    return frozenPoisonBefore(insertBefore, value->getType(),
+    return unknownValueBefore(insertBefore, value->getType(),
                               value->getName() + ".old");
   }
   return value;
@@ -5852,7 +5890,7 @@ llvm::Value *localizeCallArgument(llvm::Function &function,
   }
   auto *instruction = llvm::dyn_cast<llvm::Instruction>(value);
   if (instruction != nullptr && instruction->getFunction() != &function) {
-    return frozenPoisonBefore(insertBefore, value->getType(),
+    return unknownValueBefore(insertBefore, value->getType(),
                               value->getName() + ".old");
   }
   return value;
@@ -6456,7 +6494,7 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);
       }
       if (value == nullptr || value->getType() != slotType(slot)) {
-        value = frozenPoisonAt(oldCallBuilder, slotType(slot),
+        value = unknownValueAt(oldCallBuilder, slotType(slot),
                                slot.Unit->Name + ".arg_unknown");
       }
       args.push_back(value);
@@ -6508,8 +6546,8 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         }
         llvm::Value *value =
             extractReturnRegister(builder, *shape, *newCall, name);
-        if (value == nullptr) {
-          value = frozenPoisonAt(builder, helper->getType(),
+        if (value == nullptr || value->getType() != helper->getType()) {
+          value = unknownValueAt(builder, helper->getType(),
                                  name + ".return_unknown");
         }
         valueMap[helper] = value;
@@ -6530,8 +6568,8 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         }
         llvm::Value *value =
             extractReturnRange(builder, *shape, *newCall, rangeHelper.Range);
-        if (value == nullptr) {
-          value = frozenPoisonAt(builder, helper->getType(),
+        if (value == nullptr || value->getType() != helper->getType()) {
+          value = unknownValueAt(builder, helper->getType(),
                                  "range_return_unknown");
         }
         valueMap[helper] = value;
@@ -6635,13 +6673,9 @@ collectRemainingCallValueWarnings(const llvm::Module &module) {
       const llvm::Instruction *previous = helper->getPrevNode();
       while (previous != nullptr) {
         auto *call = llvm::dyn_cast<llvm::CallBase>(previous);
-        if (call != nullptr) {
-          llvm::Function *callee = call->getCalledFunction();
-          if (callee == nullptr ||
-              !callee->getName().starts_with("notdec.register.summary_")) {
-            sourceCall = call;
-            break;
-          }
+        if (call != nullptr && isAnalyzableCall(*call)) {
+          sourceCall = call;
+          break;
         }
         previous = previous->getPrevNode();
       }

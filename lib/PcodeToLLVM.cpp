@@ -39,6 +39,47 @@ std::string varnodeKey(const VarnodeView &varnode) {
   return os.str();
 }
 
+std::string llvmTypeName(llvm::Type *type) {
+  std::string result;
+  llvm::raw_string_ostream os(result);
+  if (type != nullptr) {
+    type->print(os);
+  } else {
+    os << "<null>";
+  }
+  return os.str();
+}
+
+llvm::Function *getOrInsertUnknownValueHelper(llvm::Module &module,
+                                              llvm::Type *type) {
+  std::string name = "notdec.unknown." + llvmTypeName(type);
+  llvm::FunctionType *functionType =
+      llvm::FunctionType::get(type, {}, false);
+  if (auto *function = module.getFunction(name)) {
+    if (function->getFunctionType() == functionType) {
+      return function;
+    }
+  }
+  std::string prefix = name + ".";
+  for (llvm::Function &function : module.functions()) {
+    if (function.getName().starts_with(prefix) &&
+        function.getFunctionType() == functionType) {
+      return &function;
+    }
+  }
+  if (module.getNamedValue(name) != nullptr) {
+    name += ".typed";
+  }
+  return llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
+                                name, module);
+}
+
+llvm::Value *unknownValueAt(llvm::IRBuilder<> &builder, llvm::Module &module,
+                            llvm::Type *type, llvm::Twine name) {
+  return builder.CreateCall(getOrInsertUnknownValueHelper(module, type), {},
+                            name);
+}
+
 std::string valueName(const VarnodeView &varnode) {
   std::ostringstream os;
   os << varnode.Space << '_' << std::hex << varnode.Offset << '_' << std::dec
@@ -1314,8 +1355,7 @@ private:
       }
     }
 
-    return Builder.CreateFreeze(llvm::PoisonValue::get(type),
-                                valueName(varnode) + "_in");
+    return unknownValueAt(Builder, Module, type, valueName(varnode) + "_in");
   }
 
   std::optional<uint64_t> sourceRam(const VarnodeView &varnode) const {
@@ -1379,8 +1419,8 @@ private:
       return resized;
     }
     if (llvm::pred_empty(block)) {
-      return Builder.CreateFreeze(llvm::PoisonValue::get(resized->getType()),
-                                  valueName(varnode) + ".missing");
+      return unknownValueAt(Builder, Module, resized->getType(),
+                            valueName(varnode) + ".missing");
     }
 
     auto key = std::make_pair(varnodeKey(varnode), block);
@@ -1401,7 +1441,7 @@ private:
                                                              *pred)) {
         incoming = resized;
       } else {
-        incoming = frozenPoisonAtEnd(*pred, resized->getType(),
+        incoming = unknownValueAtEnd(*pred, resized->getType(),
                                      valueName(varnode) + ".missing");
       }
       phi->addIncoming(incoming, pred);
@@ -1430,14 +1470,14 @@ private:
     return domTree.dominates(instruction.getParent(), &block);
   }
 
-  llvm::Value *frozenPoisonAtEnd(llvm::BasicBlock &block, llvm::Type *type,
+  llvm::Value *unknownValueAtEnd(llvm::BasicBlock &block, llvm::Type *type,
                                  llvm::Twine name) {
     llvm::Instruction *terminator = block.getTerminator();
     if (terminator == nullptr) {
       return llvm::PoisonValue::get(type);
     }
     llvm::IRBuilder<> builder(terminator);
-    return builder.CreateFreeze(llvm::PoisonValue::get(type), name);
+    return unknownValueAt(builder, Module, type, name);
   }
 
   bool requireInputCount(const PcodeOpView &op, size_t count,

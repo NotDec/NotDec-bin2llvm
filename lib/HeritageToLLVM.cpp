@@ -34,6 +34,47 @@ unsigned bitWidth(uint32_t byteSize) {
   return byteSize == 0 ? 1 : byteSize * 8;
 }
 
+std::string llvmTypeName(llvm::Type *type) {
+  std::string result;
+  llvm::raw_string_ostream os(result);
+  if (type != nullptr) {
+    type->print(os);
+  } else {
+    os << "<null>";
+  }
+  return os.str();
+}
+
+llvm::Function *getOrInsertUnknownValueHelper(llvm::Module &module,
+                                              llvm::Type *type) {
+  std::string name = "notdec.unknown." + llvmTypeName(type);
+  llvm::FunctionType *functionType =
+      llvm::FunctionType::get(type, {}, false);
+  if (auto *function = module.getFunction(name)) {
+    if (function->getFunctionType() == functionType) {
+      return function;
+    }
+  }
+  std::string prefix = name + ".";
+  for (llvm::Function &function : module.functions()) {
+    if (function.getName().starts_with(prefix) &&
+        function.getFunctionType() == functionType) {
+      return &function;
+    }
+  }
+  if (module.getNamedValue(name) != nullptr) {
+    name += ".typed";
+  }
+  return llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
+                                name, module);
+}
+
+llvm::Value *unknownValueAt(llvm::IRBuilder<> &builder, llvm::Module &module,
+                            llvm::Type *type, llvm::Twine name) {
+  return builder.CreateCall(getOrInsertUnknownValueHelper(module, type), {},
+                            name);
+}
+
 bool isIntLikeType(const std::string &type) {
   return type == "int" || type == "uint" || type == "undefined4";
 }
@@ -649,9 +690,9 @@ private:
 
     llvm::IRBuilder<> entryBuilder(&Function->getEntryBlock(),
                                    Function->getEntryBlock().begin());
-    llvm::Value *tempValue = entryBuilder.CreateFreeze(
-        llvm::PoisonValue::get(intType(varnode.Size)),
-        varnode.Id + ".register_input");
+    llvm::Value *tempValue =
+        unknownValueAt(entryBuilder, Module, intType(varnode.Size),
+                       varnode.Id + ".register_input");
     if (llvm::Instruction *tempInst =
             llvm::dyn_cast<llvm::Instruction>(tempValue)) {
       tempInst->setMetadata("notdec.register.source",
@@ -670,9 +711,9 @@ private:
     // uses do not keep falling back to fresh poison.
     llvm::IRBuilder<> entryBuilder(&Function->getEntryBlock(),
                                    Function->getEntryBlock().begin());
-    llvm::Value *tempValue = entryBuilder.CreateFreeze(
-        llvm::PoisonValue::get(intType(varnode.Size)),
-        varnode.Id + ".stack_input");
+    llvm::Value *tempValue =
+        unknownValueAt(entryBuilder, Module, intType(varnode.Size),
+                       varnode.Id + ".stack_input");
     if (llvm::Instruction *tempInst =
             llvm::dyn_cast<llvm::Instruction>(tempValue)) {
       tempInst->setMetadata("notdec.stack.input",
@@ -727,8 +768,7 @@ private:
     }
 
     warnPoisonFallback("read unmodeled varnode " + describeVarnode(*varnode));
-    return Builder.CreateFreeze(llvm::PoisonValue::get(intType(varnode->Size)),
-                                id + "_in");
+    return unknownValueAt(Builder, Module, intType(varnode->Size), id + "_in");
   }
 
   bool write(const std::string &id, llvm::Value *value,
