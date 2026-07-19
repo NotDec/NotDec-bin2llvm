@@ -4233,6 +4233,60 @@ bool testInternalSignatureRewriteUsesNarrowEntryRangeArg() {
              "module failed verifier after narrow RDI entry argument test");
 }
 
+bool testInternalSignatureShapeParamKeepsOverwrittenEntryRange() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-overwritten-entry-range-param", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rdi->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *function =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_overwrites_rdi32", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *input = builder.CreateCall(
+      partialRead,
+      {rdi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "input32");
+  builder.CreateStore(input, sink);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 0),
+                "RDI");
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten =
+      module.getFunction("notdec_native_overwrites_rdi32");
+  bool hasUnknownValue = false;
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      hasUnknownValue |= call != nullptr && call->getCalledFunction() != nullptr &&
+                         call->getCalledFunction()->getName().starts_with(
+                             "notdec.unknown.");
+    }
+  }
+
+  return expect(rewritten != nullptr, "overwritten RDI entry callee missing") &&
+         expect(rewritten->arg_size() == 1,
+                "overwritten RDI entry range was not added as argument") &&
+         expect(rewritten->getArg(0)->getType()->isIntegerTy(32),
+                "overwritten RDI entry argument was not i32") &&
+         expect(!hasPartialReadCall(*rewritten),
+                "overwritten RDI entry left partial read helper") &&
+         expect(!hasUnknownValue,
+                "overwritten RDI entry was materialized as unknown") &&
+         verifyOk(module,
+                  "module failed verifier after overwritten entry range test");
+}
+
 bool testNarrowEntryRangeDoesNotCreateWholeEntryLoad() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-narrow-entry-range-no-full-load", context);
@@ -7529,6 +7583,7 @@ int main() {
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testInternalSignatureRewriteUsesReadEntryReturnRegisterArg();
   ok &= testInternalSignatureRewriteUsesNarrowEntryRangeArg();
+  ok &= testInternalSignatureShapeParamKeepsOverwrittenEntryRange();
   ok &= testNarrowEntryRangeDoesNotCreateWholeEntryLoad();
   ok &= testPostSignatureCleanupRewritesInternalEntryRawLoad();
   ok &= testInternalSignatureRewriteUsesZmmArgAndReturn();

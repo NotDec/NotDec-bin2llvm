@@ -5061,7 +5061,27 @@ private:
     return call;
   }
 
+  bool shapeParamCoversRange(const RegisterRangeKey &range) const {
+    auto shapeIt = SignatureState.Shapes.find(&Function);
+    if (shapeIt == SignatureState.Shapes.end()) {
+      return false;
+    }
+    for (const NativeSignatureSlot &slot : shapeIt->second.Params) {
+      if (slot.Unit == nullptr || slot.Unit->Global != range.Global) {
+        continue;
+      }
+      if (range.BitOffset >= slot.OffsetBits &&
+          range.BitOffset + range.BitWidth <= slot.OffsetBits + slot.SizeBits) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool rangeMayComeFromEntry(const RegisterRangeKey &range) const {
+    if (shapeParamCoversRange(range)) {
+      return true;
+    }
     const RegisterUnit *unit = unitForRange(range);
     if (unit == nullptr) {
       return false;
