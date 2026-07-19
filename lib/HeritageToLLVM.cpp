@@ -683,6 +683,32 @@ private:
     return llvm::MDNode::get(Context, fields);
   }
 
+  void attachUnknownSourceMetadata(llvm::Value *value, llvm::StringRef reason,
+                                   const HeritageVarnode &varnode) {
+    auto *inst = llvm::dyn_cast_or_null<llvm::Instruction>(value);
+    if (inst == nullptr) {
+      return;
+    }
+    std::vector<llvm::Metadata *> fields = {
+        llvm::MDString::get(Context, "reason=" + reason.str()),
+        llvm::MDString::get(Context, "varnode=" + describeVarnode(varnode)),
+        llvm::MDString::get(Context, "space=" + varnode.Space),
+        llvm::MDString::get(Context,
+                            "offset=" + std::to_string(varnode.Offset)),
+        llvm::MDString::get(Context, "size=" + std::to_string(varnode.Size)),
+    };
+    if (varnode.RegisterName) {
+      fields.push_back(
+          llvm::MDString::get(Context, "register=" + *varnode.RegisterName));
+    }
+    if (CurrentOp != nullptr) {
+      fields.push_back(llvm::MDString::get(Context,
+                                           "op=" + describeCurrentOp()));
+    }
+    inst->setMetadata("notdec.unknown.source",
+                      llvm::MDNode::get(Context, fields));
+  }
+
   llvm::Value *registerInputTemp(const HeritageVarnode &varnode) {
     if (auto it = Values.find(varnode.Id); it != Values.end()) {
       return resize(it->second, varnode.Size);
@@ -697,6 +723,7 @@ private:
             llvm::dyn_cast<llvm::Instruction>(tempValue)) {
       tempInst->setMetadata("notdec.register.source",
                             registerSourceMetadata(varnode));
+      attachUnknownSourceMetadata(tempInst, "register_input_temp", varnode);
     }
     Values[varnode.Id] = tempValue;
     return tempValue;
@@ -727,6 +754,7 @@ private:
                                      Context,
                                      "size=" + std::to_string(varnode.Size)),
                                  llvm::MDString::get(Context, "kind=temp")}));
+      attachUnknownSourceMetadata(tempInst, "stack_input_temp", varnode);
     }
     Values[varnode.Id] = tempValue;
     return tempValue;
@@ -768,7 +796,10 @@ private:
     }
 
     warnPoisonFallback("read unmodeled varnode " + describeVarnode(*varnode));
-    return unknownValueAt(Builder, Module, intType(varnode->Size), id + "_in");
+    llvm::Value *unknown =
+        unknownValueAt(Builder, Module, intType(varnode->Size), id + "_in");
+    attachUnknownSourceMetadata(unknown, "unmodeled_varnode", *varnode);
+    return unknown;
   }
 
   bool write(const std::string &id, llvm::Value *value,

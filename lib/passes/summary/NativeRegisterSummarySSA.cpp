@@ -364,6 +364,39 @@ llvm::Value *unknownValueAt(llvm::IRBuilder<> &builder, llvm::Type *type,
                             {}, name);
 }
 
+void attachUnknownValueMetadata(llvm::Value *value, llvm::StringRef reason,
+                                llvm::StringRef functionName = "",
+                                llvm::StringRef calleeName = "",
+                                llvm::StringRef registerName = "",
+                                llvm::StringRef kind = "",
+                                llvm::StringRef detail = "") {
+  auto *inst = llvm::dyn_cast_or_null<llvm::Instruction>(value);
+  if (inst == nullptr) {
+    return;
+  }
+  llvm::LLVMContext &context = inst->getContext();
+  std::vector<llvm::Metadata *> fields;
+  fields.push_back(llvm::MDString::get(context, "reason=" + reason.str()));
+  if (!functionName.empty()) {
+    fields.push_back(llvm::MDString::get(context,
+                                         "function=" + functionName.str()));
+  }
+  if (!calleeName.empty()) {
+    fields.push_back(llvm::MDString::get(context, "callee=" + calleeName.str()));
+  }
+  if (!registerName.empty()) {
+    fields.push_back(
+        llvm::MDString::get(context, "register=" + registerName.str()));
+  }
+  if (!kind.empty()) {
+    fields.push_back(llvm::MDString::get(context, "kind=" + kind.str()));
+  }
+  if (!detail.empty()) {
+    fields.push_back(llvm::MDString::get(context, "detail=" + detail.str()));
+  }
+  inst->setMetadata("notdec.unknown.source", llvm::MDNode::get(context, fields));
+}
+
 llvm::Value *unknownValueBefore(llvm::Instruction &insertBefore,
                                 llvm::Type *type, llvm::Twine name) {
   llvm::IRBuilder<> builder(&insertBefore);
@@ -1693,6 +1726,106 @@ varArgInferenceWarning(const NativeRegisterExternalCallsite &callsite,
   return warning;
 }
 
+llvm::StringRef originName(NativeRegisterCallsiteValueOrigin origin) {
+  switch (origin) {
+  case NativeRegisterCallsiteValueOrigin::LocalDefinition:
+    return "local";
+  case NativeRegisterCallsiteValueOrigin::ForwardedEntry:
+    return "entry";
+  case NativeRegisterCallsiteValueOrigin::CallProduced:
+    return "call_clobber";
+  case NativeRegisterCallsiteValueOrigin::Mixed:
+    return "mixed";
+  case NativeRegisterCallsiteValueOrigin::Unknown:
+    return "unknown";
+  }
+  return "unknown";
+}
+
+const NativeRegisterCallsiteSlotEvidence *
+slotAtPrefix(llvm::ArrayRef<NativeRegisterCallsiteSlotEvidence> slots,
+             unsigned prefix) {
+  if (prefix >= slots.size()) {
+    return nullptr;
+  }
+  return &slots[prefix];
+}
+
+std::string slotDetail(const NativeRegisterCallsiteSlotEvidence &slot) {
+  return slot.UnitName + "[" + std::to_string(slot.OffsetBits) + ":" +
+         std::to_string(slot.SizeBits) + "]=" +
+         originName(slot.Origin).str();
+}
+
+void warnIfStoppedAtCallClobber(
+    std::vector<NativeRegisterSummarySSAWarning> &warnings,
+    const NativeRegisterExternalCallsite &callsite,
+    llvm::ArrayRef<NativeRegisterCallsiteSlotEvidence> slots, unsigned prefix,
+    llvm::StringRef reason) {
+  const NativeRegisterCallsiteSlotEvidence *slot = slotAtPrefix(slots, prefix);
+  if (slot == nullptr ||
+      slot->Origin != NativeRegisterCallsiteValueOrigin::CallProduced) {
+    return;
+  }
+  warnings.push_back(varArgInferenceWarning(callsite, slotDetail(*slot),
+                                            reason));
+}
+
+std::string calleeNameForWarning(const llvm::CallBase &call) {
+  llvm::Function *callee = call.getCalledFunction();
+  return callee == nullptr ? std::string("<indirect>") : callee->getName().str();
+}
+
+std::string slotRegisterName(const NativeSignatureSlot &slot) {
+  if (slot.Unit != nullptr) {
+    return slot.Unit->Name;
+  }
+  return slot.AbiName;
+}
+
+NativeRegisterSummarySSAWarning
+callSlotWarning(const llvm::CallBase &call, const NativeSignatureSlot &slot,
+                llvm::StringRef kind, llvm::StringRef reason) {
+  NativeRegisterSummarySSAWarning warning;
+  const llvm::Function *function = call.getFunction();
+  warning.FunctionName =
+      function == nullptr ? std::string("") : function->getName().str();
+  warning.CalleeName = calleeNameForWarning(call);
+  warning.RegisterName = slotRegisterName(slot);
+  warning.Kind = kind.str();
+  warning.Reason = reason.str();
+  warning.Uses = 1;
+  return warning;
+}
+
+NativeRegisterSummarySSAWarning
+callRegisterWarning(const llvm::CallBase &call, llvm::StringRef registerName,
+                    llvm::StringRef kind, llvm::StringRef reason) {
+  NativeRegisterSummarySSAWarning warning;
+  const llvm::Function *function = call.getFunction();
+  warning.FunctionName =
+      function == nullptr ? std::string("") : function->getName().str();
+  warning.CalleeName = calleeNameForWarning(call);
+  warning.RegisterName = registerName.str();
+  warning.Kind = kind.str();
+  warning.Reason = reason.str();
+  warning.Uses = 1;
+  return warning;
+}
+
+NativeRegisterSummarySSAWarning
+returnSlotWarning(const llvm::Function &function, const NativeSignatureSlot &slot,
+                  llvm::StringRef reason) {
+  NativeRegisterSummarySSAWarning warning;
+  warning.FunctionName = function.getName().str();
+  warning.CalleeName = "<return>";
+  warning.RegisterName = slotRegisterName(slot);
+  warning.Kind = "return_binding";
+  warning.Reason = reason.str();
+  warning.Uses = 1;
+  return warning;
+}
+
 NativeExternalCallsiteShapeMap inferExternalCallShapes(
     NativeExternalPrototypeMap &prototypes,
     const NativeRegisterSummary &baseSummary,
@@ -1704,8 +1837,11 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
        baseSummary.ExternalCallsites) {
     if (callsite.Kind == NativeRegisterExternalCallsiteKind::UnknownExternal) {
       if (!callsite.Indirect) {
-        aritiesByCallee[callsite.CalleeName].push_back(
-            localDefinitionPrefix(callsite));
+        unsigned prefix = localDefinitionPrefix(callsite);
+        aritiesByCallee[callsite.CalleeName].push_back(prefix);
+        warnIfStoppedAtCallClobber(
+            warnings, callsite, callsite.Slots, prefix,
+            "unknown_external_arity_stopped_at_call_clobber");
       }
       continue;
     }
@@ -1750,6 +1886,9 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
             "float_tail=" + std::to_string(added) + "/" +
                 std::to_string(*sseVarArgs),
             "incomplete_float_vararg_mapping"));
+        warnIfStoppedAtCallClobber(
+            warnings, callsite, floatSlots, added,
+            "float_vararg_evidence_stopped_at_call_clobber");
       }
       callsiteShapes.emplace(callsite.Call, std::move(shape));
       continue;
@@ -1779,6 +1918,9 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
           callsite, "tail=" + std::to_string(inferredTail),
           "non_contiguous_vararg_evidence"));
     }
+    warnIfStoppedAtCallClobber(
+        warnings, callsite, integerSlots, rawPrefix,
+        "vararg_evidence_stopped_at_call_clobber");
     callsiteShapes.emplace(callsite.Call, std::move(shape));
   }
 
@@ -2261,6 +2403,11 @@ private:
       return llvm::APInt();
     }
     return llvm::APInt::getAllOnes(bitWidth);
+  }
+
+  bool callPreservesRegisterByAbi(const RegisterUnit &unit) const {
+    return isSegmentBaseUnit(unit.Name) ||
+           Abi.Unaffected.count(unit.Name) != 0;
   }
 
   static llvm::APInt maskForLowBits(unsigned bitWidth, unsigned lowBits) {
@@ -4291,8 +4438,20 @@ private:
     if (unit == nullptr || range.BitWidth == 0) {
       return nullptr;
     }
-    return unknownValueBefore(insertBefore, rangeType(range),
-                              unit->Name + suffix);
+    llvm::Value *value =
+        unknownValueBefore(insertBefore, rangeType(range), unit->Name + suffix);
+    std::string reason = suffix.str();
+    if (!reason.empty() && reason.front() == '.') {
+      reason.erase(reason.begin());
+    }
+    if (reason.empty()) {
+      reason = "range_unknown";
+    }
+    std::string detail = "offset=" + std::to_string(range.BitOffset) +
+                         ",width=" + std::to_string(range.BitWidth);
+    attachUnknownValueMetadata(value, reason, Function.getName(), "",
+                               unit->Name, "range_ssa", detail);
+    return value;
   }
 
   llvm::Value *rangeTypedValueOrUnknown(llvm::Value *value,
@@ -4968,14 +5127,10 @@ private:
       if (signatureReturnUsesUnit(const_cast<llvm::CallBase &>(call), unit)) {
         return CallRegisterEffect::ReturnValue;
       }
-      if (isSegmentBaseUnit(unit.Name) ||
-          Abi.Unaffected.count(unit.Name) != 0) {
+      if (callPreservesRegisterByAbi(unit)) {
         return CallRegisterEffect::Preserve;
       }
-      if (Abi.KilledByCall.count(unit.Name) != 0) {
-        return CallRegisterEffect::Clobber;
-      }
-      return CallRegisterEffect::Unknown;
+      return CallRegisterEffect::Clobber;
     }
     if (callee != nullptr && !callee->isDeclaration()) {
       auto fnIt = SummaryFacts.find(callee);
@@ -4999,10 +5154,7 @@ private:
       return CallRegisterEffect::Unknown;
     }
 
-    if (isSegmentBaseUnit(unit.Name)) {
-      return CallRegisterEffect::Preserve;
-    }
-    if (Abi.Unaffected.count(unit.Name) != 0) {
+    if (callPreservesRegisterByAbi(unit)) {
       return CallRegisterEffect::Preserve;
     }
     if (signatureReturnUsesUnit(const_cast<llvm::CallBase &>(call), unit) ||
@@ -5010,13 +5162,7 @@ private:
          !isLikelyNonReturnIntegerAbiOutput(Abi, unit.Name))) {
       return CallRegisterEffect::ReturnValue;
     }
-    if (isFloatAbiOutputUnit(Abi, unit.Name)) {
-      return CallRegisterEffect::Unknown;
-    }
-    if (Abi.KilledByCall.count(unit.Name) != 0) {
-      return CallRegisterEffect::Clobber;
-    }
-    return CallRegisterEffect::Unknown;
+    return CallRegisterEffect::Clobber;
   }
 
   bool callReadsRegister(const llvm::CallBase &call,
@@ -5160,31 +5306,31 @@ private:
   std::vector<CallArgStoreBinding>
   callArgStoreBindings(llvm::CallBase &call, const SignatureShape &shape) {
     std::vector<CallArgStoreBinding> bindings;
-    llvm::Function *callee = call.getCalledFunction();
-    bool allowRangeEntryInputs = callee != nullptr && !callee->isDeclaration();
     std::vector<NativeSignatureSlot> slots = callParamSlots(call, shape);
     for (auto [index, slot] : llvm::enumerate(slots)) {
       const RegisterUnit *unit = slot.Unit;
       if (unit == nullptr) {
+        SignatureState.Warnings.push_back(
+            callSlotWarning(call, slot, "call_arg", "call_arg_slot_missing"));
         break;
       }
       llvm::Value *value = resolve(readSlotValueBefore(call, slot));
-      if (value == nullptr || value->getType() != slotType(slot)) {
+      if (value == nullptr) {
+        SignatureState.Warnings.push_back(callSlotWarning(
+            call, slot, "call_arg", "call_arg_binding_missing"));
+        break;
+      }
+      if (value->getType() != slotType(slot)) {
+        SignatureState.Warnings.push_back(callSlotWarning(
+            call, slot, "call_arg", "call_arg_type_mismatch"));
         break;
       }
       if (mayDependOnSummaryClobberValue(value)) {
-        break;
+        SignatureState.Warnings.push_back(callSlotWarning(
+            call, slot, "call_arg", "call_arg_binding_uses_clobber_value"));
       }
       llvm::StoreInst *store = findNearestStoreBeforeCall(call, *unit);
-      if (store == nullptr && isEntryInputValue(value) &&
-          !allowRangeEntryInputs) {
-        break;
-      }
-      llvm::Value *argValue = value;
-      if (argValue == nullptr || argValue->getType() != slotType(slot)) {
-        break;
-      }
-      bindings.push_back(CallArgStoreBinding{store, unit, value, argValue,
+      bindings.push_back(CallArgStoreBinding{store, unit, value, value,
                                              slotType(slot),
                                              static_cast<unsigned>(index)});
     }
@@ -5350,8 +5496,13 @@ private:
     }
     if (kind == "return" && !isIntegerAbiOutput(Abi, unit->Name) &&
         !signatureReturnUsesUnit(call, *unit)) {
-      return unknownValueBefore(*insertBefore, rangeType(range),
-                                unit->Name + ".range_return_unknown");
+      llvm::Value *value = unknownValueBefore(
+          *insertBefore, rangeType(range), unit->Name + ".range_return_unknown");
+      attachUnknownValueMetadata(value, "range_return_not_abi_output",
+                                 Function.getName(),
+                                 calleeNameForWarning(call), unit->Name,
+                                 "return");
+      return value;
     }
 
     llvm::IRBuilder<> builder(insertBefore);
@@ -5367,6 +5518,10 @@ private:
       }
       llvm::Value *value = unknownValueAt(builder, rangeType(range),
                                           unit->Name + ".range_return_unknown");
+      attachUnknownValueMetadata(value, "range_return_rewrite_missing_value",
+                                 Function.getName(),
+                                 calleeNameForWarning(call), unit->Name,
+                                 "return");
       CallRangeValues.emplace(key, value);
       return value;
     }
@@ -5474,95 +5629,30 @@ private:
       values.reserve(shapeIt->second.Returns.size());
       for (const NativeSignatureSlot &slot : shapeIt->second.Returns) {
         const RegisterUnit *unit = slot.Unit;
-        llvm::Value *value = nullptr;
-        if (!returnSlotMayReadCallClobber(*ret, slot)) {
-          value = resolve(readSlotValueBefore(
-              *ret, slot, unit->Name + ".return_range",
-              /*allowUnknownSegments=*/true));
+        llvm::Value *value = resolve(readSlotValueBefore(
+            *ret, slot, unit->Name + ".return_range",
+            /*allowUnknownSegments=*/true));
+        llvm::StringRef reason;
+        if (value == nullptr) {
+          reason = "return_binding_missing";
+        } else if (value->getType() != slotType(slot)) {
+          reason = "return_binding_type_mismatch";
+        } else if (mayDependOnSummaryClobberValue(value)) {
+          reason = "return_binding_uses_clobber_value";
         }
-        if (value == nullptr || value->getType() != slotType(slot) ||
-            mayDependOnSummaryClobberValue(value)) {
+        if (!reason.empty()) {
+          SignatureState.Warnings.push_back(
+              returnSlotWarning(Function, slot, reason));
           value = unknownValueBefore(*ret, slotType(slot),
                                      unit->Name + ".return_unknown");
+          attachUnknownValueMetadata(value, reason, Function.getName(),
+                                     "<return>", unit->Name,
+                                     "return_binding");
         }
         values.push_back(value);
       }
       SignatureState.FunctionReturns[&Function][ret] = std::move(values);
     }
-  }
-
-  bool returnSlotMayReadCallClobber(llvm::ReturnInst &ret,
-                                    const NativeSignatureSlot &slot) {
-    if (slot.Unit == nullptr || slot.SizeBits == 0) {
-      return false;
-    }
-    std::vector<RegisterRangeKey> ranges = plannedRangesCovering(
-        slot.Unit->Global, slot.OffsetBits, slot.SizeBits);
-    llvm::BasicBlock *block = ret.getParent();
-    if (block == nullptr) {
-      return false;
-    }
-    llvm::SmallPtrSet<llvm::BasicBlock *, 16> seen;
-    std::vector<llvm::BasicBlock *> worklist{block};
-    while (!worklist.empty()) {
-      llvm::BasicBlock *current = worklist.back();
-      worklist.pop_back();
-      if (current == nullptr || !seen.insert(current).second) {
-        continue;
-      }
-      llvm::Instruction *before = current == block
-                                      ? static_cast<llvm::Instruction *>(&ret)
-                                      : current->getTerminator();
-      if (before == nullptr) {
-        continue;
-      }
-      if (blockMayClobberReturnRangesBefore(*current, ranges, before)) {
-        return true;
-      }
-      for (llvm::BasicBlock *pred : llvm::predecessors(current)) {
-        worklist.push_back(pred);
-      }
-    }
-    return false;
-  }
-
-  bool
-  blockMayClobberReturnRangesBefore(llvm::BasicBlock &block,
-                                    llvm::ArrayRef<RegisterRangeKey> ranges,
-                                    llvm::Instruction *before) const {
-    for (auto it = before->getIterator(); it != block.begin();) {
-      --it;
-      llvm::Instruction &inst = *it;
-      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
-        RegisterAccess access = registerStore(*store, Units);
-        if (access.Unit != nullptr && access.IsStorageValue &&
-            rangeListUsesGlobal(ranges, access.Unit->Global)) {
-          return false;
-        }
-        continue;
-      }
-      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
-      if (call == nullptr || !isAnalyzableCall(*call)) {
-        continue;
-      }
-      for (const RegisterRangeKey &range : ranges) {
-        const RegisterUnit *unit = unitForRange(range);
-        if (unit == nullptr) {
-          continue;
-        }
-        if (callEffect(*call, *unit) == CallRegisterEffect::Clobber) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  static bool rangeListUsesGlobal(llvm::ArrayRef<RegisterRangeKey> ranges,
-                                  llvm::GlobalVariable *global) {
-    return llvm::any_of(ranges, [&](const RegisterRangeKey &range) {
-      return range.Global == global;
-    });
   }
 
   llvm::MDNode *markerNode(llvm::StringRef value) const {
@@ -5678,13 +5768,23 @@ llvm::Value *castSlotValueToRegister(llvm::IRBuilder<> &builder,
 llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
                               const SignatureShape &shape,
                               const std::vector<llvm::Value *> &values) {
+  auto functionName = [&]() -> llvm::StringRef {
+    llvm::BasicBlock *block = builder.GetInsertBlock();
+    return block == nullptr || block->getParent() == nullptr
+               ? llvm::StringRef("")
+               : block->getParent()->getName();
+  };
   if (shape.Returns.empty()) {
     return nullptr;
   }
   if (shape.Returns.size() == 1) {
     llvm::Type *retTy = singleReturnType(shape);
     if (values.empty() || values.front()->getType() != retTy) {
-      return unknownValueAt(builder, retTy, "notdec.return_unknown");
+      llvm::Value *unknown =
+          unknownValueAt(builder, retTy, "notdec.return_unknown");
+      attachUnknownValueMetadata(unknown, "function_return_missing_value",
+                                 functionName(), "", "", "function_return");
+      return unknown;
     }
     return values.front();
   }
@@ -5697,9 +5797,17 @@ llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
             ? values[index]
             : unknownValueAt(builder, slotType(slot),
                              slot.Unit->Name + ".return_unknown");
+    if (index >= values.size()) {
+      attachUnknownValueMetadata(value, "function_return_missing_value",
+                                 functionName(), "", slot.Unit->Name,
+                                 "function_return");
+    }
     if (value->getType() != slotType(slot)) {
       value = unknownValueAt(builder, slotType(slot),
                              slot.Unit->Name + ".return_unknown");
+      attachUnknownValueMetadata(value, "function_return_type_mismatch",
+                                 functionName(), "", slot.Unit->Name,
+                                 "function_return");
     }
     result = builder.CreateInsertValue(result, value, {index});
   }
@@ -5846,6 +5954,9 @@ llvm::Value *foreignArgumentReplacement(
                             function.getEntryBlock().getFirstNonPHIIt());
   llvm::Value *unknown =
       unknownValueAt(builder, argument.getType(), argument.getName() + ".old");
+  attachUnknownValueMetadata(unknown, "foreign_argument_replacement",
+                             function.getName(), "",
+                             argument.getName(), "localize");
   unknownByType.emplace(argument.getType(), unknown);
   return unknown;
 }
@@ -5874,8 +5985,13 @@ llvm::Value *localizeReturnValue(llvm::Function &function,
   }
   auto *instruction = llvm::dyn_cast<llvm::Instruction>(value);
   if (instruction != nullptr && instruction->getFunction() != &function) {
-    return unknownValueBefore(insertBefore, value->getType(),
-                              value->getName() + ".old");
+    llvm::Value *unknown =
+        unknownValueBefore(insertBefore, value->getType(),
+                           value->getName() + ".old");
+    attachUnknownValueMetadata(unknown, "foreign_return_value_replacement",
+                               function.getName(), "",
+                               value->getName(), "localize_return");
+    return unknown;
   }
   return value;
 }
@@ -5890,8 +6006,13 @@ llvm::Value *localizeCallArgument(llvm::Function &function,
   }
   auto *instruction = llvm::dyn_cast<llvm::Instruction>(value);
   if (instruction != nullptr && instruction->getFunction() != &function) {
-    return unknownValueBefore(insertBefore, value->getType(),
-                              value->getName() + ".old");
+    llvm::Value *unknown =
+        unknownValueBefore(insertBefore, value->getType(),
+                           value->getName() + ".old");
+    attachUnknownValueMetadata(unknown, "foreign_call_argument_replacement",
+                               function.getName(), "",
+                               value->getName(), "localize_call_arg");
+    return unknown;
   }
   return value;
 }
@@ -6289,7 +6410,8 @@ bool valueMayDependOnUnknownPlaceholder(
   if (auto *call = llvm::dyn_cast<llvm::CallBase>(value)) {
     llvm::Function *callee = call->getCalledFunction();
     if (callee != nullptr &&
-        callee->getName().starts_with("notdec.register.vararg_unknown.")) {
+        (callee->getName().starts_with("notdec.register.vararg_unknown.") ||
+         isNotDecOpaqueUnknownName(callee->getName()))) {
       return true;
     }
     if (std::optional<NativeRegisterValueInsertInfo> insert =
@@ -6339,9 +6461,8 @@ bool shouldPoisonUnprovenVarArg(const CallArgStoreBinding &binding,
   if (valueMayDependOnUnknownPlaceholder(value)) {
     return true;
   }
-  auto *constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(value);
-  if (constant != nullptr) {
-    return constant->isZero();
+  if (llvm::isa_and_nonnull<llvm::ConstantInt>(value)) {
+    return false;
   }
   if (value == nullptr || !value->getType()->isIntegerTy()) {
     return false;
@@ -6493,9 +6614,28 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         value = remapValue(value);
         value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);
       }
-      if (value == nullptr || value->getType() != slotType(slot)) {
+      llvm::StringRef reason;
+      if (value == nullptr) {
+        reason = "call_arg_rewrite_missing_binding";
+      } else if (value->getType() != slotType(slot)) {
+        reason = "call_arg_rewrite_type_mismatch";
+      } else if (valueMayDependOnUnknownPlaceholder(value)) {
+        state.Warnings.push_back(callSlotWarning(
+            *oldCall, slot, "call_arg", "call_arg_uses_unknown_value"));
+      } else if (mayDependOnSummaryClobberValue(value)) {
+        state.Warnings.push_back(callSlotWarning(
+            *oldCall, slot, "call_arg", "call_arg_uses_clobber_value"));
+      }
+      if (!reason.empty()) {
+        state.Warnings.push_back(
+            callSlotWarning(*oldCall, slot, "call_arg", reason));
+        std::string regName = slotRegisterName(slot);
         value = unknownValueAt(oldCallBuilder, slotType(slot),
-                               slot.Unit->Name + ".arg_unknown");
+                               regName + ".arg_unknown");
+        attachUnknownValueMetadata(value, reason,
+                                   oldCall->getFunction()->getName(),
+                                   calleeNameForWarning(*oldCall), regName,
+                                   "call_arg");
       }
       args.push_back(value);
     }
@@ -6510,14 +6650,34 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         }
         value = remapValue(value);
         value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);
+        if (mayDependOnSummaryClobberValue(value)) {
+          state.Warnings.push_back(callRegisterWarning(
+              *oldCall, binding.Unit == nullptr ? "" : binding.Unit->Name,
+              "call_arg", "vararg_arg_uses_clobber_value"));
+        }
+        bool unknownValue = valueMayDependOnUnknownPlaceholder(value);
         if (shouldPoisonUnprovenVarArg(binding, value, module.getDataLayout(),
                                        oldCall)) {
+          llvm::StringRef reason = unknownValue ? "vararg_arg_uses_unknown_value"
+                                                : "vararg_arg_unproven_zero";
+          state.Warnings.push_back(callRegisterWarning(
+              *oldCall, binding.Unit == nullptr ? "" : binding.Unit->Name,
+              "call_arg", reason));
           llvm::Function *unknown =
               getOrInsertVarArgUnknownHelper(module, value->getType());
           value = oldCallBuilder.CreateCall(unknown);
+          attachUnknownValueMetadata(value, reason,
+                                     oldCall->getFunction()->getName(),
+                                     calleeNameForWarning(*oldCall),
+                                     binding.Unit == nullptr ? ""
+                                                             : binding.Unit->Name,
+                                     "call_arg");
         }
         if (binding.ValueType != nullptr &&
             value->getType() != binding.ValueType) {
+          state.Warnings.push_back(callRegisterWarning(
+              *oldCall, binding.Unit == nullptr ? "" : binding.Unit->Name,
+              "call_arg", "vararg_arg_type_mismatch"));
           continue;
         }
         args.push_back(value);
@@ -6547,8 +6707,17 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         llvm::Value *value =
             extractReturnRegister(builder, *shape, *newCall, name);
         if (value == nullptr || value->getType() != helper->getType()) {
+          llvm::StringRef reason = value == nullptr
+                                      ? "return_helper_rewrite_missing_value"
+                                      : "return_helper_rewrite_type_mismatch";
+          state.Warnings.push_back(
+              callRegisterWarning(*oldCall, name, "return", reason));
           value = unknownValueAt(builder, helper->getType(),
                                  name + ".return_unknown");
+          attachUnknownValueMetadata(value, reason,
+                                     oldCall->getFunction()->getName(),
+                                     calleeNameForWarning(*oldCall), name,
+                                     "return");
         }
         valueMap[helper] = value;
         helper->replaceAllUsesWith(value);
@@ -6569,8 +6738,20 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         llvm::Value *value =
             extractReturnRange(builder, *shape, *newCall, rangeHelper.Range);
         if (value == nullptr || value->getType() != helper->getType()) {
+          llvm::StringRef reason = value == nullptr
+                                      ? "range_return_helper_rewrite_missing_value"
+                                      : "range_return_helper_rewrite_type_mismatch";
+          std::string regName = rangeHelper.Range.Global == nullptr
+                                    ? std::string("")
+                                    : rangeHelper.Range.Global->getName().str();
+          state.Warnings.push_back(
+              callRegisterWarning(*oldCall, regName, "return", reason));
           value = unknownValueAt(builder, helper->getType(),
                                  "range_return_unknown");
+          attachUnknownValueMetadata(value, reason,
+                                     oldCall->getFunction()->getName(),
+                                     calleeNameForWarning(*oldCall), regName,
+                                     "return");
         }
         valueMap[helper] = value;
         helper->replaceAllUsesWith(value);
@@ -6640,7 +6821,7 @@ std::string warningReasonForHelper(const llvm::CallInst &helper,
     return "unresolved_return_register";
   }
   if (kind == "clobber") {
-    return "callee_clobber_still_used";
+    return "remaining_summary_clobber_value";
   }
   return "unresolved_register_helper";
 }

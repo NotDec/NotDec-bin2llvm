@@ -1429,7 +1429,7 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
   options.EnableResidueRemoval = false;
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
 
-  bool hasUnknownIncoming = false;
+  bool hasClobberIncoming = false;
   bool hasUndefIncoming = false;
   bool hasZeroIncoming = false;
   for (llvm::Instruction &inst : llvm::instructions(*function)) {
@@ -1438,7 +1438,8 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
       continue;
     }
     for (llvm::Value *incoming : phi->incoming_values()) {
-      hasUnknownIncoming |= isUnknownValueCall(incoming);
+      hasClobberIncoming |= valueNameContains(incoming, "summary_clobber") ||
+                            valueNameContains(incoming, "R10.clobber");
       hasUndefIncoming |= llvm::isa<llvm::UndefValue>(incoming);
       auto *constant = llvm::dyn_cast<llvm::ConstantInt>(incoming);
       hasZeroIncoming |= constant != nullptr && constant->isZero();
@@ -1447,10 +1448,10 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
 
   return expect(summary.LoadsReplaced == 1,
                 "unknown incoming load was not replaced") &&
-         expect(summary.UnknownCallEffects >= 1,
-                "unknown call effect was not observed") &&
-         expect(hasUnknownIncoming,
-                "unknown incoming was not materialized as opaque unknown") &&
+         expect(summary.CallClobberValues >= 1,
+                "external clobber effect was not observed") &&
+         expect(hasClobberIncoming,
+                "clobber incoming was not materialized explicitly") &&
          expect(!hasUndefIncoming, "unknown incoming still used bare undef") &&
          expect(!hasZeroIncoming, "unknown incoming was folded to zero") &&
          verifyOk(module,
@@ -2193,9 +2194,9 @@ bool testDeadFlagStoreBeforeCallIsRemoved() {
          verifyOk(module, "module failed verifier after dead flag store test");
 }
 
-bool testFlagStoreReadAfterCallIsKept() {
+bool testFlagStoreBeforeVolatileCallIsRemoved() {
   llvm::LLVMContext context;
-  llvm::Module module("summary-ssa-live-flag-after-call", context);
+  llvm::Module module("summary-ssa-clobbered-flag-after-call", context);
   attachTestAbi(module);
   llvm::GlobalVariable *of = createRegisterGlobal(
       module, "OF", llvm::Type::getInt8Ty(context), 523, 1);
@@ -2209,7 +2210,7 @@ bool testFlagStoreReadAfterCallIsKept() {
       llvm::FunctionType::get(llvm::Type::getInt8Ty(context), {});
   llvm::Function *function =
       llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
-                             "live_flag_store_after_call", module);
+                             "clobbered_flag_store_after_call", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -2220,9 +2221,11 @@ bool testFlagStoreReadAfterCallIsKept() {
   builder.CreateRet(loaded);
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  return expect(summary.DeadStoresRemoved == 0,
-                "live flag store after call was removed") &&
-         verifyOk(module, "module failed verifier after live flag store test");
+  return expect(summary.DeadStoresRemoved == 1,
+                "clobbered flag store before call was not removed") &&
+         expect(summary.CallClobberValues >= 1,
+                "flag read after call did not materialize clobber value") &&
+         verifyOk(module, "module failed verifier after clobbered flag test");
 }
 
 bool testPostRewriteInstCombineExposesDeadFlagStore() {
@@ -3051,9 +3054,9 @@ bool testKnownVarArgUsesSseCountForFloatTail() {
                   "module failed verifier after known vararg float rewrite");
 }
 
-bool testKnownVarArgZeroTailUsesPoison() {
+bool testKnownVarArgZeroTailKeepsConstantZero() {
   llvm::LLVMContext context;
-  llvm::Module module("summary-ssa-known-vararg-zero-tail-poison", context);
+  llvm::Module module("summary-ssa-known-vararg-zero-tail-constant", context);
   attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
   llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
@@ -3098,12 +3101,14 @@ bool testKnownVarArgZeroTailUsesPoison() {
   return expect(rewrittenCall != nullptr, "known vararg zero call missing") &&
          expect(rewrittenCall->arg_size() == 4,
                 "known vararg zero call used wrong arity") &&
-         expect(llvm::isa<llvm::PoisonValue>(rewrittenCall->getArgOperand(3)),
-                "known vararg zero tail was not rewritten to poison") &&
-         expect(cleanup.VarArgUnknownHelpersLowered == 1,
-                "vararg unknown helper was not lowered") &&
+         expect(llvm::isa<llvm::ConstantInt>(rewrittenCall->getArgOperand(3)) &&
+                    llvm::cast<llvm::ConstantInt>(rewrittenCall->getArgOperand(3))
+                        ->isZero(),
+                "known vararg zero tail was not kept as constant zero") &&
+         expect(cleanup.VarArgUnknownHelpersLowered == 0,
+                "constant zero vararg used an unknown helper") &&
          verifyOk(module,
-                  "module failed verifier after known vararg poison rewrite");
+                  "module failed verifier after known vararg zero rewrite");
 }
 
 bool testKnownVarArgUnknownPhiTailUsesPoison() {
@@ -5522,7 +5527,7 @@ bool testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn() {
          verifyOk(module, "module failed verifier after ZMM ABI effect test");
 }
 
-bool testUnknownExternalFloatAbiClobberDoesNotUseWholeZmm() {
+bool testUnknownExternalFloatAbiClobberUsesWholeZmm() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-unknown-float-clobber", context);
   attachTestFloatAbi(module, 1);
@@ -5549,8 +5554,8 @@ bool testUnknownExternalFloatAbiClobberDoesNotUseWholeZmm() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  return expect(summary.CallClobberValues == 0,
-                "float ABI clobber created a whole-ZMM helper") &&
+  return expect(summary.CallClobberValues >= 1,
+                "float ABI clobber was not modeled") &&
          expect(!moduleHasFunctionNamed(module,
                                         "notdec.register.summary_clobber.i512"),
                 "whole-ZMM summary clobber declaration remained") &&
@@ -7493,7 +7498,7 @@ int main() {
   ok &= testKnownFixedArgExternalTruncatesAbiInputs();
   ok &= testCallArgUsesPartialRangeRead();
   ok &= testDeadFlagStoreBeforeCallIsRemoved();
-  ok &= testFlagStoreReadAfterCallIsKept();
+  ok &= testFlagStoreBeforeVolatileCallIsRemoved();
   ok &= testPostRewriteInstCombineExposesDeadFlagStore();
   ok &= testKnownZeroArgExternalTypedReturnIsMaterialized();
   ok &= testKnownErrnoLocationReturnIsMaterialized();
@@ -7504,7 +7509,7 @@ int main() {
   ok &= testKnownVarArgCallsitesKeepIndependentArities();
   ok &= testKnownVarArgDoesNotReuseStaleCallerSavedTail();
   ok &= testKnownVarArgUsesSseCountForFloatTail();
-  ok &= testKnownVarArgZeroTailUsesPoison();
+  ok &= testKnownVarArgZeroTailKeepsConstantZero();
   ok &= testKnownVarArgUnknownPhiTailUsesPoison();
   ok &= testMismatchedDirectCallUseUsesReturnExtract();
   ok &= testKnownExternalUsesSingleIntegerReturn();
@@ -7557,7 +7562,7 @@ int main() {
   ok &= testSelfPhiFsCanaryAddressStackCanaryCheckIsRemoved();
   ok &= testSelfPhiFsBaseStackCanaryCheckIsRemoved();
   ok &= testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn();
-  ok &= testUnknownExternalFloatAbiClobberDoesNotUseWholeZmm();
+  ok &= testUnknownExternalFloatAbiClobberUsesWholeZmm();
   ok &= testUnknownExternalIntegerClobberUsesRangeCallValue();
   ok &= testKnownPowUsesFloatAbiSlots();
   ok &= testKnownUnaryLibmUsesFloatAbiSlots();
