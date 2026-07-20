@@ -870,7 +870,14 @@ private:
       result = blockForNativeTarget(*falseTarget, errorMessage);
       return result != nullptr;
     }
-    result = usesNativeCfg() ? nullptr : fallback;
+    if (usesNativeCfg()) {
+      std::ostringstream os;
+      os << "native conditional block 0x" << std::hex << blockAddress
+         << " is missing false successor for true target 0x" << trueTarget;
+      errorMessage = os.str();
+      return false;
+    }
+    result = fallback;
     return true;
   }
 
@@ -1203,7 +1210,7 @@ private:
         }
         return false;
       }
-      llvm::BasicBlock *falseBlock = fallthrough ? fallthrough : exitBlock();
+      llvm::BasicBlock *falseBlock = fallthrough;
       if (trueAddress) {
         if (!nativeConditionalTrueTarget(blockIndex, *trueAddress, trueBlock,
                                          errorMessage)) {
@@ -1218,9 +1225,22 @@ private:
                                            nativeFalseBlock, errorMessage)) {
             return false;
           }
-          falseBlock =
-              nativeFalseBlock != nullptr ? nativeFalseBlock : exitBlock();
+          falseBlock = nativeFalseBlock;
         }
+      }
+      if (falseBlock == nullptr) {
+        if (usesNativeCfg()) {
+          std::ostringstream os;
+          os << "native conditional block 0x" << std::hex
+             << blockAddressForIndex(blockIndex)
+             << " is missing false successor";
+          if (trueAddress) {
+            os << " for true target 0x" << *trueAddress;
+          }
+          errorMessage = os.str();
+          return false;
+        }
+        falseBlock = exitBlock();
       }
       Builder.CreateCondBr(asCondition(read(op.Inputs[1])), trueBlock,
                            falseBlock);
