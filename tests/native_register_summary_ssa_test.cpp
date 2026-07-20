@@ -1346,6 +1346,105 @@ bool testDuplicatePredecessorEdgesKeepPhiComplete() {
                   "module failed verifier after duplicate-edge PHI test");
 }
 
+bool testPartialReadLoopPassthroughUsesDominatorTree() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-read-loop-dt", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rsi->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rsi->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt32Ty(context),
+                                       {llvm::Type::getInt1Ty(context)}, false);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "partial_read_loop_passthrough", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *header =
+      llvm::BasicBlock::Create(context, "header", function);
+  llvm::BasicBlock *updateRcx =
+      llvm::BasicBlock::Create(context, "update_rcx", function);
+  llvm::BasicBlock *updateRsi =
+      llvm::BasicBlock::Create(context, "update_rsi", function);
+  llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+  llvm::BasicBlock *exit = llvm::BasicBlock::Create(context, "exit", function);
+
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 0),
+                "RCX");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 0),
+                "RSI");
+  builder.CreateBr(header);
+
+  builder.SetInsertPoint(header);
+  llvm::Value *headerRsi = builder.CreateCall(
+      partialRead,
+      {rsi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  llvm::Value *done = builder.CreateICmpEQ(
+      headerRsi, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 3));
+  builder.CreateCondBr(done, exit, updateRcx);
+
+  builder.SetInsertPoint(updateRcx);
+  llvm::Value *rcxLow = builder.CreateCall(
+      partialRead,
+      {rcx, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  llvm::Value *rcxNext =
+      builder.CreateAdd(rcxLow, llvm::ConstantInt::get(rcxLow->getType(), 1));
+  builder.CreateCall(
+      partialWrite,
+      {rcx, rcxNext,
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateCondBr(function->getArg(0), join, updateRsi);
+
+  builder.SetInsertPoint(updateRsi);
+  llvm::Value *rsiLow = builder.CreateCall(
+      partialRead,
+      {rsi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  llvm::Value *rsiNext =
+      builder.CreateAdd(rsiLow, llvm::ConstantInt::get(rsiLow->getType(), 1));
+  builder.CreateCall(
+      partialWrite,
+      {rsi, rsiNext,
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateBr(join);
+
+  builder.SetInsertPoint(join);
+  llvm::Value *joinedRsi = builder.CreateCall(
+      partialRead,
+      {rsi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  llvm::Value *keepGoing = builder.CreateICmpULT(
+      joinedRsi, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 5));
+  builder.CreateCondBr(keepGoing, header, exit);
+
+  builder.SetInsertPoint(exit);
+  llvm::Value *result = builder.CreateCall(
+      partialRead,
+      {rsi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateRet(result);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool hasUnknown = false;
+  for (llvm::Instruction &inst : llvm::instructions(*function)) {
+    hasUnknown |= isUnknownValueCall(&inst);
+  }
+
+  return expect(summary.LoadsReplaced >= 4,
+                "loop partial reads were not rewritten") &&
+         expect(!hasPartialReadCall(*function),
+                "loop partial read helper remained") &&
+         expect(!hasUnknown,
+                "loop passthrough partial read created an unknown value") &&
+         verifyOk(module,
+                  "module failed verifier after partial read loop DT test");
+}
+
 bool testRegisterPointerPhiLoadIsCanonicalized() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-register-pointer-phi-load", context);
@@ -7624,6 +7723,7 @@ int main() {
   bool ok = true;
   ok &= testPhiIncomingMatchesPredecessors();
   ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
+  ok &= testPartialReadLoopPassthroughUsesDominatorTree();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();
   ok &= testUnknownPhiIncomingUsesFrozenPoison();
   ok &= testSelfOnlyPhiBecomesOpaqueUnknown();
