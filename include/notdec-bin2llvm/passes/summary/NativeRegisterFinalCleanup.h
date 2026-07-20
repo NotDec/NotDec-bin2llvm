@@ -22,6 +22,7 @@ struct NativeRegisterFinalCleanupSummary {
   uint64_t FunctionsSeen = 0;
   uint64_t FunctionsWithoutRegisterResidue = 0;
   uint64_t DeadRegisterReadsRemoved = 0;
+  uint64_t DeadUnknownValuesRemoved = 0;
   uint64_t RegisterGlobalsRemoved = 0;
   uint64_t HelperDeclarationsRemoved = 0;
   uint64_t ValueRangeHelpersLowered = 0;

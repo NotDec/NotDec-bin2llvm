@@ -7662,6 +7662,56 @@ bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
                   "module failed verifier after globaldce cleanup test");
 }
 
+bool testFinalCleanupDropsDeadUnknownValueCalls() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-dead-unknown", context);
+
+  auto *unknownType =
+      llvm::FunctionType::get(llvm::Type::getInt32Ty(context), {}, false);
+  llvm::Function *unknown =
+      llvm::Function::Create(unknownType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec.unknown.i32", module);
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "final_cleanup_dead_unknown", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(unknown, {}, "dead_unknown");
+  llvm::CallInst *live = builder.CreateCall(unknown, {}, "live_unknown");
+  builder.CreateStore(live, sink);
+  builder.CreateRetVoid();
+
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+
+  unsigned unknownCalls = 0;
+  bool storeUsesUnknown = false;
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    if (isUnknownValueCall(&inst)) {
+      ++unknownCalls;
+    }
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    storeUsesUnknown |=
+        store != nullptr && store->getPointerOperand() == sink &&
+        isUnknownValueCall(store->getValueOperand());
+  }
+
+  return expect(unknownCalls == 1,
+                "final cleanup kept wrong number of unknown value calls") &&
+         expect(storeUsesUnknown, "live unknown value call was removed") &&
+         expect(cleanup.DeadUnknownValuesRemoved == 1,
+                "final cleanup did not count dead unknown value") &&
+         expect(moduleHasUsedFunctionNamed(module, "notdec.unknown.i32"),
+                "live unknown helper declaration was removed") &&
+         verifyOk(module,
+                  "module failed verifier after dead unknown cleanup test");
+}
+
 bool testFinalCleanupLowersValueRangeHelpers() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-value-range", context);
@@ -7845,6 +7895,7 @@ int main() {
   ok &= testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering();
   ok &= testPostRewritePeepholeSimplifiesExtractFromInsertedRange();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
+  ok &= testFinalCleanupDropsDeadUnknownValueCalls();
   ok &= testFinalCleanupLowersValueRangeHelpers();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

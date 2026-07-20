@@ -83,6 +83,10 @@ bool isVarArgUnknownHelperName(llvm::StringRef name) {
   return name.starts_with("notdec.register.vararg_unknown.");
 }
 
+bool isOpaqueUnknownHelperName(llvm::StringRef name) {
+  return name.starts_with("notdec.unknown.");
+}
+
 llvm::APInt partialWriteMask(unsigned fullWidth, unsigned writeWidth,
                              uint64_t bitOffset) {
   if (fullWidth == 0 || writeWidth == 0 || bitOffset >= fullWidth ||
@@ -253,6 +257,35 @@ uint64_t eraseDeadRegisterReads(llvm::Module &module) {
   return removed;
 }
 
+uint64_t eraseDeadUnknownValueCalls(llvm::Module &module) {
+  std::vector<llvm::CallBase *> deadCalls;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr || !call->use_empty()) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee != nullptr && isOpaqueUnknownHelperName(callee->getName())) {
+        deadCalls.push_back(call);
+      }
+    }
+  }
+
+  uint64_t removed = 0;
+  for (llvm::CallBase *call : deadCalls) {
+    if (call->getParent() == nullptr || !call->use_empty()) {
+      continue;
+    }
+    call->eraseFromParent();
+    ++removed;
+  }
+  return removed;
+}
+
 uint64_t eraseUnusedRegisterGlobals(llvm::Module &module) {
   std::vector<llvm::GlobalVariable *> deadGlobals;
   for (llvm::GlobalVariable &global : module.globals()) {
@@ -276,6 +309,7 @@ uint64_t eraseUnusedRegisterHelperDeclarations(llvm::Module &module) {
     llvm::StringRef name = function.getName();
     if (name.starts_with("notdec.register.summary_") ||
         isVarArgUnknownHelperName(name) ||
+        isOpaqueUnknownHelperName(name) ||
         isNativeRegisterValueRangeName(name) ||
         isNativeRegisterPartialReadName(name) ||
         isNativeRegisterPartialWriteName(name)) {
@@ -394,6 +428,7 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   summary.ValueRangeHelpersLowered += lowerValueRangeHelpers(module);
   summary.VarArgUnknownHelpersLowered += lowerVarArgUnknownHelpers(module);
   runLocalDeadCodeCleanup(module);
+  summary.DeadUnknownValuesRemoved += eraseDeadUnknownValueCalls(module);
   summary.DeadRegisterReadsRemoved += eraseDeadRegisterReads(module);
   runLocalDeadCodeCleanup(module);
   summary.RegisterGlobalsRemoved += eraseUnusedRegisterGlobals(module);
@@ -431,6 +466,7 @@ void printNativeRegisterFinalCleanupSummary(
      << " functions_without_register_residue="
      << summary.FunctionsWithoutRegisterResidue
      << " dead_register_reads_removed=" << summary.DeadRegisterReadsRemoved
+     << " dead_unknown_values_removed=" << summary.DeadUnknownValuesRemoved
      << " register_globals_removed=" << summary.RegisterGlobalsRemoved
      << " helper_declarations_removed=" << summary.HelperDeclarationsRemoved
      << " value_range_helpers_lowered=" << summary.ValueRangeHelpersLowered
