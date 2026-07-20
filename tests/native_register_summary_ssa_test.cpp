@@ -3201,6 +3201,95 @@ bool testKnownVarArgUnknownPhiTailUsesPoison() {
                   "module failed verifier after unknown-phi vararg rewrite");
 }
 
+bool testNonX64VarArgUnknownPhiTailDoesNotUsePoisonHelper() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-non-x64-vararg-unknown-tail", context);
+  attachTestAbiWithInputs(module, {"A0", "A1", "A2", "A3"});
+  llvm::GlobalVariable *a0 = createRegisterGlobal(module, "A0");
+  llvm::GlobalVariable *a1 = createRegisterGlobal(module, "A1");
+  llvm::GlobalVariable *a2 = createRegisterGlobal(module, "A2");
+  llvm::GlobalVariable *a3 = createRegisterGlobal(module, "A3");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__fprintf_chk", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage,
+      "non_x64_vararg_unknown_tail_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *unknownBlock =
+      llvm::BasicBlock::Create(context, "unknown", function);
+  llvm::BasicBlock *zeroBlock =
+      llvm::BasicBlock::Create(context, "zero", function);
+  llvm::BasicBlock *merge = llvm::BasicBlock::Create(context, "merge", function);
+
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, a0, llvm::ConstantInt::get(a0->getValueType(), 1),
+                "A0");
+  storeRegister(builder, a1, llvm::ConstantInt::get(a1->getValueType(), 2),
+                "A1");
+  storeRegister(builder, a2, llvm::ConstantInt::get(a2->getValueType(), 3),
+                "A2");
+  llvm::Value *cond =
+      builder.CreateFreeze(llvm::PoisonValue::get(llvm::Type::getInt1Ty(context)),
+                           "unknown_cond");
+  builder.CreateCondBr(cond, unknownBlock, zeroBlock);
+
+  builder.SetInsertPoint(unknownBlock);
+  auto *tail32Type = llvm::Type::getInt32Ty(context);
+  llvm::Value *unknown =
+      builder.CreateFreeze(llvm::PoisonValue::get(tail32Type), "tail_unknown");
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(zeroBlock);
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(merge);
+  llvm::PHINode *tail = builder.CreatePHI(tail32Type, 2, "tail");
+  tail->addIncoming(unknown, unknownBlock);
+  tail->addIncoming(llvm::ConstantInt::get(tail32Type, 0), zeroBlock);
+  llvm::Function *insert = notdec::bin2llvm::getOrInsertNativeRegisterValueInsert(
+      module, a3->getValueType(), tail32Type, 64, 32);
+  llvm::Value *tail64 = builder.CreateCall(
+      insert,
+      {llvm::ConstantInt::get(a3->getValueType(), 0), tail,
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "tail_insert");
+  storeRegister(builder, a3, tail64, "A3");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+  llvm::Function *rewrittenCaller =
+      module.getFunction("non_x64_vararg_unknown_tail_caller");
+  llvm::CallInst *rewrittenCall = nullptr;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenCaller)) {
+      auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (candidate != nullptr && candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() == "__fprintf_chk") {
+        rewrittenCall = candidate;
+      }
+    }
+  }
+
+  return expect(rewrittenCall != nullptr,
+                "non-x64 vararg unknown call missing") &&
+         expect(rewrittenCall->arg_size() == 4,
+                "non-x64 vararg unknown call used wrong arity") &&
+         expect(cleanup.VarArgUnknownHelpersLowered == 0,
+                "non-x64 vararg used an x64-only unknown helper") &&
+         expect(!moduleHasFunctionNamed(module,
+                                        "notdec.register.vararg_unknown.i64"),
+                "non-x64 vararg unknown helper declaration remained") &&
+         verifyOk(module,
+                  "module failed verifier after non-x64 vararg rewrite");
+}
+
 bool testMismatchedDirectCallUseUsesReturnExtract() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-direct-call-use-return-extract", context);
@@ -7565,6 +7654,7 @@ int main() {
   ok &= testKnownVarArgUsesSseCountForFloatTail();
   ok &= testKnownVarArgZeroTailKeepsConstantZero();
   ok &= testKnownVarArgUnknownPhiTailUsesPoison();
+  ok &= testNonX64VarArgUnknownPhiTailDoesNotUsePoisonHelper();
   ok &= testMismatchedDirectCallUseUsesReturnExtract();
   ok &= testKnownExternalUsesSingleIntegerReturn();
   ok &= testUnknownExternalTreatsRdxAsClobberNotReturn();

@@ -1597,6 +1597,21 @@ unknownExternalEvidenceSlots(const AbiFacts &abi) {
   return result;
 }
 
+bool isLikelyX86_64SysVAbi(const AbiFacts &abi) {
+  static constexpr const char *expected[] = {"RDI", "RSI", "RDX",
+                                             "RCX", "R8",  "R9"};
+  constexpr unsigned expectedCount = sizeof(expected) / sizeof(expected[0]);
+  if (abi.IntegerInputsInOrder.size() < expectedCount) {
+    return false;
+  }
+  for (unsigned index = 0; index < expectedCount; ++index) {
+    if (abi.IntegerInputsInOrder[index].UnitName != expected[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 unsigned localDefinitionPrefix(
     llvm::ArrayRef<NativeRegisterCallsiteSlotEvidence> slots) {
   unsigned prefix = 0;
@@ -6559,6 +6574,7 @@ foldFullInsertOfExtracts(llvm::Value *value,
 }
 
 void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
+                            const AbiFacts &abi,
                             NativeRegisterSummarySSASummary &summary) {
   std::map<llvm::Function *, llvm::Function *> replacements;
   std::vector<std::pair<llvm::Function *, SignatureShape>> replacementShapes;
@@ -6676,7 +6692,8 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
               "call_arg", "vararg_arg_uses_clobber_value"));
         }
         bool unknownValue = valueMayDependOnUnknownPlaceholder(value);
-        if (shouldPoisonUnprovenVarArg(binding, value, module.getDataLayout(),
+        if (isLikelyX86_64SysVAbi(abi) &&
+            shouldPoisonUnprovenVarArg(binding, value, module.getDataLayout(),
                                        oldCall)) {
           llvm::StringRef reason = unknownValue ? "vararg_arg_uses_unknown_value"
                                                 : "vararg_arg_unproven_zero";
@@ -7001,7 +7018,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
     refineIndirectCallsiteParamShapes(signatureState);
     addDemandedExternalReturns(signatureState, units, abi, externalPrototypes);
     markSignatureCallArgStores(signatureState, summary);
-    rewriteSignatureShapes(module, signatureState, summary);
+    rewriteSignatureShapes(module, signatureState, abi, summary);
     eraseUnusedSummaryHelperDeclarations(module);
     if (options.EnableResidueRemoval) {
       constexpr unsigned maxPostRewriteCleanupIterations = 10;
