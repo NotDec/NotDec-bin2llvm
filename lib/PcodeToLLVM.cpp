@@ -1107,6 +1107,21 @@ private:
     return ExitBlock;
   }
 
+  llvm::BasicBlock *nativeIndirectSwitchDefaultBlock(uint64_t blockAddress) {
+    // Native successor facts are authoritative here; a missing switch case is
+    // a bad fact or unsupported dynamic path, not a normal function return.
+    std::ostringstream name;
+    name << "native_indirect_default_" << std::hex << blockAddress;
+    llvm::BasicBlock *block =
+        llvm::BasicBlock::Create(Context, name.str(), &Function);
+    llvm::IRBuilder<> trapBuilder(block);
+    llvm::Function *trap = llvm::Intrinsic::getOrInsertDeclaration(
+        &Module, llvm::Intrinsic::trap);
+    trapBuilder.CreateCall(trap);
+    trapBuilder.CreateUnreachable();
+    return block;
+  }
+
   llvm::Value *asCondition(llvm::Value *value) {
     if (value->getType()->isIntegerTy(1)) {
       return value;
@@ -1283,8 +1298,11 @@ private:
         }
         if (!successors.empty()) {
           llvm::Value *target = resize(read(op.Inputs[0]), 8);
-          auto *switchInst = Builder.CreateSwitch(target, exitBlock(),
-                                                  successors.size());
+          auto *switchInst =
+              Builder.CreateSwitch(target,
+                                   nativeIndirectSwitchDefaultBlock(
+                                       blockAddressForIndex(blockIndex)),
+                                   successors.size());
           for (const auto &[address, successor] : successors) {
             switchInst->addCase(
                 llvm::cast<llvm::ConstantInt>(

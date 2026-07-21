@@ -4,6 +4,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -375,13 +376,16 @@ bool testInternalConditionalTailBranchWithoutLocalBlock() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   program.Ops.push_back(cbranchOp(0x1000, 0x2000));
+  program.Ops.push_back(returnOp(0x3000));
 
   notdec::bin2llvm::PcodeLoweringConfig config;
   config.EntryFunctionName = "internal_conditional_tail_branch";
   config.EntryAddress = 0x1000;
   config.DirectCallTargets.emplace(0x2000, "notdec_native_2000");
   config.BlockRanges.emplace(0x1000, 0x1001);
-  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{});
+  config.BlockRanges.emplace(0x3000, 0x3001);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x3000});
+  config.BlockSuccessors.emplace(0x3000, std::vector<uint64_t>{});
 
   std::string errorMessage;
   std::unique_ptr<llvm::Module> module =
@@ -1203,20 +1207,41 @@ bool testNativeIndirectBranchLowersMultipleSuccessorsAsSwitch() {
   llvm::Function *function = module ? module->getFunction(
                                           "native_indirect_multiple_successors")
                                     : nullptr;
-  bool hasSwitch = false;
+  llvm::SwitchInst *switchInst = nullptr;
   if (function != nullptr) {
     for (llvm::BasicBlock &block : *function) {
-      if (llvm::isa<llvm::SwitchInst>(block.getTerminator())) {
-        hasSwitch = true;
+      if (auto *candidate =
+              llvm::dyn_cast<llvm::SwitchInst>(block.getTerminator())) {
+        switchInst = candidate;
       }
+    }
+  }
+  llvm::BasicBlock *defaultBlock =
+      switchInst == nullptr ? nullptr : switchInst->getDefaultDest();
+  bool defaultIsTrap = false;
+  bool defaultIsUnreachable = false;
+  if (defaultBlock != nullptr) {
+    defaultIsUnreachable =
+        llvm::isa<llvm::UnreachableInst>(defaultBlock->getTerminator());
+    for (llvm::Instruction &instruction :
+         defaultBlock->instructionsWithoutDebug()) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+      defaultIsTrap |= call != nullptr && call->getIntrinsicID() ==
+                                             llvm::Intrinsic::trap;
     }
   }
   return expect(module != nullptr,
                 "native indirect branch with multiple successors should lower") &&
          expect(function != nullptr,
                 "multiple indirect successor function is missing") &&
-         expect(hasSwitch,
-                "multiple indirect successor branch did not lower as switch");
+         expect(switchInst != nullptr,
+                "multiple indirect successor branch did not lower as switch") &&
+         expect(defaultIsTrap,
+                "multiple indirect switch default did not lower to trap") &&
+         expect(defaultIsUnreachable,
+                "multiple indirect switch default did not end unreachable") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after multiple indirect successor");
 }
 
 bool functionUsesGlobal(llvm::Function *function, const std::string &name) {
