@@ -74,6 +74,9 @@ python3 external/NotDec-bin2llvm/scripts/native-register-residue-audit.py --deta
 
 - `FUN_27a0` 仍有一个未使用的 `RAX.arg`。汇编入口是 `push %rax; pop %rax; push %rax; call perror; call exit`，
   这里的 `RAX` 更像栈对齐/占位，不是源码参数。当前先跳过，不为 fortune 这个 case 专门加 cleanup。
+- `FUN_3470` 里一处 `open(path, O_RDONLY)` 被保留成三参 `open(path, 0, %RDX-like)`。反汇编显示
+  call 前只准备了 `RDI/RSI`，第三个值来自前面循环里的旧 `RDX` 局部值；这是 bounded vararg 推断没利用
+  `flags=0` 的问题。当前先跳过，不在 fortune 这个 case 里专门加 `open` flags-aware 规则。
 
 ## 评价
 
