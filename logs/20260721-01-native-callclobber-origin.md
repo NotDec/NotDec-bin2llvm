@@ -70,6 +70,11 @@ python3 external/NotDec-bin2llvm/scripts/native-register-residue-audit.py --deta
 - `notdec.unknown`、`range_unknown`、`freeze`、`summary_return`、`summary_clobber` 都是 0。
 - IR 里出现的 `poison/undef` 只来自 LLVM attribute `nocreateundeforpoison` 文本，不是实际值。
 
+### 已知暂不处理
+
+- `FUN_27a0` 仍有一个未使用的 `RAX.arg`。汇编入口是 `push %rax; pop %rax; push %rax; call perror; call exit`，
+  这里的 `RAX` 更像栈对齐/占位，不是源码参数。当前先跳过，不为 fortune 这个 case 专门加 cleanup。
+
 ## 评价
 
 - 实现效果：8/10。修正了 `recode_scan_request` 漏参，同时保留直接 clobber / mixed 不作为参数证据的边界。
