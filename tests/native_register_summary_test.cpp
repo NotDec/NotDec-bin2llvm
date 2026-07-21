@@ -555,8 +555,9 @@ bool testUnknownExternalCallsiteEvidenceClassifiesOrigins() {
   llvm::LLVMContext context;
   llvm::Module module("summary-unknown-external-evidence", context);
   attachExternalEvidenceAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
   llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
-  (void)createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
   (void)createRegisterGlobal(module, "RDX");
 
   auto *callType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
@@ -570,6 +571,8 @@ bool testUnknownExternalCallsiteEvidenceClassifiesOrigins() {
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   builder.CreateCall(callType, producer);
+  llvm::LoadInst *produced = loadRegister(builder, rax, "RAX", "produced");
+  storeRegisterValue(builder, rsi, produced, "RSI");
   storeRegister(builder, rdi, 7, "RDI");
   builder.CreateCall(callType, target);
   builder.CreateRetVoid();
@@ -593,10 +596,10 @@ bool testUnknownExternalCallsiteEvidenceClassifiesOrigins() {
   using Origin = notdec::bin2llvm::NativeRegisterCallsiteValueOrigin;
   return expect(callsite->Slots[0].Origin == Origin::LocalDefinition,
                 "RDI evidence was not classified as local") &&
-         expect(callsite->Slots[1].Origin == Origin::CallProduced,
-                "RSI evidence crossed an external call as entry") &&
-         expect(callsite->Slots[2].Origin == Origin::CallProduced,
-                "RDX evidence was not classified as call produced");
+         expect(callsite->Slots[1].Origin == Origin::LocalDefinition,
+                "RSI explicit write from a call value was not local") &&
+         expect(callsite->Slots[2].Origin == Origin::CallClobber,
+                "RDX evidence was not classified as call clobber");
 }
 
 bool testCalleeReadPropagatesToCallerEntry() {

@@ -48,7 +48,7 @@ enum class NativeRegisterCallsiteValueOrigin {
   LocalDefinition,
   ForwardedEntry,
   Mixed,
-  CallProduced,
+  CallClobber,
   Unknown,
 };
 

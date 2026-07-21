@@ -282,7 +282,7 @@ PcodeToLLVM
      - `LocalDefinition`
      - `ForwardedEntry`
      - `Mixed`
-     - `CallProduced`
+     - `CallClobber`
    - bottom-up 最后一轮已经得到稳定 block `In/Out`；callsite evidence 直接复用该状态，
      不重新求解 CFG。
 

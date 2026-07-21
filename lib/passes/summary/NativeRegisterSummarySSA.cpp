@@ -1747,7 +1747,7 @@ llvm::StringRef originName(NativeRegisterCallsiteValueOrigin origin) {
     return "local";
   case NativeRegisterCallsiteValueOrigin::ForwardedEntry:
     return "entry";
-  case NativeRegisterCallsiteValueOrigin::CallProduced:
+  case NativeRegisterCallsiteValueOrigin::CallClobber:
     return "call_clobber";
   case NativeRegisterCallsiteValueOrigin::Mixed:
     return "mixed";
@@ -1779,7 +1779,7 @@ void warnIfStoppedAtCallClobber(
     llvm::StringRef reason) {
   const NativeRegisterCallsiteSlotEvidence *slot = slotAtPrefix(slots, prefix);
   if (slot == nullptr ||
-      slot->Origin != NativeRegisterCallsiteValueOrigin::CallProduced) {
+      slot->Origin != NativeRegisterCallsiteValueOrigin::CallClobber) {
     return;
   }
   warnings.push_back(varArgInferenceWarning(callsite, slotDetail(*slot),

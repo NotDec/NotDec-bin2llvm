@@ -350,7 +350,7 @@ forward solver 同时维护按 bit 的来源状态：
 ```text
 Entry         来自函数入口
 Local         本函数明确写入
-CallProduced  前一个 call 的返回值或 clobber
+CallClobber   call effect 隐式改写出来的脏值
 ```
 
 一个 ABI slot 的全部 bit 都来自同一来源时，分别映射为：
@@ -358,7 +358,7 @@ CallProduced  前一个 call 的返回值或 clobber
 ```text
 ForwardedEntry
 LocalDefinition
-CallProduced
+CallClobber
 ```
 
 不同来源混合时是 `Mixed`，无法判断时是 `Unknown`。
@@ -375,14 +375,14 @@ SCC bottom-up 最后一轮已经在稳定 callee effect 下得到每个 block �
 
 ```text
 Local, Local, Entry -> 2
-Local, CallProduced -> 1
+Local, CallClobber -> 1
 Entry, Local        -> 0
 ```
 
 同一 external 的最终参数数量取所有 callsite 前缀的最大值。
 这样不会因为某个条件分支少设置一个可选参数而取到过小结果。
 
-`ForwardedEntry`、`Mixed`、`CallProduced` 和 `Unknown` 不作为强证据。
+`ForwardedEntry`、`Mixed`、`CallClobber` 和 `Unknown` 不作为强证据。
 callsite 不一致会输出 warning；所有 callsite 都是零前缀时保持零参数假设并输出
 unresolved warning。
 内置和用户 JSON prototype 始终优先，不参与自动推断。
@@ -409,7 +409,7 @@ fixed + Local, Local, Entry -> fixed + 2
 fixed + Entry, Local        -> fixed
 ```
 
-遇到 `ForwardedEntry`、`Mixed`、`CallProduced` 或 `Unknown` 就停止。
+遇到 `ForwardedEntry`、`Mixed`、`CallClobber` 或 `Unknown` 就停止。
 `MaxArgs` 限制源码层总参数数，因此额外参数上限是 `MaxArgs - FixedArgs`。
 
 结果保存在 callsite shape map 中，不写回 declaration prototype。declaration 仍保持固定

@@ -94,11 +94,11 @@ struct Cell {
 struct RegisterOriginBits {
   llvm::APInt Entry;
   llvm::APInt Local;
-  llvm::APInt CallProduced;
+  llvm::APInt CallClobber;
 
   bool operator==(const RegisterOriginBits &other) const {
     return Entry == other.Entry && Local == other.Local &&
-           CallProduced == other.CallProduced;
+           CallClobber == other.CallClobber;
   }
 };
 
@@ -114,10 +114,6 @@ struct State {
   // SSA values known to be a function-entry register plus a constant offset.
   // Offset 0 is also used for saved register values loaded back from stack.
   std::map<llvm::Value *, ValueOrigin> ValueOrigins;
-  // Values that directly or transitively come from a register value produced
-  // by a call.  The evidence replay only needs this negative fact to avoid
-  // treating clobber-derived argument stores as local definitions.
-  std::set<llvm::Value *> CallProducedValues;
   // Current stack pointer as an entry-SP-relative offset.  This is deliberately
   // narrow: it only exists so push/pop save slots can be recognized even when
   // RSP itself is ignored by the register summary.
@@ -128,7 +124,6 @@ struct State {
            EndsInNoReturn == other.EndsInNoReturn && Cells == other.Cells &&
            Origins == other.Origins && StackSlots == other.StackSlots &&
            ValueOrigins == other.ValueOrigins &&
-           CallProducedValues == other.CallProducedValues &&
            StackPointerOffset == other.StackPointerOffset;
   }
 
@@ -858,7 +853,7 @@ llvm::APInt registerRangeMask(llvm::GlobalVariable *global, unsigned offsetBits,
 enum class RegisterOriginKind {
   Entry,
   Local,
-  CallProduced,
+  CallClobber,
   Mixed,
 };
 
@@ -872,13 +867,13 @@ void setRegisterOrigin(State &state, llvm::GlobalVariable *global,
   RegisterOriginBits bits = originIn(state, global);
   bits.Entry &= ~boundedMask;
   bits.Local &= ~boundedMask;
-  bits.CallProduced &= ~boundedMask;
+  bits.CallClobber &= ~boundedMask;
   if (kind == RegisterOriginKind::Entry) {
     bits.Entry |= boundedMask;
   } else if (kind == RegisterOriginKind::Local) {
     bits.Local |= boundedMask;
-  } else if (kind == RegisterOriginKind::CallProduced) {
-    bits.CallProduced |= boundedMask;
+  } else if (kind == RegisterOriginKind::CallClobber) {
+    bits.CallClobber |= boundedMask;
   }
   state.Origins[global] = std::move(bits);
 }
@@ -926,7 +921,7 @@ bool joinState(State &target, const State &source) {
     RegisterOriginBits joined = {
         before.Entry & incoming.Entry,
         before.Local & incoming.Local,
-        before.CallProduced & incoming.CallProduced,
+        before.CallClobber & incoming.CallClobber,
     };
     if (!(joined == before)) {
       target.Origins[global] = std::move(joined);
@@ -948,15 +943,6 @@ bool joinState(State &target, const State &source) {
     if (sourceIt == source.ValueOrigins.end() ||
         sourceIt->second != it->second) {
       it = target.ValueOrigins.erase(it);
-      changed = true;
-    } else {
-      ++it;
-    }
-  }
-  for (auto it = target.CallProducedValues.begin();
-       it != target.CallProducedValues.end();) {
-    if (source.CallProducedValues.count(*it) == 0) {
-      it = target.CallProducedValues.erase(it);
       changed = true;
     } else {
       ++it;
@@ -1121,9 +1107,9 @@ private:
   std::map<llvm::Function *, std::set<llvm::Function *>> Callers;
   std::map<llvm::Function *, FunctionEffect> Effects;
   std::map<llvm::Function *, FunctionDemand> Demands;
-  // ValueOrigins and CallProducedValues are forward facts for LLVM SSA values.
-  // A value defined and fully used inside one basic block is already consumed
-  // during transferBlock(); carrying it around loops only slows convergence.
+  // ValueOrigins are forward facts for LLVM SSA values. A value defined and
+  // fully used inside one basic block is already consumed during
+  // transferBlock(); carrying it around loops only slows convergence.
   std::set<llvm::Value *> CrossBlockValues;
   // The last SCC iteration is already solved against stable callee effects.
   // Keep those block states only for the preliminary callsite-evidence pass.
@@ -1382,8 +1368,8 @@ private:
     if ((bits.Entry & mask) == mask) {
       return NativeRegisterCallsiteValueOrigin::ForwardedEntry;
     }
-    if ((bits.CallProduced & mask) == mask) {
-      return NativeRegisterCallsiteValueOrigin::CallProduced;
+    if ((bits.CallClobber & mask) == mask) {
+      return NativeRegisterCallsiteValueOrigin::CallClobber;
     }
     return NativeRegisterCallsiteValueOrigin::Mixed;
   }
@@ -1486,14 +1472,6 @@ private:
         ++it;
       }
     }
-    for (auto it = state.CallProducedValues.begin();
-         it != state.CallProducedValues.end();) {
-      if (CrossBlockValues.count(*it) == 0) {
-        it = state.CallProducedValues.erase(it);
-      } else {
-        ++it;
-      }
-    }
   }
 
   void transferInstruction(llvm::Instruction &inst, State &state) {
@@ -1521,15 +1499,6 @@ private:
         } else {
           state.ValueOrigins.erase(load);
         }
-        RegisterOriginBits origins = originIn(state, access.Unit->Global);
-        unsigned width = registerBitWidth(access.Unit->Global);
-        llvm::APInt mask =
-            width == 0 ? llvm::APInt() : llvm::APInt::getAllOnes(width);
-        if (mask.getBitWidth() != 0 && (origins.CallProduced & mask) == mask) {
-          state.CallProducedValues.insert(load);
-        } else {
-          state.CallProducedValues.erase(load);
-        }
         return;
       }
       if (std::optional<StackSlotKey> slot =
@@ -1540,7 +1509,6 @@ private:
         } else {
           state.ValueOrigins.erase(load);
         }
-        state.CallProducedValues.erase(load);
       }
       return;
     }
@@ -1613,24 +1581,12 @@ private:
           Cell before = cellIn(state, partialRead->Global);
           if (before.MayEntry && !before.MayNonEntry) {
             state.ValueOrigins[&inst] = ValueOrigin{partialRead->Global, 0};
-            state.CallProducedValues.erase(&inst);
           } else {
             readRegister(state, partialRead->Global);
             state.ValueOrigins.erase(&inst);
-            RegisterOriginBits origins = originIn(state, partialRead->Global);
-            llvm::APInt mask =
-                registerRangeMask(partialRead->Global, partialRead->BitOffset,
-                                  partialRead->ReadWidth);
-            if (mask.getBitWidth() != 0 &&
-                (origins.CallProduced & mask) == mask) {
-              state.CallProducedValues.insert(&inst);
-            } else {
-              state.CallProducedValues.erase(&inst);
-            }
           }
         } else {
           state.ValueOrigins.erase(&inst);
-          state.CallProducedValues.erase(&inst);
         }
         return;
       }
@@ -1655,7 +1611,6 @@ private:
           }
         }
         state.ValueOrigins.erase(&inst);
-        state.CallProducedValues.erase(&inst);
         return;
       }
     }
@@ -1722,45 +1677,11 @@ private:
     return std::nullopt;
   }
 
-  bool valueDependsOnCallProduced(llvm::Value *value, const State &state,
-                                  std::set<llvm::Value *> &visiting) const {
-    value = value->stripPointerCasts();
-    if (state.CallProducedValues.count(value) != 0) {
-      return true;
-    }
-    if (llvm::isa<llvm::Constant>(value) || !visiting.insert(value).second) {
-      return false;
-    }
-    auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
-    if (inst == nullptr || llvm::isa<llvm::CallBase>(inst) ||
-        llvm::isa<llvm::LoadInst>(inst)) {
-      visiting.erase(value);
-      return false;
-    }
-    for (llvm::Value *operand : inst->operands()) {
-      if (valueDependsOnCallProduced(operand, state, visiting)) {
-        visiting.erase(value);
-        return true;
-      }
-    }
-    visiting.erase(value);
-    return false;
-  }
-
-  bool valueDependsOnCallProduced(llvm::Value *value,
-                                  const State &state) const {
-    std::set<llvm::Value *> visiting;
-    return valueDependsOnCallProduced(value, state, visiting);
-  }
-
   RegisterOriginKind
   registerOriginKindForStoredValue(llvm::Value *value,
                                    const State &state) const {
     if (entryValueOrigin(value, state)) {
       return RegisterOriginKind::Entry;
-    }
-    if (valueDependsOnCallProduced(value, state)) {
-      return RegisterOriginKind::CallProduced;
     }
     return RegisterOriginKind::Local;
   }
@@ -1934,7 +1855,7 @@ private:
           (callee.MayEntry && pre.MayNonEntry) || callee.MayNonEntry;
       state.Cells[global] = post;
       if (!callee.MayEntry && callee.MayNonEntry) {
-        setFullRegisterOrigin(state, global, RegisterOriginKind::CallProduced);
+        setFullRegisterOrigin(state, global, RegisterOriginKind::CallClobber);
       } else if (callee.MayEntry && callee.MayNonEntry) {
         setFullRegisterOrigin(state, global, RegisterOriginKind::Mixed);
       }
@@ -1978,7 +1899,7 @@ private:
       }
       writeRegister(state, global);
       setRegisterOrigin(state, global, clobberMask,
-                        RegisterOriginKind::CallProduced);
+                        RegisterOriginKind::CallClobber);
     }
   }
 

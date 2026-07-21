@@ -4076,7 +4076,7 @@ bool testUnknownExternalArityStopsAtPhiClobberArg() {
                   "module failed verifier after phi clobber arity test");
 }
 
-bool testUnknownExternalArityStopsAtBinaryClobberArg() {
+bool testUnknownExternalArityCountsExplicitBinaryArg() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-unknown-external-binary-clobber-arity",
                       context);
@@ -4148,8 +4148,8 @@ bool testUnknownExternalArityStopsAtBinaryClobberArg() {
 
   return expect(rewritten != nullptr,
                 "unknown external binary clobber arity callee missing") &&
-         expect(rewritten->arg_size() == 2,
-                "unknown external arity counted binary clobber as argument") &&
+         expect(rewritten->arg_size() == 3,
+                "unknown external arity missed explicit binary argument") &&
          expect(hasInferredArityWarning,
                 "unknown external binary clobber arity warning missing") &&
          verifyOk(module,
@@ -7815,7 +7815,7 @@ int main() {
   ok &= testExternalPrototypeJsonOverridesInferredArity();
   ok &= testUnknownExternalArityStopsAtClobberArg();
   ok &= testUnknownExternalArityStopsAtPhiClobberArg();
-  ok &= testUnknownExternalArityStopsAtBinaryClobberArg();
+  ok &= testUnknownExternalArityCountsExplicitBinaryArg();
   ok &= testRecordedCallArgValueSurvivesDeadStoreCleanup();
   ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
   ok &= testInternalSignatureParamsUseAbiOrder();
