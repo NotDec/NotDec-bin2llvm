@@ -2847,24 +2847,50 @@ private:
                              const gtirb::Module &module,
                              uint64_t &edgeCount) {
     const gtirb::CFG &cfg = module.getIR()->getCFG();
+    std::map<uint64_t, const gtirb::CodeBlock *> codeBlocksByAddress;
+    for (const gtirb::CodeBlock &block : module.code_blocks()) {
+      if (block.getAddress()) {
+        codeBlocksByAddress.emplace(static_cast<uint64_t>(*block.getAddress()),
+                                    &block);
+      }
+    }
+
     for (const auto &[entry, function] : state.functions()) {
       (void)entry;
+      std::set<uint64_t> blockStarts;
       for (const NativeBasicBlock &block : function.Blocks) {
-        const gtirb::CodeBlock *gtirbBlock = nullptr;
-        for (const gtirb::CodeBlock &candidate : module.code_blocks()) {
-          if (candidate.getAddress() &&
-              static_cast<uint64_t>(*candidate.getAddress()) == block.Start) {
-            gtirbBlock = &candidate;
-            break;
+        blockStarts.insert(block.Start);
+      }
+      auto functionContains = [&](uint64_t address) {
+        for (const NativeBasicBlock &block : function.Blocks) {
+          if (block.Start <= address && address < block.End) {
+            return true;
           }
         }
-        if (gtirbBlock == nullptr) {
-          continue;
-        }
-
+        return false;
+      };
+      auto addFlowXref = [&](uint64_t source, uint64_t target) {
+        NativeXref xref;
+        xref.From = source;
+        xref.To = target;
+        xref.Kind = NativeXrefKind::Flow;
+        xref.Source = "gtirb-ddisasm-flow";
+        state.addXref(std::move(xref));
+      };
+      auto addCallXref = [&](uint64_t source, uint64_t target) {
+        NativeXref xref;
+        xref.From = source;
+        xref.To = target;
+        xref.Kind = NativeXrefKind::Call;
+        xref.Source = "gtirb-ddisasm-call";
+        state.addXref(std::move(xref));
+      };
+      auto importBlockEdges = [&](uint64_t source,
+                                  const gtirb::CodeBlock &gtirbBlock,
+                                  bool attachSuccessors) {
         std::vector<uint64_t> successors;
         for (auto [successorNode, label] :
-             gtirb::cfgSuccessors(cfg, gtirbBlock)) {
+             gtirb::cfgSuccessors(cfg, &gtirbBlock)) {
           if (!label || !gtirb::CodeBlock::classof(successorNode)) {
             continue;
           }
@@ -2879,34 +2905,39 @@ private:
           uint64_t target = static_cast<uint64_t>(*successor->getAddress());
           if (type == gtirb::EdgeType::Branch ||
               type == gtirb::EdgeType::Fallthrough) {
-            bool localTarget = false;
-            for (const NativeBasicBlock &candidate : function.Blocks) {
-              if (candidate.Start == target) {
-                localTarget = true;
-                break;
-              }
-            }
-            if (localTarget) {
+            bool localTarget = blockStarts.count(target) != 0;
+            if (attachSuccessors && localTarget) {
               successors.push_back(target);
             } else {
-              NativeXref xref;
-              xref.From = block.Start;
-              xref.To = target;
-              xref.Kind = NativeXrefKind::Flow;
-              xref.Source = "gtirb-ddisasm-flow";
-              state.addXref(std::move(xref));
+              addFlowXref(source, target);
             }
             ++edgeCount;
           } else if (type == gtirb::EdgeType::Call) {
-            NativeXref xref;
-            xref.From = block.Start;
-            xref.To = target;
-            xref.Kind = NativeXrefKind::Call;
-            xref.Source = "gtirb-ddisasm-call";
-            state.addXref(std::move(xref));
+            addCallXref(source, target);
           }
         }
-        state.addBasicBlockSuccessors(function.Entry, block.Start, successors);
+        if (attachSuccessors) {
+          state.addBasicBlockSuccessors(function.Entry, source, successors);
+        }
+      };
+
+      for (const NativeBasicBlock &block : function.Blocks) {
+        auto gtirbBlock = codeBlocksByAddress.find(block.Start);
+        if (gtirbBlock == codeBlocksByAddress.end()) {
+          continue;
+        }
+        importBlockEdges(block.Start, *gtirbBlock->second,
+                         /*attachSuccessors=*/true);
+      }
+
+      // GTIRB CFG can contain code-block boundaries that FunctionBlocks did not
+      // list for this function.  Keep those edges as flow xrefs so the normalizer
+      // can split the containing NativeBasicBlock before lowering.
+      for (const auto &[address, gtirbBlock] : codeBlocksByAddress) {
+        if (blockStarts.count(address) != 0 || !functionContains(address)) {
+          continue;
+        }
+        importBlockEdges(address, *gtirbBlock, /*attachSuccessors=*/false);
       }
     }
   }
@@ -4485,10 +4516,8 @@ public:
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
     if (state.hasGtirbControlFlowAuthority()) {
       foldEhFrameOnlyBranchTargets(state);
-      for (const auto &[entry, function] : state.functions()) {
-        (void)function;
-        state.removeInvalidBasicBlockSuccessors(entry);
-      }
+      splitGtirbFlowXrefBlocks(state);
+      restoreIntraFunctionFlowXrefSuccessors(state);
       recoverExternalFunctionPointerFlows(state);
       return;
     }
@@ -4868,6 +4897,42 @@ private:
       }
       state.addBasicBlockSuccessors(sourceOwner->Entry, sourceBlock->Start,
                                     {xref.To});
+    }
+  }
+
+  static void splitGtirbFlowXrefBlocks(NativeProgramState &state) {
+    std::vector<std::pair<uint64_t, uint64_t>> splits;
+    auto addSplit = [&](uint64_t entry, uint64_t address) {
+      if (address == 0) {
+        return;
+      }
+      auto item = std::make_pair(entry, address);
+      if (std::find(splits.begin(), splits.end(), item) == splits.end()) {
+        splits.push_back(item);
+      }
+    };
+
+    for (const NativeXref &xref : state.xrefs()) {
+      if (xref.Kind != NativeXrefKind::Flow ||
+          xref.Source != "gtirb-ddisasm-flow") {
+        continue;
+      }
+      const NativeFunction *sourceOwner = state.functionContaining(xref.From);
+      const NativeFunction *targetOwner = state.functionContaining(xref.To);
+      if (sourceOwner == nullptr || targetOwner == nullptr ||
+          sourceOwner->Entry != targetOwner->Entry) {
+        continue;
+      }
+      if (!functionHasBlockStartingAt(*sourceOwner, xref.From)) {
+        addSplit(sourceOwner->Entry, xref.From);
+      }
+      if (!functionHasBlockStartingAt(*sourceOwner, xref.To)) {
+        addSplit(sourceOwner->Entry, xref.To);
+      }
+    }
+
+    for (const auto &[entry, address] : splits) {
+      ensureFunctionBlockStartsAt(state, entry, address);
     }
   }
 

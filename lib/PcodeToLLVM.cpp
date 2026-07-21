@@ -523,6 +523,15 @@ private:
   void addNativeBlockStart(std::set<size_t> &starts, size_t start,
                            uint64_t blockAddress, uint64_t blockEnd,
                            bool internalPcodeBlock = false) {
+    // A p-code branch can target the start of its own machine block, for
+    // example a tight loop ending in `jae block_start`.  That is still a real
+    // native block, not an instruction-internal p-code split.  Keep the first
+    // native mapping so conditional lowering will consult native CFG facts for
+    // the false edge.
+    if (internalPcodeBlock && starts.count(start) != 0 &&
+        NativeInternalPcodeStarts.count(start) == 0) {
+      return;
+    }
     starts.insert(start);
     NativeBlockAddressForStart[start] =
         internalPcodeBlock ? (*CurrentProgramOps)[start].Address : blockAddress;
@@ -821,13 +830,15 @@ private:
                                    llvm::BasicBlock *&result,
                                    std::string &errorMessage) {
     result = nullptr;
-    if (isInternalPcodeBlock(blockIndex)) {
+    if (isInternalPcodeBlock(blockIndex) && fallback != nullptr) {
       result = fallback;
       return true;
     }
     uint64_t blockAddress = blockAddressForIndex(blockIndex);
-    auto successorIt = Config.BlockSuccessors.find(blockAddress);
-    if (successorIt == Config.BlockSuccessors.end()) {
+    uint64_t factBlockAddress = blockAddress;
+    const std::vector<uint64_t> *successors =
+        nativeSuccessorsForBlockIndex(blockIndex, factBlockAddress);
+    if (successors == nullptr) {
       if (usesNativeCfg()) {
         std::ostringstream os;
         os << "native conditional block 0x" << std::hex << blockAddress
@@ -844,14 +855,14 @@ private:
     // p-code block is the fallthrough for sparse or out-of-order ranges.
     bool sawTrueTarget = !nativeRangesCoverAddress(trueTarget);
     std::optional<uint64_t> falseTarget;
-    for (uint64_t successor : successorIt->second) {
+    for (uint64_t successor : *successors) {
       if (successor == trueTarget) {
         sawTrueTarget = true;
         continue;
       }
       if (falseTarget) {
         std::ostringstream os;
-        os << "native conditional block 0x" << std::hex << blockAddress
+        os << "native conditional block 0x" << std::hex << factBlockAddress
            << " has multiple false successors";
         errorMessage = os.str();
         return false;
@@ -861,7 +872,7 @@ private:
 
     if (!sawTrueTarget) {
       std::ostringstream os;
-      os << "native conditional block 0x" << std::hex << blockAddress
+      os << "native conditional block 0x" << std::hex << factBlockAddress
          << " is missing true successor 0x" << trueTarget;
       errorMessage = os.str();
       return false;

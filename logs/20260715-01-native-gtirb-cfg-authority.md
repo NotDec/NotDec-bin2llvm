@@ -117,3 +117,81 @@ external/NotDec-bin2llvm/build/bin/notdec-native-llvm \
   fortune 完整 lifting 和 `llvm-as` 通过。
 - 复杂度：4/10。主要是把 CFG 来源分流，并给 p-code 内部块 lowering 加父块 successor 回退。
 - 维护成本：4/10。后续如果恢复 internal/seed-linear，需要重新补一条独立路径；GTIRB 主路径更简单。
+
+## 2026-07-21 追加：GTIRB flow target 落在块中间时补 split
+
+### 背景
+
+fortune 里 `0x2e50`、`0x2ea0`、`0x3884`、`0x43d0` 这些条件跳转的 false edge
+在 GTIRB/ddisasm facts 里存在，但 lowering 时有的函数被报错跳过。原因有两类：
+
+- GTIRB CFG 里有些 flow source/target 是 CodeBlock 边界，但没有进入 FunctionBlocks；
+  normalizer 之前不会按这些 flow xref 拆开当前 `NativeBasicBlock`。
+- SLEIGH 为 CMOV 生成的内部 `CBRANCH` 会把同一个机器块拆成 p-code internal block；
+  后续真实条件跳转在 internal block 里时，false edge 仍应读取父机器块的 GTIRB successor。
+
+### 实现
+
+- `lib/NativeAnalysis.cpp:2846` 的 `GtirbFunctionFactsAnalyzer::importCfgEdges()`：
+  建立地址到 GTIRB CodeBlock 的索引。FunctionBlocks 内的块仍直接导入 successor；
+  函数范围内但没有列入 FunctionBlocks 的 CodeBlock flow edge 记录成 `gtirb-ddisasm-flow`
+  xref，留给 normalizer 拆块。
+- `lib/NativeAnalysis.cpp:4516` 的 `FlowFactNormalizer::run()`：
+  GTIRB authority 路径不再调用 `removeInvalidBasicBlockSuccessors()` 删除中间目标，
+  改为先 `splitGtirbFlowXrefBlocks()`，再 `restoreIntraFunctionFlowXrefSuccessors()`。
+- `lib/NativeAnalysis.cpp:4903` 新增 `splitGtirbFlowXrefBlocks()`：
+  对同函数内的 `gtirb-ddisasm-flow` source/target 调 `ensureFunctionBlockStartsAt()`，
+  让落在块中间的 flow 边先形成真实 native block。
+- `lib/PcodeToLLVM.cpp:523` 的 `addNativeBlockStart()`：
+  p-code 内部跳转如果目标正好是已有机器块起点，不再把这个起点覆盖成 internal p-code block。
+- `lib/PcodeToLLVM.cpp:828` 的 `nativeConditionalFalseBlock()`：
+  internal p-code block 如果没有内部 continuation，就通过 `nativeSuccessorsForBlockIndex()`
+  读取父机器块 successor，修复 CMOV 后真实条件跳转找不到 false edge 的问题。
+
+### 验证
+
+构建：
+
+```bash
+cmake --build external/NotDec-bin2llvm/build --target notdec-native-llvm notdec-native-discover -j4
+```
+
+结果：通过。
+
+相关测试：
+
+```bash
+ctest --test-dir external/NotDec-bin2llvm/build \
+  -R 'native_analysis|pcode_to_llvm|native_register_summary_ssa' \
+  --output-on-failure
+```
+
+结果：`notdec.pcode_to_llvm.cfg`、`notdec.native_analysis.facts` 通过。
+
+fortune native：
+
+```bash
+OUT=/tmp/notdec-bin2llvm-fortune-gtirb-split-fixed-20260721-071222
+external/NotDec-bin2llvm/build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/games/fortune \
+  -o "$OUT/fortune.native.ll" \
+  --all-confirmed --skip-runtime \
+  --external-prototypes /sn640/NotDec-Exp/Bench2/bin2llvm-external-prototypes/fortune-executable.external-prototypes.json \
+  --summary-json-out "$OUT/summary.json" \
+  --register-ssa-warning-out "$OUT/register-ssa-warnings.tsv"
+llvm-22.1.0.obj/bin/llvm-as "$OUT/fortune.native.ll" -o "$OUT/fortune.native.bc"
+llvm-22.1.0.obj/bin/opt -passes=verify "$OUT/fortune.native.bc" -o "$OUT/fortune.verified.bc"
+```
+
+结果：
+
+- `stderr.log` 为空，不再出现 `missing false successor`。
+- `llvm-as` 和 verifier 通过。
+- IR 中 `bb_2e50`、`bb_2ea0`、`bb_43d0` 的循环/落出边正常；
+  `bb_3884` 为 `br i1 %48, label %bb_38cd, label %bb_3889`。
+
+### 评估
+
+- 实现效果：8/10。fortune 暴露的缺 false edge 已修复，且没有回退到 SLEIGH 自建 native CFG。
+- 复杂度：5/10。NativeAnalysis 多了一步 GTIRB flow xref split；Pcode lowering 只补 parent successor 查询。
+- 维护成本：4/10。逻辑仍围绕 GTIRB facts，不引入新的 CFG 猜测路径。
