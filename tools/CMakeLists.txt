@@ -168,5 +168,22 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
         SKIP_RETURN_CODE 77
         TIMEOUT 300
     )
+
+    add_test(
+      NAME notdec.native_llvm.realworld_fortune_i386
+      COMMAND
+        ${PROJECT_SOURCE_DIR}/scripts/native-fortune-i386-regression.sh
+        $<TARGET_FILE:notdec-native-llvm>
+        ${NOTDEC_LLVM_INSTALL_DIR}/bin
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_BINARY_DIR}
+    )
+    set_tests_properties(
+      notdec.native_llvm.realworld_fortune_i386
+      PROPERTIES
+        LABELS "native;realworld;i386"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
   endif ()
 endif ()

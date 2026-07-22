@@ -32,6 +32,18 @@ class DebFixture:
 
 
 FIXTURES: dict[str, DebFixture] = {
+    "fortune-i386": DebFixture(
+        urls=(
+            "https://archive.ubuntu.com/ubuntu/pool/universe/f/fortune-mod/"
+            "fortune-mod_1.99.1-7build1_i386.deb",
+            "https://snapshot.ubuntu.com/ubuntu/pool/universe/f/fortune-mod/"
+            "fortune-mod_1.99.1-7build1_i386.deb",
+        ),
+        deb_name="fortune-mod_1.99.1-7build1_i386.deb",
+        deb_sha256="557db8839509d0080be8b8256900addde642199df541776a859ac0d0a7ee5f6d",
+        member_path="usr/games/fortune",
+        binary_sha256="403bd9e1fbcb64f3d7554a473db17acdcad6d4ac488cc71b3c8a82f14ea37006",
+    ),
     "fortune-x86_64": DebFixture(
         urls=(
             "https://archive.ubuntu.com/ubuntu/pool/universe/f/fortune-mod/"

@@ -1,0 +1,6 @@
+{
+  "recode_new_request": {
+    "params": ["ptr"],
+    "return": "ptr"
+  }
+}
