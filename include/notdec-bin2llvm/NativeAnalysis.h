@@ -23,6 +23,11 @@ enum class NativeFunctionConfidence {
 
 std::string toString(NativeFunctionConfidence confidence);
 
+bool isSupportedNativeElfArchitecture(const LIEF::ELF::Binary &binary);
+std::string nativeElfArchitectureName(const LIEF::ELF::Binary &binary);
+std::string unsupportedNativeElfArchitectureMessage(
+    const LIEF::ELF::Binary &binary, const std::string &component);
+
 struct NativeMemoryRange {
   uint64_t Start = 0;
   uint64_t Size = 0;

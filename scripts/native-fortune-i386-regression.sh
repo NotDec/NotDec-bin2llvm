@@ -21,7 +21,7 @@ OUT_DIR="${NOTDEC_NATIVE_FORTUNE_I386_OUT_DIR:-$BUILD_DIR/native-fortune-i386-re
 PROTO_JSON="$SOURCE_DIR/tests/fixtures/native/fortune-i386.external-prototypes.json"
 FETCH_FIXTURE="$SOURCE_DIR/scripts/fetch-native-fixture.py"
 RESIDUE_AUDIT="$SOURCE_DIR/scripts/native-register-residue-audit.py"
-KNOWN_UNSUPPORTED="automatic sleigh spec selection only supports x86-64 ELF"
+KNOWN_UNSUPPORTED="native LLVM lowering currently supports x86-64 ELF only"
 
 require_executable() {
   if [[ ! -x "$1" ]]; then

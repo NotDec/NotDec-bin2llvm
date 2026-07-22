@@ -1403,6 +1403,12 @@ int main(int argc, char **argv) {
       std::cerr << "failed to parse ELF: " << options->ElfPath << '\n';
       return 1;
     }
+    if (!notdec::bin2llvm::isSupportedNativeElfArchitecture(*binary)) {
+      std::cerr << notdec::bin2llvm::unsupportedNativeElfArchitectureMessage(
+                       *binary, "native discovery")
+                << '\n';
+      return 1;
+    }
 
     notdec::bin2llvm::NativeProgramState state(*binary);
     options->GtirbOptions.ElfPath = options->ElfPath;

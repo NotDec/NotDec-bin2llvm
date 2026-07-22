@@ -332,27 +332,28 @@ std::filesystem::path defaultX86SpecRoot() {
          "Ghidra/Processors/x86/data/languages";
 }
 
-std::filesystem::path defaultX86CspecPath() {
+std::filesystem::path defaultX86_64CspecPath() {
   return defaultX86SpecRoot() / "x86-64-gcc.cspec";
 }
 
-std::filesystem::path resolveX86CspecPath(
+std::filesystem::path resolveX86_64CspecPath(
     const notdec::bin2llvm::SleighSpecOptions &options) {
   if (options.RootSlaDir) {
     return std::filesystem::path(*options.RootSlaDir) / "x86-64-gcc.cspec";
   }
-  return defaultX86CspecPath();
+  return defaultX86_64CspecPath();
 }
 
 bool resolveSpecOptions(const LIEF::ELF::Binary &binary,
                         notdec::bin2llvm::SleighSpecOptions &options) {
+  if (!notdec::bin2llvm::isSupportedNativeElfArchitecture(binary)) {
+    std::cerr << notdec::bin2llvm::unsupportedNativeElfArchitectureMessage(
+                     binary, "native LLVM lowering")
+              << '\n';
+    return false;
+  }
   if (!options.SlaFileName.empty()) {
     return true;
-  }
-
-  if (binary.header().machine_type() != LIEF::ELF::ARCH::X86_64) {
-    std::cerr << "automatic sleigh spec selection only supports x86-64 ELF\n";
-    return false;
   }
 
   std::filesystem::path specRoot = defaultX86SpecRoot();
@@ -834,7 +835,7 @@ void attachMemoryMapMetadata(
 bool attachDefaultAbiMetadata(
     llvm::Module &module,
     const notdec::bin2llvm::SleighSpecOptions &specOptions) {
-  std::filesystem::path cspecPath = resolveX86CspecPath(specOptions);
+  std::filesystem::path cspecPath = resolveX86_64CspecPath(specOptions);
   std::string errorMessage;
   std::optional<notdec::bin2llvm::NativeAbiSpec> abi =
       notdec::bin2llvm::parseGhidraCspecDefaultAbi(cspecPath.string(),

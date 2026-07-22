@@ -5,6 +5,7 @@
 
 #include <LIEF/ELF/Binary.hpp>
 #include <LIEF/ELF/DynamicEntry.hpp>
+#include <LIEF/ELF/EnumToString.hpp>
 #include <LIEF/ELF/Relocation.hpp>
 #include <LIEF/ELF/Section.hpp>
 #include <LIEF/ELF/Segment.hpp>
@@ -385,8 +386,9 @@ public:
   int priority() const override { return 20; }
 
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
-    if (state.binary().header().machine_type() != LIEF::ELF::ARCH::X86_64) {
-      state.addNote("relocation analysis currently supports x86-64 ELF only");
+    if (!isSupportedNativeElfArchitecture(state.binary())) {
+      state.addNote(unsupportedNativeElfArchitectureMessage(
+          state.binary(), "relocation/PLT analysis"));
       return;
     }
 
@@ -2348,6 +2350,9 @@ matchX86PicI32OffsetDispatch(const NativeProgramState &state,
 
 bool isExternalFunctionPointerRelocationAt(const NativeProgramState &state,
                                            uint64_t address) {
+  if (!isSupportedNativeElfArchitecture(state.binary())) {
+    return false;
+  }
   for (const NativeRelocationInfo &relocation : state.relocations()) {
     if (relocation.Address != address || relocation.Status != "external" ||
         relocation.SymbolName.empty()) {
@@ -3211,8 +3216,9 @@ private:
 
   bool resolveSpecOptions(NativeProgramState &state) {
     const LIEF::ELF::Binary &binary = state.binary();
-    if (binary.header().machine_type() != LIEF::ELF::ARCH::X86_64) {
-      state.addNote("sleigh instruction decode supports x86-64 ELF only");
+    if (!isSupportedNativeElfArchitecture(binary)) {
+      state.addNote(unsupportedNativeElfArchitectureMessage(
+          binary, "SLEIGH instruction decode"));
       return false;
     }
 
@@ -5266,6 +5272,24 @@ std::string toString(NativeInstructionFlowKind kind) {
     return "return";
   }
   return "unknown";
+}
+
+bool isSupportedNativeElfArchitecture(const LIEF::ELF::Binary &binary) {
+  return binary.header().machine_type() == LIEF::ELF::ARCH::X86_64;
+}
+
+std::string nativeElfArchitectureName(const LIEF::ELF::Binary &binary) {
+  const char *name = LIEF::ELF::to_string(binary.header().machine_type());
+  if (name != nullptr) {
+    return name;
+  }
+  return "unknown";
+}
+
+std::string unsupportedNativeElfArchitectureMessage(
+    const LIEF::ELF::Binary &binary, const std::string &component) {
+  return component + " currently supports x86-64 ELF only; got " +
+         nativeElfArchitectureName(binary);
 }
 
 NativeProgramState::NativeProgramState(const LIEF::ELF::Binary &binary)
