@@ -66,6 +66,8 @@ struct NativeRegisterSummarySSAWarning {
   std::string FunctionName;
   std::string CalleeName;
   std::string RegisterName;
+  uint64_t RangeBitOffset = 0;
+  uint64_t RangeBitWidth = 0;
   std::string Kind;
   std::string Reason;
   uint64_t Uses = 0;

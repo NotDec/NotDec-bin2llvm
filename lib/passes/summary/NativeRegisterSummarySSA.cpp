@@ -1828,6 +1828,21 @@ callRegisterWarning(const llvm::CallBase &call, llvm::StringRef registerName,
   return warning;
 }
 
+std::string registerNameForRange(const RegisterRangeKey &range) {
+  return range.Global == nullptr ? std::string("")
+                                 : range.Global->getName().str();
+}
+
+NativeRegisterSummarySSAWarning
+callRangeWarning(const llvm::CallBase &call, const RegisterRangeKey &range,
+                 llvm::StringRef kind, llvm::StringRef reason) {
+  NativeRegisterSummarySSAWarning warning =
+      callRegisterWarning(call, registerNameForRange(range), kind, reason);
+  warning.RangeBitOffset = range.BitOffset;
+  warning.RangeBitWidth = range.BitWidth;
+  return warning;
+}
+
 NativeRegisterSummarySSAWarning
 returnSlotWarning(const llvm::Function &function, const NativeSignatureSlot &slot,
                   llvm::StringRef reason) {
@@ -6728,16 +6743,14 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
           llvm::StringRef reason = value == nullptr
                                       ? "range_return_helper_rewrite_missing_value"
                                       : "range_return_helper_rewrite_type_mismatch";
-          std::string regName = rangeHelper.Range.Global == nullptr
-                                    ? std::string("")
-                                    : rangeHelper.Range.Global->getName().str();
           state.Warnings.push_back(
-              callRegisterWarning(*oldCall, regName, "return", reason));
+              callRangeWarning(*newCall, rangeHelper.Range, "return", reason));
+          std::string regName = registerNameForRange(rangeHelper.Range);
           value = unknownValueAt(builder, helper->getType(),
                                  "range_return_unknown");
           attachUnknownValueMetadata(value, reason,
                                      oldCall->getFunction()->getName(),
-                                     calleeNameForWarning(*oldCall), regName,
+                                     calleeNameForWarning(*newCall), regName,
                                      "return");
         }
         valueMap[helper] = value;
@@ -6792,6 +6805,15 @@ std::string metadataField(const llvm::MDNode &node, llvm::StringRef key) {
     }
   }
   return "";
+}
+
+uint64_t metadataUInt64Field(const llvm::MDNode &node, llvm::StringRef key) {
+  std::string valueText = metadataField(node, key);
+  uint64_t value = 0;
+  if (!valueText.empty()) {
+    (void)llvm::StringRef(valueText).getAsInteger(10, value);
+  }
+  return value;
 }
 
 std::string warningReasonForHelper(const llvm::CallInst &helper,
@@ -6855,6 +6877,10 @@ collectRemainingCallValueWarnings(const llvm::Module &module) {
       warning.CalleeName =
           callee == nullptr ? "<indirect>" : callee->getName().str();
       warning.RegisterName = regName;
+      if (metadata != nullptr) {
+        warning.RangeBitOffset = metadataUInt64Field(*metadata, "bit_offset");
+        warning.RangeBitWidth = metadataUInt64Field(*metadata, "bit_width");
+      }
       warning.Kind = kind;
       warning.Reason = warningReasonForHelper(*helper, kind, regName, callee);
       warning.Uses = helper->getNumUses();
@@ -7082,7 +7108,12 @@ void printNativeRegisterSummarySSASummary(
        << " function=" << warning.FunctionName
        << " callee=" << warning.CalleeName
        << " register=" << warning.RegisterName << " kind=" << warning.Kind
-       << " reason=" << warning.Reason << " uses=" << warning.Uses << "\n";
+       << " reason=" << warning.Reason << " uses=" << warning.Uses;
+    if (warning.RangeBitWidth != 0) {
+      os << " range_offset=" << warning.RangeBitOffset
+         << " range_width=" << warning.RangeBitWidth;
+    }
+    os << "\n";
   }
   for (const NativeRegisterSummarySSAFunctionSummary &function :
        summary.Functions) {

@@ -566,14 +566,16 @@ bool writeRegisterSSAWarnings(
     return false;
   }
 
-  output << "function\tcallee\tregister\tkind\treason\tuses\n";
+  output << "function\tcallee\tregister\tkind\treason\tuses"
+         << "\trange_offset\trange_width\n";
   for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
        summary.Warnings) {
     output << tsvEscape(warning.FunctionName) << '\t'
            << tsvEscape(warning.CalleeName) << '\t'
            << tsvEscape(warning.RegisterName) << '\t'
            << tsvEscape(warning.Kind) << '\t'
-           << tsvEscape(warning.Reason) << '\t' << warning.Uses << '\n';
+           << tsvEscape(warning.Reason) << '\t' << warning.Uses << '\t'
+           << warning.RangeBitOffset << '\t' << warning.RangeBitWidth << '\n';
   }
   return true;
 }
