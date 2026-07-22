@@ -151,5 +151,22 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
         ${PROJECT_BINARY_DIR}
         ${NOTDEC_LLVM_INSTALL_DIR}/bin
     )
+
+    add_test(
+      NAME notdec.native_llvm.realworld_fortune_x86_64
+      COMMAND
+        ${PROJECT_SOURCE_DIR}/scripts/native-fortune-x86_64-regression.sh
+        $<TARGET_FILE:notdec-native-llvm>
+        ${NOTDEC_LLVM_INSTALL_DIR}/bin
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_BINARY_DIR}
+    )
+    set_tests_properties(
+      notdec.native_llvm.realworld_fortune_x86_64
+      PROPERTIES
+        LABELS "native;realworld"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
   endif ()
 endif ()
