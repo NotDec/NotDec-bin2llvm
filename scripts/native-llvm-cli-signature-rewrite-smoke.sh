@@ -18,20 +18,20 @@ BUILD_DIR="$3"
 LLVM_BIN="$4"
 
 OUT_LL="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite.ll"
-SUMMARY_TXT="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-summary.txt"
+OUT_STDERR="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite.stderr"
 OUT_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite.bc"
 VERIFY_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite.opt.bc"
 RERUN_LL="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-rerun.ll"
-RERUN_SUMMARY_TXT="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-rerun-summary.txt"
+RERUN_STDERR="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-rerun.stderr"
 RERUN_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-rerun.bc"
 RERUN_VERIFY_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-rerun.opt.bc"
 FIXTURE_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-input.bc"
 OUT_LL_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc.ll"
-SUMMARY_TXT_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-summary.txt"
+OUT_STDERR_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc.stderr"
 OUT_BC_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc.bc"
 VERIFY_BC_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc.opt.bc"
 RERUN_LL_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-rerun.ll"
-RERUN_SUMMARY_TXT_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-rerun-summary.txt"
+RERUN_STDERR_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-rerun.stderr"
 RERUN_BC_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-rerun.bc"
 RERUN_VERIFY_BC_FROM_BC="$BUILD_DIR/notdec-native-llvm-cli-signature-rewrite-from-bc-rerun.opt.bc"
 
@@ -67,95 +67,71 @@ require_not_contains() {
   fi
 }
 
+require_empty() {
+  local file="$1"
+  if [[ -s "$file" ]]; then
+    echo "expected empty file: $file" >&2
+    sed -n '1,80p' "$file" >&2
+    exit 1
+  fi
+}
+
 require_executable "$NATIVE_LLVM"
 require_executable "$LLVM_BIN/llvm-as"
 require_executable "$LLVM_BIN/opt"
 require_file "$FIXTURE_LL"
 mkdir -p "$BUILD_DIR"
 
-run_signature_rewrite_check() {
+run_default_summary_rewrite_check() {
   local input_ir="$1"
   local out_ll="$2"
-  local summary_txt="$3"
+  local stderr_txt="$3"
   local out_bc="$4"
   local verify_bc="$5"
 
   "$NATIVE_LLVM" "$input_ir" \
     --no-instcombine-pass \
-    --no-register-ssa-pass \
-    --prototype-recovery-summary \
     --rewrite-prototype-signatures \
     -o "$out_ll" \
-    2> "$summary_txt"
+    2> "$stderr_txt"
 
-  require_contains "define void @cli_input_rdi(i64 %" "$out_ll"
   require_contains "define void @cli_empty_recovered()" "$out_ll"
+  require_contains "define void @cli_input_rdi(i64 %" "$out_ll"
   require_contains "define i64 @cli_return_rax()" "$out_ll"
   require_contains "define i64 @cli_input_rdi_return_rax(i64 %" "$out_ll"
   require_contains "define i64 @cli_input_rdi_rsi_return_rax(i64 %" "$out_ll"
   require_contains ", i64 %" "$out_ll"
-  require_contains "define { i64, i64 } @cli_return_rax_rdx()" "$out_ll"
-  require_contains "define { i64, i64 } @cli_input_rdi_return_rax_rdx(i64 %" "$out_ll"
-  require_contains "define { i64, i64 } @cli_input_rdi_rsi_return_rax_rdx(i64 %" "$out_ll"
-  require_contains "notdec.prototype.recovered" "$out_ll"
-  require_contains "input_count=0" "$out_ll"
-  require_contains "return_count=0" "$out_ll"
-  require_contains "input_count=2" "$out_ll"
-  require_contains "return_count=2" "$out_ll"
+  require_contains "define i64 @cli_return_rax_rdx()" "$out_ll"
+  require_contains "define i64 @cli_input_rdi_return_rax_rdx(i64 %" "$out_ll"
+  require_contains "define i64 @cli_input_rdi_rsi_return_rax_rdx(i64 %" "$out_ll"
 
+  require_not_contains "@RDI =" "$out_ll"
+  require_not_contains "@RSI =" "$out_ll"
+  require_not_contains "@RAX =" "$out_ll"
+  require_not_contains "@RDX =" "$out_ll"
+  require_not_contains "ptr @RDI" "$out_ll"
+  require_not_contains "ptr @RSI" "$out_ll"
   require_not_contains "ptr @RAX" "$out_ll"
   require_not_contains "ptr @RDX" "$out_ll"
   require_not_contains "notdec.register.access" "$out_ll"
-  require_not_contains "notdec.register.external_inputs" "$out_ll"
-  require_not_contains "notdec.prototype.input_candidates" "$out_ll"
-  require_not_contains "notdec.prototype.return_candidates" "$out_ll"
-
-  require_contains "signature rewrite seen functions: 8" "$summary_txt"
-  require_contains "signature rewrite rewritten functions: 7" "$summary_txt"
-  require_contains "signature rewrite skipped functions: 1" "$summary_txt"
-  require_contains "signature rewrite skipped reason already matches: 1" \
-    "$summary_txt"
+  require_not_contains "notdec.register.summary_return" "$out_ll"
+  require_not_contains "notdec.register.summary_clobber" "$out_ll"
+  require_not_contains "notdec.unknown" "$out_ll"
+  require_not_contains "notdec.prototype.recovered" "$out_ll"
+  require_empty "$stderr_txt"
 
   "$LLVM_BIN/llvm-as" "$out_ll" -o "$out_bc"
   "$LLVM_BIN/opt" -passes=verify "$out_bc" -o "$verify_bc"
 }
 
-run_rerun_check() {
-  local input_ir="$1"
-  local out_ll="$2"
-  local summary_txt="$3"
-  local out_bc="$4"
-  local verify_bc="$5"
-
-  "$NATIVE_LLVM" "$input_ir" \
-    --no-instcombine-pass \
-    --no-register-ssa-pass \
-    --prototype-recovery-summary \
-    --rewrite-prototype-signatures \
-    -o "$out_ll" \
-    2> "$summary_txt"
-
-  require_contains "notdec.prototype.recovered" "$out_ll"
-  require_contains "signature rewrite seen functions: 8" "$summary_txt"
-  require_contains "signature rewrite rewritten functions: 0" "$summary_txt"
-  require_contains "signature rewrite skipped functions: 8" "$summary_txt"
-  require_contains "signature rewrite skipped reason already matches: 8" \
-    "$summary_txt"
-  require_not_contains "signature rewrite skipped reason missing recovered prototype" \
-    "$summary_txt"
-
-  "$LLVM_BIN/llvm-as" "$out_ll" -o "$out_bc"
-  "$LLVM_BIN/opt" -passes=verify "$out_bc" -o "$verify_bc"
-}
-
-run_signature_rewrite_check "$FIXTURE_LL" "$OUT_LL" "$SUMMARY_TXT" \
+run_default_summary_rewrite_check "$FIXTURE_LL" "$OUT_LL" "$OUT_STDERR" \
   "$OUT_BC" "$VERIFY_BC"
-run_rerun_check "$OUT_LL" "$RERUN_LL" "$RERUN_SUMMARY_TXT" \
+run_default_summary_rewrite_check "$OUT_LL" "$RERUN_LL" "$RERUN_STDERR" \
   "$RERUN_BC" "$RERUN_VERIFY_BC"
 
 "$LLVM_BIN/llvm-as" "$FIXTURE_LL" -o "$FIXTURE_BC"
-run_signature_rewrite_check "$FIXTURE_BC" "$OUT_LL_FROM_BC" \
-  "$SUMMARY_TXT_FROM_BC" "$OUT_BC_FROM_BC" "$VERIFY_BC_FROM_BC"
-run_rerun_check "$OUT_LL_FROM_BC" "$RERUN_LL_FROM_BC" \
-  "$RERUN_SUMMARY_TXT_FROM_BC" "$RERUN_BC_FROM_BC" \
+run_default_summary_rewrite_check "$FIXTURE_BC" "$OUT_LL_FROM_BC" \
+  "$OUT_STDERR_FROM_BC" "$OUT_BC_FROM_BC" "$VERIFY_BC_FROM_BC"
+run_default_summary_rewrite_check "$OUT_LL_FROM_BC" "$RERUN_LL_FROM_BC" \
+  "$RERUN_STDERR_FROM_BC" "$RERUN_BC_FROM_BC" \
   "$RERUN_VERIFY_BC_FROM_BC"
