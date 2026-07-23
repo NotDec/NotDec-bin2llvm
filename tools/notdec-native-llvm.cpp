@@ -788,7 +788,8 @@ NativeCallTargets planNativeCallTargets(
     if (relocation.SymbolName.empty() || relocation.Status != "external") {
       continue;
     }
-    if (relocation.TypeName != "X86_64_GLOB_DAT") {
+    if (relocation.TypeName != "X86_64_GLOB_DAT" &&
+        relocation.TypeName != "X86_GLOB_DAT") {
       continue;
     }
     targets.IndirectExternal.emplace(relocation.Address,

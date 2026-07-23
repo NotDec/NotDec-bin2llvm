@@ -80,6 +80,82 @@ std::string relocationPurposeName(const LIEF::ELF::Relocation &relocation) {
   return "unknown";
 }
 
+bool supportsRelocationPltAnalysis(LIEF::ELF::ARCH arch) {
+  return arch == LIEF::ELF::ARCH::X86_64 || arch == LIEF::ELF::ARCH::I386;
+}
+
+bool isRelativeRelocation(LIEF::ELF::ARCH arch,
+                          LIEF::ELF::Relocation::TYPE type) {
+  if (arch == LIEF::ELF::ARCH::X86_64) {
+    return type == LIEF::ELF::Relocation::TYPE::X86_64_RELATIVE ||
+           type == LIEF::ELF::Relocation::TYPE::X86_64_RELATIVE64;
+  }
+  if (arch == LIEF::ELF::ARCH::I386) {
+    return type == LIEF::ELF::Relocation::TYPE::X86_RELATIVE;
+  }
+  return false;
+}
+
+bool isGlobDatRelocation(LIEF::ELF::ARCH arch,
+                         LIEF::ELF::Relocation::TYPE type) {
+  if (arch == LIEF::ELF::ARCH::X86_64) {
+    return type == LIEF::ELF::Relocation::TYPE::X86_64_GLOB_DAT;
+  }
+  if (arch == LIEF::ELF::ARCH::I386) {
+    return type == LIEF::ELF::Relocation::TYPE::X86_GLOB_DAT;
+  }
+  return false;
+}
+
+bool isJumpSlotRelocation(LIEF::ELF::ARCH arch,
+                          LIEF::ELF::Relocation::TYPE type) {
+  if (arch == LIEF::ELF::ARCH::X86_64) {
+    return type == LIEF::ELF::Relocation::TYPE::X86_64_JUMP_SLOT;
+  }
+  if (arch == LIEF::ELF::ARCH::I386) {
+    return type == LIEF::ELF::Relocation::TYPE::X86_JUMP_SLOT;
+  }
+  return false;
+}
+
+bool isAbsoluteExternalFunctionPointerRelocation(
+    LIEF::ELF::ARCH arch, LIEF::ELF::Relocation::TYPE type) {
+  if (arch == LIEF::ELF::ARCH::X86_64) {
+    return type == LIEF::ELF::Relocation::TYPE::X86_64_64;
+  }
+  if (arch == LIEF::ELF::ARCH::I386) {
+    return type == LIEF::ELF::Relocation::TYPE::X86_32;
+  }
+  return false;
+}
+
+bool isIRelativeRelocation(LIEF::ELF::ARCH arch,
+                           LIEF::ELF::Relocation::TYPE type) {
+  if (arch == LIEF::ELF::ARCH::X86_64) {
+    return type == LIEF::ELF::Relocation::TYPE::X86_64_IRELATIVE;
+  }
+  if (arch == LIEF::ELF::ARCH::I386) {
+    return type == LIEF::ELF::Relocation::TYPE::X86_IRELATIVE;
+  }
+  return false;
+}
+
+std::optional<int64_t>
+relocationAddendForPointerValue(const NativeProgramState &state,
+                                const LIEF::ELF::Relocation &relocation) {
+  if (state.binary().header().machine_type() != LIEF::ELF::ARCH::I386) {
+    return relocation.addend();
+  }
+
+  // i386 uses REL relocations: the addend is stored in the relocated word.
+  std::optional<uint64_t> rawAddend =
+      state.readRawPointer(relocation.address());
+  if (!rawAddend) {
+    return std::nullopt;
+  }
+  return static_cast<int64_t>(*rawAddend);
+}
+
 std::optional<NativeSectionInfo> findSection(const NativeProgramState &state,
                                              const std::string &name) {
   for (const NativeSectionInfo &section : state.sections()) {
@@ -386,9 +462,10 @@ public:
   int priority() const override { return 20; }
 
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
-    if (state.binary().header().machine_type() != LIEF::ELF::ARCH::X86_64) {
-      state.addNote("relocation/PLT analysis currently supports x86-64 ELF "
-                    "only; got " +
+    LIEF::ELF::ARCH arch = state.binary().header().machine_type();
+    if (!supportsRelocationPltAnalysis(arch)) {
+      state.addNote("relocation/PLT analysis currently supports x86-64 and "
+                    "i386 ELF only; got " +
                     nativeElfArchitectureName(state.binary()));
       return;
     }
@@ -411,14 +488,20 @@ public:
         symbolIsFunction = symbol->type() == LIEF::ELF::Symbol::TYPE::FUNC;
       }
 
-      switch (relocation.type()) {
-      case LIEF::ELF::Relocation::TYPE::X86_64_RELATIVE:
-      case LIEF::ELF::Relocation::TYPE::X86_64_RELATIVE64:
-        info.ComputedValue = static_cast<uint64_t>(relocation.addend());
-        info.Status = "applied";
-        state.addRelocatedPointer(info.Address, *info.ComputedValue);
-        break;
-      case LIEF::ELF::Relocation::TYPE::X86_64_GLOB_DAT:
+      if (isRelativeRelocation(arch, relocation.type())) {
+        std::optional<int64_t> addend =
+            relocationAddendForPointerValue(state, relocation);
+        if (addend) {
+          info.Addend = *addend;
+          info.ComputedValue = static_cast<uint64_t>(*addend);
+          info.Status = "applied";
+          state.addRelocatedPointer(info.Address, *info.ComputedValue);
+        } else {
+          info.Status = "unsupported";
+          state.addNote("could not read implicit relocation addend at " +
+                        hexAddress(info.Address));
+        }
+      } else if (isGlobDatRelocation(arch, relocation.type())) {
         if (info.SymbolValue != 0) {
           info.ComputedValue =
               info.SymbolValue + static_cast<uint64_t>(relocation.addend());
@@ -430,32 +513,39 @@ public:
         if (symbolIsFunction && !info.SymbolName.empty()) {
           globDatFunctions.push_back(info);
         }
-        break;
-      case LIEF::ELF::Relocation::TYPE::X86_64_JUMP_SLOT:
+      } else if (isJumpSlotRelocation(arch, relocation.type())) {
         info.Status = "external";
         jumpSlots.push_back(info);
-        break;
-      case LIEF::ELF::Relocation::TYPE::X86_64_64:
+      } else if (isAbsoluteExternalFunctionPointerRelocation(
+                     arch, relocation.type())) {
         if (symbolIsFunction && info.SymbolValue == 0 &&
             !info.SymbolName.empty()) {
           info.Status = "external";
         } else {
           info.Status = "unsupported";
         }
-        break;
-      case LIEF::ELF::Relocation::TYPE::X86_64_IRELATIVE:
-        info.ComputedValue = static_cast<uint64_t>(relocation.addend());
-        info.Status = "resolver";
-        break;
-      default:
+      } else if (isIRelativeRelocation(arch, relocation.type())) {
+        std::optional<int64_t> addend =
+            relocationAddendForPointerValue(state, relocation);
+        if (addend) {
+          info.Addend = *addend;
+          info.ComputedValue = static_cast<uint64_t>(*addend);
+          info.Status = "resolver";
+        } else {
+          info.Status = "unsupported";
+          state.addNote("could not read implicit resolver addend at " +
+                        hexAddress(info.Address));
+        }
+      } else {
         info.Status = "unsupported";
-        break;
       }
 
       state.addRelocation(std::move(info));
     }
 
-    addPltGotEntries(state, std::move(globDatFunctions));
+    if (arch == LIEF::ELF::ARCH::X86_64) {
+      addPltGotEntries(state, std::move(globDatFunctions));
+    }
     addPltEntries(state, jumpSlots);
     addRelocationPointerXrefs(state);
   }
@@ -2351,7 +2441,8 @@ matchX86PicI32OffsetDispatch(const NativeProgramState &state,
 
 bool isExternalFunctionPointerRelocationAt(const NativeProgramState &state,
                                            uint64_t address) {
-  if (state.binary().header().machine_type() != LIEF::ELF::ARCH::X86_64) {
+  LIEF::ELF::ARCH arch = state.binary().header().machine_type();
+  if (!supportsRelocationPltAnalysis(arch)) {
     return false;
   }
   for (const NativeRelocationInfo &relocation : state.relocations()) {
@@ -2359,8 +2450,10 @@ bool isExternalFunctionPointerRelocationAt(const NativeProgramState &state,
         relocation.SymbolName.empty()) {
       continue;
     }
-    return relocation.TypeName == "X86_64_GLOB_DAT" ||
-           relocation.TypeName == "X86_64_64";
+    LIEF::ELF::Relocation::TYPE type =
+        static_cast<LIEF::ELF::Relocation::TYPE>(relocation.Type);
+    return isGlobDatRelocation(arch, type) ||
+           isAbsoluteExternalFunctionPointerRelocation(arch, type);
   }
   return false;
 }
