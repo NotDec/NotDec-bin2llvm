@@ -132,6 +132,19 @@ std::optional<int64_t> signedConstantValue(llvm::Value *value) {
   return constant->getSExtValue();
 }
 
+bool isStackAlignmentMask(llvm::Value *value) {
+  auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value);
+  if (constant == nullptr || constant->getBitWidth() > 64) {
+    return false;
+  }
+  int64_t mask = constant->getSExtValue();
+  if (mask >= -1) {
+    return false;
+  }
+  uint64_t alignment = static_cast<uint64_t>(-mask);
+  return llvm::isPowerOf2_64(alignment);
+}
+
 std::optional<int64_t> stackOffsetFromBase(llvm::Value *value,
                                            llvm::Value *base,
                                            std::set<llvm::Value *> &seen) {
@@ -163,6 +176,18 @@ std::optional<int64_t> stackOffsetFromBase(llvm::Value *value,
     if (auto lhs = stackOffsetFromBase(op->getOperand(0), base, seen)) {
       if (auto rhs = signedConstantValue(op->getOperand(1))) {
         return *lhs - *rhs;
+      }
+    }
+  }
+  if (op->getOpcode() == llvm::Instruction::And) {
+    if (auto lhs = stackOffsetFromBase(op->getOperand(0), base, seen)) {
+      if (*lhs == 0 && isStackAlignmentMask(op->getOperand(1))) {
+        return 0;
+      }
+    }
+    if (auto rhs = stackOffsetFromBase(op->getOperand(1), base, seen)) {
+      if (*rhs == 0 && isStackAlignmentMask(op->getOperand(0))) {
+        return 0;
       }
     }
   }

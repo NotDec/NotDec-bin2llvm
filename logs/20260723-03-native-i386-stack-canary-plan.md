@@ -77,3 +77,25 @@ i386 fortune 已经能走 GTIRB native 链路，并且 PLT/GOT 现在能解析�
 - 实现效果：7/10。消除了 i386 CALL/RET 自身隐式 return-address 栈动作，未直接解决 caller 参数和普通栈帧残留。
 - 复杂度：3/10。复用原 x64 结构，只把寄存器名和宽度参数化。
 - 维护成本：3/10。后续 x86-family 行为集中在一个 spec 中，比复制一套 i386 逻辑更容易维护。
+
+## 阶段二实现记录：i386 stack frame rewrite 基础增强
+
+已完成并单独提交。
+
+- `lib/passes/summary/NativeStackFrame.cpp:132-144`：新增 `isStackAlignmentMask()`，识别 `-power_of_two` 形式的栈对齐 mask。
+- `lib/passes/summary/NativeStackFrame.cpp:179-191`：`stackOffsetFromBase()` 支持 `and stack_base, -alignment`，把它作为本地 aligned stack base 继续追踪负偏移。
+- 该规则仍只让负偏移进入 `notdec_stack.native`，不会把 `ESP+4` / `ESP+8` 这类 caller 参数槽纳入本地栈帧。
+
+验证：
+
+- `cmake --build external/NotDec-bin2llvm/build --target notdec-native-llvm -j4`：通过。
+- `ctest --test-dir external/NotDec-bin2llvm/build -R notdec.native_llvm.realworld_fortune_i386 --output-on-failure`：通过。
+- `ctest --test-dir external/NotDec-bin2llvm/build -R 'notdec.native_(discover.x86_64_smoke|llvm.x86_64_smoke|llvm.realworld_fortune_x86_64)' --output-on-failure`：通过。
+- i386 fortune 的 `stack_frame_accesses_rewritten` 从 693 增加到 704；`notdec_native_14d0` 这类 `and ESP, -16` 的 aligned frame 已生成 `notdec_stack.native`。
+- residue 仍为 `ESP` 27 条、`GS_OFFSET` 7 条；剩余 `ESP` 多为正偏移 caller/返回槽，不属于本阶段要处理的本地负偏移栈帧。
+
+评分：
+
+- 实现效果：6/10。补上 aligned stack base 的本地栈帧重写，残留数量暂未下降。
+- 复杂度：2/10。只扩展已有 offset 追踪，不改 pipeline。
+- 维护成本：2/10。规则窄，只匹配常见对齐 mask。
