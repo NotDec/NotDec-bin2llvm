@@ -386,9 +386,10 @@ public:
   int priority() const override { return 20; }
 
   void run(NativeProgramState &state, NativeAnalysisManager &) override {
-    if (!isSupportedNativeElfArchitecture(state.binary())) {
-      state.addNote(unsupportedNativeElfArchitectureMessage(
-          state.binary(), "relocation/PLT analysis"));
+    if (state.binary().header().machine_type() != LIEF::ELF::ARCH::X86_64) {
+      state.addNote("relocation/PLT analysis currently supports x86-64 ELF "
+                    "only; got " +
+                    nativeElfArchitectureName(state.binary()));
       return;
     }
 
@@ -2350,7 +2351,7 @@ matchX86PicI32OffsetDispatch(const NativeProgramState &state,
 
 bool isExternalFunctionPointerRelocationAt(const NativeProgramState &state,
                                            uint64_t address) {
-  if (!isSupportedNativeElfArchitecture(state.binary())) {
+  if (state.binary().header().machine_type() != LIEF::ELF::ARCH::X86_64) {
     return false;
   }
   for (const NativeRelocationInfo &relocation : state.relocations()) {
@@ -3216,7 +3217,9 @@ private:
 
   bool resolveSpecOptions(NativeProgramState &state) {
     const LIEF::ELF::Binary &binary = state.binary();
-    if (!isSupportedNativeElfArchitecture(binary)) {
+    std::optional<NativeElfArchitectureSpec> archSpec =
+        nativeElfArchitectureSpec(binary);
+    if (!archSpec) {
       state.addNote(unsupportedNativeElfArchitectureMessage(
           binary, "SLEIGH instruction decode"));
       return false;
@@ -3225,8 +3228,8 @@ private:
     std::filesystem::path specRoot =
         std::filesystem::path(NOTDEC_BIN2LLVM_DEFAULT_GHIDRA_SOURCE_DIR) /
         "Ghidra/Processors/x86/data/languages";
-    std::filesystem::path slaPath = specRoot / "x86-64.sla";
-    std::filesystem::path pspecPath = specRoot / "x86-64.pspec";
+    std::filesystem::path slaPath = specRoot / archSpec->SlaFileName;
+    std::filesystem::path pspecPath = specRoot / archSpec->PspecFileName;
     if (!std::filesystem::exists(slaPath)) {
       state.addNote("sleigh instruction decode missing spec: " +
                     slaPath.string());
@@ -5274,8 +5277,22 @@ std::string toString(NativeInstructionFlowKind kind) {
   return "unknown";
 }
 
+std::optional<NativeElfArchitectureSpec>
+nativeElfArchitectureSpec(const LIEF::ELF::Binary &binary) {
+  switch (binary.header().machine_type()) {
+  case LIEF::ELF::ARCH::X86_64:
+    return NativeElfArchitectureSpec{"x86-64.sla", "x86-64.pspec",
+                                     "x86-64-gcc.cspec"};
+  case LIEF::ELF::ARCH::I386:
+    return NativeElfArchitectureSpec{"x86.sla", "x86.pspec",
+                                     "x86gcc.cspec"};
+  default:
+    return std::nullopt;
+  }
+}
+
 bool isSupportedNativeElfArchitecture(const LIEF::ELF::Binary &binary) {
-  return binary.header().machine_type() == LIEF::ELF::ARCH::X86_64;
+  return nativeElfArchitectureSpec(binary).has_value();
 }
 
 std::string nativeElfArchitectureName(const LIEF::ELF::Binary &binary) {
@@ -5288,7 +5305,7 @@ std::string nativeElfArchitectureName(const LIEF::ELF::Binary &binary) {
 
 std::string unsupportedNativeElfArchitectureMessage(
     const LIEF::ELF::Binary &binary, const std::string &component) {
-  return component + " currently supports x86-64 ELF only; got " +
+  return component + " currently supports x86-64 and i386 ELF only; got " +
          nativeElfArchitectureName(binary);
 }
 

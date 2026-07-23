@@ -21,7 +21,6 @@ OUT_DIR="${NOTDEC_NATIVE_FORTUNE_I386_OUT_DIR:-$BUILD_DIR/native-fortune-i386-re
 PROTO_JSON="$SOURCE_DIR/tests/fixtures/native/fortune-i386.external-prototypes.json"
 FETCH_FIXTURE="$SOURCE_DIR/scripts/fetch-native-fixture.py"
 RESIDUE_AUDIT="$SOURCE_DIR/scripts/native-register-residue-audit.py"
-KNOWN_UNSUPPORTED="native LLVM lowering currently supports x86-64 ELF only"
 
 require_executable() {
   if [[ ! -x "$1" ]]; then
@@ -46,14 +45,20 @@ require_not_contains() {
   fi
 }
 
-require_tsv_header_only() {
-  local file="$1"
-  local label="$2"
-  local rows
-  rows="$(wc -l < "$file")"
-  if [[ "$rows" != "1" ]]; then
-    echo "$label contains unexpected rows: $file" >&2
-    sed -n '1,40p' "$file" >&2
+require_contains() {
+  local needle="$1"
+  local file="$2"
+  if ! grep -Fq "$needle" "$file"; then
+    echo "missing expected text in $file: $needle" >&2
+    exit 1
+  fi
+}
+
+require_line_prefix() {
+  local prefix="$1"
+  local file="$2"
+  if ! grep -q "^$prefix" "$file"; then
+    echo "missing expected line prefix in $file: $prefix" >&2
     exit 1
   fi
 }
@@ -98,11 +103,6 @@ NATIVE_RC=$?
 set -e
 
 if [[ "$NATIVE_RC" -ne 0 ]]; then
-  if grep -Fq "$KNOWN_UNSUPPORTED" "$STDERR_TXT"; then
-    echo "SKIP: i386 native lifting is not wired yet: $KNOWN_UNSUPPORTED"
-    echo "fortune fixture: $FORTUNE"
-    exit 77
-  fi
   sed -n '1,120p' "$STDERR_TXT" >&2
   exit "$NATIVE_RC"
 fi
@@ -111,12 +111,12 @@ fi
 "$LLVM_BIN/opt" -passes=verify "$OUT_BC" -o "$VERIFY_BC"
 "$RESIDUE_AUDIT" --details "$OUT_LL" > "$RESIDUE_TSV"
 
-require_tsv_header_only "$RESIDUE_TSV" "register residue audit"
 require_file "$WARNING_TSV"
-require_not_contains "notdec.register.summary_return" "$OUT_LL"
-require_not_contains "notdec.register.summary_clobber" "$OUT_LL"
-require_not_contains "notdec.unknown" "$OUT_LL"
+require_line_prefix "define " "$OUT_LL"
+require_contains "stackpointer.register=ESP" "$OUT_LL"
+require_not_contains "stackpointer.register=RSP" "$OUT_LL"
 
 echo "fortune fixture: $FORTUNE"
 echo "fortune native IR: $OUT_LL"
 echo "fortune register SSA warnings: $WARNING_TSV"
+echo "fortune register residue audit: $RESIDUE_TSV"

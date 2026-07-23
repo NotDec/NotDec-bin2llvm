@@ -332,33 +332,35 @@ std::filesystem::path defaultX86SpecRoot() {
          "Ghidra/Processors/x86/data/languages";
 }
 
-std::filesystem::path defaultX86_64CspecPath() {
-  return defaultX86SpecRoot() / "x86-64-gcc.cspec";
-}
-
-std::filesystem::path resolveX86_64CspecPath(
-    const notdec::bin2llvm::SleighSpecOptions &options) {
+std::filesystem::path resolveCspecPath(
+    const notdec::bin2llvm::SleighSpecOptions &options,
+    const notdec::bin2llvm::NativeElfArchitectureSpec &archSpec) {
   if (options.RootSlaDir) {
-    return std::filesystem::path(*options.RootSlaDir) / "x86-64-gcc.cspec";
+    return std::filesystem::path(*options.RootSlaDir) / archSpec.CspecFileName;
   }
-  return defaultX86_64CspecPath();
+  return defaultX86SpecRoot() / archSpec.CspecFileName;
 }
 
 bool resolveSpecOptions(const LIEF::ELF::Binary &binary,
                         notdec::bin2llvm::SleighSpecOptions &options) {
-  if (!notdec::bin2llvm::isSupportedNativeElfArchitecture(binary)) {
+  std::optional<notdec::bin2llvm::NativeElfArchitectureSpec> archSpec =
+      notdec::bin2llvm::nativeElfArchitectureSpec(binary);
+  if (!archSpec) {
     std::cerr << notdec::bin2llvm::unsupportedNativeElfArchitectureMessage(
                      binary, "native LLVM lowering")
               << '\n';
     return false;
   }
+  std::filesystem::path specRoot = defaultX86SpecRoot();
+  std::filesystem::path pspecPath = specRoot / archSpec->PspecFileName;
   if (!options.SlaFileName.empty()) {
+    if (!options.PspecFileName && std::filesystem::exists(pspecPath)) {
+      options.PspecFileName = pspecPath.string();
+    }
     return true;
   }
 
-  std::filesystem::path specRoot = defaultX86SpecRoot();
-  std::filesystem::path slaPath = specRoot / "x86-64.sla";
-  std::filesystem::path pspecPath = specRoot / "x86-64.pspec";
+  std::filesystem::path slaPath = specRoot / archSpec->SlaFileName;
   if (!std::filesystem::exists(slaPath)) {
     std::cerr << "could not find auto-selected sla file: "
               << slaPath.string() << '\n';
@@ -834,8 +836,9 @@ void attachMemoryMapMetadata(
 
 bool attachDefaultAbiMetadata(
     llvm::Module &module,
-    const notdec::bin2llvm::SleighSpecOptions &specOptions) {
-  std::filesystem::path cspecPath = resolveX86_64CspecPath(specOptions);
+    const notdec::bin2llvm::SleighSpecOptions &specOptions,
+    const notdec::bin2llvm::NativeElfArchitectureSpec &archSpec) {
+  std::filesystem::path cspecPath = resolveCspecPath(specOptions, archSpec);
   std::string errorMessage;
   std::optional<notdec::bin2llvm::NativeAbiSpec> abi =
       notdec::bin2llvm::parseGhidraCspecDefaultAbi(cspecPath.string(),
@@ -855,7 +858,11 @@ bool ensureDefaultAbiMetadata(
   if (notdec::bin2llvm::readNativeAbiMetadata(module)) {
     return true;
   }
-  return attachDefaultAbiMetadata(module, specOptions);
+  return attachDefaultAbiMetadata(
+      module, specOptions,
+      notdec::bin2llvm::NativeElfArchitectureSpec{"x86-64.sla",
+                                                  "x86-64.pspec",
+                                                  "x86-64-gcc.cspec"});
 }
 
 std::unique_ptr<llvm::Module> buildConfirmedModule(
@@ -1072,8 +1079,20 @@ bool runPrototypeRecoveryPassIfEnabled(llvm::Module &module,
   return true;
 }
 
+bool hasExternallyVisibleFunctionDefinition(const llvm::Module &module) {
+  for (const llvm::Function &function : module) {
+    if (!function.isDeclaration() && !function.hasLocalLinkage()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool runFinalCleanupPass(llvm::Module &module) {
   notdec::bin2llvm::NativeRegisterFinalCleanupOptions passOptions;
+  // If entry-point recovery has not found a public root yet, GlobalDCE would
+  // delete every internal native function and hide the actual frontend state.
+  passOptions.RunGlobalDCE = hasExternallyVisibleFunctionDefinition(module);
   notdec::bin2llvm::runNativeRegisterFinalCleanup(module, passOptions);
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after final cleanup pass\n";
@@ -1146,6 +1165,14 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (!resolveSpecOptions(*binary, options->SpecOptions)) {
+      return 1;
+    }
+    std::optional<notdec::bin2llvm::NativeElfArchitectureSpec> archSpec =
+        notdec::bin2llvm::nativeElfArchitectureSpec(*binary);
+    if (!archSpec) {
+      std::cerr << notdec::bin2llvm::unsupportedNativeElfArchitectureMessage(
+                       *binary, "native LLVM lowering")
+                << '\n';
       return 1;
     }
     std::unique_ptr<notdec::bin2llvm::NativeProgramState> selectedState;
@@ -1245,7 +1272,7 @@ int main(int argc, char **argv) {
       notdec::bin2llvm::NativeProgramState memoryState(*binary);
       attachMemoryMapMetadata(*module, memoryState);
     }
-    if (!attachDefaultAbiMetadata(*module, options->SpecOptions)) {
+    if (!attachDefaultAbiMetadata(*module, options->SpecOptions, *archSpec)) {
       return 1;
     }
 

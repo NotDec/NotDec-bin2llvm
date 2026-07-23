@@ -23,6 +23,17 @@ enum class NativeFunctionConfidence {
 
 std::string toString(NativeFunctionConfidence confidence);
 
+// The native frontend needs the Ghidra language, processor, and compiler spec
+// files to agree with the ELF machine type.  Keep the filenames together so
+// SLEIGH decode and ABI metadata cannot silently choose different arches.
+struct NativeElfArchitectureSpec {
+  std::string SlaFileName;
+  std::string PspecFileName;
+  std::string CspecFileName;
+};
+
+std::optional<NativeElfArchitectureSpec>
+nativeElfArchitectureSpec(const LIEF::ELF::Binary &binary);
 bool isSupportedNativeElfArchitecture(const LIEF::ELF::Binary &binary);
 std::string nativeElfArchitectureName(const LIEF::ELF::Binary &binary);
 std::string unsupportedNativeElfArchitectureMessage(
