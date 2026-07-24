@@ -17,6 +17,9 @@ struct NativeExternalPrototype {
   enum class ValueType {
     I32,
     I64,
+    // Width comes from the LLVM module DataLayout.  This covers pointer
+    // returns/arguments and C ABI long/size_t on ILP32 vs LP64 targets.
+    PointerSized,
     Float,
     Double,
   };

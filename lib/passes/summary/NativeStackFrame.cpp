@@ -213,9 +213,10 @@ llvm::Value *createStackFramePointer(llvm::IRBuilder<> &builder,
                                      llvm::AllocaInst &storage,
                                      int64_t frameLow, int64_t offset,
                                      llvm::StringRef name) {
+  llvm::Type *indexType =
+      storage.getModule()->getDataLayout().getIndexType(storage.getType());
   llvm::Value *byteOffset = llvm::ConstantInt::get(
-      llvm::Type::getInt64Ty(storage.getContext()),
-      static_cast<uint64_t>(offset - frameLow));
+      indexType, static_cast<uint64_t>(offset - frameLow));
   return builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(storage.getContext()),
                                    &storage, byteOffset, name);
 }

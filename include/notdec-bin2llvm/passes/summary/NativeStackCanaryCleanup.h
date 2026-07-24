@@ -14,9 +14,9 @@ struct NativeStackCanaryCleanupOptions {
 };
 
 // Summary-chain stack canary cleanup.  This pass only removes compiler-inserted
-// stack-protector epilogues that compare a saved stack slot with FS:0x28 and
-// branch to __stack_chk_fail on mismatch.  It does not model general TLS or
-// segment-base semantics.
+// stack-protector epilogues that compare a saved stack slot with a known TLS
+// canary slot and branch to __stack_chk_fail on mismatch.  It does not model
+// general TLS or segment-base semantics.
 struct NativeStackCanaryCleanupSummary {
   uint64_t FunctionsSeen = 0;
   uint64_t CanaryChecksRemoved = 0;

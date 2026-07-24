@@ -5,6 +5,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -89,6 +90,43 @@ std::string valueName(const VarnodeView &varnode) {
 
 unsigned bitWidth(uint32_t byteSize) {
   return byteSize == 0 ? 1 : byteSize * 8;
+}
+
+std::optional<uint32_t>
+inferPointerByteSizeFromRegisters(const std::vector<RegisterInfo> &registers) {
+  bool hasRsp = false;
+  bool hasRip = false;
+  bool hasEsp = false;
+  bool hasEip = false;
+  for (const RegisterInfo &reg : registers) {
+    hasRsp |= reg.Name == "RSP" && reg.Size == 8;
+    hasRip |= reg.Name == "RIP" && reg.Size == 8;
+    hasEsp |= reg.Name == "ESP" && reg.Size == 4;
+    hasEip |= reg.Name == "EIP" && reg.Size == 4;
+  }
+  if (hasRsp && hasRip) {
+    return 8;
+  }
+  if (hasEsp && hasEip) {
+    return 4;
+  }
+  return std::nullopt;
+}
+
+void setModuleDataLayoutFromPointerSize(llvm::Module &module,
+                                        uint32_t pointerByteSize,
+                                        bool isBigEndian) {
+  if (!module.getDataLayout().isDefault()) {
+    return;
+  }
+  if (pointerByteSize != 4 && pointerByteSize != 8) {
+    return;
+  }
+  std::string layout = isBigEndian ? "E" : "e";
+  uint32_t pointerBits = pointerByteSize * 8;
+  layout += "-p:" + std::to_string(pointerBits) + ":" +
+            std::to_string(pointerBits);
+  module.setDataLayout(layout);
 }
 
 class PcodeLowerer {
@@ -1322,7 +1360,7 @@ private:
           return lowerUnknownVoidIndirectTailJump(op.Inputs[0]);
         }
         if (!successors.empty()) {
-          llvm::Value *target = resize(read(op.Inputs[0]), 8);
+          llvm::Value *target = resize(read(op.Inputs[0]), pointerByteSize());
           auto *switchInst =
               Builder.CreateSwitch(target,
                                    nativeIndirectSwitchDefaultBlock(
@@ -1401,6 +1439,10 @@ private:
     return Builder.CreateTrunc(value, targetType);
   }
 
+  uint32_t pointerByteSize() const {
+    return static_cast<uint32_t>(Module.getDataLayout().getPointerSize());
+  }
+
   llvm::Value *read(const VarnodeView &varnode) {
     llvm::Type *type = intType(varnode.Size);
     if (varnode.Space == "const") {
@@ -1414,7 +1456,8 @@ private:
     }
 
     if (varnode.Space == "ram") {
-      auto *address = llvm::ConstantInt::get(intType(8), varnode.Offset);
+      auto *address =
+          llvm::ConstantInt::get(intType(pointerByteSize()), varnode.Offset);
       auto *load = Builder.CreateLoad(type, memoryPointer(address),
                                       valueName(varnode) + "_in");
       load->setAlignment(llvm::Align(1));
@@ -2046,6 +2089,7 @@ private:
   }
 
   llvm::Value *memoryPointer(llvm::Value *address) {
+    address = resize(address, pointerByteSize());
     if (Config.MemoryModel == PcodeMemoryModel::IntToPtr) {
       return Builder.CreateIntToPtr(address, llvm::PointerType::get(Context, 0),
                                     "notdec_ram_ptr");
@@ -2072,7 +2116,7 @@ private:
       return false;
     }
 
-    llvm::Value *address = resize(read(op.Inputs[1]), 8);
+    llvm::Value *address = resize(read(op.Inputs[1]), pointerByteSize());
     auto *load =
         Builder.CreateLoad(intType(op.Output->Size), memoryPointer(address),
                            valueName(*op.Output));
@@ -2087,7 +2131,7 @@ private:
       return false;
     }
 
-    llvm::Value *address = resize(read(op.Inputs[1]), 8);
+    llvm::Value *address = resize(read(op.Inputs[1]), pointerByteSize());
     llvm::Value *value = read(op.Inputs[2]);
     auto *store = Builder.CreateStore(value, memoryPointer(address));
     store->setAlignment(llvm::Align(1));
@@ -2137,7 +2181,7 @@ private:
     auto *calleeType =
         llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
     auto *calleePointer =
-        Builder.CreateIntToPtr(resize(read(target), 8),
+        Builder.CreateIntToPtr(resize(read(target), pointerByteSize()),
                                llvm::PointerType::getUnqual(Context));
     return Builder.CreateCall(calleeType, calleePointer, {});
   }
@@ -2413,6 +2457,12 @@ bool appendPcodeFunction(llvm::LLVMContext &context, llvm::Module &module,
                          const PcodeProgram &program,
                          const PcodeLoweringConfig &config,
                          std::string &errorMessage) {
+  if (auto pointerByteSize =
+          inferPointerByteSizeFromRegisters(program.Registers)) {
+    setModuleDataLayoutFromPointerSize(module, *pointerByteSize,
+                                       program.IsBigEndian);
+  }
+
   auto *functionType =
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), false);
   llvm::Function *function = module.getFunction(config.EntryFunctionName);

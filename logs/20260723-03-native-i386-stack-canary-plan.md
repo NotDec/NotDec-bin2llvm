@@ -99,3 +99,39 @@ i386 fortune 已经能走 GTIRB native 链路，并且 PLT/GOT 现在能解析�
 - 实现效果：6/10。补上 aligned stack base 的本地栈帧重写，残留数量暂未下降。
 - 复杂度：2/10。只扩展已有 offset 追踪，不改 pipeline。
 - 维护成本：2/10。规则窄，只匹配常见对齐 mask。
+
+## 阶段三实现记录：i386 GS canary 与指针宽度修正
+
+已完成。
+
+### canary 清理
+
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:31-42`：把 TLS canary 位置改成 `TlsCanarySpec`，保留 x86-64 `FS_OFFSET+40`，新增 i386 `GS_OFFSET+20`。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:155-205`、`207-270`：新增对 TLS base 和 `base + const` 地址链的识别，支持 `zext/add/sub` 这类 cleanup 后更绕的表达式。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:1132-1225`：删除逻辑仍从 `__stack_chk_fail` fail block 反向看前驱边，只删除已确认的 canary compare 边。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:1228-1267`：shared fail block 逐个 predecessor 处理，避免一个 fail sink 里混入非 canary 边时误删。
+
+### pointer width 修正
+
+- `lib/PcodeToLLVM.cpp:96-130`、`1442-1444`、`2091-2100`、`2180-2186`、`2460-2464`：根据寄存器集合推断 32/64 位 DataLayout，内存地址、间接调用目标统一按 `module.getDataLayout().getPointerSize()` 调整。
+- `lib/HeritageToLLVM.cpp:116-160`、`205-218`、`720-726`、`1737-1742`、`2188-2191`、`2445-2496`：Heritage lowering 同步设置 DataLayout，`long/ulong/T*` 和地址 lowering 不再固定 64 位。
+- `lib/passes/summary/NativeStackFrame.cpp:212-221`：`notdec_stack.native` GEP index 改用 DataLayout 的 index type。
+- `include/notdec-bin2llvm/NativeExternalPrototype.h:17-23`、`lib/NativeExternalPrototype.cpp:18-30`、`187-198`：新增 `PointerSized` prototype 类型，`ptr/pointer/size_t/ssize_t/long/ulong` 走 DataLayout；`__errno_location` 和 `__ctype_*_loc` 默认返回 pointer-sized。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1038-1048`、`1397-1428`、`1480-1503`：known external 的 typed 参数/返回类型从 module DataLayout 取 pointer 宽度。
+- `tests/native_register_summary_ssa_test.cpp:127-147`、`2175-2220`、`7867-7869`：新增 i386 DataLayout 下 `__errno_location` 返回 i32 的回归测试。
+
+### 验证
+
+- `cmake --build external/NotDec-bin2llvm/build --target native_register_summary_ssa_test notdec-native-llvm pcode_to_llvm_test heritage_to_llvm_test -j4`：通过。
+- `./external/NotDec-bin2llvm/build/bin/native_register_summary_ssa_test`：通过。
+- `./external/NotDec-bin2llvm/build/bin/pcode_to_llvm_test`：通过。
+- `ctest --test-dir external/NotDec-bin2llvm/build -R notdec.native_llvm.realworld_fortune_i386 --output-on-failure`：通过。
+- `external/NotDec-bin2llvm/build/native-fortune-i386-regression/fortune.native.ll`：`target datalayout = "e-p:32:32"`；`__errno_location` 为 `declare i32 @__errno_location()`；未再出现 `ptrtoint ptr %notdec_stack.native... to i64`。
+- `external/NotDec-bin2llvm/build/native-fortune-i386-regression/run.stderr`：`stack_canary_checks_removed=7`，`stack_canary_fail_blocks_removed=7`。
+- `./external/NotDec-bin2llvm/build/bin/heritage_to_llvm_test`：仍失败在既有 `stack input fallback was not reused`，这次改动没有修这个旧测试问题。
+
+### 评分
+
+- 实现效果：8/10。i386 canary 从 5 个提升到 7 个删除，`GS_OFFSET` 全局残留消失，i386 指针宽度从源头改成 DataLayout。
+- 复杂度：4/10。canary 匹配增加了 TLS 地址链递归，但删除仍锚定 `__stack_chk_fail` 前驱边。
+- 维护成本：4/10。pointer-sized prototype 和 DataLayout 路径集中化后，比继续散落硬编码 8 字节更容易维护；Heritage 旧 prototype recovery 仍有单独的 i64 遗留点，后续可单独处理。

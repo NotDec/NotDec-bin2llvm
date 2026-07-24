@@ -35,12 +35,13 @@
 namespace {
 
 llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context,
-                                     const std::string &name) {
+                                     const std::string &name,
+                                     uint64_t size = 8) {
   llvm::Metadata *fields[] = {
       llvm::MDString::get(context, "base=" + name),
       llvm::MDString::get(context, "space=register"),
       llvm::MDString::get(context, "offset=0"),
-      llvm::MDString::get(context, "size=8"),
+      llvm::MDString::get(context, "size=" + std::to_string(size)),
       llvm::MDString::get(context, "name=" + name),
   };
   return llvm::MDNode::get(context, fields);
@@ -123,6 +124,28 @@ void attachTestAbi(llvm::Module &module) {
   attachTestAbiWithInputs(module, {"RDI"});
 }
 
+void attachI386TestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_i386_test";
+  abi.StackPointerRegister = "ESP";
+  abi.StackPointerSpace = "register";
+
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 4;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "EAX";
+  abi.Outputs.push_back(output);
+
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = "EAX";
+  abi.Effects.push_back(killed);
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 void attachTestFloatAbi(llvm::Module &module, unsigned floatInputs) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__summary_ssa_float_test";
@@ -195,20 +218,21 @@ void attachTestIntegerAndFloatVarArgAbi(llvm::Module &module) {
 
 llvm::StoreInst *storeRegister(llvm::IRBuilder<> &builder,
                                llvm::GlobalVariable *reg, llvm::Value *value,
-                               const std::string &name) {
+                               const std::string &name, uint64_t size = 8) {
   llvm::StoreInst *store = builder.CreateStore(value, reg);
   store->setMetadata("notdec.register.access",
-                     registerAccessMetadata(reg->getContext(), name));
+                     registerAccessMetadata(reg->getContext(), name, size));
   return store;
 }
 
 llvm::LoadInst *loadRegister(llvm::IRBuilder<> &builder,
                              llvm::GlobalVariable *reg, const std::string &name,
-                             const std::string &valueName = "") {
+                             const std::string &valueName = "",
+                             uint64_t size = 8) {
   llvm::LoadInst *load =
       builder.CreateLoad(reg->getValueType(), reg, valueName);
   load->setMetadata("notdec.register.access",
-                    registerAccessMetadata(reg->getContext(), name));
+                    registerAccessMetadata(reg->getContext(), name, size));
   return load;
 }
 
@@ -2146,6 +2170,53 @@ bool testKnownErrnoLocationReturnIsMaterialized() {
                 "errno_location left register SSA warning") &&
          verifyOk(module,
                   "module failed verifier after errno_location rewrite");
+}
+
+bool testKnownErrnoLocationReturnUsesI386DataLayout() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-errno-location-i386-return", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386TestAbi(module);
+  llvm::GlobalVariable *eax =
+      createRegisterGlobal(module, "EAX", llvm::Type::getInt32Ty(context), 0,
+                           4);
+
+  auto *voidCalleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(voidCalleeType, llvm::GlobalValue::ExternalLinkage,
+                             "__errno_location", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt32Ty(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "errno_location_i386_return_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(voidCalleeType, callee);
+  llvm::LoadInst *eaxLoad = loadRegister(builder, eax, "EAX", "eax.after", 4);
+  builder.CreateRet(eaxLoad);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("__errno_location");
+  llvm::CallInst *call = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (candidate != nullptr && candidate->getCalledFunction() == rewritten) {
+      call = candidate;
+    }
+  }
+
+  return expect(rewritten != nullptr, "i386 errno_location external missing") &&
+         expect(rewritten->getReturnType()->isIntegerTy(32),
+                "i386 errno_location did not use pointer-width return") &&
+         expect(call != nullptr, "i386 errno_location call missing") &&
+         expect(call->getType()->isIntegerTy(32),
+                "i386 errno_location call did not use pointer-width return") &&
+         expect(summary.Warnings.empty(),
+                "i386 errno_location left register SSA warning") &&
+         verifyOk(module,
+                  "module failed verifier after i386 errno_location rewrite");
 }
 
 bool testKnownFixedArgExternalTruncatesAbiInputs() {
@@ -7795,6 +7866,7 @@ int main() {
   ok &= testPostRewriteInstCombineExposesDeadFlagStore();
   ok &= testKnownZeroArgExternalTypedReturnIsMaterialized();
   ok &= testKnownErrnoLocationReturnIsMaterialized();
+  ok &= testKnownErrnoLocationReturnUsesI386DataLayout();
   ok &= testKnownFiveArgExternalUsesFiveInputs();
   ok &= testKnownFixedExternalArities();
   ok &= testKnownVarArgExternalInfersDefinedAbiInputs();

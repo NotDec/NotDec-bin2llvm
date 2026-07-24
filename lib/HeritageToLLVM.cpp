@@ -4,6 +4,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -21,6 +22,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -84,6 +86,80 @@ bool isLikelyX86_64Language(const std::string &language) {
          language.find("64") != std::string::npos;
 }
 
+std::optional<uint32_t> pointerByteSizeFromLanguage(
+    const std::string &language) {
+  if (isLikelyX86_64Language(language)) {
+    return 8;
+  }
+  if (language.find("x86") != std::string::npos &&
+      language.find("32") != std::string::npos) {
+    return 4;
+  }
+  return std::nullopt;
+}
+
+bool isBigEndianLanguage(const std::string &language) {
+  return language.find("big") != std::string::npos;
+}
+
+std::optional<uint32_t>
+inferPointerByteSizeFromHeritageProgram(const HeritageProgram &program) {
+  if (auto fromLanguage = pointerByteSizeFromLanguage(program.Program.Language)) {
+    return fromLanguage;
+  }
+
+  bool hasRsp = false;
+  bool hasRip = false;
+  bool hasEsp = false;
+  bool hasEip = false;
+  for (const HeritageVarnode &varnode : program.Varnodes) {
+    if (!varnode.IsRegister || !varnode.RegisterName) {
+      continue;
+    }
+    hasRsp |= *varnode.RegisterName == "RSP" && varnode.Size == 8;
+    hasRip |= *varnode.RegisterName == "RIP" && varnode.Size == 8;
+    hasEsp |= *varnode.RegisterName == "ESP" && varnode.Size == 4;
+    hasEip |= *varnode.RegisterName == "EIP" && varnode.Size == 4;
+  }
+  if (hasRsp && hasRip) {
+    return 8;
+  }
+  if (hasEsp && hasEip) {
+    return 4;
+  }
+  return std::nullopt;
+}
+
+std::optional<uint32_t>
+inferPointerByteSizeFromHeritageModule(const HeritageModule &module) {
+  if (auto fromLanguage = pointerByteSizeFromLanguage(module.Program.Language)) {
+    return fromLanguage;
+  }
+  for (const HeritageModuleFunction &function : module.Functions) {
+    if (auto pointerByteSize =
+            inferPointerByteSizeFromHeritageProgram(function.Program)) {
+      return pointerByteSize;
+    }
+  }
+  return std::nullopt;
+}
+
+void setModuleDataLayoutFromPointerSize(llvm::Module &module,
+                                        uint32_t pointerByteSize,
+                                        bool isBigEndian) {
+  if (!module.getDataLayout().isDefault()) {
+    return;
+  }
+  if (pointerByteSize != 4 && pointerByteSize != 8) {
+    return;
+  }
+  std::string layout = isBigEndian ? "E" : "e";
+  uint32_t pointerBits = pointerByteSize * 8;
+  layout += "-p:" + std::to_string(pointerBits) + ":" +
+            std::to_string(pointerBits);
+  module.setDataLayout(layout);
+}
+
 struct X86_64RegisterAlias {
   const char *Name;
   const char *Base;
@@ -126,16 +202,21 @@ void printPoisonFallbackError(llvm::StringRef functionName,
                << functionName << ": " << reason << '\n';
 }
 
-llvm::Type *typeForSourceType(llvm::LLVMContext &context,
-                              const std::string &type) {
+llvm::Type *typeForSourceType(llvm::Module &module, const std::string &type) {
+  llvm::LLVMContext &context = module.getContext();
+  uint32_t pointerByteSize =
+      static_cast<uint32_t>(module.getDataLayout().getPointerSize());
   if (type == "void") {
     return llvm::Type::getVoidTy(context);
   }
   if (isIntLikeType(type)) {
     return llvm::IntegerType::get(context, 32);
   }
-  if (type == "long" || type == "ulong" || type == "undefined8" ||
+  if (type == "long" || type == "ulong" ||
       type.find('*') != std::string::npos) {
+    return llvm::IntegerType::get(context, bitWidth(pointerByteSize));
+  }
+  if (type == "undefined8") {
     return llvm::IntegerType::get(context, 64);
   }
   if (type == "short" || type == "ushort" || type == "undefined2") {
@@ -209,20 +290,20 @@ std::string uniqueSymbolName(const std::string &preferred,
 }
 
 llvm::FunctionType *
-functionTypeForHeritageFunction(llvm::LLVMContext &context,
+functionTypeForHeritageFunction(llvm::Module &module,
                                 const HeritageFunction &function) {
   std::vector<llvm::Type *> paramTypes;
   for (const HeritageParam &param : function.Params) {
-    paramTypes.push_back(typeForSourceType(context, param.Type));
+    paramTypes.push_back(typeForSourceType(module, param.Type));
   }
 
-  llvm::Type *returnType = typeForSourceType(context, function.ReturnType);
+  llvm::Type *returnType = typeForSourceType(module, function.ReturnType);
   return llvm::FunctionType::get(returnType, paramTypes, false);
 }
 
-llvm::FunctionType *varargFunctionType(llvm::LLVMContext &context,
+llvm::FunctionType *varargFunctionType(llvm::Module &module,
                                        const std::string &returnType) {
-  return llvm::FunctionType::get(typeForSourceType(context, returnType), {},
+  return llvm::FunctionType::get(typeForSourceType(module, returnType), {},
                                  true);
 }
 
@@ -359,7 +440,7 @@ llvm::Function *declareInternalFunction(llvm::Module &module,
                                         const HeritageFunction &function,
                                         const std::string &name) {
   auto *functionType =
-      functionTypeForHeritageFunction(module.getContext(), function);
+      functionTypeForHeritageFunction(module, function);
   auto *llvmFunction = llvm::Function::Create(
       functionType, llvm::GlobalValue::ExternalLinkage, name, &module);
 
@@ -508,7 +589,7 @@ private:
   }
 
   llvm::Type *typeForSourceType(const std::string &type) {
-    return ::notdec::bin2llvm::typeForSourceType(Context, type);
+    return ::notdec::bin2llvm::typeForSourceType(Module, type);
   }
 
   bool createFunction(std::string &errorMessage) {
@@ -617,7 +698,8 @@ private:
     }
   }
 
-  llvm::Value *resize(llvm::Value *value, uint32_t byteSize) {
+  llvm::Value *resizeWithBuilder(llvm::IRBuilderBase &builder,
+                                 llvm::Value *value, uint32_t byteSize) {
     llvm::Type *targetType = intType(byteSize);
     if (value->getType() == targetType) {
       return value;
@@ -626,9 +708,21 @@ private:
     unsigned sourceBits = value->getType()->getIntegerBitWidth();
     unsigned targetBits = targetType->getIntegerBitWidth();
     if (sourceBits < targetBits) {
-      return Builder.CreateZExt(value, targetType);
+      return builder.CreateZExt(value, targetType);
     }
-    return Builder.CreateTrunc(value, targetType);
+    return builder.CreateTrunc(value, targetType);
+  }
+
+  llvm::Value *resize(llvm::Value *value, uint32_t byteSize) {
+    return resizeWithBuilder(Builder, value, byteSize);
+  }
+
+  uint32_t pointerByteSize() const {
+    return static_cast<uint32_t>(Module.getDataLayout().getPointerSize());
+  }
+
+  uint32_t pointerIndexByteSize() const {
+    return static_cast<uint32_t>(Module.getDataLayout().getIndexSize(0));
   }
 
   llvm::Value *resizeToIntegerType(llvm::Value *value,
@@ -1579,7 +1673,8 @@ private:
       return nullptr;
     }
     auto *byteOffset = llvm::ConstantInt::get(
-        intType(8), static_cast<uint64_t>(offset - Stack.Low));
+        intType(pointerIndexByteSize()),
+        static_cast<uint64_t>(offset - Stack.Low));
     return builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(Context),
                                      Stack.Storage, byteOffset,
                                      varnode.Id + ".stack");
@@ -1591,7 +1686,8 @@ private:
       return nullptr;
     }
     if (varnode.Space == "ram") {
-      llvm::Value *address = llvm::ConstantInt::get(intType(8), varnode.Offset);
+      llvm::Value *address =
+          llvm::ConstantInt::get(intType(pointerByteSize()), varnode.Offset);
       return memoryPointer(builder, address);
     }
     if (varnode.Space == "stack") {
@@ -1640,6 +1736,7 @@ private:
 
   llvm::Value *memoryPointer(llvm::IRBuilderBase &builder,
                              llvm::Value *address) {
+    address = resizeWithBuilder(builder, address, pointerByteSize());
     return builder.CreateIntToPtr(address, llvm::PointerType::get(Context, 0),
                                   "notdec_mem_ptr");
   }
@@ -1664,7 +1761,7 @@ private:
       return false;
     }
 
-    llvm::Value *address = resize(read(op.Inputs[1]), 8);
+    llvm::Value *address = resize(read(op.Inputs[1]), pointerByteSize());
     auto *load = Builder.CreateLoad(intType(output->Size),
                                     memoryPointer(Builder, address),
                                     *op.Output);
@@ -1678,7 +1775,7 @@ private:
       return false;
     }
 
-    llvm::Value *address = resize(read(op.Inputs[1]), 8);
+    llvm::Value *address = resize(read(op.Inputs[1]), pointerByteSize());
     llvm::Value *value = read(op.Inputs[2]);
     auto *store = Builder.CreateStore(value, memoryPointer(Builder, address));
     store->setAlignment(llvm::Align(1));
@@ -2088,8 +2185,8 @@ private:
         }
         return true;
       }
-      llvm::Value *address =
-          Builder.CreateIntToPtr(target, llvm::PointerType::get(Context, 0));
+      llvm::Value *address = Builder.CreateIntToPtr(
+          resize(target, pointerByteSize()), llvm::PointerType::get(Context, 0));
       llvm::IndirectBrInst *branch =
           Builder.CreateIndirectBr(address, block.Out.size());
       for (const std::string &successor : block.Out) {
@@ -2346,6 +2443,10 @@ buildHeritageModule(llvm::LLVMContext &context, const HeritageProgram &program,
                     const HeritageLoweringConfig &config,
                     std::string &errorMessage) {
   auto module = std::make_unique<llvm::Module>(config.ModuleName, context);
+  if (auto pointerByteSize = inferPointerByteSizeFromHeritageProgram(program)) {
+    setModuleDataLayoutFromPointerSize(
+        *module, *pointerByteSize, isBigEndianLanguage(program.Program.Language));
+  }
   HeritageLowerer lowerer(context, *module, program, config);
   if (!lowerer.lower(errorMessage)) {
     return nullptr;
@@ -2357,6 +2458,12 @@ std::unique_ptr<llvm::Module> buildHeritageDeclarationModule(
     llvm::LLVMContext &context, const HeritageModule &heritageModule,
     const HeritageLoweringConfig &config, std::string &errorMessage) {
   auto module = std::make_unique<llvm::Module>(config.ModuleName, context);
+  if (auto pointerByteSize =
+          inferPointerByteSizeFromHeritageModule(heritageModule)) {
+    setModuleDataLayoutFromPointerSize(
+        *module, *pointerByteSize,
+        isBigEndianLanguage(heritageModule.Program.Language));
+  }
   HeritageModuleSymbolPlan symbols = planModuleSymbols(heritageModule);
 
   for (size_t index = 0; index < heritageModule.Functions.size(); ++index) {
@@ -2369,7 +2476,7 @@ std::unique_ptr<llvm::Module> buildHeritageDeclarationModule(
     const HeritageExternalFunction &external = heritageModule.Externals[index];
     module->getOrInsertFunction(
         symbols.ExternalNames[index],
-        varargFunctionType(context, external.ReturnType));
+        varargFunctionType(*module, external.ReturnType));
   }
 
   return module;
@@ -2381,6 +2488,12 @@ std::unique_ptr<llvm::Module> buildHeritageModuleWithBodies(
     std::string &errorMessage) {
   stats = HeritageModuleLoweringStats{};
   auto module = std::make_unique<llvm::Module>(config.ModuleName, context);
+  if (auto pointerByteSize =
+          inferPointerByteSizeFromHeritageModule(heritageModule)) {
+    setModuleDataLayoutFromPointerSize(
+        *module, *pointerByteSize,
+        isBigEndianLanguage(heritageModule.Program.Language));
+  }
   HeritageModuleSymbolPlan symbols = planModuleSymbols(heritageModule);
   RegisterStorage registers(
       context, *module, registerInfosForHeritageModule(heritageModule), false);
@@ -2396,7 +2509,7 @@ std::unique_ptr<llvm::Module> buildHeritageModuleWithBodies(
     const HeritageExternalFunction &external = heritageModule.Externals[index];
     module->getOrInsertFunction(
         symbols.ExternalNames[index],
-        varargFunctionType(context, external.ReturnType));
+        varargFunctionType(*module, external.ReturnType));
     stats.DeclaredExternalFunctions++;
   }
 

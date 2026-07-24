@@ -18,6 +18,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -1034,13 +1035,17 @@ unitByName(const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
   return nullptr;
 }
 
-llvm::Type *llvmTypeForKnownValue(llvm::LLVMContext &context,
+llvm::Type *llvmTypeForKnownValue(llvm::Module &module,
                                   NativeExternalPrototype::ValueType type) {
+  llvm::LLVMContext &context = module.getContext();
   switch (type) {
   case NativeExternalPrototype::ValueType::I32:
     return llvm::Type::getInt32Ty(context);
   case NativeExternalPrototype::ValueType::I64:
     return llvm::Type::getInt64Ty(context);
+  case NativeExternalPrototype::ValueType::PointerSized:
+    return llvm::IntegerType::get(
+        context, module.getDataLayout().getPointerSizeInBits());
   case NativeExternalPrototype::ValueType::Float:
     return llvm::Type::getFloatTy(context);
   case NativeExternalPrototype::ValueType::Double:
@@ -1393,8 +1398,8 @@ std::optional<NativeSignatureSlot>
 typedParamSlot(NativeExternalPrototype::ValueType type, unsigned &integerIndex,
                unsigned &floatIndex,
                const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
-               const AbiFacts &abi, llvm::LLVMContext &context) {
-  llvm::Type *llvmType = llvmTypeForKnownValue(context, type);
+               const AbiFacts &abi, llvm::Module &module) {
+  llvm::Type *llvmType = llvmTypeForKnownValue(module, type);
   if (isFloatKnownValue(type)) {
     if (floatIndex >= abi.FloatInputsInOrder.size()) {
       return std::nullopt;
@@ -1414,8 +1419,8 @@ typedParamSlot(NativeExternalPrototype::ValueType type, unsigned &integerIndex,
 std::optional<NativeSignatureSlot>
 typedReturnSlot(NativeExternalPrototype::ValueType type,
                 const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
-                const AbiFacts &abi, llvm::LLVMContext &context) {
-  llvm::Type *llvmType = llvmTypeForKnownValue(context, type);
+                const AbiFacts &abi, llvm::Module &module) {
+  llvm::Type *llvmType = llvmTypeForKnownValue(module, type);
   if (isFloatKnownValue(type)) {
     if (abi.FloatOutputsInOrder.empty()) {
       return std::nullopt;
@@ -1478,11 +1483,15 @@ SignatureShape shapeForKnownExternal(
     return shape;
   }
   if (!known->TypedParams.empty() || known->TypedReturn) {
+    llvm::Module *module = function.getParent();
+    if (module == nullptr) {
+      return shape;
+    }
     unsigned integerIndex = 0;
     unsigned floatIndex = 0;
     for (NativeExternalPrototype::ValueType type : known->TypedParams) {
       std::optional<NativeSignatureSlot> slot = typedParamSlot(
-          type, integerIndex, floatIndex, units, abi, function.getContext());
+          type, integerIndex, floatIndex, units, abi, *module);
       if (!slot) {
         return shape;
       }
@@ -1490,7 +1499,7 @@ SignatureShape shapeForKnownExternal(
     }
     if (known->TypedReturn) {
       std::optional<NativeSignatureSlot> slot = typedReturnSlot(
-          *known->TypedReturn, units, abi, function.getContext());
+          *known->TypedReturn, units, abi, *module);
       if (slot) {
         shape.Returns.push_back(*slot);
       }

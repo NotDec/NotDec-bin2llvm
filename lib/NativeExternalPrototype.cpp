@@ -20,9 +20,13 @@ bool parseValueType(llvm::StringRef text, ValueType &type) {
     type = ValueType::I32;
     return true;
   }
-  if (text == "i64" || text == "ptr" || text == "pointer" ||
-      text == "size_t" || text == "ssize_t" || text == "long") {
+  if (text == "i64") {
     type = ValueType::I64;
+    return true;
+  }
+  if (text == "ptr" || text == "pointer" || text == "size_t" ||
+      text == "ssize_t" || text == "long" || text == "ulong") {
+    type = ValueType::PointerSized;
     return true;
   }
   if (text == "float") {
@@ -183,12 +187,15 @@ bool loadPrototypeArray(const llvm::json::Array &array,
 const NativeExternalPrototypeMap &defaultNativeExternalPrototypes() {
   static const NativeExternalPrototypeMap prototypes = {
       {"__assert_fail", {4, false, true}},
-      {"__ctype_b_loc", {0, false, false, 1, {}, ValueType::I64}},
-      {"__ctype_tolower_loc", {0, false, false, 1, {}, ValueType::I64}},
-      {"__ctype_toupper_loc", {0, false, false, 1, {}, ValueType::I64}},
+      {"__ctype_b_loc", {0, false, false, 1, {}, ValueType::PointerSized}},
+      {"__ctype_tolower_loc",
+       {0, false, false, 1, {}, ValueType::PointerSized}},
+      {"__ctype_toupper_loc",
+       {0, false, false, 1, {}, ValueType::PointerSized}},
       {"__cxa_atexit", {3, false, false}},
       {"__cxa_finalize", {1, false, false}},
-      {"__errno_location", {0, false, false, 1, {}, ValueType::I64}},
+      {"__errno_location",
+       {0, false, false, 1, {}, ValueType::PointerSized}},
       {"__explicit_bzero_chk", {3, false, false}},
       {"__fdelt_chk", {1, false, false}},
       {"__fgets_chk", {4, false, false}},
