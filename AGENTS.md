@@ -90,7 +90,8 @@ bin2LLVM 子项目近期目标：围绕 Bench2 这些真实项目生成 LLVM IR�
 
 ### 旧链路：heritage
 
-这是之前模仿 Ghidra heritage/trial/use 思路写出来的链路，保留用于对照和历史测试。
+这是之前模仿 Ghidra heritage/trial/use 思路写出来的链路，接近弃用。
+现在只保留用于对照、历史测试和必要的编译维护，不再作为新功能承载路线。
 
 - 代码目录：
   - `include/notdec-bin2llvm/passes/heritage/`
@@ -104,6 +105,7 @@ bin2LLVM 子项目近期目标：围绕 Bench2 这些真实项目生成 LLVM IR�
 - 开发要求：
   - 不要把新 summary 链路的新功能写回这里。
   - `NativePrototypeRecovery` 属于旧链路，不作为新链路 internal signature rewrite 的实现基础。
+  - 除非是保持现有测试或旧用例不坏，不再主动扩展 `NativeHeritageSSA` / `NativePrototypeRecovery`。
 
 Bench2 真实项目集合在 `/sn640/NotDec-Exp/Bench2`：
 
