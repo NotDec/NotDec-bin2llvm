@@ -549,14 +549,21 @@ bool valueNameContains(const llvm::Value *value, llvm::StringRef needle) {
 }
 
 llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
-                                               uint64_t fsOffset,
+                                               uint64_t tlsOffset,
                                                bool useZextCondition,
                                                bool extraFailSideEffect,
                                                bool maskSavedCanary = false,
-                                               bool saveRealCanary = false) {
+                                               bool saveRealCanary = false,
+                                               llvm::StringRef tlsRegisterName =
+                                                   "FS_OFFSET",
+                                               unsigned tlsRegisterBytes = 8) {
   llvm::LLVMContext &context = module.getContext();
-  llvm::GlobalVariable *fsOffsetRegister =
-      createRegisterGlobal(module, "FS_OFFSET");
+  llvm::Type *tlsRegisterType = tlsRegisterBytes == 4
+                                    ? llvm::Type::getInt32Ty(context)
+                                    : llvm::Type::getInt64Ty(context);
+  llvm::GlobalVariable *tlsBaseRegister =
+      createRegisterGlobal(module, tlsRegisterName.str(), tlsRegisterType, 0,
+                           tlsRegisterBytes);
 
   auto *failType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *failFunction = llvm::Function::Create(
@@ -582,42 +589,43 @@ llvm::Function *createStackCanaryCheckFunction(llvm::Module &module,
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24),
       "saved_canary_ptr");
   llvm::Value *initialSavedCanary =
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+      llvm::ConstantInt::get(tlsRegisterType, 0);
   if (saveRealCanary) {
-    llvm::LoadInst *savedFsBase =
-        loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base_save");
-    llvm::Value *savedFsCanaryAddress = builder.CreateAdd(
-        savedFsBase,
-        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), fsOffset),
-        "fs_canary_save_addr");
-    llvm::Value *savedFsCanaryPointer = builder.CreateIntToPtr(
-        savedFsCanaryAddress, llvm::PointerType::get(context, 0),
-        "fs_canary_save_ptr");
+    llvm::LoadInst *savedTlsBase =
+        loadRegister(builder, tlsBaseRegister, tlsRegisterName.str(),
+                     "tls_base_save", tlsRegisterBytes);
+    llvm::Value *savedTlsCanaryAddress = builder.CreateAdd(
+        savedTlsBase, llvm::ConstantInt::get(tlsRegisterType, tlsOffset),
+        "tls_canary_save_addr");
+    llvm::Value *savedTlsCanaryPointer = builder.CreateIntToPtr(
+        savedTlsCanaryAddress, llvm::PointerType::get(context, 0),
+        "tls_canary_save_ptr");
     initialSavedCanary =
-        builder.CreateLoad(llvm::Type::getInt64Ty(context),
-                           savedFsCanaryPointer, "fs_canary_save");
+        builder.CreateLoad(tlsRegisterType, savedTlsCanaryPointer,
+                           "tls_canary_save");
   }
   builder.CreateStore(initialSavedCanary, savedPointer);
   llvm::LoadInst *savedCanary = builder.CreateLoad(
-      llvm::Type::getInt64Ty(context), savedPointer, "saved_canary");
-  llvm::LoadInst *fsBase =
-      loadRegister(builder, fsOffsetRegister, "FS_OFFSET", "fs_base");
-  llvm::Value *fsCanaryAddress = builder.CreateAdd(
-      fsBase, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), fsOffset),
-      "fs_canary_addr");
-  llvm::Value *fsCanaryPointer = builder.CreateIntToPtr(
-      fsCanaryAddress, llvm::PointerType::get(context, 0), "fs_canary_ptr");
-  llvm::LoadInst *fsCanary = builder.CreateLoad(llvm::Type::getInt64Ty(context),
-                                                fsCanaryPointer, "fs_canary");
+      tlsRegisterType, savedPointer, "saved_canary");
+  llvm::LoadInst *tlsBase =
+      loadRegister(builder, tlsBaseRegister, tlsRegisterName.str(), "tls_base",
+                   tlsRegisterBytes);
+  llvm::Value *tlsCanaryAddress = builder.CreateAdd(
+      tlsBase, llvm::ConstantInt::get(tlsRegisterType, tlsOffset),
+      "tls_canary_addr");
+  llvm::Value *tlsCanaryPointer = builder.CreateIntToPtr(
+      tlsCanaryAddress, llvm::PointerType::get(context, 0), "tls_canary_ptr");
+  llvm::LoadInst *tlsCanary =
+      builder.CreateLoad(tlsRegisterType, tlsCanaryPointer, "tls_canary");
   llvm::Value *savedCompareValue = savedCanary;
   if (maskSavedCanary) {
     savedCompareValue = builder.CreateAnd(
         savedCanary,
-        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0xffffffffULL),
+        llvm::ConstantInt::get(tlsRegisterType, 0xffffffffULL),
         "saved_canary_low32");
   }
   llvm::ICmpInst *same = llvm::cast<llvm::ICmpInst>(
-      builder.CreateICmpEQ(savedCompareValue, fsCanary, "canary_same"));
+      builder.CreateICmpEQ(savedCompareValue, tlsCanary, "canary_same"));
   llvm::Value *condition = same;
   if (useZextCondition) {
     llvm::Value *wide =
@@ -5543,6 +5551,27 @@ bool testStackCanaryCheckIsRemoved() {
          verifyOk(module, "module failed verifier after stack canary removal");
 }
 
+bool testI386GsStackCanaryCheckIsRemoved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-i386-gs-stack-canary-remove", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386TestAbi(module);
+  llvm::Function *function = createStackCanaryCheckFunction(
+      module, 20, false, false, false, false, "GS_OFFSET", 4);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.StackCanaryChecksRemoved == 1,
+                "i386 GS stack canary check was not counted as removed") &&
+         expect(summary.StackCanaryFailBlocksRemoved == 1,
+                "i386 GS stack canary fail block was not counted as removed") &&
+         expect(!hasCallTo(*function, "__stack_chk_fail"),
+                "i386 GS stack canary fail call was kept") &&
+         expect(!hasRegisterLoad(*function, "GS_OFFSET"),
+                "i386 GS stack canary GS_OFFSET load was kept") &&
+         verifyOk(module,
+                  "module failed verifier after i386 GS canary removal");
+}
+
 bool testDeadStackCanaryFailThunkIsRemoved() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-stack-canary-fail-thunk-remove", context);
@@ -7960,6 +7989,7 @@ int main() {
   ok &= testExternalPrototypeJsonOverlaysDefaultNoReturn();
   ok &= testInternalNoReturnCallFallthroughIsTruncated();
   ok &= testStackCanaryCheckIsRemoved();
+  ok &= testI386GsStackCanaryCheckIsRemoved();
   ok &= testDeadStackCanaryFailThunkIsRemoved();
   ok &= testStackCanaryPrologueSaveIsRemoved();
   ok &= testStackCanaryZextConditionIsRemoved();

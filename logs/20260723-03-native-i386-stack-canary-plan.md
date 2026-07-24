@@ -150,3 +150,22 @@ i386 fortune 已经能走 GTIRB native 链路，并且 PLT/GOT 现在能解析�
 - `cmake --build external/NotDec-bin2llvm/build --target notdec-native-llvm -j4`：通过。
 - `ctest --test-dir external/NotDec-bin2llvm/build -R notdec.native_llvm.realworld_fortune_i386 --output-on-failure`：通过。
 - i386 fortune 最终 IR 中 `notdec_native_4430` 已删除，只剩 `declare void @__stack_chk_fail()`；summary 输出 `stack_canary_fail_functions_removed=1`。
+
+### 补充：i386 GS canary 回归测试
+
+- `tests/native_register_summary_ssa_test.cpp:551-628`：把 `createStackCanaryCheckFunction()` 从 FS/64 位固定测试 helper 改成可传 TLS register 名和字宽，默认仍是 `FS_OFFSET` / 8 字节。
+- `tests/native_register_summary_ssa_test.cpp:5554-5573`：新增 `testI386GsStackCanaryCheckIsRemoved()`，构造 `e-p:32:32`、`ESP` ABI、`GS_OFFSET+20` 的 i386 canary 形状，确认 SummarySSA 前段直接删掉 canary check 和 `GS_OFFSET` load。
+- `tests/native_register_summary_ssa_test.cpp:7989`：把新回归接入 `native_register_summary_ssa_test`。
+
+验证：
+
+- `cmake --build external/NotDec-bin2llvm/build --target native_register_summary_ssa_test notdec-native-llvm -j4`：通过。
+- `./external/NotDec-bin2llvm/build/bin/native_register_summary_ssa_test`：通过。
+- `ctest --test-dir external/NotDec-bin2llvm/build -R notdec.native_llvm.realworld_fortune_i386 --output-on-failure`：通过。
+- `llvm-22.1.0.obj/bin/llvm-as external/NotDec-bin2llvm/build/native-fortune-i386-regression/fortune.native.ll -o /tmp/fortune-i386-check.bc`：通过。
+- `llvm-22.1.0.obj/bin/opt -passes=verify /tmp/fortune-i386-check.bc -disable-output`：通过。
+
+审计结果：
+
+- i386 fortune 输出没有 `GS_OFFSET` global / load / `GS_OFFSET.entry`。
+- `ESP.entry` 剩余 22 个，均非负偏移；主要是 `ESP+4` / `ESP+8` 的 caller 参数或返回槽，不属于本阶段的本地负偏移栈帧重写。
