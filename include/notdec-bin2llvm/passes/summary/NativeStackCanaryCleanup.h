@@ -21,6 +21,7 @@ struct NativeStackCanaryCleanupSummary {
   uint64_t FunctionsSeen = 0;
   uint64_t CanaryChecksRemoved = 0;
   uint64_t FailBlocksRemoved = 0;
+  uint64_t FailFunctionsRemoved = 0;
 };
 
 NativeStackCanaryCleanupSummary runNativeStackCanaryCleanup(

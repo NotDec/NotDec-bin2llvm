@@ -901,18 +901,21 @@ bool isDirectStackCheckFailCallee(llvm::Function *callee) {
 
 bool functionOnlyCallsStackCheckFail(
     llvm::Function &function, std::set<llvm::Function *> &visiting,
-    std::map<llvm::Function *, bool> &cache);
+    std::map<llvm::Function *, bool> &cache,
+    std::set<llvm::Function *> *failOnlyFunctions = nullptr);
 
 bool isStackCheckFailCallee(llvm::Function *callee,
                             std::set<llvm::Function *> &visiting,
-                            std::map<llvm::Function *, bool> &cache) {
+                            std::map<llvm::Function *, bool> &cache,
+                            std::set<llvm::Function *> *failOnlyFunctions) {
   if (isDirectStackCheckFailCallee(callee)) {
     return true;
   }
   if (callee == nullptr || callee->isDeclaration()) {
     return false;
   }
-  return functionOnlyCallsStackCheckFail(*callee, visiting, cache);
+  return functionOnlyCallsStackCheckFail(*callee, visiting, cache,
+                                         failOnlyFunctions);
 }
 
 bool isSkippedNativeSetupCall(llvm::CallInst &call) {
@@ -929,14 +932,16 @@ bool isDiscardedSummarySetupCall(llvm::CallInst &call) {
 
 bool blockOnlyCallsStackCheckFail(llvm::BasicBlock &block,
                                   std::set<llvm::Function *> &visiting,
-                                  std::map<llvm::Function *, bool> &cache) {
+                                  std::map<llvm::Function *, bool> &cache,
+                                  std::set<llvm::Function *>
+                                      *failOnlyFunctions) {
   llvm::CallInst *failCall = nullptr;
   bool sawFailCall = false;
   for (llvm::Instruction &inst : block) {
     if (!sawFailCall) {
       if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
-        if (isStackCheckFailCallee(call->getCalledFunction(), visiting,
-                                   cache)) {
+        if (isStackCheckFailCallee(call->getCalledFunction(), visiting, cache,
+                                   failOnlyFunctions)) {
           failCall = call;
           sawFailCall = true;
           continue;
@@ -971,9 +976,13 @@ bool blockOnlyCallsStackCheckFail(llvm::BasicBlock &block,
 
 bool functionOnlyCallsStackCheckFail(
     llvm::Function &function, std::set<llvm::Function *> &visiting,
-    std::map<llvm::Function *, bool> &cache) {
+    std::map<llvm::Function *, bool> &cache,
+    std::set<llvm::Function *> *failOnlyFunctions) {
   auto cached = cache.find(&function);
   if (cached != cache.end()) {
+    if (cached->second && failOnlyFunctions != nullptr) {
+      failOnlyFunctions->insert(&function);
+    }
     return cached->second;
   }
   if (!visiting.insert(&function).second) {
@@ -984,7 +993,8 @@ bool functionOnlyCallsStackCheckFail(
   if (!function.empty()) {
     result = true;
     for (llvm::BasicBlock &block : function) {
-      if (!blockOnlyCallsStackCheckFail(block, visiting, cache)) {
+      if (!blockOnlyCallsStackCheckFail(block, visiting, cache,
+                                        failOnlyFunctions)) {
         result = false;
         break;
       }
@@ -993,6 +1003,9 @@ bool functionOnlyCallsStackCheckFail(
 
   visiting.erase(&function);
   cache[&function] = result;
+  if (result && failOnlyFunctions != nullptr) {
+    failOnlyFunctions->insert(&function);
+  }
   return result;
 }
 
@@ -1227,15 +1240,16 @@ bool eraseStackCanaryPredecessor(llvm::BranchInst &branch,
 
 void eraseStackCanaryChecks(llvm::Function &function,
                             llvm::StringRef stackPointerRegister,
-                            NativeStackCanaryCleanupSummary &summary) {
+                            NativeStackCanaryCleanupSummary &summary,
+                            std::set<llvm::Function *> &failOnlyFunctions) {
   std::set<llvm::Function *> visitingFailSinks;
   std::map<llvm::Function *, bool> failSinkCache;
   bool changed = true;
   while (changed) {
     changed = false;
     for (llvm::BasicBlock &block : llvm::make_early_inc_range(function)) {
-      bool failSink =
-          blockOnlyCallsStackCheckFail(block, visitingFailSinks, failSinkCache);
+      bool failSink = blockOnlyCallsStackCheckFail(
+          block, visitingFailSinks, failSinkCache, &failOnlyFunctions);
       if (!failSink) {
         continue;
       }
@@ -1266,6 +1280,26 @@ void eraseStackCanaryChecks(llvm::Function &function,
   }
 }
 
+void eraseDeadFailOnlyFunctions(
+    std::set<llvm::Function *> &failOnlyFunctions,
+    NativeStackCanaryCleanupSummary &summary) {
+  std::set<llvm::Function *> visiting;
+  std::map<llvm::Function *, bool> cache;
+  for (llvm::Function *function :
+       llvm::make_early_inc_range(failOnlyFunctions)) {
+    if (function == nullptr || function->getParent() == nullptr ||
+        function->isDeclaration() || !function->hasLocalLinkage() ||
+        !function->use_empty()) {
+      continue;
+    }
+    if (!functionOnlyCallsStackCheckFail(*function, visiting, cache)) {
+      continue;
+    }
+    function->eraseFromParent();
+    ++summary.FailFunctionsRemoved;
+  }
+}
+
 } // namespace
 
 NativeStackCanaryCleanupSummary
@@ -1276,13 +1310,16 @@ runNativeStackCanaryCleanup(llvm::Module &module,
   if (std::optional<NativeAbiSpec> abi = readNativeAbiMetadata(module)) {
     stackPointerRegister = abi->StackPointerRegister;
   }
+  std::set<llvm::Function *> failOnlyFunctions;
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;
     }
     ++summary.FunctionsSeen;
-    eraseStackCanaryChecks(function, stackPointerRegister, summary);
+    eraseStackCanaryChecks(function, stackPointerRegister, summary,
+                           failOnlyFunctions);
   }
+  eraseDeadFailOnlyFunctions(failOnlyFunctions, summary);
   if (options.PrintSummary) {
     printNativeStackCanaryCleanupSummary(summary, llvm::errs());
   }
@@ -1293,7 +1330,8 @@ void printNativeStackCanaryCleanupSummary(
     const NativeStackCanaryCleanupSummary &summary, llvm::raw_ostream &os) {
   os << "Native stack canary cleanup: functions=" << summary.FunctionsSeen
      << " checks_removed=" << summary.CanaryChecksRemoved
-     << " fail_blocks_removed=" << summary.FailBlocksRemoved << '\n';
+     << " fail_blocks_removed=" << summary.FailBlocksRemoved
+     << " fail_functions_removed=" << summary.FailFunctionsRemoved << '\n';
 }
 
 } // namespace notdec::bin2llvm

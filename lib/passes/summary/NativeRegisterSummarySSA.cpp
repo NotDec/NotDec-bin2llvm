@@ -6988,6 +6988,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   NativeRegisterSummarySSASummary summary;
   summary.StackCanaryChecksRemoved = canarySummary.CanaryChecksRemoved;
   summary.StackCanaryFailBlocksRemoved = canarySummary.FailBlocksRemoved;
+  summary.StackCanaryFailFunctionsRemoved =
+      canarySummary.FailFunctionsRemoved;
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;
@@ -7054,6 +7056,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       summary.StackCanaryChecksRemoved += lateCanarySummary.CanaryChecksRemoved;
       summary.StackCanaryFailBlocksRemoved +=
           lateCanarySummary.FailBlocksRemoved;
+      summary.StackCanaryFailFunctionsRemoved +=
+          lateCanarySummary.FailFunctionsRemoved;
       eraseDeadSummaryCallValueHelpers(module);
       summary.DeadLoadsRemoved += eraseDeadSummarySSAEntryReads(module);
       eraseUnusedSummaryHelperDeclarations(module);
@@ -7103,6 +7107,8 @@ void printNativeRegisterSummarySSASummary(
      << " stack_canary_checks_removed=" << summary.StackCanaryChecksRemoved
      << " stack_canary_fail_blocks_removed="
      << summary.StackCanaryFailBlocksRemoved
+     << " stack_canary_fail_functions_removed="
+     << summary.StackCanaryFailFunctionsRemoved
      << " partial_demand_candidates=" << summary.PartialDemandCandidates
      << " partial_demand_matched=" << summary.PartialDemandMatched
      << " partial_demand_rejected=" << summary.PartialDemandRejected

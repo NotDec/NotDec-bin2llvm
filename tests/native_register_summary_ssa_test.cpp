@@ -5543,6 +5543,52 @@ bool testStackCanaryCheckIsRemoved() {
          verifyOk(module, "module failed verifier after stack canary removal");
 }
 
+bool testDeadStackCanaryFailThunkIsRemoved() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-stack-canary-fail-thunk-remove", context);
+  attachTestAbi(module);
+  llvm::Function *function =
+      createStackCanaryCheckFunction(module, 40, false, false);
+  llvm::Function *directFail = module.getFunction("__stack_chk_fail");
+  if (directFail == nullptr) {
+    return expect(false, "direct stack check fail declaration missing");
+  }
+
+  auto *failType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *failThunk =
+      llvm::Function::Create(failType, llvm::GlobalValue::InternalLinkage,
+                             "notdec_native_4430", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", failThunk);
+  llvm::IRBuilder<> thunkBuilder(entry);
+  thunkBuilder.CreateCall(directFail->getFunctionType(), directFail, {});
+  thunkBuilder.CreateUnreachable();
+
+  bool rewired = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call != nullptr && call->getCalledFunction() == directFail) {
+      call->setCalledFunction(failThunk->getFunctionType(), failThunk);
+      rewired = true;
+    }
+  }
+  if (!rewired) {
+    return expect(false, "stack canary fail call was not rewired to thunk");
+  }
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  return expect(summary.StackCanaryChecksRemoved == 1,
+                "thunk stack canary check was not removed") &&
+         expect(summary.StackCanaryFailFunctionsRemoved == 1,
+                "dead stack canary fail thunk was not counted as removed") &&
+         expect(!moduleHasFunctionNamed(module, "notdec_native_4430"),
+                "dead stack canary fail thunk was kept") &&
+         expect(!hasCallTo(*function, "__stack_chk_fail"),
+                "stack canary fail thunk call was kept") &&
+         verifyOk(module,
+                  "module failed verifier after stack canary fail thunk test");
+}
+
 bool testStackCanaryPrologueSaveIsRemoved() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-stack-canary-prologue-save-remove", context);
@@ -7914,6 +7960,7 @@ int main() {
   ok &= testExternalPrototypeJsonOverlaysDefaultNoReturn();
   ok &= testInternalNoReturnCallFallthroughIsTruncated();
   ok &= testStackCanaryCheckIsRemoved();
+  ok &= testDeadStackCanaryFailThunkIsRemoved();
   ok &= testStackCanaryPrologueSaveIsRemoved();
   ok &= testStackCanaryZextConditionIsRemoved();
   ok &= testStackCanaryMaskedSavedLoadIsRemoved();

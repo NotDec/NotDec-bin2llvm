@@ -135,3 +135,18 @@ i386 fortune 已经能走 GTIRB native 链路，并且 PLT/GOT 现在能解析�
 - 实现效果：8/10。i386 canary 从 5 个提升到 7 个删除，`GS_OFFSET` 全局残留消失，i386 指针宽度从源头改成 DataLayout。
 - 复杂度：4/10。canary 匹配增加了 TLS 地址链递归，但删除仍锚定 `__stack_chk_fail` 前驱边。
 - 维护成本：4/10。pointer-sized prototype 和 DataLayout 路径集中化后，比继续散落硬编码 8 字节更容易维护；Heritage 旧 prototype recovery 仍有单独的 i64 遗留点，后续可单独处理。
+
+### 补充：删除无调用者的 fail-local thunk
+
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:902-1006`：`functionOnlyCallsStackCheckFail()` 判断出 fail-only 函数时，把对应函数记录到本轮候选集合。
+- `lib/passes/summary/NativeStackCanaryCleanup.cpp:1240-1298`：canary fail edge 清完后，只删除 `internal/local + use_empty + fail-only body` 的候选函数。
+- `include/notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h:20-24`、`include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h:100-102`、`lib/passes/summary/NativeRegisterSummarySSA.cpp:6988-7109`：新增 `fail_functions_removed` / `stack_canary_fail_functions_removed` 统计。
+- `tests/native_register_summary_ssa_test.cpp:5546-5590`、`7960-7962`：新增 `notdec_native_4430` 形状的 internal fail thunk 单测，确认 fail edge 删除后 thunk 本体也会删除。
+
+验证：
+
+- `cmake --build external/NotDec-bin2llvm/build --target native_register_summary_ssa_test -j4`：通过。
+- `./external/NotDec-bin2llvm/build/bin/native_register_summary_ssa_test`：通过。
+- `cmake --build external/NotDec-bin2llvm/build --target notdec-native-llvm -j4`：通过。
+- `ctest --test-dir external/NotDec-bin2llvm/build -R notdec.native_llvm.realworld_fortune_i386 --output-on-failure`：通过。
+- i386 fortune 最终 IR 中 `notdec_native_4430` 已删除，只剩 `declare void @__stack_chk_fail()`；summary 输出 `stack_canary_fail_functions_removed=1`。
