@@ -111,6 +111,10 @@ struct State {
   // fixed entry-SP offsets or notdec_stack.native alloca offsets, not arbitrary
   // memory.
   std::map<StackSlotKey, llvm::GlobalVariable *> StackSlots;
+  // Caller stack-argument evidence is separate from saved-register tracking.
+  // Values are intentionally coarse: the summary only needs to know whether a
+  // cspec stack slot was explicitly written before a call.
+  std::map<StackSlotKey, NativeRegisterCallsiteValueOrigin> StackSlotOrigins;
   // SSA values known to be a function-entry register plus a constant offset.
   // Offset 0 is also used for saved register values loaded back from stack.
   std::map<llvm::Value *, ValueOrigin> ValueOrigins;
@@ -123,6 +127,7 @@ struct State {
     return Reachable == other.Reachable &&
            EndsInNoReturn == other.EndsInNoReturn && Cells == other.Cells &&
            Origins == other.Origins && StackSlots == other.StackSlots &&
+           StackSlotOrigins == other.StackSlotOrigins &&
            ValueOrigins == other.ValueOrigins &&
            StackPointerOffset == other.StackPointerOffset;
   }
@@ -175,6 +180,7 @@ struct AbiFacts {
   std::set<std::string> KilledByCall;
   std::map<std::string, llvm::APInt> KilledByCallMasks;
   std::string StackPointer;
+  uint64_t StackShift = 0;
 };
 
 using RegisterDemand = std::map<llvm::GlobalVariable *, llvm::APInt>;
@@ -774,6 +780,7 @@ collectAbiFacts(const llvm::Module &module,
     }
   }
   facts.StackPointer = abi->StackPointerRegister;
+  facts.StackShift = abi->StackShift;
   return facts;
 }
 
@@ -932,6 +939,17 @@ bool joinState(State &target, const State &source) {
     auto sourceIt = source.StackSlots.find(it->first);
     if (sourceIt == source.StackSlots.end() || sourceIt->second != it->second) {
       it = target.StackSlots.erase(it);
+      changed = true;
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = target.StackSlotOrigins.begin();
+       it != target.StackSlotOrigins.end();) {
+    auto sourceIt = source.StackSlotOrigins.find(it->first);
+    if (sourceIt == source.StackSlotOrigins.end() ||
+        sourceIt->second != it->second) {
+      it = target.StackSlotOrigins.erase(it);
       changed = true;
     } else {
       ++it;
@@ -1351,6 +1369,24 @@ private:
   NativeRegisterCallsiteValueOrigin
   callsiteOrigin(const State &state,
                  const NativeRegisterCallInputSlot &slot) const {
+    if (slot.Kind == NativeRegisterCallInputSlotKind::Stack) {
+      llvm::GlobalVariable *stackPointer = stackPointerGlobal();
+      if (stackPointer == nullptr || !state.StackPointerOffset) {
+        return NativeRegisterCallsiteValueOrigin::Unknown;
+      }
+      int64_t expectedOffset = *state.StackPointerOffset +
+                               static_cast<int64_t>(slot.StackOffset) -
+                               static_cast<int64_t>(Abi.StackShift);
+      StackSlotKey key{stackPointer, expectedOffset};
+      auto originIt = state.StackSlotOrigins.find(key);
+      if (originIt != state.StackSlotOrigins.end()) {
+        return originIt->second;
+      }
+      if (state.StackSlots.count(key) != 0) {
+        return NativeRegisterCallsiteValueOrigin::ForwardedEntry;
+      }
+      return NativeRegisterCallsiteValueOrigin::Unknown;
+    }
     auto unitIt = UnitsByName.find(slot.UnitName);
     if (unitIt == UnitsByName.end()) {
       return NativeRegisterCallsiteValueOrigin::Unknown;
@@ -1382,7 +1418,12 @@ private:
     for (auto [index, slot] : llvm::enumerate(slots)) {
       NativeRegisterCallsiteSlotEvidence evidence;
       evidence.Index = index;
+      evidence.Kind = slot.Kind;
       evidence.UnitName = slot.UnitName;
+      evidence.StackSpace = slot.StackSpace;
+      evidence.StackOffset = slot.StackOffset;
+      evidence.StackSize = slot.StackSize;
+      evidence.StackAlign = slot.StackAlign;
       evidence.OffsetBits = slot.OffsetBits;
       evidence.SizeBits = slot.SizeBits;
       evidence.Float = slot.Float;
@@ -1559,9 +1600,14 @@ private:
         if (origin && origin->Offset == 0 &&
             canTrackSavedEntryRegister(origin->Base)) {
           state.StackSlots[*slot] = origin->Base;
+          state.StackSlotOrigins[*slot] =
+              NativeRegisterCallsiteValueOrigin::ForwardedEntry;
         } else {
           markEntryValueRead(store->getValueOperand(), state);
           state.StackSlots.erase(*slot);
+          state.StackSlotOrigins[*slot] =
+              origin ? NativeRegisterCallsiteValueOrigin::ForwardedEntry
+                     : NativeRegisterCallsiteValueOrigin::LocalDefinition;
         }
       } else {
         markInstructionEntryValueReads(inst, state);
@@ -1865,6 +1911,9 @@ private:
   void applyCallInputs(State &state,
                        const std::vector<NativeRegisterCallInputSlot> &inputs) {
     for (const NativeRegisterCallInputSlot &input : inputs) {
+      if (input.Kind != NativeRegisterCallInputSlotKind::Register) {
+        continue;
+      }
       auto unitIt = UnitsByName.find(input.UnitName);
       if (unitIt == UnitsByName.end()) {
         continue;
@@ -2084,6 +2133,9 @@ private:
     }
 
     auto addInputDemand = [&](const NativeRegisterCallInputSlot &input) {
+      if (input.Kind != NativeRegisterCallInputSlotKind::Register) {
+        return;
+      }
       auto unitIt = UnitsByName.find(input.UnitName);
       if (unitIt == UnitsByName.end()) {
         return;

@@ -93,8 +93,21 @@ struct AbiFacts {
     unsigned OffsetBits = 0;
     unsigned SizeBits = 0;
   };
+  // Stack pentry copied from cspec metadata.  A single Ghidra stack pentry
+  // normally describes a repeating argument area; concrete argument slots below
+  // are expanded from this range, never from an architecture hardcode.
+  struct StackSlot {
+    std::string Space;
+    std::string MetaType;
+    uint64_t Offset = 0;
+    uint32_t MinSize = 0;
+    uint32_t MaxSize = 0;
+    uint32_t Align = 0;
+    size_t AbiIndex = 0;
+  };
   std::vector<RegisterSlot> IntegerInputsInOrder;
   std::vector<RegisterSlot> FloatInputsInOrder;
+  std::vector<StackSlot> StackInputsInOrder;
   std::set<std::string> Outputs;
   std::vector<std::string> OutputsInOrder;
   std::vector<RegisterSlot> IntegerOutputsInOrder;
@@ -103,6 +116,8 @@ struct AbiFacts {
   std::set<std::string> InternalReturnRegisters;
   std::set<std::string> Unaffected;
   std::set<std::string> KilledByCall;
+  std::string StackPointer;
+  uint64_t StackShift = 0;
 };
 
 enum class CallRegisterEffect {
@@ -238,6 +253,7 @@ struct PartialDemandState {
 enum class NativeSignatureSlotKind {
   IntegerRegister,
   FloatRegister,
+  IntegerStack,
 };
 
 // A signature slot is the bridge between the ABI slot and the lifted register
@@ -249,6 +265,10 @@ struct NativeSignatureSlot {
   const RegisterUnit *Unit = nullptr;
   std::string AbiName;
   std::string MetaType;
+  std::string StackSpace;
+  uint64_t StackOffset = 0;
+  uint32_t StackSize = 0;
+  uint32_t StackAlign = 0;
   unsigned OffsetBits = 0;
   unsigned SizeBits = 0;
   llvm::Type *LlvmType = nullptr;
@@ -923,6 +943,19 @@ abiRegisterSlot(const NativeAbiParamEntry &entry, const std::string &unitName,
   return slot;
 }
 
+AbiFacts::StackSlot abiStackSlot(const NativeAbiParamEntry &entry,
+                                 size_t abiIndex) {
+  AbiFacts::StackSlot slot;
+  slot.Space = entry.Storage.Space;
+  slot.MetaType = entry.MetaType;
+  slot.Offset = entry.Storage.Offset;
+  slot.MinSize = entry.MinSize;
+  slot.MaxSize = entry.MaxSize;
+  slot.Align = entry.Align;
+  slot.AbiIndex = abiIndex;
+  return slot;
+}
+
 AbiFacts
 collectAbiFacts(const llvm::Module &module,
                 const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -931,7 +964,7 @@ collectAbiFacts(const llvm::Module &module,
   if (!abi) {
     return facts;
   }
-  for (const NativeAbiParamEntry &entry : abi->Inputs) {
+  for (auto [abiIndex, entry] : llvm::enumerate(abi->Inputs)) {
     if (entry.Storage.Kind == NativeAbiStorageKind::Register &&
         !entry.Storage.Name.empty()) {
       std::string name = storageUnitName(entry.Storage, units);
@@ -944,6 +977,9 @@ collectAbiFacts(const llvm::Module &module,
       facts.InternalParamRegisters.insert(name);
       pushUnique(facts.InputsInOrder, name);
       facts.IntegerInputsInOrder.push_back(abiRegisterSlot(entry, name, units));
+    } else if (entry.Storage.Kind == NativeAbiStorageKind::Stack &&
+               !entry.Storage.Space.empty()) {
+      facts.StackInputsInOrder.push_back(abiStackSlot(entry, abiIndex));
     }
   }
   for (const NativeAbiParamEntry &entry : abi->Outputs) {
@@ -977,6 +1013,8 @@ collectAbiFacts(const llvm::Module &module,
       facts.KilledByCall.insert(storageUnitName(effect.Storage, units));
     }
   }
+  facts.StackPointer = abi->StackPointerRegister;
+  facts.StackShift = abi->StackShift;
   return facts;
 }
 
@@ -1135,6 +1173,52 @@ std::optional<NativeSignatureSlot> signatureSlotFromAbi(
   return slot;
 }
 
+uint64_t stackSlotStep(uint32_t sizeBytes, uint32_t alignBytes) {
+  if (alignBytes == 0) {
+    return sizeBytes;
+  }
+  uint64_t rounded =
+      ((static_cast<uint64_t>(sizeBytes) + alignBytes - 1) / alignBytes) *
+      alignBytes;
+  return std::max<uint64_t>(rounded, alignBytes);
+}
+
+std::optional<NativeSignatureSlot>
+signatureStackSlotFromAbi(const AbiFacts::StackSlot &abiSlot,
+                          unsigned stackIndex, llvm::Type *llvmType,
+                          NativeSignatureSlotKind kind) {
+  if (llvmType == nullptr || !llvmType->isSized() || abiSlot.MaxSize == 0) {
+    return std::nullopt;
+  }
+  uint32_t sizeBytes =
+      static_cast<uint32_t>((llvmType->getScalarSizeInBits() + 7) / 8);
+  if (sizeBytes == 0) {
+    return std::nullopt;
+  }
+  if (abiSlot.MinSize != 0 && sizeBytes < abiSlot.MinSize) {
+    sizeBytes = abiSlot.MinSize;
+  }
+  if (sizeBytes > abiSlot.MaxSize) {
+    return std::nullopt;
+  }
+  uint64_t relative = stackIndex * stackSlotStep(sizeBytes, abiSlot.Align);
+  if (relative > abiSlot.MaxSize || sizeBytes > abiSlot.MaxSize - relative) {
+    return std::nullopt;
+  }
+  NativeSignatureSlot slot;
+  slot.Kind = kind;
+  slot.AbiName = abiSlot.Space + "+" + std::to_string(abiSlot.Offset);
+  slot.MetaType = abiSlot.MetaType;
+  slot.StackSpace = abiSlot.Space;
+  slot.StackOffset = abiSlot.Offset + relative;
+  slot.StackSize = sizeBytes;
+  slot.StackAlign = abiSlot.Align;
+  slot.OffsetBits = 0;
+  slot.SizeBits = sizeBytes * 8;
+  slot.LlvmType = llvmType;
+  return slot;
+}
+
 llvm::Type *slotType(const NativeSignatureSlot &slot) {
   return slot.LlvmType != nullptr ? slot.LlvmType
                                   : slot.Unit->Global->getValueType();
@@ -1259,6 +1343,137 @@ floatSlotForDemand(llvm::LLVMContext &context,
                               NativeSignatureSlotKind::FloatRegister);
 }
 
+const RegisterUnit *stackPointerUnit(
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi) {
+  if (abi.StackPointer.empty()) {
+    return nullptr;
+  }
+  for (const auto &[global, unit] : units) {
+    (void)global;
+    if (unit.Name == abi.StackPointer) {
+      return &unit;
+    }
+  }
+  return nullptr;
+}
+
+std::optional<int64_t> entryStackOffsetFromValue(
+    llvm::Value *value, const RegisterUnit &stackPointer,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  value = value->stripPointerCasts();
+  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(value)) {
+    RegisterAccess access = registerLoad(*load, units);
+    if (access.Unit != nullptr && access.Unit->Global == stackPointer.Global) {
+      return 0;
+    }
+    return std::nullopt;
+  }
+  auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
+  if (binary == nullptr || (binary->getOpcode() != llvm::Instruction::Add &&
+                            binary->getOpcode() != llvm::Instruction::Sub)) {
+    return std::nullopt;
+  }
+  auto lhs = entryStackOffsetFromValue(binary->getOperand(0), stackPointer,
+                                       units);
+  auto *rhs = llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(1));
+  if (lhs && rhs != nullptr && rhs->getBitWidth() <= 64) {
+    int64_t delta = rhs->getSExtValue();
+    return binary->getOpcode() == llvm::Instruction::Sub ? *lhs - delta
+                                                          : *lhs + delta;
+  }
+  if (binary->getOpcode() == llvm::Instruction::Add) {
+    auto rhsOrigin = entryStackOffsetFromValue(binary->getOperand(1),
+                                               stackPointer, units);
+    auto *lhsConst = llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(0));
+    if (rhsOrigin && lhsConst != nullptr && lhsConst->getBitWidth() <= 64) {
+      return *rhsOrigin + lhsConst->getSExtValue();
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<int64_t> entryStackOffsetFromPointer(
+    llvm::Value *pointer, const RegisterUnit &stackPointer,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  pointer = pointer->stripPointerCasts();
+  auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(pointer);
+  if (intToPtr == nullptr) {
+    return std::nullopt;
+  }
+  return entryStackOffsetFromValue(intToPtr->getOperand(0), stackPointer, units);
+}
+
+std::optional<NativeSignatureSlot> stackInputSlotForLoad(
+    llvm::LoadInst &load,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi) {
+  const RegisterUnit *stackPointer = stackPointerUnit(units, abi);
+  if (stackPointer == nullptr || abi.StackInputsInOrder.empty() ||
+      !load.getType()->isSized()) {
+    return std::nullopt;
+  }
+  std::optional<int64_t> signedOffset = entryStackOffsetFromPointer(
+      load.getPointerOperand(), *stackPointer, units);
+  if (!signedOffset || *signedOffset < 0) {
+    return std::nullopt;
+  }
+  uint64_t offset = static_cast<uint64_t>(*signedOffset);
+  uint32_t sizeBytes =
+      static_cast<uint32_t>((load.getType()->getScalarSizeInBits() + 7) / 8);
+  if (sizeBytes == 0) {
+    return std::nullopt;
+  }
+  for (const AbiFacts::StackSlot &abiSlot : abi.StackInputsInOrder) {
+    if (offset < abiSlot.Offset || sizeBytes < abiSlot.MinSize ||
+        sizeBytes > abiSlot.MaxSize) {
+      continue;
+    }
+    uint64_t relative = offset - abiSlot.Offset;
+    if (relative > abiSlot.MaxSize || sizeBytes > abiSlot.MaxSize - relative) {
+      continue;
+    }
+    if (abiSlot.Align != 0 && relative % abiSlot.Align != 0) {
+      continue;
+    }
+    NativeSignatureSlot slot;
+    slot.Kind = NativeSignatureSlotKind::IntegerStack;
+    slot.AbiName = abiSlot.Space + "+" + std::to_string(offset);
+    slot.MetaType = abiSlot.MetaType;
+    slot.StackSpace = abiSlot.Space;
+    slot.StackOffset = offset;
+    slot.StackSize = sizeBytes;
+    slot.StackAlign = abiSlot.Align;
+    slot.OffsetBits = 0;
+    slot.SizeBits = sizeBytes * 8;
+    slot.LlvmType = load.getType();
+    return slot;
+  }
+  return std::nullopt;
+}
+
+void appendInternalStackParams(
+    SignatureShape &shape, llvm::Function &function,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi) {
+  std::map<std::pair<uint64_t, unsigned>, NativeSignatureSlot> stackSlots;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+    if (load == nullptr || load->use_empty()) {
+      continue;
+    }
+    if (std::optional<NativeSignatureSlot> slot =
+            stackInputSlotForLoad(*load, units, abi)) {
+      stackSlots.emplace(std::make_pair(slot->StackOffset, slot->SizeBits),
+                         *slot);
+    }
+  }
+  for (const auto &[key, slot] : stackSlots) {
+    (void)key;
+    shape.Params.push_back(slot);
+  }
+}
+
 SignatureShape shapeForInternalFunction(
     llvm::Function &function,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -1349,6 +1564,8 @@ SignatureShape shapeForInternalFunction(
     addParamForUnit(*unit, floatAbiInputSlotForUnit(abi, unit->Name));
   }
 
+  appendInternalStackParams(shape, function, units, abi);
+
   for (const RegisterUnit *unit : orderedUnits) {
     if (abi.InternalReturnRegisters.count(unit->Name) == 0) {
       continue;
@@ -1396,24 +1613,52 @@ SignatureShape shapeForInternalFunction(
 
 std::optional<NativeSignatureSlot>
 typedParamSlot(NativeExternalPrototype::ValueType type, unsigned &integerIndex,
-               unsigned &floatIndex,
+               unsigned &floatIndex, unsigned &stackIndex,
                const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
                const AbiFacts &abi, llvm::Module &module) {
   llvm::Type *llvmType = llvmTypeForKnownValue(module, type);
   if (isFloatKnownValue(type)) {
-    if (floatIndex >= abi.FloatInputsInOrder.size()) {
-      return std::nullopt;
+    if (floatIndex < abi.FloatInputsInOrder.size()) {
+      return signatureSlotFromAbi(abi.FloatInputsInOrder[floatIndex++], units,
+                                  llvmType,
+                                  NativeSignatureSlotKind::FloatRegister);
     }
-    return signatureSlotFromAbi(abi.FloatInputsInOrder[floatIndex++], units,
-                                llvmType,
-                                NativeSignatureSlotKind::FloatRegister);
-  }
-  if (integerIndex >= abi.IntegerInputsInOrder.size()) {
+    if (!abi.StackInputsInOrder.empty()) {
+      return signatureStackSlotFromAbi(abi.StackInputsInOrder.front(),
+                                       stackIndex++, llvmType,
+                                       NativeSignatureSlotKind::IntegerStack);
+    }
     return std::nullopt;
   }
-  return signatureSlotFromAbi(abi.IntegerInputsInOrder[integerIndex++], units,
-                              llvmType,
-                              NativeSignatureSlotKind::IntegerRegister);
+  if (integerIndex < abi.IntegerInputsInOrder.size()) {
+    return signatureSlotFromAbi(abi.IntegerInputsInOrder[integerIndex++], units,
+                                llvmType,
+                                NativeSignatureSlotKind::IntegerRegister);
+  }
+  if (!abi.StackInputsInOrder.empty()) {
+    return signatureStackSlotFromAbi(abi.StackInputsInOrder.front(),
+                                     stackIndex++, llvmType,
+                                     NativeSignatureSlotKind::IntegerStack);
+  }
+  return std::nullopt;
+}
+
+std::optional<NativeSignatureSlot>
+untypedIntegerParamSlot(unsigned index,
+                        const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+                        const AbiFacts &abi, llvm::Module &module) {
+  if (index < abi.IntegerInputsInOrder.size()) {
+    return signatureSlotFromAbi(abi.IntegerInputsInOrder[index], units, nullptr,
+                                NativeSignatureSlotKind::IntegerRegister);
+  }
+  if (abi.StackInputsInOrder.empty()) {
+    return std::nullopt;
+  }
+  llvm::Type *llvmType = llvmTypeForKnownValue(
+      module, NativeExternalPrototype::ValueType::PointerSized);
+  return signatureStackSlotFromAbi(
+      abi.StackInputsInOrder.front(), index - abi.IntegerInputsInOrder.size(),
+      llvmType, NativeSignatureSlotKind::IntegerStack);
 }
 
 std::optional<NativeSignatureSlot>
@@ -1489,9 +1734,10 @@ SignatureShape shapeForKnownExternal(
     }
     unsigned integerIndex = 0;
     unsigned floatIndex = 0;
+    unsigned stackIndex = 0;
     for (NativeExternalPrototype::ValueType type : known->TypedParams) {
       std::optional<NativeSignatureSlot> slot = typedParamSlot(
-          type, integerIndex, floatIndex, units, abi, *module);
+          type, integerIndex, floatIndex, stackIndex, units, abi, *module);
       if (!slot) {
         return shape;
       }
@@ -1508,14 +1754,16 @@ SignatureShape shapeForKnownExternal(
     shape.MaxArgs = known->MaxArgs;
     return shape;
   }
-  unsigned count =
-      std::min<unsigned>(known->FixedArgs, abi.InputsInOrder.size());
   shape.VarArg = known->VarArg;
   shape.MaxArgs = known->MaxArgs;
-  for (unsigned index = 0; index < count; ++index) {
-    const RegisterUnit *unit = unitByName(units, abi.InputsInOrder[index]);
-    if (unit != nullptr) {
-      shape.Params.push_back(integerSignatureSlot(*unit));
+  if (llvm::Module *module = function.getParent()) {
+    for (unsigned index = 0; index < known->FixedArgs; ++index) {
+      std::optional<NativeSignatureSlot> slot =
+          untypedIntegerParamSlot(index, units, abi, *module);
+      if (!slot) {
+        break;
+      }
+      shape.Params.push_back(*slot);
     }
   }
   return shape;
@@ -1523,7 +1771,16 @@ SignatureShape shapeForKnownExternal(
 
 NativeRegisterCallInputSlot callInputSlot(const NativeSignatureSlot &slot) {
   NativeRegisterCallInputSlot input;
-  input.UnitName = slot.Unit->Name;
+  if (slot.Kind == NativeSignatureSlotKind::IntegerStack) {
+    input.Kind = NativeRegisterCallInputSlotKind::Stack;
+    input.StackSpace = slot.StackSpace;
+    input.StackOffset = slot.StackOffset;
+    input.StackSize = slot.StackSize;
+    input.StackAlign = slot.StackAlign;
+  } else {
+    input.Kind = NativeRegisterCallInputSlotKind::Register;
+    input.UnitName = slot.Unit->Name;
+  }
   input.OffsetBits = slot.OffsetBits;
   input.SizeBits = slot.SizeBits;
   input.Float = slot.Kind == NativeSignatureSlotKind::FloatRegister;
@@ -1532,6 +1789,7 @@ NativeRegisterCallInputSlot callInputSlot(const NativeSignatureSlot &slot) {
 
 NativeRegisterCallInputSlot callInputSlot(const AbiFacts::RegisterSlot &slot) {
   NativeRegisterCallInputSlot input;
+  input.Kind = NativeRegisterCallInputSlotKind::Register;
   input.UnitName = slot.UnitName;
   input.OffsetBits = slot.OffsetBits;
   input.SizeBits = slot.SizeBits;
@@ -1539,10 +1797,63 @@ NativeRegisterCallInputSlot callInputSlot(const AbiFacts::RegisterSlot &slot) {
   return input;
 }
 
+NativeRegisterCallInputSlot callInputSlot(const AbiFacts::StackSlot &slot,
+                                          unsigned stackIndex,
+                                          llvm::Type *llvmType) {
+  NativeRegisterCallInputSlot input;
+  input.Kind = NativeRegisterCallInputSlotKind::Stack;
+  input.StackSpace = slot.Space;
+  uint32_t sizeBytes =
+      static_cast<uint32_t>((llvmType->getScalarSizeInBits() + 7) / 8);
+  uint64_t relative = stackIndex * stackSlotStep(sizeBytes, slot.Align);
+  if (relative > slot.MaxSize || sizeBytes > slot.MaxSize - relative) {
+    return input;
+  }
+  input.StackOffset = slot.Offset + relative;
+  input.StackSize = sizeBytes;
+  input.StackAlign = slot.Align;
+  input.SizeBits = sizeBytes * 8;
+  input.Float = false;
+  return input;
+}
+
 bool sameCallInputSlot(const NativeRegisterCallInputSlot &lhs,
                        const NativeRegisterCallInputSlot &rhs) {
-  return lhs.UnitName == rhs.UnitName && lhs.OffsetBits == rhs.OffsetBits &&
-         lhs.SizeBits == rhs.SizeBits && lhs.Float == rhs.Float;
+  if (lhs.Kind != rhs.Kind || lhs.OffsetBits != rhs.OffsetBits ||
+      lhs.SizeBits != rhs.SizeBits || lhs.Float != rhs.Float) {
+    return false;
+  }
+  if (lhs.Kind == NativeRegisterCallInputSlotKind::Stack) {
+    return lhs.StackSpace == rhs.StackSpace &&
+           lhs.StackOffset == rhs.StackOffset &&
+           lhs.StackSize == rhs.StackSize && lhs.StackAlign == rhs.StackAlign;
+  }
+  return lhs.UnitName == rhs.UnitName;
+}
+
+void addStackEvidenceSlots(const AbiFacts &abi, llvm::Module &module,
+                           std::vector<NativeRegisterCallInputSlot> &slots,
+                           unsigned startIndex, unsigned count,
+                           llvm::ArrayRef<NativeRegisterCallInputSlot> fixed) {
+  if (abi.StackInputsInOrder.empty() || count == 0) {
+    return;
+  }
+  llvm::Type *slotType = llvmTypeForKnownValue(
+      module, NativeExternalPrototype::ValueType::PointerSized);
+  const AbiFacts::StackSlot &stack = abi.StackInputsInOrder.front();
+  for (unsigned index = 0; index < count; ++index) {
+    NativeRegisterCallInputSlot input =
+        callInputSlot(stack, startIndex + index, slotType);
+    if (input.SizeBits == 0) {
+      break;
+    }
+    if (std::none_of(fixed.begin(), fixed.end(),
+                     [&](const NativeRegisterCallInputSlot &existing) {
+                       return sameCallInputSlot(existing, input);
+                     })) {
+      slots.push_back(std::move(input));
+    }
+  }
 }
 
 NativeExternalCallShapeMap buildExternalCallShapes(
@@ -1566,9 +1877,7 @@ NativeExternalCallShapeMap buildExternalCallShapes(
     callShape.MaxArgs = known->MaxArgs;
     callShape.FixedInputsComplete = signature.Params.size() == known->FixedArgs;
     for (const NativeSignatureSlot &slot : signature.Params) {
-      if (slot.Unit != nullptr) {
-        callShape.Inputs.push_back(callInputSlot(slot));
-      }
+      callShape.Inputs.push_back(callInputSlot(slot));
     }
 
     // The preliminary summary reads only fixed inputs.  Keep the remaining ABI
@@ -1590,6 +1899,16 @@ NativeExternalCallShapeMap buildExternalCallShapes(
       for (const AbiFacts::RegisterSlot &slot : abi.FloatInputsInOrder) {
         addRemaining(slot, callShape.VarArgInputs);
       }
+      unsigned fixedStack = 0;
+      for (const NativeRegisterCallInputSlot &input : callShape.Inputs) {
+        if (input.Kind == NativeRegisterCallInputSlotKind::Stack) {
+          ++fixedStack;
+        }
+      }
+      unsigned tailCount =
+          callShape.MaxArgs == 0 ? 16 : callShape.MaxArgs - callShape.FixedArgs;
+      addStackEvidenceSlots(abi, module, callShape.VarArgInputs, fixedStack,
+                            tailCount, callShape.Inputs);
     }
     result.emplace(function.getName().str(), std::move(callShape));
   }
@@ -1597,11 +1916,16 @@ NativeExternalCallShapeMap buildExternalCallShapes(
 }
 
 std::vector<NativeRegisterCallInputSlot>
-unknownExternalEvidenceSlots(const AbiFacts &abi) {
+unknownExternalEvidenceSlots(const AbiFacts &abi, llvm::Module &module) {
   std::vector<NativeRegisterCallInputSlot> result;
-  result.reserve(abi.IntegerInputsInOrder.size());
+  result.reserve(abi.IntegerInputsInOrder.size() + 16);
   for (const AbiFacts::RegisterSlot &slot : abi.IntegerInputsInOrder) {
     result.push_back(callInputSlot(slot));
+  }
+  if (!abi.StackInputsInOrder.empty()) {
+    // Unknown externals need a finite evidence window.  The offsets still come
+    // from cspec; this bound only stops unbounded pentry expansion.
+    addStackEvidenceSlots(abi, module, result, 0, 16, {});
   }
   return result;
 }
@@ -1665,7 +1989,12 @@ bool hasLocalDefinitionAfter(
 NativeRegisterCallInputSlot
 callInputSlot(const NativeRegisterCallsiteSlotEvidence &slot) {
   NativeRegisterCallInputSlot input;
+  input.Kind = slot.Kind;
   input.UnitName = slot.UnitName;
+  input.StackSpace = slot.StackSpace;
+  input.StackOffset = slot.StackOffset;
+  input.StackSize = slot.StackSize;
+  input.StackAlign = slot.StackAlign;
   input.OffsetBits = slot.OffsetBits;
   input.SizeBits = slot.SizeBits;
   input.Float = slot.Float;
@@ -1776,6 +2105,10 @@ slotAtPrefix(llvm::ArrayRef<NativeRegisterCallsiteSlotEvidence> slots,
 }
 
 std::string slotDetail(const NativeRegisterCallsiteSlotEvidence &slot) {
+  if (slot.Kind == NativeRegisterCallInputSlotKind::Stack) {
+    return slot.StackSpace + "+" + std::to_string(slot.StackOffset) + "[" +
+           std::to_string(slot.SizeBits) + "]=" + originName(slot.Origin).str();
+  }
   return slot.UnitName + "[" + std::to_string(slot.OffsetBits) + ":" +
          std::to_string(slot.SizeBits) + "]=" +
          originName(slot.Origin).str();
@@ -1801,6 +2134,9 @@ std::string calleeNameForWarning(const llvm::CallBase &call) {
 }
 
 std::string slotRegisterName(const NativeSignatureSlot &slot) {
+  if (slot.Kind == NativeSignatureSlotKind::IntegerStack) {
+    return slot.StackSpace + "+" + std::to_string(slot.StackOffset);
+  }
   if (slot.Unit != nullptr) {
     return slot.Unit->Name;
   }
@@ -2236,6 +2572,47 @@ void refineIndirectCallsiteParamShapes(SignatureRewriteState &state) {
   }
 }
 
+void refineInternalStackParamShapes(SignatureRewriteState &state) {
+  for (auto &[function, shape] : state.Shapes) {
+    if (function == nullptr || function->isDeclaration()) {
+      continue;
+    }
+    auto firstStack = std::find_if(
+        shape.Params.begin(), shape.Params.end(),
+        [](const NativeSignatureSlot &slot) {
+          return slot.Kind == NativeSignatureSlotKind::IntegerStack;
+        });
+    if (firstStack == shape.Params.end()) {
+      continue;
+    }
+
+    unsigned finalArity = shape.Params.size();
+    bool hasDirectCall = false;
+    for (auto &[call, bindings] : state.CallArgs) {
+      if (call == nullptr || call->getCalledFunction() != function) {
+        continue;
+      }
+      hasDirectCall = true;
+      finalArity = std::min(finalArity, callsiteBoundArgPrefix(bindings));
+    }
+    if (!hasDirectCall || finalArity >= shape.Params.size()) {
+      continue;
+    }
+    shape.Params.resize(finalArity);
+    for (auto &[call, bindings] : state.CallArgs) {
+      if (call == nullptr || call->getCalledFunction() != function) {
+        continue;
+      }
+      bindings.erase(
+          std::remove_if(bindings.begin(), bindings.end(),
+                         [&](const CallArgStoreBinding &binding) {
+                           return binding.Index >= finalArity;
+                         }),
+          bindings.end());
+    }
+  }
+}
+
 void markSignatureCallArgStores(SignatureRewriteState &state,
                                 NativeRegisterSummarySSASummary &summary) {
   for (const auto &[call, bindings] : state.CallArgs) {
@@ -2381,6 +2758,11 @@ public:
   }
 
 private:
+  struct EntryAddressState {
+    std::map<llvm::Value *, int64_t> Offsets;
+    std::optional<int64_t> StackPointerOffset = 0;
+  };
+
   llvm::Function &Function;
   const std::map<llvm::GlobalVariable *, RegisterUnit> &Units;
   const std::map<llvm::Function *, FunctionSummaryFacts> &SummaryFacts;
@@ -4939,6 +5321,112 @@ private:
     return nullptr;
   }
 
+  llvm::GlobalVariable *stackPointerGlobal() const {
+    if (Abi.StackPointer.empty()) {
+      return nullptr;
+    }
+    for (const auto &[global, unit] : Units) {
+      if (unit.Name == Abi.StackPointer) {
+        return global;
+      }
+    }
+    return nullptr;
+  }
+
+  std::optional<int64_t> entryOffsetForValue(llvm::Value *value,
+                                             EntryAddressState &state) const {
+    value = value->stripPointerCasts();
+    auto known = state.Offsets.find(value);
+    if (known != state.Offsets.end()) {
+      return known->second;
+    }
+    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
+    if (binary == nullptr || (binary->getOpcode() != llvm::Instruction::Add &&
+                              binary->getOpcode() != llvm::Instruction::Sub)) {
+      return std::nullopt;
+    }
+    auto lhs = entryOffsetForValue(binary->getOperand(0), state);
+    auto *rhs = llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(1));
+    if (!lhs || rhs == nullptr || rhs->getBitWidth() > 64) {
+      if (binary->getOpcode() == llvm::Instruction::Add) {
+        auto rhsOrigin = entryOffsetForValue(binary->getOperand(1), state);
+        auto *lhsConst = llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(0));
+        if (rhsOrigin && lhsConst != nullptr && lhsConst->getBitWidth() <= 64) {
+          return *rhsOrigin + lhsConst->getSExtValue();
+        }
+      }
+      return std::nullopt;
+    }
+    int64_t delta = rhs->getSExtValue();
+    return binary->getOpcode() == llvm::Instruction::Sub ? *lhs - delta
+                                                          : *lhs + delta;
+  }
+
+  void transferEntryAddressInst(llvm::Instruction &inst,
+                                EntryAddressState &state) const {
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      RegisterAccess access = registerLoad(*load, Units);
+      if (access.Unit != nullptr && access.Unit->Global == stackPointerGlobal() &&
+          state.StackPointerOffset) {
+        state.Offsets[load] = *state.StackPointerOffset;
+      }
+      return;
+    }
+    if (auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(&inst)) {
+      if (auto offset = entryOffsetForValue(binary, state)) {
+        state.Offsets[binary] = *offset;
+      }
+      return;
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      RegisterAccess access = registerStore(*store, Units);
+      if (access.Unit != nullptr && access.Unit->Global == stackPointerGlobal()) {
+        state.StackPointerOffset =
+            entryOffsetForValue(store->getValueOperand(), state);
+      }
+    }
+  }
+
+  EntryAddressState entryAddressStateBefore(llvm::Instruction &before) const {
+    EntryAddressState state;
+    if (before.getParent() == nullptr) {
+      state.StackPointerOffset = std::nullopt;
+      return state;
+    }
+    for (llvm::Instruction &inst : *before.getParent()) {
+      if (&inst == &before) {
+        break;
+      }
+      transferEntryAddressInst(inst, state);
+    }
+    return state;
+  }
+
+  std::optional<int64_t> entryStackOffsetBefore(llvm::Instruction &before,
+                                                llvm::Value *pointer) const {
+    llvm::GlobalVariable *stackPointer = stackPointerGlobal();
+    if (stackPointer == nullptr) {
+      return std::nullopt;
+    }
+    pointer = pointer->stripPointerCasts();
+    auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(pointer);
+    if (intToPtr == nullptr) {
+      return std::nullopt;
+    }
+    EntryAddressState state = entryAddressStateBefore(before);
+    return entryOffsetForValue(intToPtr->getOperand(0), state);
+  }
+
+  std::optional<int64_t> callsiteStackOffset(llvm::CallBase &call,
+                                             const NativeSignatureSlot &slot) const {
+    EntryAddressState state = entryAddressStateBefore(call);
+    if (!state.StackPointerOffset) {
+      return std::nullopt;
+    }
+    return *state.StackPointerOffset + static_cast<int64_t>(slot.StackOffset) -
+           static_cast<int64_t>(Abi.StackShift);
+  }
+
   std::pair<llvm::Argument *, const NativeSignatureSlot *>
   entryArgumentSlot(const RegisterUnit &unit) const {
     auto shapeIt = SignatureState.Shapes.find(&Function);
@@ -5199,7 +5687,9 @@ private:
             externalCallsiteShapeForCall(SignatureState, call)) {
       return llvm::any_of(callsiteShape->Inputs,
                           [&](const NativeRegisterCallInputSlot &input) {
-                            return input.UnitName == unit.Name;
+                            return input.Kind ==
+                                       NativeRegisterCallInputSlotKind::Register &&
+                                   input.UnitName == unit.Name;
                           });
     }
     for (const NativeSignatureSlot &slot : shape->Params) {
@@ -5263,6 +5753,21 @@ private:
 
   std::optional<NativeSignatureSlot>
   signatureSlotForCallInput(const NativeRegisterCallInputSlot &input) const {
+    if (input.Kind == NativeRegisterCallInputSlotKind::Stack) {
+      llvm::Type *type =
+          llvm::IntegerType::get(Function.getContext(), input.SizeBits);
+      NativeSignatureSlot slot;
+      slot.Kind = NativeSignatureSlotKind::IntegerStack;
+      slot.AbiName = input.StackSpace + "+" + std::to_string(input.StackOffset);
+      slot.StackSpace = input.StackSpace;
+      slot.StackOffset = input.StackOffset;
+      slot.StackSize = input.StackSize;
+      slot.StackAlign = input.StackAlign;
+      slot.OffsetBits = 0;
+      slot.SizeBits = input.SizeBits;
+      slot.LlvmType = type;
+      return slot;
+    }
     const RegisterUnit *unit = unitByName(input.UnitName);
     if (unit == nullptr) {
       return std::nullopt;
@@ -5318,11 +5823,6 @@ private:
     std::vector<NativeSignatureSlot> slots = callParamSlots(call, shape);
     for (auto [index, slot] : llvm::enumerate(slots)) {
       const RegisterUnit *unit = slot.Unit;
-      if (unit == nullptr) {
-        SignatureState.Warnings.push_back(
-            callSlotWarning(call, slot, "call_arg", "call_arg_slot_missing"));
-        break;
-      }
       llvm::Value *value = resolve(readSlotValueBefore(call, slot));
       if (value == nullptr) {
         SignatureState.Warnings.push_back(callSlotWarning(
@@ -5338,7 +5838,10 @@ private:
         SignatureState.Warnings.push_back(callSlotWarning(
             call, slot, "call_arg", "call_arg_binding_uses_clobber_value"));
       }
-      llvm::StoreInst *store = findNearestStoreBeforeCall(call, *unit);
+      llvm::StoreInst *store =
+          slot.Kind == NativeSignatureSlotKind::IntegerStack
+              ? findNearestStackStoreBeforeCall(call, slot)
+              : findNearestStoreBeforeCall(call, *unit);
       bindings.push_back(CallArgStoreBinding{store, unit, value, value,
                                              slotType(slot),
                                              static_cast<unsigned>(index)});
@@ -5350,7 +5853,7 @@ private:
                                    const NativeSignatureSlot &slot) {
     return readSlotValueBefore(
         static_cast<llvm::Instruction &>(call), slot,
-        slot.Unit == nullptr ? llvm::Twine("slot")
+        slot.Unit == nullptr ? llvm::Twine("stack.arg")
                              : llvm::Twine(slot.Unit->Name) + ".arg_range");
   }
 
@@ -5358,6 +5861,10 @@ private:
                                    const NativeSignatureSlot &slot,
                                    llvm::Twine rangeName,
                                    bool allowUnknownSegments = false) {
+    if (slot.Kind == NativeSignatureSlotKind::IntegerStack) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&before);
+      return call == nullptr ? nullptr : readStackSlotValueBefore(*call, slot);
+    }
     if (slot.Unit == nullptr || before.getParent() == nullptr) {
       return nullptr;
     }
@@ -5418,6 +5925,60 @@ private:
     llvm::IRBuilder<> builder(castBefore);
     return builder.CreateBitCast(bits, targetType,
                                  slot.Unit->Name + ".arg_range_float");
+  }
+
+  llvm::Value *readStackSlotValueBefore(llvm::CallBase &call,
+                                        const NativeSignatureSlot &slot) {
+    llvm::StoreInst *store = findNearestStackStoreBeforeCall(call, slot);
+    if (store == nullptr) {
+      return nullptr;
+    }
+    llvm::Value *value = resolve(store->getValueOperand());
+    llvm::Type *targetType = slotType(slot);
+    if (value == nullptr || targetType == nullptr) {
+      return nullptr;
+    }
+    if (value->getType() == targetType) {
+      return value;
+    }
+    if (!value->getType()->isIntegerTy() || !targetType->isIntegerTy()) {
+      return nullptr;
+    }
+    llvm::IRBuilder<> builder(&call);
+    return builder.CreateZExtOrTrunc(value, targetType, "stack.arg.cast");
+  }
+
+  llvm::StoreInst *findNearestStackStoreBeforeCall(
+      llvm::CallBase &call, const NativeSignatureSlot &slot) {
+    std::optional<int64_t> expected = callsiteStackOffset(call, slot);
+    if (!expected || call.getParent() == nullptr) {
+      return nullptr;
+    }
+    for (auto it = call.getIterator(); it != call.getParent()->begin();) {
+      --it;
+      llvm::Instruction &inst = *it;
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        std::optional<int64_t> offset =
+            entryStackOffsetBefore(*store, store->getPointerOperand());
+        if (!offset) {
+          return nullptr;
+        }
+        if (*offset == *expected) {
+          return store;
+        }
+        continue;
+      }
+      if (auto *otherCall = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (isAnalyzableCall(*otherCall)) {
+          return nullptr;
+        }
+        continue;
+      }
+      if (inst.mayWriteToMemory()) {
+        return nullptr;
+      }
+    }
+    return nullptr;
   }
 
   llvm::StoreInst *findNearestStoreBeforeCall(llvm::CallBase &call,
@@ -6282,7 +6843,10 @@ llvm::Value *rangeEntrySlotReplacement(llvm::Instruction &inst,
 void rewriteInternalFunctionBody(llvm::Function &oldFunction,
                                  llvm::Function &newFunction,
                                  const SignatureShape &shape,
-                                 SignatureRewriteState &state) {
+                                 SignatureRewriteState &state,
+                                 const std::map<llvm::GlobalVariable *,
+                                                RegisterUnit> &units,
+                                 const AbiFacts &abi) {
   newFunction.splice(newFunction.end(), &oldFunction);
   unsigned index = 0;
   for (llvm::Argument &arg : newFunction.args()) {
@@ -6290,7 +6854,7 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
       break;
     }
     const NativeSignatureSlot &slot = shape.Params[index];
-    arg.setName(slot.Unit->Name + ".arg");
+    arg.setName(slotRegisterName(slot) + ".arg");
     std::vector<llvm::LoadInst *> entryLoads;
     if (slot.Unit != nullptr && slot.Unit->Global != nullptr) {
       for (llvm::Instruction &inst : llvm::instructions(newFunction)) {
@@ -6307,6 +6871,18 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
       for (auto it = block.begin(); it != block.end();) {
         llvm::Instruction &inst = *it++;
         auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+        if (slot.Kind == NativeSignatureSlotKind::IntegerStack) {
+          if (load != nullptr && load->getType() == arg.getType()) {
+            std::optional<NativeSignatureSlot> loadSlot =
+                stackInputSlotForLoad(*load, units, abi);
+            if (loadSlot && loadSlot->StackOffset == slot.StackOffset &&
+                loadSlot->SizeBits == slot.SizeBits) {
+              state.ValueMap[load] = &arg;
+              load->replaceAllUsesWith(&arg);
+            }
+          }
+          continue;
+        }
         if (load != nullptr &&
             load->getMetadata("notdec.register.summary_ssa.entry") != nullptr) {
           auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
@@ -6548,6 +7124,8 @@ foldFullInsertOfExtracts(llvm::Value *value,
 }
 
 void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
+                            const std::map<llvm::GlobalVariable *, RegisterUnit>
+                                &units,
                             const AbiFacts &abi,
                             NativeRegisterSummarySSASummary &summary) {
   std::map<llvm::Function *, llvm::Function *> replacements;
@@ -6564,7 +7142,8 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
     replacements[function] = newFunction;
     replacementShapes.emplace_back(newFunction, shape);
     if (!function->isDeclaration()) {
-      rewriteInternalFunctionBody(*function, *newFunction, shape, state);
+      rewriteInternalFunctionBody(*function, *newFunction, shape, state, units,
+                                  abi);
     }
     ++summary.FunctionsRewritten;
   }
@@ -6951,7 +7530,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       NativeRegisterUnknownExternalInputPolicy::NoInputs;
   baseSummaryOptions.RunTopDownDemand = false;
   baseSummaryOptions.CollectExternalCallsiteEvidence = true;
-  baseSummaryOptions.ExternalEvidenceSlots = unknownExternalEvidenceSlots(abi);
+  baseSummaryOptions.ExternalEvidenceSlots = unknownExternalEvidenceSlots(abi, module);
   NativeRegisterSummary baseRegisterSummary =
       runNativeRegisterSummary(module, baseSummaryOptions);
   std::map<llvm::Function *, FunctionSummaryFacts> baseFacts =
@@ -7003,9 +7582,10 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   }
   if (options.EnableRewrite) {
     refineIndirectCallsiteParamShapes(signatureState);
+    refineInternalStackParamShapes(signatureState);
     addDemandedExternalReturns(signatureState, units, abi, externalPrototypes);
     markSignatureCallArgStores(signatureState, summary);
-    rewriteSignatureShapes(module, signatureState, abi, summary);
+    rewriteSignatureShapes(module, signatureState, units, abi, summary);
     eraseUnusedSummaryHelperDeclarations(module);
     if (options.EnableResidueRemoval) {
       constexpr unsigned maxPostRewriteCleanupIterations = 10;

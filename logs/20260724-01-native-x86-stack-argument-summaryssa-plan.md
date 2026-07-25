@@ -146,3 +146,39 @@ signature rewrite 可以把 stack 参数变成 LLVM call operands / function arg
 - callee pop / stdcall 清理差异。
 - 复杂 `EBP` frame pointer 场景。
 - 完整 i386 float/x87 参数恢复。
+
+# 实现记录（2026-07-25）
+
+本轮已完成第一版 fixed stack argument 支持，范围仍限 SummarySSA 默认链路，不碰 heritage。
+
+## 改动位置
+
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummary.h:17`：给 `NativeRegisterCallInputSlot` / `NativeRegisterCallsiteSlotEvidence` 增加 register/stack kind，以及 stack space、callee entry-SP offset、size、align 字段。这里的 offset 是 cspec pentry offset。
+- `lib/passes/summary/NativeRegisterSummary.cpp:117`、`:1372`、`:1603`、`:1914`：第一遍 summary 记录 caller 栈 slot 的 local/entry evidence；匹配 caller store 时使用 `slot.StackOffset - Abi.StackShift`，所以 i386 `stack+4` 会匹配 call 前 `ESP+0`，x64 `stack+8` 会匹配 call 前 `RSP+0`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:94`、`:1017`、`:1174`、`:1614`：`AbiFacts` 保留 `NativeAbiSpec::Inputs` 里的 stack pentry，并从 pentry 展开 concrete stack slot；没有按架构名硬编码 `ESP+4`、`RSP+8` 或 `RSP+40`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1344`、`:1455`、`:1567`、`:6874`：callee 侧识别 `SP.entry + 常量` 的 stack load，匹配 ABI stack pentry 后加入 internal signature，并在 rewrite 时用 LLVM argument 替换对应 load。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1774`、`:1839`、`:5756`、`:5930`、`:5951`：known external、vararg tail、unknown external evidence 和 call rewrite 都能携带 stack input；caller 侧只接受同一 basic block 内 fixed offset stack store，遇到 unknown memory write / 中间 call 就停止。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:2575`：新增 `refineInternalStackParamShapes()`。实现时发现如果仅按 callee stack load 加参数，x64 fortune 会把未绑定的内部函数 stack load 改成 `notdec.unknown` 参数；现在会按直接 callsite 绑定前缀裁剪 internal stack params，避免 x64 误扩。
+- `tests/native_register_summary_ssa_test.cpp:127`、`:2123`、`:2179`、`:2240`：新增 i386 known external 自定义 stack offset、x64 第七参 stack overflow 自定义 offset、i386 internal stack input rewrite 三个测试。测试故意用 i386 `stack+12`、x64 `stack+16`，用来证明逻辑读的是 ABI metadata，不是常见 offset 硬编码。
+
+## 和原计划的差异
+
+- 原计划里“callee 扫到 stack load 就加入 internal signature”不够保守。真实 x64 fortune 里有内部函数读取 entry-SP 正偏移，但 caller 不一定有可证明的 stack arg store。直接 rewrite 会产生大量 `stack+*.arg_unknown`。本轮增加了 direct callsite 绑定裁剪，只保留能被 caller 证明的 internal stack params。
+- unknown external 的 stack evidence 需要使用当前 module 的 DataLayout 来决定 pointer-sized stack slot 大小，不能用临时 module 或固定 64-bit。
+- vararg / unknown external 的 stack evidence 需要有限窗口。本轮用 16 个候选作为推断上限；offset 和步长仍来自 cspec pentry 的 offset/align/maxsize。
+
+## 验证
+
+- `cmake --build external/NotDec-bin2llvm/build --target native_register_summary_ssa_test notdec-native-llvm -j4`：通过。
+- `./external/NotDec-bin2llvm/build/bin/native_register_summary_ssa_test`：通过。
+- `ctest --test-dir external/NotDec-bin2llvm/build -R 'notdec.native_(llvm.realworld_fortune_i386|discover.x86_64_smoke|llvm.x86_64_smoke|llvm.realworld_fortune_x86_64)' --output-on-failure`：4/4 通过。最终本机耗时：x64 discover smoke 6.77s，x64 llvm smoke 0.33s，x64 fortune 12.83s，i386 fortune 14.99s。
+
+本轮没有单独记录修改前同口径 fortune 时间；但实现过程中曾出现 x64 fortune `notdec.unknown` 残留，已经通过 internal stack param 裁剪修掉，最终 x64/i386 fortune 都通过。
+
+## 评分
+
+- 实现效果：8/10。已覆盖 cspec stack pentry、i386 stack arg、x64 register overflow stack arg、callee stack load rewrite，以及 fortune 回归。
+- 复杂度：6/10。新增了 stack slot 表达和局部 entry-SP offset 分析，但仍限制在固定 offset，不引入 alias 或完整栈数据流。
+- 维护成本：6/10。主要成本是 Summary 和 SummarySSA 两边都要理解 stack input；后续如果支持 EBP 正偏移、stdcall、byval，需要继续收窄规则，不能在当前 helper 上硬扩。
+
+更好的后续方案是把 `NativePrototypeModel::findInputStack()` 风格的 range/align 匹配抽成 Summary / SummarySSA 共用 helper，减少当前两处手写匹配逻辑。

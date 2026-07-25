@@ -14,8 +14,22 @@ class raw_ostream;
 
 namespace notdec::bin2llvm {
 
+enum class NativeRegisterCallInputSlotKind {
+  Register,
+  Stack,
+};
+
 struct NativeRegisterCallInputSlot {
+  NativeRegisterCallInputSlotKind Kind =
+      NativeRegisterCallInputSlotKind::Register;
   std::string UnitName;
+  // Stack slots are ABI pentry-derived locations.  StackOffset is the callee
+  // entry-SP relative offset from cspec; caller-side matching adjusts it by the
+  // cspec stackshift before looking for the store before CALL.
+  std::string StackSpace;
+  uint64_t StackOffset = 0;
+  uint32_t StackSize = 0;
+  uint32_t StackAlign = 0;
   unsigned OffsetBits = 0;
   unsigned SizeBits = 0;
   // True for ABI floating-point slots backed by a lifted integer register.
@@ -54,7 +68,13 @@ enum class NativeRegisterCallsiteValueOrigin {
 
 struct NativeRegisterCallsiteSlotEvidence {
   unsigned Index = 0;
+  NativeRegisterCallInputSlotKind Kind =
+      NativeRegisterCallInputSlotKind::Register;
   std::string UnitName;
+  std::string StackSpace;
+  uint64_t StackOffset = 0;
+  uint32_t StackSize = 0;
+  uint32_t StackAlign = 0;
   unsigned OffsetBits = 0;
   unsigned SizeBits = 0;
   bool Float = false;

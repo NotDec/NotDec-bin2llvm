@@ -124,6 +124,76 @@ void attachTestAbi(llvm::Module &module) {
   attachTestAbiWithInputs(module, {"RDI"});
 }
 
+void addStackInput(notdec::bin2llvm::NativeAbiSpec &abi,
+                   const std::string &space, uint64_t offset, uint32_t align,
+                   uint32_t maxSize = 64) {
+  notdec::bin2llvm::NativeAbiParamEntry input;
+  input.MinSize = 1;
+  input.MaxSize = maxSize;
+  input.Align = align;
+  input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Stack;
+  input.Storage.Space = space;
+  input.Storage.Offset = offset;
+  abi.Inputs.push_back(input);
+}
+
+void attachI386StackTestAbi(llvm::Module &module, uint64_t offset = 4) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_i386_stack_test";
+  abi.StackPointerRegister = "ESP";
+  abi.StackPointerSpace = "register";
+  abi.StackShift = 4;
+  addStackInput(abi, "stack", offset, 4);
+
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 4;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "EAX";
+  abi.Outputs.push_back(output);
+
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = "EAX";
+  abi.Effects.push_back(killed);
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
+void attachX64StackTestAbi(llvm::Module &module, uint64_t offset = 8) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_x64_stack_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  abi.StackShift = 8;
+
+  for (llvm::StringRef name : {"RDI", "RSI", "RDX", "RCX", "R8", "R9"}) {
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 1;
+    input.MaxSize = 8;
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = name.str();
+    abi.Inputs.push_back(input);
+  }
+  addStackInput(abi, "stack", offset, 8);
+
+  notdec::bin2llvm::NativeAbiParamEntry output;
+  output.MinSize = 1;
+  output.MaxSize = 8;
+  output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  output.Storage.Name = "RAX";
+  abi.Outputs.push_back(output);
+
+  notdec::bin2llvm::NativeAbiEffect killed;
+  killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+  killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  killed.Storage.Name = "RAX";
+  abi.Effects.push_back(killed);
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 void attachI386TestAbi(llvm::Module &module) {
   notdec::bin2llvm::NativeAbiSpec abi;
   abi.PrototypeName = "__summary_ssa_i386_test";
@@ -2048,6 +2118,187 @@ bool testAbiInputStoreBeforeCallIsKept() {
                 "ABI input store before call was not collected") &&
          expect(callRewritten, "ABI input call was not rewritten") &&
          verifyOk(module, "module failed verifier after call input test");
+}
+
+bool testI386KnownExternalUsesCspecStackOffset() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-i386-stack-known-external", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackTestAbi(module, 12);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  llvm::GlobalVariable *esp =
+      createRegisterGlobal(module, "ESP", i32, 0, 4);
+  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+
+  auto *calleeType = llvm::FunctionType::get(i32, {}, false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "puts", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "i386_stack_known", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *espEntry = loadRegister(builder, esp, "ESP", "esp.entry", 4);
+  llvm::Value *argAddress = builder.CreateAdd(
+      espEntry, llvm::ConstantInt::get(i32, 8), "arg.addr");
+  llvm::Value *argPointer =
+      builder.CreateIntToPtr(argAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(i32, 42), argPointer);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction = module.getFunction("i386_stack_known");
+  if (!expect(rewrittenFunction != nullptr,
+              "i386 stack external caller missing")) {
+    return false;
+  }
+  llvm::CallInst *rewritten = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName() == "puts") {
+      rewritten = call;
+    }
+  }
+  auto *constant = rewritten == nullptr || rewritten->arg_size() != 1
+                       ? nullptr
+                       : llvm::dyn_cast<llvm::ConstantInt>(
+                             rewritten->getArgOperand(0));
+  return expect(rewritten != nullptr, "i386 stack external call missing") &&
+         expect(rewritten->arg_size() == 1,
+                "i386 stack external did not use one stack arg") &&
+         expect(constant != nullptr && constant->getZExtValue() == 42,
+                "i386 stack arg did not come from cspec offset") &&
+         expect(summary.CallArgStoresMarked == 1,
+                "i386 stack arg store was not marked") &&
+         verifyOk(module,
+                  "module failed verifier after i386 stack external rewrite");
+}
+
+bool testX64KnownExternalUsesCspecStackOverflowOffset() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-x64-stack-known-external", context);
+  module.setDataLayout("e-p:64:64");
+  attachX64StackTestAbi(module, 16);
+  auto *i64 = llvm::Type::getInt64Ty(context);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  (void)createRegisterGlobal(module, "RAX");
+  std::vector<llvm::GlobalVariable *> regs;
+  for (const char *name : {"RDI", "RSI", "RDX", "RCX", "R8", "R9"}) {
+    regs.push_back(createRegisterGlobal(module, name));
+  }
+
+  auto *calleeType = llvm::FunctionType::get(i64, {}, false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "getnameinfo", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "x64_stack_known", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  for (auto [index, reg] : llvm::enumerate(regs)) {
+    storeRegister(builder, reg, llvm::ConstantInt::get(i64, index + 1),
+                  reg->getName().str());
+  }
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::Value *argAddress = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(i64, 8), "arg.addr");
+  llvm::Value *argPointer =
+      builder.CreateIntToPtr(argAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(i64, 77), argPointer);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction = module.getFunction("x64_stack_known");
+  if (!expect(rewrittenFunction != nullptr,
+              "x64 stack external caller missing")) {
+    return false;
+  }
+  llvm::CallInst *rewritten = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName() == "getnameinfo") {
+      rewritten = call;
+    }
+  }
+  auto *constant = rewritten == nullptr || rewritten->arg_size() != 7
+                       ? nullptr
+                       : llvm::dyn_cast<llvm::ConstantInt>(
+                             rewritten->getArgOperand(6));
+  return expect(rewritten != nullptr, "x64 stack external call missing") &&
+         expect(rewritten->arg_size() == 7,
+                "x64 stack overflow arg was not rewritten") &&
+         expect(constant != nullptr && constant->getZExtValue() == 77,
+                "x64 stack overflow arg did not use cspec offset") &&
+         verifyOk(module,
+                  "module failed verifier after x64 stack external rewrite");
+}
+
+bool testI386InternalStackInputIsRewritten() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-i386-internal-stack", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackTestAbi(module);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  llvm::GlobalVariable *esp =
+      createRegisterGlobal(module, "ESP", i32, 0, 4);
+  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+
+  auto *calleeType = llvm::FunctionType::get(i32, {}, false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "stack_callee", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  llvm::LoadInst *calleeEsp =
+      loadRegister(calleeBuilder, esp, "ESP", "callee.esp", 4);
+  llvm::Value *loadAddress = calleeBuilder.CreateAdd(
+      calleeEsp, llvm::ConstantInt::get(i32, 4), "arg.addr");
+  llvm::Value *loadPointer = calleeBuilder.CreateIntToPtr(
+      loadAddress, llvm::PointerType::get(context, 0));
+  llvm::LoadInst *stackArg = calleeBuilder.CreateLoad(i32, loadPointer);
+  calleeBuilder.CreateRet(stackArg);
+
+  auto *callerType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::ExternalLinkage, "stack_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> callerBuilder(callerEntry);
+  llvm::LoadInst *callerEsp =
+      loadRegister(callerBuilder, esp, "ESP", "caller.esp", 4);
+  llvm::Value *storePointer = callerBuilder.CreateIntToPtr(
+      callerEsp, llvm::PointerType::get(context, 0));
+  callerBuilder.CreateStore(llvm::ConstantInt::get(i32, 123), storePointer);
+  callerBuilder.CreateCall(calleeType, callee);
+  callerBuilder.CreateRetVoid();
+
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenCallee = module.getFunction("stack_callee");
+  llvm::CallInst *rewrittenCall = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(caller)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call != nullptr && call->getCalledFunction() == rewrittenCallee) {
+      rewrittenCall = call;
+    }
+  }
+  auto *constant = rewrittenCall == nullptr || rewrittenCall->arg_size() != 1
+                       ? nullptr
+                       : llvm::dyn_cast<llvm::ConstantInt>(
+                             rewrittenCall->getArgOperand(0));
+  return expect(rewrittenCallee != nullptr,
+                "i386 internal stack callee missing") &&
+         expect(rewrittenCallee->arg_size() == 1,
+                "i386 internal stack callee was not given an arg") &&
+         expect(rewrittenCall != nullptr && rewrittenCall->arg_size() == 1,
+                "i386 internal stack call was not rewritten") &&
+         expect(constant != nullptr && constant->getZExtValue() == 123,
+                "i386 internal stack arg did not bind caller store") &&
+         verifyOk(module,
+                  "module failed verifier after i386 internal stack rewrite");
 }
 
 bool testKnownZeroArgExternalDropsAbiInputs() {
@@ -7933,6 +8184,9 @@ int main() {
   ok &= testOverwrittenStoreIsRemoved();
   ok &= testCrossBlockDeadStoreIsRemoved();
   ok &= testAbiInputStoreBeforeCallIsKept();
+  ok &= testI386KnownExternalUsesCspecStackOffset();
+  ok &= testX64KnownExternalUsesCspecStackOverflowOffset();
+  ok &= testI386InternalStackInputIsRewritten();
   ok &= testKnownZeroArgExternalDropsAbiInputs();
   ok &= testKnownFixedArgExternalTruncatesAbiInputs();
   ok &= testCallArgUsesPartialRangeRead();
