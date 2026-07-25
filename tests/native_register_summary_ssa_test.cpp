@@ -47,6 +47,14 @@ llvm::MDNode *registerAccessMetadata(llvm::LLVMContext &context,
   return llvm::MDNode::get(context, fields);
 }
 
+llvm::MDNode *summaryPhiMetadata(llvm::LLVMContext &context,
+                                 const std::string &name) {
+  llvm::Metadata *fields[] = {
+      llvm::MDString::get(context, "name=" + name),
+  };
+  return llvm::MDNode::get(context, fields);
+}
+
 llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
                                            const std::string &name) {
   llvm::LLVMContext &context = module.getContext();
@@ -2174,6 +2182,264 @@ bool testI386KnownExternalUsesCspecStackOffset() {
                 "i386 stack arg store was not marked") &&
          verifyOk(module,
                   "module failed verifier after i386 stack external rewrite");
+}
+
+bool testI386NativeFrameOutgoingStackArgIsBound() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-i386-native-frame-outgoing-stack", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackTestAbi(module);
+  auto *i8 = llvm::Type::getInt8Ty(context);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  (void)createRegisterGlobal(module, "ESP", i32, 0, 4);
+  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+
+  auto *calleeType = llvm::FunctionType::get(i32, {}, false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "puts", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "i386_native_frame_outgoing",
+      module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *stackType = llvm::ArrayType::get(i8, 16);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(stackType, nullptr, "notdec_stack.native");
+  llvm::Value *basePointer = builder.CreateInBoundsGEP(
+      i8, stack, llvm::ConstantInt::get(i32, 12), "native.arg.base");
+  llvm::Value *baseInteger =
+      builder.CreatePtrToInt(basePointer, i32, "native.arg.base.int");
+  llvm::Value *argAddress =
+      builder.CreateSub(baseInteger, llvm::ConstantInt::get(i32, 12),
+                        "native.arg.addr");
+  llvm::Value *argPointer =
+      builder.CreateIntToPtr(argAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(i32, 55), argPointer);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction =
+      module.getFunction("i386_native_frame_outgoing");
+  if (!expect(rewrittenFunction != nullptr,
+              "i386 native frame outgoing caller missing")) {
+    return false;
+  }
+  llvm::CallInst *rewritten = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName() == "puts") {
+      rewritten = call;
+    }
+  }
+  auto *constant = rewritten == nullptr || rewritten->arg_size() != 1
+                       ? nullptr
+                       : llvm::dyn_cast<llvm::ConstantInt>(
+                             rewritten->getArgOperand(0));
+  return expect(rewritten != nullptr,
+                "i386 native frame outgoing call missing") &&
+         expect(rewritten->arg_size() == 1,
+                "i386 native frame outgoing arg was not rewritten") &&
+         expect(constant != nullptr && constant->getZExtValue() == 55,
+                "i386 native frame outgoing arg did not bind the store") &&
+         expect(summary.CallArgStoresMarked == 1,
+                "i386 native frame outgoing store was not marked") &&
+         verifyOk(module,
+                  "module failed verifier after native frame outgoing rewrite");
+}
+
+bool testI386NativeFrameLoadDoesNotBecomeStackInput() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-i386-native-frame-load", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackTestAbi(module);
+  auto *i8 = llvm::Type::getInt8Ty(context);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  (void)createRegisterGlobal(module, "ESP", i32, 0, 4);
+  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+
+  auto *type = llvm::FunctionType::get(i32, {}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "i386_native_frame_load",
+      module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *stackType = llvm::ArrayType::get(i8, 16);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(stackType, nullptr, "notdec_stack.native");
+  llvm::Value *slot =
+      builder.CreateInBoundsGEP(i8, stack, llvm::ConstantInt::get(i32, 0));
+  llvm::LoadInst *localValue = builder.CreateLoad(i32, slot);
+  builder.CreateRet(localValue);
+
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction =
+      module.getFunction("i386_native_frame_load");
+  return expect(rewrittenFunction != nullptr,
+                "i386 native frame load function missing") &&
+         expect(rewrittenFunction->arg_empty(),
+                "native frame load was misclassified as stack input") &&
+         verifyOk(module,
+                  "module failed verifier after native frame load test");
+}
+
+
+bool testI386NativeFrameOutgoingVarArgPrefixIsBound() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-i386-native-frame-vararg-prefix", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackTestAbi(module);
+  auto *i8 = llvm::Type::getInt8Ty(context);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  (void)createRegisterGlobal(module, "ESP", i32, 0, 4);
+  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+
+  auto *calleeType = llvm::FunctionType::get(i32, {}, true);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__fprintf_chk", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "i386_native_frame_vararg",
+      module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *stackType = llvm::ArrayType::get(i8, 60);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(stackType, nullptr, "notdec_stack.native");
+  llvm::Value *basePointer = builder.CreateInBoundsGEP(
+      i8, stack, llvm::ConstantInt::get(i32, 12), "native.arg.base");
+  llvm::Value *baseInteger =
+      builder.CreatePtrToInt(basePointer, i32, "native.arg.base.int");
+  for (auto [delta, value] : {std::pair<int, int>{-4, 33},
+                              std::pair<int, int>{-8, 1},
+                              std::pair<int, int>{-12, 22}}) {
+    llvm::Value *argAddress = builder.CreateAdd(
+        baseInteger, llvm::ConstantInt::get(i32, delta), "native.arg.addr");
+    llvm::Value *argPointer =
+        builder.CreateIntToPtr(argAddress, llvm::PointerType::get(context, 0));
+    builder.CreateStore(llvm::ConstantInt::get(i32, value), argPointer);
+  }
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction =
+      module.getFunction("i386_native_frame_vararg");
+  if (!expect(rewrittenFunction != nullptr,
+              "i386 native frame vararg caller missing")) {
+    return false;
+  }
+  llvm::CallInst *rewritten = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName() == "__fprintf_chk") {
+      rewritten = call;
+    }
+  }
+  auto constantArg = [&](unsigned index) -> llvm::ConstantInt * {
+    return rewritten == nullptr || rewritten->arg_size() <= index
+               ? nullptr
+               : llvm::dyn_cast<llvm::ConstantInt>(
+                     rewritten->getArgOperand(index));
+  };
+  llvm::ConstantInt *arg0 = constantArg(0);
+  llvm::ConstantInt *arg1 = constantArg(1);
+  llvm::ConstantInt *arg2 = constantArg(2);
+  return expect(rewritten != nullptr,
+                "i386 native frame vararg call missing") &&
+         expect(rewritten->arg_size() >= 3,
+                "i386 native frame vararg fixed prefix was not rewritten") &&
+         expect(arg0 != nullptr && arg0->getZExtValue() == 22,
+                "i386 native frame vararg first stack arg was not bound") &&
+         expect(arg1 != nullptr && arg1->getZExtValue() == 1,
+                "i386 native frame vararg second stack arg was not bound") &&
+         expect(arg2 != nullptr && arg2->getZExtValue() == 33,
+                "i386 native frame vararg third stack arg was not bound") &&
+         expect(summary.CallArgStoresMarked == 3,
+                "i386 native frame vararg stores were not marked") &&
+         verifyOk(module,
+                  "module failed verifier after native frame vararg rewrite");
+}
+
+bool testI386StackPointerSummaryOutgoingVarArgPrefixIsBound() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-i386-esp-summary-vararg-prefix", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackTestAbi(module);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  (void)createRegisterGlobal(module, "ESP", i32, 0, 4);
+  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+
+  auto *calleeType = llvm::FunctionType::get(i32, {}, true);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__fprintf_chk", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "i386_esp_summary_vararg",
+      module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *callBlock =
+      llvm::BasicBlock::Create(context, "call", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateBr(callBlock);
+
+  builder.SetInsertPoint(callBlock);
+  llvm::PHINode *esp = builder.CreatePHI(i32, 1, "ESP.range_summary_ssa.test");
+  esp->addIncoming(llvm::ConstantInt::get(i32, 0x1000), entry);
+  esp->setMetadata("notdec.register.summary_ssa.phi",
+                   summaryPhiMetadata(context, "ESP"));
+  for (auto [delta, value] : {std::pair<int, int>{-4, 33},
+                              std::pair<int, int>{-8, 1},
+                              std::pair<int, int>{-12, 22}}) {
+    llvm::Value *argAddress = builder.CreateAdd(
+        esp, llvm::ConstantInt::get(i32, delta), "esp.summary.arg.addr");
+    llvm::Value *argPointer =
+        builder.CreateIntToPtr(argAddress, llvm::PointerType::get(context, 0));
+    builder.CreateStore(llvm::ConstantInt::get(i32, value), argPointer);
+  }
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction =
+      module.getFunction("i386_esp_summary_vararg");
+  if (!expect(rewrittenFunction != nullptr,
+              "i386 ESP summary vararg caller missing")) {
+    return false;
+  }
+  llvm::CallInst *rewritten = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName() == "__fprintf_chk") {
+      rewritten = call;
+    }
+  }
+  auto constantArg = [&](unsigned index) -> llvm::ConstantInt * {
+    return rewritten == nullptr || rewritten->arg_size() <= index
+               ? nullptr
+               : llvm::dyn_cast<llvm::ConstantInt>(
+                     rewritten->getArgOperand(index));
+  };
+  llvm::ConstantInt *arg0 = constantArg(0);
+  llvm::ConstantInt *arg1 = constantArg(1);
+  llvm::ConstantInt *arg2 = constantArg(2);
+  return expect(rewritten != nullptr, "i386 ESP summary vararg call missing") &&
+         expect(rewritten->arg_size() >= 3,
+                "i386 ESP summary vararg prefix was not rewritten") &&
+         expect(arg0 != nullptr && arg0->getZExtValue() == 22,
+                "i386 ESP summary first stack arg was not bound") &&
+         expect(arg1 != nullptr && arg1->getZExtValue() == 1,
+                "i386 ESP summary second stack arg was not bound") &&
+         expect(arg2 != nullptr && arg2->getZExtValue() == 33,
+                "i386 ESP summary third stack arg was not bound") &&
+         expect(summary.CallArgStoresMarked == 3,
+                "i386 ESP summary vararg stores were not marked") &&
+         verifyOk(module,
+                  "module failed verifier after ESP summary vararg rewrite");
 }
 
 bool testX64KnownExternalUsesCspecStackOverflowOffset() {
@@ -8185,6 +8451,10 @@ int main() {
   ok &= testCrossBlockDeadStoreIsRemoved();
   ok &= testAbiInputStoreBeforeCallIsKept();
   ok &= testI386KnownExternalUsesCspecStackOffset();
+  ok &= testI386NativeFrameOutgoingStackArgIsBound();
+  ok &= testI386NativeFrameLoadDoesNotBecomeStackInput();
+  ok &= testI386NativeFrameOutgoingVarArgPrefixIsBound();
+  ok &= testI386StackPointerSummaryOutgoingVarArgPrefixIsBound();
   ok &= testX64KnownExternalUsesCspecStackOverflowOffset();
   ok &= testI386InternalStackInputIsRewritten();
   ok &= testKnownZeroArgExternalDropsAbiInputs();

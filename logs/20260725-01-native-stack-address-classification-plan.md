@@ -1,0 +1,338 @@
+# 原始 prompt
+
+```text
+内部有一个 8232 字节本地栈 buffer，不应该不在范围内吗，应该是RSP - xxx。把寄存器参数 spill 到本地栈槽，后面再 load，但是当前不是主要关注RSP+xx的地方吗，难道spill到的地方是RSP - xxx？
+
+因为我们寄存器参数也是按照函数的使用判断是否作为参数的，所以还是可以直接扫描使用点作为强证据的。signedOffset < 0可能可以单独扫描，或者单独收集作为参数相关的证据
+
+我觉得store matcher应该支持所有的偏移，不区分什么Offset < 0，但是后续处理的时候，根据ABI cspec的栈传参的范围，去把参数相关区域的load单独拿出来。如果是参数识别就处理拿出来的这些，如果是其他的就去掉参数识别的这些？
+
+详细规划一下具体怎么做，形成一个具体的规划文件
+```
+
+# 背景
+
+上一轮 SummarySSA 已经能从 cspec 读取 i386 / x64 的 stack pentry，并能把一部分 `SP.entry + 正偏移` load 识别成 stack 参数。但 fortune 讨论暴露出两个问题：
+
+1. 参数识别、caller stack store binding、本地栈帧访问现在混在一起，容易把“地址偏移正负”误用成“是不是参数”的判断。
+2. caller 侧 store matcher 对 stack 地址形状太窄。i386 fortune 里有 call 前已经写入栈参数的场景，但 matcher 没认出来，最后生成 `stack+*.arg_unknown`。
+
+正确方向是把问题分成两层：
+
+- 先统一识别“这是哪个栈地址，偏移多少”，这里不按正负过滤。
+- 再按 cspec 的 ABI stack pentry 判断哪些访问属于传参区域。
+
+也就是说，`Offset < 0` 不应该让 store matcher 直接放弃；它只说明这个地址落在当前入口 SP 坐标的下方，可能是本地栈、寄存器 spill、outgoing call arg，也可能是 rewrite 后的 native stack alloca 地址。
+
+# 当前实现状态
+
+相关代码集中在 `lib/passes/summary/NativeRegisterSummarySSA.cpp`：
+
+- `entryStackOffsetFromValue()` / `entryStackOffsetFromPointer()`：只追 `SP.entry +/- 常量` 形状。
+- `stackInputSlotForLoad()`：只接收 `signedOffset >= 0`，并用 cspec stack pentry 过滤 callee 侧入口参数 load。
+- `appendInternalStackParams()`：扫描 callee 侧 load，并把匹配的 stack slot 加入 internal function signature。
+- `findNearestStackStoreBeforeCall()`：从 call 往前找 matching stack store，但只认 `entryStackOffsetBefore()` 能解释的 store 地址。
+- `refineInternalStackParamShapes()`：如果 direct callsite 不能绑定足够参数，就裁剪 internal stack params，避免 x64 fortune 误扩成大量 `stack+*.arg_unknown`。
+
+当前最直接的问题不是 `stackInputSlotForLoad()` 的 `<0` 检查本身，而是 stack 地址识别能力太弱，并且 caller store binding 一遇到无法解释的 store 就停止。
+
+# 目标
+
+做一个 SummarySSA 内部的 stack address 分类层，让 callee 参数识别和 caller store binding 共用同一套地址解释，但后续消费规则分开：
+
+1. store matcher 支持所有可归一化的 signed offset，不因为 offset 正负直接放弃。
+2. 参数识别只消费 cspec stack pentry 覆盖的入口参数区域。
+3. 本地栈帧、寄存器 spill、outgoing call arg 可以被分类和记录，但不能直接扩 internal signature。
+4. i386 fortune 中 call 前已写栈参数但仍变成 `stack+*.arg_unknown` 的例子要下降。
+5. x64 现有寄存器参数恢复不能退化，尤其不能重新引入 `FUN_5270` / `FUN_3470` 这类误扩 stack 参数。
+
+# 技术路线
+
+## 1. 引入统一 stack address 分类
+
+在 SummarySSA 内部新增一个小 helper，用来解释 load/store 指针，返回一个简单分类结果：
+
+- `KnownEntrySpOffset`：地址能归一化到 `SP.entry + signedOffset`。
+- `KnownNativeFrameOffset`：地址来自 `notdec_stack.native` alloca 或其 `ptrtoint + 常量`，记录 native frame offset。
+- `Unknown`：暂时解释不了。
+
+结果里只需要保留：
+
+- address kind。
+- signed offset。
+- access size。
+- base stack pointer register 名。
+- 原始 instruction/value，用于 warning 和 audit。
+
+第一版只支持这些形状：
+
+- `load @ESP/@RSP` 作为 entry SP。
+- `entry SP + const` / `entry SP - const`。
+- `inttoptr(entry SP +/- const)`。
+- `ptrtoint %notdec_stack.native`。
+- `ptrtoint %notdec_stack.native.ptrN +/- const`。
+
+不做 alias 分析，不跨 basic block 推复杂表达式。
+
+## 2. ABI 参数区域只从 cspec 得到
+
+保留现在 `AbiFacts::StackInputsInOrder` 的来源：只从 `NativeAbiSpec::Inputs` 里的 stack pentry 读取。
+
+然后增加一个明确的判断函数：
+
+- 输入：`StackAddressClass`、访问 size。
+- 输出：是否落在 ABI stack input pentry 范围内，以及对应 `NativeSignatureSlot`。
+
+规则：
+
+- 只有 `KnownEntrySpOffset` 能作为 callee entry stack 参数。
+- offset 必须落在 cspec stack pentry 范围。
+- size 必须满足 pentry 的 minsize/maxsize。
+- offset 必须满足 pentry align。
+- i386 `stack+4`、x64 sysv `stack+8`、未来 x64 MS `stack+40` 都只能来自 cspec metadata，不能按架构名硬编码。
+
+`KnownNativeFrameOffset` 不作为 ABI 参数输入，但可以作为本地栈或 outgoing arg 的候选证据。
+
+## 3. callee 侧参数扫描
+
+`appendInternalStackParams()` 继续扫描 callee 侧 load，但不再自己解析地址。它只做：
+
+1. 调用统一 stack address classifier。
+2. 只保留 `KnownEntrySpOffset`。
+3. 再用 ABI pentry 判断是否是参数区域。
+4. 有真实 use 才加入 internal signature。
+
+这样可以保持和寄存器参数类似的原则：函数确实读了入口参数位置，才作为参数候选。
+
+但它不能消费：
+
+- `SP.entry - const`。
+- native frame alloca。
+- rewritten local stack slot。
+- call 前 outgoing 参数临时槽。
+
+这些进入 audit / local stack 证据，不扩 signature。
+
+## 4. caller 侧 store matcher 支持所有 signed offset
+
+`findNearestStackStoreBeforeCall()` 改为：
+
+1. 根据 callee 参数 slot 和 cspec `StackShift` 算出 callsite expected offset。
+2. 从 call 往前扫描 store。
+3. 对每个 store 调用统一 classifier。
+4. 如果能归一化并且 offset 等于 expected，就绑定这个 store。
+5. 如果 store 地址解释不了，不要立即失败；只有可能写到同一栈区域或是 unknown memory write 时才停止。
+
+这里不能按正负过滤。因为 outgoing call arg 在当前函数的入口 SP 坐标下常常可能是负偏移，尤其函数有自己的 frame 或 aligned stack 后。
+
+第一版仍只在同一 basic block 内向前扫描，跨 block 留到后续数据流。
+
+## 5. 参数识别和其他栈处理分开消费
+
+需要明确消费顺序：
+
+1. callee entry stack load：如果落在 ABI pentry 范围，作为函数参数候选。
+2. caller stack store：如果匹配某个 call 参数 slot，作为 call argument binding，并且只有绑定成功后才允许删除这个 store。
+3. native frame load/store：继续给 stack frame rewrite / dead store cleanup 处理，不参与参数识别。
+4. 其他 `SP.entry - const` 访问：先保守保留，记录 audit，不做参数 rewrite。
+
+重点是不让“参数识别”吞掉本地栈，也不让“本地栈清理”删掉已经被识别成 call arg 的 store。
+
+## 6. 调整 internal stack param 裁剪
+
+当前 `refineInternalStackParamShapes()` 用 direct callsite 绑定前缀裁剪 internal stack 参数。保留这个保护，但判断要更细：
+
+- callee 侧 ABI stack load 是强候选。
+- direct callsite 有 matching store 时，确认该参数。
+- direct callsite 暂时没有 matching store 时，不马上证明它不是参数；先根据函数是否有 direct callers、是否外部可见、是否递归来决定。
+
+第一版建议：
+
+- 有 direct callers 的 internal 函数：仍按已绑定前缀裁剪，避免 x64 fortune 误扩。
+- 没有 direct callers 或外部可达的函数：保留 callee-side ABI stack load 候选，但生成 warning。
+- 递归函数：至少要求自身递归 callsite 能绑定对应参数，否则保守裁剪。
+
+这个策略比现在更清楚：caller 证据用于避免误扩，不替代 callee 侧使用证据。
+
+# fortune 里的目标例子
+
+## i386：call 前 store 已存在但 binding 失败
+
+`notdec_native_3510` 中，`__fprintf_chk` 前已经把 3 个值写到当前栈上的连续位置，随后 call 仍然变成 `stack+4/8/12.arg_unknown`。这说明 callsite stack store matcher 没认出这些 store。
+
+计划目标是让这些 store 被绑定成 `__fprintf_chk` 的真实参数，而不是用 unknown 补洞。
+
+同类场景还包括 `fseek`、`fgets`、`fwrite`、`exit` 等 i386 外部调用。
+
+## x64：避免 internal stack 参数误扩
+
+x64 fortune 目前最终 IR 中：
+
+- `FUN_5270()` 没有参数。
+- `FUN_3470()` 是 6 个 register 参数。
+- `FUN_3eb0()` 是 2 个 register 参数。
+
+这些函数内部有本地栈 buffer 或 register spill，但不应该变成 stack 参数。新分类层必须把 native frame / local spill 和 `RSP.entry + ABI stack pentry` 区分开。
+
+如果后续真的出现 x64 第 7 个参数或 vararg stack tail，它应该通过 cspec `stack+8` pentry 和 caller store 绑定进入参数，而不是靠本地栈 load 猜。
+
+# 阶段计划
+
+## 阶段一：只加 audit，不改 rewrite 结果
+
+先实现 stack address classifier，并在 SummarySSA warning / audit 中记录：
+
+- callee 侧 ABI stack load 候选。
+- callee 侧 negative stack load 候选。
+- native frame load/store。
+- caller 侧 expected stack arg offset。
+- caller 侧扫描到的 matching / non-matching / unknown store。
+
+判断标准：
+
+- fortune i386 / x64 输出不变。
+- audit 能解释当前 `stack+*.arg_unknown` 是因为 expected offset 没找到 store，还是 store 地址无法归一化。
+
+## 阶段二：改 caller store matcher
+
+让 `findNearestStackStoreBeforeCall()` 使用 classifier，并支持 signed offset / native frame 形状。
+
+判断标准：
+
+- i386 fortune 外部调用的 `stack+*.arg_unknown` 明显下降。
+- `call_arg_binding_missing` warning 下降。
+- 只删除被绑定的 store。
+- x64 fortune 不退化。
+
+## 阶段三：整理 callee 参数扫描
+
+把 `stackInputSlotForLoad()` 改成调用 classifier + ABI pentry filter。保持 `KnownEntrySpOffset` 才能进参数，不把 native frame / negative offset 作为参数。
+
+判断标准：
+
+- i386 internal stack 参数仍能恢复。
+- x64 第 7 参数单测仍通过。
+- `FUN_5270`、`FUN_3470` 不出现额外 stack 参数。
+
+## 阶段四：调整 internal stack param 裁剪
+
+基于 audit 结果决定是否放宽 `refineInternalStackParamShapes()`。如果 caller matcher 已经能绑定 i386/x64 主要场景，裁剪可以继续保守；如果发现 callee 侧有真实 ABI stack load 但 caller 侧因为间接调用或跨 block 暂时无法证明，再单独引入 warning 和保守保留策略。
+
+判断标准：
+
+- 不重新引入 x64 fortune `stack+*.arg_unknown` 扩散。
+- i386 不因为裁剪丢掉已经有明确 `ESP.entry + ABI offset` use 的内部函数参数。
+
+## 阶段五：补测试和回归
+
+新增 SummarySSA 单测：
+
+- i386 caller store 在 `ESP.entry - const` 坐标下也能绑定到 `stack+4` 参数。
+- i386 rewritten native frame alloca store 能绑定 outgoing call arg，但不会作为 callee input 参数。
+- i386 callee `ESP.entry+4` load 变成 stack formal。
+- i386 callee `ESP.entry-4` load 不变成 stack formal。
+- x64 第 7 个参数仍从 cspec `stack+8` 进入。
+- x64 local alloca / register spill 不扩 internal signature。
+
+回归：
+
+- `native_register_summary_ssa_test`
+- i386 fortune
+- x64 fortune
+- x64 native smoke
+
+# 风险
+
+最大风险是 native frame alloca 和 entry-SP offset 的坐标混淆。尤其 i386 函数里会有 aligned stack、call 前 outgoing args、本地 spill 混在一起。实现时必须让 classifier 明确说出自己识别的是哪种坐标，不能只返回一个裸 offset。
+
+第二个风险是 store matcher 过度跳过 unknown store。遇到无法解释的 memory write 时，如果继续往前找，可能跨过真正 clobber；如果直接停止，又会漏掉 fortune 里的参数 store。第一版可以只对“明确不是栈相关”的 store 继续，对 unknown memory write 仍停止。
+
+第三个风险是 internal stack param 裁剪过强。callee 侧使用 ABI stack slot 本身是强证据，但 caller 侧绑定失败可能只是 matcher 暂时弱。需要先用 audit 区分 matcher 问题和真实误扩。
+
+# 不做什么
+
+本轮不做：
+
+- 跨 basic block stack arg 数据流。
+- 动态栈指针表达式。
+- 完整 alias 分析。
+- struct/byval/sret 参数恢复。
+- stdcall callee pop 差异。
+- x87 / float stack 参数恢复。
+- heritage prototype recovery 路线维护。
+
+# 判断标准
+
+最终完成后应满足：
+
+- stack 地址识别不再用 offset 正负直接决定是否参与 store matcher。
+- 参数识别只消费 cspec stack pentry 覆盖的入口参数区域。
+- i386 fortune 的 `stack+*.arg_unknown` 和 `call_arg_binding_missing` 明显下降。
+- x64 fortune 不出现新的 internal stack 参数误扩。
+- SummarySSA 单测覆盖 i386 和 x64 两套 ABI stack pentry。
+- IR 仍通过 LLVM 22 `llvm-as` / `opt -passes=verify`。
+
+# 实现记录（2026-07-25）
+
+## 已完成
+
+本次实现了阶段二的核心路径，并补了一处后置清理：
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:1407` 新增 `isNativeStackAlloca()` / `nativeStackAllocaSize()`，用于从 `notdec_stack.native` alloca 还原 native frame 的最低偏移。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:5983` 新增 `stackSlotIndex()`，只按 cspec `StackInputsInOrder` 展开的 stack slot 计算参数序号，没有硬编码 i386/x64 偏移。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:6003` 到 `6087` 新增 native frame offset 解析，支持 `alloca/gep/ptrtoint/inttoptr/add/sub`，并在每层先走 SummarySSA 的 `resolve()`。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:6090` 到 `6178` 新增 `ESP/RSP.range_summary_ssa + const` 解析。fortune i386 的真实形状是 `%ESP.range_summary_ssa527 - 12`，不是最终 IR 里看到的 native alloca 直连形状。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:6180` 到 `6275` 改写 `findNearestStackStoreBeforeCall()`：保留原有 entry-SP 精确匹配；额外收集 native-frame store 和 stack-pointer-SSA-relative store；按最低 outgoing 地址 + cspec slot index * step 绑定栈参数；未知普通内存写和可分析 call 仍截断扫描。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp:7945` 到 `7950` 增加 rewrite 后的死 summary helper 兜底清理，避免签名 rewrite 消掉最后 use 后，`summary_clobber` helper 留在最终 IR。
+- `tests/native_register_summary_ssa_test.cpp:50` 新增测试用 summary phi metadata helper。
+- `tests/native_register_summary_ssa_test.cpp:2187`、`2289`、`2367` 新增/调整 i386 caller stack store 用例，覆盖 native-frame 单参数、native-frame vararg prefix、以及 fortune 里的 `ESP.range_summary_ssa + const` 形状。
+- `tests/native_register_summary_ssa_test.cpp:8456` 到 `8458` 挂载新增测试。
+
+## fortune 实例结果
+
+`notdec_native_3510` 的 `__fprintf_chk` 之前是：
+
+- `stack+4.arg_unknown`
+- `stack+8.arg_unknown`
+- `stack+12.arg_unknown`
+
+实现后变成直接实参：
+
+- `%unique_1e780_4355`
+- `1`
+- `%storemerge`
+
+这对应 i386 push 顺序：最低 outgoing 地址是第一个栈参数。该 call 目前只剩 vararg tail `stack+16` 缺证据 warning，固定前三个参数已绑定。
+
+## 验证
+
+通过：
+
+```bash
+cmake --build external/NotDec-bin2llvm/build --target native_register_summary_ssa_test -j4
+./external/NotDec-bin2llvm/build/bin/native_register_summary_ssa_test
+cmake --build external/NotDec-bin2llvm/build --target native_register_summary_ssa_test notdec-native-llvm -j4
+ctest --test-dir external/NotDec-bin2llvm/build -R 'notdec.native_(llvm.realworld_fortune_i386|discover.x86_64_smoke|llvm.x86_64_smoke|llvm.realworld_fortune_x86_64)' --output-on-failure
+```
+
+结果：
+
+- `native_register_summary_ssa_test` 通过。
+- `notdec.native_discover.x86_64_smoke` 通过。
+- `notdec.native_llvm.x86_64_smoke` 通过。
+- `notdec.native_llvm.realworld_fortune_x86_64` 通过。
+- `notdec.native_llvm.realworld_fortune_i386` 通过。
+
+## 计划调整
+
+阶段一的 audit 没单独落地。实现时直接通过 fortune 实例定位到了缺失形状：SummarySSA 中间态保留的是 `ESP.range_summary_ssa + const`，最终 IR 才显示成 native alloca。阶段二因此同时支持 native-frame 地址和 stack-pointer SSA 相对地址。
+
+阶段三/四暂未展开。callee 侧参数扫描仍保持原来的 `KnownEntrySpOffset + cspec pentry` 过滤，不把 native frame 或负偏移 load 当作 internal stack 参数。x64 fortune 回归确认 `FUN_3470` 仍是 6 个寄存器参数，`FUN_5270` 没有重新误扩 stack 参数。
+
+## 评分
+
+- 实现效果：8/10。修掉 fortune i386 的目标 `__fprintf_chk` 固定栈参数，并保持 x64 回归不退化。
+- 复杂度：6/10。新增了两类地址解析，代码比单纯 entry-SP matcher 复杂，但范围集中在 caller store binding。
+- 维护成本：6/10。后续如果要支持跨 basic block 或动态栈调整，需要把现在的同块回扫提升成小型数据流；当前实现没有提前做这层扩展。
+
+更好的后续方案：把 native-frame / stack-pointer-relative / entry-SP 三类结果收敛成一个明确的 `StackAddressClass` 结构，给 callee load、caller store、audit 共用。当前先保持局部 helper，避免一次性重构 SummarySSA 前段。

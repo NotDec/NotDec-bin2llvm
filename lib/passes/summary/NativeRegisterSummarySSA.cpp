@@ -1404,6 +1404,38 @@ std::optional<int64_t> entryStackOffsetFromPointer(
   return entryStackOffsetFromValue(intToPtr->getOperand(0), stackPointer, units);
 }
 
+bool isNativeStackAlloca(const llvm::AllocaInst &alloca) {
+  return alloca.hasName() && alloca.getName().starts_with("notdec_stack.native");
+}
+
+std::optional<uint64_t> nativeStackAllocaSize(const llvm::AllocaInst &alloca,
+                                              const llvm::DataLayout &layout) {
+  if (!isNativeStackAlloca(alloca)) {
+    return std::nullopt;
+  }
+  llvm::TypeSize allocated = layout.getTypeAllocSize(alloca.getAllocatedType());
+  if (allocated.isScalable()) {
+    return std::nullopt;
+  }
+  uint64_t bytes = allocated.getFixedValue();
+  if (alloca.isArrayAllocation()) {
+    auto *count = llvm::dyn_cast<llvm::ConstantInt>(alloca.getArraySize());
+    if (count == nullptr || count->getBitWidth() > 64) {
+      return std::nullopt;
+    }
+    uint64_t arrayCount = count->getZExtValue();
+    if (arrayCount != 0 &&
+        bytes > std::numeric_limits<uint64_t>::max() / arrayCount) {
+      return std::nullopt;
+    }
+    bytes *= arrayCount;
+  }
+  if (bytes > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    return std::nullopt;
+  }
+  return bytes;
+}
+
 std::optional<NativeSignatureSlot> stackInputSlotForLoad(
     llvm::LoadInst &load,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -5948,34 +5980,302 @@ private:
     return builder.CreateZExtOrTrunc(value, targetType, "stack.arg.cast");
   }
 
+  std::optional<uint64_t>
+  stackSlotIndex(const NativeSignatureSlot &slot) const {
+    for (const AbiFacts::StackSlot &abiSlot : Abi.StackInputsInOrder) {
+      if (slot.StackSpace != abiSlot.Space ||
+          slot.StackOffset < abiSlot.Offset) {
+        continue;
+      }
+      uint64_t relative = slot.StackOffset - abiSlot.Offset;
+      if (abiSlot.Align != 0 && relative % abiSlot.Align != 0) {
+        continue;
+      }
+      uint64_t step = stackSlotStep(slot.StackSize, abiSlot.Align);
+      if (step == 0 || relative % step != 0) {
+        continue;
+      }
+      return relative / step;
+    }
+    return std::nullopt;
+  }
+
+  std::optional<int64_t> nativeFrameIntegerOffset(
+      llvm::Value *value, const llvm::DataLayout &layout,
+      llvm::SmallPtrSetImpl<llvm::Value *> &seen) const {
+    value = resolve(value);
+    if (value == nullptr) {
+      return std::nullopt;
+    }
+    value = value->stripPointerCasts();
+    if (!seen.insert(value).second) {
+      return std::nullopt;
+    }
+    if (auto *ptrToInt = llvm::dyn_cast<llvm::PtrToIntInst>(value)) {
+      return nativeFramePointerOffset(ptrToInt->getPointerOperand(), layout,
+                                      seen);
+    }
+    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
+    if (binary == nullptr ||
+        (binary->getOpcode() != llvm::Instruction::Add &&
+         binary->getOpcode() != llvm::Instruction::Sub)) {
+      return std::nullopt;
+    }
+    auto lhs = nativeFrameIntegerOffset(binary->getOperand(0), layout, seen);
+    auto *rhs =
+        llvm::dyn_cast_or_null<llvm::ConstantInt>(resolve(binary->getOperand(1)));
+    if (lhs && rhs != nullptr && rhs->getBitWidth() <= 64) {
+      int64_t delta = rhs->getSExtValue();
+      return binary->getOpcode() == llvm::Instruction::Sub ? *lhs - delta
+                                                            : *lhs + delta;
+    }
+    if (binary->getOpcode() == llvm::Instruction::Add) {
+      auto rhsOrigin =
+          nativeFrameIntegerOffset(binary->getOperand(1), layout, seen);
+      auto *lhsConst =
+          llvm::dyn_cast_or_null<llvm::ConstantInt>(
+              resolve(binary->getOperand(0)));
+      if (rhsOrigin && lhsConst != nullptr && lhsConst->getBitWidth() <= 64) {
+        return *rhsOrigin + lhsConst->getSExtValue();
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<int64_t> nativeFramePointerOffset(
+      llvm::Value *value, const llvm::DataLayout &layout,
+      llvm::SmallPtrSetImpl<llvm::Value *> &seen) const {
+    value = resolve(value);
+    if (value == nullptr) {
+      return std::nullopt;
+    }
+    value = value->stripPointerCasts();
+    if (!seen.insert(value).second) {
+      return std::nullopt;
+    }
+    if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(value)) {
+      if (std::optional<uint64_t> size = nativeStackAllocaSize(*alloca, layout)) {
+        return -static_cast<int64_t>(*size);
+      }
+      return std::nullopt;
+    }
+    if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value)) {
+      auto base =
+          nativeFramePointerOffset(gep->getPointerOperand(), layout, seen);
+      if (!base) {
+        return std::nullopt;
+      }
+      llvm::APInt byteOffset(
+          layout.getIndexSizeInBits(gep->getPointerAddressSpace()), 0);
+      if (!gep->accumulateConstantOffset(layout, byteOffset)) {
+        return std::nullopt;
+      }
+      return *base + byteOffset.getSExtValue();
+    }
+    if (auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(value)) {
+      return nativeFrameIntegerOffset(intToPtr->getOperand(0), layout, seen);
+    }
+    return std::nullopt;
+  }
+
+  std::optional<int64_t> nativeFrameStackOffset(llvm::Value *pointer) const {
+    llvm::Module *module = Function.getParent();
+    if (module == nullptr) {
+      return std::nullopt;
+    }
+    llvm::SmallPtrSet<llvm::Value *, 16> seen;
+    return nativeFramePointerOffset(pointer, module->getDataLayout(), seen);
+  }
+
+  struct StackPointerRelativeOffset {
+    llvm::Value *Base = nullptr;
+    int64_t Offset = 0;
+  };
+
+  bool isStackPointerSummaryValue(llvm::Value *value) const {
+    value = resolve(value);
+    if (value == nullptr) {
+      return false;
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(value)) {
+      RegisterAccess access = registerLoad(*load, Units);
+      return access.Unit != nullptr &&
+             access.Unit->Global == stackPointerGlobal();
+    }
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
+    if (inst == nullptr) {
+      return false;
+    }
+    if (auto name =
+            mdField(inst->getMetadata("notdec.register.summary_ssa.phi"),
+                    "name")) {
+      return *name == Abi.StackPointer;
+    }
+    if (Abi.StackPointer.empty() || !value->hasName()) {
+      return false;
+    }
+    std::string prefix = Abi.StackPointer + ".range_summary_ssa";
+    return value->getName().starts_with(prefix);
+  }
+
+  std::optional<StackPointerRelativeOffset> stackPointerRelativeIntegerOffset(
+      llvm::Value *value, llvm::SmallPtrSetImpl<llvm::Value *> &seen) const {
+    value = resolve(value);
+    if (value == nullptr) {
+      return std::nullopt;
+    }
+    value = value->stripPointerCasts();
+    if (isStackPointerSummaryValue(value)) {
+      return StackPointerRelativeOffset{value, 0};
+    }
+    if (!seen.insert(value).second) {
+      return std::nullopt;
+    }
+    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
+    if (binary == nullptr ||
+        (binary->getOpcode() != llvm::Instruction::Add &&
+         binary->getOpcode() != llvm::Instruction::Sub)) {
+      return std::nullopt;
+    }
+    auto lhs =
+        stackPointerRelativeIntegerOffset(binary->getOperand(0), seen);
+    auto *rhs =
+        llvm::dyn_cast_or_null<llvm::ConstantInt>(resolve(binary->getOperand(1)));
+    if (lhs && rhs != nullptr && rhs->getBitWidth() <= 64) {
+      int64_t delta = rhs->getSExtValue();
+      lhs->Offset =
+          binary->getOpcode() == llvm::Instruction::Sub ? lhs->Offset - delta
+                                                        : lhs->Offset + delta;
+      return lhs;
+    }
+    if (binary->getOpcode() == llvm::Instruction::Add) {
+      auto rhsOrigin =
+          stackPointerRelativeIntegerOffset(binary->getOperand(1), seen);
+      auto *lhsConst =
+          llvm::dyn_cast_or_null<llvm::ConstantInt>(
+              resolve(binary->getOperand(0)));
+      if (rhsOrigin && lhsConst != nullptr && lhsConst->getBitWidth() <= 64) {
+        rhsOrigin->Offset += lhsConst->getSExtValue();
+        return rhsOrigin;
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<StackPointerRelativeOffset>
+  stackPointerRelativeOffset(llvm::Value *pointer) const {
+    pointer = resolve(pointer);
+    if (pointer == nullptr) {
+      return std::nullopt;
+    }
+    pointer = pointer->stripPointerCasts();
+    auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(pointer);
+    if (intToPtr == nullptr) {
+      return std::nullopt;
+    }
+    llvm::SmallPtrSet<llvm::Value *, 16> seen;
+    return stackPointerRelativeIntegerOffset(intToPtr->getOperand(0), seen);
+  }
+
   llvm::StoreInst *findNearestStackStoreBeforeCall(
       llvm::CallBase &call, const NativeSignatureSlot &slot) {
     std::optional<int64_t> expected = callsiteStackOffset(call, slot);
-    if (!expected || call.getParent() == nullptr) {
+    if (call.getParent() == nullptr) {
       return nullptr;
     }
+    std::optional<uint64_t> nativeFrameIndex = stackSlotIndex(slot);
+    uint64_t nativeFrameStep =
+        nativeFrameIndex ? stackSlotStep(slot.StackSize, slot.StackAlign) : 0;
+    std::map<int64_t, llvm::StoreInst *> nativeFrameStores;
+    struct RelativeStoreGroup {
+      llvm::Value *Base = nullptr;
+      std::map<int64_t, llvm::StoreInst *> Stores;
+    };
+    std::vector<RelativeStoreGroup> stackPointerStores;
+    auto recordStackPointerStore = [&](llvm::Value *base, int64_t offset,
+                                       llvm::StoreInst *store) {
+      base = resolve(base);
+      for (RelativeStoreGroup &group : stackPointerStores) {
+        if (resolve(group.Base) == base) {
+          group.Stores.try_emplace(offset, store);
+          return;
+        }
+      }
+      RelativeStoreGroup group;
+      group.Base = base;
+      group.Stores.try_emplace(offset, store);
+      stackPointerStores.push_back(std::move(group));
+    };
     for (auto it = call.getIterator(); it != call.getParent()->begin();) {
       --it;
       llvm::Instruction &inst = *it;
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
-        std::optional<int64_t> offset =
-            entryStackOffsetBefore(*store, store->getPointerOperand());
-        if (!offset) {
-          return nullptr;
+        if (expected) {
+          if (std::optional<int64_t> offset =
+                  entryStackOffsetBefore(*store, store->getPointerOperand())) {
+            if (*offset == *expected) {
+              return store;
+            }
+            continue;
+          }
         }
-        if (*offset == *expected) {
-          return store;
+        if (nativeFrameIndex && nativeFrameStep != 0) {
+          if (std::optional<int64_t> offset =
+                  nativeFrameStackOffset(store->getPointerOperand())) {
+            // The stack rewrite turns a downward-growing outgoing argument area
+            // into native-frame offsets.  Keep the latest store for each frame
+            // offset, then map cspec stack slots from the lowest outgoing
+            // address upward.  That matches both i386 push sequences and x64
+            // reserved stack argument areas.
+            nativeFrameStores.try_emplace(*offset, store);
+            continue;
+          }
+          if (std::optional<StackPointerRelativeOffset> offset =
+                  stackPointerRelativeOffset(store->getPointerOperand())) {
+            recordStackPointerStore(offset->Base, offset->Offset, store);
+            continue;
+          }
         }
-        continue;
+        RegisterAccess access = registerStore(*store, Units);
+        if (access.Unit != nullptr) {
+          continue;
+        }
+        break;
       }
       if (auto *otherCall = llvm::dyn_cast<llvm::CallBase>(&inst)) {
         if (isAnalyzableCall(*otherCall)) {
-          return nullptr;
+          break;
         }
         continue;
       }
       if (inst.mayWriteToMemory()) {
+        break;
+      }
+    }
+    auto storeForIndexedOffset =
+        [&](const std::map<int64_t, llvm::StoreInst *> &stores)
+        -> llvm::StoreInst * {
+      if (!nativeFrameIndex || stores.empty() || nativeFrameStep == 0 ||
+          *nativeFrameIndex >
+              static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+                  nativeFrameStep) {
         return nullptr;
+      }
+      int64_t delta =
+          static_cast<int64_t>(*nativeFrameIndex * nativeFrameStep);
+      int64_t lowestOffset = stores.begin()->first;
+      if (lowestOffset > std::numeric_limits<int64_t>::max() - delta) {
+        return nullptr;
+      }
+      auto found = stores.find(lowestOffset + delta);
+      return found == stores.end() ? nullptr : found->second;
+    };
+    if (llvm::StoreInst *store = storeForIndexedOffset(nativeFrameStores)) {
+      return store;
+    }
+    for (const RelativeStoreGroup &group : stackPointerStores) {
+      if (llvm::StoreInst *store = storeForIndexedOffset(group.Stores)) {
+        return store;
       }
     }
     return nullptr;
@@ -7642,6 +7942,12 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       summary.DeadLoadsRemoved += eraseDeadSummarySSAEntryReads(module);
       eraseUnusedSummaryHelperDeclarations(module);
     }
+    // Signature rewrite and late stack cleanup can remove the final real use of
+    // a summary call-value helper.  Do one unconditional sweep before emitting
+    // warnings/output so dead clobber helpers do not leak into final IR when no
+    // residue cleanup iteration was needed for them.
+    eraseDeadSummaryCallValueHelpers(module);
+    eraseUnusedSummaryHelperDeclarations(module);
   }
   summary.FunctionsSeen = summary.Functions.size();
   summary.Warnings = collectRemainingCallValueWarnings(module);
