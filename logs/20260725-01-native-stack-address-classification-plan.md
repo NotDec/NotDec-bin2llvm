@@ -336,3 +336,82 @@ ctest --test-dir external/NotDec-bin2llvm/build -R 'notdec.native_(llvm.realworl
 - 维护成本：6/10。后续如果要支持跨 basic block 或动态栈调整，需要把现在的同块回扫提升成小型数据流；当前实现没有提前做这层扩展。
 
 更好的后续方案：把 native-frame / stack-pointer-relative / entry-SP 三类结果收敛成一个明确的 `StackAddressClass` 结构，给 callee load、caller store、audit 共用。当前先保持局部 helper，避免一次性重构 SummarySSA 前段。
+
+# 实现记录（2026-08-03）
+
+## 已完成：`and SP, -16` 作为独立 caller 栈基址
+
+本次完成阶段二的对齐栈补充，不把对齐后的 SP 伪装成 entry SP：
+
+- `lib/passes/summary/NativeRegisterSummary.cpp:67` 到 `:100` 新增
+  `StackPointerAddress` 和 `-16` mask 识别。`Base == nullptr` 只表示真正的
+  entry SP；`and SP, -16` 的 SSA value 是一个新的 base。
+- `NativeRegisterSummary.cpp:145` 到 `:161` 将 summary 的 SP 状态拆为
+  `CurrentStackPointer` 和每个 load 的 `StackPointerAddresses`。因此保存寄存器、
+  caller store 和 entry register origin 不再共用一个裸 offset。
+- `NativeRegisterSummary.cpp:1416` 到 `:1431`、`:1817` 到 `:1917` 按当前 SP
+  base 和 cspec `StackShift` 计算 callsite slot。callee 侧仍只认真正的 entry-SP
+  地址，aligned SP 不会落进 `stack+4` / `stack+8` 的 callee 参数区域。
+- `NativeRegisterSummary.cpp:1966` 到 `:1997` 在每个真实 call 后清空
+  `StackSlotOrigins`，保留 `StackSlots` 给 saved-register tracking。这样前一个 call
+  的 `[ESP+4]` 证据不会扩宽下一个 call 的 arity。
+- `NativeRegisterSummary.cpp:1326` 到 `:1345` 是本次计划外的必要修正：外部
+  callsite evidence 预分析原来只按寄存器 lattice 判断 CFG 收敛，call 后清空栈证据
+  时可能提前停止。仅在 `CollectExternalCallsiteEvidence` 模式改为比较完整 `State`；
+  普通 summary 继续使用原来的 register lattice，避免扩大分析成本。
+- `NativeRegisterSummarySSA.cpp:69` 到 `:76`、`:6131` 到 `:6205` 只把对齐结果
+  当 caller store matcher 的独立 base；`entryStackOffsetFromValue()` 仍不会把它解释
+  成 entry SP。
+- `tests/native_register_summary_ssa_test.cpp:2187` 到 `:2307` 新增 i386 对齐 SP
+  参数绑定和 call 后旧 evidence 失效测试；`:8576` 到 `:8577` 挂载测试。
+- `tests/native_register_summary_ssa_test.cpp:2628` 到 `:2694` 新增 x64 对齐 RSP
+  的第七个栈参数测试；`:8649` 挂载测试。
+- `tests/native_register_summary_test.cpp:142` 到 `:151` 显式构造 register input
+  slot，适配已有的 `Kind` 字段，避免旧 aggregate initializer 把寄存器名当成 enum。
+
+## fortune 结果
+
+i386 fortune 的目标调用现在是：
+
+```llvm
+call i32 @recode_new_outer(i32 1)
+call i32 @recode_new_request(i32 %2)
+call i32 @setlocale(i32 6, i32 %...)
+call i32 @nl_langinfo(i32 14)
+```
+
+`recode_new_outer` 的 warning 为 `arity=1..1/final=1`。这证明前一个 call 的
+`[ESP+4]` 没有被错误复用为它的第二个参数。x64 fortune 的 residue audit 只有表头，
+没有 `notdec.register.summary_clobber` 残留。
+
+## 验证
+
+通过：
+
+```bash
+cmake --build build --target native_register_summary_ssa_test \
+  native_register_summary_test notdec-native-llvm -j4
+build/bin/native_register_summary_ssa_test
+build/bin/native_register_summary_test
+scripts/native-fortune-i386-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+scripts/native-fortune-x86_64-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+ctest --test-dir build -R '^notdec\\.native_llvm\\.x86_64_smoke$' \
+  --output-on-failure
+```
+
+两个 fortune 脚本均以 LLVM 22 的 `llvm-as` 和 `opt -passes=verify` 验证输出。i386
+同口径单次性能对比：修改前 `15.81s / 169792 KB`，修改后 `16.11s / 168600 KB`；
+0.30s 差异在一次运行的波动范围内，内存没有增长。
+
+## 计划调整与评分
+
+原计划只考虑了地址分类，没有明确要求 external evidence 数据流也随栈证据收敛。
+call 后使 evidence 失效后，这个遗漏会直接影响 CFG join；已限定在 evidence 预分析中
+修正，没有把完整状态比较放进常规 summary。
+
+- 实现效果：9/10。i386 对齐栈参数可绑定，旧参数证据不会串到下一 call，x64 回归保持通过。
+- 复杂度：6/10。增加一个小地址结构和两张状态表，但没有重构 callee 参数扫描。
+- 维护成本：6/10。`and SP, -16` 仅覆盖当前 ABI 常见对齐形状；动态对齐或非 `-16` mask
+  仍应在有真实样本时单独扩展。

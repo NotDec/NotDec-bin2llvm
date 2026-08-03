@@ -139,6 +139,17 @@ void attachExternalEvidenceAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+notdec::bin2llvm::NativeRegisterCallInputSlot
+registerInputSlot(const std::string &name, unsigned offsetBits = 0,
+                  unsigned sizeBits = 64) {
+  notdec::bin2llvm::NativeRegisterCallInputSlot slot;
+  slot.Kind = notdec::bin2llvm::NativeRegisterCallInputSlotKind::Register;
+  slot.UnitName = name;
+  slot.OffsetBits = offsetBits;
+  slot.SizeBits = sizeBits;
+  return slot;
+}
+
 llvm::GlobalVariable *createRegisterGlobal(llvm::Module &module,
                                            const std::string &name,
                                            llvm::Type *type, uint64_t offset,
@@ -453,7 +464,7 @@ bool testKnownExternalShapeReadsOnlyDeclaredRegister() {
 
   notdec::bin2llvm::NativeRegisterSummaryOptions options;
   notdec::bin2llvm::NativeExternalCallShape shape;
-  shape.Inputs.push_back({"RSI", 0, 64});
+  shape.Inputs.push_back(registerInputSlot("RSI"));
   options.ExternalCallShapes.emplace("known_external", std::move(shape));
   options.UnknownExternalInputPolicy =
       notdec::bin2llvm::NativeRegisterUnknownExternalInputPolicy::NoInputs;
@@ -492,9 +503,9 @@ bool testKnownVarArgUsesFixedThenCallsiteInputs() {
   builder.CreateRetVoid();
 
   notdec::bin2llvm::NativeExternalCallShape fixedShape;
-  fixedShape.Inputs.push_back({"RDI", 0, 64});
-  fixedShape.VarArgInputs.push_back({"RSI", 0, 64});
-  fixedShape.VarArgInputs.push_back({"RDX", 0, 64});
+  fixedShape.Inputs.push_back(registerInputSlot("RDI"));
+  fixedShape.VarArgInputs.push_back(registerInputSlot("RSI"));
+  fixedShape.VarArgInputs.push_back(registerInputSlot("RDX"));
   fixedShape.FixedArgs = 1;
   fixedShape.VarArg = true;
 
@@ -532,7 +543,7 @@ bool testKnownVarArgUsesFixedThenCallsiteInputs() {
   }
 
   notdec::bin2llvm::NativeExternalCallShape callsiteShape = fixedShape;
-  callsiteShape.Inputs.push_back({"RSI", 0, 64});
+  callsiteShape.Inputs.push_back(registerInputSlot("RSI"));
   notdec::bin2llvm::NativeRegisterSummaryOptions finalOptions = baseOptions;
   finalOptions.CollectExternalCallsiteEvidence = false;
   finalOptions.ExternalCallsiteShapes.emplace(call, std::move(callsiteShape));
@@ -582,9 +593,9 @@ bool testUnknownExternalCallsiteEvidenceClassifiesOrigins() {
       notdec::bin2llvm::NativeRegisterUnknownExternalInputPolicy::NoInputs;
   options.CollectExternalCallsiteEvidence = true;
   options.ExternalEvidenceSlots = {
-      {"RDI", 0, 64},
-      {"RSI", 0, 64},
-      {"RDX", 0, 64},
+      registerInputSlot("RDI"),
+      registerInputSlot("RSI"),
+      registerInputSlot("RDX"),
   };
   auto summary = notdec::bin2llvm::runNativeRegisterSummary(module, options);
   const auto *callsite = unknownExternalCallsite(summary, "unknown_target");

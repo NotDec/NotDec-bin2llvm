@@ -64,6 +64,22 @@ struct StackSlotKey {
   }
 };
 
+// A stack address is kept relative to one concrete SP-producing SSA value.
+// Base == nullptr denotes the function-entry stack pointer.  An `and SP, -16`
+// result deliberately becomes a new base, because it is not entry-SP equal.
+struct StackPointerAddress {
+  llvm::Value *Base = nullptr;
+  int64_t Offset = 0;
+
+  bool operator==(const StackPointerAddress &other) const {
+    return Base == other.Base && Offset == other.Offset;
+  }
+
+  bool operator!=(const StackPointerAddress &other) const {
+    return !(*this == other);
+  }
+};
+
 struct ValueOrigin {
   llvm::GlobalVariable *Base = nullptr;
   int64_t Offset = 0;
@@ -74,6 +90,14 @@ struct ValueOrigin {
 
   bool operator!=(const ValueOrigin &other) const { return !(*this == other); }
 };
+
+bool isSixteenByteStackAlignmentMask(llvm::Value *value) {
+  auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value);
+  if (constant == nullptr || constant->getBitWidth() > 64) {
+    return false;
+  }
+  return constant->getSExtValue() == -16;
+}
 
 // Forward abstract state for one backing register. Missing map entries use this
 // default value, but only inside a reachable block state.
@@ -118,10 +142,14 @@ struct State {
   // SSA values known to be a function-entry register plus a constant offset.
   // Offset 0 is also used for saved register values loaded back from stack.
   std::map<llvm::Value *, ValueOrigin> ValueOrigins;
-  // Current stack pointer as an entry-SP-relative offset.  This is deliberately
-  // narrow: it only exists so push/pop save slots can be recognized even when
-  // RSP itself is ignored by the register summary.
-  std::optional<int64_t> StackPointerOffset = 0;
+  // Loads of the ignored stack-pointer register need their own address facts.
+  // Unlike ValueOrigins, these facts may be based on an aligned SP value and
+  // must never make that value look like a function-entry register value.
+  std::map<llvm::Value *, StackPointerAddress> StackPointerAddresses;
+  // This is the current SP position for caller stack arguments and saved stack
+  // slots.  It begins at entry SP, but `and SP, -16` changes the base identity.
+  std::optional<StackPointerAddress> CurrentStackPointer =
+      StackPointerAddress{};
 
   bool operator==(const State &other) const {
     return Reachable == other.Reachable &&
@@ -129,7 +157,8 @@ struct State {
            Origins == other.Origins && StackSlots == other.StackSlots &&
            StackSlotOrigins == other.StackSlotOrigins &&
            ValueOrigins == other.ValueOrigins &&
-           StackPointerOffset == other.StackPointerOffset;
+           StackPointerAddresses == other.StackPointerAddresses &&
+           CurrentStackPointer == other.CurrentStackPointer;
   }
 
   bool sameSummaryLattice(const State &other) const {
@@ -966,8 +995,19 @@ bool joinState(State &target, const State &source) {
       ++it;
     }
   }
-  if (target.StackPointerOffset != source.StackPointerOffset) {
-    target.StackPointerOffset = std::nullopt;
+  for (auto it = target.StackPointerAddresses.begin();
+       it != target.StackPointerAddresses.end();) {
+    auto sourceIt = source.StackPointerAddresses.find(it->first);
+    if (sourceIt == source.StackPointerAddresses.end() ||
+        sourceIt->second != it->second) {
+      it = target.StackPointerAddresses.erase(it);
+      changed = true;
+    } else {
+      ++it;
+    }
+  }
+  if (target.CurrentStackPointer != source.CurrentStackPointer) {
+    target.CurrentStackPointer = std::nullopt;
     changed = true;
   }
   return changed;
@@ -1283,7 +1323,10 @@ private:
           for (llvm::BasicBlock *pred : llvm::predecessors(&block)) {
             joinState(joined, flow.Out[pred]);
           }
-          if (!flow.In[&block].sameSummaryLattice(joined)) {
+          bool inputChanged = Options.CollectExternalCallsiteEvidence
+                                  ? !(flow.In[&block] == joined)
+                                  : !flow.In[&block].sameSummaryLattice(joined);
+          if (inputChanged) {
             flow.In[&block] = std::move(joined);
             changed = true;
           } else {
@@ -1291,7 +1334,10 @@ private:
           }
         }
         State next = transferBlock(block, flow.In[&block]);
-        if (!flow.Out[&block].sameSummaryLattice(next)) {
+        bool outputChanged = Options.CollectExternalCallsiteEvidence
+                                 ? !(flow.Out[&block] == next)
+                                 : !flow.Out[&block].sameSummaryLattice(next);
+        if (outputChanged) {
           flow.Out[&block] = std::move(next);
           changed = true;
         } else {
@@ -1370,19 +1416,15 @@ private:
   callsiteOrigin(const State &state,
                  const NativeRegisterCallInputSlot &slot) const {
     if (slot.Kind == NativeRegisterCallInputSlotKind::Stack) {
-      llvm::GlobalVariable *stackPointer = stackPointerGlobal();
-      if (stackPointer == nullptr || !state.StackPointerOffset) {
+      std::optional<StackSlotKey> key = callsiteStackSlot(state, slot);
+      if (!key) {
         return NativeRegisterCallsiteValueOrigin::Unknown;
       }
-      int64_t expectedOffset = *state.StackPointerOffset +
-                               static_cast<int64_t>(slot.StackOffset) -
-                               static_cast<int64_t>(Abi.StackShift);
-      StackSlotKey key{stackPointer, expectedOffset};
-      auto originIt = state.StackSlotOrigins.find(key);
+      auto originIt = state.StackSlotOrigins.find(*key);
       if (originIt != state.StackSlotOrigins.end()) {
         return originIt->second;
       }
-      if (state.StackSlots.count(key) != 0) {
+      if (state.StackSlots.count(*key) != 0) {
         return NativeRegisterCallsiteValueOrigin::ForwardedEntry;
       }
       return NativeRegisterCallsiteValueOrigin::Unknown;
@@ -1513,6 +1555,14 @@ private:
         ++it;
       }
     }
+    for (auto it = state.StackPointerAddresses.begin();
+         it != state.StackPointerAddresses.end();) {
+      if (CrossBlockValues.count(it->first) == 0) {
+        it = state.StackPointerAddresses.erase(it);
+      } else {
+        ++it;
+      }
+    }
   }
 
   void transferInstruction(llvm::Instruction &inst, State &state) {
@@ -1528,22 +1578,31 @@ private:
         }
         if (pureEntryValue) {
           if (access.Unit->Global == stackPointerGlobal()) {
-            if (state.StackPointerOffset) {
-              state.ValueOrigins[load] =
-                  ValueOrigin{access.Unit->Global, *state.StackPointerOffset};
+            if (state.CurrentStackPointer) {
+              state.StackPointerAddresses[load] = *state.CurrentStackPointer;
+              if (state.CurrentStackPointer->Base == nullptr) {
+                state.ValueOrigins[load] = ValueOrigin{
+                    access.Unit->Global, state.CurrentStackPointer->Offset};
+              } else {
+                state.ValueOrigins.erase(load);
+              }
             } else {
               state.ValueOrigins.erase(load);
+              state.StackPointerAddresses.erase(load);
             }
           } else {
             state.ValueOrigins[load] = ValueOrigin{access.Unit->Global, 0};
           }
         } else {
           state.ValueOrigins.erase(load);
+          if (access.Unit->Global == stackPointerGlobal()) {
+            state.StackPointerAddresses.erase(load);
+          }
         }
         return;
       }
       if (std::optional<StackSlotKey> slot =
-              fixedEntryStackSlot(load->getPointerOperand(), state)) {
+              fixedStackSlot(load->getPointerOperand(), state)) {
         auto saved = state.StackSlots.find(*slot);
         if (saved != state.StackSlots.end()) {
           state.ValueOrigins[load] = ValueOrigin{saved->second, 0};
@@ -1558,12 +1617,8 @@ private:
       if (access.Unit != nullptr) {
         if (isIgnored(*access.Unit, Options)) {
           if (access.Unit->Global == stackPointerGlobal()) {
-            if (auto origin = entryValueOrigin(store->getValueOperand(), state);
-                origin && origin->Base == access.Unit->Global) {
-              state.StackPointerOffset = origin->Offset;
-            } else {
-              state.StackPointerOffset = std::nullopt;
-            }
+            state.CurrentStackPointer =
+                stackPointerAddressOrigin(store->getValueOperand(), state);
           }
           state.ValueOrigins.erase(store);
           return;
@@ -1594,7 +1649,7 @@ private:
         return;
       }
       if (std::optional<StackSlotKey> slot =
-              fixedEntryStackSlot(store->getPointerOperand(), state)) {
+              fixedStackSlot(store->getPointerOperand(), state)) {
         std::optional<ValueOrigin> origin =
             entryValueOrigin(store->getValueOperand(), state);
         if (origin && origin->Offset == 0 &&
@@ -1754,15 +1809,62 @@ private:
     }
   }
 
-  std::optional<std::pair<llvm::GlobalVariable *, int64_t>>
-  entryAddressOrigin(llvm::Value *value, const State &state) const {
+  std::optional<StackSlotKey>
+  stackSlotKey(const StackPointerAddress &address) const {
+    llvm::Value *base = address.Base;
+    if (base == nullptr) {
+      base = stackPointerGlobal();
+    }
+    if (base == nullptr) {
+      return std::nullopt;
+    }
+    return StackSlotKey{base, address.Offset};
+  }
+
+  std::optional<StackSlotKey>
+  callsiteStackSlot(const State &state,
+                    const NativeRegisterCallInputSlot &slot) const {
+    if (!state.CurrentStackPointer) {
+      return std::nullopt;
+    }
+    StackPointerAddress address = *state.CurrentStackPointer;
+    address.Offset += static_cast<int64_t>(slot.StackOffset) -
+                      static_cast<int64_t>(Abi.StackShift);
+    return stackSlotKey(address);
+  }
+
+  std::optional<StackPointerAddress>
+  stackPointerAddressOrigin(llvm::Value *value, const State &state) const {
     value = value->stripPointerCasts();
-    if (std::optional<ValueOrigin> origin = entryValueOrigin(value, state)) {
-      return std::make_pair(origin->Base, origin->Offset);
+    auto known = state.StackPointerAddresses.find(value);
+    if (known != state.StackPointerAddresses.end()) {
+      return known->second;
+    }
+    if (std::optional<ValueOrigin> origin = entryValueOrigin(value, state);
+        origin && origin->Base == stackPointerGlobal()) {
+      return StackPointerAddress{nullptr, origin->Offset};
     }
     auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
-    if (binary == nullptr || (binary->getOpcode() != llvm::Instruction::Add &&
-                              binary->getOpcode() != llvm::Instruction::Sub)) {
+    if (binary == nullptr) {
+      return std::nullopt;
+    }
+
+    if (binary->getOpcode() == llvm::Instruction::And) {
+      llvm::Value *stackOperand = nullptr;
+      if (isSixteenByteStackAlignmentMask(binary->getOperand(1))) {
+        stackOperand = binary->getOperand(0);
+      } else if (isSixteenByteStackAlignmentMask(binary->getOperand(0))) {
+        stackOperand = binary->getOperand(1);
+      }
+      if (stackOperand != nullptr &&
+          stackPointerAddressOrigin(stackOperand, state)) {
+        return StackPointerAddress{binary, 0};
+      }
+      return std::nullopt;
+    }
+
+    if (binary->getOpcode() != llvm::Instruction::Add &&
+        binary->getOpcode() != llvm::Instruction::Sub) {
       return std::nullopt;
     }
 
@@ -1776,18 +1878,18 @@ private:
       return negate ? -value : value;
     };
 
-    if (auto base = entryAddressOrigin(binary->getOperand(0), state)) {
+    if (auto base = stackPointerAddressOrigin(binary->getOperand(0), state)) {
       if (auto offset = parseConstantOffset(binary->getOperand(1),
                                             binary->getOpcode() ==
                                                 llvm::Instruction::Sub)) {
-        base->second += *offset;
+        base->Offset += *offset;
         return base;
       }
     }
     if (binary->getOpcode() == llvm::Instruction::Add) {
-      if (auto base = entryAddressOrigin(binary->getOperand(1), state)) {
+      if (auto base = stackPointerAddressOrigin(binary->getOperand(1), state)) {
         if (auto offset = parseConstantOffset(binary->getOperand(0), false)) {
-          base->second += *offset;
+          base->Offset += *offset;
           return base;
         }
       }
@@ -1795,8 +1897,8 @@ private:
     return std::nullopt;
   }
 
-  std::optional<StackSlotKey> fixedEntryStackSlot(llvm::Value *pointer,
-                                                  const State &state) const {
+  std::optional<StackSlotKey> fixedStackSlot(llvm::Value *pointer,
+                                              const State &state) const {
     if (auto slot = nativeStackAllocaSlot(pointer)) {
       return slot;
     }
@@ -1804,12 +1906,11 @@ private:
     if (intToPtr == nullptr) {
       return std::nullopt;
     }
-    auto address = entryAddressOrigin(intToPtr->getOperand(0), state);
-    llvm::GlobalVariable *stackPointer = stackPointerGlobal();
-    if (!address || stackPointer == nullptr || address->first != stackPointer) {
+    auto address = stackPointerAddressOrigin(intToPtr->getOperand(0), state);
+    if (!address) {
       return std::nullopt;
     }
-    return StackSlotKey{stackPointer, address->second};
+    return stackSlotKey(*address);
   }
 
   std::optional<StackSlotKey>
@@ -1863,6 +1964,7 @@ private:
         Effects.count(callee) != 0) {
       const FunctionEffect &effect = Effects[callee];
       applyFunctionEffect(effect, state);
+      consumeCallerStackArgEvidence(state);
       if (effect.NoReturn) {
         markNoReturnExit(state);
       }
@@ -1870,16 +1972,25 @@ private:
     }
     if (const NativeExternalCallShape *shape = externalCallShape(call)) {
       applyExternalCallEffect(state, *shape);
+      consumeCallerStackArgEvidence(state);
       if (shape->NoReturn) {
         markNoReturnExit(state);
       }
       return;
     }
     applyUnknownExternalCallEffect(state);
+    consumeCallerStackArgEvidence(state);
     if (callee != nullptr && callee->isDeclaration() &&
         callee->hasFnAttribute(llvm::Attribute::NoReturn)) {
       markNoReturnExit(state);
     }
+  }
+
+  void consumeCallerStackArgEvidence(State &state) const {
+    // A caller stack slot is argument evidence only for the next real call.
+    // Keep StackSlots for saved-register tracking, but discard this separate
+    // evidence so a reused outgoing area cannot widen a later call signature.
+    state.StackSlotOrigins.clear();
   }
 
   void markNoReturnExit(State &state) const {

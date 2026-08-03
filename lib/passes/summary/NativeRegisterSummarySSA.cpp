@@ -66,6 +66,14 @@ struct RegisterAccess {
   bool IsStorageValue = false;
 };
 
+bool isSixteenByteStackAlignmentMask(llvm::Value *value) {
+  auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value);
+  if (constant == nullptr || constant->getBitWidth() > 64) {
+    return false;
+  }
+  return constant->getSExtValue() == -16;
+}
+
 struct SummaryRegisterFact {
   bool ReadEntry = false;
   bool MayEntry = true;
@@ -6118,6 +6126,24 @@ private:
     return value->getName().starts_with(prefix);
   }
 
+  bool isStackPointerAlignmentValue(llvm::Value *value) const {
+    value = resolve(value);
+    if (value == nullptr) {
+      return false;
+    }
+    value = value->stripPointerCasts();
+    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
+    if (binary == nullptr || binary->getOpcode() != llvm::Instruction::And) {
+      return false;
+    }
+    // Alignment loses the entry-SP relation.  Retain the AND instruction as a
+    // separate caller-side base instead of pretending it is entry SP.
+    return (isSixteenByteStackAlignmentMask(binary->getOperand(1)) &&
+            isStackPointerSummaryValue(binary->getOperand(0))) ||
+           (isSixteenByteStackAlignmentMask(binary->getOperand(0)) &&
+            isStackPointerSummaryValue(binary->getOperand(1)));
+  }
+
   std::optional<StackPointerRelativeOffset> stackPointerRelativeIntegerOffset(
       llvm::Value *value, llvm::SmallPtrSetImpl<llvm::Value *> &seen) const {
     value = resolve(value);
@@ -6126,6 +6152,9 @@ private:
     }
     value = value->stripPointerCasts();
     if (isStackPointerSummaryValue(value)) {
+      return StackPointerRelativeOffset{value, 0};
+    }
+    if (isStackPointerAlignmentValue(value)) {
       return StackPointerRelativeOffset{value, 0};
     }
     if (!seen.insert(value).second) {

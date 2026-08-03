@@ -2184,6 +2184,128 @@ bool testI386KnownExternalUsesCspecStackOffset() {
                   "module failed verifier after i386 stack external rewrite");
 }
 
+bool testI386AlignedStackPointerOutgoingArgIsBound() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-i386-aligned-stack-outgoing", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackTestAbi(module);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  llvm::GlobalVariable *esp = createRegisterGlobal(module, "ESP", i32, 0, 4);
+  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+
+  auto *calleeType = llvm::FunctionType::get(i32, {}, false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "puts", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "i386_aligned_stack_outgoing", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *espEntry = loadRegister(builder, esp, "ESP", "esp.entry", 4);
+  llvm::Value *alignedEsp = builder.CreateAnd(
+      espEntry, llvm::ConstantInt::get(i32, -16, true), "esp.aligned");
+  storeRegister(builder, esp, alignedEsp, "ESP", 4);
+  llvm::Value *argPointer =
+      builder.CreateIntToPtr(alignedEsp, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(i32, 42), argPointer);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction =
+      module.getFunction("i386_aligned_stack_outgoing");
+  llvm::CallInst *rewritten = nullptr;
+  if (rewrittenFunction != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() != nullptr &&
+          call->getCalledFunction()->getName() == "puts") {
+        rewritten = call;
+      }
+    }
+  }
+  auto *constant =
+      rewritten == nullptr || rewritten->arg_size() != 1
+          ? nullptr
+          : llvm::dyn_cast<llvm::ConstantInt>(rewritten->getArgOperand(0));
+  return expect(rewritten != nullptr,
+                "i386 aligned stack external call missing") &&
+         expect(rewritten->arg_size() == 1,
+                "i386 aligned stack external did not use one stack arg") &&
+         expect(constant != nullptr && constant->getZExtValue() == 42,
+                "i386 aligned stack arg did not bind the store") &&
+         expect(summary.CallArgStoresMarked == 1,
+                "i386 aligned stack arg store was not marked") &&
+         verifyOk(module,
+                  "module failed verifier after aligned stack argument test");
+}
+
+bool testI386UnknownExternalDoesNotReusePreviousStackArgs() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-i386-stack-evidence-lifetime", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackTestAbi(module);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  llvm::GlobalVariable *esp = createRegisterGlobal(module, "ESP", i32, 0, 4);
+  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+
+  auto *calleeType = llvm::FunctionType::get(i32, {}, false);
+  llvm::Function *first = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "first_unknown", module);
+  llvm::Function *second = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "second_unknown", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "i386_stack_evidence_lifetime", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *espEntry = loadRegister(builder, esp, "ESP", "esp.entry", 4);
+  llvm::Value *alignedEsp = builder.CreateAnd(
+      espEntry, llvm::ConstantInt::get(i32, -16, true), "esp.aligned");
+  storeRegister(builder, esp, alignedEsp, "ESP", 4);
+  llvm::Value *slot0 =
+      builder.CreateIntToPtr(alignedEsp, llvm::PointerType::get(context, 0));
+  llvm::Value *slot4Address = builder.CreateAdd(
+      alignedEsp, llvm::ConstantInt::get(i32, 4), "stack.slot4.addr");
+  llvm::Value *slot4 =
+      builder.CreateIntToPtr(slot4Address, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(i32, 11), slot0);
+  builder.CreateStore(llvm::ConstantInt::get(i32, 22), slot4);
+  builder.CreateCall(calleeType, first);
+  builder.CreateStore(llvm::ConstantInt::get(i32, 33), slot0);
+  builder.CreateCall(calleeType, second);
+  builder.CreateRetVoid();
+
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction =
+      module.getFunction("i386_stack_evidence_lifetime");
+  llvm::CallInst *firstCall = nullptr;
+  llvm::CallInst *secondCall = nullptr;
+  if (rewrittenFunction != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call == nullptr || call->getCalledFunction() == nullptr) {
+        continue;
+      }
+      if (call->getCalledFunction()->getName() == "first_unknown") {
+        firstCall = call;
+      } else if (call->getCalledFunction()->getName() == "second_unknown") {
+        secondCall = call;
+      }
+    }
+  }
+  return expect(firstCall != nullptr && firstCall->arg_size() == 2,
+                "first unknown external did not retain its two stack args") &&
+         expect(secondCall != nullptr && secondCall->arg_size() == 1,
+                "second unknown external reused a stale stack arg") &&
+         verifyOk(module,
+                  "module failed verifier after stack evidence lifetime test");
+}
+
 bool testI386NativeFrameOutgoingStackArgIsBound() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-i386-native-frame-outgoing-stack", context);
@@ -2501,6 +2623,72 @@ bool testX64KnownExternalUsesCspecStackOverflowOffset() {
                 "x64 stack overflow arg did not use cspec offset") &&
          verifyOk(module,
                   "module failed verifier after x64 stack external rewrite");
+}
+
+bool testX64AlignedStackPointerOutgoingArgIsBound() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-x64-aligned-stack-outgoing", context);
+  module.setDataLayout("e-p:64:64");
+  attachX64StackTestAbi(module, 16);
+  auto *i64 = llvm::Type::getInt64Ty(context);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  (void)createRegisterGlobal(module, "RAX");
+  std::vector<llvm::GlobalVariable *> regs;
+  for (const char *name : {"RDI", "RSI", "RDX", "RCX", "R8", "R9"}) {
+    regs.push_back(createRegisterGlobal(module, name));
+  }
+
+  auto *calleeType = llvm::FunctionType::get(i64, {}, false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "getnameinfo", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "x64_aligned_stack_outgoing",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  for (auto [index, reg] : llvm::enumerate(regs)) {
+    storeRegister(builder, reg, llvm::ConstantInt::get(i64, index + 1),
+                  reg->getName().str());
+  }
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::Value *alignedRsp = builder.CreateAnd(
+      rspEntry, llvm::ConstantInt::get(i64, -16, true), "rsp.aligned");
+  storeRegister(builder, rsp, alignedRsp, "RSP");
+  llvm::Value *argAddress = builder.CreateAdd(
+      alignedRsp, llvm::ConstantInt::get(i64, 8), "arg.addr");
+  llvm::Value *argPointer =
+      builder.CreateIntToPtr(argAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(i64, 77), argPointer);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction =
+      module.getFunction("x64_aligned_stack_outgoing");
+  llvm::CallInst *rewritten = nullptr;
+  if (rewrittenFunction != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() != nullptr &&
+          call->getCalledFunction()->getName() == "getnameinfo") {
+        rewritten = call;
+      }
+    }
+  }
+  auto *constant = rewritten == nullptr || rewritten->arg_size() != 7
+                       ? nullptr
+                       : llvm::dyn_cast<llvm::ConstantInt>(
+                             rewritten->getArgOperand(6));
+  return expect(rewritten != nullptr,
+                "x64 aligned stack external call missing") &&
+         expect(rewritten->arg_size() == 7,
+                "x64 aligned stack overflow arg was not rewritten") &&
+         expect(constant != nullptr && constant->getZExtValue() == 77,
+                "x64 aligned stack arg did not bind the store") &&
+         verifyOk(module,
+                  "module failed verifier after aligned x64 stack rewrite");
 }
 
 bool testI386InternalStackInputIsRewritten() {
@@ -8451,11 +8639,14 @@ int main() {
   ok &= testCrossBlockDeadStoreIsRemoved();
   ok &= testAbiInputStoreBeforeCallIsKept();
   ok &= testI386KnownExternalUsesCspecStackOffset();
+  ok &= testI386AlignedStackPointerOutgoingArgIsBound();
+  ok &= testI386UnknownExternalDoesNotReusePreviousStackArgs();
   ok &= testI386NativeFrameOutgoingStackArgIsBound();
   ok &= testI386NativeFrameLoadDoesNotBecomeStackInput();
   ok &= testI386NativeFrameOutgoingVarArgPrefixIsBound();
   ok &= testI386StackPointerSummaryOutgoingVarArgPrefixIsBound();
   ok &= testX64KnownExternalUsesCspecStackOverflowOffset();
+  ok &= testX64AlignedStackPointerOutgoingArgIsBound();
   ok &= testI386InternalStackInputIsRewritten();
   ok &= testKnownZeroArgExternalDropsAbiInputs();
   ok &= testKnownFixedArgExternalTruncatesAbiInputs();
