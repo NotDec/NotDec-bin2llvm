@@ -662,3 +662,39 @@ scripts/native-fortune-x86_64-regression.sh build/bin/notdec-native-llvm \
 - 维护成本：4/10。thunk 字节模式只覆盖 i386 `mov (%esp),%reg; ret`，
   其它架构（x64 RIP 相对）不需要；后续若遇到 thunk 后不跟 `add` 的
   变体，当前会退化成保留 call（不折叠），行为安全。
+
+## 已完成：caller 侧回溯扫描不再被非栈 store 打断
+
+### 背景
+
+剩余 14 条 call_arg 绑定告警里，3fe0→3d30 stack+4、36c0→close stack+4
+（含其 rewrite_missing）是同一类：push store 就在 call 同一块里，但更靠近
+call 的位置有非栈 store（3fe0 的 `mov %ax,(%esi)`、36c0 bswap 后对
+`inttoptr(ESI+k)` 的 store），`findNearestStackStoreBeforeCall`
+遇到非栈 store 直接 break，够不到更早的 push。
+
+### 实现
+
+`lib/passes/summary/NativeRegisterSummarySSA.cpp`
+`findNearestStackStoreBeforeCall()`（约 5920 行）：非栈、非寄存器 store
+由 `break` 改为 `continue`。语义与第一遍 dataflow 对齐：第一遍只跟踪
+concrete stack slot，非栈 store 不使槽位失效；call 和其余
+mayWriteToMemory 指令仍然限制扫描范围（对应第一遍 call 后
+`consumeCallerStackArgEvidence` 清空 outgoing evidence）。
+
+### 验证
+
+- i386 fortune：41 条 warning → 38 条；call_arg 15 → 11 条，3fe0/36c0
+  的 3 条（2 binding_missing + 1 rewrite_missing）消失。
+- x64 fortune：call_arg 仍 0 条，无回归。
+- 5 个 native 单测全过。
+
+### 评分
+
+- 实现效果：10/10，3 条告警消失，无新告警。
+- 复杂度：2/10，一行语义改动。
+- 维护成本：2/10，注释说明了与第一遍 dataflow 的一致性。
+
+剩余 call_arg 告警 11 条：跨块 push 7 条（2170 递归、2a50→2170、
+2a50→fwrite 及其 3 条 rewrite_missing、3510→__fprintf_chk），
+fp vararg 2 条（19b0），clobber 值 2 条（3a90）。

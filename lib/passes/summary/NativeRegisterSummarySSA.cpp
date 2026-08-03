@@ -5921,7 +5921,12 @@ private:
         if (access.Unit != nullptr) {
           continue;
         }
-        break;
+        // Same convention as the first-pass dataflow: only concrete stack
+        // slots are evidence for outgoing args. A store to an unclassified
+        // address (data/heap pointer) does not invalidate the slots we are
+        // matching, so keep scanning instead of stopping. Calls and other
+        // memory-writing instructions still bound the scan.
+        continue;
       }
       if (auto *otherCall = llvm::dyn_cast<llvm::CallBase>(&inst)) {
         if (isAnalyzableCall(*otherCall)) {
