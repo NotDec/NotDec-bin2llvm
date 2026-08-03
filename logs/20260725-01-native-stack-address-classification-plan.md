@@ -481,3 +481,63 @@ scripts/native-fortune-x86_64-regression.sh build/bin/notdec-native-llvm \
 - 实现效果：9/10。统一了三处坐标解释，同时保住 i386/x64 的 ABI 参数边界。
 - 复杂度：6/10。增加一个小型函数内数据流，删除两份重复状态，整体理解成本略降。
 - 维护成本：6/10。后续只有在真实样本需要时，才为跨 block 参数值或 alias 增加独立分析。
+
+# 实现记录（2026-08-03，第一遍 summary 的 native-frame evidence 坐标回退）
+
+## 已完成
+
+阶段二改完后，i386 fortune 的 unknown external 仍全部被推断成 arity=0。根因在
+第一遍 summary：`fixedStackSlot()` 记录 outgoing store 证据时用的是
+`{notdec_stack.native alloca, allocaOffset}`（`addressForPointer` 对 alloca GEP
+返回 NativeFrame），而 `callsiteStackSlot()` 查询时用 entry-SP 坐标
+`{@ESP, entryOffset}`，两者永远不匹配，16 个 evidence 槽全部 Unknown，
+`localDefinitionPrefix` 得到 0。本次给第一遍的 evidence 查询补 NativeFrame 回退：
+
+- `lib/passes/summary/NativeRegisterSummary.cpp:78` 新增 `nativeFrameOrigin()`，
+  从 `notdec_stack.native` alloca 的 `[N x i8]` 大小还原 `frameLow = -N`。
+- `:110` 新增 `entrySlotToNativeFrameKey()`，把 entry-SP 偏移换算成
+  `entryOffset - frameLow` 的 alloca 偏移。
+- `:1429` 的 `callsiteOrigin()` 先按原 entry-SP key 查，miss 后再按换算出的
+  alloca key 查 `StackSlotOrigins` / `StackSlots`，其余逻辑不变。
+- `tests/native_register_summary_test.cpp:691` 新增
+  `testI386RewrittenFrameStackEvidenceMatchesAllocaSlot()`：手工构造
+  `notdec_stack.native` alloca + outgoing store + `ESP-4` push，验证证据能匹配；
+  去掉回退后该测试失败。
+
+## 结果
+
+i386 fortune：
+
+- `__xstat` 4 个调用点 arity 0 -> 3，最终 IR 为 `call i32 @__xstat(i32 3, ...)`。
+- `_IO_putc` arity 0 -> 2，`recode_string` 0 -> 2，`recode_delete_request` /
+  `recode_new_outer` 0 -> 1。
+- `unresolved_unknown_external_signature` 从 7 条降到 2 条；剩下
+  `notdec_native_10a0` / `notdec_native_1839` 是内部零参数函数，修改前已存在。
+- 新增 `non_contiguous_vararg_evidence`（`__fprintf_chk` / `__snprintf_chk` /
+  `__sprintf_chk` / `snprintf`）和个别 `call_arg_binding_missing` warning：这是
+  arity 推断从 0 变成真实值后暴露的后续问题，vararg tail（`stack+16` 等）绑定
+  尚未完全对齐，留待下轮。
+
+x64 fortune 无退化，`unresolved_unknown_external_signature` 仍为 0。
+
+## 验证
+
+```bash
+cmake --build build --target native_register_summary_test \
+  native_register_summary_ssa_test notdec-native-llvm -j$(nproc)
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+scripts/native-fortune-i386-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+scripts/native-fortune-x86_64-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+```
+
+两个 fortune 脚本均用 LLVM 22 的 `llvm-as` 和 `opt -passes=verify` 验证输出。
+
+## 评分
+
+- 实现效果：9/10。unknown external 的栈参数 arity 恢复正确，x64 无退化。
+- 复杂度：5/10。只加两个小 helper 和一个回退查询，没有改动 rewrite。
+- 维护成本：5/10。坐标换算依赖 alloca 大小等于 `-frameLow` 这一构造不变式，
+  后续改 rewrite 布局时需要同步留意。

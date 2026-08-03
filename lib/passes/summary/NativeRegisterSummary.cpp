@@ -13,6 +13,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstIterator.h"
@@ -66,6 +67,59 @@ struct StackSlotKey {
     return Base == other.Base && Offset == other.Offset;
   }
 };
+
+// The stack frame rewrite folds outgoing call arguments into the same
+// notdec_stack.native alloca as locals.  Stores before a call are therefore
+// recorded under alloca-relative offsets, while cspec slot math starts from the
+// entry-SP offset.  This helper translates between the two coordinate spaces;
+// the alloca size is exactly -frameLow by construction, so no extra metadata is
+// needed.
+std::optional<std::pair<llvm::AllocaInst *, int64_t>>
+nativeFrameOrigin(llvm::Function &function) {
+  llvm::AllocaInst *alloca = nullptr;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &inst : block) {
+      auto *candidate = llvm::dyn_cast<llvm::AllocaInst>(&inst);
+      if (candidate == nullptr || !candidate->hasName() ||
+          !candidate->getName().starts_with("notdec_stack.native")) {
+        continue;
+      }
+      if (alloca != nullptr) {
+        return std::nullopt;
+      }
+      alloca = candidate;
+    }
+  }
+  if (alloca == nullptr) {
+    return std::nullopt;
+  }
+  auto *array = llvm::dyn_cast<llvm::ArrayType>(alloca->getAllocatedType());
+  if (array == nullptr || !array->getElementType()->isIntegerTy(8)) {
+    return std::nullopt;
+  }
+  uint64_t frameSize = array->getNumElements();
+  if (frameSize > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    return std::nullopt;
+  }
+  return std::make_pair(alloca, -static_cast<int64_t>(frameSize));
+}
+
+// Convert an entry-SP relative slot into the equivalent alloca-relative slot,
+// or return nullopt when the function has no rewritten native frame.
+std::optional<StackSlotKey>
+entrySlotToNativeFrameKey(llvm::Function &function,
+                          const StackSlotKey &entryKey) {
+  std::optional<std::pair<llvm::AllocaInst *, int64_t>> frame =
+      nativeFrameOrigin(function);
+  if (!frame || entryKey.Offset < frame->second) {
+    return std::nullopt;
+  }
+  int64_t allocaOffset = entryKey.Offset - frame->second;
+  if (allocaOffset < 0) {
+    return std::nullopt;
+  }
+  return StackSlotKey{frame->first, allocaOffset};
+}
 
 struct ValueOrigin {
   llvm::GlobalVariable *Base = nullptr;
@@ -1379,12 +1433,30 @@ private:
       if (!key) {
         return NativeRegisterCallsiteValueOrigin::Unknown;
       }
-      auto originIt = state.StackSlotOrigins.find(*key);
-      if (originIt != state.StackSlotOrigins.end()) {
-        return originIt->second;
+      auto originFor = [&](const StackSlotKey &candidate)
+          -> std::optional<NativeRegisterCallsiteValueOrigin> {
+        auto originIt = state.StackSlotOrigins.find(candidate);
+        if (originIt != state.StackSlotOrigins.end()) {
+          return originIt->second;
+        }
+        if (state.StackSlots.count(candidate) != 0) {
+          return NativeRegisterCallsiteValueOrigin::ForwardedEntry;
+        }
+        return std::nullopt;
+      };
+      if (std::optional<NativeRegisterCallsiteValueOrigin> origin =
+              originFor(*key)) {
+        return *origin;
       }
-      if (state.StackSlots.count(*key) != 0) {
-        return NativeRegisterCallsiteValueOrigin::ForwardedEntry;
+      // After the stack frame rewrite, outgoing argument stores live in
+      // notdec_stack.native under alloca-relative offsets.  Try that coordinate
+      // space as a fallback so cspec stack slots still see their stores.
+      if (std::optional<StackSlotKey> frameKey =
+              entrySlotToNativeFrameKey(*call.getFunction(), *key)) {
+        if (std::optional<NativeRegisterCallsiteValueOrigin> origin =
+                originFor(*frameKey)) {
+          return *origin;
+        }
       }
       return NativeRegisterCallsiteValueOrigin::Unknown;
     }

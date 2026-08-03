@@ -688,6 +688,60 @@ bool testI386AlignedStackCallsiteEvidenceUsesCurrentEsp() {
                 "aligned i386 stack store was not matched at current ESP");
 }
 
+bool testI386RewrittenFrameStackEvidenceMatchesAllocaSlot() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-i386-rewritten-frame-evidence", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackEvidenceAbi(module);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  llvm::GlobalVariable *esp = createRegisterGlobal(module, "ESP", i32, 0, 4);
+
+  auto *callType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external =
+      llvm::Function::Create(callType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_stack_target", module);
+  llvm::Function *function =
+      llvm::Function::Create(callType, llvm::GlobalValue::ExternalLinkage,
+                             "rewritten_frame_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  // Mimic a rewritten native frame: alloca size is exactly -frameLow, and the
+  // outgoing argument store lives at allocaOffset = entryOffset - frameLow.
+  auto *frameType = llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 8);
+  llvm::AllocaInst *frame =
+      builder.CreateAlloca(frameType, nullptr, "notdec_stack.native");
+  // entryOffset -4 -> allocaOffset 4 (frameLow == -8).
+  llvm::Value *slot =
+      builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(context), frame,
+                                llvm::ConstantInt::get(i32, 4));
+  builder.CreateStore(llvm::ConstantInt::get(i32, 55), slot);
+  llvm::LoadInst *entryEsp = loadRegister(builder, esp, "ESP", "entry.esp");
+  llvm::Value *pushed =
+      builder.CreateSub(entryEsp, llvm::ConstantInt::get(i32, 4));
+  storeRegisterValue(builder, esp, pushed, "ESP");
+  builder.CreateCall(callType, external);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummaryOptions options;
+  options.AttachMetadata = false;
+  options.IgnoredRegisters.insert("ESP");
+  options.UnknownExternalInputPolicy =
+      notdec::bin2llvm::NativeRegisterUnknownExternalInputPolicy::NoInputs;
+  options.CollectExternalCallsiteEvidence = true;
+  options.ExternalEvidenceSlots = {stackInputSlot(4)};
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module, options);
+  const auto *callsite =
+      unknownExternalCallsite(summary, "unknown_stack_target");
+  using Origin = notdec::bin2llvm::NativeRegisterCallsiteValueOrigin;
+  return expect(callsite != nullptr,
+                "missing rewritten frame stack callsite evidence") &&
+         expect(callsite->Slots.size() == 1,
+                "rewritten frame stack evidence slot count mismatch") &&
+         expect(callsite->Slots[0].Origin == Origin::LocalDefinition,
+                "rewritten frame outgoing store was not matched via alloca");
+}
+
 bool testCalleeReadPropagatesToCallerEntry() {
   llvm::LLVMContext context;
   llvm::Module module("summary-call-read", context);
@@ -965,6 +1019,7 @@ int main() {
   ok &= testKnownVarArgUsesFixedThenCallsiteInputs();
   ok &= testUnknownExternalCallsiteEvidenceClassifiesOrigins();
   ok &= testI386AlignedStackCallsiteEvidenceUsesCurrentEsp();
+  ok &= testI386RewrittenFrameStackEvidenceMatchesAllocaSlot();
   ok &= testCalleeReadPropagatesToCallerEntry();
   ok &= testSparseJoinKeepsUntouchedPath();
   ok &= testTopDownDemandKeepsOnlyUsedReturn();
