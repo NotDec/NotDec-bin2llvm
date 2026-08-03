@@ -7,13 +7,14 @@
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
+#include "notdec-bin2llvm/passes/summary/NativeStackAddress.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
-#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
@@ -40,6 +41,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -65,14 +67,6 @@ struct RegisterAccess {
   bool IsRegisterAccess = false;
   bool IsStorageValue = false;
 };
-
-bool isSixteenByteStackAlignmentMask(llvm::Value *value) {
-  auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value);
-  if (constant == nullptr || constant->getBitWidth() > 64) {
-    return false;
-  }
-  return constant->getSExtValue() == -16;
-}
 
 struct SummaryRegisterFact {
   bool ReadEntry = false;
@@ -361,8 +355,7 @@ std::string llvmTypeName(llvm::Type *type) {
 llvm::Function *getOrInsertUnknownValueHelper(llvm::Module &module,
                                               llvm::Type *type) {
   std::string name = "notdec.unknown." + llvmTypeName(type);
-  llvm::FunctionType *functionType =
-      llvm::FunctionType::get(type, {}, false);
+  llvm::FunctionType *functionType = llvm::FunctionType::get(type, {}, false);
   if (auto *function = module.getFunction(name)) {
     if (function->getFunctionType() == functionType) {
       return function;
@@ -378,8 +371,8 @@ llvm::Function *getOrInsertUnknownValueHelper(llvm::Module &module,
   if (module.getNamedValue(name) != nullptr) {
     name += ".typed";
   }
-  return llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
-                                name, module);
+  return llvm::Function::Create(
+      functionType, llvm::GlobalValue::ExternalLinkage, name, module);
 }
 
 llvm::Value *unknownValueAt(llvm::IRBuilder<> &builder, llvm::Type *type,
@@ -388,9 +381,8 @@ llvm::Value *unknownValueAt(llvm::IRBuilder<> &builder, llvm::Type *type,
   if (block == nullptr || block->getModule() == nullptr) {
     return llvm::PoisonValue::get(type);
   }
-  return builder.CreateCall(getOrInsertUnknownValueHelper(*block->getModule(),
-                                                          type),
-                            {}, name);
+  return builder.CreateCall(
+      getOrInsertUnknownValueHelper(*block->getModule(), type), {}, name);
 }
 
 void attachUnknownValueMetadata(llvm::Value *value, llvm::StringRef reason,
@@ -407,11 +399,12 @@ void attachUnknownValueMetadata(llvm::Value *value, llvm::StringRef reason,
   std::vector<llvm::Metadata *> fields;
   fields.push_back(llvm::MDString::get(context, "reason=" + reason.str()));
   if (!functionName.empty()) {
-    fields.push_back(llvm::MDString::get(context,
-                                         "function=" + functionName.str()));
+    fields.push_back(
+        llvm::MDString::get(context, "function=" + functionName.str()));
   }
   if (!calleeName.empty()) {
-    fields.push_back(llvm::MDString::get(context, "callee=" + calleeName.str()));
+    fields.push_back(
+        llvm::MDString::get(context, "callee=" + calleeName.str()));
   }
   if (!registerName.empty()) {
     fields.push_back(
@@ -423,7 +416,8 @@ void attachUnknownValueMetadata(llvm::Value *value, llvm::StringRef reason,
   if (!detail.empty()) {
     fields.push_back(llvm::MDString::get(context, "detail=" + detail.str()));
   }
-  inst->setMetadata("notdec.unknown.source", llvm::MDNode::get(context, fields));
+  inst->setMetadata("notdec.unknown.source",
+                    llvm::MDNode::get(context, fields));
 }
 
 llvm::Value *unknownValueBefore(llvm::Instruction &insertBefore,
@@ -435,8 +429,7 @@ llvm::Value *unknownValueBefore(llvm::Instruction &insertBefore,
 llvm::Function *getOrInsertVarArgUnknownHelper(llvm::Module &module,
                                                llvm::Type *type) {
   std::string name = "notdec.register.vararg_unknown." + llvmTypeName(type);
-  llvm::FunctionType *functionType =
-      llvm::FunctionType::get(type, {}, false);
+  llvm::FunctionType *functionType = llvm::FunctionType::get(type, {}, false);
   return llvm::cast<llvm::Function>(
       module.getOrInsertFunction(name, functionType).getCallee());
 }
@@ -1351,9 +1344,9 @@ floatSlotForDemand(llvm::LLVMContext &context,
                               NativeSignatureSlotKind::FloatRegister);
 }
 
-const RegisterUnit *stackPointerUnit(
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
-    const AbiFacts &abi) {
+const RegisterUnit *
+stackPointerUnit(const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+                 const AbiFacts &abi) {
   if (abi.StackPointer.empty()) {
     return nullptr;
   }
@@ -1366,99 +1359,20 @@ const RegisterUnit *stackPointerUnit(
   return nullptr;
 }
 
-std::optional<int64_t> entryStackOffsetFromValue(
-    llvm::Value *value, const RegisterUnit &stackPointer,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
-  value = value->stripPointerCasts();
-  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(value)) {
-    RegisterAccess access = registerLoad(*load, units);
-    if (access.Unit != nullptr && access.Unit->Global == stackPointer.Global) {
-      return 0;
-    }
+std::optional<NativeSignatureSlot>
+stackInputSlotForLoad(llvm::LoadInst &load,
+                      const NativeStackAddressAnalysis &stackAddresses,
+                      const AbiFacts &abi) {
+  if (abi.StackInputsInOrder.empty() || !load.getType()->isSized()) {
     return std::nullopt;
   }
-  auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
-  if (binary == nullptr || (binary->getOpcode() != llvm::Instruction::Add &&
-                            binary->getOpcode() != llvm::Instruction::Sub)) {
+  std::optional<NativeStackAddress> address =
+      stackAddresses.addressForPointer(load.getPointerOperand());
+  if (!address || address->Kind != NativeStackAddressKind::EntryStackPointer ||
+      address->Offset < 0) {
     return std::nullopt;
   }
-  auto lhs = entryStackOffsetFromValue(binary->getOperand(0), stackPointer,
-                                       units);
-  auto *rhs = llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(1));
-  if (lhs && rhs != nullptr && rhs->getBitWidth() <= 64) {
-    int64_t delta = rhs->getSExtValue();
-    return binary->getOpcode() == llvm::Instruction::Sub ? *lhs - delta
-                                                          : *lhs + delta;
-  }
-  if (binary->getOpcode() == llvm::Instruction::Add) {
-    auto rhsOrigin = entryStackOffsetFromValue(binary->getOperand(1),
-                                               stackPointer, units);
-    auto *lhsConst = llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(0));
-    if (rhsOrigin && lhsConst != nullptr && lhsConst->getBitWidth() <= 64) {
-      return *rhsOrigin + lhsConst->getSExtValue();
-    }
-  }
-  return std::nullopt;
-}
-
-std::optional<int64_t> entryStackOffsetFromPointer(
-    llvm::Value *pointer, const RegisterUnit &stackPointer,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
-  pointer = pointer->stripPointerCasts();
-  auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(pointer);
-  if (intToPtr == nullptr) {
-    return std::nullopt;
-  }
-  return entryStackOffsetFromValue(intToPtr->getOperand(0), stackPointer, units);
-}
-
-bool isNativeStackAlloca(const llvm::AllocaInst &alloca) {
-  return alloca.hasName() && alloca.getName().starts_with("notdec_stack.native");
-}
-
-std::optional<uint64_t> nativeStackAllocaSize(const llvm::AllocaInst &alloca,
-                                              const llvm::DataLayout &layout) {
-  if (!isNativeStackAlloca(alloca)) {
-    return std::nullopt;
-  }
-  llvm::TypeSize allocated = layout.getTypeAllocSize(alloca.getAllocatedType());
-  if (allocated.isScalable()) {
-    return std::nullopt;
-  }
-  uint64_t bytes = allocated.getFixedValue();
-  if (alloca.isArrayAllocation()) {
-    auto *count = llvm::dyn_cast<llvm::ConstantInt>(alloca.getArraySize());
-    if (count == nullptr || count->getBitWidth() > 64) {
-      return std::nullopt;
-    }
-    uint64_t arrayCount = count->getZExtValue();
-    if (arrayCount != 0 &&
-        bytes > std::numeric_limits<uint64_t>::max() / arrayCount) {
-      return std::nullopt;
-    }
-    bytes *= arrayCount;
-  }
-  if (bytes > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-    return std::nullopt;
-  }
-  return bytes;
-}
-
-std::optional<NativeSignatureSlot> stackInputSlotForLoad(
-    llvm::LoadInst &load,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
-    const AbiFacts &abi) {
-  const RegisterUnit *stackPointer = stackPointerUnit(units, abi);
-  if (stackPointer == nullptr || abi.StackInputsInOrder.empty() ||
-      !load.getType()->isSized()) {
-    return std::nullopt;
-  }
-  std::optional<int64_t> signedOffset = entryStackOffsetFromPointer(
-      load.getPointerOperand(), *stackPointer, units);
-  if (!signedOffset || *signedOffset < 0) {
-    return std::nullopt;
-  }
-  uint64_t offset = static_cast<uint64_t>(*signedOffset);
+  uint64_t offset = static_cast<uint64_t>(address->Offset);
   uint32_t sizeBytes =
       static_cast<uint32_t>((load.getType()->getScalarSizeInBits() + 7) / 8);
   if (sizeBytes == 0) {
@@ -1496,6 +1410,12 @@ void appendInternalStackParams(
     SignatureShape &shape, llvm::Function &function,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     const AbiFacts &abi) {
+  const RegisterUnit *stackPointer = stackPointerUnit(units, abi);
+  if (stackPointer == nullptr) {
+    return;
+  }
+  NativeStackAddressAnalysis stackAddresses(function, stackPointer->Global,
+                                            abi.StackPointer);
   std::map<std::pair<uint64_t, unsigned>, NativeSignatureSlot> stackSlots;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
@@ -1503,7 +1423,7 @@ void appendInternalStackParams(
       continue;
     }
     if (std::optional<NativeSignatureSlot> slot =
-            stackInputSlotForLoad(*load, units, abi)) {
+            stackInputSlotForLoad(*load, stackAddresses, abi)) {
       stackSlots.emplace(std::make_pair(slot->StackOffset, slot->SizeBits),
                          *slot);
     }
@@ -1683,10 +1603,9 @@ typedParamSlot(NativeExternalPrototype::ValueType type, unsigned &integerIndex,
   return std::nullopt;
 }
 
-std::optional<NativeSignatureSlot>
-untypedIntegerParamSlot(unsigned index,
-                        const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
-                        const AbiFacts &abi, llvm::Module &module) {
+std::optional<NativeSignatureSlot> untypedIntegerParamSlot(
+    unsigned index, const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi, llvm::Module &module) {
   if (index < abi.IntegerInputsInOrder.size()) {
     return signatureSlotFromAbi(abi.IntegerInputsInOrder[index], units, nullptr,
                                 NativeSignatureSlotKind::IntegerRegister);
@@ -1784,8 +1703,8 @@ SignatureShape shapeForKnownExternal(
       shape.Params.push_back(*slot);
     }
     if (known->TypedReturn) {
-      std::optional<NativeSignatureSlot> slot = typedReturnSlot(
-          *known->TypedReturn, units, abi, *module);
+      std::optional<NativeSignatureSlot> slot =
+          typedReturnSlot(*known->TypedReturn, units, abi, *module);
       if (slot) {
         shape.Returns.push_back(*slot);
       }
@@ -2045,9 +1964,10 @@ std::optional<unsigned> constantLowByteBeforeCall(
     const NativeRegisterExternalCallsite &callsite,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     llvm::StringRef registerName) {
-  auto unitIt = std::find_if(units.begin(), units.end(), [&](const auto &entry) {
-    return entry.second.Name == registerName;
-  });
+  auto unitIt =
+      std::find_if(units.begin(), units.end(), [&](const auto &entry) {
+        return entry.second.Name == registerName;
+      });
   if (unitIt == units.end() || callsite.Call == nullptr ||
       callsite.Call->getParent() == nullptr) {
     return std::nullopt;
@@ -2150,8 +2070,7 @@ std::string slotDetail(const NativeRegisterCallsiteSlotEvidence &slot) {
            std::to_string(slot.SizeBits) + "]=" + originName(slot.Origin).str();
   }
   return slot.UnitName + "[" + std::to_string(slot.OffsetBits) + ":" +
-         std::to_string(slot.SizeBits) + "]=" +
-         originName(slot.Origin).str();
+         std::to_string(slot.SizeBits) + "]=" + originName(slot.Origin).str();
 }
 
 void warnIfStoppedAtCallClobber(
@@ -2164,13 +2083,14 @@ void warnIfStoppedAtCallClobber(
       slot->Origin != NativeRegisterCallsiteValueOrigin::CallClobber) {
     return;
   }
-  warnings.push_back(varArgInferenceWarning(callsite, slotDetail(*slot),
-                                            reason));
+  warnings.push_back(
+      varArgInferenceWarning(callsite, slotDetail(*slot), reason));
 }
 
 std::string calleeNameForWarning(const llvm::CallBase &call) {
   llvm::Function *callee = call.getCalledFunction();
-  return callee == nullptr ? std::string("<indirect>") : callee->getName().str();
+  return callee == nullptr ? std::string("<indirect>")
+                           : callee->getName().str();
 }
 
 std::string slotRegisterName(const NativeSignatureSlot &slot) {
@@ -2183,9 +2103,10 @@ std::string slotRegisterName(const NativeSignatureSlot &slot) {
   return slot.AbiName;
 }
 
-NativeRegisterSummarySSAWarning
-callSlotWarning(const llvm::CallBase &call, const NativeSignatureSlot &slot,
-                llvm::StringRef kind, llvm::StringRef reason) {
+NativeRegisterSummarySSAWarning callSlotWarning(const llvm::CallBase &call,
+                                                const NativeSignatureSlot &slot,
+                                                llvm::StringRef kind,
+                                                llvm::StringRef reason) {
   NativeRegisterSummarySSAWarning warning;
   const llvm::Function *function = call.getFunction();
   warning.FunctionName =
@@ -2218,9 +2139,10 @@ std::string registerNameForRange(const RegisterRangeKey &range) {
                                  : range.Global->getName().str();
 }
 
-NativeRegisterSummarySSAWarning
-callRangeWarning(const llvm::CallBase &call, const RegisterRangeKey &range,
-                 llvm::StringRef kind, llvm::StringRef reason) {
+NativeRegisterSummarySSAWarning callRangeWarning(const llvm::CallBase &call,
+                                                 const RegisterRangeKey &range,
+                                                 llvm::StringRef kind,
+                                                 llvm::StringRef reason) {
   NativeRegisterSummarySSAWarning warning =
       callRegisterWarning(call, registerNameForRange(range), kind, reason);
   warning.RangeBitOffset = range.BitOffset;
@@ -2229,8 +2151,8 @@ callRangeWarning(const llvm::CallBase &call, const RegisterRangeKey &range,
 }
 
 NativeRegisterSummarySSAWarning
-returnSlotWarning(const llvm::Function &function, const NativeSignatureSlot &slot,
-                  llvm::StringRef reason) {
+returnSlotWarning(const llvm::Function &function,
+                  const NativeSignatureSlot &slot, llvm::StringRef reason) {
   NativeRegisterSummarySSAWarning warning;
   warning.FunctionName = function.getName().str();
   warning.CalleeName = "<return>";
@@ -2296,11 +2218,11 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
         ++added;
       }
       if (added < *sseVarArgs) {
-        warnings.push_back(varArgInferenceWarning(
-            callsite,
-            "float_tail=" + std::to_string(added) + "/" +
-                std::to_string(*sseVarArgs),
-            "incomplete_float_vararg_mapping"));
+        warnings.push_back(
+            varArgInferenceWarning(callsite,
+                                   "float_tail=" + std::to_string(added) + "/" +
+                                       std::to_string(*sseVarArgs),
+                                   "incomplete_float_vararg_mapping"));
         warnIfStoppedAtCallClobber(
             warnings, callsite, floatSlots, added,
             "float_vararg_evidence_stopped_at_call_clobber");
@@ -2333,9 +2255,8 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
           callsite, "tail=" + std::to_string(inferredTail),
           "non_contiguous_vararg_evidence"));
     }
-    warnIfStoppedAtCallClobber(
-        warnings, callsite, integerSlots, rawPrefix,
-        "vararg_evidence_stopped_at_call_clobber");
+    warnIfStoppedAtCallClobber(warnings, callsite, integerSlots, rawPrefix,
+                               "vararg_evidence_stopped_at_call_clobber");
     callsiteShapes.emplace(callsite.Call, std::move(shape));
   }
 
@@ -2643,12 +2564,11 @@ void refineInternalStackParamShapes(SignatureRewriteState &state) {
       if (call == nullptr || call->getCalledFunction() != function) {
         continue;
       }
-      bindings.erase(
-          std::remove_if(bindings.begin(), bindings.end(),
-                         [&](const CallArgStoreBinding &binding) {
-                           return binding.Index >= finalArity;
-                         }),
-          bindings.end());
+      bindings.erase(std::remove_if(bindings.begin(), bindings.end(),
+                                    [&](const CallArgStoreBinding &binding) {
+                                      return binding.Index >= finalArity;
+                                    }),
+                     bindings.end());
     }
   }
 }
@@ -2798,11 +2718,6 @@ public:
   }
 
 private:
-  struct EntryAddressState {
-    std::map<llvm::Value *, int64_t> Offsets;
-    std::optional<int64_t> StackPointerOffset = 0;
-  };
-
   llvm::Function &Function;
   const std::map<llvm::GlobalVariable *, RegisterUnit> &Units;
   const std::map<llvm::Function *, FunctionSummaryFacts> &SummaryFacts;
@@ -2842,6 +2757,9 @@ private:
   std::map<llvm::GlobalVariable *, std::set<uint64_t>> RangeBoundaries;
   std::map<llvm::GlobalVariable *, std::vector<RegisterRangeKey>> PlannedRanges;
   std::map<CallRangeValueKey, llvm::Value *> CallRangeValues;
+  // This is built after register-load rewriting and remains valid while call
+  // arguments are collected. It must not survive a later IR-mutating phase.
+  std::unique_ptr<NativeStackAddressAnalysis> StackAddresses;
   bool PostSignatureCleanup = false;
 
   static unsigned valueBitWidth(llvm::Value *value) {
@@ -2867,8 +2785,7 @@ private:
   }
 
   bool callPreservesRegisterByAbi(const RegisterUnit &unit) const {
-    return isSegmentBaseUnit(unit.Name) ||
-           Abi.Unaffected.count(unit.Name) != 0;
+    return isSegmentBaseUnit(unit.Name) || Abi.Unaffected.count(unit.Name) != 0;
   }
 
   static llvm::APInt maskForLowBits(unsigned bitWidth, unsigned lowBits) {
@@ -4071,12 +3988,10 @@ private:
     return domTree.dominates(inst->getParent(), use->getParent());
   }
 
-  llvm::Value *
-  assembleRangeReadIfDominating(const std::vector<RegisterRangeKey> &ranges,
-                                uint64_t readOffset, uint32_t readWidth,
-                                llvm::Instruction *before, llvm::Twine name,
-                                llvm::DominatorTree &domTree,
-                                bool allowUnknownSegments = false) {
+  llvm::Value *assembleRangeReadIfDominating(
+      const std::vector<RegisterRangeKey> &ranges, uint64_t readOffset,
+      uint32_t readWidth, llvm::Instruction *before, llvm::Twine name,
+      llvm::DominatorTree &domTree, bool allowUnknownSegments = false) {
     if (ranges.empty() || before == nullptr || readWidth == 0) {
       return nullptr;
     }
@@ -4152,8 +4067,7 @@ private:
     unsigned fullWidth = registerBitWidth(unit);
     llvm::Value *value = readAccessRangeIfDominating(
         unit.Global, 0, fullWidth, before,
-        llvm::Twine(unit.Name) + ".full_range", domTree,
-        allowUnknownSegments);
+        llvm::Twine(unit.Name) + ".full_range", domTree, allowUnknownSegments);
     value = resolve(value);
     if (value == nullptr || value->getType() != unit.Global->getValueType()) {
       return nullptr;
@@ -5373,100 +5287,6 @@ private:
     return nullptr;
   }
 
-  std::optional<int64_t> entryOffsetForValue(llvm::Value *value,
-                                             EntryAddressState &state) const {
-    value = value->stripPointerCasts();
-    auto known = state.Offsets.find(value);
-    if (known != state.Offsets.end()) {
-      return known->second;
-    }
-    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
-    if (binary == nullptr || (binary->getOpcode() != llvm::Instruction::Add &&
-                              binary->getOpcode() != llvm::Instruction::Sub)) {
-      return std::nullopt;
-    }
-    auto lhs = entryOffsetForValue(binary->getOperand(0), state);
-    auto *rhs = llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(1));
-    if (!lhs || rhs == nullptr || rhs->getBitWidth() > 64) {
-      if (binary->getOpcode() == llvm::Instruction::Add) {
-        auto rhsOrigin = entryOffsetForValue(binary->getOperand(1), state);
-        auto *lhsConst = llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(0));
-        if (rhsOrigin && lhsConst != nullptr && lhsConst->getBitWidth() <= 64) {
-          return *rhsOrigin + lhsConst->getSExtValue();
-        }
-      }
-      return std::nullopt;
-    }
-    int64_t delta = rhs->getSExtValue();
-    return binary->getOpcode() == llvm::Instruction::Sub ? *lhs - delta
-                                                          : *lhs + delta;
-  }
-
-  void transferEntryAddressInst(llvm::Instruction &inst,
-                                EntryAddressState &state) const {
-    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
-      RegisterAccess access = registerLoad(*load, Units);
-      if (access.Unit != nullptr && access.Unit->Global == stackPointerGlobal() &&
-          state.StackPointerOffset) {
-        state.Offsets[load] = *state.StackPointerOffset;
-      }
-      return;
-    }
-    if (auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(&inst)) {
-      if (auto offset = entryOffsetForValue(binary, state)) {
-        state.Offsets[binary] = *offset;
-      }
-      return;
-    }
-    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
-      RegisterAccess access = registerStore(*store, Units);
-      if (access.Unit != nullptr && access.Unit->Global == stackPointerGlobal()) {
-        state.StackPointerOffset =
-            entryOffsetForValue(store->getValueOperand(), state);
-      }
-    }
-  }
-
-  EntryAddressState entryAddressStateBefore(llvm::Instruction &before) const {
-    EntryAddressState state;
-    if (before.getParent() == nullptr) {
-      state.StackPointerOffset = std::nullopt;
-      return state;
-    }
-    for (llvm::Instruction &inst : *before.getParent()) {
-      if (&inst == &before) {
-        break;
-      }
-      transferEntryAddressInst(inst, state);
-    }
-    return state;
-  }
-
-  std::optional<int64_t> entryStackOffsetBefore(llvm::Instruction &before,
-                                                llvm::Value *pointer) const {
-    llvm::GlobalVariable *stackPointer = stackPointerGlobal();
-    if (stackPointer == nullptr) {
-      return std::nullopt;
-    }
-    pointer = pointer->stripPointerCasts();
-    auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(pointer);
-    if (intToPtr == nullptr) {
-      return std::nullopt;
-    }
-    EntryAddressState state = entryAddressStateBefore(before);
-    return entryOffsetForValue(intToPtr->getOperand(0), state);
-  }
-
-  std::optional<int64_t> callsiteStackOffset(llvm::CallBase &call,
-                                             const NativeSignatureSlot &slot) const {
-    EntryAddressState state = entryAddressStateBefore(call);
-    if (!state.StackPointerOffset) {
-      return std::nullopt;
-    }
-    return *state.StackPointerOffset + static_cast<int64_t>(slot.StackOffset) -
-           static_cast<int64_t>(Abi.StackShift);
-  }
-
   std::pair<llvm::Argument *, const NativeSignatureSlot *>
   entryArgumentSlot(const RegisterUnit &unit) const {
     auto shapeIt = SignatureState.Shapes.find(&Function);
@@ -5725,12 +5545,11 @@ private:
     }
     if (const NativeExternalCallShape *callsiteShape =
             externalCallsiteShapeForCall(SignatureState, call)) {
-      return llvm::any_of(callsiteShape->Inputs,
-                          [&](const NativeRegisterCallInputSlot &input) {
-                            return input.Kind ==
-                                       NativeRegisterCallInputSlotKind::Register &&
-                                   input.UnitName == unit.Name;
-                          });
+      return llvm::any_of(
+          callsiteShape->Inputs, [&](const NativeRegisterCallInputSlot &input) {
+            return input.Kind == NativeRegisterCallInputSlotKind::Register &&
+                   input.UnitName == unit.Name;
+          });
     }
     for (const NativeSignatureSlot &slot : shape->Params) {
       if (slot.Unit != nullptr && slot.Unit->Name == unit.Name) {
@@ -5741,6 +5560,11 @@ private:
   }
 
   void collectSignatureCallArgs() {
+    // Register SSA has finished changing the current function at this point.
+    // Build fresh address facts here rather than carrying raw Instruction*
+    // through earlier rewriting.
+    StackAddresses = std::make_unique<NativeStackAddressAnalysis>(
+        Function, stackPointerGlobal(), Abi.StackPointer);
     std::vector<llvm::CallBase *> calls;
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
       auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
@@ -5816,8 +5640,8 @@ private:
       return integerSignatureSlot(*unit);
     }
 
-    llvm::Type *type = floatTypeForSizeBits(Function.getContext(),
-                                            input.SizeBits);
+    llvm::Type *type =
+        floatTypeForSizeBits(Function.getContext(), input.SizeBits);
     if (type == nullptr) {
       return std::nullopt;
     }
@@ -5870,8 +5694,8 @@ private:
         break;
       }
       if (value->getType() != slotType(slot)) {
-        SignatureState.Warnings.push_back(callSlotWarning(
-            call, slot, "call_arg", "call_arg_type_mismatch"));
+        SignatureState.Warnings.push_back(
+            callSlotWarning(call, slot, "call_arg", "call_arg_type_mismatch"));
         break;
       }
       if (mayDependOnSummaryClobberValue(value)) {
@@ -6008,262 +5832,85 @@ private:
     return std::nullopt;
   }
 
-  std::optional<int64_t> nativeFrameIntegerOffset(
-      llvm::Value *value, const llvm::DataLayout &layout,
-      llvm::SmallPtrSetImpl<llvm::Value *> &seen) const {
-    value = resolve(value);
-    if (value == nullptr) {
-      return std::nullopt;
+  NativeStackAddressAnalysis &stackAddressAnalysis() {
+    if (!StackAddresses) {
+      StackAddresses = std::make_unique<NativeStackAddressAnalysis>(
+          Function, stackPointerGlobal(), Abi.StackPointer);
     }
-    value = value->stripPointerCasts();
-    if (!seen.insert(value).second) {
-      return std::nullopt;
-    }
-    if (auto *ptrToInt = llvm::dyn_cast<llvm::PtrToIntInst>(value)) {
-      return nativeFramePointerOffset(ptrToInt->getPointerOperand(), layout,
-                                      seen);
-    }
-    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
-    if (binary == nullptr ||
-        (binary->getOpcode() != llvm::Instruction::Add &&
-         binary->getOpcode() != llvm::Instruction::Sub)) {
-      return std::nullopt;
-    }
-    auto lhs = nativeFrameIntegerOffset(binary->getOperand(0), layout, seen);
-    auto *rhs =
-        llvm::dyn_cast_or_null<llvm::ConstantInt>(resolve(binary->getOperand(1)));
-    if (lhs && rhs != nullptr && rhs->getBitWidth() <= 64) {
-      int64_t delta = rhs->getSExtValue();
-      return binary->getOpcode() == llvm::Instruction::Sub ? *lhs - delta
-                                                            : *lhs + delta;
-    }
-    if (binary->getOpcode() == llvm::Instruction::Add) {
-      auto rhsOrigin =
-          nativeFrameIntegerOffset(binary->getOperand(1), layout, seen);
-      auto *lhsConst =
-          llvm::dyn_cast_or_null<llvm::ConstantInt>(
-              resolve(binary->getOperand(0)));
-      if (rhsOrigin && lhsConst != nullptr && lhsConst->getBitWidth() <= 64) {
-        return *rhsOrigin + lhsConst->getSExtValue();
-      }
-    }
-    return std::nullopt;
+    return *StackAddresses;
   }
 
-  std::optional<int64_t> nativeFramePointerOffset(
-      llvm::Value *value, const llvm::DataLayout &layout,
-      llvm::SmallPtrSetImpl<llvm::Value *> &seen) const {
-    value = resolve(value);
-    if (value == nullptr) {
+  std::optional<NativeStackAddress>
+  callsiteStackAddress(llvm::CallBase &call, const NativeSignatureSlot &slot) {
+    if (slot.StackOffset >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        Abi.StackShift >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
       return std::nullopt;
     }
-    value = value->stripPointerCasts();
-    if (!seen.insert(value).second) {
+    std::optional<NativeStackAddress> current =
+        stackAddressAnalysis().stackPointerBefore(call);
+    if (!current) {
       return std::nullopt;
     }
-    if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(value)) {
-      if (std::optional<uint64_t> size = nativeStackAllocaSize(*alloca, layout)) {
-        return -static_cast<int64_t>(*size);
-      }
-      return std::nullopt;
-    }
-    if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value)) {
-      auto base =
-          nativeFramePointerOffset(gep->getPointerOperand(), layout, seen);
-      if (!base) {
-        return std::nullopt;
-      }
-      llvm::APInt byteOffset(
-          layout.getIndexSizeInBits(gep->getPointerAddressSpace()), 0);
-      if (!gep->accumulateConstantOffset(layout, byteOffset)) {
-        return std::nullopt;
-      }
-      return *base + byteOffset.getSExtValue();
-    }
-    if (auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(value)) {
-      return nativeFrameIntegerOffset(intToPtr->getOperand(0), layout, seen);
-    }
-    return std::nullopt;
+    int64_t slotOffset = static_cast<int64_t>(slot.StackOffset);
+    int64_t stackShift = static_cast<int64_t>(Abi.StackShift);
+    int64_t delta = slotOffset >= stackShift ? slotOffset - stackShift
+                                             : -(stackShift - slotOffset);
+    return nativeStackAddressWithOffset(*current, delta);
   }
 
-  std::optional<int64_t> nativeFrameStackOffset(llvm::Value *pointer) const {
-    llvm::Module *module = Function.getParent();
-    if (module == nullptr) {
-      return std::nullopt;
-    }
-    llvm::SmallPtrSet<llvm::Value *, 16> seen;
-    return nativeFramePointerOffset(pointer, module->getDataLayout(), seen);
-  }
-
-  struct StackPointerRelativeOffset {
-    llvm::Value *Base = nullptr;
-    int64_t Offset = 0;
-  };
-
-  bool isStackPointerSummaryValue(llvm::Value *value) const {
-    value = resolve(value);
-    if (value == nullptr) {
-      return false;
-    }
-    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(value)) {
-      RegisterAccess access = registerLoad(*load, Units);
-      return access.Unit != nullptr &&
-             access.Unit->Global == stackPointerGlobal();
-    }
-    auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
-    if (inst == nullptr) {
-      return false;
-    }
-    if (auto name =
-            mdField(inst->getMetadata("notdec.register.summary_ssa.phi"),
-                    "name")) {
-      return *name == Abi.StackPointer;
-    }
-    if (Abi.StackPointer.empty() || !value->hasName()) {
-      return false;
-    }
-    std::string prefix = Abi.StackPointer + ".range_summary_ssa";
-    return value->getName().starts_with(prefix);
-  }
-
-  bool isStackPointerAlignmentValue(llvm::Value *value) const {
-    value = resolve(value);
-    if (value == nullptr) {
-      return false;
-    }
-    value = value->stripPointerCasts();
-    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
-    if (binary == nullptr || binary->getOpcode() != llvm::Instruction::And) {
-      return false;
-    }
-    // Alignment loses the entry-SP relation.  Retain the AND instruction as a
-    // separate caller-side base instead of pretending it is entry SP.
-    return (isSixteenByteStackAlignmentMask(binary->getOperand(1)) &&
-            isStackPointerSummaryValue(binary->getOperand(0))) ||
-           (isSixteenByteStackAlignmentMask(binary->getOperand(0)) &&
-            isStackPointerSummaryValue(binary->getOperand(1)));
-  }
-
-  std::optional<StackPointerRelativeOffset> stackPointerRelativeIntegerOffset(
-      llvm::Value *value, llvm::SmallPtrSetImpl<llvm::Value *> &seen) const {
-    value = resolve(value);
-    if (value == nullptr) {
-      return std::nullopt;
-    }
-    value = value->stripPointerCasts();
-    if (isStackPointerSummaryValue(value)) {
-      return StackPointerRelativeOffset{value, 0};
-    }
-    if (isStackPointerAlignmentValue(value)) {
-      return StackPointerRelativeOffset{value, 0};
-    }
-    if (!seen.insert(value).second) {
-      return std::nullopt;
-    }
-    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
-    if (binary == nullptr ||
-        (binary->getOpcode() != llvm::Instruction::Add &&
-         binary->getOpcode() != llvm::Instruction::Sub)) {
-      return std::nullopt;
-    }
-    auto lhs =
-        stackPointerRelativeIntegerOffset(binary->getOperand(0), seen);
-    auto *rhs =
-        llvm::dyn_cast_or_null<llvm::ConstantInt>(resolve(binary->getOperand(1)));
-    if (lhs && rhs != nullptr && rhs->getBitWidth() <= 64) {
-      int64_t delta = rhs->getSExtValue();
-      lhs->Offset =
-          binary->getOpcode() == llvm::Instruction::Sub ? lhs->Offset - delta
-                                                        : lhs->Offset + delta;
-      return lhs;
-    }
-    if (binary->getOpcode() == llvm::Instruction::Add) {
-      auto rhsOrigin =
-          stackPointerRelativeIntegerOffset(binary->getOperand(1), seen);
-      auto *lhsConst =
-          llvm::dyn_cast_or_null<llvm::ConstantInt>(
-              resolve(binary->getOperand(0)));
-      if (rhsOrigin && lhsConst != nullptr && lhsConst->getBitWidth() <= 64) {
-        rhsOrigin->Offset += lhsConst->getSExtValue();
-        return rhsOrigin;
-      }
-    }
-    return std::nullopt;
-  }
-
-  std::optional<StackPointerRelativeOffset>
-  stackPointerRelativeOffset(llvm::Value *pointer) const {
-    pointer = resolve(pointer);
-    if (pointer == nullptr) {
-      return std::nullopt;
-    }
-    pointer = pointer->stripPointerCasts();
-    auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(pointer);
-    if (intToPtr == nullptr) {
-      return std::nullopt;
-    }
-    llvm::SmallPtrSet<llvm::Value *, 16> seen;
-    return stackPointerRelativeIntegerOffset(intToPtr->getOperand(0), seen);
-  }
-
-  llvm::StoreInst *findNearestStackStoreBeforeCall(
-      llvm::CallBase &call, const NativeSignatureSlot &slot) {
-    std::optional<int64_t> expected = callsiteStackOffset(call, slot);
+  llvm::StoreInst *
+  findNearestStackStoreBeforeCall(llvm::CallBase &call,
+                                  const NativeSignatureSlot &slot) {
     if (call.getParent() == nullptr) {
       return nullptr;
     }
-    std::optional<uint64_t> nativeFrameIndex = stackSlotIndex(slot);
-    uint64_t nativeFrameStep =
-        nativeFrameIndex ? stackSlotStep(slot.StackSize, slot.StackAlign) : 0;
-    std::map<int64_t, llvm::StoreInst *> nativeFrameStores;
+    std::optional<NativeStackAddress> expected =
+        callsiteStackAddress(call, slot);
+    std::optional<uint64_t> stackIndex = stackSlotIndex(slot);
+    uint64_t stackStep =
+        stackIndex ? stackSlotStep(slot.StackSize, slot.StackAlign) : 0;
     struct RelativeStoreGroup {
+      NativeStackAddressKind Kind =
+          NativeStackAddressKind::RelativeStackPointer;
       llvm::Value *Base = nullptr;
       std::map<int64_t, llvm::StoreInst *> Stores;
     };
-    std::vector<RelativeStoreGroup> stackPointerStores;
-    auto recordStackPointerStore = [&](llvm::Value *base, int64_t offset,
-                                       llvm::StoreInst *store) {
-      base = resolve(base);
-      for (RelativeStoreGroup &group : stackPointerStores) {
-        if (resolve(group.Base) == base) {
-          group.Stores.try_emplace(offset, store);
+    std::vector<RelativeStoreGroup> relativeStores;
+    auto recordRelativeStore = [&](const NativeStackAddress &address,
+                                   llvm::StoreInst *store) {
+      for (RelativeStoreGroup &group : relativeStores) {
+        if (group.Kind == address.Kind && group.Base == address.Base) {
+          group.Stores.try_emplace(address.Offset, store);
           return;
         }
       }
       RelativeStoreGroup group;
-      group.Base = base;
-      group.Stores.try_emplace(offset, store);
-      stackPointerStores.push_back(std::move(group));
+      group.Kind = address.Kind;
+      group.Base = address.Base;
+      group.Stores.try_emplace(address.Offset, store);
+      relativeStores.push_back(std::move(group));
     };
     for (auto it = call.getIterator(); it != call.getParent()->begin();) {
       --it;
       llvm::Instruction &inst = *it;
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
-        if (expected) {
-          if (std::optional<int64_t> offset =
-                  entryStackOffsetBefore(*store, store->getPointerOperand())) {
-            if (*offset == *expected) {
-              return store;
-            }
-            continue;
+        std::optional<NativeStackAddress> address =
+            stackAddressAnalysis().addressForPointer(
+                store->getPointerOperand());
+        if (address) {
+          if (expected && *address == *expected) {
+            return store;
           }
-        }
-        if (nativeFrameIndex && nativeFrameStep != 0) {
-          if (std::optional<int64_t> offset =
-                  nativeFrameStackOffset(store->getPointerOperand())) {
-            // The stack rewrite turns a downward-growing outgoing argument area
-            // into native-frame offsets.  Keep the latest store for each frame
-            // offset, then map cspec stack slots from the lowest outgoing
-            // address upward.  That matches both i386 push sequences and x64
-            // reserved stack argument areas.
-            nativeFrameStores.try_emplace(*offset, store);
-            continue;
+          // A native alloca or aligned SP has no entry-SP meaning, but it still
+          // preserves the ordering of outgoing slots. Group it by its concrete
+          // base and use the cspec slot index only for this caller-side match.
+          if (stackIndex && stackStep != 0 &&
+              address->Kind != NativeStackAddressKind::EntryStackPointer) {
+            recordRelativeStore(*address, store);
           }
-          if (std::optional<StackPointerRelativeOffset> offset =
-                  stackPointerRelativeOffset(store->getPointerOperand())) {
-            recordStackPointerStore(offset->Base, offset->Offset, store);
-            continue;
-          }
+          continue;
         }
         RegisterAccess access = registerStore(*store, Units);
         if (access.Unit != nullptr) {
@@ -6284,14 +5931,13 @@ private:
     auto storeForIndexedOffset =
         [&](const std::map<int64_t, llvm::StoreInst *> &stores)
         -> llvm::StoreInst * {
-      if (!nativeFrameIndex || stores.empty() || nativeFrameStep == 0 ||
-          *nativeFrameIndex >
+      if (!stackIndex || stores.empty() || stackStep == 0 ||
+          *stackIndex >
               static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
-                  nativeFrameStep) {
+                  stackStep) {
         return nullptr;
       }
-      int64_t delta =
-          static_cast<int64_t>(*nativeFrameIndex * nativeFrameStep);
+      int64_t delta = static_cast<int64_t>(*stackIndex * stackStep);
       int64_t lowestOffset = stores.begin()->first;
       if (lowestOffset > std::numeric_limits<int64_t>::max() - delta) {
         return nullptr;
@@ -6299,10 +5945,7 @@ private:
       auto found = stores.find(lowestOffset + delta);
       return found == stores.end() ? nullptr : found->second;
     };
-    if (llvm::StoreInst *store = storeForIndexedOffset(nativeFrameStores)) {
-      return store;
-    }
-    for (const RelativeStoreGroup &group : stackPointerStores) {
+    for (const RelativeStoreGroup &group : relativeStores) {
       if (llvm::StoreInst *store = storeForIndexedOffset(group.Stores)) {
         return store;
       }
@@ -6395,12 +6038,12 @@ private:
     }
     if (kind == "return" && !isIntegerAbiOutput(Abi, unit->Name) &&
         !signatureReturnUsesUnit(call, *unit)) {
-      llvm::Value *value = unknownValueBefore(
-          *insertBefore, rangeType(range), unit->Name + ".range_return_unknown");
+      llvm::Value *value =
+          unknownValueBefore(*insertBefore, rangeType(range),
+                             unit->Name + ".range_return_unknown");
       attachUnknownValueMetadata(value, "range_return_not_abi_output",
-                                 Function.getName(),
-                                 calleeNameForWarning(call), unit->Name,
-                                 "return");
+                                 Function.getName(), calleeNameForWarning(call),
+                                 unit->Name, "return");
       return value;
     }
 
@@ -6418,9 +6061,8 @@ private:
       llvm::Value *value = unknownValueAt(builder, rangeType(range),
                                           unit->Name + ".range_return_unknown");
       attachUnknownValueMetadata(value, "range_return_rewrite_missing_value",
-                                 Function.getName(),
-                                 calleeNameForWarning(call), unit->Name,
-                                 "return");
+                                 Function.getName(), calleeNameForWarning(call),
+                                 unit->Name, "return");
       CallRangeValues.emplace(key, value);
       return value;
     }
@@ -6528,9 +6170,9 @@ private:
       values.reserve(shapeIt->second.Returns.size());
       for (const NativeSignatureSlot &slot : shapeIt->second.Returns) {
         const RegisterUnit *unit = slot.Unit;
-        llvm::Value *value = resolve(readSlotValueBefore(
-            *ret, slot, unit->Name + ".return_range",
-            /*allowUnknownSegments=*/true));
+        llvm::Value *value = resolve(
+            readSlotValueBefore(*ret, slot, unit->Name + ".return_range",
+                                /*allowUnknownSegments=*/true));
         llvm::StringRef reason;
         if (value == nullptr) {
           reason = "return_binding_missing";
@@ -6545,8 +6187,7 @@ private:
           value = unknownValueBefore(*ret, slotType(slot),
                                      unit->Name + ".return_unknown");
           attachUnknownValueMetadata(value, reason, Function.getName(),
-                                     "<return>", unit->Name,
-                                     "return_binding");
+                                     "<return>", unit->Name, "return_binding");
         }
         values.push_back(value);
       }
@@ -6854,8 +6495,8 @@ llvm::Value *foreignArgumentReplacement(
   llvm::Value *unknown =
       unknownValueAt(builder, argument.getType(), argument.getName() + ".old");
   attachUnknownValueMetadata(unknown, "foreign_argument_replacement",
-                             function.getName(), "",
-                             argument.getName(), "localize");
+                             function.getName(), "", argument.getName(),
+                             "localize");
   unknownByType.emplace(argument.getType(), unknown);
   return unknown;
 }
@@ -6884,12 +6525,11 @@ llvm::Value *localizeReturnValue(llvm::Function &function,
   }
   auto *instruction = llvm::dyn_cast<llvm::Instruction>(value);
   if (instruction != nullptr && instruction->getFunction() != &function) {
-    llvm::Value *unknown =
-        unknownValueBefore(insertBefore, value->getType(),
-                           value->getName() + ".old");
+    llvm::Value *unknown = unknownValueBefore(insertBefore, value->getType(),
+                                              value->getName() + ".old");
     attachUnknownValueMetadata(unknown, "foreign_return_value_replacement",
-                               function.getName(), "",
-                               value->getName(), "localize_return");
+                               function.getName(), "", value->getName(),
+                               "localize_return");
     return unknown;
   }
   return value;
@@ -6905,12 +6545,11 @@ llvm::Value *localizeCallArgument(llvm::Function &function,
   }
   auto *instruction = llvm::dyn_cast<llvm::Instruction>(value);
   if (instruction != nullptr && instruction->getFunction() != &function) {
-    llvm::Value *unknown =
-        unknownValueBefore(insertBefore, value->getType(),
-                           value->getName() + ".old");
+    llvm::Value *unknown = unknownValueBefore(insertBefore, value->getType(),
+                                              value->getName() + ".old");
     attachUnknownValueMetadata(unknown, "foreign_call_argument_replacement",
-                               function.getName(), "",
-                               value->getName(), "localize_call_arg");
+                               function.getName(), "", value->getName(),
+                               "localize_call_arg");
     return unknown;
   }
   return value;
@@ -7169,14 +6808,16 @@ llvm::Value *rangeEntrySlotReplacement(llvm::Instruction &inst,
                                  slot.Unit->Name + ".range_entry_arg");
 }
 
-void rewriteInternalFunctionBody(llvm::Function &oldFunction,
-                                 llvm::Function &newFunction,
-                                 const SignatureShape &shape,
-                                 SignatureRewriteState &state,
-                                 const std::map<llvm::GlobalVariable *,
-                                                RegisterUnit> &units,
-                                 const AbiFacts &abi) {
+void rewriteInternalFunctionBody(
+    llvm::Function &oldFunction, llvm::Function &newFunction,
+    const SignatureShape &shape, SignatureRewriteState &state,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi) {
   newFunction.splice(newFunction.end(), &oldFunction);
+  const RegisterUnit *stackPointer = stackPointerUnit(units, abi);
+  NativeStackAddressAnalysis stackAddresses(
+      newFunction, stackPointer == nullptr ? nullptr : stackPointer->Global,
+      abi.StackPointer);
   unsigned index = 0;
   for (llvm::Argument &arg : newFunction.args()) {
     if (index >= shape.Params.size()) {
@@ -7203,7 +6844,7 @@ void rewriteInternalFunctionBody(llvm::Function &oldFunction,
         if (slot.Kind == NativeSignatureSlotKind::IntegerStack) {
           if (load != nullptr && load->getType() == arg.getType()) {
             std::optional<NativeSignatureSlot> loadSlot =
-                stackInputSlotForLoad(*load, units, abi);
+                stackInputSlotForLoad(*load, stackAddresses, abi);
             if (loadSlot && loadSlot->StackOffset == slot.StackOffset &&
                 loadSlot->SizeBits == slot.SizeBits) {
               state.ValueMap[load] = &arg;
@@ -7308,7 +6949,8 @@ bool valueMayDependOnUnknownPlaceholder(
   if (value == nullptr) {
     return false;
   }
-  if (llvm::isa<llvm::PoisonValue>(value) || llvm::isa<llvm::UndefValue>(value)) {
+  if (llvm::isa<llvm::PoisonValue>(value) ||
+      llvm::isa<llvm::UndefValue>(value)) {
     return true;
   }
   if (llvm::isa<llvm::Constant>(value)) {
@@ -7340,16 +6982,16 @@ bool valueMayDependOnUnknownPlaceholder(
     return false;
   }
 
-  // These are value-only glue nodes created while rebuilding register ranges.  If
-  // any piece comes from a freeze-poison placeholder, the final vararg value is
-  // not a real source value even if InstCombine can later pick 0 for it.
-  bool shouldInspectOperands =
-      llvm::isa<llvm::PHINode>(value) || llvm::isa<llvm::SelectInst>(value) ||
-      llvm::isa<llvm::CastInst>(value) ||
-      llvm::isa<llvm::BinaryOperator>(value) ||
-      llvm::isa<llvm::UnaryOperator>(value) ||
-      llvm::isa<llvm::ExtractValueInst>(value) ||
-      llvm::isa<llvm::InsertValueInst>(value);
+  // These are value-only glue nodes created while rebuilding register ranges.
+  // If any piece comes from a freeze-poison placeholder, the final vararg value
+  // is not a real source value even if InstCombine can later pick 0 for it.
+  bool shouldInspectOperands = llvm::isa<llvm::PHINode>(value) ||
+                               llvm::isa<llvm::SelectInst>(value) ||
+                               llvm::isa<llvm::CastInst>(value) ||
+                               llvm::isa<llvm::BinaryOperator>(value) ||
+                               llvm::isa<llvm::UnaryOperator>(value) ||
+                               llvm::isa<llvm::ExtractValueInst>(value) ||
+                               llvm::isa<llvm::InsertValueInst>(value);
   if (!shouldInspectOperands) {
     return false;
   }
@@ -7381,7 +7023,8 @@ bool shouldPoisonUnprovenVarArg(const CallArgStoreBinding &binding,
   if (value == nullptr || !value->getType()->isIntegerTy()) {
     return false;
   }
-  llvm::KnownBits known = llvm::computeKnownBits(value, layout, nullptr, context);
+  llvm::KnownBits known =
+      llvm::computeKnownBits(value, layout, nullptr, context);
   return known.isZero();
 }
 
@@ -7452,11 +7095,10 @@ foldFullInsertOfExtracts(llvm::Value *value,
   return source;
 }
 
-void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
-                            const std::map<llvm::GlobalVariable *, RegisterUnit>
-                                &units,
-                            const AbiFacts &abi,
-                            NativeRegisterSummarySSASummary &summary) {
+void rewriteSignatureShapes(
+    llvm::Module &module, SignatureRewriteState &state,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi, NativeRegisterSummarySSASummary &summary) {
   std::map<llvm::Function *, llvm::Function *> replacements;
   std::vector<std::pair<llvm::Function *, SignatureShape>> replacementShapes;
   for (auto &[function, shape] : state.Shapes) {
@@ -7550,10 +7192,9 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         std::string regName = slotRegisterName(slot);
         value = unknownValueAt(oldCallBuilder, slotType(slot),
                                regName + ".arg_unknown");
-        attachUnknownValueMetadata(value, reason,
-                                   oldCall->getFunction()->getName(),
-                                   calleeNameForWarning(*oldCall), regName,
-                                   "call_arg");
+        attachUnknownValueMetadata(
+            value, reason, oldCall->getFunction()->getName(),
+            calleeNameForWarning(*oldCall), regName, "call_arg");
       }
       args.push_back(value);
     }
@@ -7577,20 +7218,19 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         if (isLikelyX86_64SysVAbi(abi) &&
             shouldPoisonUnprovenVarArg(binding, value, module.getDataLayout(),
                                        oldCall)) {
-          llvm::StringRef reason = unknownValue ? "vararg_arg_uses_unknown_value"
-                                                : "vararg_arg_unproven_zero";
+          llvm::StringRef reason = unknownValue
+                                       ? "vararg_arg_uses_unknown_value"
+                                       : "vararg_arg_unproven_zero";
           state.Warnings.push_back(callRegisterWarning(
               *oldCall, binding.Unit == nullptr ? "" : binding.Unit->Name,
               "call_arg", reason));
           llvm::Function *unknown =
               getOrInsertVarArgUnknownHelper(module, value->getType());
           value = oldCallBuilder.CreateCall(unknown);
-          attachUnknownValueMetadata(value, reason,
-                                     oldCall->getFunction()->getName(),
-                                     calleeNameForWarning(*oldCall),
-                                     binding.Unit == nullptr ? ""
-                                                             : binding.Unit->Name,
-                                     "call_arg");
+          attachUnknownValueMetadata(
+              value, reason, oldCall->getFunction()->getName(),
+              calleeNameForWarning(*oldCall),
+              binding.Unit == nullptr ? "" : binding.Unit->Name, "call_arg");
         }
         if (binding.ValueType != nullptr &&
             value->getType() != binding.ValueType) {
@@ -7627,16 +7267,15 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
             extractReturnRegister(builder, *shape, *newCall, name);
         if (value == nullptr || value->getType() != helper->getType()) {
           llvm::StringRef reason = value == nullptr
-                                      ? "return_helper_rewrite_missing_value"
-                                      : "return_helper_rewrite_type_mismatch";
+                                       ? "return_helper_rewrite_missing_value"
+                                       : "return_helper_rewrite_type_mismatch";
           state.Warnings.push_back(
               callRegisterWarning(*oldCall, name, "return", reason));
           value = unknownValueAt(builder, helper->getType(),
                                  name + ".return_unknown");
-          attachUnknownValueMetadata(value, reason,
-                                     oldCall->getFunction()->getName(),
-                                     calleeNameForWarning(*oldCall), name,
-                                     "return");
+          attachUnknownValueMetadata(
+              value, reason, oldCall->getFunction()->getName(),
+              calleeNameForWarning(*oldCall), name, "return");
         }
         valueMap[helper] = value;
         helper->replaceAllUsesWith(value);
@@ -7657,18 +7296,17 @@ void rewriteSignatureShapes(llvm::Module &module, SignatureRewriteState &state,
         llvm::Value *value =
             extractReturnRange(builder, *shape, *newCall, rangeHelper.Range);
         if (value == nullptr || value->getType() != helper->getType()) {
-          llvm::StringRef reason = value == nullptr
-                                      ? "range_return_helper_rewrite_missing_value"
-                                      : "range_return_helper_rewrite_type_mismatch";
+          llvm::StringRef reason =
+              value == nullptr ? "range_return_helper_rewrite_missing_value"
+                               : "range_return_helper_rewrite_type_mismatch";
           state.Warnings.push_back(
               callRangeWarning(*newCall, rangeHelper.Range, "return", reason));
           std::string regName = registerNameForRange(rangeHelper.Range);
           value = unknownValueAt(builder, helper->getType(),
                                  "range_return_unknown");
-          attachUnknownValueMetadata(value, reason,
-                                     oldCall->getFunction()->getName(),
-                                     calleeNameForWarning(*newCall), regName,
-                                     "return");
+          attachUnknownValueMetadata(
+              value, reason, oldCall->getFunction()->getName(),
+              calleeNameForWarning(*newCall), regName, "return");
         }
         valueMap[helper] = value;
         helper->replaceAllUsesWith(value);
@@ -7845,8 +7483,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   NativeRegisterPreSummaryPeepholeSummary peepholeSummary =
       runNativeRegisterPreSummaryPeephole(module);
   if (options.PrintSummary) {
-    printNativeRegisterPreSummaryPeepholeSummary(peepholeSummary,
-                                                 llvm::errs());
+    printNativeRegisterPreSummaryPeepholeSummary(peepholeSummary, llvm::errs());
   }
   AbiFacts abi = collectAbiFacts(module, units);
 
@@ -7859,7 +7496,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       NativeRegisterUnknownExternalInputPolicy::NoInputs;
   baseSummaryOptions.RunTopDownDemand = false;
   baseSummaryOptions.CollectExternalCallsiteEvidence = true;
-  baseSummaryOptions.ExternalEvidenceSlots = unknownExternalEvidenceSlots(abi, module);
+  baseSummaryOptions.ExternalEvidenceSlots =
+      unknownExternalEvidenceSlots(abi, module);
   NativeRegisterSummary baseRegisterSummary =
       runNativeRegisterSummary(module, baseSummaryOptions);
   std::map<llvm::Function *, FunctionSummaryFacts> baseFacts =
@@ -7896,8 +7534,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   NativeRegisterSummarySSASummary summary;
   summary.StackCanaryChecksRemoved = canarySummary.CanaryChecksRemoved;
   summary.StackCanaryFailBlocksRemoved = canarySummary.FailBlocksRemoved;
-  summary.StackCanaryFailFunctionsRemoved =
-      canarySummary.FailFunctionsRemoved;
+  summary.StackCanaryFailFunctionsRemoved = canarySummary.FailFunctionsRemoved;
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;

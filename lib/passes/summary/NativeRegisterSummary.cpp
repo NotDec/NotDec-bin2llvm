@@ -5,6 +5,7 @@
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
+#include "notdec-bin2llvm/passes/summary/NativeStackAddress.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
@@ -24,7 +25,9 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -64,22 +67,6 @@ struct StackSlotKey {
   }
 };
 
-// A stack address is kept relative to one concrete SP-producing SSA value.
-// Base == nullptr denotes the function-entry stack pointer.  An `and SP, -16`
-// result deliberately becomes a new base, because it is not entry-SP equal.
-struct StackPointerAddress {
-  llvm::Value *Base = nullptr;
-  int64_t Offset = 0;
-
-  bool operator==(const StackPointerAddress &other) const {
-    return Base == other.Base && Offset == other.Offset;
-  }
-
-  bool operator!=(const StackPointerAddress &other) const {
-    return !(*this == other);
-  }
-};
-
 struct ValueOrigin {
   llvm::GlobalVariable *Base = nullptr;
   int64_t Offset = 0;
@@ -90,14 +77,6 @@ struct ValueOrigin {
 
   bool operator!=(const ValueOrigin &other) const { return !(*this == other); }
 };
-
-bool isSixteenByteStackAlignmentMask(llvm::Value *value) {
-  auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value);
-  if (constant == nullptr || constant->getBitWidth() > 64) {
-    return false;
-  }
-  return constant->getSExtValue() == -16;
-}
 
 // Forward abstract state for one backing register. Missing map entries use this
 // default value, but only inside a reachable block state.
@@ -142,23 +121,12 @@ struct State {
   // SSA values known to be a function-entry register plus a constant offset.
   // Offset 0 is also used for saved register values loaded back from stack.
   std::map<llvm::Value *, ValueOrigin> ValueOrigins;
-  // Loads of the ignored stack-pointer register need their own address facts.
-  // Unlike ValueOrigins, these facts may be based on an aligned SP value and
-  // must never make that value look like a function-entry register value.
-  std::map<llvm::Value *, StackPointerAddress> StackPointerAddresses;
-  // This is the current SP position for caller stack arguments and saved stack
-  // slots.  It begins at entry SP, but `and SP, -16` changes the base identity.
-  std::optional<StackPointerAddress> CurrentStackPointer =
-      StackPointerAddress{};
-
   bool operator==(const State &other) const {
     return Reachable == other.Reachable &&
            EndsInNoReturn == other.EndsInNoReturn && Cells == other.Cells &&
            Origins == other.Origins && StackSlots == other.StackSlots &&
            StackSlotOrigins == other.StackSlotOrigins &&
-           ValueOrigins == other.ValueOrigins &&
-           StackPointerAddresses == other.StackPointerAddresses &&
-           CurrentStackPointer == other.CurrentStackPointer;
+           ValueOrigins == other.ValueOrigins;
   }
 
   bool sameSummaryLattice(const State &other) const {
@@ -995,21 +963,6 @@ bool joinState(State &target, const State &source) {
       ++it;
     }
   }
-  for (auto it = target.StackPointerAddresses.begin();
-       it != target.StackPointerAddresses.end();) {
-    auto sourceIt = source.StackPointerAddresses.find(it->first);
-    if (sourceIt == source.StackPointerAddresses.end() ||
-        sourceIt->second != it->second) {
-      it = target.StackPointerAddresses.erase(it);
-      changed = true;
-    } else {
-      ++it;
-    }
-  }
-  if (target.CurrentStackPointer != source.CurrentStackPointer) {
-    target.CurrentStackPointer = std::nullopt;
-    changed = true;
-  }
   return changed;
 }
 
@@ -1173,6 +1126,12 @@ private:
   // Keep those block states only for the preliminary callsite-evidence pass.
   std::map<llvm::Function *, FunctionFlow> StableFlows;
   std::vector<NativeRegisterExternalCallsite> ExternalCallsites;
+  // Stack coordinates are independent from register-value flow.  Cache one
+  // immutable analysis per function so the preliminary summary and its
+  // callsite evidence use the same ABI-facing address model as SummarySSA.
+  mutable std::map<llvm::Function *,
+                   std::unique_ptr<NativeStackAddressAnalysis>>
+      StackAddressAnalyses;
 
   void buildCallGraph() {
     std::set<llvm::Function *> defined(Functions.begin(), Functions.end());
@@ -1413,10 +1372,10 @@ private:
   }
 
   NativeRegisterCallsiteValueOrigin
-  callsiteOrigin(const State &state,
+  callsiteOrigin(const State &state, llvm::CallBase &call,
                  const NativeRegisterCallInputSlot &slot) const {
     if (slot.Kind == NativeRegisterCallInputSlotKind::Stack) {
-      std::optional<StackSlotKey> key = callsiteStackSlot(state, slot);
+      std::optional<StackSlotKey> key = callsiteStackSlot(call, slot);
       if (!key) {
         return NativeRegisterCallsiteValueOrigin::Unknown;
       }
@@ -1453,7 +1412,7 @@ private:
   }
 
   std::vector<NativeRegisterCallsiteSlotEvidence>
-  callsiteEvidence(const State &state,
+  callsiteEvidence(const State &state, llvm::CallBase &call,
                    llvm::ArrayRef<NativeRegisterCallInputSlot> slots) const {
     std::vector<NativeRegisterCallsiteSlotEvidence> result;
     result.reserve(slots.size());
@@ -1469,7 +1428,7 @@ private:
       evidence.OffsetBits = slot.OffsetBits;
       evidence.SizeBits = slot.SizeBits;
       evidence.Float = slot.Float;
-      evidence.Origin = callsiteOrigin(state, slot);
+      evidence.Origin = callsiteOrigin(state, call, slot);
       result.push_back(std::move(evidence));
     }
     return result;
@@ -1491,10 +1450,11 @@ private:
       evidence.FixedArgs = shape->FixedArgs;
       evidence.MaxArgs = shape->MaxArgs;
       evidence.FixedInputsComplete = shape->FixedInputsComplete;
-      evidence.Slots = callsiteEvidence(state, shape->VarArgInputs);
+      evidence.Slots = callsiteEvidence(state, call, shape->VarArgInputs);
     } else {
       evidence.Kind = NativeRegisterExternalCallsiteKind::UnknownExternal;
-      evidence.Slots = callsiteEvidence(state, Options.ExternalEvidenceSlots);
+      evidence.Slots =
+          callsiteEvidence(state, call, Options.ExternalEvidenceSlots);
     }
     ExternalCallsites.push_back(std::move(evidence));
   }
@@ -1555,14 +1515,6 @@ private:
         ++it;
       }
     }
-    for (auto it = state.StackPointerAddresses.begin();
-         it != state.StackPointerAddresses.end();) {
-      if (CrossBlockValues.count(it->first) == 0) {
-        it = state.StackPointerAddresses.erase(it);
-      } else {
-        ++it;
-      }
-    }
   }
 
   void transferInstruction(llvm::Instruction &inst, State &state) {
@@ -1577,32 +1529,16 @@ private:
           readRegister(state, access.Unit->Global);
         }
         if (pureEntryValue) {
-          if (access.Unit->Global == stackPointerGlobal()) {
-            if (state.CurrentStackPointer) {
-              state.StackPointerAddresses[load] = *state.CurrentStackPointer;
-              if (state.CurrentStackPointer->Base == nullptr) {
-                state.ValueOrigins[load] = ValueOrigin{
-                    access.Unit->Global, state.CurrentStackPointer->Offset};
-              } else {
-                state.ValueOrigins.erase(load);
-              }
-            } else {
-              state.ValueOrigins.erase(load);
-              state.StackPointerAddresses.erase(load);
-            }
-          } else {
+          if (access.Unit->Global != stackPointerGlobal()) {
             state.ValueOrigins[load] = ValueOrigin{access.Unit->Global, 0};
           }
         } else {
           state.ValueOrigins.erase(load);
-          if (access.Unit->Global == stackPointerGlobal()) {
-            state.StackPointerAddresses.erase(load);
-          }
         }
         return;
       }
       if (std::optional<StackSlotKey> slot =
-              fixedStackSlot(load->getPointerOperand(), state)) {
+              fixedStackSlot(load->getPointerOperand(), *load)) {
         auto saved = state.StackSlots.find(*slot);
         if (saved != state.StackSlots.end()) {
           state.ValueOrigins[load] = ValueOrigin{saved->second, 0};
@@ -1616,10 +1552,6 @@ private:
       RegisterAccess access = registerStore(*store, Units);
       if (access.Unit != nullptr) {
         if (isIgnored(*access.Unit, Options)) {
-          if (access.Unit->Global == stackPointerGlobal()) {
-            state.CurrentStackPointer =
-                stackPointerAddressOrigin(store->getValueOperand(), state);
-          }
           state.ValueOrigins.erase(store);
           return;
         }
@@ -1649,7 +1581,7 @@ private:
         return;
       }
       if (std::optional<StackSlotKey> slot =
-              fixedStackSlot(store->getPointerOperand(), state)) {
+              fixedStackSlot(store->getPointerOperand(), *store)) {
         std::optional<ValueOrigin> origin =
             entryValueOrigin(store->getValueOperand(), state);
         if (origin && origin->Offset == 0 &&
@@ -1809,10 +1741,21 @@ private:
     }
   }
 
+  NativeStackAddressAnalysis &
+  stackAddressAnalysis(llvm::Function &function) const {
+    std::unique_ptr<NativeStackAddressAnalysis> &analysis =
+        StackAddressAnalyses[&function];
+    if (!analysis) {
+      analysis = std::make_unique<NativeStackAddressAnalysis>(
+          function, stackPointerGlobal(), Abi.StackPointer);
+    }
+    return *analysis;
+  }
+
   std::optional<StackSlotKey>
-  stackSlotKey(const StackPointerAddress &address) const {
+  stackSlotKey(const NativeStackAddress &address) const {
     llvm::Value *base = address.Base;
-    if (base == nullptr) {
+    if (address.Kind == NativeStackAddressKind::EntryStackPointer) {
       base = stackPointerGlobal();
     }
     if (base == nullptr) {
@@ -1822,114 +1765,39 @@ private:
   }
 
   std::optional<StackSlotKey>
-  callsiteStackSlot(const State &state,
+  callsiteStackSlot(llvm::CallBase &call,
                     const NativeRegisterCallInputSlot &slot) const {
-    if (!state.CurrentStackPointer) {
+    llvm::Function *function = call.getFunction();
+    if (function == nullptr ||
+        slot.StackOffset >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        Abi.StackShift >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
       return std::nullopt;
     }
-    StackPointerAddress address = *state.CurrentStackPointer;
-    address.Offset += static_cast<int64_t>(slot.StackOffset) -
-                      static_cast<int64_t>(Abi.StackShift);
-    return stackSlotKey(address);
-  }
-
-  std::optional<StackPointerAddress>
-  stackPointerAddressOrigin(llvm::Value *value, const State &state) const {
-    value = value->stripPointerCasts();
-    auto known = state.StackPointerAddresses.find(value);
-    if (known != state.StackPointerAddresses.end()) {
-      return known->second;
-    }
-    if (std::optional<ValueOrigin> origin = entryValueOrigin(value, state);
-        origin && origin->Base == stackPointerGlobal()) {
-      return StackPointerAddress{nullptr, origin->Offset};
-    }
-    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value);
-    if (binary == nullptr) {
+    std::optional<NativeStackAddress> current =
+        stackAddressAnalysis(*function).stackPointerBefore(call);
+    if (!current) {
       return std::nullopt;
     }
-
-    if (binary->getOpcode() == llvm::Instruction::And) {
-      llvm::Value *stackOperand = nullptr;
-      if (isSixteenByteStackAlignmentMask(binary->getOperand(1))) {
-        stackOperand = binary->getOperand(0);
-      } else if (isSixteenByteStackAlignmentMask(binary->getOperand(0))) {
-        stackOperand = binary->getOperand(1);
-      }
-      if (stackOperand != nullptr &&
-          stackPointerAddressOrigin(stackOperand, state)) {
-        return StackPointerAddress{binary, 0};
-      }
-      return std::nullopt;
-    }
-
-    if (binary->getOpcode() != llvm::Instruction::Add &&
-        binary->getOpcode() != llvm::Instruction::Sub) {
-      return std::nullopt;
-    }
-
-    auto parseConstantOffset = [](llvm::Value *constant,
-                                  bool negate) -> std::optional<int64_t> {
-      auto *intConstant = llvm::dyn_cast<llvm::ConstantInt>(constant);
-      if (intConstant == nullptr || intConstant->getBitWidth() > 64) {
-        return std::nullopt;
-      }
-      int64_t value = intConstant->getSExtValue();
-      return negate ? -value : value;
-    };
-
-    if (auto base = stackPointerAddressOrigin(binary->getOperand(0), state)) {
-      if (auto offset = parseConstantOffset(binary->getOperand(1),
-                                            binary->getOpcode() ==
-                                                llvm::Instruction::Sub)) {
-        base->Offset += *offset;
-        return base;
-      }
-    }
-    if (binary->getOpcode() == llvm::Instruction::Add) {
-      if (auto base = stackPointerAddressOrigin(binary->getOperand(1), state)) {
-        if (auto offset = parseConstantOffset(binary->getOperand(0), false)) {
-          base->Offset += *offset;
-          return base;
-        }
-      }
-    }
-    return std::nullopt;
-  }
-
-  std::optional<StackSlotKey> fixedStackSlot(llvm::Value *pointer,
-                                              const State &state) const {
-    if (auto slot = nativeStackAllocaSlot(pointer)) {
-      return slot;
-    }
-    auto *intToPtr = llvm::dyn_cast<llvm::IntToPtrInst>(pointer);
-    if (intToPtr == nullptr) {
-      return std::nullopt;
-    }
-    auto address = stackPointerAddressOrigin(intToPtr->getOperand(0), state);
-    if (!address) {
-      return std::nullopt;
-    }
-    return stackSlotKey(*address);
+    int64_t stackOffset = static_cast<int64_t>(slot.StackOffset);
+    int64_t stackShift = static_cast<int64_t>(Abi.StackShift);
+    int64_t delta = stackOffset >= stackShift ? stackOffset - stackShift
+                                              : -(stackShift - stackOffset);
+    std::optional<NativeStackAddress> address =
+        nativeStackAddressWithOffset(*current, delta);
+    return address ? stackSlotKey(*address) : std::nullopt;
   }
 
   std::optional<StackSlotKey>
-  nativeStackAllocaSlot(llvm::Value *pointer) const {
-    auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(pointer);
-    if (gep == nullptr || gep->getNumIndices() != 1) {
+  fixedStackSlot(llvm::Value *pointer, llvm::Instruction &instruction) const {
+    llvm::Function *function = instruction.getFunction();
+    if (function == nullptr) {
       return std::nullopt;
     }
-    auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(
-        gep->getPointerOperand()->stripPointerCasts());
-    if (alloca == nullptr || !alloca->hasName() ||
-        !alloca->getName().starts_with("notdec_stack.native")) {
-      return std::nullopt;
-    }
-    auto *offset = llvm::dyn_cast<llvm::ConstantInt>(gep->idx_begin()->get());
-    if (offset == nullptr || offset->getBitWidth() > 64) {
-      return std::nullopt;
-    }
-    return StackSlotKey{alloca, offset->getSExtValue()};
+    std::optional<NativeStackAddress> address =
+        stackAddressAnalysis(*function).addressForPointer(pointer);
+    return address ? stackSlotKey(*address) : std::nullopt;
   }
 
   bool hasSavedEntryRegister(const State &state,

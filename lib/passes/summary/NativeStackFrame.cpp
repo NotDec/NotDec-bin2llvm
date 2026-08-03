@@ -1,9 +1,10 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/passes/summary/NativeStackAddress.h"
 
-#include "llvm/IR/Constants.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -91,7 +92,8 @@ bool loadReadsRegister(const llvm::LoadInst &load,
   }
   auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
       load.getPointerOperand()->stripPointerCasts());
-  return global != nullptr && global->getMetadata("notdec.register") != nullptr &&
+  return global != nullptr &&
+         global->getMetadata("notdec.register") != nullptr &&
          registerName(*global) == wantedRegister;
 }
 
@@ -124,91 +126,6 @@ bool valueUsesRegisterLoad(llvm::Value &value, llvm::StringRef registerName,
   return false;
 }
 
-std::optional<int64_t> signedConstantValue(llvm::Value *value) {
-  auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value);
-  if (constant == nullptr || constant->getBitWidth() > 64) {
-    return std::nullopt;
-  }
-  return constant->getSExtValue();
-}
-
-bool isStackAlignmentMask(llvm::Value *value) {
-  auto *constant = llvm::dyn_cast<llvm::ConstantInt>(value);
-  if (constant == nullptr || constant->getBitWidth() > 64) {
-    return false;
-  }
-  int64_t mask = constant->getSExtValue();
-  if (mask >= -1) {
-    return false;
-  }
-  uint64_t alignment = static_cast<uint64_t>(-mask);
-  return llvm::isPowerOf2_64(alignment);
-}
-
-std::optional<int64_t> stackOffsetFromBase(llvm::Value *value,
-                                           llvm::Value *base,
-                                           std::set<llvm::Value *> &seen) {
-  value = value->stripPointerCasts();
-  if (value == base) {
-    return 0;
-  }
-  if (!seen.insert(value).second) {
-    return std::nullopt;
-  }
-
-  auto *op = llvm::dyn_cast<llvm::Operator>(value);
-  if (op == nullptr) {
-    return std::nullopt;
-  }
-  if (op->getOpcode() == llvm::Instruction::Add) {
-    if (auto lhs = stackOffsetFromBase(op->getOperand(0), base, seen)) {
-      if (auto rhs = signedConstantValue(op->getOperand(1))) {
-        return *lhs + *rhs;
-      }
-    }
-    if (auto rhs = stackOffsetFromBase(op->getOperand(1), base, seen)) {
-      if (auto lhs = signedConstantValue(op->getOperand(0))) {
-        return *lhs + *rhs;
-      }
-    }
-  }
-  if (op->getOpcode() == llvm::Instruction::Sub) {
-    if (auto lhs = stackOffsetFromBase(op->getOperand(0), base, seen)) {
-      if (auto rhs = signedConstantValue(op->getOperand(1))) {
-        return *lhs - *rhs;
-      }
-    }
-  }
-  if (op->getOpcode() == llvm::Instruction::And) {
-    if (auto lhs = stackOffsetFromBase(op->getOperand(0), base, seen)) {
-      if (*lhs == 0 && isStackAlignmentMask(op->getOperand(1))) {
-        return 0;
-      }
-    }
-    if (auto rhs = stackOffsetFromBase(op->getOperand(1), base, seen)) {
-      if (*rhs == 0 && isStackAlignmentMask(op->getOperand(0))) {
-        return 0;
-      }
-    }
-  }
-  return std::nullopt;
-}
-
-std::optional<int64_t> functionStackLowOffset(llvm::Function &function,
-                                              llvm::Value *stackBase) {
-  std::optional<int64_t> low;
-  for (llvm::Instruction &instruction : llvm::instructions(function)) {
-    std::set<llvm::Value *> seen;
-    std::optional<int64_t> offset =
-        stackOffsetFromBase(&instruction, stackBase, seen);
-    if (!offset || *offset >= 0) {
-      continue;
-    }
-    low = low ? std::min(*low, *offset) : *offset;
-  }
-  return low;
-}
-
 llvm::Value *createStackFramePointer(llvm::IRBuilder<> &builder,
                                      llvm::AllocaInst &storage,
                                      int64_t frameLow, int64_t offset,
@@ -219,6 +136,22 @@ llvm::Value *createStackFramePointer(llvm::IRBuilder<> &builder,
       indexType, static_cast<uint64_t>(offset - frameLow));
   return builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(storage.getContext()),
                                    &storage, byteOffset, name);
+}
+
+std::optional<uint64_t> memoryAccessSize(const llvm::DataLayout &layout,
+                                         const llvm::Instruction &instruction) {
+  llvm::Type *type = nullptr;
+  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+    type = load->getType();
+  } else if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+    type = store->getValueOperand()->getType();
+  }
+  if (type == nullptr) {
+    return std::nullopt;
+  }
+  llvm::TypeSize size = layout.getTypeStoreSize(type);
+  return size.isScalable() ? std::nullopt
+                           : std::optional<uint64_t>(size.getFixedValue());
 }
 
 bool hasExistingStackAlloca(const llvm::Function &function) {
@@ -234,28 +167,9 @@ bool hasExistingStackAlloca(const llvm::Function &function) {
   return false;
 }
 
-llvm::LoadInst *singleRegisterLoad(llvm::Function &function,
-                                   llvm::StringRef registerName) {
-  llvm::LoadInst *result = nullptr;
-  for (llvm::BasicBlock &block : function) {
-    for (llvm::Instruction &instruction : block) {
-      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
-      if (load == nullptr || !loadReadsRegister(*load, registerName)) {
-        continue;
-      }
-      if (result != nullptr) {
-        return nullptr;
-      }
-      result = load;
-    }
-  }
-  return result;
-}
-
-std::optional<llvm::Value *>
-mergeKnownValueAtBlockEntry(llvm::BasicBlock &block,
-                            const std::map<llvm::BasicBlock *, llvm::Value *>
-                                &blockOut) {
+std::optional<llvm::Value *> mergeKnownValueAtBlockEntry(
+    llvm::BasicBlock &block,
+    const std::map<llvm::BasicBlock *, llvm::Value *> &blockOut) {
   llvm::Value *merged = nullptr;
   bool sawPredecessor = false;
   for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
@@ -366,51 +280,155 @@ bool isFramePointerRegisterName(llvm::StringRef name) {
   return name == "RBP" || name == "EBP" || name == "BP";
 }
 
+bool valueFeedsStackPointerStore(llvm::Value &value,
+                                 llvm::GlobalVariable &stackPointer,
+                                 std::set<llvm::Value *> &seen) {
+  if (!seen.insert(&value).second) {
+    return false;
+  }
+  for (llvm::User *user : value.users()) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(user);
+    if (store != nullptr && store->getValueOperand() == &value &&
+        store->getPointerOperand()->stripPointerCasts() == &stackPointer) {
+      return true;
+    }
+    auto *instruction = llvm::dyn_cast<llvm::Instruction>(user);
+    if (instruction != nullptr &&
+        (llvm::isa<llvm::BinaryOperator>(instruction) ||
+         llvm::isa<llvm::CastInst>(instruction) ||
+         llvm::isa<llvm::PHINode>(instruction) ||
+         llvm::isa<llvm::SelectInst>(instruction))) {
+      if (valueFeedsStackPointerStore(*instruction, stackPointer, seen)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool valueFeedsEntryStackInput(llvm::Value &value,
+                               const NativeStackAddressAnalysis &addresses,
+                               std::set<llvm::Value *> &seen) {
+  if (!seen.insert(&value).second) {
+    return false;
+  }
+  for (llvm::User *user : value.users()) {
+    auto *instruction = llvm::dyn_cast<llvm::Instruction>(user);
+    if (instruction == nullptr) {
+      continue;
+    }
+    std::optional<NativeStackAddress> address;
+    if (llvm::isa<llvm::IntToPtrInst>(instruction)) {
+      address = addresses.addressForPointer(instruction);
+    } else if (instruction->getType()->isIntegerTy()) {
+      address = addresses.addressForIntegerValue(instruction);
+    }
+    if (address && address->Kind == NativeStackAddressKind::EntryStackPointer &&
+        address->Offset >= 0) {
+      return true;
+    }
+    if (llvm::isa<llvm::BinaryOperator>(instruction) ||
+        llvm::isa<llvm::CastInst>(instruction) ||
+        llvm::isa<llvm::PHINode>(instruction) ||
+        llvm::isa<llvm::SelectInst>(instruction)) {
+      if (valueFeedsEntryStackInput(*instruction, addresses, seen)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool rewriteFunctionStackAccesses(llvm::Function &function,
                                   llvm::StringRef stackRegisterName,
                                   NativeStackFrameRewriteSummary &summary) {
   if (hasExistingStackAlloca(function)) {
     return false;
   }
-  llvm::LoadInst *stackBase = singleRegisterLoad(function, stackRegisterName);
-  if (stackBase == nullptr) {
+  llvm::Module *module = function.getParent();
+  if (module == nullptr) {
     return false;
   }
+  llvm::GlobalVariable *stackPointer =
+      findNativeStackPointerGlobal(*module, stackRegisterName);
+  if (stackPointer == nullptr) {
+    return false;
+  }
+  NativeStackAddressAnalysis addresses(function, stackPointer,
+                                       stackRegisterName);
+  const llvm::DataLayout &layout = module->getDataLayout();
+  std::vector<StackFrameAddressValue> integerAddresses;
+  std::vector<StackFrameAddressValue> pointerAddresses;
+  std::optional<int64_t> low;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(&instruction);
+      if (pointer == nullptr) {
+        continue;
+      }
+      std::optional<NativeStackAddress> address =
+          addresses.addressForPointer(pointer);
+      if (!address ||
+          address->Kind != NativeStackAddressKind::EntryStackPointer ||
+          address->Offset >= 0) {
+        continue;
+      }
 
-  std::optional<int64_t> low = functionStackLowOffset(function, stackBase);
-  if (!low) {
+      bool localOnly = !pointer->use_empty();
+      for (llvm::User *user : pointer->users()) {
+        auto *memory = llvm::dyn_cast<llvm::Instruction>(user);
+        bool isPointerOperand =
+            (memory != nullptr && llvm::isa<llvm::LoadInst>(memory) &&
+             llvm::cast<llvm::LoadInst>(memory)->getPointerOperand() ==
+                 pointer) ||
+            (memory != nullptr && llvm::isa<llvm::StoreInst>(memory) &&
+             llvm::cast<llvm::StoreInst>(memory)->getPointerOperand() ==
+                 pointer);
+        std::optional<uint64_t> size = memory == nullptr
+                                           ? std::nullopt
+                                           : memoryAccessSize(layout, *memory);
+        uint64_t bytesBelowEntry =
+            static_cast<uint64_t>(-(address->Offset + 1)) + 1;
+        if (!isPointerOperand || !size || *size == 0 ||
+            *size > bytesBelowEntry) {
+          localOnly = false;
+          break;
+        }
+      }
+      if (!localOnly) {
+        continue;
+      }
+      pointerAddresses.push_back({pointer, address->Offset});
+      low = low ? std::min(*low, address->Offset) : address->Offset;
+    }
+  }
+  for (llvm::Instruction &instruction : llvm::instructions(function)) {
+    if (!instruction.getType()->isIntegerTy()) {
+      continue;
+    }
+    std::optional<NativeStackAddress> address =
+        addresses.addressForIntegerValue(&instruction);
+    if (!address ||
+        address->Kind != NativeStackAddressKind::EntryStackPointer ||
+        address->Offset >= 0) {
+      continue;
+    }
+    std::set<llvm::Value *> seen;
+    if (valueFeedsStackPointerStore(instruction, *stackPointer, seen)) {
+      continue;
+    }
+    seen.clear();
+    if (valueFeedsEntryStackInput(instruction, addresses, seen)) {
+      continue;
+    }
+    integerAddresses.push_back({&instruction, address->Offset});
+    low = low ? std::min(*low, address->Offset) : address->Offset;
+  }
+  if (!low || (pointerAddresses.empty() && integerAddresses.empty())) {
     return false;
   }
   uint64_t frameSize = static_cast<uint64_t>(-*low);
   if (frameSize > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
-    return false;
-  }
-
-  std::vector<StackFrameAddressValue> integerAddresses;
-  std::vector<StackFrameAddressValue> pointerAddresses;
-  for (llvm::BasicBlock &block : function) {
-    for (llvm::Instruction &instruction : block) {
-      if (auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(&instruction)) {
-        std::set<llvm::Value *> seen;
-        std::optional<int64_t> offset =
-            stackOffsetFromBase(pointer->getOperand(0), stackBase, seen);
-        if (offset && *offset >= *low && *offset < 0) {
-          pointerAddresses.push_back({&instruction, *offset});
-        }
-        continue;
-      }
-      std::set<llvm::Value *> seen;
-      std::optional<int64_t> offset =
-          stackOffsetFromBase(&instruction, stackBase, seen);
-      if (!offset || *offset < *low || *offset >= 0) {
-        continue;
-      }
-      if (instruction.getType()->isIntegerTy()) {
-        integerAddresses.push_back({&instruction, *offset});
-      }
-    }
-  }
-  if (integerAddresses.empty() && pointerAddresses.empty()) {
     return false;
   }
 
@@ -450,7 +468,6 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
     stackIntegers[key] = integer;
     return integer;
   };
-
   uint64_t rewritten = 0;
   for (const StackFrameAddressValue &address : pointerAddresses) {
     if (address.Instruction->getParent() == nullptr) {
@@ -466,8 +483,8 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
         address.Instruction->use_empty()) {
       continue;
     }
-    llvm::Value *localInteger = stackIntegerForOffset(
-        address.Offset, address.Instruction->getType());
+    llvm::Value *localInteger =
+        stackIntegerForOffset(address.Offset, address.Instruction->getType());
     address.Instruction->replaceAllUsesWith(localInteger);
     ++rewritten;
   }
@@ -494,9 +511,7 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
   return true;
 }
 
-void eraseInstructionOnly(llvm::Instruction &inst) {
-  inst.eraseFromParent();
-}
+void eraseInstructionOnly(llvm::Instruction &inst) { inst.eraseFromParent(); }
 
 bool stackAllocaPointer(llvm::Value *value) {
   value = value->stripPointerCasts();
@@ -509,8 +524,8 @@ bool stackAllocaPointer(llvm::Value *value) {
   return gep != nullptr && stackAllocaPointer(gep->getPointerOperand());
 }
 
-bool stackAllocaStoreIsLoaded(
-    llvm::StoreInst &store, const std::vector<llvm::LoadInst *> &loads) {
+bool stackAllocaStoreIsLoaded(llvm::StoreInst &store,
+                              const std::vector<llvm::LoadInst *> &loads) {
   llvm::Value *storePointer = store.getPointerOperand()->stripPointerCasts();
   for (llvm::LoadInst *load : loads) {
     if (load->getPointerOperand()->stripPointerCasts() == storePointer) {
@@ -699,8 +714,9 @@ void cleanupRegisterBookkeeping(llvm::Function &function,
 
 } // namespace
 
-NativeStackFrameRewriteSummary runNativeStackFrameRewrite(
-    llvm::Module &module, const NativeStackFrameRewriteOptions &options) {
+NativeStackFrameRewriteSummary
+runNativeStackFrameRewrite(llvm::Module &module,
+                           const NativeStackFrameRewriteOptions &options) {
   NativeStackFrameRewriteSummary summary;
   std::optional<NativeAbiSpec> abi = readNativeAbiMetadata(module);
   if (!abi || abi->StackPointerRegister.empty()) {
@@ -717,8 +733,8 @@ NativeStackFrameRewriteSummary runNativeStackFrameRewrite(
     ++summary.FunctionsSeen;
     bool rewritten = false;
     for (const std::string &framePointer : framePointers) {
-      uint64_t replaced = replaceFramePointerLoads(
-          function, framePointer, abi->StackPointerRegister);
+      uint64_t replaced = replaceFramePointerLoads(function, framePointer,
+                                                   abi->StackPointerRegister);
       if (replaced != 0) {
         summary.FramePointerLoadsReplaced += replaced;
         // The replacement is path-sensitive: it only changes loads whose
@@ -743,8 +759,9 @@ NativeStackFrameRewriteSummary runNativeStackFrameRewrite(
   return summary;
 }
 
-NativeStackFrameCleanupSummary runNativeStackFrameCleanup(
-    llvm::Module &module, const NativeStackFrameCleanupOptions &options) {
+NativeStackFrameCleanupSummary
+runNativeStackFrameCleanup(llvm::Module &module,
+                           const NativeStackFrameCleanupOptions &options) {
   NativeStackFrameCleanupSummary summary;
   if (options.Registers.empty()) {
     return summary;

@@ -415,3 +415,69 @@ call 后使 evidence 失效后，这个遗漏会直接影响 CFG join；已限�
 - 复杂度：6/10。增加一个小地址结构和两张状态表，但没有重构 callee 参数扫描。
 - 维护成本：6/10。`and SP, -16` 仅覆盖当前 ABI 常见对齐形状；动态对齐或非 `-16` mask
   仍应在有真实样本时单独扩展。
+
+# 实现记录（2026-08-03，合并栈地址分析）
+
+## 已完成
+
+前两次实现分别在 `NativeRegisterSummary`、`NativeRegisterSummarySSA` 维护当前 SP
+状态；`NativeStackFrame` 又单独从入口 SP 找负偏移。这三者都在回答“该地址相对哪个
+栈基址”，但结果不能互用。本次将其收敛为 `NativeStackAddress`：
+
+- `include/notdec-bin2llvm/passes/summary/NativeStackAddress.h:20` 到 `:115` 定义三类
+  坐标：入口 SP、相对 SP、`notdec_stack.native` frame。只有第一类可以是 callee ABI
+  参数；对齐后的 SP 和本地 frame 即使数值偏移相同也不能混用。
+- `lib/passes/summary/NativeStackAddress.cpp:190` 到 `:414` 新增函数内 SP 数据流，识别
+  直接 SP load/store、常量 add/sub、`and SP, -16` 一类对齐掩码和 native frame
+  `alloca/gep/ptrtoint/inttoptr`。前驱地址不一致时返回 unknown，不猜测合并结果。
+  `:51` 到 `:64` 还避免对 `INT64_MIN` 对齐掩码做有符号取负。
+- `NativeStackFrame.cpp:342` 到 `:498` 改用共享分析，只把可证明的入口 SP 负偏移改为
+  `notdec_stack.native`；对齐 SP 仍保守保留，因其低位相对入口 SP 不可知。
+- `NativeRegisterSummary.cpp:1129` 到 `:1134`、`:1374` 到 `:1459`、`:1744` 到 `:1800`
+  缓存同一分析给 preliminary external callsite evidence 使用，按当前 SP 和 cspec
+  `StackShift` 找 caller 栈槽；删除原来的 `StackPointerAddress` 状态副本。
+- `NativeRegisterSummarySSA.cpp:1362` 到 `:1435` 和 `:6811` 到 `:6853` 用共享分析扫描
+  callee load，但仍须同时满足 entry-SP、非负偏移和 cspec `StackInputsInOrder` 的
+  size/alignment 范围。`:5835` 到 `:5953` 用当前 SP 计算 caller expected slot，支持
+  正负偏移和相对/native-frame store，却不将它们扩成 internal formal。
+- `lib/CMakeLists.txt:14` 将新实现编入 core library。`tests/native_register_summary_test.cpp:644`
+  覆盖静态 summary 的对齐 ESP evidence；`tests/native_register_summary_ssa_test.cpp:2751`
+  到 `:2942` 覆盖跨 block 的 `ESP-20+24 == stack+4`、i386 负偏移/对齐 local，以及
+  x64 对齐后的 `RSP+8` local。既有 x64 第七个参数及对齐 RSP caller 测试继续覆盖
+  cspec `stack+8` 路径。
+
+## 结果和边界
+
+i386 fortune 中 `notdec_native_1cb0`、`notdec_native_1ce0` 都保留为 `stack+4`；
+`notdec_native_2a50` 从伪 stack formal 收敛到 `stack+4`、`stack+8`。warning 行数为
+43。x64 fortune 中 `FUN_5270()` 仍无参数，`FUN_3470` 仍是 6 个寄存器参数，residue
+audit 只有表头。
+
+`notdec_native_2a50 -> fwrite` 的四个 push 分散在不同 basic block，`notdec_native_36c0
+-> close` 的 push 后有未知别名的普通 store；两者仍会产生 `call_arg_binding_missing`。
+本轮不跨 CFG 合并 stack value，也不跳过未知内存写，避免把错误 store 绑定成参数。
+
+## 验证
+
+通过：
+
+```bash
+cmake --build build --target native_register_summary_test \
+  native_register_summary_ssa_test notdec-native-llvm -j4
+build/bin/native_register_summary_test
+build/bin/native_register_summary_ssa_test
+ctest --test-dir build -R '^notdec\\.native_llvm\\.x86_64_smoke$' --output-on-failure
+scripts/native-fortune-i386-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+scripts/native-fortune-x86_64-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+```
+
+两个 fortune 脚本均使用 LLVM 22 的 `llvm-as` 和 `opt -passes=verify`。i386 同口径
+单次为 `15.65s / 168464 KB`，上一版为 `15.87s / 168116 KB`，无可见性能退化。
+
+## 评分
+
+- 实现效果：9/10。统一了三处坐标解释，同时保住 i386/x64 的 ABI 参数边界。
+- 复杂度：6/10。增加一个小型函数内数据流，删除两份重复状态，整体理解成本略降。
+- 维护成本：6/10。后续只有在真实样本需要时，才为跨 block 参数值或 alias 增加独立分析。

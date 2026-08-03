@@ -139,6 +139,25 @@ void attachExternalEvidenceAbi(llvm::Module &module) {
   notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
 }
 
+void attachI386StackEvidenceAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_i386_stack_evidence_test";
+  abi.StackPointerRegister = "ESP";
+  abi.StackPointerSpace = "register";
+  abi.StackShift = 4;
+
+  notdec::bin2llvm::NativeAbiParamEntry input;
+  input.MinSize = 1;
+  input.MaxSize = 64;
+  input.Align = 4;
+  input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Stack;
+  input.Storage.Space = "stack";
+  input.Storage.Offset = 4;
+  abi.Inputs.push_back(input);
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 notdec::bin2llvm::NativeRegisterCallInputSlot
 registerInputSlot(const std::string &name, unsigned offsetBits = 0,
                   unsigned sizeBits = 64) {
@@ -147,6 +166,17 @@ registerInputSlot(const std::string &name, unsigned offsetBits = 0,
   slot.UnitName = name;
   slot.OffsetBits = offsetBits;
   slot.SizeBits = sizeBits;
+  return slot;
+}
+
+notdec::bin2llvm::NativeRegisterCallInputSlot stackInputSlot(uint64_t offset) {
+  notdec::bin2llvm::NativeRegisterCallInputSlot slot;
+  slot.Kind = notdec::bin2llvm::NativeRegisterCallInputSlotKind::Stack;
+  slot.StackSpace = "stack";
+  slot.StackOffset = offset;
+  slot.StackSize = 4;
+  slot.StackAlign = 4;
+  slot.SizeBits = 32;
   return slot;
 }
 
@@ -330,10 +360,9 @@ bool testPartialReadReadsEntry() {
       fn == nullptr ? nullptr : registerSummary(*fn, "RAX");
   std::string entryMask =
       raxSummary == nullptr ? "" : raxSummary->EntryDemandMaskHex;
-  std::transform(entryMask.begin(), entryMask.end(), entryMask.begin(),
-                 [](unsigned char ch) {
-                   return static_cast<char>(std::tolower(ch));
-                 });
+  std::transform(
+      entryMask.begin(), entryMask.end(), entryMask.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
   return expect(raxSummary != nullptr, "missing partial read RAX summary") &&
          expect(raxSummary->ReadEntry,
                 "partial read helper was not marked readEntry") &&
@@ -380,9 +409,9 @@ bool testKnownVarArgExternalKeepsFullInputDemand() {
   llvm::Function *open = llvm::Function::Create(
       openType, llvm::GlobalValue::ExternalLinkage, "open", module);
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "partial_rcx_before_open",
-      module);
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "partial_rcx_before_open", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -399,10 +428,9 @@ bool testKnownVarArgExternalKeepsFullInputDemand() {
       fn == nullptr ? nullptr : registerSummary(*fn, "RCX");
   std::string entryMask =
       rcxSummary == nullptr ? "" : rcxSummary->EntryDemandMaskHex;
-  std::transform(entryMask.begin(), entryMask.end(), entryMask.begin(),
-                 [](unsigned char ch) {
-                   return static_cast<char>(std::tolower(ch));
-                 });
+  std::transform(
+      entryMask.begin(), entryMask.end(), entryMask.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
   return expect(rcxSummary != nullptr, "missing vararg RCX summary") &&
          expect(rcxSummary->ReadEntry,
                 "known vararg call did not read entry RCX") &&
@@ -611,6 +639,53 @@ bool testUnknownExternalCallsiteEvidenceClassifiesOrigins() {
                 "RSI explicit write from a call value was not local") &&
          expect(callsite->Slots[2].Origin == Origin::CallClobber,
                 "RDX evidence was not classified as call clobber");
+}
+
+bool testI386AlignedStackCallsiteEvidenceUsesCurrentEsp() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-i386-aligned-stack-evidence", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackEvidenceAbi(module);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  llvm::GlobalVariable *esp = createRegisterGlobal(module, "ESP", i32, 0, 4);
+
+  auto *callType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external =
+      llvm::Function::Create(callType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_stack_target", module);
+  llvm::Function *function =
+      llvm::Function::Create(callType, llvm::GlobalValue::ExternalLinkage,
+                             "aligned_stack_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *entryEsp = loadRegister(builder, esp, "ESP", "entry.esp");
+  llvm::Value *alignedEsp = builder.CreateAnd(
+      entryEsp, llvm::ConstantInt::get(i32, -16, true), "esp.aligned");
+  storeRegisterValue(builder, esp, alignedEsp, "ESP");
+  llvm::Value *argPointer =
+      builder.CreateIntToPtr(alignedEsp, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(i32, 55), argPointer);
+  builder.CreateCall(callType, external);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummaryOptions options;
+  options.AttachMetadata = false;
+  options.IgnoredRegisters.insert("ESP");
+  options.UnknownExternalInputPolicy =
+      notdec::bin2llvm::NativeRegisterUnknownExternalInputPolicy::NoInputs;
+  options.CollectExternalCallsiteEvidence = true;
+  options.ExternalEvidenceSlots = {stackInputSlot(4)};
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module, options);
+  const auto *callsite =
+      unknownExternalCallsite(summary, "unknown_stack_target");
+  using Origin = notdec::bin2llvm::NativeRegisterCallsiteValueOrigin;
+  return expect(callsite != nullptr,
+                "missing aligned i386 stack callsite evidence") &&
+         expect(callsite->Slots.size() == 1,
+                "aligned i386 stack evidence slot count mismatch") &&
+         expect(callsite->Slots[0].Origin == Origin::LocalDefinition,
+                "aligned i386 stack store was not matched at current ESP");
 }
 
 bool testCalleeReadPropagatesToCallerEntry() {
@@ -889,6 +964,7 @@ int main() {
   ok &= testKnownExternalShapeReadsOnlyDeclaredRegister();
   ok &= testKnownVarArgUsesFixedThenCallsiteInputs();
   ok &= testUnknownExternalCallsiteEvidenceClassifiesOrigins();
+  ok &= testI386AlignedStackCallsiteEvidenceUsesCurrentEsp();
   ok &= testCalleeReadPropagatesToCallerEntry();
   ok &= testSparseJoinKeepsUntouchedPath();
   ok &= testTopDownDemandKeepsOnlyUsedReturn();
