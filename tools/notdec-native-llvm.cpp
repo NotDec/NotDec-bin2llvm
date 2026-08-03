@@ -456,6 +456,7 @@ runNativeDiscovery(const LIEF::ELF::Binary &binary,
     state.addNote("native internal seed-linear CFG discovery is disabled; "
                   "use --native-decode-mode gtirb");
   }
+  manager.addAnalyzer(notdec::bin2llvm::createX86PcThunkAnalyzer());
   manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
   manager.run(state);
   return state;
@@ -879,6 +880,12 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
 
   NativeCallTargets callTargets =
       planNativeCallTargets(state, skipRuntimeFunctions);
+  std::unordered_map<uint64_t, std::string> thunkCallTargets;
+  for (const auto &[entry, function] : state.functions()) {
+    if (function.IsPcThunk) {
+      thunkCallTargets.emplace(entry, function.PcThunkRegister);
+    }
+  }
 
   unsigned appended = 0;
   unsigned skippedRuntime = 0;
@@ -888,6 +895,9 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
       if (function.RangeEnd > function.Entry && skipRuntimeFunctions) {
         ++skippedRuntime;
       }
+      continue;
+    }
+    if (function.IsPcThunk) {
       continue;
     }
 
@@ -913,6 +923,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
     config.DirectCallTargets = callTargets.Direct;
     config.ExternalCallTargets = callTargets.External;
     config.IndirectExternalCallTargets = callTargets.IndirectExternal;
+    config.ThunkCallTargets = thunkCallTargets;
     config.BlockRanges = blockRangesByStart(function);
     config.BlockSuccessors = blockSuccessors(function);
 

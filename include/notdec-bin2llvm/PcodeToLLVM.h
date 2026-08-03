@@ -51,6 +51,11 @@ struct PcodeLoweringConfig {
   // varnode at that GOT address.
   std::unordered_map<uint64_t, std::string> IndirectExternalCallTargets;
 
+  // Address-to-register table for x86 PIC get_pc thunks.  A call to one of
+  // these is `mov (%esp), %reg; ret`, so lifting folds `call thunk; add $imm,
+  // %reg` into `%reg = fallthrough + imm` instead of emitting a call.
+  std::unordered_map<uint64_t, std::string> ThunkCallTargets;
+
   // Optional native block facts keyed by block start.  Native sparse functions
   // can have cold blocks far away from the entry, so contiguous P-Code order is
   // not always a valid fallthrough relation.  Ranges name the accepted block

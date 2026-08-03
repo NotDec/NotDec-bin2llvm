@@ -1,6 +1,7 @@
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstrTypes.h"
@@ -1362,6 +1363,87 @@ bool testNonX64DoesNotSuppressCallStackEffect() {
                 "module failed verifier after non-x64 call lowering");
 }
 
+bool testX86PcThunkCallFoldsToConstantBase() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Registers.push_back({"register", 0x20, 4, "ESP"});
+  program.Registers.push_back({"register", 0x28, 4, "EIP"});
+  program.Registers.push_back({"register", 0x30, 4, "EBX"});
+
+  auto op = [&](uint64_t address, uint64_t instructionSize,
+                notdec::bin2llvm::PcodeOpcode opcode,
+                std::optional<notdec::bin2llvm::VarnodeView> output,
+                std::vector<notdec::bin2llvm::VarnodeView> inputs) {
+    notdec::bin2llvm::PcodeOpView view;
+    view.Address = address;
+    view.InstructionSize = instructionSize;
+    view.Opcode = opcode;
+    view.OpcodeName = notdec::bin2llvm::pcodeOpcodeName(opcode);
+    view.Output = std::move(output);
+    view.Inputs = std::move(inputs);
+    return view;
+  };
+
+  // call 0x1740 (get_pc_thunk.bx) at 0x1000: return address 0x1005 is pushed,
+  // then `add $0x547f, %ebx` folds to EBX = 0x1005 + 0x547f = 0x6584.
+  program.Ops.push_back(op(0x1000, 5, notdec::bin2llvm::PcodeOpcode::IntSub,
+                           registerVarnode(0x20, 4, "ESP"),
+                           {registerVarnode(0x20, 4, "ESP"),
+                            constVarnode(4, 4)}));
+  program.Ops.push_back(op(0x1000, 5, notdec::bin2llvm::PcodeOpcode::Store,
+                           std::nullopt,
+                           {constVarnode(0, 4),
+                            registerVarnode(0x20, 4, "ESP"),
+                            constVarnode(0x1005, 4)}));
+  program.Ops.push_back(op(0x1000, 5, notdec::bin2llvm::PcodeOpcode::Call,
+                           std::nullopt, {ramVarnode(0x1740, 4)}));
+  program.Ops.push_back(op(0x1005, 3, notdec::bin2llvm::PcodeOpcode::IntAdd,
+                           registerVarnode(0x30, 4, "EBX"),
+                           {registerVarnode(0x30, 4, "EBX"),
+                            constVarnode(0x547f, 4)}));
+  program.Ops.push_back(op(0x1008, 1, notdec::bin2llvm::PcodeOpcode::Return,
+                           std::nullopt, {registerVarnode(0x28, 4, "EIP")}));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x86_pc_thunk_folds_to_constant";
+  config.ThunkCallTargets.emplace(0x1740, "EBX");
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasCall = false;
+  llvm::ConstantInt *ebxStore = nullptr;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        hasCall |= llvm::isa<llvm::CallBase>(&instruction);
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+        if (store == nullptr) {
+          continue;
+        }
+        llvm::GlobalVariable *global =
+            llvm::dyn_cast<llvm::GlobalVariable>(store->getPointerOperand());
+        if (global != nullptr && global->getName() == "EBX") {
+          ebxStore = llvm::dyn_cast<llvm::ConstantInt>(store->getValueOperand());
+        }
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "thunk fold function is missing") &&
+         expect(!hasCall, "thunk call was not folded away") &&
+         expect(ebxStore != nullptr &&
+                    ebxStore->getZExtValue() == 0x1005 + 0x547f,
+                "thunk base register was not folded to fallthrough + imm") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after thunk fold");
+}
+
 bool testPartialRegisterWriteUsesPartialWriteHelper() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -1491,6 +1573,7 @@ int main() {
   ok &= testX64CallSuppressesReturnAddressStackEffect();
   ok &= testX64ReturnSuppressesReturnAddressStackEffect();
   ok &= testNonX64DoesNotSuppressCallStackEffect();
+  ok &= testX86PcThunkCallFoldsToConstantBase();
   ok &= testPartialRegisterWriteUsesPartialWriteHelper();
   ok &= testPartialRegisterReadUsesPartialReadHelper();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;

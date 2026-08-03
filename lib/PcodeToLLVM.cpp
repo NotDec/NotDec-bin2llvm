@@ -148,6 +148,7 @@ public:
 
     CurrentProgramOps = &program.Ops;
     prepareX86CallReturnStackSuppression(program);
+    prepareX86PcThunkSuppression(program);
     if (!buildBasicBlocks(program, errorMessage)) {
       return false;
     }
@@ -174,6 +175,12 @@ public:
       bool ended = false;
       for (size_t opIndex = start; opIndex < end; ++opIndex) {
         if (SuppressedPcodeOpIndices.count(opIndex) != 0) {
+          auto baseIt = ThunkBaseWrites.find(opIndex);
+          if (baseIt != ThunkBaseWrites.end()) {
+            llvm::Value *value = llvm::ConstantInt::get(
+                intType(baseIt->second.first.Size), baseIt->second.second);
+            write(baseIt->second.first, value);
+          }
           continue;
         }
 
@@ -507,6 +514,96 @@ private:
         warnX86StackPatternMiss(program.Ops[start].Address, "RET", *spec);
       }
 
+      start = end;
+    }
+  }
+
+  // Fold x86 PIC `call <get_pc_thunk>; add $imm, %reg` into a constant base
+  // address.  The thunk is `mov (%esp), %reg; ret`, so %reg ends up as the
+  // call fallthrough plus the following immediate.  Suppressing the call here
+  // also stops the pushed return address from being treated as an argument.
+  void prepareX86PcThunkSuppression(const PcodeProgram &program) {
+    ThunkBaseWrites.clear();
+    if (Config.ThunkCallTargets.empty()) {
+      return;
+    }
+
+    for (size_t start = 0; start < program.Ops.size();) {
+      size_t end = start + 1;
+      while (end < program.Ops.size() &&
+             program.Ops[end].Address == program.Ops[start].Address) {
+        ++end;
+      }
+
+      std::optional<uint64_t> callTarget;
+      for (size_t index = start; index < end; ++index) {
+        if (program.Ops[index].Opcode == PcodeOpcode::Call) {
+          if (std::optional<uint64_t> target = directTarget(program.Ops[index], 0)) {
+            callTarget = *target;
+            break;
+          }
+        }
+      }
+      auto thunkIt = callTarget
+                         ? Config.ThunkCallTargets.find(*callTarget)
+                         : Config.ThunkCallTargets.end();
+      if (thunkIt == Config.ThunkCallTargets.end()) {
+        start = end;
+        continue;
+      }
+
+      uint64_t fallthrough =
+          program.Ops[start].Address + program.Ops[start].InstructionSize;
+      std::optional<size_t> addIndex;
+      std::optional<VarnodeView> baseRegister;
+      uint64_t immediate = 0;
+      for (size_t index = end; index < program.Ops.size(); ++index) {
+        const PcodeOpView &op = program.Ops[index];
+        if (isTerminator(op.Opcode) || op.Opcode == PcodeOpcode::Call ||
+            op.Opcode == PcodeOpcode::CallInd) {
+          break;
+        }
+        if (op.Opcode != PcodeOpcode::IntAdd || !op.Output ||
+            !op.Output->IsRegister ||
+            op.Output->RegisterName != thunkIt->second) {
+          continue;
+        }
+        bool hasBaseInput = false;
+        std::optional<uint64_t> constInput;
+        for (const VarnodeView &input : op.Inputs) {
+          if (input.IsRegister && input.RegisterName == thunkIt->second) {
+            hasBaseInput = true;
+          } else if (input.Space == "const") {
+            constInput = input.Offset;
+          }
+        }
+        if (!hasBaseInput || !constInput) {
+          continue;
+        }
+        addIndex = index;
+        baseRegister = *op.Output;
+        immediate = *constInput;
+        break;
+      }
+      if (!addIndex || !baseRegister) {
+        start = end;
+        continue;
+      }
+
+      for (size_t index = start; index < end; ++index) {
+        SuppressedPcodeOpIndices.insert(index);
+      }
+      size_t addEnd = *addIndex + 1;
+      while (addEnd < program.Ops.size() &&
+             program.Ops[addEnd].Address == program.Ops[*addIndex].Address) {
+        ++addEnd;
+      }
+      for (size_t index = *addIndex; index < addEnd; ++index) {
+        SuppressedPcodeOpIndices.insert(index);
+      }
+      ThunkBaseWrites.emplace(start,
+                              std::make_pair(*baseRegister,
+                                             fallthrough + immediate));
       start = end;
     }
   }
@@ -2443,6 +2540,9 @@ private:
   std::unordered_map<uint64_t, llvm::BasicBlock *> BlockForAddress;
   std::unordered_map<uint64_t, llvm::BasicBlock *> TailJumpBlockForAddress;
   std::set<size_t> SuppressedPcodeOpIndices;
+  // op index of a folded get_pc thunk call -> (written register, constant
+  // base).  The write is emitted at the suppressed call position.
+  std::map<size_t, std::pair<VarnodeView, uint64_t>> ThunkBaseWrites;
   std::vector<uint64_t> EmptyNativeBlockAddresses;
   std::vector<llvm::BasicBlock *> ExternalTargetBlocks;
   const std::vector<PcodeOpView> *CurrentProgramOps = nullptr;

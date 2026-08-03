@@ -66,6 +66,11 @@ struct NativeFunctionSeed {
   std::string PrimaryName;
   std::vector<std::string> Aliases;
   std::vector<std::string> Sources;
+  // x86 PIC get_pc thunks (mov (%esp),%reg; ret) are compiler-generated
+  // base-address helpers, not real external calls.  Keep the written register
+  // so lifting can fold `call thunk; add $imm, %reg` into a constant.
+  bool IsPcThunk = false;
+  std::string PcThunkRegister;
   // ELF dynamic/exported symbols can be called from outside the lifted module.
   // Keep that fact on the seed so GTIRB and internal decode paths can copy it
   // into confirmed functions without depending on where the function came from.
@@ -188,6 +193,10 @@ struct NativeFunction {
   std::vector<NativeBasicBlock> Blocks;
   std::string Source;
   bool IsExternallyVisible = false;
+  // See NativeFunctionSeed.  A confirmed get_pc thunk still gets a block so it
+  // can be skipped cleanly by module building.
+  bool IsPcThunk = false;
+  std::string PcThunkRegister;
 };
 
 // Runtime filtering keeps ELF/glibc startup, teardown, and PLT stubs out of
@@ -430,6 +439,7 @@ std::unique_ptr<NativeAnalyzer> createGtirbFunctionFactsAnalyzer(
 std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
     NativeSleighDecodeOptions options = {});
 std::unique_ptr<NativeAnalyzer> createX86JumpTableAnalyzer();
+std::unique_ptr<NativeAnalyzer> createX86PcThunkAnalyzer();
 std::unique_ptr<NativeAnalyzer> createFlowFactNormalizer();
 std::unique_ptr<NativeAnalyzer> createReportAnalyzer(std::ostream &output);
 

@@ -582,3 +582,83 @@ scripts/native-fortune-x86_64-regression.sh build/bin/notdec-native-llvm \
 - 复杂度：2/10。只改一个判断条件加注释。
 - 维护成本：3/10。语义清楚（栈槽不连续不可靠），后续若要重新启用需先解决
   局部变量区混入 evidence 的问题。
+
+# 实现记录（2026-08-03，i386 PIC get_pc thunk 识别与折叠）
+
+## 已完成
+
+fortune 是 PIE，几乎每个函数入口都有 `call 1740; add $imm, %ebx`
+（0x1740 = `mov (%esp),%ebx; ret` 的 `__x86.get_pc_thunk.bx`，0x1839 是
+`mov (%esp),%edx; ret` 的 dx 变体）。这两个地址不在 confirmed 函数里，被当成
+unknown external：30+1 个调用点的返回地址 push 被误当栈参数，签名推成
+`notdec_native_1740(i32 %EBX.arg)`，几乎每个函数入口都多一个 EBX.arg，
+EBX 基址（GOT）完全没建模。修复分两层：
+
+1. thunk 识别（NativeAnalysis）：新增 `X86PcThunkAnalyzer`
+   （`lib/NativeAnalysis.cpp:4522`，priority 70），从已解码 CALL 的
+   `DirectCallTargets` 收集未确认目标，按 `8b ?? 24 c3` 字节模式匹配
+   `mov (%esp),%reg; ret`，写入 `NativeFunctionSeed` / `NativeFunction` 新字段
+   `IsPcThunk` / `PcThunkRegister`（`include/notdec-bin2llvm/NativeAnalysis.h:72`
+   与 `:198`）。0x1740 / 0x1839 因此进入 `functions()`。
+2. call+add 折叠（PcodeToLLVM）：`PcodeLoweringConfig` 新增
+   `ThunkCallTargets`（address -> register，`PcodeToLLVM.h:57`）；
+   `prepareX86PcThunkSuppression()`（`lib/PcodeToLLVM.cpp:525`）对 thunk call
+   预扫描后续 `add $imm, %reg`，把 CALL 指令组和 ADD 都加入
+   `SuppressedPcodeOpIndices`，并在被抑制的 call 位置写
+   `%reg = fallthrough + imm` 常量（fallthrough = call 地址 + 指令大小）。
+
+工具层同步：`tools/notdec-native-llvm.cpp:459` 注册 analyzer；
+`:883` 收集 thunk map 传入 config；`:900` 跳过 thunk 函数本身提升；
+`tools/notdec-native-discover.cpp:1431` 注册 analyzer。
+
+## 结果
+
+i386 fortune：
+
+- `notdec_native_1740` / `notdec_native_1839` 从 IR 完全消失，
+  `EBX.arg` 参数全部消失（main 从 `(i32 %EBX.arg)` 变回 0 参数）。
+- GOT 基址变成常量，`load [ebx+off]` 解析成绝对地址
+  （`inttoptr (i32 N to ptr)` 共 69 处），例如 2a50 的
+  `add %EBX,21631` 折叠后 EBX = 0x1496 + 0x6B3A = 0x7FD0。
+- `notdec_native_43c0`（init-array 处理）从 `(EBX.arg, stack+4/8/12)`
+  变为 `(stack+4, stack+8, stack+12)`（argc/argv/envp），循环里
+  `.init_array` 地址 0x7D98 成为常量。
+- warnings 从 55 条降到 41 条：1740 的 arity=0..1 / inconsistent、
+  1839 的 unresolved、相关 clobber 全部消失；剩 10a0（`.init` 入口）
+  unresolved 和 call_arg 栈绑定问题留待后续。
+
+x64 fortune 与改动前 warnings 完全一致，无退化。
+
+## 验证
+
+```bash
+cmake --build build --target notdec-native-llvm notdec-native-discover \
+  pcode_to_llvm_test native_register_summary_ssa_test -j$(nproc)
+./build/bin/pcode_to_llvm_test
+./build/bin/native_register_summary_ssa_test
+./build/bin/native_analysis_facts_test
+./build/bin/native_register_summary_test
+./build/bin/native_external_call_signature_rewrite_test
+scripts/native-fortune-i386-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+scripts/native-fortune-x86_64-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+```
+
+新增单测 `testX86PcThunkCallFoldsToConstantBase()`
+（`tests/pcode_to_llvm_test.cpp:1366`）：构造 `call 0x1740` +
+`add $0x547f, %ebx` 的 i386 pcode，验证 call 被折叠掉、EBX 被写常量
+`0x1005 + 0x547f`。顺带修了上一轮遗留：`native_register_summary_ssa_test`
+里 `__snprintf_chk` 用例 FixedArgs 4 -> 5
+（`tests/native_register_summary_ssa_test.cpp:3794`），该用例在原型表
+改成 5 后一直挂。
+
+## 评分
+
+- 实现效果：10/10。thunk 全部消解，GOT 基址常量，函数签名不再被返回
+  地址污染。
+- 复杂度：4/10。A 是一个 analyzer + 两个字段；B 复用现有 pcode 抑制
+  机制，新增一个 prepare 函数。
+- 维护成本：4/10。thunk 字节模式只覆盖 i386 `mov (%esp),%reg; ret`，
+  其它架构（x64 RIP 相对）不需要；后续若遇到 thunk 后不跟 `add` 的
+  变体，当前会退化成保留 call（不折叠），行为安全。

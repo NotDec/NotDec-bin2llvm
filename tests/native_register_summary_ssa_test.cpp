@@ -3791,7 +3791,7 @@ bool testKnownVarArgExternalInfersDefinedAbiInputs() {
   };
   const KnownVarArgCase cases[] = {
       {"__isoc23_sscanf", 2}, {"__isoc99_sscanf", 2}, {"__asprintf_chk", 3},
-      {"__snprintf_chk", 4},  {"__syslog_chk", 2},    {"fscanf", 2},
+      {"__snprintf_chk", 5},  {"__syslog_chk", 2},    {"fscanf", 2},
       {"prctl", 1, 3},
   };
 

@@ -1428,6 +1428,7 @@ int main(int argc, char **argv) {
       state.addNote("native internal seed-linear CFG discovery is disabled; "
                     "use --native-decode-mode gtirb");
     }
+    manager.addAnalyzer(notdec::bin2llvm::createX86PcThunkAnalyzer());
     manager.addAnalyzer(notdec::bin2llvm::createFlowFactNormalizer());
     if (options->Mode == OutputMode::TextReport) {
       manager.addAnalyzer(notdec::bin2llvm::createReportAnalyzer(std::cout));

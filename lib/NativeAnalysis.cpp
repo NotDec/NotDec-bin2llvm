@@ -4514,6 +4514,76 @@ private:
   std::ostream &Output;
 };
 
+// x86 PIC code computes its GOT base with `call <get_pc_thunk>; add $imm, %reg`
+// where the thunk is `mov (%esp), %reg; ret`.  These thunks are compiler
+// artifacts, not real callable functions: recognizing them lets lifting fold
+// the call+add pair into a constant instead of inferring an external signature
+// from the pushed return address.
+class X86PcThunkAnalyzer final : public NativeAnalyzer {
+public:
+  std::string name() const override { return "X86PcThunkAnalyzer"; }
+  int priority() const override { return 70; }
+
+  void run(NativeProgramState &state, NativeAnalysisManager &) override {
+    if (state.pointerSize() != 4) {
+      return;
+    }
+    std::set<uint64_t> callTargets;
+    for (const auto &[address, instruction] : state.instructions()) {
+      (void)address;
+      for (uint64_t target : instruction.DirectCallTargets) {
+        callTargets.insert(target);
+      }
+    }
+    for (uint64_t target : callTargets) {
+      std::optional<std::string> registerName = pcThunkRegister(state, target);
+      if (!registerName || state.functionContaining(target) != nullptr ||
+          state.functions().count(target) != 0) {
+        continue;
+      }
+      state.addFunctionSeed(target, 5, "", "x86-pc-thunk",
+                            NativeFunctionConfidence::High);
+      NativeFunction function;
+      function.Entry = target;
+      function.RangeStart = target;
+      function.RangeEnd = target + 5;
+      NativeBasicBlock block;
+      block.Start = target;
+      block.End = target + 5;
+      function.Blocks.push_back(block);
+      function.Source = "x86-pc-thunk";
+      function.IsPcThunk = true;
+      function.PcThunkRegister = *registerName;
+      state.addFunction(std::move(function));
+    }
+  }
+
+private:
+  // `mov (%esp), %reg; ret`: 8b <modrm:00 reg 100> 24 c3.  Returns the
+  // destination register name for the two common PIC base registers.
+  static std::optional<std::string> pcThunkRegister(NativeProgramState &state,
+                                                    uint64_t address) {
+    if (!state.isExecutableAddress(address)) {
+      return std::nullopt;
+    }
+    std::vector<uint8_t> bytes;
+    if (!readBytes(state, address, 5, bytes)) {
+      return std::nullopt;
+    }
+    if (bytes.size() != 5 || bytes[0] != 0x8b ||
+        (bytes[1] & 0xc7) != 0x04 || bytes[2] != 0x24 || bytes[3] != 0xc3) {
+      return std::nullopt;
+    }
+    static const char *const names[] = {"EAX", "ECX", "EDX", "EBX",
+                                        "ESP", "EBP", "ESI", "EDI"};
+    unsigned reg = (bytes[1] >> 3) & 0x7;
+    if (reg == 4) {
+      return std::nullopt;
+    }
+    return std::string(names[reg]);
+  }
+};
+
 class X86JumpTableAnalyzer final : public NativeAnalyzer {
 public:
   std::string name() const override { return "X86JumpTableAnalyzer"; }
@@ -6138,6 +6208,10 @@ std::unique_ptr<NativeAnalyzer> createSleighSeedInstructionAnalyzer(
 
 std::unique_ptr<NativeAnalyzer> createX86JumpTableAnalyzer() {
   return std::make_unique<X86JumpTableAnalyzer>();
+}
+
+std::unique_ptr<NativeAnalyzer> createX86PcThunkAnalyzer() {
+  return std::make_unique<X86PcThunkAnalyzer>();
 }
 
 std::unique_ptr<NativeAnalyzer> createFlowFactNormalizer() {
