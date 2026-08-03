@@ -541,3 +541,44 @@ scripts/native-fortune-x86_64-regression.sh build/bin/notdec-native-llvm \
 - 复杂度：5/10。只加两个小 helper 和一个回退查询，没有改动 rewrite。
 - 维护成本：5/10。坐标换算依赖 alloca 大小等于 `-frameLow` 这一构造不变式，
   后续改 rewrite 布局时需要同步留意。
+
+# 实现记录（2026-08-03，过滤栈槽 non_contiguous vararg evidence 误报）
+
+## 已完成
+
+上一轮新增的 `non_contiguous_vararg_evidence` warning 是误报：栈槽 evidence
+窗口（`addStackEvidenceSlots` 固定补 16 个槽，`VarArgInputs` 一直延伸到局部
+变量区）里，参数槽后面排着局部变量 store，来源同样是 `LocalDefinition`，
+`hasLocalDefinitionAfter` 就误报"参数区不连续"。实际每个告警点的 tail 都与
+IR 里真实 push 数一致（i386：`snprintf` tail=1、`__sprintf_chk` tail=1、
+`__snprintf_chk` tail=2/3、`__fprintf_chk` tail=1，共 9 条；x64 4 条），
+只是栈上 evidence 无法靠来源区分参数槽和局部变量槽。
+
+改法：`lib/passes/summary/NativeRegisterSummarySSA.cpp:1938`
+`hasLocalDefinitionAfter()` 只检查非栈槽（`Kind != Stack`）。栈上"不连续"
+基本是 outgoing 区与本地帧重叠造成，不可靠；寄存器槽（x64 SysV vararg 的
+`RDI..R9` 顺序）仍保留这个信号。
+
+## 结果
+
+- i386 fortune：`non_contiguous_vararg_evidence` 9 -> 0。
+- x64 fortune：基线对比只有 4 条 `non_contiguous_vararg_evidence` 消失，
+  其余 warning 完全一致，无退化。
+- 该函数只在告警分支调用，不影响 vararg tail 推断和 rewrite。
+
+## 验证
+
+```bash
+cmake --build build --target notdec-native-llvm -j$(nproc)
+scripts/native-fortune-i386-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+scripts/native-fortune-x86_64-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+```
+
+## 评分
+
+- 实现效果：10/10。误报全部消除，真实 tail 推断未受影响。
+- 复杂度：2/10。只改一个判断条件加注释。
+- 维护成本：3/10。语义清楚（栈槽不连续不可靠），后续若要重新启用需先解决
+  局部变量区混入 evidence 的问题。

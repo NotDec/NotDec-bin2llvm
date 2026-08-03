@@ -1937,11 +1937,16 @@ renumberedSlotsByKind(const NativeRegisterExternalCallsite &callsite,
 
 bool hasLocalDefinitionAfter(
     llvm::ArrayRef<NativeRegisterCallsiteSlotEvidence> slots, unsigned prefix) {
+  // Stack evidence slots extend past the outgoing argument area into the
+  // local frame, where local-variable stores are also LocalDefinition.  A
+  // "hole" in stack origins is therefore normally a frame overlap, not a real
+  // argument discontinuity, so only register slots keep this signal.
   return llvm::any_of(
       slots.drop_front(std::min<size_t>(prefix, slots.size())),
       [](const NativeRegisterCallsiteSlotEvidence &slot) {
         return slot.Origin ==
-               NativeRegisterCallsiteValueOrigin::LocalDefinition;
+                   NativeRegisterCallsiteValueOrigin::LocalDefinition &&
+               slot.Kind != NativeRegisterCallInputSlotKind::Stack;
       });
 }
 
