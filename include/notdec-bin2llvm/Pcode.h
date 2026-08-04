@@ -110,6 +110,12 @@ struct PcodeOpView {
   // operand values, instead of reverse-engineering the instruction from the
   // p-code shape.
   std::string Mnemonic;
+  // Operand text of the machine instruction (e.g. "AX", "word ptr [RBP + -0x2]").
+  // Empty when the instruction has no operands (e.g. "FABS").  Together with
+  // Mnemonic it is the full assembly instruction; x87 classification uses it
+  // to tell operand forms apart (register vs memory) without p-code shape
+  // matching.
+  std::string Body;
   PcodeOpcode Opcode = PcodeOpcode::Unsupported;
   std::string OpcodeName;
   std::optional<VarnodeView> Output;

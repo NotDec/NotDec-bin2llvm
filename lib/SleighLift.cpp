@@ -266,10 +266,11 @@ void setInstructionSize(PcodeProgram &program, size_t firstOp,
   }
 }
 
-void setInstructionMnemonic(PcodeProgram &program, size_t firstOp,
-                            const std::string &mnemonic) {
+void setInstructionAssembly(PcodeProgram &program, size_t firstOp,
+                            const SleighInstructionSummary &summary) {
   for (size_t index = firstOp; index < program.Ops.size(); ++index) {
-    program.Ops[index].Mnemonic = mnemonic;
+    program.Ops[index].Mnemonic = summary.Mnemonic;
+    program.Ops[index].Body = summary.Body;
   }
 }
 
@@ -293,9 +294,9 @@ bool appendInstructionPcode(ghidra::Sleigh &engine, PcodeCollector &collector,
       program.Ops.clear();
       return false;
     }
-    setInstructionMnemonic(
+    setInstructionAssembly(
         program, firstOp,
-        asmCollector.take(static_cast<uint64_t>(instructionLength)).Mnemonic);
+        asmCollector.take(static_cast<uint64_t>(instructionLength)));
     current = current + instructionLength;
     return true;
   } catch (ghidra::UnimplError &error) {

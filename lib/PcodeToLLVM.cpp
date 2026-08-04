@@ -151,11 +151,16 @@ uint32_t x87StackIndex(const VarnodeView &varnode) {
   return static_cast<uint32_t>((varnode.Offset - 0x1100) / 0x10);
 }
 
-// x87 FPU status word register (offset 0x10a2, 2 bytes).  Like the FPU stack
-// it is library-internal state; fnstsw/fstsw read it through an intrinsic.
-bool isFpuStatusWordVarnode(const VarnodeView &varnode) {
+// x87 FPU control/status word registers (control 0x10a0, status 0x10a2, both
+// 2 bytes).  Like the FPU stack they are library-internal state: fldcw/fnstcw
+// manage the control word and fnstsw/fstsw read the status word, all through
+// notdec.x87.* intrinsics.  Lowering suppresses every op that reads or writes
+// these registers inside a folded group, so the LLVM globals are only created
+// for FPU-word instructions that are not folded yet (e.g. fstenv).
+bool isFpuWordVarnode(const VarnodeView &varnode) {
   return varnode.IsRegister && varnode.Space == "register" &&
-         varnode.Offset == 0x10a2 && varnode.Size == 2;
+         varnode.Size == 2 &&
+         (varnode.Offset == 0x10a0 || varnode.Offset == 0x10a2);
 }
 
 bool touchesX87Stack(const PcodeProgram &program, size_t start, size_t end) {
@@ -238,17 +243,20 @@ std::string memArithName(PcodeOpcode opcode, bool memIsInput0) {
   }
 }
 
-// Register arithmetic on ST0: ST0 = op(ST0, st(i)).
-std::string regArithName(PcodeOpcode opcode) {
+// Register arithmetic on ST0: ST0 = op(ST0, st(i)).  Reverse forms
+// (fsubr/fdivr) are ST0 = op(st(i), ST0), i.e. input0 is the st(i) slot, the
+// same convention as popArithName.
+std::string regArithName(PcodeOpcode opcode, const VarnodeView &input0) {
+  bool reverse = x87StackIndex(input0) != 0;
   switch (opcode) {
   case PcodeOpcode::FloatAdd:
     return "fadd";
   case PcodeOpcode::FloatSub:
-    return "fsub";
+    return reverse ? "fsubr" : "fsub";
   case PcodeOpcode::FloatMult:
     return "fmul";
   case PcodeOpcode::FloatDiv:
-    return "fdiv";
+    return reverse ? "fdivr" : "fdiv";
   default:
     return "";
   }
@@ -461,10 +469,9 @@ private:
     // bit2=ZF); lowering writes the EFLAGS bits that integer code observes.
     // The FPU status word stays library-internal like the FPU stack.
     bool WritesComparisonFlags = false;
-    // fnstsw/fstsw: the intrinsic returns the FPU status word; lowering
-    // writes it to the p-code target (AX register or a memory store).  The
-    // group's FSW COPY must not be lowered.
-    bool WritesStatusWord = false;
+    // fnstsw/fstsw/fnstcw/fstcw: the intrinsic returns the FPU status/control
+    // word; lowering writes it to the p-code target (AX register or a memory
+    // store).
     std::optional<VarnodeView> ResultRegister;
   };
 
@@ -895,46 +902,78 @@ private:
     spec.Start = start;
     spec.End = end;
 
-    // fnstsw/fstsw copy the FPU status word to AX or memory.  The p-code is
-    // only COPY(FSW) and does not touch the x87 stack, so this branch runs
-    // before the stack check below.  The status word is library-internal:
-    // the intrinsic returns it and lowering writes it to the p-code target.
-    if (mnemonic == "FNSTSW" || mnemonic == "FSTSW") {
-      const PcodeOpView *copy = nullptr;
-      for (size_t index = start; index < end; ++index) {
-        const PcodeOpView &op = program.Ops[index];
-        if (op.Opcode == PcodeOpcode::Copy && op.Output &&
-            op.Inputs.size() == 1 &&
-            isFpuStatusWordVarnode(op.Inputs[0])) {
-          copy = &op;
-          break;
-        }
-      }
-      if (copy == nullptr || !copy->Output) {
-        return std::nullopt;
-      }
-      const VarnodeView &target = *copy->Output;
-      if (target.IsRegister) {
-        spec.ResultRegister = target;
-      } else {
-        const PcodeOpView *store = nullptr;
+    // fnstsw/fstsw copy the FPU status word to AX or memory; fnstcw/fstcw
+    // copy the FPU control word to memory.  The p-code never touches the x87
+    // stack, so these branches run before the stack check below.  The words
+    // are library-internal: the intrinsic returns one and lowering writes it
+    // to the p-code target.  The mnemonic decides the instruction and the
+    // Body text tells the operand form (AX vs memory); the p-code only
+    // supplies the concrete target varnode/address.
+    if (mnemonic == "FNSTSW" || mnemonic == "FSTSW" ||
+        mnemonic == "FNSTCW" || mnemonic == "FSTCW") {
+      spec.IntrinsicName =
+          std::string("notdec.x87.") +
+          ((mnemonic == "FNSTCW" || mnemonic == "FSTCW") ? "fnstcw"
+                                                         : "fnstsw");
+      spec.ResultType = intType(2);
+      if (program.Ops[start].Body == "AX") {
         for (size_t index = start; index < end; ++index) {
           const PcodeOpView &op = program.Ops[index];
-          if (op.Opcode == PcodeOpcode::Store && op.Inputs.size() == 3 &&
-              sameVarnode(op.Inputs[2], target)) {
-            store = &op;
+          if (op.Opcode == PcodeOpcode::Copy && op.Output &&
+              op.Output->IsRegister && op.Output->Size == 2) {
+            spec.ResultRegister = *op.Output;
             break;
           }
         }
-        if (store == nullptr) {
+        if (!spec.ResultRegister) {
           return std::nullopt;
         }
-        spec.StoreAddress = store->Inputs[1];
-        spec.StoreValueSize = 2;
+      } else {
+        for (size_t index = start; index < end; ++index) {
+          const PcodeOpView &op = program.Ops[index];
+          if (op.Opcode == PcodeOpcode::Store && op.Inputs.size() == 3) {
+            spec.StoreAddress = op.Inputs[1];
+            spec.StoreValueSize = 2;
+            break;
+          }
+        }
+        if (!spec.StoreAddress) {
+          return std::nullopt;
+        }
       }
-      spec.IntrinsicName = "notdec.x87.fnstsw";
-      spec.ResultType = intType(2);
-      spec.WritesStatusWord = true;
+      return spec;
+    }
+
+    // fldcw: load the FPU control word from memory into the library.  The
+    // only p-code op producing a value is the memory LOAD; its result is the
+    // call argument and the control-word COPY is suppressed by lowering.
+    if (mnemonic == "FLDCW") {
+      const PcodeOpView *load = nullptr;
+      for (size_t index = start; index < end; ++index) {
+        const PcodeOpView &op = program.Ops[index];
+        if (op.Opcode == PcodeOpcode::Load && op.Output &&
+            op.Output->Size == 2) {
+          load = &op;
+          break;
+        }
+      }
+      if (load == nullptr) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName = "notdec.x87.fldcw";
+      spec.Args = {*load->Output};
+      spec.ArgTypes = {intType(2)};
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      return spec;
+    }
+
+    // fabs/fchs: ST0 = |ST0| / ST0 = -ST0, no explicit operands.  The
+    // mnemonic fully determines the semantics, so the group's p-code is
+    // skipped entirely.
+    if (mnemonic == "FABS" || mnemonic == "FCHS") {
+      spec.IntrinsicName =
+          mnemonic == "FABS" ? "notdec.x87.fabs" : "notdec.x87.fchs";
+      spec.ResultType = llvm::Type::getVoidTy(Context);
       return spec;
     }
 
@@ -1008,6 +1047,11 @@ private:
     }
 
     // fstp / fistp: store ST0 to memory or to st(i) (st(0) is a plain pop).
+    // The mnemonic decides the instruction; the STORE only supplies the
+    // target address and the stored value width.  Ghidra models FISTP as
+    // round(ST0)->trunc and FSTP as FLOAT2FLOAT/COPY of ST0, but those
+    // p-code shapes are not consulted: the library rounds with the FPU mode
+    // set by fldcw, so the truncated store is correct either way.
     if (mnemonic == "FSTP" || mnemonic == "FISTP") {
       const PcodeOpView *storeOp = nullptr;
       for (size_t index = start; index < end; ++index) {
@@ -1019,27 +1063,16 @@ private:
       // STORE inputs are (space selector, address, value).
       if (storeOp != nullptr && storeOp->Inputs.size() == 3) {
         const VarnodeView &storedValue = storeOp->Inputs[2];
-        const PcodeOpView *producer =
-            findProducer(program, start, end, storedValue);
-        if (producer == nullptr || producer->Inputs.size() != 1 ||
-            !isX87StackVarnode(producer->Inputs[0]) ||
-            x87StackIndex(producer->Inputs[0]) != 0) {
-          return std::nullopt;
-        }
         if (mnemonic == "FISTP") {
-          if (producer->Opcode != PcodeOpcode::FloatTrunc) {
+          if (storedValue.Size != 2 && storedValue.Size != 4 &&
+              storedValue.Size != 8) {
             return std::nullopt;
           }
-          spec.IntrinsicName = "notdec.x87.fistp.i" +
-                               std::to_string(producer->Output->Size * 8);
-          spec.ResultType = intType(producer->Output->Size);
+          spec.IntrinsicName =
+              "notdec.x87.fistp.i" + std::to_string(storedValue.Size * 8);
+          spec.ResultType = intType(storedValue.Size);
         } else {
-          // f32/f64 go through FLOAT2FLOAT, f80 through a plain COPY.
-          if (producer->Opcode != PcodeOpcode::FloatFloat2Float &&
-              producer->Opcode != PcodeOpcode::Copy) {
-            return std::nullopt;
-          }
-          llvm::Type *fpType = floatType(producer->Output->Size);
+          llvm::Type *fpType = floatType(storedValue.Size);
           if (fpType == nullptr) {
             return std::nullopt;
           }
@@ -1047,7 +1080,7 @@ private:
           spec.ResultType = fpType;
         }
         spec.StoreAddress = storeOp->Inputs[1];
-        spec.StoreValueSize = producer->Output->Size;
+        spec.StoreValueSize = storedValue.Size;
         return spec;
       }
       if (mnemonic == "FISTP") {
@@ -1182,9 +1215,11 @@ private:
       return std::nullopt;
     }
 
-    // Register or memory arithmetic on ST0.
+    // Register or memory arithmetic on ST0.  FSUBR/FDIVR are the reverse
+    // forms (ST0 = st(i) - ST0 / ST0 = st(i) / ST0); the direction is read
+    // from the p-code operand order.
     if (mnemonic == "FADD" || mnemonic == "FSUB" || mnemonic == "FMUL" ||
-        mnemonic == "FDIV") {
+        mnemonic == "FDIV" || mnemonic == "FSUBR" || mnemonic == "FDIVR") {
       const PcodeOpView *write = nullptr;
       for (size_t index = start; index < end; ++index) {
         const PcodeOpView &op = program.Ops[index];
@@ -1206,8 +1241,8 @@ private:
         uint32_t index = x87StackIndex(input0) == 0
                              ? x87StackIndex(input1)
                              : x87StackIndex(input0);
-        spec.IntrinsicName = "notdec.x87." + regArithName(write->Opcode) +
-                             ".sti";
+        spec.IntrinsicName = "notdec.x87." +
+                             regArithName(write->Opcode, input0) + ".sti";
         spec.Args = {stIndexVarnode(index)};
         spec.ArgTypes = {intType(1)};
         spec.ResultType = llvm::Type::getVoidTy(Context);
@@ -1445,18 +1480,22 @@ private:
     // argument values are available through the normal p-code SSA cache.
     // Comparison instructions (fcomi/fucomip) have no memory operand and
     // their unique temps are group-private, so nothing needs lowering here.
-    // fnstsw/fstsw must not lower the COPY that reads the status word: the
-    // intrinsic returns it instead.
+    // fnstsw/fnstcw must not lower the COPY that reads the FPU word and
+    // fldcw must not lower the COPY that writes it: the intrinsic returns or
+    // consumes the word instead.  The same applies to any ST0..ST7 rolling
+    // writes, which stay inside the library.
     if (!spec.WritesComparisonFlags) {
       for (size_t index = spec.Start; index < spec.End; ++index) {
         const PcodeOpView &op = (*CurrentProgramOps)[index];
         if (op.Opcode == PcodeOpcode::Store ||
-            (op.Output && isX87StackVarnode(*op.Output)) ||
+            (op.Output &&
+             (isX87StackVarnode(*op.Output) ||
+              isFpuWordVarnode(*op.Output))) ||
             std::any_of(op.Inputs.begin(), op.Inputs.end(),
-                        isX87StackVarnode) ||
-            (spec.WritesStatusWord &&
-             std::any_of(op.Inputs.begin(), op.Inputs.end(),
-                         isFpuStatusWordVarnode))) {
+                        [](const VarnodeView &varnode) {
+                          return isX87StackVarnode(varnode) ||
+                                 isFpuWordVarnode(varnode);
+                        })) {
           continue;
         }
         if (!lowerOp(op, errorMessage)) {

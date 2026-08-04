@@ -1868,6 +1868,70 @@ bool testX87FdivrpSt2FoldsToIntrinsicCall() {
                 "module failed verifier after x87 fdivrp st(2) folding");
 }
 
+// fsubr %st(0),%st(3): ST0 = st(3) - ST0, the reverse register form.  The
+// p-code is FLOAT_SUB(st(3), ST0); the intrinsic name must keep the reverse
+// direction (fsubr, not fsub).
+void addX87FsubrSt3Ops(notdec::bin2llvm::PcodeProgram &program,
+                       uint64_t address) {
+  notdec::bin2llvm::PcodeOpView sub;
+  sub.Opcode = notdec::bin2llvm::PcodeOpcode::FloatSub;
+  sub.OpcodeName = "FLOAT_SUB";
+  sub.Output = registerVarnode(0x1100, 10, "ST0");
+  sub.Inputs.push_back(registerVarnode(0x1130, 10, "ST3"));
+  sub.Inputs.push_back(registerVarnode(0x1100, 10, "ST0"));
+  sub.Address = address;
+  sub.InstructionSize = 1;
+  sub.Mnemonic = "FSUBR";
+  sub.Body = "ST0,ST3";
+  program.Ops.push_back(sub);
+}
+
+bool testX87FsubrSt3FoldsToIntrinsicCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FsubrSt3Ops(program, 0x1000);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fsubr_st3";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFsubrSt3 = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr || call->getCalledFunction() == nullptr) {
+          continue;
+        }
+        if (call->getCalledFunction()->getName() ==
+                "notdec.x87.fsubr.sti" &&
+            call->arg_size() == 1) {
+          if (auto *constant =
+                  llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0))) {
+            hasFsubrSt3 |= constant->getZExtValue() == 3;
+          }
+        }
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fsubr st(3) function is missing") &&
+         expect(hasFsubrSt3,
+                "x87 fsubr st(3) did not fold to notdec.x87.fsubr.sti(3)") &&
+         expect(!functionUsesGlobal(function, "ST0"),
+                "x87 fsubr st(3) kept an ST0 register global") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fsubr st(3) folding");
+}
+
 // fcomi/fucomip: compare ST0 with st(1), write EFLAGS/FPU status from the
 // packed intrinsic result.  pop selects the FCOMIP/FUCOMIP rolling pop.
 void addX87FcomiOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address,
@@ -2009,6 +2073,7 @@ void addX87FpremFnstswOps(notdec::bin2llvm::PcodeProgram &program,
   copy.OpcodeName = "COPY";
   copy.Output = registerVarnode(0x0, 2, "AX");
   copy.Inputs.push_back(registerVarnode(0x10a2, 2, "FSW"));
+  copy.Body = "AX";
   push(copy, address + 1, "FNSTSW");
 
   notdec::bin2llvm::PcodeOpView andOp;
@@ -2204,6 +2269,171 @@ bool testX87FpremFnstswFoldsToIntrinsicCall() {
                 "module failed verifier after x87 fprem/fnstsw folding");
 }
 
+// python fegetround/fesetround style sequence: fnstcw [mem] then fldcw [mem].
+// Mirrors the real p-code: FNSTCW is COPY(FPUControlWord) -> STORE and FLDCW
+// is LOAD -> COPY(FPUControlWord).  The mnemonic drives the classification;
+// only the memory operand value comes from the p-code.
+void addX87FnstcwFldcwOps(notdec::bin2llvm::PcodeProgram &program,
+                          uint64_t address) {
+  auto push = [&](notdec::bin2llvm::PcodeOpView op, uint64_t addr,
+                  const std::string &mnemonic) {
+    op.Address = addr;
+    op.InstructionSize = 1;
+    op.Mnemonic = mnemonic;
+    program.Ops.push_back(op);
+  };
+
+  notdec::bin2llvm::PcodeOpView copyCw;
+  copyCw.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  copyCw.OpcodeName = "COPY";
+  copyCw.Output = uniqueVarnode(0x6a00, 2);
+  copyCw.Inputs.push_back(registerVarnode(0x10a0, 2, "FPUControlWord"));
+  copyCw.Body = "word ptr [RBP + -0x2]";
+  push(copyCw, address, "FNSTCW");
+
+  notdec::bin2llvm::PcodeOpView storeCw;
+  storeCw.Opcode = notdec::bin2llvm::PcodeOpcode::Store;
+  storeCw.OpcodeName = "STORE";
+  storeCw.Inputs.push_back(constVarnode(0x558a4c827b20, 8));
+  storeCw.Inputs.push_back(ramVarnode(0x1234, 8));
+  storeCw.Inputs.push_back(uniqueVarnode(0x6a00, 2));
+  storeCw.Body = "word ptr [RBP + -0x2]";
+  push(storeCw, address, "FNSTCW");
+
+  notdec::bin2llvm::PcodeOpView loadCw;
+  loadCw.Opcode = notdec::bin2llvm::PcodeOpcode::Load;
+  loadCw.OpcodeName = "LOAD";
+  loadCw.Output = uniqueVarnode(0x6a01, 2);
+  loadCw.Inputs.push_back(constVarnode(0x558a4c827b20, 8));
+  loadCw.Inputs.push_back(ramVarnode(0x1238, 8));
+  loadCw.Body = "word ptr [RBP + -0x4]";
+  push(loadCw, address + 1, "FLDCW");
+
+  notdec::bin2llvm::PcodeOpView writeCw;
+  writeCw.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  writeCw.OpcodeName = "COPY";
+  writeCw.Output = registerVarnode(0x10a0, 2, "FPUControlWord");
+  writeCw.Inputs.push_back(uniqueVarnode(0x6a01, 2));
+  writeCw.Body = "word ptr [RBP + -0x4]";
+  push(writeCw, address + 1, "FLDCW");
+}
+
+bool testX87FnstcwFldcwFoldsToIntrinsicCalls() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  program.Registers.push_back({"register", 0x10a0, 2, "FPUControlWord"});
+  addX87FnstcwFldcwOps(program, 0x1000);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fnstcw_fldcw";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFnstcw = false;
+  bool hasFldcw = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr || call->getCalledFunction() == nullptr) {
+          continue;
+        }
+        if (call->getCalledFunction()->getName() == "notdec.x87.fnstcw") {
+          hasFnstcw = true;
+        }
+        if (call->getCalledFunction()->getName() == "notdec.x87.fldcw") {
+          hasFldcw = true;
+        }
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fnstcw/fldcw function is missing") &&
+         expect(hasFnstcw, "x87 fnstcw did not fold to notdec.x87.fnstcw") &&
+         expect(hasFldcw, "x87 fldcw did not fold to notdec.x87.fldcw") &&
+         expect(!functionUsesGlobal(function, "FPUControlWord"),
+                "x87 fnstcw/fldcw kept the FPUControlWord global") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fnstcw/fldcw folding");
+}
+
+void addX87FabsChsOps(notdec::bin2llvm::PcodeProgram &program,
+                      uint64_t address) {
+  auto push = [&](notdec::bin2llvm::PcodeOpView op, uint64_t addr,
+                  const std::string &mnemonic) {
+    op.Address = addr;
+    op.InstructionSize = 1;
+    op.Mnemonic = mnemonic;
+    program.Ops.push_back(op);
+  };
+
+  notdec::bin2llvm::PcodeOpView absOp;
+  absOp.Opcode = notdec::bin2llvm::PcodeOpcode::FloatAbs;
+  absOp.OpcodeName = "FLOAT_ABS";
+  absOp.Output = registerVarnode(0x1100, 10, "ST0");
+  absOp.Inputs.push_back(registerVarnode(0x1100, 10, "ST0"));
+  push(absOp, address, "FABS");
+
+  notdec::bin2llvm::PcodeOpView chsOp;
+  chsOp.Opcode = notdec::bin2llvm::PcodeOpcode::FloatNeg;
+  chsOp.OpcodeName = "FLOAT_NEG";
+  chsOp.Output = registerVarnode(0x1100, 10, "ST0");
+  chsOp.Inputs.push_back(registerVarnode(0x1100, 10, "ST0"));
+  push(chsOp, address + 1, "FCHS");
+}
+
+bool testX87FabsChsFoldsToIntrinsicCalls() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FabsChsOps(program, 0x1000);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fabs_chs";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFabs = false;
+  bool hasFchs = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr || call->getCalledFunction() == nullptr) {
+          continue;
+        }
+        if (call->getCalledFunction()->getName() == "notdec.x87.fabs") {
+          hasFabs = true;
+        }
+        if (call->getCalledFunction()->getName() == "notdec.x87.fchs") {
+          hasFchs = true;
+        }
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fabs/fchs function is missing") &&
+         expect(hasFabs, "x87 fabs did not fold to notdec.x87.fabs") &&
+         expect(hasFchs, "x87 fchs did not fold to notdec.x87.fchs") &&
+         expect(!functionUsesGlobal(function, "ST0"),
+                "x87 fabs/fchs kept an ST0 register global") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fabs/fchs folding");
+}
+
 } // namespace
 
 int main() {
@@ -2247,8 +2477,11 @@ int main() {
   ok &= testX87FstpFoldsToIntrinsicCall();
   ok &= testX87FldzFoldsToIntrinsicCall();
   ok &= testX87FdivrpSt2FoldsToIntrinsicCall();
+  ok &= testX87FsubrSt3FoldsToIntrinsicCall();
   ok &= testX87FcomiFoldsToIntrinsicCall();
   ok &= testX87FucomipFoldsToIntrinsicCall();
   ok &= testX87FpremFnstswFoldsToIntrinsicCall();
+  ok &= testX87FnstcwFldcwFoldsToIntrinsicCalls();
+  ok &= testX87FabsChsFoldsToIntrinsicCalls();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
