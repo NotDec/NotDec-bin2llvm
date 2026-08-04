@@ -2,6 +2,7 @@
 
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/NativeExternalPrototype.h"
+#include "notdec-bin2llvm/NativeX87Intrinsic.h"
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
@@ -782,6 +783,10 @@ bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
   llvm::Function *callee = call.getCalledFunction();
   return callee != nullptr &&
          (callee->getName().starts_with("notdec.register.") ||
+          // x87 instructions are folded into library-style calls: they own the
+          // FPU stack and touch no general register, so no ABI clobber/input
+          // should be derived for them.
+          isNativeX87IntrinsicName(callee->getName()) ||
           isNativeRegisterValueRangeName(callee->getName()));
 }
 
@@ -1430,6 +1435,9 @@ private:
     llvm::Function *callee = call.getCalledFunction();
     if (callee != nullptr &&
         (!callee->isDeclaration() || callee->isIntrinsic())) {
+      return false;
+    }
+    if (isNotDecRegisterHelperCall(call)) {
       return false;
     }
     return externalCallShape(call) == nullptr;

@@ -24,6 +24,6 @@ parseSleighBytesOptions(int argc, char **argv, std::ostream &errorStream);
 PcodeProgram collectSleighPcode(const SleighBytesOptions &options,
                                 std::ostream &errorStream);
 
-void printPcodeProgram(const PcodeProgram &program, std::ostream &os);
+void printPcodeProgram(const PcodeProgram &program, std::ostream &os, bool withAddress = false);
 
 } // namespace notdec::bin2llvm

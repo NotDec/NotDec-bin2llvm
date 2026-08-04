@@ -116,6 +116,17 @@ require_line_prefix "define " "$OUT_LL"
 require_contains "stackpointer.register=ESP" "$OUT_LL"
 require_not_contains "stackpointer.register=RSP" "$OUT_LL"
 
+# x87 instructions are folded into library-style notdec.x87.* calls: the FPU
+# stack owns no register globals and register SSA must not derive clobber or
+# entry values for ST0..ST7.
+require_not_contains "@ST" "$OUT_LL"
+require_contains "notdec.x87.fild.i32" "$OUT_LL"
+require_contains "notdec.x87.fstp.f64" "$OUT_LL"
+if grep -P '\tST[0-7]\t' "$WARNING_TSV"; then
+  echo "unexpected x87 register SSA warning in $WARNING_TSV" >&2
+  exit 1
+fi
+
 echo "fortune fixture: $FORTUNE"
 echo "fortune native IR: $OUT_LL"
 echo "fortune register SSA warnings: $WARNING_TSV"

@@ -1537,6 +1537,198 @@ bool testPartialRegisterReadUsesPartialReadHelper() {
                 "module failed verifier after partial register read lowering");
 }
 
+
+notdec::bin2llvm::PcodeOpView x87StackCopyOp(uint64_t address,
+                                             uint64_t instructionSize,
+                                             uint64_t dstOffset,
+                                             uint64_t srcOffset,
+                                             const std::string &dstName,
+                                             const std::string &srcName) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.InstructionSize = instructionSize;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  op.OpcodeName = "COPY";
+  op.Output = registerVarnode(dstOffset, 10, dstName);
+  op.Inputs.push_back(registerVarnode(srcOffset, 10, srcName));
+  return op;
+}
+
+notdec::bin2llvm::PcodeOpView x87UniqueCopyOp(uint64_t address,
+                                              uint64_t instructionSize,
+                                              uint64_t uniqueOffset,
+                                              uint64_t srcOffset,
+                                              const std::string &srcName) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.InstructionSize = instructionSize;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  op.OpcodeName = "COPY";
+  op.Output = uniqueVarnode(uniqueOffset, 10);
+  op.Inputs.push_back(registerVarnode(srcOffset, 10, srcName));
+  return op;
+}
+
+notdec::bin2llvm::PcodeOpView x87CopyFromUniqueOp(uint64_t address,
+                                                  uint64_t instructionSize,
+                                                  uint64_t dstOffset,
+                                                  uint64_t uniqueOffset,
+                                                  const std::string &dstName) {
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = address;
+  op.InstructionSize = instructionSize;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  op.OpcodeName = "COPY";
+  op.Output = registerVarnode(dstOffset, 10, dstName);
+  op.Inputs.push_back(uniqueVarnode(uniqueOffset, 10));
+  return op;
+}
+
+// fildl (%ram): rolling push prefix, load i32, ST0 = INT2FLOAT(load).
+void addX87FildlOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address) {
+  program.Ops.push_back(x87UniqueCopyOp(address, 1, 0x27180, 0x1170, "ST7"));
+  for (unsigned index = 7; index >= 1; --index) {
+    uint64_t dst = 0x1100 + index * 0x10;
+    uint64_t src = 0x1100 + (index - 1) * 0x10;
+    program.Ops.push_back(x87StackCopyOp(
+        address, 1, dst, src, "ST" + std::to_string(index),
+        "ST" + std::to_string(index - 1)));
+  }
+  program.Ops.push_back(
+      x87CopyFromUniqueOp(address, 1, 0x1100, 0x27180, "ST0"));
+
+  notdec::bin2llvm::PcodeOpView load;
+  load.Address = address;
+  load.InstructionSize = 1;
+  load.Opcode = notdec::bin2llvm::PcodeOpcode::Load;
+  load.OpcodeName = "LOAD";
+  load.Output = uniqueVarnode(0x5580, 4);
+  load.Inputs.push_back(constVarnode(0, 8));
+  load.Inputs.push_back(ramVarnode(0x4000, 4));
+  program.Ops.push_back(load);
+
+  notdec::bin2llvm::PcodeOpView cast;
+  cast.Address = address;
+  cast.InstructionSize = 1;
+  cast.Opcode = notdec::bin2llvm::PcodeOpcode::FloatInt2Float;
+  cast.OpcodeName = "INT2FLOAT";
+  cast.Output = registerVarnode(0x1100, 10, "ST0");
+  cast.Inputs.push_back(uniqueVarnode(0x5580, 4));
+  program.Ops.push_back(cast);
+}
+
+// fstpl (%ram): ST0 -> double, STORE, rolling pop suffix.
+void addX87FstpOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address) {
+  notdec::bin2llvm::PcodeOpView cast;
+  cast.Address = address;
+  cast.InstructionSize = 1;
+  cast.Opcode = notdec::bin2llvm::PcodeOpcode::FloatFloat2Float;
+  cast.OpcodeName = "FLOAT2FLOAT";
+  cast.Output = uniqueVarnode(0x5600, 8);
+  cast.Inputs.push_back(registerVarnode(0x1100, 10, "ST0"));
+  program.Ops.push_back(cast);
+
+  notdec::bin2llvm::PcodeOpView store;
+  store.Address = address;
+  store.InstructionSize = 1;
+  store.Opcode = notdec::bin2llvm::PcodeOpcode::Store;
+  store.OpcodeName = "STORE";
+  store.Inputs.push_back(constVarnode(0, 8));
+  store.Inputs.push_back(ramVarnode(0x5000, 4));
+  store.Inputs.push_back(uniqueVarnode(0x5600, 8));
+  program.Ops.push_back(store);
+
+  for (unsigned index = 0; index < 7; ++index) {
+    uint64_t dst = 0x1100 + index * 0x10;
+    uint64_t src = 0x1100 + (index + 1) * 0x10;
+    program.Ops.push_back(x87StackCopyOp(
+        address, 1, dst, src, "ST" + std::to_string(index),
+        "ST" + std::to_string(index + 1)));
+  }
+}
+
+bool testX87FildlFoldsToIntrinsicCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FildlOps(program, 0x1000);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fildl";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFildl = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        hasFildl |=
+            callee != nullptr && callee->getName() == "notdec.x87.fild.i32";
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fildl function is missing") &&
+         expect(hasFildl, "x87 fildl did not fold to notdec.x87.fild.i32") &&
+         expect(!functionUsesGlobal(function, "ST0"),
+                "x87 fildl kept an ST0 register global") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fildl folding");
+}
+
+bool testX87FstpFoldsToIntrinsicCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FstpOps(program, 0x1000);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fstp";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFstp = false;
+  bool hasStore = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call != nullptr) {
+          llvm::Function *callee = call->getCalledFunction();
+          hasFstp |= callee != nullptr &&
+                     callee->getName() == "notdec.x87.fstp.f64";
+        }
+        hasStore |= llvm::isa<llvm::StoreInst>(&instruction);
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fstp function is missing") &&
+         expect(hasFstp, "x87 fstp did not fold to notdec.x87.fstp.f64") &&
+         expect(hasStore, "x87 fstp did not keep the result store") &&
+         expect(!functionUsesGlobal(function, "ST0"),
+                "x87 fstp kept an ST0 register global") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fstp folding");
+}
+
 } // namespace
 
 int main() {
@@ -1576,5 +1768,7 @@ int main() {
   ok &= testX86PcThunkCallFoldsToConstantBase();
   ok &= testPartialRegisterWriteUsesPartialWriteHelper();
   ok &= testPartialRegisterReadUsesPartialReadHelper();
+  ok &= testX87FildlFoldsToIntrinsicCall();
+  ok &= testX87FstpFoldsToIntrinsicCall();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

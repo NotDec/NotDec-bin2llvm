@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    notdec::bin2llvm::printPcodeProgram(program, std::cout);
+    notdec::bin2llvm::printPcodeProgram(program, std::cout, true);
     return 0;
   } catch (const ghidra::LowlevelError &error) {
     std::cerr << "libsla error: " << error.explain << '\n';

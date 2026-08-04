@@ -2,6 +2,7 @@
 
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/NativeExternalPrototype.h"
+#include "notdec-bin2llvm/NativeX87Intrinsic.h"
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
@@ -519,6 +520,8 @@ bool isUnknownExternalFunction(const llvm::Function &function,
          !isNativeRegisterValueRangeName(function.getName()) &&
          !isNativeRegisterPartialReadName(function.getName()) &&
          !isNativeRegisterPartialWriteName(function.getName()) &&
+         // x87 intrinsics are folded library calls with no ABI register shape.
+         !isNativeX87IntrinsicName(function.getName()) &&
          !isKnownExternalFunction(function, prototypes);
 }
 
@@ -868,6 +871,10 @@ bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
   llvm::Function *callee = call.getCalledFunction();
   return callee != nullptr &&
          (callee->getName().starts_with("notdec.register.") ||
+          // x87 instructions are folded into library-style calls: they own the
+          // FPU stack and touch no general register, so no ABI clobber/input
+          // should be derived for them.
+          isNativeX87IntrinsicName(callee->getName()) ||
           isNotDecOpaqueUnknownName(callee->getName()));
 }
 

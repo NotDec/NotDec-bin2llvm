@@ -141,8 +141,11 @@ PcodeProgram collectSleighPcode(const SleighBytesOptions &options,
                             errorStream);
 }
 
-void printPcodeProgram(const PcodeProgram &program, std::ostream &os) {
+void printPcodeProgram(const PcodeProgram &program, std::ostream &os, bool withAddress) {
   for (const PcodeOpView &op : program.Ops) {
+    if (withAddress) {
+      os << "0x" << std::hex << op.Address << std::dec << ": ";
+    }
     if (op.Output) {
       printVarData(os, *op.Output);
       os << " = ";

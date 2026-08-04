@@ -6,6 +6,7 @@ add_library(notdec-bin2llvm-core STATIC
   NativeExternalPrototype.cpp
   NativePrototypeModel.cpp
   NativeRegisterPartialRead.cpp
+  NativeX87Intrinsic.cpp
   NativeRegisterPartialWrite.cpp
   NativeRegisterValueRange.cpp
   Pcode.cpp

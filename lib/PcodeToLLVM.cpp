@@ -1,4 +1,5 @@
 #include "notdec-bin2llvm/PcodeToLLVM.h"
+#include "notdec-bin2llvm/NativeX87Intrinsic.h"
 #include "notdec-bin2llvm/RegisterStorage.h"
 
 #include "llvm/ADT/APInt.h"
@@ -129,6 +130,95 @@ void setModuleDataLayoutFromPointerSize(llvm::Module &module,
   module.setDataLayout(layout);
 }
 
+// x87 FPU stack: ST0..ST7 live at register-space offsets 0x1100..0x1140, each
+// 10 bytes.  MMX aliases the same offsets with size 8, so the size check keeps
+// MMX accesses out of the x87 path.  These registers are never lowered to LLVM
+// globals: every x87 machine instruction is folded into one notdec.x87.* call
+// and the physical stack state stays inside that library.
+bool isX87StackVarnode(const VarnodeView &varnode) {
+  if (!varnode.IsRegister || varnode.Size != 10) {
+    return false;
+  }
+  if (varnode.RegisterName && varnode.RegisterName->size() == 3 &&
+      (*varnode.RegisterName)[0] == 'S' && (*varnode.RegisterName)[1] == 'T') {
+    return true;
+  }
+  return varnode.Space == "register" && varnode.Offset >= 0x1100 &&
+         varnode.Offset < 0x1140;
+}
+
+uint32_t x87StackIndex(const VarnodeView &varnode) {
+  return static_cast<uint32_t>((varnode.Offset - 0x1100) / 0x10);
+}
+
+std::vector<RegisterInfo>
+registersWithoutX87Stack(const std::vector<RegisterInfo> &registers) {
+  std::vector<RegisterInfo> result;
+  result.reserve(registers.size());
+  for (const RegisterInfo &reg : registers) {
+    if (reg.Space == "register" && reg.Size == 10 && reg.Offset >= 0x1100 &&
+        reg.Offset < 0x1140) {
+      continue;
+    }
+    result.push_back(reg);
+  }
+  return result;
+}
+
+bool isFloatBinaryOpcode(PcodeOpcode opcode) {
+  switch (opcode) {
+  case PcodeOpcode::FloatAdd:
+  case PcodeOpcode::FloatSub:
+  case PcodeOpcode::FloatMult:
+  case PcodeOpcode::FloatDiv:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Intrinsic name suffix for the LLVM type an x87 operand is lifted to.
+std::string fpSuffix(llvm::Type *type) {
+  if (type->isX86_FP80Ty()) {
+    return "f80";
+  }
+  return type->isDoubleTy() ? "f64" : "f32";
+}
+
+// Pop arithmetic (faddp/fmulp/...): ST1 = op(ST0, ST1).  Reverse forms
+// (fsubrp/fdivrp) are ST1 = op(ST1, ST0), i.e. input0 is ST1.
+std::string popArithName(PcodeOpcode opcode, const VarnodeView &input0) {
+  switch (opcode) {
+  case PcodeOpcode::FloatAdd:
+    return "faddp";
+  case PcodeOpcode::FloatMult:
+    return "fmulp";
+  case PcodeOpcode::FloatSub:
+    return x87StackIndex(input0) == 1 ? "fsubrp" : "fsubp";
+  case PcodeOpcode::FloatDiv:
+    return x87StackIndex(input0) == 1 ? "fdivrp" : "fdivp";
+  default:
+    return "";
+  }
+}
+
+// Memory arithmetic on ST0: ST0 = op(mem, ST0) is the reverse form
+// (fsubr/fdivr) because the memory operand comes first in the p-code.
+std::string memArithName(PcodeOpcode opcode, bool memIsInput0) {
+  switch (opcode) {
+  case PcodeOpcode::FloatAdd:
+    return "fadd";
+  case PcodeOpcode::FloatMult:
+    return "fmul";
+  case PcodeOpcode::FloatSub:
+    return memIsInput0 ? "fsubr" : "fsub";
+  case PcodeOpcode::FloatDiv:
+    return memIsInput0 ? "fdivr" : "fdiv";
+  default:
+    return "";
+  }
+}
+
 class PcodeLowerer {
 public:
   PcodeLowerer(llvm::LLVMContext &context, llvm::Module &module,
@@ -140,7 +230,8 @@ public:
 
   bool lower(const PcodeProgram &program, std::string &errorMessage) {
     Registers = std::make_unique<RegisterStorage>(
-        Context, Module, program.Registers, program.IsBigEndian);
+        Context, Module, registersWithoutX87Stack(program.Registers),
+        program.IsBigEndian);
 
     if (program.Ops.empty() && !usesNativeCfg()) {
       return true;
@@ -149,6 +240,7 @@ public:
     CurrentProgramOps = &program.Ops;
     prepareX86CallReturnStackSuppression(program);
     prepareX86PcThunkSuppression(program);
+    prepareX87IntrinsicSuppression(program);
     if (!buildBasicBlocks(program, errorMessage)) {
       return false;
     }
@@ -174,6 +266,14 @@ public:
 
       bool ended = false;
       for (size_t opIndex = start; opIndex < end; ++opIndex) {
+        auto x87It = X87Groups.find(opIndex);
+        if (x87It != X87Groups.end()) {
+          if (!lowerX87Group(x87It->second, errorMessage)) {
+            return false;
+          }
+          opIndex = x87It->second.End - 1;
+          continue;
+        }
         if (SuppressedPcodeOpIndices.count(opIndex) != 0) {
           auto baseIt = ThunkBaseWrites.find(opIndex);
           if (baseIt != ThunkBaseWrites.end()) {
@@ -307,7 +407,25 @@ private:
     return nullptr;
   }
 
+
+  // One x87 machine instruction folded into a single notdec.x87.* call.  The
+  // library owns the physical FPU stack, so the lifted IR keeps none of the
+  // rolling ST0..ST7 p-code writes; only the memory operand reads stay in the
+  // IR and feed the call arguments.  For fstp/fistp the call result is stored
+  // by the lowering to the original p-code store address.
+  struct X87IntrinsicSpec {
+    size_t Start = 0;
+    size_t End = 0;
+    std::string IntrinsicName;
+    std::vector<VarnodeView> Args;
+    std::vector<llvm::Type *> ArgTypes;
+    llvm::Type *ResultType = nullptr;
+    std::optional<VarnodeView> StoreAddress;
+    std::optional<uint32_t> StoreValueSize;
+  };
+
   static bool isTerminator(PcodeOpcode opcode) {
+
     return opcode == PcodeOpcode::Branch ||
            opcode == PcodeOpcode::BranchInd ||
            opcode == PcodeOpcode::CBranch || opcode == PcodeOpcode::Return;
@@ -608,7 +726,276 @@ private:
     }
   }
 
+
+  // Fold x87 instructions into notdec.x87.* calls.  The physical FPU stack
+  // state lives inside the library, so the rolling ST0..ST7 p-code writes are
+  // all suppressed and the call arguments are the explicit assembly operands.
+  void prepareX87IntrinsicSuppression(const PcodeProgram &program) {
+    X87Groups.clear();
+    for (size_t start = 0; start < program.Ops.size();) {
+      size_t end = start + 1;
+      while (end < program.Ops.size() &&
+             program.Ops[end].Address == program.Ops[start].Address) {
+        ++end;
+      }
+      if (std::optional<X87IntrinsicSpec> spec =
+              classifyX87Intrinsic(program, start, end)) {
+        X87Groups.emplace(start, std::move(*spec));
+      }
+      start = end;
+    }
+  }
+
+  static const PcodeOpView *findProducer(const PcodeProgram &program,
+                                         size_t start, size_t end,
+                                         const VarnodeView &target) {
+    for (size_t index = start; index < end; ++index) {
+      const PcodeOpView &op = program.Ops[index];
+      if (op.Output && sameVarnode(*op.Output, target)) {
+        return &op;
+      }
+    }
+    return nullptr;
+  }
+
+  // Recognize one x87 instruction from its p-code expansion.  Returns the
+  // folded intrinsic description, or nullopt when the instruction does not
+  // match a known shape and has to fall back to ordinary p-code lowering.
+  std::optional<X87IntrinsicSpec>
+  classifyX87Intrinsic(const PcodeProgram &program, size_t start,
+                       size_t end) {
+    bool hasStackVarnode = false;
+    for (size_t index = start; index < end; ++index) {
+      const PcodeOpView &op = program.Ops[index];
+      if ((op.Output && isX87StackVarnode(*op.Output)) ||
+          std::any_of(op.Inputs.begin(), op.Inputs.end(),
+                      isX87StackVarnode)) {
+        hasStackVarnode = true;
+        break;
+      }
+    }
+    if (!hasStackVarnode) {
+      return std::nullopt;
+    }
+
+    const PcodeOpView *storeOp = nullptr;
+    const PcodeOpView *stackWriteOp = nullptr;
+    for (size_t index = start; index < end; ++index) {
+      const PcodeOpView &op = program.Ops[index];
+      if (op.Opcode == PcodeOpcode::Store) {
+        storeOp = &op;
+        continue;
+      }
+      if (!op.Output || !isX87StackVarnode(*op.Output)) {
+        continue;
+      }
+      switch (op.Opcode) {
+      case PcodeOpcode::FloatInt2Float:
+      case PcodeOpcode::FloatFloat2Float:
+      case PcodeOpcode::FloatTrunc:
+      case PcodeOpcode::FloatAdd:
+      case PcodeOpcode::FloatSub:
+      case PcodeOpcode::FloatMult:
+      case PcodeOpcode::FloatDiv:
+        stackWriteOp = &op;
+        break;
+      default:
+        break;
+      }
+      if (stackWriteOp != nullptr) {
+        break;
+      }
+    }
+    if (stackWriteOp == nullptr && storeOp == nullptr) {
+      return std::nullopt;
+    }
+
+    X87IntrinsicSpec spec;
+    spec.Start = start;
+    spec.End = end;
+
+    // fstp / fistp: the stored value is produced from ST0.  STORE inputs are
+    // (space selector, address, value).
+    if (storeOp != nullptr && storeOp->Inputs.size() == 3) {
+      const VarnodeView &storedValue = storeOp->Inputs[2];
+      const PcodeOpView *producer =
+          findProducer(program, start, end, storedValue);
+      if (producer != nullptr && producer->Inputs.size() == 1 &&
+          isX87StackVarnode(producer->Inputs[0]) &&
+          x87StackIndex(producer->Inputs[0]) == 0) {
+        if (producer->Opcode == PcodeOpcode::FloatFloat2Float) {
+          llvm::Type *fpType = floatType(producer->Output->Size);
+          if (fpType == nullptr) {
+            return std::nullopt;
+          }
+          spec.IntrinsicName = "notdec.x87.fstp." + fpSuffix(fpType);
+          spec.ResultType = fpType;
+        } else if (producer->Opcode == PcodeOpcode::FloatTrunc) {
+          spec.IntrinsicName = "notdec.x87.fistp.i" +
+                               std::to_string(producer->Output->Size * 8);
+          spec.ResultType = intType(producer->Output->Size);
+        } else {
+          return std::nullopt;
+        }
+        spec.StoreAddress = storeOp->Inputs[1];
+        spec.StoreValueSize = producer->Output->Size;
+        return spec;
+      }
+    }
+
+    if (stackWriteOp == nullptr) {
+      return std::nullopt;
+    }
+
+    const PcodeOpView &writeOp = *stackWriteOp;
+    // push integer (fild): ST0 = INT2FLOAT(mem)
+    if (writeOp.Opcode == PcodeOpcode::FloatInt2Float) {
+      if (writeOp.Inputs.size() != 1) {
+        return std::nullopt;
+      }
+      const VarnodeView &input = writeOp.Inputs[0];
+      if (input.Size != 2 && input.Size != 4 && input.Size != 8) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName =
+          "notdec.x87.fild.i" + std::to_string(input.Size * 8);
+      spec.Args = {input};
+      spec.ArgTypes = {intType(input.Size)};
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      return spec;
+    }
+
+    // push float (fld): ST0 = FLOAT2FLOAT(mem)
+    if (writeOp.Opcode == PcodeOpcode::FloatFloat2Float) {
+      if (writeOp.Inputs.size() != 1) {
+        return std::nullopt;
+      }
+      const VarnodeView &input = writeOp.Inputs[0];
+      if (isX87StackVarnode(input)) {
+        return std::nullopt; // fld %st(i) not covered yet
+      }
+      llvm::Type *fpType = floatType(input.Size);
+      if (fpType == nullptr) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName = "notdec.x87.fld." + fpSuffix(fpType);
+      spec.Args = {input};
+      spec.ArgTypes = {fpType};
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      return spec;
+    }
+
+    // float arithmetic on the stack
+    if (isFloatBinaryOpcode(writeOp.Opcode)) {
+      if (writeOp.Inputs.size() != 2) {
+        return std::nullopt;
+      }
+      const VarnodeView &input0 = writeOp.Inputs[0];
+      const VarnodeView &input1 = writeOp.Inputs[1];
+      bool input0IsST = isX87StackVarnode(input0);
+      bool input1IsST = isX87StackVarnode(input1);
+      if (input0IsST && input1IsST) {
+        // Pop arithmetic (faddp/fmulp/...): ST1 = op(ST0, ST1), then pop.
+        if (x87StackIndex(*writeOp.Output) != 1) {
+          return std::nullopt;
+        }
+        std::string name = popArithName(writeOp.Opcode, input0);
+        if (name.empty()) {
+          return std::nullopt;
+        }
+        spec.IntrinsicName = "notdec.x87." + name;
+        spec.ResultType = llvm::Type::getVoidTy(Context);
+        return spec;
+      }
+      if (x87StackIndex(*writeOp.Output) != 0 ||
+          input0IsST == input1IsST) {
+        return std::nullopt;
+      }
+      // Memory arithmetic on ST0.  The memory operand is a FLOAT2FLOAT
+      // product; recover the raw memory value to pass as the argument.
+      const VarnodeView &memOperand = input0IsST ? input1 : input0;
+      const PcodeOpView *producer =
+          findProducer(program, start, end, memOperand);
+      if (producer == nullptr ||
+          producer->Opcode != PcodeOpcode::FloatFloat2Float ||
+          producer->Inputs.size() != 1 ||
+          isX87StackVarnode(producer->Inputs[0])) {
+        return std::nullopt;
+      }
+      const VarnodeView &rawMem = producer->Inputs[0];
+      llvm::Type *fpType = floatType(rawMem.Size);
+      if (fpType == nullptr) {
+        return std::nullopt;
+      }
+      std::string name = memArithName(writeOp.Opcode, !input0IsST);
+      if (name.empty()) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName = "notdec.x87." + name + "." + fpSuffix(fpType);
+      spec.Args = {rawMem};
+      spec.ArgTypes = {fpType};
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      return spec;
+    }
+
+    return std::nullopt;
+  }
+
+  llvm::Value *toIntrinsicArg(llvm::Value *value, llvm::Type *targetType) {
+    if (value->getType() == targetType) {
+      return value;
+    }
+    if (targetType->isFloatingPointTy()) {
+      return Builder.CreateBitCast(value, targetType);
+    }
+    return Builder.CreateZExtOrTrunc(value, targetType);
+  }
+
+  bool lowerX87Group(const X87IntrinsicSpec &spec,
+                     std::string &errorMessage) {
+    // Lower the non-stack ops (LOAD / INT_ADD address computation) so the call
+    // argument values are available through the normal p-code SSA cache.
+    for (size_t index = spec.Start; index < spec.End; ++index) {
+      const PcodeOpView &op = (*CurrentProgramOps)[index];
+      if (op.Opcode == PcodeOpcode::Store ||
+          (op.Output && isX87StackVarnode(*op.Output)) ||
+          std::any_of(op.Inputs.begin(), op.Inputs.end(),
+                      isX87StackVarnode)) {
+        continue;
+      }
+      if (!lowerOp(op, errorMessage)) {
+        return false;
+      }
+    }
+
+    llvm::Function *intrinsic = getOrInsertNativeX87Intrinsic(
+        Module, spec.IntrinsicName, spec.ResultType, spec.ArgTypes);
+    std::vector<llvm::Value *> args;
+    args.reserve(spec.Args.size());
+    for (size_t index = 0; index < spec.Args.size(); ++index) {
+      args.push_back(
+          toIntrinsicArg(read(spec.Args[index]), spec.ArgTypes[index]));
+    }
+    llvm::Value *result = Builder.CreateCall(intrinsic, args);
+
+    if (spec.StoreAddress && spec.StoreValueSize) {
+      llvm::Value *stored = result;
+      if (stored->getType()->isFloatingPointTy()) {
+        stored = Builder.CreateBitCast(stored, intType(*spec.StoreValueSize));
+      } else {
+        stored = Builder.CreateZExtOrTrunc(stored,
+                                           intType(*spec.StoreValueSize));
+      }
+      auto *store = Builder.CreateStore(
+          stored, memoryPointer(resize(read(*spec.StoreAddress),
+                                       pointerByteSize())));
+      store->setAlignment(llvm::Align(1));
+    }
+    return true;
+  }
+
   std::string blockName(uint64_t address) {
+
     std::ostringstream os;
     os << "bb_" << std::hex << address;
     return os.str();
@@ -2543,6 +2930,8 @@ private:
   // op index of a folded get_pc thunk call -> (written register, constant
   // base).  The write is emitted at the suppressed call position.
   std::map<size_t, std::pair<VarnodeView, uint64_t>> ThunkBaseWrites;
+  // First op index of an x87 instruction -> folded intrinsic description.
+  std::map<size_t, X87IntrinsicSpec> X87Groups;
   std::vector<uint64_t> EmptyNativeBlockAddresses;
   std::vector<llvm::BasicBlock *> ExternalTargetBlocks;
   const std::vector<PcodeOpView> *CurrentProgramOps = nullptr;
