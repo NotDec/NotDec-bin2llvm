@@ -698,3 +698,62 @@ mayWriteToMemory 指令仍然限制扫描范围（对应第一遍 call 后
 剩余 call_arg 告警 11 条：跨块 push 7 条（2170 递归、2a50→2170、
 2a50→fwrite 及其 3 条 rewrite_missing、3510→__fprintf_chk），
 fp vararg 2 条（19b0），clobber 值 2 条（3a90）。
+
+## 已完成：跨块 push 参数的 load 绑定
+
+### 背景
+
+剩余 11 条 call_arg 里 7 条是跨块 push：push 序列一部分在 call 块、
+一部分在 immediate 前驱块，`findNearestStackStoreBeforeCall` 只扫
+call 所在块，绑定失败。涉及 2170 递归（bb_2789 stack+16）、
+2a50→2170（bb_30ff stack+12）、2a50→fwrite（bb_31c4 stack+8/12/16，
+含 3 条 rewrite_missing）、3510→__fprintf_chk（bb_3601 stack+16）。
+临时打点确认：每个失败槽的 alloca 偏移 = 块内相对分组最低偏移 +
+cspec index*step，且该偏移的 store 在每个 immediate 前驱里都有
+（不同前驱值不同，如 fwrite 的 nmemb 27/29/31）。
+
+### 方案
+
+不在 call 前枚举各前驱的 store 值或建 phi，而是直接插一条 load 读槽，
+把 load 作为参数值。理由：load 读到的是 call 时刻槽里的真实内存值，
+正好就是原始二进制 call 读到的值，天然按路径正确；前驱里那些 push
+store 继续喂给 load，语义和重写前的内存传参一致。
+
+### 实现
+
+`lib/passes/summary/NativeRegisterSummarySSA.cpp`：
+- `RelativeStoreGroup` 从函数局部提到文件作用域（约 180 行）。
+- `findNearestStackStoreBeforeCall` 拆成
+  `scanStackStoresBeforeCall(call, slot, groups)`（约 5888 行，块内
+  扫描+匹配，顺带输出相对分组），保留原两参 wrapper（约 5980 行）。
+- `readStackSlotValueBefore`（约 5811 行）：块内无匹配时走
+  `readCrossBlockStackSlotBeforeCall`（约 6025 行）：以块内相对分组
+  最低偏移 + index*step 锚定槽的 alloca 偏移，对每个 immediate 前驱
+  用 `findNearestStackStoreInBlock`（约 5990 行，从块尾回扫，
+  call/mayWriteToMemory 做界）确认都写了该槽，然后 `CreateLoad`
+  插到 call 前作为绑定值。跨块绑定 Store=nullptr，不进 StoresToErase，
+  前驱 push store 保留。
+
+只对 IntegerStack 且槽型为整数的 slot 做跨块回退（fp vararg 的
+`store double` 仍是独立问题）；call 块内没有栈 store 作锚点时不绑定，
+保持保守。
+
+### 验证
+
+- i386 fortune：warning 38 → 31 条；call_arg 11 → 4 条，7 条跨块
+  （4 binding_missing + 3 rewrite_missing）全部消失，剩 2 fp vararg
+  （19b0）+ 2 clobber（3a90）。
+- 输出 IR：fwrite 调用点 3 个栈参变成槽 load；2170 递归调用 6 参全绑
+  （3 个跨块 load）；2170 签名从截断的 2 个栈参恢复为完整 6 个
+  （stack+4..+24），顺带修掉 `refineInternalStackParamShapes` 因绑定
+  缺失导致的签名截错；3510 的 `__fprintf_chk` 首参在清理后被折叠成
+  per-path phi。
+- x64 fortune：call_arg 仍 0 条，无回归。
+- 5 个 native 单测全过。
+
+### 评分
+
+- 实现效果：10/10，7 条告警消失且签名不再被截断。
+- 复杂度：3/10，一个块内扫描拆分 + 一个前驱回扫 + 一条 load。
+- 维护成本：3/10，跨块匹配依赖块内相对分组锚定（前驱内锚定不可靠，
+  因为前驱只含 push 序列的不连续子集）；无锚点时保守不绑定。

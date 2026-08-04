@@ -172,6 +172,18 @@ struct CallArgStoreBinding {
   unsigned Index = 0;
 };
 
+// Concrete stack stores seen while scanning backwards from a call, grouped by
+// their address base.  The in-block relative-group match uses the lowest store
+// offset as an anchor plus the cspec slot index; the cross-block fallback needs
+// the same groups to derive the alloca-relative offset of a slot whose push
+// sequence continues into predecessor blocks.
+struct RelativeStoreGroup {
+  NativeStackAddressKind Kind =
+      NativeStackAddressKind::RelativeStackPointer;
+  llvm::Value *Base = nullptr;
+  std::map<int64_t, llvm::StoreInst *> Stores;
+};
+
 const CallArgStoreBinding *
 bindingForIndex(const std::vector<CallArgStoreBinding> &bindings,
                 unsigned index) {
@@ -5798,9 +5810,11 @@ private:
 
   llvm::Value *readStackSlotValueBefore(llvm::CallBase &call,
                                         const NativeSignatureSlot &slot) {
-    llvm::StoreInst *store = findNearestStackStoreBeforeCall(call, slot);
+    std::vector<RelativeStoreGroup> relativeStores;
+    llvm::StoreInst *store =
+        scanStackStoresBeforeCall(call, slot, relativeStores);
     if (store == nullptr) {
-      return nullptr;
+      return readCrossBlockStackSlotBeforeCall(call, slot, relativeStores);
     }
     llvm::Value *value = resolve(store->getValueOperand());
     llvm::Type *targetType = slotType(slot);
@@ -5865,9 +5879,15 @@ private:
     return nativeStackAddressWithOffset(*current, delta);
   }
 
+  // Scans backwards from the call inside its own block and returns the store
+  // matched for the slot (exact entry-SP match, or the relative-group match
+  // that preserves outgoing-slot ordering).  Also fills relativeStores with all
+  // concrete stack stores seen so the cross-block fallback can derive the
+  // alloca-relative offset of a slot pushed in predecessor blocks.
   llvm::StoreInst *
-  findNearestStackStoreBeforeCall(llvm::CallBase &call,
-                                  const NativeSignatureSlot &slot) {
+  scanStackStoresBeforeCall(llvm::CallBase &call,
+                            const NativeSignatureSlot &slot,
+                            std::vector<RelativeStoreGroup> &relativeStores) {
     if (call.getParent() == nullptr) {
       return nullptr;
     }
@@ -5876,13 +5896,6 @@ private:
     std::optional<uint64_t> stackIndex = stackSlotIndex(slot);
     uint64_t stackStep =
         stackIndex ? stackSlotStep(slot.StackSize, slot.StackAlign) : 0;
-    struct RelativeStoreGroup {
-      NativeStackAddressKind Kind =
-          NativeStackAddressKind::RelativeStackPointer;
-      llvm::Value *Base = nullptr;
-      std::map<int64_t, llvm::StoreInst *> Stores;
-    };
-    std::vector<RelativeStoreGroup> relativeStores;
     auto recordRelativeStore = [&](const NativeStackAddress &address,
                                    llvm::StoreInst *store) {
       for (RelativeStoreGroup &group : relativeStores) {
@@ -5959,6 +5972,106 @@ private:
       if (llvm::StoreInst *store = storeForIndexedOffset(group.Stores)) {
         return store;
       }
+    }
+    return nullptr;
+  }
+
+  llvm::StoreInst *
+  findNearestStackStoreBeforeCall(llvm::CallBase &call,
+                                  const NativeSignatureSlot &slot) {
+    std::vector<RelativeStoreGroup> relativeStores;
+    return scanStackStoresBeforeCall(call, slot, relativeStores);
+  }
+
+  // Scans one block backwards from its terminator for the nearest store to a
+  // concrete stack address.  Used by the cross-block fallback to confirm every
+  // predecessor writes the outgoing slot before the call.
+  llvm::StoreInst *
+  findNearestStackStoreInBlock(llvm::BasicBlock &block,
+                               const NativeStackAddress &expected) {
+    for (auto it = block.end(); it != block.begin();) {
+      --it;
+      llvm::Instruction &inst = *it;
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        std::optional<NativeStackAddress> address =
+            stackAddressAnalysis().addressForPointer(
+                store->getPointerOperand());
+        if (address && *address == expected) {
+          return store;
+        }
+        continue;
+      }
+      if (auto *otherCall = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (isAnalyzableCall(*otherCall)) {
+          return nullptr;
+        }
+        continue;
+      }
+      if (inst.mayWriteToMemory()) {
+        return nullptr;
+      }
+    }
+    return nullptr;
+  }
+
+  // Fallback for push sequences that continue into predecessor blocks: the
+  // value of an outgoing slot at the call is exactly what a load from that
+  // slot reads, so materialize that load instead of trying to pick one
+  // predecessor's store value.  The slot offset is anchored on the in-block
+  // relative group (same arithmetic as the in-block match); the walk then
+  // requires every immediate predecessor to write the slot, matching the
+  // conservative slot-level evidence of the first pass.
+  llvm::Value *
+  readCrossBlockStackSlotBeforeCall(
+      llvm::CallBase &call, const NativeSignatureSlot &slot,
+      const std::vector<RelativeStoreGroup> &relativeStores) {
+    if (call.getParent() == nullptr) {
+      return nullptr;
+    }
+    llvm::Type *targetType = slotType(slot);
+    if (targetType == nullptr || !targetType->isIntegerTy()) {
+      return nullptr;
+    }
+    std::optional<uint64_t> stackIndex = stackSlotIndex(slot);
+    uint64_t stackStep =
+        stackIndex ? stackSlotStep(slot.StackSize, slot.StackAlign) : 0;
+    if (!stackIndex || stackStep == 0 ||
+        *stackIndex >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+                stackStep) {
+      return nullptr;
+    }
+    int64_t delta = static_cast<int64_t>(*stackIndex * stackStep);
+    for (const RelativeStoreGroup &group : relativeStores) {
+      if (group.Kind == NativeStackAddressKind::EntryStackPointer ||
+          group.Stores.empty()) {
+        continue;
+      }
+      int64_t lowestOffset = group.Stores.begin()->first;
+      if (lowestOffset > std::numeric_limits<int64_t>::max() - delta) {
+        continue;
+      }
+      NativeStackAddress expected{group.Kind, group.Base,
+                                  lowestOffset + delta};
+      llvm::Value *pointer = nullptr;
+      bool allPredecessorsWriteSlot = true;
+      for (llvm::BasicBlock *predecessor :
+           llvm::predecessors(call.getParent())) {
+        llvm::StoreInst *store =
+            findNearestStackStoreInBlock(*predecessor, expected);
+        if (store == nullptr) {
+          allPredecessorsWriteSlot = false;
+          break;
+        }
+        if (pointer == nullptr) {
+          pointer = store->getPointerOperand();
+        }
+      }
+      if (!allPredecessorsWriteSlot || pointer == nullptr) {
+        continue;
+      }
+      llvm::IRBuilder<> builder(&call);
+      return resolve(builder.CreateLoad(targetType, pointer));
     }
     return nullptr;
   }
