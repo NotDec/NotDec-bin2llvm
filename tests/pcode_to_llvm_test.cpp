@@ -1966,6 +1966,86 @@ void addX87FcomiOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address,
   }
 }
 
+// fprem + fnstsw %ax + test $0x4,%ah + jne: the fmod retry loop found in
+// libicu/libav/libpython.  Mirrors the real p-code: FPREM is a single-shot
+// remainder (FLOAT_DIV/FLOAT_MULT/FLOAT_SUB), FNSTSW copies the status word
+// to AX, TEST reads AH, and the branch loops back while C2 is set.
+void addX87FpremFnstswOps(notdec::bin2llvm::PcodeProgram &program,
+                          uint64_t address) {
+  auto push = [&](notdec::bin2llvm::PcodeOpView op, uint64_t addr,
+                  const std::string &mnemonic) {
+    op.Address = addr;
+    op.InstructionSize = 1;
+    op.Mnemonic = mnemonic;
+    program.Ops.push_back(op);
+  };
+
+  notdec::bin2llvm::PcodeOpView div;
+  div.Opcode = notdec::bin2llvm::PcodeOpcode::FloatDiv;
+  div.OpcodeName = "FLOAT_DIV";
+  div.Output = uniqueVarnode(0xeec00, 10);
+  div.Inputs.push_back(registerVarnode(0x1100, 10, "ST0"));
+  div.Inputs.push_back(registerVarnode(0x1110, 10, "ST1"));
+  push(div, address, "FPREM");
+
+  notdec::bin2llvm::PcodeOpView mul;
+  mul.Opcode = notdec::bin2llvm::PcodeOpcode::FloatMult;
+  mul.OpcodeName = "FLOAT_MULT";
+  mul.Output = uniqueVarnode(0xeec00, 10);
+  mul.Inputs.push_back(uniqueVarnode(0xeec00, 10));
+  mul.Inputs.push_back(registerVarnode(0x1110, 10, "ST1"));
+  push(mul, address, "FPREM");
+
+  notdec::bin2llvm::PcodeOpView rem;
+  rem.Opcode = notdec::bin2llvm::PcodeOpcode::FloatSub;
+  rem.OpcodeName = "FLOAT_SUB";
+  rem.Output = registerVarnode(0x1100, 10, "ST0");
+  rem.Inputs.push_back(registerVarnode(0x1100, 10, "ST0"));
+  rem.Inputs.push_back(uniqueVarnode(0xeec00, 10));
+  push(rem, address, "FPREM");
+
+  notdec::bin2llvm::PcodeOpView copy;
+  copy.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  copy.OpcodeName = "COPY";
+  copy.Output = registerVarnode(0x0, 2, "AX");
+  copy.Inputs.push_back(registerVarnode(0x10a2, 2, "FSW"));
+  push(copy, address + 1, "FNSTSW");
+
+  notdec::bin2llvm::PcodeOpView andOp;
+  andOp.Opcode = notdec::bin2llvm::PcodeOpcode::IntAnd;
+  andOp.OpcodeName = "INT_AND";
+  andOp.Output = uniqueVarnode(0xdf700, 1);
+  andOp.Inputs.push_back(registerVarnode(0x1, 1, "AH"));
+  andOp.Inputs.push_back(constVarnode(0x4, 1));
+  push(andOp, address + 2, "TEST");
+
+  notdec::bin2llvm::PcodeOpView zf;
+  zf.Opcode = notdec::bin2llvm::PcodeOpcode::IntEqual;
+  zf.OpcodeName = "INT_EQUAL";
+  zf.Output = registerVarnode(0x206, 1, "ZF");
+  zf.Inputs.push_back(uniqueVarnode(0xdf700, 1));
+  zf.Inputs.push_back(constVarnode(0, 1));
+  push(zf, address + 2, "TEST");
+
+  notdec::bin2llvm::PcodeOpView neg;
+  neg.Opcode = notdec::bin2llvm::PcodeOpcode::BoolNegate;
+  neg.OpcodeName = "BOOL_NEGATE";
+  neg.Output = uniqueVarnode(0x24f00, 1);
+  neg.Inputs.push_back(registerVarnode(0x206, 1, "ZF"));
+  push(neg, address + 3, "JNE");
+
+  notdec::bin2llvm::PcodeOpView cbranch;
+  cbranch.Opcode = notdec::bin2llvm::PcodeOpcode::CBranch;
+  cbranch.OpcodeName = "CBRANCH";
+  notdec::bin2llvm::VarnodeView target;
+  target.Space = "ram";
+  target.Offset = address;
+  target.Size = 8;
+  cbranch.Inputs.push_back(std::move(target));
+  cbranch.Inputs.push_back(uniqueVarnode(0x24f00, 1));
+  push(cbranch, address + 3, "JNE");
+}
+
 bool testX87FcomiFoldsToIntrinsicCall() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -2069,6 +2149,61 @@ bool testX87FucomipFoldsToIntrinsicCall() {
                 "module failed verifier after x87 fucomip folding");
 }
 
+bool testX87FpremFnstswFoldsToIntrinsicCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  program.Registers.push_back({"register", 0x0, 2, "AX"});
+  program.Registers.push_back({"register", 0x206, 1, "ZF"});
+  addX87FpremFnstswOps(program, 0x1000);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fprem_fnstsw";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFprem = false;
+  bool hasFnstsw = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr) {
+          continue;
+        }
+        if (callee->getName() == "notdec.x87.fprem") {
+          hasFprem = true;
+        }
+        if (callee->getName() == "notdec.x87.fnstsw") {
+          hasFnstsw = true;
+        }
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fprem/fnstsw function is missing") &&
+         expect(hasFprem, "x87 fprem did not fold to notdec.x87.fprem") &&
+         expect(hasFnstsw, "x87 fnstsw did not fold to notdec.x87.fnstsw") &&
+         expect(functionUsesGlobal(function, "AX"),
+                "x87 fnstsw did not write the AX register") &&
+         expect(!functionUsesGlobal(function, "FPUStatusWord"),
+                "x87 fnstsw read the FPUStatusWord global") &&
+         expect(!functionUsesGlobal(function, "ST0"),
+                "x87 fprem kept an ST0 register global") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fprem/fnstsw folding");
+}
+
 } // namespace
 
 int main() {
@@ -2114,5 +2249,6 @@ int main() {
   ok &= testX87FdivrpSt2FoldsToIntrinsicCall();
   ok &= testX87FcomiFoldsToIntrinsicCall();
   ok &= testX87FucomipFoldsToIntrinsicCall();
+  ok &= testX87FpremFnstswFoldsToIntrinsicCall();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

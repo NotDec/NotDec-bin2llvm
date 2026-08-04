@@ -151,6 +151,13 @@ uint32_t x87StackIndex(const VarnodeView &varnode) {
   return static_cast<uint32_t>((varnode.Offset - 0x1100) / 0x10);
 }
 
+// x87 FPU status word register (offset 0x10a2, 2 bytes).  Like the FPU stack
+// it is library-internal state; fnstsw/fstsw read it through an intrinsic.
+bool isFpuStatusWordVarnode(const VarnodeView &varnode) {
+  return varnode.IsRegister && varnode.Space == "register" &&
+         varnode.Offset == 0x10a2 && varnode.Size == 2;
+}
+
 bool touchesX87Stack(const PcodeProgram &program, size_t start, size_t end) {
   for (size_t index = start; index < end; ++index) {
     const PcodeOpView &op = program.Ops[index];
@@ -454,6 +461,11 @@ private:
     // bit2=ZF); lowering writes the EFLAGS bits that integer code observes.
     // The FPU status word stays library-internal like the FPU stack.
     bool WritesComparisonFlags = false;
+    // fnstsw/fstsw: the intrinsic returns the FPU status word; lowering
+    // writes it to the p-code target (AX register or a memory store).  The
+    // group's FSW COPY must not be lowered.
+    bool WritesStatusWord = false;
+    std::optional<VarnodeView> ResultRegister;
   };
 
   static bool isTerminator(PcodeOpcode opcode) {
@@ -874,18 +886,61 @@ private:
   // Classify one x87 instruction by its Ghidra mnemonic.  The mnemonic
   // decides the instruction category; the p-code only supplies the operand
   // values (memory address, const, st(i) index), so new instructions do not
-  // need a p-code shape matcher.  Uncovered mnemonics (fcomi/fucomip and
-  // friends) fall back to ordinary p-code lowering.
+  // need a p-code shape matcher.  Uncovered mnemonics fall back to ordinary
+  // p-code lowering.
   std::optional<X87IntrinsicSpec>
   classifyX87ByMnemonic(const PcodeProgram &program, size_t start,
                         size_t end, const std::string &mnemonic) {
-    if (!touchesX87Stack(program, start, end)) {
-      return std::nullopt;
-    }
-
     X87IntrinsicSpec spec;
     spec.Start = start;
     spec.End = end;
+
+    // fnstsw/fstsw copy the FPU status word to AX or memory.  The p-code is
+    // only COPY(FSW) and does not touch the x87 stack, so this branch runs
+    // before the stack check below.  The status word is library-internal:
+    // the intrinsic returns it and lowering writes it to the p-code target.
+    if (mnemonic == "FNSTSW" || mnemonic == "FSTSW") {
+      const PcodeOpView *copy = nullptr;
+      for (size_t index = start; index < end; ++index) {
+        const PcodeOpView &op = program.Ops[index];
+        if (op.Opcode == PcodeOpcode::Copy && op.Output &&
+            op.Inputs.size() == 1 &&
+            isFpuStatusWordVarnode(op.Inputs[0])) {
+          copy = &op;
+          break;
+        }
+      }
+      if (copy == nullptr || !copy->Output) {
+        return std::nullopt;
+      }
+      const VarnodeView &target = *copy->Output;
+      if (target.IsRegister) {
+        spec.ResultRegister = target;
+      } else {
+        const PcodeOpView *store = nullptr;
+        for (size_t index = start; index < end; ++index) {
+          const PcodeOpView &op = program.Ops[index];
+          if (op.Opcode == PcodeOpcode::Store && op.Inputs.size() == 3 &&
+              sameVarnode(op.Inputs[2], target)) {
+            store = &op;
+            break;
+          }
+        }
+        if (store == nullptr) {
+          return std::nullopt;
+        }
+        spec.StoreAddress = store->Inputs[1];
+        spec.StoreValueSize = 2;
+      }
+      spec.IntrinsicName = "notdec.x87.fnstsw";
+      spec.ResultType = intType(2);
+      spec.WritesStatusWord = true;
+      return spec;
+    }
+
+    if (!touchesX87Stack(program, start, end)) {
+      return std::nullopt;
+    }
 
     // fldz / fld1: push a constant with no explicit operand.
     if (mnemonic == "FLDZ" || mnemonic == "FLD1") {
@@ -1074,6 +1129,21 @@ private:
       spec.ArgTypes = {intType(1)};
       spec.ResultType = intType(1);
       spec.WritesComparisonFlags = true;
+      return spec;
+    }
+
+    // fprem: partial-remainder loop folded into one library call.  Ghidra
+    // models it as a single-shot exact remainder (FLOAT_DIV/FLOAT_MULT/
+    // FLOAT_SUB) and never sets FSW C2; the library computes ST0 =
+    // remainder(ST0, ST1) exactly and keeps C2 clear, so the lifted
+    // "fprem; fnstsw; test ah,4; jne" retry loop runs once and exits.
+    if (mnemonic == "FPREM") {
+      if (findStackWrite(program, start, end, PcodeOpcode::FloatSub, 0) ==
+          nullptr) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName = "notdec.x87.fprem";
+      spec.ResultType = llvm::Type::getVoidTy(Context);
       return spec;
     }
 
@@ -1375,13 +1445,18 @@ private:
     // argument values are available through the normal p-code SSA cache.
     // Comparison instructions (fcomi/fucomip) have no memory operand and
     // their unique temps are group-private, so nothing needs lowering here.
+    // fnstsw/fstsw must not lower the COPY that reads the status word: the
+    // intrinsic returns it instead.
     if (!spec.WritesComparisonFlags) {
       for (size_t index = spec.Start; index < spec.End; ++index) {
         const PcodeOpView &op = (*CurrentProgramOps)[index];
         if (op.Opcode == PcodeOpcode::Store ||
             (op.Output && isX87StackVarnode(*op.Output)) ||
             std::any_of(op.Inputs.begin(), op.Inputs.end(),
-                        isX87StackVarnode)) {
+                        isX87StackVarnode) ||
+            (spec.WritesStatusWord &&
+             std::any_of(op.Inputs.begin(), op.Inputs.end(),
+                         isFpuStatusWordVarnode))) {
           continue;
         }
         if (!lowerOp(op, errorMessage)) {
@@ -1425,6 +1500,11 @@ private:
       write(flagVarnode(0x204, 1), zero); // AF
       write(flagVarnode(0x207, 1), zero); // SF
       write(flagVarnode(0x20b, 1), zero); // OF
+    }
+
+    if (spec.ResultRegister) {
+      // fnstsw %ax: write the status word to the register target (AX).
+      write(*spec.ResultRegister, result);
     }
 
     if (spec.StoreAddress && spec.StoreValueSize) {
