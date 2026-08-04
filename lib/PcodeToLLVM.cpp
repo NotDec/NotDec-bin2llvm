@@ -151,16 +151,18 @@ uint32_t x87StackIndex(const VarnodeView &varnode) {
   return static_cast<uint32_t>((varnode.Offset - 0x1100) / 0x10);
 }
 
-// x87 FPU control/status word registers (control 0x10a0, status 0x10a2, both
-// 2 bytes).  Like the FPU stack they are library-internal state: fldcw/fnstcw
-// manage the control word and fnstsw/fstsw read the status word, all through
-// notdec.x87.* intrinsics.  Lowering suppresses every op that reads or writes
-// these registers inside a folded group, so the LLVM globals are only created
-// for FPU-word instructions that are not folded yet (e.g. fstenv).
-bool isFpuWordVarnode(const VarnodeView &varnode) {
+// x87 FPU environment registers, 0x10a0..0x10b8: control word (0x10a0),
+// status word (0x10a2), tag word (0x10a4), last-opcode (0x10a6), data pointer
+// (0x10a8) and instruction pointer (0x10b0, the latter two 8 bytes each).
+// Like the FPU stack they are library-internal state: fldcw/fnstcw manage the
+// control word, fnstsw/fstsw read the status word and fstenv/fldenv move the
+// whole environment to/from memory, all through notdec.x87.* intrinsics.
+// Lowering suppresses every op that reads or writes these registers inside a
+// folded group, so the LLVM globals are only created for FPU-environment
+// instructions that are not folded yet.
+bool isFpuEnvVarnode(const VarnodeView &varnode) {
   return varnode.IsRegister && varnode.Space == "register" &&
-         varnode.Size == 2 &&
-         (varnode.Offset == 0x10a0 || varnode.Offset == 0x10a2);
+         varnode.Offset >= 0x10a0 && varnode.Offset < 0x10b8;
 }
 
 bool touchesX87Stack(const PcodeProgram &program, size_t start, size_t end) {
@@ -473,6 +475,12 @@ private:
     // word; lowering writes it to the p-code target (AX register or a memory
     // store).
     std::optional<VarnodeView> ResultRegister;
+    // fldenv: the library reads the FPU environment image from the pointer
+    // argument itself, so the group's memory LOADs must not be lowered.
+    bool SuppressLoads = false;
+    // fstenv/fldenv: the intrinsic takes a memory pointer and touches normal
+    // memory, unlike the register-value intrinsics.
+    bool AccessesMemory = false;
   };
 
   static bool isTerminator(PcodeOpcode opcode) {
@@ -964,6 +972,62 @@ private:
       spec.Args = {*load->Output};
       spec.ArgTypes = {intType(2)};
       spec.ResultType = llvm::Type::getVoidTy(Context);
+      return spec;
+    }
+
+    // fstenv/fnstenv: save the whole FPU environment (control/status/tag
+    // words, instruction/data pointers, opcode) to memory.  The library
+    // writes the real 28-byte x86-64 layout to the pointer; the p-code's six
+    // per-field STOREs are suppressed.  The base address is the STORE whose
+    // address is not produced inside the group (the +0 field), which is the
+    // register/expression the other five offsets are derived from.
+    if (mnemonic == "FSTENV" || mnemonic == "FNSTENV") {
+      const VarnodeView *base = nullptr;
+      for (size_t index = start; index < end; ++index) {
+        const PcodeOpView &op = program.Ops[index];
+        if (op.Opcode != PcodeOpcode::Store || op.Inputs.size() != 3) {
+          continue;
+        }
+        if (findProducer(program, start, end, op.Inputs[1]) == nullptr) {
+          base = &op.Inputs[1];
+          break;
+        }
+      }
+      if (base == nullptr) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName = "notdec.x87.fstenv";
+      spec.Args = {*base};
+      spec.ArgTypes = {llvm::PointerType::get(Context, 0)};
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.AccessesMemory = true;
+      return spec;
+    }
+
+    // fldenv: load the whole FPU environment from memory into the library.
+    // The library reads the image through the pointer argument, so the six
+    // memory LOADs and the environment-register writes are suppressed.
+    if (mnemonic == "FLDENV") {
+      const VarnodeView *base = nullptr;
+      for (size_t index = start; index < end; ++index) {
+        const PcodeOpView &op = program.Ops[index];
+        if (op.Opcode != PcodeOpcode::Load || op.Inputs.size() < 2) {
+          continue;
+        }
+        if (findProducer(program, start, end, op.Inputs[1]) == nullptr) {
+          base = &op.Inputs[1];
+          break;
+        }
+      }
+      if (base == nullptr) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName = "notdec.x87.fldenv";
+      spec.Args = {*base};
+      spec.ArgTypes = {llvm::PointerType::get(Context, 0)};
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.SuppressLoads = true;
+      spec.AccessesMemory = true;
       return spec;
     }
 
@@ -1471,6 +1535,9 @@ private:
     if (targetType->isFloatingPointTy()) {
       return Builder.CreateBitCast(value, targetType);
     }
+    if (targetType->isPointerTy()) {
+      return Builder.CreateIntToPtr(value, targetType);
+    }
     return Builder.CreateZExtOrTrunc(value, targetType);
   }
 
@@ -1487,14 +1554,15 @@ private:
     if (!spec.WritesComparisonFlags) {
       for (size_t index = spec.Start; index < spec.End; ++index) {
         const PcodeOpView &op = (*CurrentProgramOps)[index];
-        if (op.Opcode == PcodeOpcode::Store ||
+        if ((spec.SuppressLoads && op.Opcode == PcodeOpcode::Load) ||
+            op.Opcode == PcodeOpcode::Store ||
             (op.Output &&
              (isX87StackVarnode(*op.Output) ||
-              isFpuWordVarnode(*op.Output))) ||
+              isFpuEnvVarnode(*op.Output))) ||
             std::any_of(op.Inputs.begin(), op.Inputs.end(),
                         [](const VarnodeView &varnode) {
                           return isX87StackVarnode(varnode) ||
-                                 isFpuWordVarnode(varnode);
+                                 isFpuEnvVarnode(varnode);
                         })) {
           continue;
         }
@@ -1505,7 +1573,8 @@ private:
     }
 
     llvm::Function *intrinsic = getOrInsertNativeX87Intrinsic(
-        Module, spec.IntrinsicName, spec.ResultType, spec.ArgTypes);
+        Module, spec.IntrinsicName, spec.ResultType, spec.ArgTypes,
+        spec.AccessesMemory);
     std::vector<llvm::Value *> args;
     args.reserve(spec.Args.size());
     for (size_t index = 0; index < spec.Args.size(); ++index) {

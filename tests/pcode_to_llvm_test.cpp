@@ -2364,6 +2364,178 @@ bool testX87FnstcwFldcwFoldsToIntrinsicCalls() {
                 "module failed verifier after x87 fnstcw/fldcw folding");
 }
 
+// fstenv: six per-field STOREs of the FPU environment registers to
+// RSP+0/4/8/0xc/0x12/0x14, mirroring the real Ghidra p-code.  Only the base
+// address (the +0 STORE, whose address is not produced inside the group) is
+// passed to the library; the library writes the real 28-byte layout.
+void addX87FstenvOps(notdec::bin2llvm::PcodeProgram &program,
+                     uint64_t address) {
+  auto push = [&](notdec::bin2llvm::PcodeOpView op, uint64_t addr,
+                  const std::string &mnemonic) {
+    op.Address = addr;
+    op.InstructionSize = 1;
+    op.Mnemonic = mnemonic;
+    program.Ops.push_back(op);
+  };
+
+  const uint32_t offsets[6] = {0x0, 0x4, 0x8, 0xc, 0x12, 0x14};
+  const uint64_t fpuOffsets[6] = {0x10a0, 0x10a2, 0x10a4, 0x10b0, 0x10a6,
+                                  0x10a8};
+  const uint32_t sizes[6] = {2, 2, 2, 8, 2, 8};
+  for (int index = 0; index < 6; ++index) {
+    notdec::bin2llvm::PcodeOpView addrOp;
+    notdec::bin2llvm::PcodeOpView store;
+    notdec::bin2llvm::VarnodeView addrVar;
+    if (offsets[index] == 0) {
+      addrVar = registerVarnode(0x20, 8, "RSP");
+    } else {
+      addrOp.Opcode = notdec::bin2llvm::PcodeOpcode::IntAdd;
+      addrOp.OpcodeName = "INT_ADD";
+      addrOp.Output = uniqueVarnode(0x7000 + index * 0x10, 8);
+      addrOp.Inputs.push_back(registerVarnode(0x20, 8, "RSP"));
+      addrOp.Inputs.push_back(constVarnode(offsets[index], 8));
+      push(addrOp, address, "FSTENV");
+      addrVar = *addrOp.Output;
+    }
+    store.Opcode = notdec::bin2llvm::PcodeOpcode::Store;
+    store.OpcodeName = "STORE";
+    store.Inputs.push_back(constVarnode(0x558a4c827b20, 8));
+    store.Inputs.push_back(addrVar);
+    store.Inputs.push_back(registerVarnode(fpuOffsets[index], sizes[index],
+                                           "FPUEnv"));
+    push(store, address, "FSTENV");
+  }
+}
+
+bool testX87FstenvFoldsToIntrinsicCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FstenvOps(program, 0x1000);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fstenv";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFstenv = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr || call->getCalledFunction() == nullptr) {
+          continue;
+        }
+        hasFstenv |=
+            call->getCalledFunction()->getName() == "notdec.x87.fstenv";
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fstenv function is missing") &&
+         expect(hasFstenv, "x87 fstenv did not fold to notdec.x87.fstenv") &&
+         expect(!functionUsesGlobal(function, "FPUControlWord") &&
+                    !functionUsesGlobal(function, "FPUStatusWord") &&
+                    !functionUsesGlobal(function, "FPUTagWord"),
+                "x87 fstenv kept FPU environment register globals") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fstenv folding");
+}
+
+// fldenv: six memory LOADs feeding the FPU environment registers.  The
+// library reads the image through the base pointer, so the LOADs and the
+// register writes are suppressed.
+void addX87FldenvOps(notdec::bin2llvm::PcodeProgram &program,
+                     uint64_t address) {
+  auto push = [&](notdec::bin2llvm::PcodeOpView op, uint64_t addr,
+                  const std::string &mnemonic) {
+    op.Address = addr;
+    op.InstructionSize = 1;
+    op.Mnemonic = mnemonic;
+    program.Ops.push_back(op);
+  };
+
+  const uint32_t offsets[6] = {0x0, 0x4, 0x8, 0xc, 0x12, 0x14};
+  const uint64_t fpuOffsets[6] = {0x10a0, 0x10a2, 0x10a4, 0x10b0, 0x10a6,
+                                  0x10a8};
+  const uint32_t sizes[6] = {2, 2, 2, 8, 2, 8};
+  for (int index = 0; index < 6; ++index) {
+    notdec::bin2llvm::PcodeOpView addrOp;
+    notdec::bin2llvm::PcodeOpView load;
+    notdec::bin2llvm::PcodeOpView copy;
+    notdec::bin2llvm::VarnodeView addrVar;
+    if (offsets[index] == 0) {
+      addrVar = registerVarnode(0x20, 8, "RSP");
+    } else {
+      addrOp.Opcode = notdec::bin2llvm::PcodeOpcode::IntAdd;
+      addrOp.OpcodeName = "INT_ADD";
+      addrOp.Output = uniqueVarnode(0x8000 + index * 0x10, 8);
+      addrOp.Inputs.push_back(registerVarnode(0x20, 8, "RSP"));
+      addrOp.Inputs.push_back(constVarnode(offsets[index], 8));
+      push(addrOp, address, "FLDENV");
+      addrVar = *addrOp.Output;
+    }
+    load.Opcode = notdec::bin2llvm::PcodeOpcode::Load;
+    load.OpcodeName = "LOAD";
+    load.Output = uniqueVarnode(0x9000 + index * 0x10, sizes[index]);
+    load.Inputs.push_back(constVarnode(0x558a4c827b20, 8));
+    load.Inputs.push_back(addrVar);
+    push(load, address, "FLDENV");
+    copy.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+    copy.OpcodeName = "COPY";
+    copy.Output = registerVarnode(fpuOffsets[index], sizes[index], "FPUEnv");
+    copy.Inputs.push_back(*load.Output);
+    push(copy, address, "FLDENV");
+  }
+}
+
+bool testX87FldenvFoldsToIntrinsicCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FldenvOps(program, 0x1000);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fldenv";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFldenv = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr || call->getCalledFunction() == nullptr) {
+          continue;
+        }
+        hasFldenv |=
+            call->getCalledFunction()->getName() == "notdec.x87.fldenv";
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fldenv function is missing") &&
+         expect(hasFldenv, "x87 fldenv did not fold to notdec.x87.fldenv") &&
+         expect(!functionUsesGlobal(function, "FPUControlWord") &&
+                    !functionUsesGlobal(function, "FPUStatusWord") &&
+                    !functionUsesGlobal(function, "FPUTagWord"),
+                "x87 fldenv kept FPU environment register globals") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fldenv folding");
+}
+
 void addX87FabsChsOps(notdec::bin2llvm::PcodeProgram &program,
                       uint64_t address) {
   auto push = [&](notdec::bin2llvm::PcodeOpView op, uint64_t addr,
@@ -2482,6 +2654,8 @@ int main() {
   ok &= testX87FucomipFoldsToIntrinsicCall();
   ok &= testX87FpremFnstswFoldsToIntrinsicCall();
   ok &= testX87FnstcwFldcwFoldsToIntrinsicCalls();
+  ok &= testX87FstenvFoldsToIntrinsicCall();
+  ok &= testX87FldenvFoldsToIntrinsicCall();
   ok &= testX87FabsChsFoldsToIntrinsicCalls();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

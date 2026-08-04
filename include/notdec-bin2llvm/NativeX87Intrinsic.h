@@ -20,6 +20,7 @@ bool isNativeX87IntrinsicName(llvm::StringRef name);
 llvm::Function *getOrInsertNativeX87Intrinsic(llvm::Module &module,
                                               llvm::StringRef name,
                                               llvm::Type *resultType,
-                                              llvm::ArrayRef<llvm::Type *> argTypes);
+                                              llvm::ArrayRef<llvm::Type *> argTypes,
+                                              bool accessesMemory = false);
 
 } // namespace notdec::bin2llvm
