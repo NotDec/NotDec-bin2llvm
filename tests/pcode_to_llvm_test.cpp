@@ -1868,6 +1868,195 @@ bool testX87FdivrpSt2FoldsToIntrinsicCall() {
                 "module failed verifier after x87 fdivrp st(2) folding");
 }
 
+// fcomi/fucomip: compare ST0 with st(1), write EFLAGS/FPU status from the
+// packed intrinsic result.  pop selects the FCOMIP/FUCOMIP rolling pop.
+void addX87FcomiOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address,
+                    const std::string &mnemonic, bool pop) {
+  auto push = [&](notdec::bin2llvm::PcodeOpView op) {
+    op.Address = address;
+    op.InstructionSize = 1;
+    op.Mnemonic = mnemonic;
+    program.Ops.push_back(op);
+  };
+
+  notdec::bin2llvm::PcodeOpView nan0;
+  nan0.Opcode = notdec::bin2llvm::PcodeOpcode::FloatNan;
+  nan0.OpcodeName = "FLOAT_NAN";
+  nan0.Output = uniqueVarnode(0x2d300, 1);
+  nan0.Inputs.push_back(registerVarnode(0x1100, 10, "ST0"));
+  push(nan0);
+
+  notdec::bin2llvm::PcodeOpView nan1;
+  nan1.Opcode = notdec::bin2llvm::PcodeOpcode::FloatNan;
+  nan1.OpcodeName = "FLOAT_NAN";
+  nan1.Output = uniqueVarnode(0x2d380, 1);
+  nan1.Inputs.push_back(registerVarnode(0x1110, 10, "ST1"));
+  push(nan1);
+
+  notdec::bin2llvm::PcodeOpView pf;
+  pf.Opcode = notdec::bin2llvm::PcodeOpcode::BoolOr;
+  pf.OpcodeName = "BOOL_OR";
+  pf.Output = registerVarnode(0x202, 1, "PF");
+  pf.Inputs.push_back(*nan0.Output);
+  pf.Inputs.push_back(*nan1.Output);
+  push(pf);
+
+  notdec::bin2llvm::PcodeOpView equal;
+  equal.Opcode = notdec::bin2llvm::PcodeOpcode::FloatEqual;
+  equal.OpcodeName = "FLOAT_EQUAL";
+  equal.Output = uniqueVarnode(0x2d480, 1);
+  equal.Inputs.push_back(registerVarnode(0x1100, 10, "ST0"));
+  equal.Inputs.push_back(registerVarnode(0x1110, 10, "ST1"));
+  push(equal);
+
+  notdec::bin2llvm::PcodeOpView zf;
+  zf.Opcode = notdec::bin2llvm::PcodeOpcode::IntOr;
+  zf.OpcodeName = "INT_OR";
+  zf.Output = registerVarnode(0x206, 1, "ZF");
+  zf.Inputs.push_back(*pf.Output);
+  zf.Inputs.push_back(*equal.Output);
+  push(zf);
+
+  notdec::bin2llvm::PcodeOpView less;
+  less.Opcode = notdec::bin2llvm::PcodeOpcode::FloatLess;
+  less.OpcodeName = "FLOAT_LESS";
+  less.Output = uniqueVarnode(0x2d580, 1);
+  less.Inputs.push_back(registerVarnode(0x1100, 10, "ST0"));
+  less.Inputs.push_back(registerVarnode(0x1110, 10, "ST1"));
+  push(less);
+
+  notdec::bin2llvm::PcodeOpView cf;
+  cf.Opcode = notdec::bin2llvm::PcodeOpcode::IntOr;
+  cf.OpcodeName = "INT_OR";
+  cf.Output = registerVarnode(0x200, 1, "CF");
+  cf.Inputs.push_back(*pf.Output);
+  cf.Inputs.push_back(*less.Output);
+  push(cf);
+
+  auto clearReg = [&](uint64_t offset, uint32_t size,
+                      const std::string &name) {
+    notdec::bin2llvm::PcodeOpView op;
+    op.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+    op.OpcodeName = "COPY";
+    op.Output = registerVarnode(offset, size, name);
+    op.Inputs.push_back(constVarnode(0, size));
+    push(op);
+  };
+  clearReg(0x20b, 1, "OF");
+  clearReg(0x204, 1, "AF");
+  clearReg(0x207, 1, "SF");
+  clearReg(0x1091, 1, "C1");
+
+  notdec::bin2llvm::PcodeOpView fsw;
+  fsw.Opcode = notdec::bin2llvm::PcodeOpcode::IntAnd;
+  fsw.OpcodeName = "INT_AND";
+  fsw.Output = registerVarnode(0x10a2, 2, "FSW");
+  fsw.Inputs.push_back(registerVarnode(0x10a2, 2, "FSW"));
+  fsw.Inputs.push_back(constVarnode(0xfdff, 2));
+  push(fsw);
+
+  if (pop) {
+    for (unsigned index = 0; index < 7; ++index) {
+      notdec::bin2llvm::PcodeOpView op = x87StackCopyOp(
+          address, 1, 0x1100 + index * 0x10, 0x1100 + (index + 1) * 0x10,
+          "ST" + std::to_string(index), "ST" + std::to_string(index + 1));
+      op.Mnemonic = mnemonic;
+      program.Ops.push_back(op);
+    }
+  }
+}
+
+bool testX87FcomiFoldsToIntrinsicCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  program.Registers.push_back({"register", 0x200, 1, "CF"});
+  program.Registers.push_back({"register", 0x202, 1, "PF"});
+  program.Registers.push_back({"register", 0x206, 1, "ZF"});
+  addX87FcomiOps(program, 0x1000, "FCOMI", false);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fcomi";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFcomi = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee != nullptr && callee->getName() == "notdec.x87.fcomi.sti" &&
+            call->arg_size() == 1) {
+          if (auto *constant =
+                  llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0))) {
+            hasFcomi |= constant->getZExtValue() == 1;
+          }
+        }
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fcomi function is missing") &&
+         expect(hasFcomi, "x87 fcomi did not fold to notdec.x87.fcomi.sti(1)") &&
+         expect(functionUsesGlobal(function, "CF"),
+                "x87 fcomi did not write the CF flag from the result") &&
+         expect(!functionUsesGlobal(function, "ST0"),
+                "x87 fcomi kept an ST0 register global") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fcomi folding");
+}
+
+bool testX87FucomipFoldsToIntrinsicCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FcomiOps(program, 0x1000, "FUCOMIP", true);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fucomip";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFucomip = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        hasFucomip |= callee != nullptr &&
+                      callee->getName() == "notdec.x87.fucomip.sti";
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fucomip function is missing") &&
+         expect(hasFucomip,
+                "x87 fucomip did not fold to notdec.x87.fucomip.sti") &&
+         expect(!functionUsesGlobal(function, "ST0"),
+                "x87 fucomip kept an ST0 register global") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fucomip folding");
+}
+
 } // namespace
 
 int main() {
@@ -1911,5 +2100,7 @@ int main() {
   ok &= testX87FstpFoldsToIntrinsicCall();
   ok &= testX87FldzFoldsToIntrinsicCall();
   ok &= testX87FdivrpSt2FoldsToIntrinsicCall();
+  ok &= testX87FcomiFoldsToIntrinsicCall();
+  ok &= testX87FucomipFoldsToIntrinsicCall();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

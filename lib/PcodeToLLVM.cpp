@@ -450,6 +450,9 @@ private:
     llvm::Type *ResultType = nullptr;
     std::optional<VarnodeView> StoreAddress;
     std::optional<uint32_t> StoreValueSize;
+    // fcomi/fucomip: the intrinsic returns a packed i8 (bit0=CF, bit1=PF,
+    // bit2=ZF) and lowering writes the EFLAGS/FPU status bits from it.
+    bool WritesComparisonFlags = false;
   };
 
   static bool isTerminator(PcodeOpcode opcode) {
@@ -1037,6 +1040,42 @@ private:
       return spec;
     }
 
+    // fcomi/fucomip: compare ST0 with st(i), return packed CF|PF|ZF flags.
+    // FCOMI/FUCOMI do not pop; FCOMIP/FUCOMIP pop inside the library.  The
+    // st(i) operand is recovered from the FLOAT_EQUAL/FLOAT_LESS inputs.
+    if (mnemonic == "FCOMI" || mnemonic == "FCOMIP" ||
+        mnemonic == "FUCOMI" || mnemonic == "FUCOMIP") {
+      std::optional<uint32_t> index;
+      for (size_t opIndex = start; opIndex < end; ++opIndex) {
+        const PcodeOpView &op = program.Ops[opIndex];
+        if ((op.Opcode == PcodeOpcode::FloatEqual ||
+             op.Opcode == PcodeOpcode::FloatLess) &&
+            op.Inputs.size() == 2 &&
+            isX87StackVarnode(op.Inputs[0]) &&
+            isX87StackVarnode(op.Inputs[1])) {
+          index = x87StackIndex(op.Inputs[0]) == 0
+                      ? x87StackIndex(op.Inputs[1])
+                      : x87StackIndex(op.Inputs[0]);
+          break;
+        }
+      }
+      if (!index) {
+        return std::nullopt;
+      }
+      std::string name = mnemonic == "FCOMI"
+                             ? "fcomi"
+                             : mnemonic == "FCOMIP"
+                                   ? "fcomip"
+                                   : mnemonic == "FUCOMI" ? "fucomi"
+                                                          : "fucomip";
+      spec.IntrinsicName = "notdec.x87." + name + ".sti";
+      spec.Args = {stIndexVarnode(*index)};
+      spec.ArgTypes = {intType(1)};
+      spec.ResultType = intType(1);
+      spec.WritesComparisonFlags = true;
+      return spec;
+    }
+
     // Pop arithmetic (faddp/fsubp/fmulp/fdivp/fsubrp/fdivrp):
     // ST1 = op(ST0, ST1), then pop.
     if (mnemonic == "FADDP" || mnemonic == "FSUBP" || mnemonic == "FMULP" ||
@@ -1333,16 +1372,20 @@ private:
                      std::string &errorMessage) {
     // Lower the non-stack ops (LOAD / INT_ADD address computation) so the call
     // argument values are available through the normal p-code SSA cache.
-    for (size_t index = spec.Start; index < spec.End; ++index) {
-      const PcodeOpView &op = (*CurrentProgramOps)[index];
-      if (op.Opcode == PcodeOpcode::Store ||
-          (op.Output && isX87StackVarnode(*op.Output)) ||
-          std::any_of(op.Inputs.begin(), op.Inputs.end(),
-                      isX87StackVarnode)) {
-        continue;
-      }
-      if (!lowerOp(op, errorMessage)) {
-        return false;
+    // Comparison instructions (fcomi/fucomip) have no memory operand and
+    // their unique temps are group-private, so nothing needs lowering here.
+    if (!spec.WritesComparisonFlags) {
+      for (size_t index = spec.Start; index < spec.End; ++index) {
+        const PcodeOpView &op = (*CurrentProgramOps)[index];
+        if (op.Opcode == PcodeOpcode::Store ||
+            (op.Output && isX87StackVarnode(*op.Output)) ||
+            std::any_of(op.Inputs.begin(), op.Inputs.end(),
+                        isX87StackVarnode)) {
+          continue;
+        }
+        if (!lowerOp(op, errorMessage)) {
+          return false;
+        }
       }
     }
 
@@ -1355,6 +1398,34 @@ private:
           toIntrinsicArg(read(spec.Args[index]), spec.ArgTypes[index]));
     }
     llvm::Value *result = Builder.CreateCall(intrinsic, args);
+
+    if (spec.WritesComparisonFlags) {
+      // The intrinsic returns CF|PF|ZF packed into an i8 (bits 0/1/2).  The
+      // p-code writes the same bits to EFLAGS and clears AF/SF/OF plus the
+      // FPU C1/FSW bits; replicate that from the call result.
+      auto flagVarnode = [](uint64_t offset, uint32_t size) {
+        VarnodeView varnode;
+        varnode.Space = "register";
+        varnode.Offset = offset;
+        varnode.Size = size;
+        varnode.IsRegister = true;
+        return varnode;
+      };
+      const uint64_t flagOffsets[3] = {0x200, 0x202, 0x206}; // CF, PF, ZF
+      for (unsigned bit = 0; bit < 3; ++bit) {
+        llvm::Value *flag = Builder.CreateAnd(
+            Builder.CreateLShr(result, bit), 1);
+        write(flagVarnode(flagOffsets[bit], 1), flag);
+      }
+      llvm::Value *zero = llvm::ConstantInt::get(intType(1), 0);
+      write(flagVarnode(0x204, 1), zero); // AF
+      write(flagVarnode(0x207, 1), zero); // SF
+      write(flagVarnode(0x20b, 1), zero); // OF
+      write(flagVarnode(0x1091, 1), zero); // C1
+      VarnodeView fsw = flagVarnode(0x10a2, 2);
+      write(fsw, Builder.CreateAnd(read(fsw),
+                                   llvm::ConstantInt::get(intType(2), 0xfdff)));
+    }
 
     if (spec.StoreAddress && spec.StoreValueSize) {
       llvm::Value *stored = result;
