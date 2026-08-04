@@ -1729,6 +1729,145 @@ bool testX87FstpFoldsToIntrinsicCall() {
                 "module failed verifier after x87 fstp folding");
 }
 
+// fldz: INT2FLOAT(const) -> unique, rolling push, ST0 = COPY(unique).
+// Mnemonic-driven classification must fold it to notdec.x87.fldz instead of
+// matching the rolling push as a register operand.
+void addX87FldzOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address) {
+  notdec::bin2llvm::PcodeOpView convert;
+  convert.Address = address;
+  convert.InstructionSize = 1;
+  convert.Mnemonic = "FLDZ";
+  convert.Opcode = notdec::bin2llvm::PcodeOpcode::FloatInt2Float;
+  convert.OpcodeName = "INT2FLOAT";
+  convert.Output = uniqueVarnode(0x72900, 10);
+  convert.Inputs.push_back(constVarnode(0, 4));
+  program.Ops.push_back(convert);
+
+  for (unsigned index = 7; index >= 1; --index) {
+    notdec::bin2llvm::PcodeOpView op = x87StackCopyOp(
+        address, 1, 0x1100 + index * 0x10, 0x1100 + (index - 1) * 0x10,
+        "ST" + std::to_string(index), "ST" + std::to_string(index - 1));
+    op.Mnemonic = "FLDZ";
+    program.Ops.push_back(op);
+  }
+
+  notdec::bin2llvm::PcodeOpView write = x87CopyFromUniqueOp(
+      address, 1, 0x1100, 0x72900, "ST0");
+  write.Mnemonic = "FLDZ";
+  program.Ops.push_back(write);
+}
+
+bool testX87FldzFoldsToIntrinsicCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FldzOps(program, 0x1000);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fldz";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFldz = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        hasFldz |= callee != nullptr &&
+                   callee->getName() == "notdec.x87.fldz";
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fldz function is missing") &&
+         expect(hasFldz, "x87 fldz did not fold to notdec.x87.fldz") &&
+         expect(!functionUsesGlobal(function, "ST0"),
+                "x87 fldz kept an ST0 register global") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fldz folding");
+}
+
+// fdivrp %st,%st(2): ST2 = FLOAT_DIV(ST2, ST0) + rolling pop.  Ghidra names
+// this FDIVP, so the mnemonic dispatch must recover the reverse name from the
+// p-code operand order and pass the slot index as the intrinsic argument.
+void addX87FdivrpSt2Ops(notdec::bin2llvm::PcodeProgram &program,
+                        uint64_t address) {
+  notdec::bin2llvm::PcodeOpView divide;
+  divide.Address = address;
+  divide.InstructionSize = 1;
+  divide.Mnemonic = "FDIVP";
+  divide.Opcode = notdec::bin2llvm::PcodeOpcode::FloatDiv;
+  divide.OpcodeName = "FLOAT_DIV";
+  divide.Output = registerVarnode(0x1120, 10, "ST2");
+  divide.Inputs.push_back(registerVarnode(0x1120, 10, "ST2"));
+  divide.Inputs.push_back(registerVarnode(0x1100, 10, "ST0"));
+  program.Ops.push_back(divide);
+
+  for (unsigned index = 0; index < 7; ++index) {
+    notdec::bin2llvm::PcodeOpView op = x87StackCopyOp(
+        address, 1, 0x1100 + index * 0x10, 0x1100 + (index + 1) * 0x10,
+        "ST" + std::to_string(index), "ST" + std::to_string(index + 1));
+    op.Mnemonic = "FDIVP";
+    program.Ops.push_back(op);
+  }
+}
+
+bool testX87FdivrpSt2FoldsToIntrinsicCall() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FdivrpSt2Ops(program, 0x1000);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_fdivrp_st2";
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  bool hasFdivrpSt2 = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee != nullptr && callee->getName() == "notdec.x87.fdivrp.sti" &&
+            call->arg_size() == 1) {
+          if (auto *constant =
+                  llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0))) {
+            hasFdivrpSt2 |= constant->getZExtValue() == 2;
+          }
+        }
+      }
+    }
+  }
+
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 fdivrp st(2) function is missing") &&
+         expect(hasFdivrpSt2,
+                "x87 fdivrp st(2) did not fold to notdec.x87.fdivrp.sti(2)") &&
+         expect(!functionUsesGlobal(function, "ST0"),
+                "x87 fdivrp st(2) kept an ST0 register global") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after x87 fdivrp st(2) folding");
+}
+
 } // namespace
 
 int main() {
@@ -1770,5 +1909,7 @@ int main() {
   ok &= testPartialRegisterReadUsesPartialReadHelper();
   ok &= testX87FildlFoldsToIntrinsicCall();
   ok &= testX87FstpFoldsToIntrinsicCall();
+  ok &= testX87FldzFoldsToIntrinsicCall();
+  ok &= testX87FdivrpSt2FoldsToIntrinsicCall();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

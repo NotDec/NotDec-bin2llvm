@@ -266,7 +266,15 @@ void setInstructionSize(PcodeProgram &program, size_t firstOp,
   }
 }
 
+void setInstructionMnemonic(PcodeProgram &program, size_t firstOp,
+                            const std::string &mnemonic) {
+  for (size_t index = firstOp; index < program.Ops.size(); ++index) {
+    program.Ops[index].Mnemonic = mnemonic;
+  }
+}
+
 bool appendInstructionPcode(ghidra::Sleigh &engine, PcodeCollector &collector,
+                            AssemblyCollector &asmCollector,
                             ghidra::Address &current,
                             std::ostream &errorStream, PcodeProgram &program) {
   try {
@@ -274,6 +282,20 @@ bool appendInstructionPcode(ghidra::Sleigh &engine, PcodeCollector &collector,
     int32_t instructionLength = engine.oneInstruction(collector, current);
     setInstructionSize(program, firstOp,
                        static_cast<uint64_t>(instructionLength));
+    // Generate p-code before assembly text: oneInstruction() applies Sleigh
+    // context commits and printAssembly() first leaves the reused parser cache
+    // stale for context-sensitive x86 instructions (same ordering as
+    // SleighInstructionDecoder::decode).
+    int32_t assemblyLength = engine.printAssembly(asmCollector, current);
+    if (assemblyLength != instructionLength) {
+      errorStream << "Sleigh decode length mismatch @ " << current << ": "
+                  << instructionLength << " vs " << assemblyLength << '\n';
+      program.Ops.clear();
+      return false;
+    }
+    setInstructionMnemonic(
+        program, firstOp,
+        asmCollector.take(static_cast<uint64_t>(instructionLength)).Mnemonic);
     current = current + instructionLength;
     return true;
   } catch (ghidra::UnimplError &error) {
@@ -518,11 +540,12 @@ PcodeProgram collectSleighPcode(ghidra::LoadImage &loadImage,
   collectRegisters(engine, program);
 
   PcodeCollector collector(engine, program);
+  AssemblyCollector asmCollector;
   ghidra::Address current(engine.getDefaultCodeSpace(), address);
   ghidra::Address end(engine.getDefaultCodeSpace(), address + length);
   while (current < end) {
-    if (!appendInstructionPcode(engine, collector, current, errorStream,
-                                program)) {
+    if (!appendInstructionPcode(engine, collector, asmCollector, current,
+                                errorStream, program)) {
       return program;
     }
   }
@@ -561,6 +584,7 @@ collectSleighPcodeRanges(ghidra::LoadImage &loadImage,
   }
 
   PcodeCollector collector(engine, program);
+  AssemblyCollector asmCollector;
   for (const auto &[start, endOffset] : sortedRanges) {
     if (start >= endOffset) {
       continue;
@@ -569,8 +593,8 @@ collectSleighPcodeRanges(ghidra::LoadImage &loadImage,
     ghidra::Address current(engine.getDefaultCodeSpace(), start);
     ghidra::Address end(engine.getDefaultCodeSpace(), endOffset);
     while (current < end) {
-      if (!appendInstructionPcode(engine, collector, current, errorStream,
-                                  program)) {
+      if (!appendInstructionPcode(engine, collector, asmCollector, current,
+                                  errorStream, program)) {
         return program;
       }
     }

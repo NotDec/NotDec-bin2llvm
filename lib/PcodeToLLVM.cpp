@@ -151,6 +151,17 @@ uint32_t x87StackIndex(const VarnodeView &varnode) {
   return static_cast<uint32_t>((varnode.Offset - 0x1100) / 0x10);
 }
 
+bool touchesX87Stack(const PcodeProgram &program, size_t start, size_t end) {
+  for (size_t index = start; index < end; ++index) {
+    const PcodeOpView &op = program.Ops[index];
+    if ((op.Output && isX87StackVarnode(*op.Output)) ||
+        std::any_of(op.Inputs.begin(), op.Inputs.end(), isX87StackVarnode)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<RegisterInfo>
 registersWithoutX87Stack(const std::vector<RegisterInfo> &registers) {
   std::vector<RegisterInfo> result;
@@ -186,17 +197,18 @@ std::string fpSuffix(llvm::Type *type) {
 }
 
 // Pop arithmetic (faddp/fmulp/...): ST1 = op(ST0, ST1).  Reverse forms
-// (fsubrp/fdivrp) are ST1 = op(ST1, ST0), i.e. input0 is ST1.
+// (fsubrp/fdivrp) are ST1 = op(ST1, ST0), i.e. input0 is the st(i) slot.
 std::string popArithName(PcodeOpcode opcode, const VarnodeView &input0) {
+  bool reverse = x87StackIndex(input0) != 0;
   switch (opcode) {
   case PcodeOpcode::FloatAdd:
     return "faddp";
   case PcodeOpcode::FloatMult:
     return "fmulp";
   case PcodeOpcode::FloatSub:
-    return x87StackIndex(input0) == 1 ? "fsubrp" : "fsubp";
+    return reverse ? "fsubrp" : "fsubp";
   case PcodeOpcode::FloatDiv:
-    return x87StackIndex(input0) == 1 ? "fdivrp" : "fdivp";
+    return reverse ? "fdivrp" : "fdivp";
   default:
     return "";
   }
@@ -214,6 +226,22 @@ std::string memArithName(PcodeOpcode opcode, bool memIsInput0) {
     return memIsInput0 ? "fsubr" : "fsub";
   case PcodeOpcode::FloatDiv:
     return memIsInput0 ? "fdivr" : "fdiv";
+  default:
+    return "";
+  }
+}
+
+// Register arithmetic on ST0: ST0 = op(ST0, st(i)).
+std::string regArithName(PcodeOpcode opcode) {
+  switch (opcode) {
+  case PcodeOpcode::FloatAdd:
+    return "fadd";
+  case PcodeOpcode::FloatSub:
+    return "fsub";
+  case PcodeOpcode::FloatMult:
+    return "fmul";
+  case PcodeOpcode::FloatDiv:
+    return "fdiv";
   default:
     return "";
   }
@@ -741,6 +769,12 @@ private:
       if (std::optional<X87IntrinsicSpec> spec =
               classifyX87Intrinsic(program, start, end)) {
         X87Groups.emplace(start, std::move(*spec));
+      } else if (!program.Ops[start].Mnemonic.empty() &&
+                 touchesX87Stack(program, start, end)) {
+        llvm::errs() << "warning: x87 instruction "
+                     << program.Ops[start].Mnemonic << " at 0x";
+        llvm::errs().write_hex(program.Ops[start].Address);
+        llvm::errs() << " was not folded into a notdec.x87 intrinsic\n";
       }
       start = end;
     }
@@ -758,12 +792,356 @@ private:
     return nullptr;
   }
 
-  // Recognize one x87 instruction from its p-code expansion.  Returns the
-  // folded intrinsic description, or nullopt when the instruction does not
-  // match a known shape and has to fall back to ordinary p-code lowering.
+  // Dispatch x87 classification by the machine instruction mnemonic when one
+  // is available (native lifting); heritage JSON input carries no mnemonic
+  // and falls back to the p-code shape classifier below.
   std::optional<X87IntrinsicSpec>
   classifyX87Intrinsic(const PcodeProgram &program, size_t start,
                        size_t end) {
+    const std::string &mnemonic = program.Ops[start].Mnemonic;
+    if (!mnemonic.empty()) {
+      return classifyX87ByMnemonic(program, start, end, mnemonic);
+    }
+    return classifyX87ByShape(program, start, end);
+  }
+
+  // First p-code op writing an x87 stack varnode with the given opcode.
+  // outputIndex -1 matches any ST slot.
+  static const PcodeOpView *
+  findStackWrite(const PcodeProgram &program, size_t start, size_t end,
+                 PcodeOpcode opcode, int outputIndex) {
+    for (size_t index = start; index < end; ++index) {
+      const PcodeOpView &op = program.Ops[index];
+      if (!op.Output || !isX87StackVarnode(*op.Output) ||
+          op.Opcode != opcode) {
+        continue;
+      }
+      if (outputIndex >= 0 &&
+          static_cast<int>(x87StackIndex(*op.Output)) != outputIndex) {
+        continue;
+      }
+      return &op;
+    }
+    return nullptr;
+  }
+
+  // fstp %st(i): ST(i) = COPY(ST0) before the pop rotation.
+  static std::optional<uint32_t>
+  stIndexFromSt0Copy(const PcodeProgram &program, size_t start, size_t end) {
+    for (size_t index = start; index < end; ++index) {
+      const PcodeOpView &op = program.Ops[index];
+      if (op.Opcode != PcodeOpcode::Copy || op.Inputs.size() != 1 ||
+          !op.Output || !isX87StackVarnode(*op.Output) ||
+          !isX87StackVarnode(op.Inputs[0]) ||
+          x87StackIndex(op.Inputs[0]) != 0) {
+        continue;
+      }
+      return x87StackIndex(*op.Output);
+    }
+    return std::nullopt;
+  }
+
+  // fxch %st(i): ST0 = COPY(st(i)).
+  static std::optional<uint32_t>
+  stIndexFromSt0WriteCopy(const PcodeProgram &program, size_t start,
+                          size_t end) {
+    for (size_t index = start; index < end; ++index) {
+      const PcodeOpView &op = program.Ops[index];
+      if (op.Opcode != PcodeOpcode::Copy || op.Inputs.size() != 1 ||
+          !op.Output || !isX87StackVarnode(*op.Output) ||
+          x87StackIndex(*op.Output) != 0 ||
+          !isX87StackVarnode(op.Inputs[0])) {
+        continue;
+      }
+      return x87StackIndex(op.Inputs[0]);
+    }
+    return std::nullopt;
+  }
+
+  // Constant varnode carrying an st(i) slot index argument.
+  static VarnodeView stIndexVarnode(uint32_t index) {
+    VarnodeView varnode;
+    varnode.Space = "const";
+    varnode.Offset = index;
+    varnode.Size = 1;
+    return varnode;
+  }
+
+  // Classify one x87 instruction by its Ghidra mnemonic.  The mnemonic
+  // decides the instruction category; the p-code only supplies the operand
+  // values (memory address, const, st(i) index), so new instructions do not
+  // need a p-code shape matcher.  Uncovered mnemonics (fcomi/fucomip and
+  // friends) fall back to ordinary p-code lowering.
+  std::optional<X87IntrinsicSpec>
+  classifyX87ByMnemonic(const PcodeProgram &program, size_t start,
+                        size_t end, const std::string &mnemonic) {
+    if (!touchesX87Stack(program, start, end)) {
+      return std::nullopt;
+    }
+
+    X87IntrinsicSpec spec;
+    spec.Start = start;
+    spec.End = end;
+
+    // fldz / fld1: push a constant with no explicit operand.
+    if (mnemonic == "FLDZ" || mnemonic == "FLD1") {
+      spec.IntrinsicName =
+          "notdec.x87." + std::string(mnemonic == "FLDZ" ? "fldz" : "fld1");
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      return spec;
+    }
+
+    // fsqrt: ST0 = sqrt(ST0).
+    if (mnemonic == "FSQRT") {
+      if (findStackWrite(program, start, end, PcodeOpcode::FloatSqrt, 0) ==
+          nullptr) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName = "notdec.x87.fsqrt";
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      return spec;
+    }
+
+    // fld: push memory (f32/f64/f80) or duplicate st(i).
+    if (mnemonic == "FLD") {
+      // f32/f64 loads write ST0 = FLOAT2FLOAT(mem).
+      const PcodeOpView *write = findStackWrite(
+          program, start, end, PcodeOpcode::FloatFloat2Float, 0);
+      if (write != nullptr && write->Inputs.size() == 1 &&
+          !isX87StackVarnode(write->Inputs[0])) {
+        llvm::Type *fpType = floatType(write->Inputs[0].Size);
+        if (fpType != nullptr) {
+          spec.IntrinsicName = "notdec.x87.fld." + fpSuffix(fpType);
+          spec.Args = {write->Inputs[0]};
+          spec.ArgTypes = {fpType};
+          spec.ResultType = llvm::Type::getVoidTy(Context);
+          return spec;
+        }
+        return std::nullopt;
+      }
+      // f80 loads and fld %st(i) both write ST0 = COPY(unique); the producer
+      // of the unique temp tells them apart.
+      write = findStackWrite(program, start, end, PcodeOpcode::Copy, 0);
+      if (write == nullptr || write->Inputs.size() != 1 ||
+          isX87StackVarnode(write->Inputs[0])) {
+        return std::nullopt;
+      }
+      const VarnodeView &copied = write->Inputs[0];
+      const PcodeOpView *producer = findProducer(program, start, end, copied);
+      if (producer != nullptr && producer->Opcode == PcodeOpcode::Copy &&
+          producer->Inputs.size() == 1 &&
+          isX87StackVarnode(producer->Inputs[0])) {
+        spec.IntrinsicName = "notdec.x87.fld.sti";
+        spec.Args = {stIndexVarnode(x87StackIndex(producer->Inputs[0]))};
+        spec.ArgTypes = {intType(1)};
+        spec.ResultType = llvm::Type::getVoidTy(Context);
+        return spec;
+      }
+      llvm::Type *fpType = floatType(copied.Size);
+      if (fpType == nullptr) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName = "notdec.x87.fld." + fpSuffix(fpType);
+      spec.Args = {copied};
+      spec.ArgTypes = {fpType};
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      return spec;
+    }
+
+    // fstp / fistp: store ST0 to memory or to st(i) (st(0) is a plain pop).
+    if (mnemonic == "FSTP" || mnemonic == "FISTP") {
+      const PcodeOpView *storeOp = nullptr;
+      for (size_t index = start; index < end; ++index) {
+        if (program.Ops[index].Opcode == PcodeOpcode::Store) {
+          storeOp = &program.Ops[index];
+          break;
+        }
+      }
+      // STORE inputs are (space selector, address, value).
+      if (storeOp != nullptr && storeOp->Inputs.size() == 3) {
+        const VarnodeView &storedValue = storeOp->Inputs[2];
+        const PcodeOpView *producer =
+            findProducer(program, start, end, storedValue);
+        if (producer == nullptr || producer->Inputs.size() != 1 ||
+            !isX87StackVarnode(producer->Inputs[0]) ||
+            x87StackIndex(producer->Inputs[0]) != 0) {
+          return std::nullopt;
+        }
+        if (mnemonic == "FISTP") {
+          if (producer->Opcode != PcodeOpcode::FloatTrunc) {
+            return std::nullopt;
+          }
+          spec.IntrinsicName = "notdec.x87.fistp.i" +
+                               std::to_string(producer->Output->Size * 8);
+          spec.ResultType = intType(producer->Output->Size);
+        } else {
+          // f32/f64 go through FLOAT2FLOAT, f80 through a plain COPY.
+          if (producer->Opcode != PcodeOpcode::FloatFloat2Float &&
+              producer->Opcode != PcodeOpcode::Copy) {
+            return std::nullopt;
+          }
+          llvm::Type *fpType = floatType(producer->Output->Size);
+          if (fpType == nullptr) {
+            return std::nullopt;
+          }
+          spec.IntrinsicName = "notdec.x87.fstp." + fpSuffix(fpType);
+          spec.ResultType = fpType;
+        }
+        spec.StoreAddress = storeOp->Inputs[1];
+        spec.StoreValueSize = producer->Output->Size;
+        return spec;
+      }
+      if (mnemonic == "FISTP") {
+        return std::nullopt;
+      }
+      if (std::optional<uint32_t> index =
+              stIndexFromSt0Copy(program, start, end)) {
+        spec.IntrinsicName = "notdec.x87.fstp.sti";
+        spec.Args = {stIndexVarnode(*index)};
+        spec.ArgTypes = {intType(1)};
+        spec.ResultType = llvm::Type::getVoidTy(Context);
+        return spec;
+      }
+      return std::nullopt;
+    }
+
+    // fxch %st(i): swap ST0 and st(i).
+    if (mnemonic == "FXCH") {
+      if (std::optional<uint32_t> index =
+              stIndexFromSt0WriteCopy(program, start, end)) {
+        spec.IntrinsicName = "notdec.x87.fxch.sti";
+        spec.Args = {stIndexVarnode(*index)};
+        spec.ArgTypes = {intType(1)};
+        spec.ResultType = llvm::Type::getVoidTy(Context);
+        return spec;
+      }
+      return std::nullopt;
+    }
+
+    // fild: integer load pushes ST0 = INT2FLOAT(mem).
+    if (mnemonic == "FILD") {
+      const PcodeOpView *write =
+          findStackWrite(program, start, end, PcodeOpcode::FloatInt2Float, 0);
+      if (write == nullptr || write->Inputs.size() != 1) {
+        return std::nullopt;
+      }
+      const VarnodeView &input = write->Inputs[0];
+      if (input.Size != 2 && input.Size != 4 && input.Size != 8) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName =
+          "notdec.x87.fild.i" + std::to_string(input.Size * 8);
+      spec.Args = {input};
+      spec.ArgTypes = {intType(input.Size)};
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      return spec;
+    }
+
+    // Pop arithmetic (faddp/fsubp/fmulp/fdivp/fsubrp/fdivrp):
+    // ST1 = op(ST0, ST1), then pop.
+    if (mnemonic == "FADDP" || mnemonic == "FSUBP" || mnemonic == "FMULP" ||
+        mnemonic == "FDIVP" || mnemonic == "FSUBRP" ||
+        mnemonic == "FDIVRP") {
+      for (size_t index = start; index < end; ++index) {
+        const PcodeOpView &op = program.Ops[index];
+        if (!op.Output || !isX87StackVarnode(*op.Output) ||
+            !isFloatBinaryOpcode(op.Opcode) || op.Inputs.size() != 2) {
+          continue;
+        }
+        uint32_t outputIndex = x87StackIndex(*op.Output);
+        if (outputIndex == 0 || !isX87StackVarnode(op.Inputs[0]) ||
+            !isX87StackVarnode(op.Inputs[1])) {
+          return std::nullopt;
+        }
+        std::string name = popArithName(op.Opcode, op.Inputs[0]);
+        if (name.empty()) {
+          return std::nullopt;
+        }
+        // st(1) keeps the legacy no-argument name; other slots take the
+        // explicit slot index.
+        if (outputIndex == 1) {
+          spec.IntrinsicName = "notdec.x87." + name;
+        } else {
+          spec.IntrinsicName = "notdec.x87." + name + ".sti";
+          spec.Args = {stIndexVarnode(outputIndex)};
+          spec.ArgTypes = {intType(1)};
+        }
+        spec.ResultType = llvm::Type::getVoidTy(Context);
+        return spec;
+      }
+      return std::nullopt;
+    }
+
+    // Register or memory arithmetic on ST0.
+    if (mnemonic == "FADD" || mnemonic == "FSUB" || mnemonic == "FMUL" ||
+        mnemonic == "FDIV") {
+      const PcodeOpView *write = nullptr;
+      for (size_t index = start; index < end; ++index) {
+        const PcodeOpView &op = program.Ops[index];
+        if (op.Output && isX87StackVarnode(*op.Output) &&
+            isFloatBinaryOpcode(op.Opcode) && op.Inputs.size() == 2) {
+          write = &op;
+          break;
+        }
+      }
+      if (write == nullptr || x87StackIndex(*write->Output) != 0) {
+        return std::nullopt;
+      }
+      const VarnodeView &input0 = write->Inputs[0];
+      const VarnodeView &input1 = write->Inputs[1];
+      bool input0IsST = isX87StackVarnode(input0);
+      bool input1IsST = isX87StackVarnode(input1);
+      if (input0IsST && input1IsST) {
+        // Register arithmetic: ST0 = op(ST0, st(i)).
+        uint32_t index = x87StackIndex(input0) == 0
+                             ? x87StackIndex(input1)
+                             : x87StackIndex(input0);
+        spec.IntrinsicName = "notdec.x87." + regArithName(write->Opcode) +
+                             ".sti";
+        spec.Args = {stIndexVarnode(index)};
+        spec.ArgTypes = {intType(1)};
+        spec.ResultType = llvm::Type::getVoidTy(Context);
+        return spec;
+      }
+      if (input0IsST == input1IsST) {
+        return std::nullopt;
+      }
+      // Memory arithmetic on ST0.  The memory operand is a FLOAT2FLOAT
+      // product; recover the raw memory value to pass as the argument.
+      const VarnodeView &memOperand = input0IsST ? input1 : input0;
+      const PcodeOpView *producer =
+          findProducer(program, start, end, memOperand);
+      if (producer == nullptr ||
+          producer->Opcode != PcodeOpcode::FloatFloat2Float ||
+          producer->Inputs.size() != 1 ||
+          isX87StackVarnode(producer->Inputs[0])) {
+        return std::nullopt;
+      }
+      const VarnodeView &rawMem = producer->Inputs[0];
+      llvm::Type *fpType = floatType(rawMem.Size);
+      if (fpType == nullptr) {
+        return std::nullopt;
+      }
+      std::string name = memArithName(write->Opcode, !input0IsST);
+      if (name.empty()) {
+        return std::nullopt;
+      }
+      spec.IntrinsicName = "notdec.x87." + name + "." + fpSuffix(fpType);
+      spec.Args = {rawMem};
+      spec.ArgTypes = {fpType};
+      spec.ResultType = llvm::Type::getVoidTy(Context);
+      return spec;
+    }
+
+    return std::nullopt;
+  }
+
+  // Recognize one x87 instruction from its p-code expansion (heritage JSON
+  // fallback, where no mnemonic is available).  Returns the folded intrinsic
+  // description, or nullopt when the instruction does not match a known shape
+  // and has to fall back to ordinary p-code lowering.
+  std::optional<X87IntrinsicSpec>
+  classifyX87ByShape(const PcodeProgram &program, size_t start, size_t end) {
     bool hasStackVarnode = false;
     for (size_t index = start; index < end; ++index) {
       const PcodeOpView &op = program.Ops[index];
