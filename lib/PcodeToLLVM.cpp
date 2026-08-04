@@ -451,7 +451,8 @@ private:
     std::optional<VarnodeView> StoreAddress;
     std::optional<uint32_t> StoreValueSize;
     // fcomi/fucomip: the intrinsic returns a packed i8 (bit0=CF, bit1=PF,
-    // bit2=ZF) and lowering writes the EFLAGS/FPU status bits from it.
+    // bit2=ZF); lowering writes the EFLAGS bits that integer code observes.
+    // The FPU status word stays library-internal like the FPU stack.
     bool WritesComparisonFlags = false;
   };
 
@@ -1400,9 +1401,12 @@ private:
     llvm::Value *result = Builder.CreateCall(intrinsic, args);
 
     if (spec.WritesComparisonFlags) {
-      // The intrinsic returns CF|PF|ZF packed into an i8 (bits 0/1/2).  The
-      // p-code writes the same bits to EFLAGS and clears AF/SF/OF plus the
-      // FPU C1/FSW bits; replicate that from the call result.
+      // The intrinsic returns CF|PF|ZF packed into an i8 (bits 0/1/2) and
+      // mirrors the p-code flag writes that non-x87 instructions can observe:
+      // EFLAGS CF/PF/ZF are set from the result and AF/SF/OF are cleared.
+      // The FPU-internal side (FSW C1 bit and the C1 register) is owned by the
+      // intrinsic library together with the FPU stack, so it is not modelled
+      // here; the library must clear C1 in its internal status word.
       auto flagVarnode = [](uint64_t offset, uint32_t size) {
         VarnodeView varnode;
         varnode.Space = "register";
@@ -1421,10 +1425,6 @@ private:
       write(flagVarnode(0x204, 1), zero); // AF
       write(flagVarnode(0x207, 1), zero); // SF
       write(flagVarnode(0x20b, 1), zero); // OF
-      write(flagVarnode(0x1091, 1), zero); // C1
-      VarnodeView fsw = flagVarnode(0x10a2, 2);
-      write(fsw, Builder.CreateAnd(read(fsw),
-                                   llvm::ConstantInt::get(intType(2), 0xfdff)));
     }
 
     if (spec.StoreAddress && spec.StoreValueSize) {

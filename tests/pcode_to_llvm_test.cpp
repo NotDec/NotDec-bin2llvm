@@ -2012,6 +2012,12 @@ bool testX87FcomiFoldsToIntrinsicCall() {
                 "x87 fcomi did not write the CF flag from the result") &&
          expect(!functionUsesGlobal(function, "ST0"),
                 "x87 fcomi kept an ST0 register global") &&
+         expect(!functionUsesGlobal(function, "FPUStatusWord"),
+                "x87 fcomi kept an FPUStatusWord global; the status word is "
+                "library-internal") &&
+         expect(!functionUsesGlobal(function, "C1"),
+                "x87 fcomi kept a C1 global; the status word is "
+                "library-internal") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
                 "module failed verifier after x87 fcomi folding");
 }
@@ -2053,6 +2059,12 @@ bool testX87FucomipFoldsToIntrinsicCall() {
                 "x87 fucomip did not fold to notdec.x87.fucomip.sti") &&
          expect(!functionUsesGlobal(function, "ST0"),
                 "x87 fucomip kept an ST0 register global") &&
+         expect(!functionUsesGlobal(function, "FPUStatusWord"),
+                "x87 fucomip kept an FPUStatusWord global; the status word is "
+                "library-internal") &&
+         expect(!functionUsesGlobal(function, "C1"),
+                "x87 fucomip kept a C1 global; the status word is "
+                "library-internal") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
                 "module failed verifier after x87 fucomip folding");
 }

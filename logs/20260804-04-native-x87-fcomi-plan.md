@@ -67,3 +67,18 @@ native 侧改动（`lib/PcodeToLLVM.cpp`）：
 - fortune i386/x86_64 回归通过；`ctest --test-dir build -R native` 15/15 通过。
 
 说明：wrk 里 flag 寄存器经 SummarySSA 后以 SSA 值流动（IR 无 `@CF` 等全局），fcomi 后的分支直接从 intrinsic 返回值算 `CF|ZF`，与直接读写 flag 寄存器等价；单测里 RegisterStorage 路径（`@CF` 全局写入）单独覆盖。
+
+### 实现补充（FSW/C1 移出 LLVM 层）
+
+复查后调整：fcomi 原来还写 `C1=0x1091` 和 `FPUStatusWord=0x10a2`（清 bit9），这两个是"只写不读"的全局——FSW 在 pcode 层只被 `FNSTSW/FSTSW` 等 x87 指令读，整数代码读不到它（唯一桥是 `FNSTSW AX`，走普通 AX 寄存器）；Ghidra 也没把 fcomi 的 C0/C2/C3 写进 FSW（比较结果映射成 EFLAGS）。按 intrinsic 设计"FPU 状态全由库维护"，把这两处写入去掉，C1 清零由库的 fcomi/fucomip 实现负责。
+
+改动（`lib/PcodeToLLVM.cpp`）：
+
+- `X87IntrinsicSpec` 注释（约 455 行）：改为"lowering 只写整数代码能观察到的 EFLAGS 位，状态字与 FPU 栈一样归库内部"。
+- `lowerX87Group()`（约 1411 行）：删掉 `write(flagVarnode(0x1091,1), zero)` 和 `FSW = read(0x10a2) & 0xfdff` 写回，保留 CF/PF/ZF 写入和 AF/SF/OF 清零；注释说明 C1/FSW 由库负责。
+- `tests/pcode_to_llvm_test.cpp`：两条 fcomi 单测追加断言，IR 不得使用 `FPUStatusWord`/`C1` 全局。
+
+验证：
+
+- `./build/bin/pcode_to_llvm_test` 通过；`ctest --test-dir build -R native` 15/15 通过；fortune i386 回归通过。
+- wrk 全量（默认 summary-SSA 路径）：IR 无 `@FPUStatusWord`/`@C1`，fcomi 后分支仍直接从返回值算 `CF|ZF`；`--no-register-ssa-pass` 路径：只写 `@CF/@PF/@ZF`（清 `@AF/@SF/@OF`），无 FSW/C1 全局，`llvm-as`+verify 通过。
