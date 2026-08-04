@@ -2174,7 +2174,9 @@ private:
           }
           continue;
         }
-        if (!isNotDecRegisterHelperCall(*call)) {
+        llvm::Function *calleeF = call->getCalledFunction();
+        if (!isNotDecRegisterHelperCall(*call) &&
+            (calleeF == nullptr || !calleeF->isIntrinsic())) {
           applyBackwardCallDemand(*call, live, additions);
         }
         continue;

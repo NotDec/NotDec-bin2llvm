@@ -887,6 +887,14 @@ bool isSegmentBaseUnit(llvm::StringRef name) {
   return name == "FS_OFFSET" || name == "GS_OFFSET";
 }
 
+// x86 方向标志 DF 在 SysV ABI 里函数入口、返回以及外部调用返回后都必须为 0。
+// cspec 的 <unaffected> 通常不含 DF，通用调用点 clobber 逻辑会把它当未知值，
+// 导致 rep cmpsb 展开循环的指针方向丢失。把 DF 的调用点值定为常量 0：
+// 域上仍是调用点写入（NonEntry），不会误成入口参数，std/cld 的局部写不受影响。
+bool isPostCallZeroRegister(llvm::StringRef name) {
+  return name == "DF";
+}
+
 std::string
 storageUnitName(const NativeAbiStorage &storage,
                 const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -6227,6 +6235,14 @@ private:
     }
     if (insertBefore == nullptr) {
       return llvm::UndefValue::get(rangeType(range));
+    }
+    if (isPostCallZeroRegister(unit->Name)) {
+      // DF 在调用点（外部 clobber 或内部函数返回）都是 ABI 保证的常量 0，
+      // 见 isPostCallZeroRegister 注释。直接生成 0，避免 cmpsb 展开循环
+      // 的方向被 summary_clobber / range_return_unknown 占位污染。
+      llvm::Value *value = llvm::ConstantInt::get(rangeType(range), 0);
+      CallRangeValues.emplace(key, value);
+      return value;
     }
     if (kind == "return" && !isIntegerAbiOutput(Abi, unit->Name) &&
         !signatureReturnUsesUnit(call, *unit)) {
