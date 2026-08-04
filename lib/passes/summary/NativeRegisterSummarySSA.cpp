@@ -268,6 +268,7 @@ enum class NativeSignatureSlotKind {
   IntegerRegister,
   FloatRegister,
   IntegerStack,
+  FloatStack,
 };
 
 // A signature slot is the bridge between the ABI slot and the lifted register
@@ -1742,7 +1743,8 @@ SignatureShape shapeForKnownExternal(
 
 NativeRegisterCallInputSlot callInputSlot(const NativeSignatureSlot &slot) {
   NativeRegisterCallInputSlot input;
-  if (slot.Kind == NativeSignatureSlotKind::IntegerStack) {
+  if (slot.Kind == NativeSignatureSlotKind::IntegerStack ||
+      slot.Kind == NativeSignatureSlotKind::FloatStack) {
     input.Kind = NativeRegisterCallInputSlotKind::Stack;
     input.StackSpace = slot.StackSpace;
     input.StackOffset = slot.StackOffset;
@@ -1754,7 +1756,8 @@ NativeRegisterCallInputSlot callInputSlot(const NativeSignatureSlot &slot) {
   }
   input.OffsetBits = slot.OffsetBits;
   input.SizeBits = slot.SizeBits;
-  input.Float = slot.Kind == NativeSignatureSlotKind::FloatRegister;
+  input.Float = slot.Kind == NativeSignatureSlotKind::FloatRegister ||
+                slot.Kind == NativeSignatureSlotKind::FloatStack;
   return input;
 }
 
@@ -1784,7 +1787,7 @@ NativeRegisterCallInputSlot callInputSlot(const AbiFacts::StackSlot &slot,
   input.StackSize = sizeBytes;
   input.StackAlign = slot.Align;
   input.SizeBits = sizeBytes * 8;
-  input.Float = false;
+  input.Float = llvmType->isFloatingPointTy();
   return input;
 }
 
@@ -2111,7 +2114,8 @@ std::string calleeNameForWarning(const llvm::CallBase &call) {
 }
 
 std::string slotRegisterName(const NativeSignatureSlot &slot) {
-  if (slot.Kind == NativeSignatureSlotKind::IntegerStack) {
+  if (slot.Kind == NativeSignatureSlotKind::IntegerStack ||
+      slot.Kind == NativeSignatureSlotKind::FloatStack) {
     return slot.StackSpace + "+" + std::to_string(slot.StackOffset);
   }
   if (slot.Unit != nullptr) {
@@ -2248,7 +2252,37 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
       continue;
     }
 
-    unsigned rawPrefix = localDefinitionPrefix(integerSlots);
+    // Walk the evidence in source order.  A store wider than the evidence
+    // grid (e.g. an i386 8-byte fstpl double inside a 4-byte grid) widens the
+    // vararg slot and covers the following grid slots; without this, binding
+    // would mismatch on the store type and the covered upper half would look
+    // like a hole that truncates the tail.
+    std::vector<NativeRegisterCallInputSlot> tailInputs;
+    unsigned consumedSlots = 0;
+    for (unsigned cursor = 0; cursor < integerSlots.size();) {
+      const NativeRegisterCallsiteSlotEvidence &evidence = integerSlots[cursor];
+      if (evidence.Origin !=
+          NativeRegisterCallsiteValueOrigin::LocalDefinition) {
+        break;
+      }
+      NativeRegisterCallInputSlot input = callInputSlot(evidence);
+      unsigned covered = 1;
+      if (evidence.StoreSizeBytes != 0 && evidence.StackSize != 0 &&
+          evidence.StoreSizeBytes % evidence.StackSize == 0) {
+        unsigned wideSlots = evidence.StoreSizeBytes / evidence.StackSize;
+        if (wideSlots >= 1) {
+          input.StackSize = evidence.StoreSizeBytes;
+          input.SizeBits = evidence.StoreSizeBytes * 8;
+          input.Float = evidence.StoreIsFloat;
+          covered = std::min<unsigned>(
+              wideSlots, static_cast<unsigned>(integerSlots.size() - cursor));
+        }
+      }
+      tailInputs.push_back(std::move(input));
+      consumedSlots += covered;
+      cursor += covered;
+    }
+    unsigned rawPrefix = tailInputs.size();
     unsigned allowed = integerSlots.size();
     if (callsite.MaxArgs != 0) {
       unsigned maxTail = callsite.MaxArgs > callsite.FixedArgs
@@ -2258,7 +2292,7 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
     }
     unsigned inferredTail = std::min(rawPrefix, allowed);
     for (unsigned index = 0; index < inferredTail; ++index) {
-      shape.Inputs.push_back(callInputSlot(integerSlots[index]));
+      shape.Inputs.push_back(tailInputs[index]);
     }
     if (rawPrefix > allowed) {
       warnings.push_back(
@@ -2267,12 +2301,12 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
                                      "/max=" + std::to_string(allowed),
                                  "vararg_evidence_truncated_by_max_args"));
     }
-    if (hasLocalDefinitionAfter(integerSlots, rawPrefix + 1)) {
+    if (hasLocalDefinitionAfter(integerSlots, consumedSlots + 1)) {
       warnings.push_back(varArgInferenceWarning(
           callsite, "tail=" + std::to_string(inferredTail),
           "non_contiguous_vararg_evidence"));
     }
-    warnIfStoppedAtCallClobber(warnings, callsite, integerSlots, rawPrefix,
+    warnIfStoppedAtCallClobber(warnings, callsite, integerSlots, consumedSlots,
                                "vararg_evidence_stopped_at_call_clobber");
     callsiteShapes.emplace(callsite.Call, std::move(shape));
   }
@@ -5635,6 +5669,25 @@ private:
   std::optional<NativeSignatureSlot>
   signatureSlotForCallInput(const NativeRegisterCallInputSlot &input) const {
     if (input.Kind == NativeRegisterCallInputSlotKind::Stack) {
+      if (input.Float) {
+        llvm::Type *type =
+            floatTypeForSizeBits(Function.getContext(), input.SizeBits);
+        if (type == nullptr) {
+          return std::nullopt;
+        }
+        NativeSignatureSlot slot;
+        slot.Kind = NativeSignatureSlotKind::FloatStack;
+        slot.AbiName =
+            input.StackSpace + "+" + std::to_string(input.StackOffset);
+        slot.StackSpace = input.StackSpace;
+        slot.StackOffset = input.StackOffset;
+        slot.StackSize = input.StackSize;
+        slot.StackAlign = input.StackAlign;
+        slot.OffsetBits = 0;
+        slot.SizeBits = input.SizeBits;
+        slot.LlvmType = type;
+        return slot;
+      }
       llvm::Type *type =
           llvm::IntegerType::get(Function.getContext(), input.SizeBits);
       NativeSignatureSlot slot;
@@ -5719,10 +5772,11 @@ private:
         SignatureState.Warnings.push_back(callSlotWarning(
             call, slot, "call_arg", "call_arg_binding_uses_clobber_value"));
       }
+      bool isStackSlot = slot.Kind == NativeSignatureSlotKind::IntegerStack ||
+                         slot.Kind == NativeSignatureSlotKind::FloatStack;
       llvm::StoreInst *store =
-          slot.Kind == NativeSignatureSlotKind::IntegerStack
-              ? findNearestStackStoreBeforeCall(call, slot)
-              : findNearestStoreBeforeCall(call, *unit);
+          isStackSlot ? findNearestStackStoreBeforeCall(call, slot)
+                      : findNearestStoreBeforeCall(call, *unit);
       bindings.push_back(CallArgStoreBinding{store, unit, value, value,
                                              slotType(slot),
                                              static_cast<unsigned>(index)});
@@ -5742,7 +5796,8 @@ private:
                                    const NativeSignatureSlot &slot,
                                    llvm::Twine rangeName,
                                    bool allowUnknownSegments = false) {
-    if (slot.Kind == NativeSignatureSlotKind::IntegerStack) {
+    if (slot.Kind == NativeSignatureSlotKind::IntegerStack ||
+        slot.Kind == NativeSignatureSlotKind::FloatStack) {
       auto *call = llvm::dyn_cast<llvm::CallBase>(&before);
       return call == nullptr ? nullptr : readStackSlotValueBefore(*call, slot);
     }
@@ -5831,6 +5886,19 @@ private:
     return builder.CreateZExtOrTrunc(value, targetType, "stack.arg.cast");
   }
 
+  // The ABI evidence grid steps by pointer-sized slots (4 bytes on i386, 8 on
+  // x64).  A widened vararg slot (e.g. an 8-byte double in a 4-byte grid)
+  // still indexes in grid units so relative-group store matching lines up
+  // with the actual 4-byte-spaced outgoing stores.
+  uint64_t stackGridStep(uint32_t alignBytes) const {
+    const llvm::DataLayout &layout = Function.getParent()->getDataLayout();
+    uint64_t gridBytes = layout.getPointerSize();
+    if (gridBytes == 0) {
+      return 0;
+    }
+    return stackSlotStep(static_cast<uint32_t>(gridBytes), alignBytes);
+  }
+
   std::optional<uint64_t>
   stackSlotIndex(const NativeSignatureSlot &slot) const {
     for (const AbiFacts::StackSlot &abiSlot : Abi.StackInputsInOrder) {
@@ -5842,7 +5910,7 @@ private:
       if (abiSlot.Align != 0 && relative % abiSlot.Align != 0) {
         continue;
       }
-      uint64_t step = stackSlotStep(slot.StackSize, abiSlot.Align);
+      uint64_t step = stackGridStep(abiSlot.Align);
       if (step == 0 || relative % step != 0) {
         continue;
       }
@@ -5895,7 +5963,7 @@ private:
         callsiteStackAddress(call, slot);
     std::optional<uint64_t> stackIndex = stackSlotIndex(slot);
     uint64_t stackStep =
-        stackIndex ? stackSlotStep(slot.StackSize, slot.StackAlign) : 0;
+        stackIndex ? stackGridStep(slot.StackAlign) : 0;
     auto recordRelativeStore = [&](const NativeStackAddress &address,
                                    llvm::StoreInst *store) {
       for (RelativeStoreGroup &group : relativeStores) {
@@ -6029,12 +6097,13 @@ private:
       return nullptr;
     }
     llvm::Type *targetType = slotType(slot);
-    if (targetType == nullptr || !targetType->isIntegerTy()) {
+    if (targetType == nullptr ||
+        (!targetType->isIntegerTy() && !targetType->isFloatingPointTy())) {
       return nullptr;
     }
     std::optional<uint64_t> stackIndex = stackSlotIndex(slot);
     uint64_t stackStep =
-        stackIndex ? stackSlotStep(slot.StackSize, slot.StackAlign) : 0;
+        stackIndex ? stackGridStep(slot.StackAlign) : 0;
     if (!stackIndex || stackStep == 0 ||
         *stackIndex >
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /

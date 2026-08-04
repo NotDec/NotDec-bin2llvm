@@ -258,6 +258,69 @@ x64 fortune 目前最终 IR 中：
 - 完整 alias 分析。
 - struct/byval/sret 参数恢复。
 - stdcall callee pop 差异。
+
+# 实现记录 2026-08-04：fp vararg 栈槽按实际 store 宽度加宽
+
+## 问题
+
+i386 fortune 的 `notdec_native_19b0` 里有两个 `__fprintf_chk` 调用用 `fstpl` 压 8
+字节 double 作为 vararg。第一遍 evidence 网格是 4 字节 i32 槽，double store 落在
+`stack+16`（LocalDefinition），但 `stack+20`（double 上半部分）没有 store 所以是
+Unknown。推断只得出 1 个 i32 tail 槽，第二遍 binding 读到 double store 与 i32 槽类型
+不匹配，报 2 条 `call_arg_binding_missing`（`stack+16`），且 double 被整个丢掉。
+
+## 修改
+
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummary.h`：
+  `NativeRegisterCallsiteSlotEvidence` 增加 `StoreSizeBytes` / `StoreIsFloat`，记录让
+  该槽成为 LocalDefinition 的那次 store 的字节宽和浮点性。
+- `lib/passes/summary/NativeRegisterSummary.cpp`：
+  - `State` 增加 `StackSlotStores`（`StackSlotStoreInfo`），在 `transferInstruction`
+    的固定栈槽 store 分支随 `StackSlotOrigins` 一起更新；
+  - `joinState`、`consumeCallerStackArgEvidence`、`State::operator==` 同步维护；
+  - `callsiteOrigin` 增加 `resolvedKey` 出参，`callsiteEvidence` 在 origin 为
+    LocalDefinition 时把 store 信息填进 evidence。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`：
+  - `NativeSignatureSlotKind` 增加 `FloatStack`；`signatureSlotForCallInput` 对
+    float 栈 input 生成 double/float 槽；`callInputSlot`、`slotRegisterName`、
+    `readSlotValueBefore`、`callArgStoreBindings` 的栈槽分支都覆盖 FloatStack；
+  - `inferExternalCallShapes` 的整数 vararg 前缀改成分步循环：遇到
+    `StoreSizeBytes` 大于网格宽（8 字节 double）时把该槽扩成对应宽度/类型的输入槽，
+    并跳过被覆盖的下一格（i64 store 同理）；
+  - `stackSlotIndex` / `scanStackStoresBeforeCall` /
+    `readCrossBlockStackSlotBeforeCall` 的相对组匹配改用 `stackGridStep`（指针宽度
+    的网格步长，i386 4 / x64 8），宽槽也能在 alloca 相对组里命中；
+  - `readCrossBlockStackSlotBeforeCall` 允许浮点目标类型。
+- `tests/native_register_summary_ssa_test.cpp`：新增
+  `testI386NativeFrameOutgoingFloatVarArgIsWidened`，按 19b0 的布局（ESP -48、
+  alloca+12 放 double、下面 3 个 i32）验证 `__fprintf_chk` 重写后第 4 个参数是
+  double 常量，且 4 个 store 都被标记删除。
+
+## 验证
+
+- `native_register_summary_ssa_test` 通过（含新单测）。
+- i386 fortune 回归
+  `scripts/native-fortune-i386-regression.sh` 通过：2 条
+  `call_arg_binding_missing` 消失，`__fprintf_chk` 两个调用点正确带上 `double`
+  vararg，warning 文件与基线只差这 2 条，无新增告警。
+- x64 fortune 回归通过，无退化。
+- bin2llvm 全量 ctest：16/17 通过；
+  `notdec.heritage_to_llvm.forward_defs` 失败为既有问题（stash 掉本改动后仍失败，
+  与本改动无关）。
+
+## 评分与替代方案
+
+- 实现效果：直接消掉 19b0 两条 fp vararg 误报，double 进入调用参数，绑定与重写链路
+  行为一致；i64 栈 vararg 顺带获得同一条加宽路径。
+- 复杂度：改动集中在第一遍证据携带 store 信息 + 推断加宽 + 网格步长统一，没有新
+  增抽象层；风险点是 evidence 网格步长从“槽自身大小”改成“指针宽度”，已在 i386/x64
+  回归里验证不退化。
+- 维护成本：`FloatStack` 只多一个 kind，后续 float 栈参数（非 vararg）也能复用；
+  证据字段有注释说明语义。
+- 更优方案讨论：曾考虑第一遍直接生成 8 字节 double evidence 槽（会让 integer/float
+  槽列表分裂，且 upper-half 槽语义复杂），以及绑定期临时加宽（shape 已固定，重写
+  类型不一致）。最终选择“evidence 携带 store 类型 + 推断期加宽”，因为证据网格保持
+  ABI 原样，加宽只发生在消费侧，两遍 pass 各自职责清晰。
 - x87 / float stack 参数恢复。
 - heritage prototype recovery 路线维护。
 

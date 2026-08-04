@@ -172,6 +172,19 @@ struct State {
   // Values are intentionally coarse: the summary only needs to know whether a
   // cspec stack slot was explicitly written before a call.
   std::map<StackSlotKey, NativeRegisterCallsiteValueOrigin> StackSlotOrigins;
+  // The last store that wrote each evidence slot, kept beside
+  // StackSlotOrigins so callsite evidence can widen a stack vararg slot when
+  // the ABI grid (4 bytes on i386) is narrower than the actual store (an
+  // 8-byte fstpl double).
+  struct StackSlotStoreInfo {
+    uint32_t SizeBytes = 0;
+    bool IsFloat = false;
+
+    bool operator==(const StackSlotStoreInfo &other) const {
+      return SizeBytes == other.SizeBytes && IsFloat == other.IsFloat;
+    }
+  };
+  std::map<StackSlotKey, StackSlotStoreInfo> StackSlotStores;
   // SSA values known to be a function-entry register plus a constant offset.
   // Offset 0 is also used for saved register values loaded back from stack.
   std::map<llvm::Value *, ValueOrigin> ValueOrigins;
@@ -180,6 +193,7 @@ struct State {
            EndsInNoReturn == other.EndsInNoReturn && Cells == other.Cells &&
            Origins == other.Origins && StackSlots == other.StackSlots &&
            StackSlotOrigins == other.StackSlotOrigins &&
+           StackSlotStores == other.StackSlotStores &&
            ValueOrigins == other.ValueOrigins;
   }
 
@@ -1006,6 +1020,17 @@ bool joinState(State &target, const State &source) {
       ++it;
     }
   }
+  for (auto it = target.StackSlotStores.begin();
+       it != target.StackSlotStores.end();) {
+    auto sourceIt = source.StackSlotStores.find(it->first);
+    if (sourceIt == source.StackSlotStores.end() ||
+        !(sourceIt->second == it->second)) {
+      it = target.StackSlotStores.erase(it);
+      changed = true;
+    } else {
+      ++it;
+    }
+  }
   for (auto it = target.ValueOrigins.begin();
        it != target.ValueOrigins.end();) {
     auto sourceIt = source.ValueOrigins.find(it->first);
@@ -1427,7 +1452,8 @@ private:
 
   NativeRegisterCallsiteValueOrigin
   callsiteOrigin(const State &state, llvm::CallBase &call,
-                 const NativeRegisterCallInputSlot &slot) const {
+                 const NativeRegisterCallInputSlot &slot,
+                 StackSlotKey *resolvedKey = nullptr) const {
     if (slot.Kind == NativeRegisterCallInputSlotKind::Stack) {
       std::optional<StackSlotKey> key = callsiteStackSlot(call, slot);
       if (!key) {
@@ -1446,6 +1472,9 @@ private:
       };
       if (std::optional<NativeRegisterCallsiteValueOrigin> origin =
               originFor(*key)) {
+        if (resolvedKey != nullptr) {
+          *resolvedKey = *key;
+        }
         return *origin;
       }
       // After the stack frame rewrite, outgoing argument stores live in
@@ -1455,6 +1484,9 @@ private:
               entrySlotToNativeFrameKey(*call.getFunction(), *key)) {
         if (std::optional<NativeRegisterCallsiteValueOrigin> origin =
                 originFor(*frameKey)) {
+          if (resolvedKey != nullptr) {
+            *resolvedKey = *frameKey;
+          }
           return *origin;
         }
       }
@@ -1500,7 +1532,17 @@ private:
       evidence.OffsetBits = slot.OffsetBits;
       evidence.SizeBits = slot.SizeBits;
       evidence.Float = slot.Float;
-      evidence.Origin = callsiteOrigin(state, call, slot);
+      StackSlotKey resolvedKey;
+      evidence.Origin =
+          callsiteOrigin(state, call, slot, &resolvedKey);
+      if (slot.Kind == NativeRegisterCallInputSlotKind::Stack &&
+          evidence.Origin == NativeRegisterCallsiteValueOrigin::LocalDefinition) {
+        auto storeIt = state.StackSlotStores.find(resolvedKey);
+        if (storeIt != state.StackSlotStores.end()) {
+          evidence.StoreSizeBytes = storeIt->second.SizeBytes;
+          evidence.StoreIsFloat = storeIt->second.IsFloat;
+        }
+      }
       result.push_back(std::move(evidence));
     }
     return result;
@@ -1654,6 +1696,14 @@ private:
       }
       if (std::optional<StackSlotKey> slot =
               fixedStackSlot(store->getPointerOperand(), *store)) {
+        State::StackSlotStoreInfo storeInfo;
+        if (llvm::Type *valueType = store->getValueOperand()->getType();
+            valueType != nullptr && valueType->isSized() &&
+            (valueType->isIntegerTy() || valueType->isFloatingPointTy())) {
+          storeInfo.SizeBytes =
+              static_cast<uint32_t>(valueType->getScalarSizeInBits() / 8);
+          storeInfo.IsFloat = valueType->isFloatingPointTy();
+        }
         std::optional<ValueOrigin> origin =
             entryValueOrigin(store->getValueOperand(), state);
         if (origin && origin->Offset == 0 &&
@@ -1668,6 +1718,7 @@ private:
               origin ? NativeRegisterCallsiteValueOrigin::ForwardedEntry
                      : NativeRegisterCallsiteValueOrigin::LocalDefinition;
         }
+        state.StackSlotStores[*slot] = storeInfo;
       } else {
         markInstructionEntryValueReads(inst, state);
       }
@@ -1931,6 +1982,7 @@ private:
     // Keep StackSlots for saved-register tracking, but discard this separate
     // evidence so a reused outgoing area cannot widen a later call signature.
     state.StackSlotOrigins.clear();
+    state.StackSlotStores.clear();
   }
 
   void markNoReturnExit(State &state) const {

@@ -78,6 +78,13 @@ struct NativeRegisterCallsiteSlotEvidence {
   unsigned OffsetBits = 0;
   unsigned SizeBits = 0;
   bool Float = false;
+  // When the last write before the call made this stack slot LocalDefinition
+  // with a store wider than the ABI evidence grid (e.g. an i386 fstpl double
+  // inside a 4-byte vararg grid), the store's byte width and float-ness.
+  // Inference widens the vararg slot to this type and covers the following
+  // grid slots instead of binding a type-mismatched integer.
+  uint32_t StoreSizeBytes = 0;
+  bool StoreIsFloat = false;
   NativeRegisterCallsiteValueOrigin Origin =
       NativeRegisterCallsiteValueOrigin::Unknown;
 };

@@ -2477,6 +2477,108 @@ bool testI386NativeFrameOutgoingVarArgPrefixIsBound() {
                   "module failed verifier after native frame vararg rewrite");
 }
 
+bool testI386NativeFrameOutgoingFloatVarArgIsWidened() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-i386-native-frame-float-vararg", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackTestAbi(module);
+  auto *i8 = llvm::Type::getInt8Ty(context);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  auto *doubleTy = llvm::Type::getDoubleTy(context);
+  llvm::GlobalVariable *espGlobal =
+      createRegisterGlobal(module, "ESP", i32, 0, 4);
+  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+
+  auto *calleeType = llvm::FunctionType::get(i32, {}, true);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "__fprintf_chk", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "i386_native_frame_float_vararg", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  // The outgoing area is 16 bytes and sits at the bottom of a 48-byte
+  // frame; mirror the real caller by keeping ESP 48 bytes below entry so the
+  // cspec entry-SP slots line up with the alloca offsets.
+  auto *stackType = llvm::ArrayType::get(i8, 48);
+  llvm::AllocaInst *stack =
+      builder.CreateAlloca(stackType, nullptr, "notdec_stack.native");
+  llvm::Value *entryEsp = builder.CreateLoad(i32, espGlobal, "ESP.entry");
+  llvm::Value *frameEsp = builder.CreateSub(
+      entryEsp, llvm::ConstantInt::get(i32, 48), "ESP.frame");
+  builder.CreateStore(frameEsp, espGlobal);
+  llvm::Value *basePointer = builder.CreateInBoundsGEP(
+      i8, stack, llvm::ConstantInt::get(i32, 12), "native.arg.base");
+  llvm::Value *baseInteger =
+      builder.CreatePtrToInt(basePointer, i32, "native.arg.base.int");
+  auto stackPointer = [&](int delta) {
+    llvm::Value *address = builder.CreateAdd(
+        baseInteger, llvm::ConstantInt::get(i32, delta), "native.arg.addr");
+    return builder.CreateIntToPtr(address, llvm::PointerType::get(context, 0));
+  };
+  // The double occupies the highest vararg grid slot (8 bytes in a 4-byte
+  // grid); the three fixed i32 arguments sit below it.
+  builder.CreateStore(llvm::ConstantFP::get(doubleTy, 3.14), stackPointer(0));
+  for (auto [delta, value] :
+       {std::pair<int, int>{-4, 33}, std::pair<int, int>{-8, 1},
+        std::pair<int, int>{-12, 22}}) {
+    builder.CreateStore(llvm::ConstantInt::get(i32, value), stackPointer(delta));
+  }
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction =
+      module.getFunction("i386_native_frame_float_vararg");
+  if (!expect(rewrittenFunction != nullptr,
+              "i386 native frame float vararg caller missing")) {
+    return false;
+  }
+  llvm::CallInst *rewritten = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(rewrittenFunction)) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName() == "__fprintf_chk") {
+      rewritten = call;
+    }
+  }
+  if (!expect(rewritten != nullptr,
+              "i386 native frame float vararg call missing")) {
+    return false;
+  }
+  auto constantArg = [&](unsigned index) -> llvm::ConstantInt * {
+    return rewritten->arg_size() <= index
+               ? nullptr
+               : llvm::dyn_cast<llvm::ConstantInt>(
+                     rewritten->getArgOperand(index));
+  };
+  llvm::ConstantInt *arg0 = constantArg(0);
+  llvm::ConstantInt *arg1 = constantArg(1);
+  llvm::ConstantInt *arg2 = constantArg(2);
+  llvm::ConstantFP *arg3 =
+      rewritten->arg_size() <= 3
+          ? nullptr
+          : llvm::dyn_cast<llvm::ConstantFP>(rewritten->getArgOperand(3));
+  bool doubleOk = arg3 != nullptr &&
+                  arg3->getValueAPF().convertToDouble() == 3.14;
+  return expect(rewritten->arg_size() >= 4,
+                "i386 native frame float vararg tail was not bound") &&
+         expect(arg0 != nullptr && arg0->getZExtValue() == 22,
+                "i386 native frame float vararg first stack arg was not bound") &&
+         expect(arg1 != nullptr && arg1->getZExtValue() == 1,
+                "i386 native frame float vararg second stack arg was not bound") &&
+         expect(arg2 != nullptr && arg2->getZExtValue() == 33,
+                "i386 native frame float vararg third stack arg was not bound") &&
+         expect(doubleOk,
+                "i386 native frame float vararg double was not bound") &&
+         expect(summary.CallArgStoresMarked == 4,
+                "i386 native frame float vararg stores were not marked") &&
+         verifyOk(module,
+                  "module failed verifier after native frame float vararg rewrite");
+}
+
 bool testI386StackPointerSummaryOutgoingVarArgPrefixIsBound() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-i386-esp-summary-vararg-prefix", context);
@@ -8829,6 +8931,7 @@ int main() {
   ok &= testI386NativeFrameOutgoingStackArgIsBound();
   ok &= testI386NativeFrameLoadDoesNotBecomeStackInput();
   ok &= testI386NativeFrameOutgoingVarArgPrefixIsBound();
+  ok &= testI386NativeFrameOutgoingFloatVarArgIsWidened();
   ok &= testI386StackPointerSummaryOutgoingVarArgPrefixIsBound();
   ok &= testX64KnownExternalUsesCspecStackOverflowOffset();
   ok &= testX64AlignedStackPointerOutgoingArgIsBound();
