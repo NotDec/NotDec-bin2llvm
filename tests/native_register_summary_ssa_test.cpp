@@ -1545,6 +1545,43 @@ bool testPartialReadLoopPassthroughUsesDominatorTree() {
                   "module failed verifier after partial read loop DT test");
 }
 
+// SysV long double 返回值留在 x87 栈（ST0），而 ST0..ST7 已经折叠成
+// notdec.x87.* intrinsic 库调用，不在寄存器模型里。函数以 x87 栈返回时
+// （函数体最后计算指令是保留 ST0 的 x87 intrinsic），签名恢复不能给函数
+// 加假寄存器返回槽（RAX/XMM），否则尾部会 ret 垃圾值或 unknown。此时
+// 函数应保持 void 返回，值留在库内部状态，由调用方 fstp.f80() 弹出。
+bool testX87StackReturnKeepsVoidReturnType() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-x87-stack-return", context);
+  attachTestAbi(module);
+
+  llvm::FunctionType *fsqrtType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), false);
+  llvm::Function *fsqrt = llvm::cast<llvm::Function>(
+      module.getOrInsertFunction("notdec.x87.fsqrt", fsqrtType).getCallee());
+
+  // lifting 形态：函数先建为 void 返回（void (i64)），函数体最后是 x87
+  // intrinsic，随后直接 ret。
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::InternalLinkage, "x87_stack_return", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(fsqrt->getFunctionType(), fsqrt);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("x87_stack_return");
+  return expect(rewritten != nullptr,
+                "x87 stack return function was not preserved") &&
+         expect(rewritten->getReturnType()->isVoidTy(),
+                "x87 stack return gained a fake register return slot") &&
+         verifyOk(module,
+                  "module failed verifier after x87 stack return test");
+}
+
 bool testRegisterPointerPhiLoadIsCanonicalized() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-register-pointer-phi-load", context);
@@ -8912,6 +8949,7 @@ int main() {
   ok &= testPhiIncomingMatchesPredecessors();
   ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
   ok &= testPartialReadLoopPassthroughUsesDominatorTree();
+  ok &= testX87StackReturnKeepsVoidReturnType();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();
   ok &= testUnknownPhiIncomingUsesFrozenPoison();
   ok &= testSelfOnlyPhiBecomesOpaqueUnknown();
