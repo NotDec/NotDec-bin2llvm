@@ -157,10 +157,14 @@ struct Cell {
 struct RegisterOriginBits {
   llvm::APInt Entry;
   llvm::APInt Local;
+  // Local 中"最后一次写是浮点指令"的子集。XMM 槽被 movq/punpcklqdq 这类
+  // 整数打包写也会变 Local，但不是浮点参数；浮点参数证据只认这个子集。
+  llvm::APInt FloatLocal;
   llvm::APInt CallClobber;
 
   bool operator==(const RegisterOriginBits &other) const {
     return Entry == other.Entry && Local == other.Local &&
+           FloatLocal == other.FloatLocal &&
            CallClobber == other.CallClobber;
   }
 };
@@ -988,10 +992,10 @@ unsigned registerBitWidth(llvm::GlobalVariable *global) {
 RegisterOriginBits defaultOrigin(llvm::GlobalVariable *global) {
   unsigned width = registerBitWidth(global);
   if (width == 0) {
-    return {llvm::APInt(), llvm::APInt(), llvm::APInt()};
+    return {llvm::APInt(), llvm::APInt(), llvm::APInt(), llvm::APInt()};
   }
   return {llvm::APInt::getAllOnes(width), llvm::APInt(width, 0),
-          llvm::APInt(width, 0)};
+          llvm::APInt(width, 0), llvm::APInt(width, 0)};
 }
 
 RegisterOriginBits originIn(const State &state, llvm::GlobalVariable *global) {
@@ -1046,6 +1050,27 @@ void setFullRegisterOrigin(State &state, llvm::GlobalVariable *global,
   }
 }
 
+bool hasFloatWriteMetadata(const llvm::Instruction &inst) {
+  return inst.getMetadata("notdec.register.float_write") != nullptr;
+}
+
+// 浮点写记录：只对 Local 定义的写调用，维护 FloatLocal 子集。
+void recordRegisterFloatWrite(State &state, llvm::GlobalVariable *global,
+                              const llvm::APInt &mask, bool isFloatWrite) {
+  unsigned width = registerBitWidth(global);
+  if (width == 0 || mask.getBitWidth() == 0 || mask.isZero()) {
+    return;
+  }
+  llvm::APInt boundedMask = mask.zextOrTrunc(width);
+  RegisterOriginBits bits = originIn(state, global);
+  if (isFloatWrite) {
+    bits.FloatLocal |= boundedMask;
+  } else {
+    bits.FloatLocal &= ~boundedMask;
+  }
+  state.Origins[global] = std::move(bits);
+}
+
 bool joinState(State &target, const State &source) {
   if (!source.Reachable) {
     return false;
@@ -1081,6 +1106,7 @@ bool joinState(State &target, const State &source) {
     RegisterOriginBits joined = {
         before.Entry & incoming.Entry,
         before.Local & incoming.Local,
+        before.FloatLocal & incoming.FloatLocal,
         before.CallClobber & incoming.CallClobber,
     };
     if (!(joined == before)) {
@@ -1595,6 +1621,11 @@ private:
     }
     RegisterOriginBits bits = originIn(state, global);
     if ((bits.Local & mask) == mask) {
+      // 浮点参数证据只认最后一次写是浮点指令的 Local 槽；movq/punpcklqdq
+      // 整数打包写的 XMM 槽会退化成 Mixed，不参与参数推断。
+      if (slot.Float && (bits.FloatLocal & mask) != mask) {
+        return NativeRegisterCallsiteValueOrigin::Mixed;
+      }
       return NativeRegisterCallsiteValueOrigin::LocalDefinition;
     }
     if ((bits.Entry & mask) == mask) {
@@ -1778,9 +1809,17 @@ private:
         } else {
           markEntryValueRead(store->getValueOperand(), state);
           writeRegister(state, access.Unit->Global);
-          setFullRegisterOrigin(state, access.Unit->Global,
-                                registerOriginKindForStoredValue(
-                                    store->getValueOperand(), state));
+          RegisterOriginKind storedKind =
+              registerOriginKindForStoredValue(store->getValueOperand(),
+                                               state);
+          setFullRegisterOrigin(state, access.Unit->Global, storedKind);
+          if (storedKind == RegisterOriginKind::Local) {
+            recordRegisterFloatWrite(
+                state, access.Unit->Global,
+                llvm::APInt::getAllOnes(
+                    registerBitWidth(access.Unit->Global)),
+                hasFloatWriteMetadata(*store));
+          }
         }
         state.ValueOrigins.erase(store);
         return;
@@ -1843,18 +1882,28 @@ private:
         auto unitIt = Units.find(partial->Global);
         if (unitIt != Units.end() && !isIgnored(unitIt->second, Options)) {
           markEntryValueRead(partial->Value, state);
+          RegisterOriginKind partialKind =
+              registerOriginKindForStoredValue(partial->Value, state);
+          bool floatWrite = hasFloatWriteMetadata(*call);
           if (isX64Low32GprWrite(*partial, unitIt->second)) {
             writeRegister(state, partial->Global);
-            setFullRegisterOrigin(
-                state, partial->Global,
-                registerOriginKindForStoredValue(partial->Value, state));
+            setFullRegisterOrigin(state, partial->Global, partialKind);
+            if (partialKind == RegisterOriginKind::Local) {
+              recordRegisterFloatWrite(
+                  state, partial->Global,
+                  llvm::APInt::getAllOnes(
+                      registerBitWidth(partial->Global)),
+                  floatWrite);
+            }
           } else {
             partialWriteRegister(state, partial->Global);
             llvm::APInt mask = registerRangeMask(
                 partial->Global, partial->BitOffset, partial->WriteWidth);
-            setRegisterOrigin(
-                state, partial->Global, mask,
-                registerOriginKindForStoredValue(partial->Value, state));
+            setRegisterOrigin(state, partial->Global, mask, partialKind);
+            if (partialKind == RegisterOriginKind::Local) {
+              recordRegisterFloatWrite(state, partial->Global, mask,
+                                       floatWrite);
+            }
           }
         }
         state.ValueOrigins.erase(&inst);

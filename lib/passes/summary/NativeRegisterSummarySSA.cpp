@@ -1936,8 +1936,16 @@ NativeExternalCallShapeMap buildExternalCallShapes(
 std::vector<NativeRegisterCallInputSlot>
 unknownExternalEvidenceSlots(const AbiFacts &abi, llvm::Module &module) {
   std::vector<NativeRegisterCallInputSlot> result;
-  result.reserve(abi.IntegerInputsInOrder.size() + 16);
+  result.reserve(abi.IntegerInputsInOrder.size() +
+                 abi.FloatInputsInOrder.size() + 16);
   for (const AbiFacts::RegisterSlot &slot : abi.IntegerInputsInOrder) {
+    result.push_back(callInputSlot(slot));
+  }
+  // Float (SSE) arguments live in XMM registers, which lift as the low lanes
+  // of the ZMM globals.  Without these slots, unknown externals that only take
+  // floating-point arguments (e.g. round()) infer arity 0 and get rewritten
+  // with no arguments at all.
+  for (const AbiFacts::RegisterSlot &slot : abi.FloatInputsInOrder) {
     result.push_back(callInputSlot(slot));
   }
   if (!abi.StackInputsInOrder.empty()) {
@@ -1974,10 +1982,6 @@ unsigned localDefinitionPrefix(
     ++prefix;
   }
   return prefix;
-}
-
-unsigned localDefinitionPrefix(const NativeRegisterExternalCallsite &callsite) {
-  return localDefinitionPrefix(callsite.Slots);
 }
 
 std::vector<NativeRegisterCallsiteSlotEvidence>
@@ -2235,15 +2239,37 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
     std::vector<NativeRegisterSummarySSAWarning> &warnings) {
   NativeExternalCallsiteShapeMap callsiteShapes;
   std::map<std::string, std::vector<unsigned>> aritiesByCallee;
+  std::map<std::string, std::vector<std::pair<unsigned, unsigned>>>
+      intFloatAritiesByCallee;
   for (const NativeRegisterExternalCallsite &callsite :
        baseSummary.ExternalCallsites) {
     if (callsite.Kind == NativeRegisterExternalCallsiteKind::UnknownExternal) {
       if (!callsite.Indirect) {
-        unsigned prefix = localDefinitionPrefix(callsite);
-        aritiesByCallee[callsite.CalleeName].push_back(prefix);
+        // Integer and float (SSE) arguments occupy independent register
+        // sequences in the SysV ABI, so count each sequence separately.  A
+        // plain serialized prefix would stop at the first argument of the
+        // other class (e.g. f(int, double) would stop at RSI) and undercount.
+        std::vector<NativeRegisterCallsiteSlotEvidence> integerSlots =
+            renumberedSlotsByKind(callsite, false);
+        std::vector<NativeRegisterCallsiteSlotEvidence> floatSlots =
+            renumberedSlotsByKind(callsite, true);
+        unsigned integerCount = localDefinitionPrefix(integerSlots);
+        unsigned floatCount = localDefinitionPrefix(floatSlots);
+        aritiesByCallee[callsite.CalleeName].push_back(integerCount +
+                                                       floatCount);
+        intFloatAritiesByCallee[callsite.CalleeName].push_back(
+            {integerCount, floatCount});
         warnIfStoppedAtCallClobber(
-            warnings, callsite, callsite.Slots, prefix,
+            warnings, callsite, integerSlots, integerCount,
             "unknown_external_arity_stopped_at_call_clobber");
+        // 浮点侧的 ZMM 寄存器在函数入口就是 ABI call-clobber，绝大多数调用点
+        // 根本没有浮点参数证据（floatCount==0），第一个槽就是 clobber 不算
+        // "证据被打断"，只在已有浮点参数证据后才报告。
+        if (floatCount > 0) {
+          warnIfStoppedAtCallClobber(
+              warnings, callsite, floatSlots, floatCount,
+              "float_unknown_external_arity_stopped_at_call_clobber");
+        }
       }
       continue;
     }
@@ -2377,6 +2403,32 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
     // The first pass only infers input arity.  Do not cap unknown external
     // returns to the built-in one-register default; later demand decides them.
     prototype.MaxReturnRegisters = std::numeric_limits<unsigned>::max();
+    // Prefer the callsite that reaches maxArity with the most float
+    // arguments: typed params let the rewrite bind them to XMM slots instead
+    // of overflowing into integer/stack slots.  Integer arguments are assumed
+    // to come first (the common C shape is a handle/pointer followed by
+    // floating data); interleaved float-in-the-middle shapes stay untyped.
+    unsigned bestIntegerCount = 0;
+    unsigned bestFloatCount = 0;
+    for (const auto &[integerCount, floatCount] :
+         intFloatAritiesByCallee[callee]) {
+      if (integerCount + floatCount == maxArity &&
+          floatCount > bestFloatCount) {
+        bestIntegerCount = integerCount;
+        bestFloatCount = floatCount;
+      }
+    }
+    if (bestFloatCount > 0) {
+      prototype.TypedParams.reserve(maxArity);
+      for (unsigned index = 0; index < bestIntegerCount; ++index) {
+        prototype.TypedParams.push_back(
+            NativeExternalPrototype::ValueType::PointerSized);
+      }
+      for (unsigned index = 0; index < bestFloatCount; ++index) {
+        prototype.TypedParams.push_back(
+            NativeExternalPrototype::ValueType::Double);
+      }
+    }
     prototypes[callee] = std::move(prototype);
     warnings.push_back(externalInferenceWarning(
         callee, detail, "inferred_unknown_external_arity", arities.size()));

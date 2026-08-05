@@ -179,7 +179,8 @@ uint64_t RegisterStorage::bitOffset(const RegisterUnit &unit,
 
 void RegisterStorage::addAccessMetadata(llvm::Value *instruction,
                                         const RegisterUnit &unit,
-                                        const RegisterAccess &access) {
+                                        const RegisterAccess &access,
+                                        bool isFloatWrite) {
   auto *inst = llvm::dyn_cast<llvm::Instruction>(instruction);
   if (inst == nullptr) {
     return;
@@ -194,6 +195,11 @@ void RegisterStorage::addAccessMetadata(llvm::Value *instruction,
   };
   inst->setMetadata("notdec.register.access",
                     llvm::MDNode::get(Context, metadata));
+  if (isFloatWrite) {
+    inst->setMetadata(
+        "notdec.register.float_write",
+        llvm::MDNode::get(Context, llvm::MDString::get(Context, "1")));
+  }
 }
 
 llvm::Value *RegisterStorage::read(llvm::IRBuilderBase &builder,
@@ -207,7 +213,7 @@ llvm::Value *RegisterStorage::read(llvm::IRBuilderBase &builder,
   if (unit->Offset == access.Offset && unit->Size == access.Size) {
     llvm::Value *value = builder.CreateLoad(global->getValueType(), global,
                                             access.Name.value_or(""));
-    addAccessMetadata(value, *unit, access);
+    addAccessMetadata(value, *unit, access, false);
     return value;
   }
 
@@ -221,12 +227,13 @@ llvm::Value *RegisterStorage::read(llvm::IRBuilderBase &builder,
       partialRead,
       {global, llvm::ConstantInt::get(llvm::Type::getInt64Ty(Context), offset)},
       access.Name.value_or(""));
-  addAccessMetadata(call, *unit, access);
+  addAccessMetadata(call, *unit, access, false);
   return call;
 }
 
 void RegisterStorage::write(llvm::IRBuilderBase &builder,
-                            const RegisterAccess &access, llvm::Value *value) {
+                            const RegisterAccess &access, llvm::Value *value,
+                            bool isFloatWrite) {
   RegisterUnit *unit = unitFor(access);
   if (unit == nullptr) {
     return;
@@ -237,7 +244,7 @@ void RegisterStorage::write(llvm::IRBuilderBase &builder,
   if (unit->Offset == access.Offset && unit->Size == access.Size) {
     llvm::Value *resized = builder.CreateZExtOrTrunc(value, globalType);
     llvm::Value *store = builder.CreateStore(resized, global);
-    addAccessMetadata(store, *unit, access);
+    addAccessMetadata(store, *unit, access, isFloatWrite);
     return;
   }
 
@@ -252,7 +259,7 @@ void RegisterStorage::write(llvm::IRBuilderBase &builder,
       partialWrite,
       {global, partialValue,
        llvm::ConstantInt::get(llvm::Type::getInt64Ty(Context), shift)});
-  addAccessMetadata(call, *unit, access);
+  addAccessMetadata(call, *unit, access, isFloatWrite);
 }
 
 } // namespace notdec::bin2llvm

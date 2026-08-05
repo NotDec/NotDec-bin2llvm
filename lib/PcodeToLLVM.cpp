@@ -279,6 +279,36 @@ bool isFloatBinaryOpcode(PcodeOpcode opcode) {
   }
 }
 
+// SSE 浮点语义指令的 mnemonic 集合。movq/punpcklqdq/pxor 这类整数打包也会
+// 写 XMM 寄存器，但不是浮点参数准备；x87 侧已经有独立的 mnemonic 分类，这里
+// 只覆盖 XMM 域。判断只用于给寄存器写打"浮点写"标记，供 register summary
+// 收紧浮点参数证据，宁缺毋滥。
+bool isSseFloatWriteMnemonic(llvm::StringRef mnemonic) {
+  return llvm::StringSwitch<bool>(mnemonic)
+      .Cases({"MOVSD", "MOVSS", "MOVAPD", "MOVAPS", "MOVUPD", "MOVUPS",
+              "MOVHPD", "MOVLPD", "MOVHPS", "MOVLPS", "MOVDDUP", "MOVSLDUP",
+              "MOVSHDUP", "MOVNTPS", "MOVNTPD"},
+             true)
+      .Cases({"CVTSI2SD", "CVTSI2SS", "CVTSS2SD", "CVTSD2SS", "CVTDQ2PD",
+              "CVTDQ2PS", "CVTPD2DQ", "CVTPS2DQ", "CVTPD2PS", "CVTPS2PD",
+              "CVTTPS2DQ", "CVTTPD2DQ"},
+             true)
+      .Cases({"ADDSD", "ADDSS", "SUBSD", "SUBSS", "MULSD", "MULSS", "DIVSD",
+              "DIVSS", "SQRTSD", "SQRTSS", "MAXSD", "MAXSS", "MINSD",
+              "MINSS", "RCPSS", "RSQRTSS", "RCPPS", "RSQRTPS", "SQRTPS",
+              "SQRTPD", "ADDPS", "ADDPD", "SUBPS", "SUBPD", "MULPS",
+              "MULPD", "DIVPS", "DIVPD", "ADDSUBPS", "ADDSUBPD", "HADDPS",
+              "HADDPD", "HSUBPS", "HSUBPD"},
+             true)
+      .Cases({"COMISD", "COMISS", "UCOMISD", "UCOMISS", "CMPSD", "CMPSS",
+              "CMPPS", "CMPPD"},
+             true)
+      .Cases({"ANDPD", "ANDPS", "ANDNPD", "ANDNPS", "ORPD", "ORPS", "XORPD",
+              "XORPS"},
+             true)
+      .Default(false);
+}
+
 // Intrinsic name suffix for the LLVM type an x87 operand is lifted to.
 std::string fpSuffix(llvm::Type *type) {
   if (type->isX86_FP80Ty()) {
@@ -366,6 +396,7 @@ public:
     CurrentProgramOps = &program.Ops;
     prepareX86CallReturnStackSuppression(program);
     prepareX86PcThunkSuppression(program);
+    prepareSseFloatWriteMarkers(program);
     prepareX87Window(program);
     if (!buildBasicBlocks(program, errorMessage)) {
       return false;
@@ -392,6 +423,7 @@ public:
 
       bool ended = false;
       for (size_t opIndex = start; opIndex < end; ++opIndex) {
+        CurrentOpIsFloatWrite = FloatWriteOpIndices.count(opIndex) != 0;
         auto x87It = X87Groups.find(opIndex);
         if (x87It != X87Groups.end()) {
           if (!lowerX87Window(x87It->second, errorMessage)) {
@@ -949,6 +981,31 @@ private:
       return classifyX87ByMnemonic(program, start, end, mnemonic);
     }
     return classifyX87ByShape(program, start, end);
+  }
+
+  // 找出会写 XMM 寄存器的 SSE 浮点指令，把对应 pcode op 记下来。register
+  // summary 需要知道"最后一次写是浮点指令"来区分真浮点参数和整数打包
+  // （movq/punpcklqdq），mnemonic 是唯一可靠的信号。
+  void prepareSseFloatWriteMarkers(const PcodeProgram &program) {
+    FloatWriteOpIndices.clear();
+    for (size_t start = 0; start < program.Ops.size();) {
+      size_t end = start + 1;
+      while (end < program.Ops.size() &&
+             program.Ops[end].Address == program.Ops[start].Address) {
+        ++end;
+      }
+      const std::string &mnemonic = program.Ops[start].Mnemonic;
+      if (!mnemonic.empty() && isSseFloatWriteMnemonic(mnemonic)) {
+        for (size_t index = start; index < end; ++index) {
+          const PcodeOpView &op = program.Ops[index];
+          if (op.Output && op.Output->IsRegister && op.Output->RegisterName &&
+              llvm::StringRef(*op.Output->RegisterName).starts_with("XMM")) {
+            FloatWriteOpIndices.insert(index);
+          }
+        }
+      }
+      start = end;
+    }
   }
 
   // Fold x87 instructions into the ST0/ST1 window model.  Each instruction
@@ -3044,7 +3101,7 @@ private:
       RegisterAccess access{varnode.Space, varnode.Offset, varnode.Size,
                             varnode.RegisterName};
       if (Registers->hasRegister(access)) {
-        Registers->write(Builder, access, resized);
+        Registers->write(Builder, access, resized, CurrentOpIsFloatWrite);
         return;
       }
     }
@@ -3985,6 +4042,9 @@ private:
   std::unordered_map<uint64_t, llvm::BasicBlock *> BlockForAddress;
   std::unordered_map<uint64_t, llvm::BasicBlock *> TailJumpBlockForAddress;
   std::set<size_t> SuppressedPcodeOpIndices;
+  // pcode op 是否来自 SSE 浮点写 XMM 的指令，给 write() 打浮点写标记用。
+  std::set<size_t> FloatWriteOpIndices;
+  bool CurrentOpIsFloatWrite = false;
   // op index of a folded get_pc thunk call -> (written register, constant
   // base).  The write is emitted at the suppressed call position.
   std::map<size_t, std::pair<VarnodeView, uint64_t>> ThunkBaseWrites;

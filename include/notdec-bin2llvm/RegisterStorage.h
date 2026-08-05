@@ -42,7 +42,7 @@ public:
   llvm::Value *read(llvm::IRBuilderBase &builder,
                     const RegisterAccess &access);
   void write(llvm::IRBuilderBase &builder, const RegisterAccess &access,
-             llvm::Value *value);
+             llvm::Value *value, bool isFloatWrite = false);
 
 private:
   struct RegisterUnit {
@@ -59,7 +59,7 @@ private:
   uint64_t bitOffset(const RegisterUnit &unit,
                      const RegisterAccess &access) const;
   void addAccessMetadata(llvm::Value *instruction, const RegisterUnit &unit,
-                         const RegisterAccess &access);
+                         const RegisterAccess &access, bool isFloatWrite);
 
   llvm::LLVMContext &Context;
   llvm::Module &Module;
