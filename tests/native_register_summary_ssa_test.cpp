@@ -1545,23 +1545,20 @@ bool testPartialReadLoopPassthroughUsesDominatorTree() {
                   "module failed verifier after partial read loop DT test");
 }
 
-// SysV long double 返回值留在 x87 栈（ST0），而 ST0..ST7 已经折叠成
-// notdec.x87.* intrinsic 库调用，不在寄存器模型里。函数以 x87 栈返回时
-// （函数体最后计算指令是保留 ST0 的 x87 intrinsic），签名恢复不能给函数
-// 加假寄存器返回槽（RAX/XMM），否则尾部会 ret 垃圾值或 unknown。此时
-// 函数应保持 void 返回，值留在库内部状态，由调用方 fstp.f80() 弹出。
-bool testX87StackReturnKeepsVoidReturnType() {
+// SysV long double 返回约定把结果留在 x87 栈顶 ST0（80 位）。ST0/ST1 现在
+// 是窗口内的真实寄存器全局（i80），走完整的 register summary 流程：根函数
+// 不再 seed ST0（会沿调用图反向级联误报），需求只来自真正读 @ST0 的调用点，
+// 函数尾对 @ST0 的 store 被恢复成 x86_fp80 返回槽，调用方直接拿返回值。
+bool testX87StackReturnBecomesX86Fp80ReturnSlot() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-x87-stack-return", context);
   attachTestAbi(module);
 
-  llvm::FunctionType *fsqrtType =
-      llvm::FunctionType::get(llvm::Type::getVoidTy(context), false);
-  llvm::Function *fsqrt = llvm::cast<llvm::Function>(
-      module.getOrInsertFunction("notdec.x87.fsqrt", fsqrtType).getCallee());
+  llvm::GlobalVariable *st0 = createRegisterGlobal(
+      module, "ST0", llvm::Type::getIntNTy(context, 80), 0x1100, 10);
 
-  // lifting 形态：函数先建为 void 返回（void (i64)），函数体最后是 x87
-  // intrinsic，随后直接 ret。
+  // lifting 形态：函数先建为 void 返回（void (i64)），函数体把值写进 @ST0
+  // 后直接 ret，模拟 fldt; ret 的 long double 返回函数。
   auto *type = llvm::FunctionType::get(
       llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
   llvm::Function *function = llvm::Function::Create(
@@ -1569,15 +1566,48 @@ bool testX87StackReturnKeepsVoidReturnType() {
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
-  builder.CreateCall(fsqrt->getFunctionType(), fsqrt);
+  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getIntNTy(context, 80),
+                                             123),
+                      st0);
   builder.CreateRetVoid();
+
+  // 调用者（根函数，无 seed 的 ST0 需求）在调用后读 @ST0 并存进内存，模拟
+  // fstpt 接住 long double 返回值，让 x87_stack_return 从调用点获得 ST0 的
+  // ExitDemand。
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::InternalLinkage, "x87_stack_return_caller",
+      module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "caller_entry", caller);
+  llvm::IRBuilder<> callerBuilder(callerEntry);
+  llvm::AllocaInst *slot =
+      callerBuilder.CreateAlloca(llvm::Type::getIntNTy(context, 80));
+  callerBuilder.CreateCall(
+      function->getFunctionType(), function,
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  llvm::LoadInst *st0Load =
+      callerBuilder.CreateLoad(llvm::Type::getIntNTy(context, 80), st0);
+  st0Load->setMetadata("notdec.register.access",
+                       registerAccessMetadata(context, "ST0"));
+  callerBuilder.CreateStore(st0Load, slot);
+  callerBuilder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   llvm::Function *rewritten = module.getFunction("x87_stack_return");
+  bool hasSt0Param = false;
+  if (rewritten != nullptr) {
+    for (llvm::Argument &argument : rewritten->args()) {
+      hasSt0Param |= argument.getName() == "ST0";
+    }
+  }
   return expect(rewritten != nullptr,
                 "x87 stack return function was not preserved") &&
-         expect(rewritten->getReturnType()->isVoidTy(),
-                "x87 stack return gained a fake register return slot") &&
+         expect(rewritten->getReturnType()->isX86_FP80Ty(),
+                "x87 ST0 store was not recovered as an x86_fp80 return slot") &&
+         expect(!hasSt0Param,
+                "x87 ST0 must not become a function parameter (SysV)") &&
          verifyOk(module,
                   "module failed verifier after x87 stack return test");
 }
@@ -8949,7 +8979,7 @@ int main() {
   ok &= testPhiIncomingMatchesPredecessors();
   ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
   ok &= testPartialReadLoopPassthroughUsesDominatorTree();
-  ok &= testX87StackReturnKeepsVoidReturnType();
+  ok &= testX87StackReturnBecomesX86Fp80ReturnSlot();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();
   ok &= testUnknownPhiIncomingUsesFrozenPoison();
   ok &= testSelfOnlyPhiBecomesOpaqueUnknown();

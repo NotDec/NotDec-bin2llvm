@@ -56,6 +56,11 @@ RegisterAccess
 registerStore(llvm::StoreInst &store,
               const std::map<llvm::GlobalVariable *, RegisterUnit> &units);
 
+// 识别 ST0/ST1 的窗口内部搬移读（见下方定义）。
+bool isX87WindowShiftLoad(
+    llvm::LoadInst &load,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units);
+
 struct StackSlotKey {
   llvm::Value *Base = nullptr;
   int64_t Offset = 0;
@@ -744,6 +749,13 @@ storageUnitMask(const NativeAbiStorage &storage, uint64_t sizeBytes,
 RegisterAccess
 registerLoad(llvm::LoadInst &load,
              const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  // x87 窗口移位读（push/pop/fxch 的槽位搬移）只转移窗口内部状态，不产生
+  // 对寄存器值的真实需求。跳过它们，避免把 ST0 的需求通过调用点误传成
+  // callee 的 ExitDemand（见 PcodeToLLVM 的 readX87ST windowShift）。
+  if (load.getMetadata("notdec.x87.window.shift") != nullptr ||
+      isX87WindowShiftLoad(load, units)) {
+    return {};
+  }
   auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
       load.getPointerOperand()->stripPointerCasts());
   if (global == nullptr) {
@@ -758,6 +770,64 @@ registerLoad(llvm::LoadInst &load,
     return {};
   }
   return RegisterAccess{&it->second};
+}
+
+// x87 窗口移位读：push/pop/fxch 的槽位搬移（值经 bitcast 链后 store 到另一个
+// ST 寄存器，或传给 notdec.x87.* 库），只转移窗口内部状态，不是对寄存器值
+// 的真实消费。lifting 会给这类 load 打 notdec.x87.window.shift 标记，但
+// InstCombine 可能重写 load 丢掉标记，这里按 use 形态兜底识别，避免把 ST0
+// 的需求通过调用点误传成 callee 的 ExitDemand。
+bool isX87WindowShiftLoad(
+    llvm::LoadInst &load,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+      load.getPointerOperand()->stripPointerCasts());
+  if (global == nullptr) {
+    return false;
+  }
+  auto it = units.find(global);
+  if (it == units.end()) {
+    return false;
+  }
+  const RegisterUnit &unit = it->second;
+  if (unit.Name != "ST0" && unit.Name != "ST1") {
+    return false;
+  }
+  // 只有所有 use 都是窗口内部搬移（store 到寄存器全局 / 传给 x87 库）才算
+  // 纯移位读。fld %st(0) 和 fstpt 可能共享同一个 load（缓存复用）：后者
+  // 把值存到内存，是真实消费，不能按移位跳过。
+  if (load.getNumUses() == 0) {
+    return false;
+  }
+  for (llvm::User *user : load.users()) {
+    llvm::Value *value = user;
+    // 剥离 bitcast/zext/trunc 单链，找到真正的消费指令。
+    while (auto *cast = llvm::dyn_cast<llvm::CastInst>(value)) {
+      if (!cast->hasOneUse()) {
+        break;
+      }
+      value = *cast->user_begin();
+    }
+    bool internal = false;
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(value)) {
+      auto *target = llvm::dyn_cast<llvm::GlobalVariable>(
+          store->getPointerOperand()->stripPointerCasts());
+      if (target != nullptr && units.count(target) != 0) {
+        internal = true;
+      }
+    }
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(value)) {
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee != nullptr &&
+          isNativeX87IntrinsicName(callee->getName())) {
+        internal = true;
+      }
+    }
+    if (!internal) {
+      return false;
+    }
+  }
+  return true;
 }
 
 RegisterAccess
@@ -848,6 +918,19 @@ collectAbiFacts(const llvm::Module &module,
         mergeNamedMask(facts.KilledByCallMasks, slot->first, slot->second);
       }
     }
+  }
+  // SysV 的 cspec 不写 x87 寄存器，但 long double 返回约定把结果留在 ST0
+  // （80 位）。手工补进输出集合，让根函数 seed ExitDemand、调用点把 ST0
+  // 当作返回/破坏寄存器处理；ST1 只是窗口内部状态，不参与 ABI。
+  for (const auto &[global, unit] : units) {
+    (void)global;
+    if (unit.Name != "ST0") {
+      continue;
+    }
+    facts.Outputs.insert("ST0");
+    mergeNamedMask(facts.OutputMasks, "ST0", fullMask(unit));
+    facts.OutputOrder.push_back("ST0");
+    break;
   }
   facts.StackPointer = abi->StackPointerRegister;
   facts.StackShift = abi->StackShift;
@@ -2098,16 +2181,23 @@ private:
   }
 
   void seedAbiReturns(FunctionDemand &demand) const {
-    if (Abi.IntegerOutputOrder.empty()) {
-      return;
+    auto seed = [&](const std::string &name) {
+      auto it = UnitsByName.find(name);
+      if (it == UnitsByName.end()) {
+        return;
+      }
+      const RegisterUnit &unit = Units.at(it->second);
+      addDemand(demand.ExitDemand, it->second,
+                namedMaskOrFull(Abi.OutputMasks, unit));
+    };
+    if (!Abi.IntegerOutputOrder.empty()) {
+      seed(Abi.IntegerOutputOrder.front());
     }
-    auto it = UnitsByName.find(Abi.IntegerOutputOrder.front());
-    if (it == UnitsByName.end()) {
-      return;
-    }
-    const RegisterUnit &unit = Units.at(it->second);
-    addDemand(demand.ExitDemand, it->second,
-              namedMaskOrFull(Abi.OutputMasks, unit));
+    // ST0（SysV long double 返回）不 seed 根函数：与 RAX 不同，根入口点
+    // 几乎不会真的用 ST0 返回，seed 会让 ST0 需求沿调用图反向级联，给
+    // 一堆只在返回路径上被调用点 clobber 的函数误加 x86_fp80 返回槽。
+    // ST0 的 ExitDemand 只来自真正读 @ST0 的调用点（调用方把 long double
+    // 返回值接走），见 collectAbiFacts 的 ST0 输出槽补充。
   }
 
   llvm::APInt

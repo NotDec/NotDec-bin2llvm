@@ -32,11 +32,12 @@ llvm::Function *getOrInsertNativeX87Intrinsic(
     // normal memory, unlike the register-value intrinsics below.
     function->setMemoryEffects(llvm::MemoryEffects::unknown());
   } else {
-    // The FPU stack lives in hidden library state, so an x87 intrinsic may
-    // read and write that state but must never touch normal memory.  Marking
-    // memory effects as inaccessiblemem only keeps the calls from being
-    // reordered or dropped while load/store of the visible operands stay
-    // analyzable.
+    // The ST2..ST7 slots and the FPU environment live in hidden library
+    // state, so an x87 intrinsic may read and write that state but must never
+    // touch normal memory.  Marking memory effects as inaccessiblemem keeps
+    // the calls from being dropped while load/store of the visible operands
+    // stay analyzable; successive push/pop/peek/poke calls still alias the
+    // same hidden state and are not reordered across each other.
     function->setMemoryEffects(
         llvm::MemoryEffects::inaccessibleMemOnly(llvm::ModRefInfo::ModRef));
   }

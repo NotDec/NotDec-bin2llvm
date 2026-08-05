@@ -1042,6 +1042,27 @@ collectAbiFacts(const llvm::Module &module,
       facts.KilledByCall.insert(storageUnitName(effect.Storage, units));
     }
   }
+  // SysV 的 cspec 不写 x87 寄存器，但 long double 返回约定把结果留在 ST0
+  // （80 位）。手工把 ST0 补成浮点输出槽：根函数 seed ExitDemand、内部函数
+  // 从调用方返回需求传播，最后经 floatSlotForDemand 变成 x86_fp80 返回槽。
+  // ST1 只是窗口内部状态（pop 的中间值），不参与 ABI。
+  for (const auto &[global, unit] : units) {
+    (void)global;
+    if (unit.Name != "ST0") {
+      continue;
+    }
+    facts.Outputs.insert("ST0");
+    pushUnique(facts.OutputsInOrder, "ST0");
+    AbiFacts::RegisterSlot slot;
+    slot.UnitName = "ST0";
+    slot.AbiName = "ST0";
+    slot.MetaType = "float";
+    slot.OffsetBits = 0;
+    slot.SizeBits = static_cast<unsigned>(unit.Size * 8);
+    facts.FloatOutputsInOrder.push_back(slot);
+    facts.InternalReturnRegisters.insert("ST0");
+    break;
+  }
   facts.StackPointer = abi->StackPointerRegister;
   facts.StackShift = abi->StackShift;
   return facts;
@@ -1343,6 +1364,9 @@ llvm::Type *floatTypeForSizeBits(llvm::LLVMContext &context,
   if (sizeBits <= 64) {
     return llvm::Type::getDoubleTy(context);
   }
+  if (sizeBits <= 80) {
+    return llvm::Type::getX86_FP80Ty(context);
+  }
   return nullptr;
 }
 
@@ -1462,184 +1486,6 @@ void appendInternalStackParams(
   }
 }
 
-// x87 指令折叠成 intrinsic 库调用后，ST0..ST7 不在寄存器模型里，但 SysV
-// 的 long double 返回约定仍把结果留在 ST0。函数以这种方式返回时（返回路径
-// 最后一条计算指令是"保留 ST0 值"的 x87 intrinsic），寄存器返回槽模型没有
-// ST0，强行推断 RAX/XMM 只会得到垃圾值或 unknown。此时函数签名不加 LLVM
-// 返回槽（保持 void），返回值继续留在库内部状态，由调用方的
-// notdec.x87.fstp.f80() 弹出。
-bool isX87StackPreservingIntrinsic(const llvm::CallBase &call) {
-  const llvm::Function *callee = call.getCalledFunction();
-  if (callee == nullptr || !isNativeX87IntrinsicName(callee->getName())) {
-    return false;
-  }
-  // fstp.f32/f64/f80 把 ST0 导出成 LLVM 值（返回非 void），函数返回前通常
-  // 还会 store/转换，不算"ST0 留在栈上返回"。
-  return call.getType()->isVoidTy();
-}
-
-bool instructionIsX87StackReturn(const llvm::Instruction *inst) {
-  if (inst == nullptr) {
-    return false;
-  }
-  if (const llvm::CallBase *call =
-          llvm::dyn_cast<const llvm::CallBase>(inst)) {
-    return isX87StackPreservingIntrinsic(*call);
-  }
-  return false;
-}
-
-bool isStackPointerGlobalName(llvm::StringRef name) {
-  return name == "RSP" || name == "RBP" || name == "ESP" || name == "EBP";
-}
-
-// 值是否由栈指针寄存器（@RSP/@RBP 全局）派生。lifting 的栈地址是
-// inttoptr(load @RSP) + add 链，数据地址（参数、全局、常量）不是。
-bool valueDerivedFromStackPointer(const llvm::Value *value,
-                                  unsigned depth = 0) {
-  if (depth > 4) {
-    return false;
-  }
-  if (const llvm::GlobalVariable *global =
-          llvm::dyn_cast<const llvm::GlobalVariable>(value)) {
-    return isStackPointerGlobalName(global->getName());
-  }
-  if (const llvm::LoadInst *load = llvm::dyn_cast<const llvm::LoadInst>(value)) {
-    return valueDerivedFromStackPointer(load->getPointerOperand(), depth + 1);
-  }
-  if (const llvm::IntToPtrInst *itp =
-          llvm::dyn_cast<const llvm::IntToPtrInst>(value)) {
-    return valueDerivedFromStackPointer(itp->getOperand(0), depth + 1);
-  }
-  if (const llvm::PtrToIntInst *pti =
-          llvm::dyn_cast<const llvm::PtrToIntInst>(value)) {
-    return valueDerivedFromStackPointer(pti->getOperand(0), depth + 1);
-  }
-  if (const llvm::BinaryOperator *bin =
-          llvm::dyn_cast<const llvm::BinaryOperator>(value)) {
-    if (bin->getOpcode() == llvm::Instruction::Add) {
-      return valueDerivedFromStackPointer(bin->getOperand(0), depth + 1) ||
-             valueDerivedFromStackPointer(bin->getOperand(1), depth + 1);
-    }
-  }
-  return false;
-}
-
-bool isAllocaDerived(const llvm::Value *value) {
-  if (llvm::isa<llvm::AllocaInst>(value)) {
-    return true;
-  }
-  if (const llvm::GetElementPtrInst *gep =
-          llvm::dyn_cast<const llvm::GetElementPtrInst>(value)) {
-    return isAllocaDerived(gep->getPointerOperand());
-  }
-  return false;
-}
-
-// 栈清理指令：RSP/RBP 派生地址或 alloca 的 load/store、栈地址计算
-// （inttoptr/ptrtoint/add）。返回路径回溯时跳过它们，找真正的最后计算指令。
-bool isStackCleanupInstruction(const llvm::Instruction &inst) {
-  if (inst.isTerminator() || llvm::isa<llvm::PHINode>(inst)) {
-    return true;
-  }
-  if (const llvm::LoadInst *load =
-          llvm::dyn_cast<const llvm::LoadInst>(&inst)) {
-    return valueDerivedFromStackPointer(load->getPointerOperand()) ||
-           isAllocaDerived(load->getPointerOperand());
-  }
-  if (const llvm::StoreInst *store =
-          llvm::dyn_cast<const llvm::StoreInst>(&inst)) {
-    return valueDerivedFromStackPointer(store->getPointerOperand()) ||
-           isAllocaDerived(store->getPointerOperand());
-  }
-  if (llvm::isa<llvm::IntToPtrInst>(inst) ||
-      llvm::isa<llvm::PtrToIntInst>(inst)) {
-    return true;
-  }
-  if (const llvm::BinaryOperator *bin =
-          llvm::dyn_cast<const llvm::BinaryOperator>(&inst)) {
-    return bin->getOpcode() == llvm::Instruction::Add;
-  }
-  return false;
-}
-
-// block 内最后一条非栈清理指令（从 terminator 往前扫）是否是保留 ST0 的
-// x87 intrinsic。
-bool blockLastComputationIsX87(const llvm::BasicBlock &block) {
-  const llvm::Instruction *inst = block.getTerminator();
-  while (inst != nullptr) {
-    inst = inst->getPrevNode();
-    if (inst == nullptr) {
-      return false;
-    }
-    if (isStackCleanupInstruction(*inst)) {
-      continue;
-    }
-    return instructionIsX87StackReturn(inst);
-  }
-  return false;
-}
-
-// block 是否纯栈清理（无 call、无普通计算）：返回路径经过它时继续回溯。
-bool blockIsStackCleanup(const llvm::BasicBlock &block) {
-  for (const llvm::Instruction &inst : block) {
-    if (!isStackCleanupInstruction(inst)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// 函数是否以 x87 栈返回 long double：函数体内有保留 ST0 的 x87 intrinsic，
-// 且存在返回路径，从 ret 沿 pred 回溯（跳过纯栈清理 block，有限深度），
-// 最后一条计算指令是保留 ST0 的 x87 intrinsic。不要求所有路径命中：整数
-// /XMM 路径混合返回极罕见，先按宽松信号处理，用真实二进制的输出核对误报。
-bool functionReturnsX87StackValue(const llvm::Function &function) {
-  bool hasX87Intrinsic = false;
-  for (const llvm::Instruction &inst : llvm::instructions(function)) {
-    if (const llvm::CallBase *call =
-            llvm::dyn_cast<const llvm::CallBase>(&inst)) {
-      if (isX87StackPreservingIntrinsic(*call)) {
-        hasX87Intrinsic = true;
-        break;
-      }
-    }
-  }
-  if (!hasX87Intrinsic) {
-    return false;
-  }
-  for (const llvm::BasicBlock &block : function) {
-    const llvm::ReturnInst *ret =
-        llvm::dyn_cast<const llvm::ReturnInst>(block.getTerminator());
-    if (ret == nullptr) {
-      continue;
-    }
-    std::set<const llvm::BasicBlock *> visited;
-    std::vector<const llvm::BasicBlock *> frontier;
-    frontier.push_back(&block);
-    // 有限深度回溯：跳过栈清理 block，最多 8 层，避免回溯到函数入口把
-    // 普通 x87 计算路径误判为返回。
-    for (unsigned depth = 0; depth < 8 && !frontier.empty(); ++depth) {
-      std::vector<const llvm::BasicBlock *> next;
-      for (const llvm::BasicBlock *cur : frontier) {
-        if (!visited.insert(cur).second) {
-          continue;
-        }
-        if (blockLastComputationIsX87(*cur)) {
-          return true;
-        }
-        if (blockIsStackCleanup(*cur)) {
-          for (const llvm::BasicBlock *pred : llvm::predecessors(cur)) {
-            next.push_back(pred);
-          }
-        }
-      }
-      frontier = std::move(next);
-    }
-  }
-  return false;
-}
-
 SignatureShape shapeForInternalFunction(
     llvm::Function &function,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -1667,9 +1513,6 @@ SignatureShape shapeForInternalFunction(
 
   const FunctionSummaryFacts &facts = factsIt->second;
   std::set<std::string> addedParamUnits;
-  // x87 栈返回时（SysV long double 在 ST0）不生成任何 LLVM 返回槽：值在
-  // intrinsic 库内部状态，调用方 fstp.f80() 弹出，见 functionReturnsX87StackValue。
-  bool x87StackReturn = functionReturnsX87StackValue(function);
 
   // Internal native functions can be compiled with interprocedural register
   // allocation, so their real interface is not limited to the external ABI.
@@ -1678,6 +1521,11 @@ SignatureShape shapeForInternalFunction(
   auto addParamForUnit = [&](const RegisterUnit &unit,
                              const AbiFacts::RegisterSlot *floatSlot) {
     if (addedParamUnits.count(unit.Name) != 0) {
+      return;
+    }
+    // SysV 不通过 x87 栈传参：ST0/ST1 是窗口内的调用点垃圾值，入口读它们
+    // 是 unknown，不能因为 InternalReturnRegisters 里有 ST0 就把它加成参数。
+    if (unit.Name == "ST0" || unit.Name == "ST1") {
       return;
     }
     auto regIt = facts.Registers.find(unit.Name);
@@ -1736,9 +1584,6 @@ SignatureShape shapeForInternalFunction(
   appendInternalStackParams(shape, function, units, abi);
 
   for (const RegisterUnit *unit : orderedUnits) {
-    if (x87StackReturn) {
-      break;
-    }
     if (abi.InternalReturnRegisters.count(unit->Name) == 0) {
       continue;
     }

@@ -130,11 +130,11 @@ void setModuleDataLayoutFromPointerSize(llvm::Module &module,
   module.setDataLayout(layout);
 }
 
-// x87 FPU stack: ST0..ST7 live at register-space offsets 0x1100..0x1140, each
-// 10 bytes.  MMX aliases the same offsets with size 8, so the size check keeps
-// MMX accesses out of the x87 path.  These registers are never lowered to LLVM
-// globals: every x87 machine instruction is folded into one notdec.x87.* call
-// and the physical stack state stays inside that library.
+// x87 FPU stack: ST0..ST7.  ST0/ST1 are kept as real register globals (the
+// "window" the lifted IR can see and compute on); ST2..ST7 stay inside the
+// notdec.x87.* library, bridged by push/pop/peek/poke intrinsics.  MMX
+// accesses alias the same offsets with size 8, so the size check keeps MMX
+// accesses out of the x87 path.
 bool isX87StackVarnode(const VarnodeView &varnode) {
   if (!varnode.IsRegister || varnode.Size != 10) {
     return false;
@@ -144,10 +144,18 @@ bool isX87StackVarnode(const VarnodeView &varnode) {
     return true;
   }
   return varnode.Space == "register" && varnode.Offset >= 0x1100 &&
-         varnode.Offset < 0x1140;
+         varnode.Offset < 0x1180;
 }
 
 uint32_t x87StackIndex(const VarnodeView &varnode) {
+  if (varnode.RegisterName && varnode.RegisterName->size() == 3) {
+    unsigned index = (*varnode.RegisterName)[2] - '0';
+    if (index <= 7) {
+      return index;
+    }
+  }
+  // The 0x1106 (real .sla) and 0x1100 (heritage) conventions both give the
+  // right index: (0x1106-0x1100)/0x10 truncates to 0.
   return static_cast<uint32_t>((varnode.Offset - 0x1100) / 0x10);
 }
 
@@ -176,18 +184,87 @@ bool touchesX87Stack(const PcodeProgram &program, size_t start, size_t end) {
   return false;
 }
 
+// Registers for the x87 window model: ST0/ST1 become real LLVM register
+// globals so the register summary can reason about them (e.g. SysV long
+// double returns in ST0); ST2..ST7 are library-internal state and never get
+// globals.  Heritage JSON and unit tests often omit ST registers from the
+// list, so append default ST0/ST1 entries when missing to keep the window
+// backed by concrete globals.
 std::vector<RegisterInfo>
-registersWithoutX87Stack(const std::vector<RegisterInfo> &registers) {
+x87WindowRegisters(const std::vector<RegisterInfo> &registers) {
   std::vector<RegisterInfo> result;
-  result.reserve(registers.size());
+  result.reserve(registers.size() + 2);
+  bool hasST0 = false;
+  bool hasST1 = false;
   for (const RegisterInfo &reg : registers) {
-    if (reg.Space == "register" && reg.Size == 10 && reg.Offset >= 0x1100 &&
-        reg.Offset < 0x1140) {
-      continue;
+    if (reg.Space == "register" && reg.Size == 10) {
+      uint32_t index = 8;
+      if (reg.Name.size() == 3 && reg.Name[0] == 'S' && reg.Name[1] == 'T') {
+        index = reg.Name[2] - '0';
+      } else if (reg.Offset >= 0x1100 && reg.Offset < 0x1180) {
+        index = static_cast<uint32_t>((reg.Offset - 0x1100) / 0x10);
+      }
+      if (index == 0) {
+        result.push_back(reg);
+        hasST0 = true;
+        continue;
+      }
+      if (index == 1) {
+        result.push_back(reg);
+        hasST1 = true;
+        continue;
+      }
+      if (index < 8) {
+        continue;
+      }
     }
     result.push_back(reg);
   }
+  if (!hasST0) {
+    RegisterInfo st0;
+    st0.Space = "register";
+    st0.Offset = 0x1100;
+    st0.Size = 10;
+    st0.Name = "ST0";
+    result.push_back(st0);
+  }
+  if (!hasST1) {
+    RegisterInfo st1;
+    st1.Space = "register";
+    st1.Offset = 0x1110;
+    st1.Size = 10;
+    st1.Name = "ST1";
+    result.push_back(st1);
+  }
   return result;
+}
+
+// Register varnode view for an ST slot, matching the offsets used by the
+// p-code (real .sla 0x1106 vs heritage 0x1100).  Falls back to the heritage
+// convention when the register list carries no usable entry.
+VarnodeView x87StackVarnode(const std::vector<RegisterInfo> &registers,
+                            uint32_t index) {
+  for (const RegisterInfo &reg : registers) {
+    if (reg.Space != "register" || reg.Size != 10) {
+      continue;
+    }
+    if (reg.Name == "ST" + std::to_string(index)) {
+      VarnodeView varnode;
+      varnode.Space = reg.Space;
+      varnode.Offset = reg.Offset;
+      varnode.Size = reg.Size;
+      varnode.IsRegister = true;
+      varnode.RegisterName = reg.Name;
+      return varnode;
+    }
+  }
+  VarnodeView varnode;
+  varnode.Space = "register";
+  varnode.Offset = 0x1100 + index * 0x10;
+  varnode.Size = 10;
+  varnode.IsRegister = true;
+  varnode.RegisterName = "ST" + std::to_string(index);
+  return varnode;
 }
 
 bool isFloatBinaryOpcode(PcodeOpcode opcode) {
@@ -274,9 +351,13 @@ public:
   }
 
   bool lower(const PcodeProgram &program, std::string &errorMessage) {
-    Registers = std::make_unique<RegisterStorage>(
-        Context, Module, registersWithoutX87Stack(program.Registers),
-        program.IsBigEndian);
+    std::vector<RegisterInfo> windowRegisters =
+        x87WindowRegisters(program.Registers);
+    Registers = std::make_unique<RegisterStorage>(Context, Module,
+                                                  windowRegisters,
+                                                  program.IsBigEndian);
+    StVarnodes[0] = x87StackVarnode(windowRegisters, 0);
+    StVarnodes[1] = x87StackVarnode(windowRegisters, 1);
 
     if (program.Ops.empty() && !usesNativeCfg()) {
       return true;
@@ -285,7 +366,7 @@ public:
     CurrentProgramOps = &program.Ops;
     prepareX86CallReturnStackSuppression(program);
     prepareX86PcThunkSuppression(program);
-    prepareX87IntrinsicSuppression(program);
+    prepareX87Window(program);
     if (!buildBasicBlocks(program, errorMessage)) {
       return false;
     }
@@ -313,7 +394,7 @@ public:
       for (size_t opIndex = start; opIndex < end; ++opIndex) {
         auto x87It = X87Groups.find(opIndex);
         if (x87It != X87Groups.end()) {
-          if (!lowerX87Group(x87It->second, errorMessage)) {
+          if (!lowerX87Window(x87It->second, errorMessage)) {
             return false;
           }
           opIndex = x87It->second.End - 1;
@@ -453,27 +534,52 @@ private:
   }
 
 
-  // One x87 machine instruction folded into a single notdec.x87.* call.  The
-  // library owns the physical FPU stack, so the lifted IR keeps none of the
-  // rolling ST0..ST7 p-code writes; only the memory operand reads stay in the
-  // IR and feed the call arguments.  For fstp/fistp the call result is stored
-  // by the lowering to the original p-code store address.
-  struct X87IntrinsicSpec {
+  // One x87 machine instruction lowered into the ST0/ST1 window model.
+  // ST0/ST1 are real register globals the lifted IR computes on; ST2..ST7 live
+  // in the notdec.x87.* library behind push/pop/peek/poke intrinsics.  The
+  // p-code group (rolling ST0..ST7 copies and the ST write) is suppressed and
+  // re-emitted by lowerX87Window; only memory operand reads (LOAD / address
+  // computation) are lowered normally.
+  enum class X87WindowKind {
+    // Library-managed instruction: FPU environment (fnstsw/fnstcw/fldcw/
+    // fstenv/fldenv) and fprem.  The library owns the FPU environment and the
+    // ST2..ST7 state; see lowerX87Library.
+    Library,
+    // fld/fild/fldz/fld1/fld %st(i): push a value onto the x87 stack.
+    Push,
+    // fstp/fistp to memory: store ST0 (with conversion), then pop.
+    PopStore,
+    // fstp %st(i): store ST0 into slot i, then pop.
+    PopSlot,
+    // fst %st(i): store ST0 into slot i without popping.
+    StoreSlot,
+    // faddp/fsubp/fmulp/fdivp/fsubrp/fdivrp on st(1).
+    PopArith,
+    // Same with an explicit st(i) slot (i>=2).
+    PopArithSlot,
+    // fadd/fsub/fmul/fdiv/fsubr/fdivr between ST0 and st(i).
+    RegArith,
+    // Same between ST0 and a memory operand.
+    MemArith,
+    // fsqrt/fabs/fchs.
+    Unary,
+    // fcomi/fcomip/fucomi/fucomip: compare ST0 with st(i) into EFLAGS.
+    Compare,
+    // fxch %st(i): swap ST0 and st(i).
+    Fxch,
+  };
+
+  struct X87WindowSpec {
     size_t Start = 0;
     size_t End = 0;
+    X87WindowKind Kind = X87WindowKind::Library;
+
+    // Library intrinsics (environment instructions, fprem).
     std::string IntrinsicName;
     std::vector<VarnodeView> Args;
     std::vector<llvm::Type *> ArgTypes;
     llvm::Type *ResultType = nullptr;
-    std::optional<VarnodeView> StoreAddress;
-    std::optional<uint32_t> StoreValueSize;
-    // fcomi/fucomip: the intrinsic returns a packed i8 (bit0=CF, bit1=PF,
-    // bit2=ZF); lowering writes the EFLAGS bits that integer code observes.
-    // The FPU status word stays library-internal like the FPU stack.
-    bool WritesComparisonFlags = false;
-    // fnstsw/fstsw/fnstcw/fstcw: the intrinsic returns the FPU status/control
-    // word; lowering writes it to the p-code target (AX register or a memory
-    // store).
+    // fnstsw/fnstcw: write the returned word to a register (AX) or memory.
     std::optional<VarnodeView> ResultRegister;
     // fldenv: the library reads the FPU environment image from the pointer
     // argument itself, so the group's memory LOADs must not be lowered.
@@ -481,10 +587,44 @@ private:
     // fstenv/fldenv: the intrinsic takes a memory pointer and touches normal
     // memory, unlike the register-value intrinsics.
     bool AccessesMemory = false;
+    // fprem: the library call result becomes the new ST0.
+    bool StoreResultToST0 = false;
+
+    // fcomi/fucomip: write EFLAGS CF/PF/ZF from the comparison and clear
+    // AF/SF/OF; the FPU status word stays library-internal.
+    bool WritesComparisonFlags = false;
+    // fucomi/fucomip vs fcomi/fcomip.  Both set the same flags (PF on
+    // unordered, ZF/CF include the unordered case), matching the x86.sinc
+    // fcomi macro; the difference is only the invalid-operation exception.
+    bool Unordered = false;
+
+    // st(i) slot operand for Push(fld %st(i))/PopSlot/StoreSlot/PopArithSlot/
+    // RegArith/Compare/Fxch.
+    uint32_t SlotIndex = 0;
+    // fstp/fistp memory store target.
+    std::optional<VarnodeView> StoreAddress;
+    std::optional<uint32_t> StoreValueSize;
+    // fild/fistp integer conversion.
+    bool IsInt = false;
+    // Memory operand for Push/MemArith: the raw LOAD result varnode.
+    std::optional<VarnodeView> MemValue;
+    llvm::Type *MemValueType = nullptr;
+    // fldz/fld1 constant.
+    llvm::ConstantFP *PushConstant = nullptr;
+    // faddp-family binary opcode (FloatAdd/FloatSub/FloatMult/FloatDiv).
+    PcodeOpcode ArithOpcode = PcodeOpcode::FloatAdd;
+    // Whether the p-code arithmetic op has ST0 as input0; the other input is
+    // the st(i) slot or the memory operand.  The p-code operand order is the
+    // semantic operand order (e.g. FSUBP is FLOAT_SUB(ST1, ST0), FSUBRP is
+    // FLOAT_SUB(ST0, ST1)), so no separate reverse flag is needed.
+    bool ST0IsInput0 = true;
+    // Unary kind for Unary.
+    enum class UnaryKind { Sqrt, Abs, Chs } Unary = UnaryKind::Sqrt;
+    // fcomip/fucomip/fstp: pop after the operation.
+    bool Pops = false;
   };
 
   static bool isTerminator(PcodeOpcode opcode) {
-
     return opcode == PcodeOpcode::Branch ||
            opcode == PcodeOpcode::BranchInd ||
            opcode == PcodeOpcode::CBranch || opcode == PcodeOpcode::Return;
@@ -786,31 +926,6 @@ private:
   }
 
 
-  // Fold x87 instructions into notdec.x87.* calls.  The physical FPU stack
-  // state lives inside the library, so the rolling ST0..ST7 p-code writes are
-  // all suppressed and the call arguments are the explicit assembly operands.
-  void prepareX87IntrinsicSuppression(const PcodeProgram &program) {
-    X87Groups.clear();
-    for (size_t start = 0; start < program.Ops.size();) {
-      size_t end = start + 1;
-      while (end < program.Ops.size() &&
-             program.Ops[end].Address == program.Ops[start].Address) {
-        ++end;
-      }
-      if (std::optional<X87IntrinsicSpec> spec =
-              classifyX87Intrinsic(program, start, end)) {
-        X87Groups.emplace(start, std::move(*spec));
-      } else if (!program.Ops[start].Mnemonic.empty() &&
-                 touchesX87Stack(program, start, end)) {
-        llvm::errs() << "warning: x87 instruction "
-                     << program.Ops[start].Mnemonic << " at 0x";
-        llvm::errs().write_hex(program.Ops[start].Address);
-        llvm::errs() << " was not folded into a notdec.x87 intrinsic\n";
-      }
-      start = end;
-    }
-  }
-
   static const PcodeOpView *findProducer(const PcodeProgram &program,
                                          size_t start, size_t end,
                                          const VarnodeView &target) {
@@ -826,7 +941,7 @@ private:
   // Dispatch x87 classification by the machine instruction mnemonic when one
   // is available (native lifting); heritage JSON input carries no mnemonic
   // and falls back to the p-code shape classifier below.
-  std::optional<X87IntrinsicSpec>
+  std::optional<X87WindowSpec>
   classifyX87Intrinsic(const PcodeProgram &program, size_t start,
                        size_t end) {
     const std::string &mnemonic = program.Ops[start].Mnemonic;
@@ -834,6 +949,31 @@ private:
       return classifyX87ByMnemonic(program, start, end, mnemonic);
     }
     return classifyX87ByShape(program, start, end);
+  }
+
+  // Fold x87 instructions into the ST0/ST1 window model.  Each instruction
+  // group is classified by mnemonic; ST0/ST1 stay in the lifted IR while the
+  // ST2..ST7 rolling copies move through the library intrinsics.
+  void prepareX87Window(const PcodeProgram &program) {
+    X87Groups.clear();
+    for (size_t start = 0; start < program.Ops.size();) {
+      size_t end = start + 1;
+      while (end < program.Ops.size() &&
+             program.Ops[end].Address == program.Ops[start].Address) {
+        ++end;
+      }
+      if (std::optional<X87WindowSpec> spec =
+              classifyX87Intrinsic(program, start, end)) {
+        X87Groups.emplace(start, std::move(*spec));
+      } else if (!program.Ops[start].Mnemonic.empty() &&
+                 touchesX87Stack(program, start, end)) {
+        llvm::errs() << "warning: x87 instruction "
+                     << program.Ops[start].Mnemonic << " at 0x";
+        llvm::errs().write_hex(program.Ops[start].Address);
+        llvm::errs() << " was not lowered into the x87 window model\n";
+      }
+      start = end;
+    }
   }
 
   // First p-code op writing an x87 stack varnode with the given opcode.
@@ -903,58 +1043,47 @@ private:
   // values (memory address, const, st(i) index), so new instructions do not
   // need a p-code shape matcher.  Uncovered mnemonics fall back to ordinary
   // p-code lowering.
-  std::optional<X87IntrinsicSpec>
+  std::optional<X87WindowSpec>
   classifyX87ByMnemonic(const PcodeProgram &program, size_t start,
                         size_t end, const std::string &mnemonic) {
-    X87IntrinsicSpec spec;
+    X87WindowSpec spec;
     spec.Start = start;
     spec.End = end;
 
-    // fnstsw/fstsw copy the FPU status word to AX or memory; fnstcw/fstcw
-    // copy the FPU control word to memory.  The p-code never touches the x87
-    // stack, so these branches run before the stack check below.  The words
-    // are library-internal: the intrinsic returns one and lowering writes it
-    // to the p-code target.  The mnemonic decides the instruction and the
-    // Body text tells the operand form (AX vs memory); the p-code only
-    // supplies the concrete target varnode/address.
-    if (mnemonic == "FNSTSW" || mnemonic == "FSTSW" ||
-        mnemonic == "FNSTCW" || mnemonic == "FSTCW") {
-      spec.IntrinsicName =
-          std::string("notdec.x87.") +
-          ((mnemonic == "FNSTCW" || mnemonic == "FSTCW") ? "fnstcw"
-                                                         : "fnstsw");
+    // fnstsw/fnstcw: read the FPU status/control word from the library and
+    // write it to the p-code target (AX register or a memory store).
+    if (mnemonic == "FNSTSW" || mnemonic == "FNSTCW") {
+      spec.IntrinsicName = mnemonic == "FNSTSW" ? "notdec.x87.fnstsw"
+                                                : "notdec.x87.fnstcw";
       spec.ResultType = intType(2);
-      if (program.Ops[start].Body == "AX") {
-        for (size_t index = start; index < end; ++index) {
-          const PcodeOpView &op = program.Ops[index];
-          if (op.Opcode == PcodeOpcode::Copy && op.Output &&
-              op.Output->IsRegister && op.Output->Size == 2) {
-            spec.ResultRegister = *op.Output;
-            break;
-          }
+      bool hasTarget = false;
+      for (size_t index = start; index < end; ++index) {
+        const PcodeOpView &op = program.Ops[index];
+        if (op.Opcode == PcodeOpcode::Copy && op.Output &&
+            op.Output->IsRegister && op.Output->Size == 2) {
+          spec.ResultRegister = *op.Output;
+          hasTarget = true;
+          break;
         }
-        if (!spec.ResultRegister) {
-          return std::nullopt;
-        }
-      } else {
+      }
+      if (!hasTarget) {
         for (size_t index = start; index < end; ++index) {
           const PcodeOpView &op = program.Ops[index];
           if (op.Opcode == PcodeOpcode::Store && op.Inputs.size() == 3) {
             spec.StoreAddress = op.Inputs[1];
             spec.StoreValueSize = 2;
+            hasTarget = true;
             break;
           }
         }
-        if (!spec.StoreAddress) {
-          return std::nullopt;
-        }
+      }
+      if (!hasTarget) {
+        return std::nullopt;
       }
       return spec;
     }
 
-    // fldcw: load the FPU control word from memory into the library.  The
-    // only p-code op producing a value is the memory LOAD; its result is the
-    // call argument and the control-word COPY is suppressed by lowering.
+    // fldcw: load the FPU control word from memory into the library.
     if (mnemonic == "FLDCW") {
       const PcodeOpView *load = nullptr;
       for (size_t index = start; index < end; ++index) {
@@ -971,16 +1100,13 @@ private:
       spec.IntrinsicName = "notdec.x87.fldcw";
       spec.Args = {*load->Output};
       spec.ArgTypes = {intType(2)};
-      spec.ResultType = llvm::Type::getVoidTy(Context);
       return spec;
     }
 
-    // fstenv/fnstenv: save the whole FPU environment (control/status/tag
-    // words, instruction/data pointers, opcode) to memory.  The library
-    // writes the real 28-byte x86-64 layout to the pointer; the p-code's six
-    // per-field STOREs are suppressed.  The base address is the STORE whose
-    // address is not produced inside the group (the +0 field), which is the
-    // register/expression the other five offsets are derived from.
+    // fstenv/fnstenv: save the whole FPU environment to memory.  The library
+    // writes the real 28-byte x86-64 layout; the p-code's per-field STOREs
+    // are suppressed.  The base address is the STORE whose address is not
+    // produced inside the group (the +0 field).
     if (mnemonic == "FSTENV" || mnemonic == "FNSTENV") {
       const VarnodeView *base = nullptr;
       for (size_t index = start; index < end; ++index) {
@@ -999,14 +1125,11 @@ private:
       spec.IntrinsicName = "notdec.x87.fstenv";
       spec.Args = {*base};
       spec.ArgTypes = {llvm::PointerType::get(Context, 0)};
-      spec.ResultType = llvm::Type::getVoidTy(Context);
       spec.AccessesMemory = true;
       return spec;
     }
 
     // fldenv: load the whole FPU environment from memory into the library.
-    // The library reads the image through the pointer argument, so the six
-    // memory LOADs and the environment-register writes are suppressed.
     if (mnemonic == "FLDENV") {
       const VarnodeView *base = nullptr;
       for (size_t index = start; index < end; ++index) {
@@ -1025,19 +1148,8 @@ private:
       spec.IntrinsicName = "notdec.x87.fldenv";
       spec.Args = {*base};
       spec.ArgTypes = {llvm::PointerType::get(Context, 0)};
-      spec.ResultType = llvm::Type::getVoidTy(Context);
       spec.SuppressLoads = true;
       spec.AccessesMemory = true;
-      return spec;
-    }
-
-    // fabs/fchs: ST0 = |ST0| / ST0 = -ST0, no explicit operands.  The
-    // mnemonic fully determines the semantics, so the group's p-code is
-    // skipped entirely.
-    if (mnemonic == "FABS" || mnemonic == "FCHS") {
-      spec.IntrinsicName =
-          mnemonic == "FABS" ? "notdec.x87.fabs" : "notdec.x87.fchs";
-      spec.ResultType = llvm::Type::getVoidTy(Context);
       return spec;
     }
 
@@ -1045,11 +1157,22 @@ private:
       return std::nullopt;
     }
 
-    // fldz / fld1: push a constant with no explicit operand.
+    // fabs/fchs: ST0 = |ST0| / ST0 = -ST0, no explicit operands.
+    if (mnemonic == "FABS" || mnemonic == "FCHS") {
+      spec.Kind = X87WindowKind::Unary;
+      spec.Unary = mnemonic == "FABS" ? X87WindowSpec::UnaryKind::Abs
+                                      : X87WindowSpec::UnaryKind::Chs;
+      return spec;
+    }
+
+    // fldz / fld1: push an exact constant.
     if (mnemonic == "FLDZ" || mnemonic == "FLD1") {
-      spec.IntrinsicName =
-          "notdec.x87." + std::string(mnemonic == "FLDZ" ? "fldz" : "fld1");
-      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.Kind = X87WindowKind::Push;
+      llvm::APFloat apFloat(mnemonic == "FLDZ" ? 0.0 : 1.0);
+      bool ignored;
+      apFloat.convert(llvm::APFloat::x87DoubleExtended(),
+                      llvm::APFloat::rmNearestTiesToEven, &ignored);
+      spec.PushConstant = llvm::ConstantFP::get(Context, apFloat);
       return spec;
     }
 
@@ -1059,27 +1182,26 @@ private:
           nullptr) {
         return std::nullopt;
       }
-      spec.IntrinsicName = "notdec.x87.fsqrt";
-      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.Kind = X87WindowKind::Unary;
+      spec.Unary = X87WindowSpec::UnaryKind::Sqrt;
       return spec;
     }
 
     // fld: push memory (f32/f64/f80) or duplicate st(i).
     if (mnemonic == "FLD") {
+      spec.Kind = X87WindowKind::Push;
       // f32/f64 loads write ST0 = FLOAT2FLOAT(mem).
       const PcodeOpView *write = findStackWrite(
           program, start, end, PcodeOpcode::FloatFloat2Float, 0);
       if (write != nullptr && write->Inputs.size() == 1 &&
           !isX87StackVarnode(write->Inputs[0])) {
         llvm::Type *fpType = floatType(write->Inputs[0].Size);
-        if (fpType != nullptr) {
-          spec.IntrinsicName = "notdec.x87.fld." + fpSuffix(fpType);
-          spec.Args = {write->Inputs[0]};
-          spec.ArgTypes = {fpType};
-          spec.ResultType = llvm::Type::getVoidTy(Context);
-          return spec;
+        if (fpType == nullptr) {
+          return std::nullopt;
         }
-        return std::nullopt;
+        spec.MemValue = write->Inputs[0];
+        spec.MemValueType = fpType;
+        return spec;
       }
       // f80 loads and fld %st(i) both write ST0 = COPY(unique); the producer
       // of the unique temp tells them apart.
@@ -1093,29 +1215,23 @@ private:
       if (producer != nullptr && producer->Opcode == PcodeOpcode::Copy &&
           producer->Inputs.size() == 1 &&
           isX87StackVarnode(producer->Inputs[0])) {
-        spec.IntrinsicName = "notdec.x87.fld.sti";
-        spec.Args = {stIndexVarnode(x87StackIndex(producer->Inputs[0]))};
-        spec.ArgTypes = {intType(1)};
-        spec.ResultType = llvm::Type::getVoidTy(Context);
+        spec.SlotIndex = x87StackIndex(producer->Inputs[0]);
         return spec;
       }
       llvm::Type *fpType = floatType(copied.Size);
       if (fpType == nullptr) {
         return std::nullopt;
       }
-      spec.IntrinsicName = "notdec.x87.fld." + fpSuffix(fpType);
-      spec.Args = {copied};
-      spec.ArgTypes = {fpType};
-      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.MemValue = copied;
+      spec.MemValueType = fpType;
       return spec;
     }
 
-    // fstp / fistp: store ST0 to memory or to st(i) (st(0) is a plain pop).
-    // The mnemonic decides the instruction; the STORE only supplies the
-    // target address and the stored value width.  Ghidra models FISTP as
-    // round(ST0)->trunc and FSTP as FLOAT2FLOAT/COPY of ST0, but those
-    // p-code shapes are not consulted: the library rounds with the FPU mode
-    // set by fldcw, so the truncated store is correct either way.
+    // fstp / fistp: store ST0 to memory or to st(i).  The mnemonic decides
+    // the instruction; the STORE only supplies the target address and the
+    // stored value width.  Ghidra models FISTP as round(ST0)->trunc and FSTP
+    // as FLOAT2FLOAT/COPY of ST0, but the conversion is re-emitted from the
+    // loaded ST0 below.
     if (mnemonic == "FSTP" || mnemonic == "FISTP") {
       const PcodeOpView *storeOp = nullptr;
       for (size_t index = start; index < end; ++index) {
@@ -1124,7 +1240,6 @@ private:
           break;
         }
       }
-      // STORE inputs are (space selector, address, value).
       if (storeOp != nullptr && storeOp->Inputs.size() == 3) {
         const VarnodeView &storedValue = storeOp->Inputs[2];
         if (mnemonic == "FISTP") {
@@ -1132,16 +1247,15 @@ private:
               storedValue.Size != 8) {
             return std::nullopt;
           }
-          spec.IntrinsicName =
-              "notdec.x87.fistp.i" + std::to_string(storedValue.Size * 8);
-          spec.ResultType = intType(storedValue.Size);
+          spec.Kind = X87WindowKind::PopStore;
+          spec.IsInt = true;
         } else {
           llvm::Type *fpType = floatType(storedValue.Size);
           if (fpType == nullptr) {
             return std::nullopt;
           }
-          spec.IntrinsicName = "notdec.x87.fstp." + fpSuffix(fpType);
-          spec.ResultType = fpType;
+          spec.Kind = X87WindowKind::PopStore;
+          spec.MemValueType = fpType;
         }
         spec.StoreAddress = storeOp->Inputs[1];
         spec.StoreValueSize = storedValue.Size;
@@ -1150,12 +1264,25 @@ private:
       if (mnemonic == "FISTP") {
         return std::nullopt;
       }
+      // Register form: fstp %st(i).  The p-code writes ST(i) = COPY(ST0)
+      // before the rolling pop; st(0) is a plain pop and Ghidra may emit a
+      // self-copy that gets compacted away, so default to slot 0.
       if (std::optional<uint32_t> index =
               stIndexFromSt0Copy(program, start, end)) {
-        spec.IntrinsicName = "notdec.x87.fstp.sti";
-        spec.Args = {stIndexVarnode(*index)};
-        spec.ArgTypes = {intType(1)};
-        spec.ResultType = llvm::Type::getVoidTy(Context);
+        spec.SlotIndex = *index;
+      } else {
+        spec.SlotIndex = 0;
+      }
+      spec.Kind = X87WindowKind::PopSlot;
+      return spec;
+    }
+
+    // fst %st(i): ST(i) = ST0, no pop.
+    if (mnemonic == "FST") {
+      if (std::optional<uint32_t> index =
+              stIndexFromSt0Copy(program, start, end)) {
+        spec.Kind = X87WindowKind::StoreSlot;
+        spec.SlotIndex = *index;
         return spec;
       }
       return std::nullopt;
@@ -1165,10 +1292,8 @@ private:
     if (mnemonic == "FXCH") {
       if (std::optional<uint32_t> index =
               stIndexFromSt0WriteCopy(program, start, end)) {
-        spec.IntrinsicName = "notdec.x87.fxch.sti";
-        spec.Args = {stIndexVarnode(*index)};
-        spec.ArgTypes = {intType(1)};
-        spec.ResultType = llvm::Type::getVoidTy(Context);
+        spec.Kind = X87WindowKind::Fxch;
+        spec.SlotIndex = *index;
         return spec;
       }
       return std::nullopt;
@@ -1185,17 +1310,15 @@ private:
       if (input.Size != 2 && input.Size != 4 && input.Size != 8) {
         return std::nullopt;
       }
-      spec.IntrinsicName =
-          "notdec.x87.fild.i" + std::to_string(input.Size * 8);
-      spec.Args = {input};
-      spec.ArgTypes = {intType(input.Size)};
-      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.Kind = X87WindowKind::Push;
+      spec.IsInt = true;
+      spec.MemValue = input;
       return spec;
     }
 
-    // fcomi/fucomip: compare ST0 with st(i), return packed CF|PF|ZF flags.
-    // FCOMI/FUCOMI do not pop; FCOMIP/FUCOMIP pop inside the library.  The
-    // st(i) operand is recovered from the FLOAT_EQUAL/FLOAT_LESS inputs.
+    // fcomi/fcomip/fucomi/fucomip: compare ST0 with st(i) into EFLAGS.
+    // FCOMI/FUCOMI do not pop; FCOMIP/FUCOMIP do.  The st(i) operand is
+    // recovered from the FLOAT_EQUAL/FLOAT_LESS inputs.
     if (mnemonic == "FCOMI" || mnemonic == "FCOMIP" ||
         mnemonic == "FUCOMI" || mnemonic == "FUCOMIP") {
       std::optional<uint32_t> index;
@@ -1203,8 +1326,7 @@ private:
         const PcodeOpView &op = program.Ops[opIndex];
         if ((op.Opcode == PcodeOpcode::FloatEqual ||
              op.Opcode == PcodeOpcode::FloatLess) &&
-            op.Inputs.size() == 2 &&
-            isX87StackVarnode(op.Inputs[0]) &&
+            op.Inputs.size() == 2 && isX87StackVarnode(op.Inputs[0]) &&
             isX87StackVarnode(op.Inputs[1])) {
           index = x87StackIndex(op.Inputs[0]) == 0
                       ? x87StackIndex(op.Inputs[1])
@@ -1215,17 +1337,10 @@ private:
       if (!index) {
         return std::nullopt;
       }
-      std::string name = mnemonic == "FCOMI"
-                             ? "fcomi"
-                             : mnemonic == "FCOMIP"
-                                   ? "fcomip"
-                                   : mnemonic == "FUCOMI" ? "fucomi"
-                                                          : "fucomip";
-      spec.IntrinsicName = "notdec.x87." + name + ".sti";
-      spec.Args = {stIndexVarnode(*index)};
-      spec.ArgTypes = {intType(1)};
-      spec.ResultType = intType(1);
-      spec.WritesComparisonFlags = true;
+      spec.Kind = X87WindowKind::Compare;
+      spec.SlotIndex = *index;
+      spec.Unordered = mnemonic == "FUCOMI" || mnemonic == "FUCOMIP";
+      spec.Pops = mnemonic == "FCOMIP" || mnemonic == "FUCOMIP";
       return spec;
     }
 
@@ -1240,48 +1355,46 @@ private:
         return std::nullopt;
       }
       spec.IntrinsicName = "notdec.x87.fprem";
-      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.Args = {StVarnodes[0], StVarnodes[1]};
+      spec.ArgTypes = {floatType(10), floatType(10)};
+      spec.ResultType = floatType(10);
+      spec.StoreResultToST0 = true;
       return spec;
     }
 
     // Pop arithmetic (faddp/fsubp/fmulp/fdivp/fsubrp/fdivrp):
-    // ST1 = op(ST0, ST1), then pop.
+    // ST(i) = op(ST0, ST(i)) [or the reversed order from the p-code], pop.
     if (mnemonic == "FADDP" || mnemonic == "FSUBP" || mnemonic == "FMULP" ||
         mnemonic == "FDIVP" || mnemonic == "FSUBRP" ||
         mnemonic == "FDIVRP") {
       for (size_t index = start; index < end; ++index) {
         const PcodeOpView &op = program.Ops[index];
         if (!op.Output || !isX87StackVarnode(*op.Output) ||
-            !isFloatBinaryOpcode(op.Opcode) || op.Inputs.size() != 2) {
+            !isFloatBinaryOpcode(op.Opcode) || op.Inputs.size() != 2 ||
+            !isX87StackVarnode(op.Inputs[0]) ||
+            !isX87StackVarnode(op.Inputs[1])) {
           continue;
         }
         uint32_t outputIndex = x87StackIndex(*op.Output);
-        if (outputIndex == 0 || !isX87StackVarnode(op.Inputs[0]) ||
-            !isX87StackVarnode(op.Inputs[1])) {
+        if (outputIndex == 0) {
           return std::nullopt;
         }
-        std::string name = popArithName(op.Opcode, op.Inputs[0]);
-        if (name.empty()) {
-          return std::nullopt;
-        }
-        // st(1) keeps the legacy no-argument name; other slots take the
-        // explicit slot index.
+        spec.ArithOpcode = op.Opcode;
+        spec.ST0IsInput0 = x87StackIndex(op.Inputs[0]) == 0;
         if (outputIndex == 1) {
-          spec.IntrinsicName = "notdec.x87." + name;
+          spec.Kind = X87WindowKind::PopArith;
         } else {
-          spec.IntrinsicName = "notdec.x87." + name + ".sti";
-          spec.Args = {stIndexVarnode(outputIndex)};
-          spec.ArgTypes = {intType(1)};
+          spec.Kind = X87WindowKind::PopArithSlot;
+          spec.SlotIndex = outputIndex;
         }
-        spec.ResultType = llvm::Type::getVoidTy(Context);
         return spec;
       }
       return std::nullopt;
     }
 
-    // Register or memory arithmetic on ST0.  FSUBR/FDIVR are the reverse
-    // forms (ST0 = st(i) - ST0 / ST0 = st(i) / ST0); the direction is read
-    // from the p-code operand order.
+    // Register or memory arithmetic on ST0.  The operand order (who is
+    // input0) is taken from the p-code, so fsubr/fdivr need no special
+    // handling here.
     if (mnemonic == "FADD" || mnemonic == "FSUB" || mnemonic == "FMUL" ||
         mnemonic == "FDIV" || mnemonic == "FSUBR" || mnemonic == "FDIVR") {
       const PcodeOpView *write = nullptr;
@@ -1301,15 +1414,13 @@ private:
       bool input0IsST = isX87StackVarnode(input0);
       bool input1IsST = isX87StackVarnode(input1);
       if (input0IsST && input1IsST) {
-        // Register arithmetic: ST0 = op(ST0, st(i)).
-        uint32_t index = x87StackIndex(input0) == 0
+        // Register arithmetic: ST0 = op(ST0, st(i)) or op(st(i), ST0).
+        spec.Kind = X87WindowKind::RegArith;
+        spec.ArithOpcode = write->Opcode;
+        spec.ST0IsInput0 = x87StackIndex(input0) == 0;
+        spec.SlotIndex = x87StackIndex(input0) == 0
                              ? x87StackIndex(input1)
                              : x87StackIndex(input0);
-        spec.IntrinsicName = "notdec.x87." +
-                             regArithName(write->Opcode, input0) + ".sti";
-        spec.Args = {stIndexVarnode(index)};
-        spec.ArgTypes = {intType(1)};
-        spec.ResultType = llvm::Type::getVoidTy(Context);
         return spec;
       }
       if (input0IsST == input1IsST) {
@@ -1331,25 +1442,21 @@ private:
       if (fpType == nullptr) {
         return std::nullopt;
       }
-      std::string name = memArithName(write->Opcode, !input0IsST);
-      if (name.empty()) {
-        return std::nullopt;
-      }
-      spec.IntrinsicName = "notdec.x87." + name + "." + fpSuffix(fpType);
-      spec.Args = {rawMem};
-      spec.ArgTypes = {fpType};
-      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.Kind = X87WindowKind::MemArith;
+      spec.ArithOpcode = write->Opcode;
+      spec.ST0IsInput0 = input0IsST;
+      spec.MemValue = rawMem;
+      spec.MemValueType = fpType;
       return spec;
     }
 
     return std::nullopt;
   }
-
   // Recognize one x87 instruction from its p-code expansion (heritage JSON
-  // fallback, where no mnemonic is available).  Returns the folded intrinsic
+  // fallback, where no mnemonic is available).  Returns the window lowering
   // description, or nullopt when the instruction does not match a known shape
   // and has to fall back to ordinary p-code lowering.
-  std::optional<X87IntrinsicSpec>
+  std::optional<X87WindowSpec>
   classifyX87ByShape(const PcodeProgram &program, size_t start, size_t end) {
     bool hasStackVarnode = false;
     for (size_t index = start; index < end; ++index) {
@@ -1379,7 +1486,6 @@ private:
       switch (op.Opcode) {
       case PcodeOpcode::FloatInt2Float:
       case PcodeOpcode::FloatFloat2Float:
-      case PcodeOpcode::FloatTrunc:
       case PcodeOpcode::FloatAdd:
       case PcodeOpcode::FloatSub:
       case PcodeOpcode::FloatMult:
@@ -1397,7 +1503,7 @@ private:
       return std::nullopt;
     }
 
-    X87IntrinsicSpec spec;
+    X87WindowSpec spec;
     spec.Start = start;
     spec.End = end;
 
@@ -1415,12 +1521,11 @@ private:
           if (fpType == nullptr) {
             return std::nullopt;
           }
-          spec.IntrinsicName = "notdec.x87.fstp." + fpSuffix(fpType);
-          spec.ResultType = fpType;
+          spec.Kind = X87WindowKind::PopStore;
+          spec.MemValueType = fpType;
         } else if (producer->Opcode == PcodeOpcode::FloatTrunc) {
-          spec.IntrinsicName = "notdec.x87.fistp.i" +
-                               std::to_string(producer->Output->Size * 8);
-          spec.ResultType = intType(producer->Output->Size);
+          spec.Kind = X87WindowKind::PopStore;
+          spec.IsInt = true;
         } else {
           return std::nullopt;
         }
@@ -1444,11 +1549,9 @@ private:
       if (input.Size != 2 && input.Size != 4 && input.Size != 8) {
         return std::nullopt;
       }
-      spec.IntrinsicName =
-          "notdec.x87.fild.i" + std::to_string(input.Size * 8);
-      spec.Args = {input};
-      spec.ArgTypes = {intType(input.Size)};
-      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.Kind = X87WindowKind::Push;
+      spec.IsInt = true;
+      spec.MemValue = input;
       return spec;
     }
 
@@ -1459,16 +1562,15 @@ private:
       }
       const VarnodeView &input = writeOp.Inputs[0];
       if (isX87StackVarnode(input)) {
-        return std::nullopt; // fld %st(i) not covered yet
+        return std::nullopt;  // fld %st(i) not covered without a mnemonic
       }
       llvm::Type *fpType = floatType(input.Size);
       if (fpType == nullptr) {
         return std::nullopt;
       }
-      spec.IntrinsicName = "notdec.x87.fld." + fpSuffix(fpType);
-      spec.Args = {input};
-      spec.ArgTypes = {fpType};
-      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.Kind = X87WindowKind::Push;
+      spec.MemValue = input;
+      spec.MemValueType = fpType;
       return spec;
     }
 
@@ -1482,16 +1584,20 @@ private:
       bool input0IsST = isX87StackVarnode(input0);
       bool input1IsST = isX87StackVarnode(input1);
       if (input0IsST && input1IsST) {
-        // Pop arithmetic (faddp/fmulp/...): ST1 = op(ST0, ST1), then pop.
-        if (x87StackIndex(*writeOp.Output) != 1) {
+        // Pop arithmetic: ST(i) = op(ST0, ST(i)) with the operand order from
+        // the p-code, then pop.
+        uint32_t outputIndex = x87StackIndex(*writeOp.Output);
+        if (outputIndex == 0) {
           return std::nullopt;
         }
-        std::string name = popArithName(writeOp.Opcode, input0);
-        if (name.empty()) {
-          return std::nullopt;
+        spec.ArithOpcode = writeOp.Opcode;
+        spec.ST0IsInput0 = x87StackIndex(input0) == 0;
+        if (outputIndex == 1) {
+          spec.Kind = X87WindowKind::PopArith;
+        } else {
+          spec.Kind = X87WindowKind::PopArithSlot;
+          spec.SlotIndex = outputIndex;
         }
-        spec.IntrinsicName = "notdec.x87." + name;
-        spec.ResultType = llvm::Type::getVoidTy(Context);
         return spec;
       }
       if (x87StackIndex(*writeOp.Output) != 0 ||
@@ -1514,20 +1620,16 @@ private:
       if (fpType == nullptr) {
         return std::nullopt;
       }
-      std::string name = memArithName(writeOp.Opcode, !input0IsST);
-      if (name.empty()) {
-        return std::nullopt;
-      }
-      spec.IntrinsicName = "notdec.x87." + name + "." + fpSuffix(fpType);
-      spec.Args = {rawMem};
-      spec.ArgTypes = {fpType};
-      spec.ResultType = llvm::Type::getVoidTy(Context);
+      spec.Kind = X87WindowKind::MemArith;
+      spec.ArithOpcode = writeOp.Opcode;
+      spec.ST0IsInput0 = input0IsST;
+      spec.MemValue = rawMem;
+      spec.MemValueType = fpType;
       return spec;
     }
 
     return std::nullopt;
   }
-
   llvm::Value *toIntrinsicArg(llvm::Value *value, llvm::Type *targetType) {
     if (value->getType() == targetType) {
       return value;
@@ -1541,16 +1643,366 @@ private:
     return Builder.CreateZExtOrTrunc(value, targetType);
   }
 
-  bool lowerX87Group(const X87IntrinsicSpec &spec,
-                     std::string &errorMessage) {
-    // Lower the non-stack ops (LOAD / INT_ADD address computation) so the call
-    // argument values are available through the normal p-code SSA cache.
+  // --- x87 ST0/ST1 window helpers.  ST0/ST1 are i80 register globals; the
+  // float operations below bitcast to x86_fp80 at the window boundary. ---
+
+  llvm::Type *x87Fp80() { return floatType(10); }
+
+  llvm::Value *readX87ST(uint32_t index, bool windowShift = false) {
+    llvm::Value *bits = read(StVarnodes[index]);
+    if (windowShift) {
+      // 窗口移位读：push/pop/fxch 的槽位搬移（如 push 的 ST1 <- 旧 ST0），
+      // 值只在窗口内部转移，不是对 ST0/ST1 值的真实消费。register summary
+      // 看到这个标记就不会把它当成对 callee 返回值的需求。
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(bits)) {
+        load->setMetadata("notdec.x87.window.shift",
+                          llvm::MDNode::get(Context, {}));
+      }
+    }
+    return Builder.CreateBitCast(bits, x87Fp80(),
+                                 "st" + std::to_string(index));
+  }
+
+  void writeX87ST(uint32_t index, llvm::Value *value) {
+    llvm::Value *bits = Builder.CreateBitCast(value, intType(10),
+                                              "st" + std::to_string(index) +
+                                                  ".bits");
+    write(StVarnodes[index], bits);
+  }
+
+  // Push v: ST0 <- v, ST1 <- old ST0, library push(old ST1).  The library
+  // shift (old ST1 becomes its new top = ST2) is exactly the ST2..ST7 rolling
+  // copies the p-code performs.
+  void x87WindowPush(llvm::Value *value) {
+    llvm::Value *oldST0 = readX87ST(0, true);
+    llvm::Value *oldST1 = readX87ST(1, true);
+    writeX87ST(0, value);
+    writeX87ST(1, oldST0);
+    llvm::Function *push = getOrInsertNativeX87Intrinsic(
+        Module, "notdec.x87.push", llvm::Type::getVoidTy(Context),
+        {x87Fp80()}, false);
+    Builder.CreateCall(push, {oldST1});
+  }
+
+  // Full pop: ST0 <- old ST1, ST1 <- library pop() (the old ST2).
+  void x87WindowPop() {
+    llvm::Value *oldST1 = readX87ST(1, true);
+    writeX87ST(0, oldST1);
+    x87PopIntoST1();
+  }
+
+  // Only the ST1 half of a pop, used when the operation already computed the
+  // new ST0 (faddp, fstp %st(1)): ST1 <- library pop().
+  void x87PopIntoST1() {
+    llvm::Function *pop = getOrInsertNativeX87Intrinsic(
+        Module, "notdec.x87.pop", x87Fp80(), {}, false);
+    llvm::Value *next = Builder.CreateCall(pop, {});
+    writeX87ST(1, next);
+  }
+
+  // Read/write library slot ST(i) for i>=2 (the window only covers ST0/ST1).
+  llvm::Value *x87Peek(uint32_t index) {
+    llvm::Function *peek = getOrInsertNativeX87Intrinsic(
+        Module, "notdec.x87.peek", x87Fp80(), {intType(1)}, false);
+    return Builder.CreateCall(peek,
+                              {llvm::ConstantInt::get(intType(1), index)});
+  }
+
+  void x87Poke(uint32_t index, llvm::Value *value) {
+    llvm::Function *poke = getOrInsertNativeX87Intrinsic(
+        Module, "notdec.x87.poke", llvm::Type::getVoidTy(Context),
+        {intType(1), x87Fp80()}, false);
+    Builder.CreateCall(poke,
+                       {llvm::ConstantInt::get(intType(1), index), value});
+  }
+
+  // The st(i) slot value: ST0/ST1 live in the window, ST2+ in the library.
+  llvm::Value *readX87Slot(uint32_t index) {
+    if (index == 0) {
+      return readX87ST(0);
+    }
+    if (index == 1) {
+      return readX87ST(1);
+    }
+    return x87Peek(index);
+  }
+
+  llvm::Value *x87FloatArith(PcodeOpcode opcode, llvm::Value *lhs,
+                             llvm::Value *rhs) {
+    switch (opcode) {
+    case PcodeOpcode::FloatAdd:
+      return Builder.CreateFAdd(lhs, rhs);
+    case PcodeOpcode::FloatSub:
+      return Builder.CreateFSub(lhs, rhs);
+    case PcodeOpcode::FloatMult:
+      return Builder.CreateFMul(lhs, rhs);
+    case PcodeOpcode::FloatDiv:
+      return Builder.CreateFDiv(lhs, rhs);
+    default:
+      return nullptr;
+    }
+  }
+
+  // Library-managed instruction: FPU environment (fnstsw/fnstcw/fldcw/
+  // fstenv/fldenv) and fprem.  The library owns the FPU environment and the
+  // ST2..ST7 state, so the call carries explicit register/memory operands and
+  // optionally writes its result back into the ST0 window.
+  bool lowerX87Library(const X87WindowSpec &spec, std::string &errorMessage) {
+    llvm::Function *intrinsic = getOrInsertNativeX87Intrinsic(
+        Module, spec.IntrinsicName, spec.ResultType, spec.ArgTypes,
+        spec.AccessesMemory);
+    std::vector<llvm::Value *> args;
+    args.reserve(spec.Args.size());
+    for (size_t index = 0; index < spec.Args.size(); ++index) {
+      args.push_back(
+          toIntrinsicArg(read(spec.Args[index]), spec.ArgTypes[index]));
+    }
+    llvm::Value *result = Builder.CreateCall(intrinsic, args);
+
+    if (spec.StoreResultToST0) {
+      writeX87ST(0, result);
+      return true;
+    }
+
+    if (spec.ResultRegister) {
+      write(*spec.ResultRegister, result);
+    }
+
+    if (spec.StoreAddress && spec.StoreValueSize) {
+      llvm::Value *stored = result;
+      if (stored->getType()->isFloatingPointTy()) {
+        stored = Builder.CreateBitCast(stored, intType(*spec.StoreValueSize));
+      } else {
+        stored = Builder.CreateZExtOrTrunc(stored,
+                                           intType(*spec.StoreValueSize));
+      }
+      auto *store = Builder.CreateStore(
+          stored, memoryPointer(resize(read(*spec.StoreAddress),
+                                       pointerByteSize())));
+      store->setAlignment(llvm::Align(1));
+    }
+    return true;
+  }
+
+  bool lowerX87Push(const X87WindowSpec &spec, std::string &errorMessage) {
+    llvm::Value *value = nullptr;
+    if (spec.PushConstant != nullptr) {
+      value = spec.PushConstant;
+    } else if (spec.IsInt) {
+      value = Builder.CreateSIToFP(read(*spec.MemValue), x87Fp80());
+    } else if (spec.MemValue) {
+      // The memory operand is stored as integer bits; convert to the source
+      // float type and widen to x86_fp80.
+      llvm::Value *raw = read(*spec.MemValue);
+      llvm::Value *fp = Builder.CreateBitCast(raw, spec.MemValueType);
+      if (spec.MemValueType->isX86_FP80Ty()) {
+        value = fp;
+      } else {
+        value = Builder.CreateFPExt(fp, x87Fp80());
+      }
+    } else {
+      value = readX87Slot(spec.SlotIndex);
+    }
+    if (value == nullptr) {
+      return false;
+    }
+    x87WindowPush(value);
+    return true;
+  }
+
+  bool lowerX87PopStore(const X87WindowSpec &spec,
+                        std::string &errorMessage) {
+    llvm::Value *value = readX87ST(0);
+    llvm::Value *stored = nullptr;
+    if (spec.IsInt) {
+      stored = Builder.CreateFPToSI(value, intType(*spec.StoreValueSize));
+    } else if (spec.MemValueType->isX86_FP80Ty()) {
+      stored = Builder.CreateBitCast(value, intType(*spec.StoreValueSize));
+    } else {
+      llvm::Value *fp = Builder.CreateFPTrunc(value, spec.MemValueType);
+      stored = Builder.CreateBitCast(fp, intType(*spec.StoreValueSize));
+    }
+    auto *store = Builder.CreateStore(
+        stored,
+        memoryPointer(resize(read(*spec.StoreAddress), pointerByteSize())));
+    store->setAlignment(llvm::Align(1));
+    x87WindowPop();
+    return true;
+  }
+
+  bool lowerX87PopSlot(const X87WindowSpec &spec, std::string &errorMessage) {
+    if (spec.SlotIndex == 1) {
+      // fstp %st(1): ST1 <- ST0, then pop leaves ST0 = old ST1 = old ST0.
+      x87PopIntoST1();
+      return true;
+    }
+    if (spec.SlotIndex >= 2) {
+      // ST(i) <- ST0; the pop then shifts the poked value into the window.
+      x87Poke(spec.SlotIndex, readX87ST(0));
+    }
+    x87WindowPop();
+    return true;
+  }
+
+  bool lowerX87StoreSlot(const X87WindowSpec &spec,
+                         std::string &errorMessage) {
+    if (spec.SlotIndex == 0) {
+      return true;  // fst %st(0) is a no-op
+    }
+    if (spec.SlotIndex == 1) {
+      writeX87ST(1, readX87ST(0));
+      return true;
+    }
+    x87Poke(spec.SlotIndex, readX87ST(0));
+    return true;
+  }
+
+  bool lowerX87PopArith(const X87WindowSpec &spec,
+                        std::string &errorMessage) {
+    llvm::Value *st0 = readX87ST(0);
+    if (spec.Kind == X87WindowKind::PopArith) {
+      llvm::Value *st1 = readX87ST(1);
+      llvm::Value *result = spec.ST0IsInput0
+                                ? x87FloatArith(spec.ArithOpcode, st0, st1)
+                                : x87FloatArith(spec.ArithOpcode, st1, st0);
+      if (result == nullptr) {
+        return false;
+      }
+      // faddp: ST1 = op, then pop makes it the new ST0.
+      writeX87ST(0, result);
+      x87PopIntoST1();
+      return true;
+    }
+    // PopArithSlot: ST(i) = op(ST0, ST(i)), then pop.
+    llvm::Value *slot = x87Peek(spec.SlotIndex);
+    llvm::Value *result = spec.ST0IsInput0
+                              ? x87FloatArith(spec.ArithOpcode, st0, slot)
+                              : x87FloatArith(spec.ArithOpcode, slot, st0);
+    if (result == nullptr) {
+      return false;
+    }
+    x87Poke(spec.SlotIndex, result);
+    // The pop shifts ST(i) into ST(i-1), so for st(2) the poked value lands
+    // in the window as the new ST1.
+    x87WindowPop();
+    return true;
+  }
+
+  bool lowerX87RegArith(const X87WindowSpec &spec,
+                        std::string &errorMessage) {
+    llvm::Value *st0 = readX87ST(0);
+    llvm::Value *slot = readX87Slot(spec.SlotIndex);
+    llvm::Value *result = spec.ST0IsInput0
+                              ? x87FloatArith(spec.ArithOpcode, st0, slot)
+                              : x87FloatArith(spec.ArithOpcode, slot, st0);
+    if (result == nullptr) {
+      return false;
+    }
+    writeX87ST(0, result);
+    return true;
+  }
+
+  bool lowerX87MemArith(const X87WindowSpec &spec,
+                        std::string &errorMessage) {
+    llvm::Value *st0 = readX87ST(0);
+    llvm::Value *raw = read(*spec.MemValue);
+    llvm::Value *mem = Builder.CreateBitCast(raw, spec.MemValueType);
+    if (!spec.MemValueType->isX86_FP80Ty()) {
+      mem = Builder.CreateFPExt(mem, x87Fp80());
+    }
+    llvm::Value *result = spec.ST0IsInput0
+                              ? x87FloatArith(spec.ArithOpcode, st0, mem)
+                              : x87FloatArith(spec.ArithOpcode, mem, st0);
+    if (result == nullptr) {
+      return false;
+    }
+    writeX87ST(0, result);
+    return true;
+  }
+
+  bool lowerX87Unary(const X87WindowSpec &spec, std::string &errorMessage) {
+    llvm::Value *st0 = readX87ST(0);
+    llvm::Value *result = nullptr;
+    switch (spec.Unary) {
+    case X87WindowSpec::UnaryKind::Sqrt: {
+      llvm::Function *sqrt = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, llvm::Intrinsic::sqrt, {x87Fp80()});
+      result = Builder.CreateCall(sqrt, {st0});
+      break;
+    }
+    case X87WindowSpec::UnaryKind::Abs: {
+      llvm::Function *fabs = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, llvm::Intrinsic::fabs, {x87Fp80()});
+      result = Builder.CreateCall(fabs, {st0});
+      break;
+    }
+    case X87WindowSpec::UnaryKind::Chs:
+      result = Builder.CreateFNeg(st0);
+      break;
+    }
+    writeX87ST(0, result);
+    return true;
+  }
+
+  bool lowerX87Compare(const X87WindowSpec &spec,
+                       std::string &errorMessage) {
+    llvm::Value *st0 = readX87ST(0);
+    llvm::Value *slot = readX87Slot(spec.SlotIndex);
+    // Same flag shape as the x86.sinc fcomi macro: PF on unordered, ZF/CF
+    // include the unordered case, AF/SF/OF cleared.  FCOMI and FUCOMI set the
+    // same flags; they differ only in the invalid-operation exception.
+    llvm::Value *pf = Builder.CreateFCmpUNO(st0, slot);
+    llvm::Value *zf = Builder.CreateOr(pf, Builder.CreateFCmpOEQ(st0, slot));
+    llvm::Value *cf = Builder.CreateOr(pf, Builder.CreateFCmpOLT(st0, slot));
+    auto flagVarnode = [](uint64_t offset) {
+      VarnodeView varnode;
+      varnode.Space = "register";
+      varnode.Offset = offset;
+      varnode.Size = 1;
+      varnode.IsRegister = true;
+      return varnode;
+    };
+    write(flagVarnode(0x200), cf);  // CF
+    write(flagVarnode(0x202), pf);  // PF
+    write(flagVarnode(0x204),
+          llvm::ConstantInt::get(intType(1), 0));  // AF
+    write(flagVarnode(0x206), zf);  // ZF
+    write(flagVarnode(0x207),
+          llvm::ConstantInt::get(intType(1), 0));  // SF
+    write(flagVarnode(0x20b),
+          llvm::ConstantInt::get(intType(1), 0));  // OF
+    if (spec.Pops) {
+      x87WindowPop();
+    }
+    return true;
+  }
+
+  bool lowerX87Fxch(const X87WindowSpec &spec, std::string &errorMessage) {
+    if (spec.SlotIndex == 0) {
+      return true;  // fxch %st(0) is a no-op
+    }
+    if (spec.SlotIndex == 1) {
+      llvm::Value *a = readX87ST(0, true);
+      llvm::Value *b = readX87ST(1, true);
+      writeX87ST(0, b);
+      writeX87ST(1, a);
+      return true;
+    }
+    llvm::Value *slot = x87Peek(spec.SlotIndex);
+    x87Poke(spec.SlotIndex, readX87ST(0));
+    writeX87ST(0, slot);
+    return true;
+  }
+
+  bool lowerX87Window(const X87WindowSpec &spec, std::string &errorMessage) {
+    // Lower the non-stack ops (LOAD / INT_ADD address computation) so the
+    // operand values are available through the normal p-code SSA cache.
     // Comparison instructions (fcomi/fucomip) have no memory operand and
-    // their unique temps are group-private, so nothing needs lowering here.
+    // their unique temps are group-private, so nothing needs lowering there.
     // fnstsw/fnstcw must not lower the COPY that reads the FPU word and
     // fldcw must not lower the COPY that writes it: the intrinsic returns or
-    // consumes the word instead.  The same applies to any ST0..ST7 rolling
-    // writes, which stay inside the library.
+    // consumes the word instead.  The same applies to all ST0..ST7 rolling
+    // writes, which the window model re-emits below.
     if (!spec.WritesComparisonFlags) {
       for (size_t index = spec.Start; index < spec.End; ++index) {
         const PcodeOpView &op = (*CurrentProgramOps)[index];
@@ -1572,63 +2024,32 @@ private:
       }
     }
 
-    llvm::Function *intrinsic = getOrInsertNativeX87Intrinsic(
-        Module, spec.IntrinsicName, spec.ResultType, spec.ArgTypes,
-        spec.AccessesMemory);
-    std::vector<llvm::Value *> args;
-    args.reserve(spec.Args.size());
-    for (size_t index = 0; index < spec.Args.size(); ++index) {
-      args.push_back(
-          toIntrinsicArg(read(spec.Args[index]), spec.ArgTypes[index]));
+    switch (spec.Kind) {
+    case X87WindowKind::Library:
+      return lowerX87Library(spec, errorMessage);
+    case X87WindowKind::Push:
+      return lowerX87Push(spec, errorMessage);
+    case X87WindowKind::PopStore:
+      return lowerX87PopStore(spec, errorMessage);
+    case X87WindowKind::PopSlot:
+      return lowerX87PopSlot(spec, errorMessage);
+    case X87WindowKind::StoreSlot:
+      return lowerX87StoreSlot(spec, errorMessage);
+    case X87WindowKind::PopArith:
+    case X87WindowKind::PopArithSlot:
+      return lowerX87PopArith(spec, errorMessage);
+    case X87WindowKind::RegArith:
+      return lowerX87RegArith(spec, errorMessage);
+    case X87WindowKind::MemArith:
+      return lowerX87MemArith(spec, errorMessage);
+    case X87WindowKind::Unary:
+      return lowerX87Unary(spec, errorMessage);
+    case X87WindowKind::Compare:
+      return lowerX87Compare(spec, errorMessage);
+    case X87WindowKind::Fxch:
+      return lowerX87Fxch(spec, errorMessage);
     }
-    llvm::Value *result = Builder.CreateCall(intrinsic, args);
-
-    if (spec.WritesComparisonFlags) {
-      // The intrinsic returns CF|PF|ZF packed into an i8 (bits 0/1/2) and
-      // mirrors the p-code flag writes that non-x87 instructions can observe:
-      // EFLAGS CF/PF/ZF are set from the result and AF/SF/OF are cleared.
-      // The FPU-internal side (FSW C1 bit and the C1 register) is owned by the
-      // intrinsic library together with the FPU stack, so it is not modelled
-      // here; the library must clear C1 in its internal status word.
-      auto flagVarnode = [](uint64_t offset, uint32_t size) {
-        VarnodeView varnode;
-        varnode.Space = "register";
-        varnode.Offset = offset;
-        varnode.Size = size;
-        varnode.IsRegister = true;
-        return varnode;
-      };
-      const uint64_t flagOffsets[3] = {0x200, 0x202, 0x206}; // CF, PF, ZF
-      for (unsigned bit = 0; bit < 3; ++bit) {
-        llvm::Value *flag = Builder.CreateAnd(
-            Builder.CreateLShr(result, bit), 1);
-        write(flagVarnode(flagOffsets[bit], 1), flag);
-      }
-      llvm::Value *zero = llvm::ConstantInt::get(intType(1), 0);
-      write(flagVarnode(0x204, 1), zero); // AF
-      write(flagVarnode(0x207, 1), zero); // SF
-      write(flagVarnode(0x20b, 1), zero); // OF
-    }
-
-    if (spec.ResultRegister) {
-      // fnstsw %ax: write the status word to the register target (AX).
-      write(*spec.ResultRegister, result);
-    }
-
-    if (spec.StoreAddress && spec.StoreValueSize) {
-      llvm::Value *stored = result;
-      if (stored->getType()->isFloatingPointTy()) {
-        stored = Builder.CreateBitCast(stored, intType(*spec.StoreValueSize));
-      } else {
-        stored = Builder.CreateZExtOrTrunc(stored,
-                                           intType(*spec.StoreValueSize));
-      }
-      auto *store = Builder.CreateStore(
-          stored, memoryPointer(resize(read(*spec.StoreAddress),
-                                       pointerByteSize())));
-      store->setAlignment(llvm::Align(1));
-    }
-    return true;
+    return false;
   }
 
   std::string blockName(uint64_t address) {
@@ -3568,7 +3989,12 @@ private:
   // base).  The write is emitted at the suppressed call position.
   std::map<size_t, std::pair<VarnodeView, uint64_t>> ThunkBaseWrites;
   // First op index of an x87 instruction -> folded intrinsic description.
-  std::map<size_t, X87IntrinsicSpec> X87Groups;
+  // First op index of an x87 instruction -> window
+  // lowering description.
+  std::map<size_t, X87WindowSpec> X87Groups;
+  // Varnode views for the ST0/ST1 window, taken from the
+  // register list so the offsets match the p-code.
+  VarnodeView StVarnodes[2];
   std::vector<uint64_t> EmptyNativeBlockAddresses;
   std::vector<llvm::BasicBlock *> ExternalTargetBlocks;
   const std::vector<PcodeOpView> *CurrentProgramOps = nullptr;

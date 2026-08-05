@@ -1647,7 +1647,7 @@ void addX87FstpOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address) {
   }
 }
 
-bool testX87FildlFoldsToIntrinsicCall() {
+bool testX87FildlFoldsToWindowPush() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   addX64Registers(program);
@@ -1663,31 +1663,52 @@ bool testX87FildlFoldsToIntrinsicCall() {
   llvm::Function *function =
       module ? module->getFunction(config.EntryFunctionName) : nullptr;
 
-  bool hasFildl = false;
+  bool hasPush = false;
+  bool hasSIToFP = false;
+  bool hasOldLibraryCall = false;
+  bool hasWindowShiftMetadata = false;
   if (function != nullptr) {
     for (llvm::BasicBlock &block : *function) {
       for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+          hasWindowShiftMetadata |=
+              load->getMetadata("notdec.x87.window.shift") != nullptr;
+        }
+        hasSIToFP |= llvm::isa<llvm::SIToFPInst>(&instruction);
         auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
         if (call == nullptr) {
           continue;
         }
         llvm::Function *callee = call->getCalledFunction();
-        hasFildl |=
-            callee != nullptr && callee->getName() == "notdec.x87.fild.i32";
+        if (callee == nullptr) {
+          continue;
+        }
+        hasPush |= callee->getName() == "notdec.x87.push";
+        hasOldLibraryCall |= callee->getName().starts_with("notdec.x87.") &&
+                             callee->getName() != "notdec.x87.push";
       }
     }
   }
 
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fildl function is missing") &&
-         expect(hasFildl, "x87 fildl did not fold to notdec.x87.fild.i32") &&
-         expect(!functionUsesGlobal(function, "ST0"),
-                "x87 fildl kept an ST0 register global") &&
+         expect(hasPush,
+                "x87 fildl did not emit notdec.x87.push for the ST2 shift") &&
+         expect(hasSIToFP,
+                "x87 fildl did not convert the i32 load to x86_fp80") &&
+         expect(hasWindowShiftMetadata,
+                "x87 fildl window shift load lost the window-shift metadata") &&
+         expect(!hasOldLibraryCall,
+                "x87 fildl still emitted a notdec.x87.fild.* library call") &&
+         expect(functionUsesGlobal(function, "ST0"),
+                "x87 fildl did not write the ST0 window") &&
+         expect(functionUsesGlobal(function, "ST1"),
+                "x87 fildl did not shift ST0 into the ST1 window") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
-                "module failed verifier after x87 fildl folding");
+                "module failed verifier after x87 fildl window push");
 }
 
-bool testX87FstpFoldsToIntrinsicCall() {
+bool testX87FstpFoldsToWindowPopStore() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   addX64Registers(program);
@@ -1703,30 +1724,41 @@ bool testX87FstpFoldsToIntrinsicCall() {
   llvm::Function *function =
       module ? module->getFunction(config.EntryFunctionName) : nullptr;
 
-  bool hasFstp = false;
+  bool hasPop = false;
   bool hasStore = false;
+  bool hasOldLibraryCall = false;
   if (function != nullptr) {
     for (llvm::BasicBlock &block : *function) {
       for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
-        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
-        if (call != nullptr) {
-          llvm::Function *callee = call->getCalledFunction();
-          hasFstp |= callee != nullptr &&
-                     callee->getName() == "notdec.x87.fstp.f64";
-        }
         hasStore |= llvm::isa<llvm::StoreInst>(&instruction);
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr) {
+          continue;
+        }
+        hasPop |= callee->getName() == "notdec.x87.pop";
+        hasOldLibraryCall |= callee->getName().starts_with("notdec.x87.") &&
+                             callee->getName() != "notdec.x87.pop";
       }
     }
   }
 
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fstp function is missing") &&
-         expect(hasFstp, "x87 fstp did not fold to notdec.x87.fstp.f64") &&
          expect(hasStore, "x87 fstp did not keep the result store") &&
-         expect(!functionUsesGlobal(function, "ST0"),
-                "x87 fstp kept an ST0 register global") &&
+         expect(hasPop,
+                "x87 fstp did not emit notdec.x87.pop for the ST2 shift") &&
+         expect(!hasOldLibraryCall,
+                "x87 fstp still emitted a notdec.x87.fstp.* library call") &&
+         expect(functionUsesGlobal(function, "ST0"),
+                "x87 fstp did not read the ST0 window") &&
+         expect(functionUsesGlobal(function, "ST1"),
+                "x87 fstp did not shift ST1 into the ST0 window") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
-                "module failed verifier after x87 fstp folding");
+                "module failed verifier after x87 fstp window pop");
 }
 
 // fldz: INT2FLOAT(const) -> unique, rolling push, ST0 = COPY(unique).
@@ -1757,7 +1789,7 @@ void addX87FldzOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address) {
   program.Ops.push_back(write);
 }
 
-bool testX87FldzFoldsToIntrinsicCall() {
+bool testX87FldzFoldsToWindowPushConstant() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   addX64Registers(program);
@@ -1773,28 +1805,50 @@ bool testX87FldzFoldsToIntrinsicCall() {
   llvm::Function *function =
       module ? module->getFunction(config.EntryFunctionName) : nullptr;
 
-  bool hasFldz = false;
+  bool hasPush = false;
+  bool hasOldLibraryCall = false;
+  llvm::StoreInst *st0Store = nullptr;
   if (function != nullptr) {
     for (llvm::BasicBlock &block : *function) {
       for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+          if (auto *global =
+                  llvm::dyn_cast<llvm::GlobalVariable>(store->getPointerOperand())) {
+            if (global->getName() == "ST0") {
+              st0Store = store;
+            }
+          }
+        }
         auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
         if (call == nullptr) {
           continue;
         }
         llvm::Function *callee = call->getCalledFunction();
-        hasFldz |= callee != nullptr &&
-                   callee->getName() == "notdec.x87.fldz";
+        if (callee == nullptr) {
+          continue;
+        }
+        hasPush |= callee->getName() == "notdec.x87.push";
+        hasOldLibraryCall |= callee->getName().starts_with("notdec.x87.") &&
+                             callee->getName() != "notdec.x87.push";
       }
     }
   }
 
+  bool st0StoreConstant = st0Store != nullptr &&
+                          llvm::isa<llvm::Constant>(st0Store->getValueOperand());
+
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fldz function is missing") &&
-         expect(hasFldz, "x87 fldz did not fold to notdec.x87.fldz") &&
-         expect(!functionUsesGlobal(function, "ST0"),
-                "x87 fldz kept an ST0 register global") &&
+         expect(hasPush,
+                "x87 fldz did not emit notdec.x87.push for the ST2 shift") &&
+         expect(!hasOldLibraryCall,
+                "x87 fldz still emitted a notdec.x87.fldz library call") &&
+         expect(st0StoreConstant,
+                "x87 fldz did not push a constant into the ST0 window") &&
+         expect(functionUsesGlobal(function, "ST1"),
+                "x87 fldz did not shift ST0 into the ST1 window") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
-                "module failed verifier after x87 fldz folding");
+                "module failed verifier after x87 fldz window push");
 }
 
 // fdivrp %st,%st(2): ST2 = FLOAT_DIV(ST2, ST0) + rolling pop.  Ghidra names
@@ -1822,7 +1876,7 @@ void addX87FdivrpSt2Ops(notdec::bin2llvm::PcodeProgram &program,
   }
 }
 
-bool testX87FdivrpSt2FoldsToIntrinsicCall() {
+bool testX87FdivrpSt2FoldsToWindowPeekPoke() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   addX64Registers(program);
@@ -1838,34 +1892,57 @@ bool testX87FdivrpSt2FoldsToIntrinsicCall() {
   llvm::Function *function =
       module ? module->getFunction(config.EntryFunctionName) : nullptr;
 
-  bool hasFdivrpSt2 = false;
+  bool hasPeek2 = false;
+  bool hasPoke2 = false;
+  bool hasPop = false;
+  bool hasFDiv = false;
+  bool hasOldLibraryCall = false;
   if (function != nullptr) {
     for (llvm::BasicBlock &block : *function) {
       for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        hasFDiv |= llvm::isa<llvm::BinaryOperator>(&instruction) &&
+                   instruction.getOpcode() == llvm::Instruction::FDiv;
         auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
         if (call == nullptr) {
           continue;
         }
         llvm::Function *callee = call->getCalledFunction();
-        if (callee != nullptr && callee->getName() == "notdec.x87.fdivrp.sti" &&
-            call->arg_size() == 1) {
+        if (callee == nullptr) {
+          continue;
+        }
+        if (callee->getName() == "notdec.x87.peek" && call->arg_size() == 1) {
           if (auto *constant =
                   llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0))) {
-            hasFdivrpSt2 |= constant->getZExtValue() == 2;
+            hasPeek2 |= constant->getZExtValue() == 2;
           }
         }
+        if (callee->getName() == "notdec.x87.poke" && call->arg_size() == 2) {
+          if (auto *constant =
+                  llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0))) {
+            hasPoke2 |= constant->getZExtValue() == 2;
+          }
+        }
+        hasPop |= callee->getName() == "notdec.x87.pop";
+        hasOldLibraryCall |= callee->getName() == "notdec.x87.fdivrp.sti";
       }
     }
   }
 
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fdivrp st(2) function is missing") &&
-         expect(hasFdivrpSt2,
-                "x87 fdivrp st(2) did not fold to notdec.x87.fdivrp.sti(2)") &&
-         expect(!functionUsesGlobal(function, "ST0"),
-                "x87 fdivrp st(2) kept an ST0 register global") &&
+         expect(hasPeek2,
+                "x87 fdivrp st(2) did not peek slot 2 from the library") &&
+         expect(hasPoke2,
+                "x87 fdivrp st(2) did not poke slot 2 in the library") &&
+         expect(hasPop,
+                "x87 fdivrp st(2) did not pop after the operation") &&
+         expect(hasFDiv, "x87 fdivrp st(2) did not emit an x86_fp80 fdiv") &&
+         expect(!hasOldLibraryCall,
+                "x87 fdivrp st(2) still emitted notdec.x87.fdivrp.sti") &&
+         expect(functionUsesGlobal(function, "ST0"),
+                "x87 fdivrp st(2) did not use the ST0 window") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
-                "module failed verifier after x87 fdivrp st(2) folding");
+                "module failed verifier after x87 fdivrp st(2) window pop");
 }
 
 // fsubr %st(0),%st(3): ST0 = st(3) - ST0, the reverse register form.  The
@@ -1886,7 +1963,7 @@ void addX87FsubrSt3Ops(notdec::bin2llvm::PcodeProgram &program,
   program.Ops.push_back(sub);
 }
 
-bool testX87FsubrSt3FoldsToIntrinsicCall() {
+bool testX87FsubrSt3FoldsToWindowPeek() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   addX64Registers(program);
@@ -1902,34 +1979,47 @@ bool testX87FsubrSt3FoldsToIntrinsicCall() {
   llvm::Function *function =
       module ? module->getFunction(config.EntryFunctionName) : nullptr;
 
-  bool hasFsubrSt3 = false;
+  bool hasPeek3 = false;
+  bool hasFSub = false;
+  bool hasPop = false;
+  bool hasOldLibraryCall = false;
   if (function != nullptr) {
     for (llvm::BasicBlock &block : *function) {
       for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        hasFSub |= llvm::isa<llvm::BinaryOperator>(&instruction) &&
+                   instruction.getOpcode() == llvm::Instruction::FSub;
         auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
-        if (call == nullptr || call->getCalledFunction() == nullptr) {
+        if (call == nullptr) {
           continue;
         }
-        if (call->getCalledFunction()->getName() ==
-                "notdec.x87.fsubr.sti" &&
-            call->arg_size() == 1) {
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr) {
+          continue;
+        }
+        if (callee->getName() == "notdec.x87.peek" && call->arg_size() == 1) {
           if (auto *constant =
                   llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0))) {
-            hasFsubrSt3 |= constant->getZExtValue() == 3;
+            hasPeek3 |= constant->getZExtValue() == 3;
           }
         }
+        hasPop |= callee->getName() == "notdec.x87.pop";
+        hasOldLibraryCall |= callee->getName() == "notdec.x87.fsubr.sti";
       }
     }
   }
 
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fsubr st(3) function is missing") &&
-         expect(hasFsubrSt3,
-                "x87 fsubr st(3) did not fold to notdec.x87.fsubr.sti(3)") &&
-         expect(!functionUsesGlobal(function, "ST0"),
-                "x87 fsubr st(3) kept an ST0 register global") &&
+         expect(hasPeek3,
+                "x87 fsubr st(3) did not peek slot 3 from the library") &&
+         expect(hasFSub, "x87 fsubr st(3) did not emit an x86_fp80 fsub") &&
+         expect(!hasPop, "x87 fsubr st(3) must not pop (no fsubrp)") &&
+         expect(!hasOldLibraryCall,
+                "x87 fsubr st(3) still emitted notdec.x87.fsubr.sti") &&
+         expect(functionUsesGlobal(function, "ST0"),
+                "x87 fsubr st(3) did not write the ST0 window") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
-                "module failed verifier after x87 fsubr st(3) folding");
+                "module failed verifier after x87 fsubr st(3) window arith");
 }
 
 // fcomi/fucomip: compare ST0 with st(1), write EFLAGS/FPU status from the
@@ -2111,7 +2201,7 @@ void addX87FpremFnstswOps(notdec::bin2llvm::PcodeProgram &program,
   push(cbranch, address + 3, "JNE");
 }
 
-bool testX87FcomiFoldsToIntrinsicCall() {
+bool testX87FcomiFoldsToDirectCompare() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   addX64Registers(program);
@@ -2130,21 +2220,20 @@ bool testX87FcomiFoldsToIntrinsicCall() {
   llvm::Function *function =
       module ? module->getFunction(config.EntryFunctionName) : nullptr;
 
-  bool hasFcomi = false;
+  unsigned fcmpCount = 0;
+  bool hasX87LibraryCall = false;
   if (function != nullptr) {
     for (llvm::BasicBlock &block : *function) {
       for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        fcmpCount += llvm::isa<llvm::FCmpInst>(&instruction) ? 1 : 0;
         auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
         if (call == nullptr) {
           continue;
         }
         llvm::Function *callee = call->getCalledFunction();
-        if (callee != nullptr && callee->getName() == "notdec.x87.fcomi.sti" &&
-            call->arg_size() == 1) {
-          if (auto *constant =
-                  llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(0))) {
-            hasFcomi |= constant->getZExtValue() == 1;
-          }
+        if (callee != nullptr &&
+            callee->getName().starts_with("notdec.x87.")) {
+          hasX87LibraryCall = true;
         }
       }
     }
@@ -2152,11 +2241,18 @@ bool testX87FcomiFoldsToIntrinsicCall() {
 
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fcomi function is missing") &&
-         expect(hasFcomi, "x87 fcomi did not fold to notdec.x87.fcomi.sti(1)") &&
+         expect(!hasX87LibraryCall,
+                "x87 fcomi still emitted a notdec.x87.fcomi.* call") &&
+         expect(fcmpCount >= 3,
+                "x87 fcomi did not emit fcmp for PF/ZF/CF") &&
          expect(functionUsesGlobal(function, "CF"),
-                "x87 fcomi did not write the CF flag from the result") &&
-         expect(!functionUsesGlobal(function, "ST0"),
-                "x87 fcomi kept an ST0 register global") &&
+                "x87 fcomi did not write the CF flag") &&
+         expect(functionUsesGlobal(function, "PF"),
+                "x87 fcomi did not write the PF flag") &&
+         expect(functionUsesGlobal(function, "ZF"),
+                "x87 fcomi did not write the ZF flag") &&
+         expect(functionUsesGlobal(function, "ST0"),
+                "x87 fcomi did not read the ST0 window") &&
          expect(!functionUsesGlobal(function, "FPUStatusWord"),
                 "x87 fcomi kept an FPUStatusWord global; the status word is "
                 "library-internal") &&
@@ -2164,13 +2260,16 @@ bool testX87FcomiFoldsToIntrinsicCall() {
                 "x87 fcomi kept a C1 global; the status word is "
                 "library-internal") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
-                "module failed verifier after x87 fcomi folding");
+                "module failed verifier after x87 fcomi window compare");
 }
 
-bool testX87FucomipFoldsToIntrinsicCall() {
+bool testX87FucomipFoldsToDirectCompareWithPop() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   addX64Registers(program);
+  program.Registers.push_back({"register", 0x200, 1, "CF"});
+  program.Registers.push_back({"register", 0x202, 1, "PF"});
+  program.Registers.push_back({"register", 0x206, 1, "ZF"});
   addX87FcomiOps(program, 0x1000, "FUCOMIP", true);
 
   notdec::bin2llvm::PcodeLoweringConfig config;
@@ -2183,7 +2282,8 @@ bool testX87FucomipFoldsToIntrinsicCall() {
   llvm::Function *function =
       module ? module->getFunction(config.EntryFunctionName) : nullptr;
 
-  bool hasFucomip = false;
+  bool hasPop = false;
+  bool hasX87LibraryCall = false;
   if (function != nullptr) {
     for (llvm::BasicBlock &block : *function) {
       for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
@@ -2192,18 +2292,26 @@ bool testX87FucomipFoldsToIntrinsicCall() {
           continue;
         }
         llvm::Function *callee = call->getCalledFunction();
-        hasFucomip |= callee != nullptr &&
-                      callee->getName() == "notdec.x87.fucomip.sti";
+        if (callee == nullptr) {
+          continue;
+        }
+        hasPop |= callee->getName() == "notdec.x87.pop";
+        hasX87LibraryCall |=
+            callee->getName() == "notdec.x87.fucomip.sti";
       }
     }
   }
 
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fucomip function is missing") &&
-         expect(hasFucomip,
-                "x87 fucomip did not fold to notdec.x87.fucomip.sti") &&
-         expect(!functionUsesGlobal(function, "ST0"),
-                "x87 fucomip kept an ST0 register global") &&
+         expect(!hasX87LibraryCall,
+                "x87 fucomip still emitted a notdec.x87.fucomip.sti call") &&
+         expect(hasPop,
+                "x87 fucomip did not pop after the comparison") &&
+         expect(functionUsesGlobal(function, "CF"),
+                "x87 fucomip did not write the CF flag") &&
+         expect(functionUsesGlobal(function, "ST0"),
+                "x87 fucomip did not read the ST0 window") &&
          expect(!functionUsesGlobal(function, "FPUStatusWord"),
                 "x87 fucomip kept an FPUStatusWord global; the status word is "
                 "library-internal") &&
@@ -2211,10 +2319,10 @@ bool testX87FucomipFoldsToIntrinsicCall() {
                 "x87 fucomip kept a C1 global; the status word is "
                 "library-internal") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
-                "module failed verifier after x87 fucomip folding");
+                "module failed verifier after x87 fucomip window compare");
 }
 
-bool testX87FpremFnstswFoldsToIntrinsicCall() {
+bool testX87FpremFnstswFoldsToIntrinsicCalls() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   addX64Registers(program);
@@ -2233,6 +2341,7 @@ bool testX87FpremFnstswFoldsToIntrinsicCall() {
       module ? module->getFunction(config.EntryFunctionName) : nullptr;
 
   bool hasFprem = false;
+  bool fpremSignatureOk = false;
   bool hasFnstsw = false;
   if (function != nullptr) {
     for (llvm::BasicBlock &block : *function) {
@@ -2247,6 +2356,10 @@ bool testX87FpremFnstswFoldsToIntrinsicCall() {
         }
         if (callee->getName() == "notdec.x87.fprem") {
           hasFprem = true;
+          fpremSignatureOk = call->arg_size() == 2 &&
+                             call->getType()->isX86_FP80Ty() &&
+                             call->getArgOperand(0)->getType()->isX86_FP80Ty() &&
+                             call->getArgOperand(1)->getType()->isX86_FP80Ty();
         }
         if (callee->getName() == "notdec.x87.fnstsw") {
           hasFnstsw = true;
@@ -2258,13 +2371,15 @@ bool testX87FpremFnstswFoldsToIntrinsicCall() {
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fprem/fnstsw function is missing") &&
          expect(hasFprem, "x87 fprem did not fold to notdec.x87.fprem") &&
+         expect(fpremSignatureOk,
+                "x87 fprem must take/return x86_fp80 (ST0, ST1) -> ST0") &&
          expect(hasFnstsw, "x87 fnstsw did not fold to notdec.x87.fnstsw") &&
          expect(functionUsesGlobal(function, "AX"),
                 "x87 fnstsw did not write the AX register") &&
+         expect(functionUsesGlobal(function, "ST0"),
+                "x87 fprem did not write its result into the ST0 window") &&
          expect(!functionUsesGlobal(function, "FPUStatusWord"),
                 "x87 fnstsw read the FPUStatusWord global") &&
-         expect(!functionUsesGlobal(function, "ST0"),
-                "x87 fprem kept an ST0 register global") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
                 "module failed verifier after x87 fprem/fnstsw folding");
 }
@@ -2561,7 +2676,7 @@ void addX87FabsChsOps(notdec::bin2llvm::PcodeProgram &program,
   push(chsOp, address + 1, "FCHS");
 }
 
-bool testX87FabsChsFoldsToIntrinsicCalls() {
+bool testX87FabsChsFoldsToDirectUnary() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
   addX64Registers(program);
@@ -2579,31 +2694,38 @@ bool testX87FabsChsFoldsToIntrinsicCalls() {
 
   bool hasFabs = false;
   bool hasFchs = false;
+  bool hasOldLibraryCall = false;
   if (function != nullptr) {
     for (llvm::BasicBlock &block : *function) {
       for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        hasFchs |= llvm::isa<llvm::UnaryOperator>(&instruction) &&
+                   instruction.getOpcode() == llvm::Instruction::FNeg;
         auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
-        if (call == nullptr || call->getCalledFunction() == nullptr) {
+        if (call == nullptr) {
           continue;
         }
-        if (call->getCalledFunction()->getName() == "notdec.x87.fabs") {
-          hasFabs = true;
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr) {
+          continue;
         }
-        if (call->getCalledFunction()->getName() == "notdec.x87.fchs") {
-          hasFchs = true;
-        }
+        hasFabs |= callee->isIntrinsic() &&
+                   callee->getIntrinsicID() == llvm::Intrinsic::fabs;
+        hasOldLibraryCall |= callee->getName() == "notdec.x87.fabs" ||
+                             callee->getName() == "notdec.x87.fchs";
       }
     }
   }
 
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fabs/fchs function is missing") &&
-         expect(hasFabs, "x87 fabs did not fold to notdec.x87.fabs") &&
-         expect(hasFchs, "x87 fchs did not fold to notdec.x87.fchs") &&
-         expect(!functionUsesGlobal(function, "ST0"),
-                "x87 fabs/fchs kept an ST0 register global") &&
+         expect(hasFabs, "x87 fabs did not fold to llvm.fabs.f80") &&
+         expect(hasFchs, "x87 fchs did not fold to fneg") &&
+         expect(!hasOldLibraryCall,
+                "x87 fabs/fchs still emitted a notdec.x87 library call") &&
+         expect(functionUsesGlobal(function, "ST0"),
+                "x87 fabs/fchs did not rewrite the ST0 window") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
-                "module failed verifier after x87 fabs/fchs folding");
+                "module failed verifier after x87 fabs/fchs window unary");
 }
 
 } // namespace
@@ -2645,17 +2767,17 @@ int main() {
   ok &= testX86PcThunkCallFoldsToConstantBase();
   ok &= testPartialRegisterWriteUsesPartialWriteHelper();
   ok &= testPartialRegisterReadUsesPartialReadHelper();
-  ok &= testX87FildlFoldsToIntrinsicCall();
-  ok &= testX87FstpFoldsToIntrinsicCall();
-  ok &= testX87FldzFoldsToIntrinsicCall();
-  ok &= testX87FdivrpSt2FoldsToIntrinsicCall();
-  ok &= testX87FsubrSt3FoldsToIntrinsicCall();
-  ok &= testX87FcomiFoldsToIntrinsicCall();
-  ok &= testX87FucomipFoldsToIntrinsicCall();
-  ok &= testX87FpremFnstswFoldsToIntrinsicCall();
+  ok &= testX87FildlFoldsToWindowPush();
+  ok &= testX87FstpFoldsToWindowPopStore();
+  ok &= testX87FldzFoldsToWindowPushConstant();
+  ok &= testX87FdivrpSt2FoldsToWindowPeekPoke();
+  ok &= testX87FsubrSt3FoldsToWindowPeek();
+  ok &= testX87FcomiFoldsToDirectCompare();
+  ok &= testX87FucomipFoldsToDirectCompareWithPop();
+  ok &= testX87FpremFnstswFoldsToIntrinsicCalls();
   ok &= testX87FnstcwFldcwFoldsToIntrinsicCalls();
   ok &= testX87FstenvFoldsToIntrinsicCall();
   ok &= testX87FldenvFoldsToIntrinsicCall();
-  ok &= testX87FabsChsFoldsToIntrinsicCalls();
+  ok &= testX87FabsChsFoldsToDirectUnary();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
