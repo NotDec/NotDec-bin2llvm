@@ -301,8 +301,10 @@ struct SignatureShape {
 };
 
 // A range return helper records a narrow register segment produced by a direct
-// call.  Signature rewrite can then replace it from the rewritten call's real
-// return value instead of leaving a summary_return.iN helper in the IR.
+// call.  First pass records one for every ABI output register at every call
+// (the "post-call state" placeholder); signature rewrite replaces helpers that
+// fall inside the callee's return slot from the rewritten call's real return
+// value, and leaves the rest as explicit unknown.
 struct RangeReturnHelper {
   RegisterRangeKey Range;
   llvm::CallInst *Helper = nullptr;
@@ -1733,6 +1735,26 @@ integerReturnSlotForUnit(const RegisterUnit &unit, const AbiFacts &abi) {
   return integerSignatureSlot(unit);
 }
 
+std::optional<NativeSignatureSlot>
+floatReturnSlotForUnit(const RegisterUnit &unit,
+                       const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+                       const AbiFacts &abi) {
+  // 浮点 ABI 输出（XMM0/ST0）的返回槽：按输出槽的位宽生成
+  // double/x86_fp80，而不是整型 i64/i80。
+  for (const AbiFacts::RegisterSlot &slot : abi.FloatOutputsInOrder) {
+    if (slot.UnitName != unit.Name) {
+      continue;
+    }
+    llvm::Type *type = floatTypeForSlot(unit.Global->getContext(), slot);
+    if (type == nullptr) {
+      return std::nullopt;
+    }
+    return signatureSlotFromAbi(slot, units, type,
+                                NativeSignatureSlotKind::FloatRegister);
+  }
+  return std::nullopt;
+}
+
 SignatureShape shapeForKnownExternal(
     llvm::Function &function,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -2436,18 +2458,6 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
   return callsiteShapes;
 }
 
-bool rangeReturnHelpersUseRegister(
-    llvm::ArrayRef<RangeReturnHelper> helpers,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
-    llvm::StringRef name) {
-  for (const RangeReturnHelper &helper : helpers) {
-    auto unitIt = units.find(helper.Range.Global);
-    if (unitIt != units.end() && unitIt->second.Name == name) {
-      return true;
-    }
-  }
-  return false;
-}
 
 bool signatureHasReturnForRegister(const SignatureShape &shape,
                                    const RegisterUnit &unit) {
@@ -2544,52 +2554,141 @@ void addDemandedExternalReturns(
       continue;
     }
     auto shapeIt = state.Shapes.try_emplace(callee).first;
-    auto helpersIt = state.ReturnHelpers.find(call);
     auto rangeHelpersIt = state.RangeReturnHelpers.find(call);
-    auto hasDemandedReturn = [&](llvm::StringRef name) {
-      if (helpersIt != state.ReturnHelpers.end() &&
-          helpersIt->second.count(name.str()) != 0) {
-        return true;
+    auto hasAnyRangeHelper = [&](llvm::StringRef name) {
+      if (rangeHelpersIt == state.RangeReturnHelpers.end()) {
+        return false;
       }
-      return rangeHelpersIt != state.RangeReturnHelpers.end() &&
-             rangeReturnHelpersUseRegister(rangeHelpersIt->second, units, name);
-    };
-    std::optional<unsigned> maxReturnRegisters;
-    const KnownExternalPrototype *known =
-        knownExternalPrototype(prototypes, callee->getName());
-    if (known != nullptr) {
-      maxReturnRegisters = known->NoReturn ? 0 : known->MaxReturnRegisters;
-    }
-    unsigned returnIndex = 0;
-    for (const std::string &name : abi.OutputsInOrder) {
-      if (maxReturnRegisters.has_value() &&
-          returnIndex >= *maxReturnRegisters) {
-        break;
-      }
-      // Without a strong external prototype on x86-64, RDX is usually
-      // caller-clobbered, not a second return value.
-      if (!maxReturnRegisters.has_value() &&
-          isLikelyNonReturnIntegerAbiOutput(abi, name)) {
-        break;
-      }
-      if (!hasDemandedReturn(name)) {
-        ++returnIndex;
-        continue;
-      }
-      bool alreadyPresent = false;
-      for (const NativeSignatureSlot &slot : shapeIt->second.Returns) {
-        alreadyPresent |= slot.Unit->Name == name;
-      }
-      if (!alreadyPresent) {
-        const RegisterUnit *unit = unitByName(units, name);
-        if (unit != nullptr) {
-          if (std::optional<NativeSignatureSlot> slot =
-                  integerReturnSlotForUnit(*unit, abi)) {
-            shapeIt->second.Returns.push_back(*slot);
-          }
+      for (const RangeReturnHelper &helper : rangeHelpersIt->second) {
+        auto unitIt = units.find(helper.Range.Global);
+        if (unitIt != units.end() && unitIt->second.Name == name) {
+          return true;
         }
       }
-      ++returnIndex;
+      return false;
+    };
+    // 读证据：只有"调用后状态"占位被实际读取（有 use）才算。第一遍对每个
+    // ABI 输出寄存器都会生成占位（callRangeValue），没被读的占位只是死值，
+    // 不能当成"该寄存器是返回寄存器"的证据。
+    auto hasLiveReadEvidence = [&](llvm::StringRef name) {
+      if (rangeHelpersIt == state.RangeReturnHelpers.end()) {
+        return false;
+      }
+      for (const RangeReturnHelper &helper : rangeHelpersIt->second) {
+        if (helper.Helper == nullptr || helper.Helper->use_empty()) {
+          continue;
+        }
+        auto unitIt = units.find(helper.Range.Global);
+        if (unitIt != units.end() && unitIt->second.Name == name) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const KnownExternalPrototype *known =
+        knownExternalPrototype(prototypes, callee->getName());
+    // arity 推断产物（MaxReturnRegisters = UINT_MAX，见
+    // inferUnknownExternalCallsiteShapes）没有可信返回形状，返回槽推断和
+    // 完全未知外部走同一套保守规则；只有内置/JSON 原型才按
+    // MaxReturnRegisters 上限补槽。
+    const bool trustedReturns =
+        known != nullptr &&
+        known->MaxReturnRegisters != std::numeric_limits<unsigned>::max();
+    const std::optional<unsigned> maxReturnRegisters =
+        trustedReturns
+            ? std::optional<unsigned>(known->NoReturn ? 0
+                                                      : known->MaxReturnRegisters)
+            : std::nullopt;
+
+    auto addReturnSlot = [&](const RegisterUnit &unit, bool floatSlot) {
+      if (signatureHasReturnForRegister(shapeIt->second, unit)) {
+        return;
+      }
+      std::optional<NativeSignatureSlot> slot =
+          floatSlot ? floatReturnSlotForUnit(unit, units, abi)
+                    : integerReturnSlotForUnit(unit, abi);
+      if (slot) {
+        shapeIt->second.Returns.push_back(*slot);
+      }
+    };
+
+    if (trustedReturns) {
+      unsigned returnIndex = 0;
+      for (const std::string &name : abi.OutputsInOrder) {
+        if (returnIndex >= *maxReturnRegisters) {
+          break;
+        }
+        if (!hasAnyRangeHelper(name)) {
+          ++returnIndex;
+          continue;
+        }
+        const RegisterUnit *unit = unitByName(units, name);
+        if (unit != nullptr) {
+          addReturnSlot(*unit, isFloatAbiOutputUnit(abi, name));
+        }
+        ++returnIndex;
+      }
+      continue;
+    }
+
+    const AbiFacts::RegisterSlot *firstFloat = nullptr;
+    if (!abi.FloatOutputsInOrder.empty()) {
+      firstFloat = &abi.FloatOutputsInOrder.front();
+    }
+    const AbiFacts::RegisterSlot *firstInt = nullptr;
+    if (!abi.IntegerOutputsInOrder.empty()) {
+      firstInt = &abi.IntegerOutputsInOrder.front();
+    }
+    const RegisterUnit *st0 = unitByName(units, "ST0");
+
+    // 未知外部（含 arity 推断产物）：SysV 下普通函数返回要么走整型
+    // （RAX，结构体可带 RDX 等），要么走浮点（XMM0 或 x87 ST0），浮点
+    // 返回和整型返回互斥，保守只取一类。浮点最多 1 个返回槽：XMM0
+    // （float/double）优先，有 x87 证据才 ST0（long double）；ZMM1 等
+    // 后续 SSE 输出一律当调用 clobber。旧 call 的 LLVM 返回类型是
+    // lifting/原型恢复对返回寄存器的直接声明，优先级最高；call 是 void
+    // 时退回"调用后被实际读取"的证据。
+    llvm::Type *oldReturnType = call->getType();
+    const bool oldTypeFloat = oldReturnType->isFloatingPointTy();
+    const bool oldTypeSt0 =
+        oldTypeFloat && oldReturnType->getPrimitiveSizeInBits() > 64;
+    if (!oldTypeSt0 && firstFloat != nullptr &&
+        (oldTypeFloat ||
+         hasLiveReadEvidence(firstFloat->UnitName))) {
+      if (const RegisterUnit *unit =
+              unitByName(units, firstFloat->UnitName)) {
+        addReturnSlot(*unit, true);
+        continue;
+      }
+    }
+    if (st0 != nullptr && (oldTypeSt0 || hasLiveReadEvidence("ST0"))) {
+      addReturnSlot(*st0, true);
+      continue;
+    }
+    // 整型返回槽：RAX（第一个整型输出）起，其余整型输出除 RDX 外按读
+    // 证据补（真实 SysV 上 IntegerOutputsInOrder 只有 RAX/RDX，RDX 被
+    // 排除后就是 RAX 一个）。RAX 本身额外接受旧 call 的非 void 整型返回
+    // 类型作为证据（原型恢复给出 i64 返回时，结果可能被直接 store 回
+    // 寄存器全局，见 addDemandedExternalReturns 调用方的测试模式）。
+    for (const std::string &name : abi.OutputsInOrder) {
+      if (isFloatAbiOutputUnit(abi, name)) {
+        continue;
+      }
+      if (isLikelyNonReturnIntegerAbiOutput(abi, name)) {
+        break;
+      }
+      const bool isFirstInt = firstInt != nullptr && name == firstInt->UnitName;
+      const bool demanded =
+          isFirstInt
+              ? (!oldReturnType->isVoidTy() || hasLiveReadEvidence(name))
+              : hasLiveReadEvidence(name);
+      if (!demanded) {
+        continue;
+      }
+      const RegisterUnit *unit = unitByName(units, name);
+      if (unit != nullptr) {
+        addReturnSlot(*unit, false);
+      }
     }
   }
 }
@@ -2774,6 +2873,10 @@ llvm::Value *extractReturnRange(llvm::IRBuilder<> &builder,
                                 const SignatureShape &shape, llvm::Value &call,
                                 const RegisterRangeKey &range);
 
+llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
+                              const SignatureShape &shape,
+                              const std::vector<llvm::Value *> &values);
+
 // Local canonicalization used between signature rewrite and final residue
 // cleanup.  It is intentionally kept at the SummarySSA top level: the per
 // function builder caches instruction pointers while rewriting, and running
@@ -2825,7 +2928,12 @@ public:
       rewriteLoads();
       addIndirectCallsiteShapes(SignatureState, Units, Abi);
       collectSignatureCallArgs();
-      collectFunctionReturnValues();
+      // 第一遍只读退出点前 ABI 输出槽位生成"调用后被读"证据
+      // （RangeReturnHelpers），供 addDemandedExternalReturns 给未知外部
+      // 补返回槽（sqrtl 的 ST0 就靠它）；不记录返回绑定、不改 ret。
+      // 真正的返回绑定在重写后的清理遍收集：第一遍时 callee 返回槽可能
+      // 还没补全，且链上占位跨函数重写存活不了。
+      collectFunctionReturnValues(/*recordBinding=*/false);
       rewritePartialWrites();
       finalizePendingPhis();
       if (Options.EnableResidueRemoval) {
@@ -2846,7 +2954,11 @@ public:
     }
   }
 
-  void removeDeadStoresAfterSignatureRewrite() {
+  // collectReturns 只在重写后第一轮清理开：返回绑定读取依赖 partial write
+  // helper 提供的范围边界（32 位低半段），一旦第一轮把 helper 当死代码删掉，
+  // 后续轮次范围退化成整寄存器，返回链会整体变成 unknown。ret 更新产生的
+  // 指令都是活值，不会被后续轮次的死代码清理误删。
+  void removeDeadStoresAfterSignatureRewrite(bool collectReturns = true) {
     Summary.FunctionName = Function.getName().str();
     PostSignatureCleanup = true;
     collectAccesses();
@@ -2855,6 +2967,9 @@ public:
     foldDuplicatePartialReadXors();
     rewriteLoads();
     rewritePartialWrites();
+    if (collectReturns) {
+      collectFunctionReturnValues();
+    }
     // This cleanup run still creates new range helper calls while rewriting
     // loads/writes, so physical deletion stays after liveness cleanup.
     removeDeadStoresByLiveness();
@@ -5149,8 +5264,6 @@ private:
         continue;
       }
 
-      llvm::StringRef kind =
-          effect == CallRegisterEffect::ReturnValue ? "return" : "clobber";
       std::vector<RegisterRangeKey> ranges =
           plannedRangesCovering(global, 0, registerBitWidth(unit));
       if (ranges.empty()) {
@@ -5158,7 +5271,7 @@ private:
         continue;
       }
       for (const RegisterRangeKey &range : ranges) {
-        llvm::Value *value = callRangeValue(*call, range, kind);
+        llvm::Value *value = callRangeValue(*call, range);
         value = resolve(value);
         if (value != nullptr && value->getType() == rangeType(range)) {
           CurrentDef[{&block, range}] = RangedSSAValue{value, range};
@@ -5649,9 +5762,10 @@ private:
       if (!fact.MayNonEntry) {
         return CallRegisterEffect::Preserve;
       }
-      if (fact.ExitDemand) {
-        return CallRegisterEffect::ReturnValue;
-      }
+      // 第一遍不再区分 return：ExitDemand 是"函数确实返回这个寄存器"的
+      // summary 事实，但调用点只需要知道"被改动"，该寄存器是否返回由
+      // 签名（shape.Returns）在重写后按需解析。见
+      // logs/20260805-12-native-unify-call-return-plan.md。
       if (!fact.MayEntry) {
         return CallRegisterEffect::Clobber;
       }
@@ -5660,11 +5774,6 @@ private:
 
     if (callPreservesRegisterByAbi(unit)) {
       return CallRegisterEffect::Preserve;
-    }
-    if (signatureReturnUsesUnit(const_cast<llvm::CallBase &>(call), unit) ||
-        (isIntegerAbiOutput(Abi, unit.Name) &&
-         !isLikelyNonReturnIntegerAbiOutput(Abi, unit.Name))) {
-      return CallRegisterEffect::ReturnValue;
     }
     return CallRegisterEffect::Clobber;
   }
@@ -6305,13 +6414,16 @@ private:
   }
 
   llvm::Value *callRangeValue(llvm::CallBase &call,
-                              const RegisterRangeKey &range,
-                              llvm::StringRef kind) {
+                              const RegisterRangeKey &range) {
     const RegisterUnit *unit = unitForRange(range);
     if (unit == nullptr || range.BitWidth == 0) {
       return nullptr;
     }
-    CallRangeValueKey key{&call, range, kind.str()};
+    // 占位统一：第一遍与清理遍共用同一个键（不再按 return/clobber 分）。
+    // "是不是返回值"唯一来自签名（shape.Returns）；第一遍只负责生成
+    // "调用后状态"占位并记录 ABI 输出寄存器读证据，见
+    // logs/20260805-12-native-unify-call-return-plan.md。
+    CallRangeValueKey key{&call, range, "clobber"};
     if (auto cached = CallRangeValues.find(key);
         cached != CallRangeValues.end()) {
       return cached->second;
@@ -6332,20 +6444,10 @@ private:
       CallRangeValues.emplace(key, value);
       return value;
     }
-    if (kind == "return" && !isIntegerAbiOutput(Abi, unit->Name) &&
-        !signatureReturnUsesUnit(call, *unit)) {
-      llvm::Value *value =
-          unknownValueBefore(*insertBefore, rangeType(range),
-                             unit->Name + ".range_return_unknown");
-      attachUnknownValueMetadata(value, "range_return_not_abi_output",
-                                 Function.getName(), calleeNameForWarning(call),
-                                 unit->Name, "return");
-      return value;
-    }
-
     llvm::IRBuilder<> builder(insertBefore);
-    if (kind == "return" && PostSignatureCleanup &&
-        SignatureState.RewrittenCalls.count(&call) != 0) {
+    if (PostSignatureCleanup &&
+        SignatureState.RewrittenCalls.count(&call) != 0 &&
+        signatureReturnUsesUnit(call, *unit)) {
       const SignatureShape *shape = shapeForCall(SignatureState, call);
       if (shape != nullptr) {
         llvm::Value *value = extractReturnRange(builder, *shape, call, range);
@@ -6364,17 +6466,19 @@ private:
     }
 
     llvm::CallInst *value = builder.CreateCall(
-        callRangeValueHelper(range, kind), {}, unit->Name + "." + kind.str());
+        callRangeValueHelper(range), {}, unit->Name + ".clobber");
     value->setMetadata("notdec.register.summary_ssa.call_value",
-                       callRangeValueNode(range, kind, &call));
+                       callRangeValueNode(range, &call));
     CallRangeValues.emplace(key, value);
-    if (kind == "return") {
+    ++Summary.CallClobberValues;
+    // 调用点后 ABI 输出寄存器被读的证据：返回槽唯一由签名决定，
+    // addDemandedExternalReturns 用这份证据给未知外部补返回槽，
+    // 重写时按 shape 解析成真实返回值或 unknown。
+    if (isIntegerAbiOutput(Abi, unit->Name) ||
+        isFloatAbiOutputUnit(Abi, unit->Name)) {
       SignatureState.ReturnHelpers[&call];
       SignatureState.RangeReturnHelpers[&call].push_back(
           RangeReturnHelper{range, value});
-      ++Summary.CallReturnValues;
-    } else {
-      ++Summary.CallClobberValues;
     }
     return value;
   }
@@ -6406,14 +6510,13 @@ private:
     return false;
   }
 
-  llvm::FunctionCallee callRangeValueHelper(const RegisterRangeKey &range,
-                                            llvm::StringRef kind) {
+  llvm::FunctionCallee callRangeValueHelper(const RegisterRangeKey &range) {
     llvm::Module *module = Function.getParent();
     llvm::Type *valueType = rangeType(range);
     llvm::FunctionType *functionType =
         llvm::FunctionType::get(valueType, {}, false);
-    return module->getOrInsertFunction("notdec.register.summary_" + kind.str() +
-                                           "." + typeSuffix(*valueType),
+    return module->getOrInsertFunction("notdec.register.summary_clobber." +
+                                           typeSuffix(*valueType),
                                        functionType);
   }
 
@@ -6425,7 +6528,6 @@ private:
   }
 
   llvm::MDNode *callRangeValueNode(const RegisterRangeKey &range,
-                                   llvm::StringRef kind,
                                    llvm::Instruction *call) const {
     const RegisterUnit *unit = unitForRange(range);
     uint64_t index = 0;
@@ -6439,7 +6541,7 @@ private:
         llvm::MDString::get(
             Function.getContext(),
             "name=" + (unit == nullptr ? std::string("") : unit->Name)),
-        llvm::MDString::get(Function.getContext(), "kind=" + kind.str()),
+        llvm::MDString::get(Function.getContext(), "kind=clobber"),
         llvm::MDString::get(Function.getContext(),
                             "bit_offset=" + std::to_string(range.BitOffset)),
         llvm::MDString::get(Function.getContext(),
@@ -6450,7 +6552,7 @@ private:
     return llvm::MDNode::get(Function.getContext(), fields);
   }
 
-  void collectFunctionReturnValues() {
+  void collectFunctionReturnValues(bool recordBinding = true) {
     auto shapeIt = SignatureState.Shapes.find(&Function);
     if (shapeIt == SignatureState.Shapes.end() ||
         shapeIt->second.Returns.empty()) {
@@ -6474,9 +6576,19 @@ private:
           reason = "return_binding_missing";
         } else if (value->getType() != slotType(slot)) {
           reason = "return_binding_type_mismatch";
-        } else if (mayDependOnSummaryClobberValue(value)) {
-          reason = "return_binding_uses_clobber_value";
+        } else if (PostSignatureCleanup &&
+                   mayDependOnSummaryClobberValue(value)) {
+          // callee 没把该寄存器作为返回槽时，链上只有 summary_clobber
+          // 占位；ret 不能把占位当真实返回值留在 IR 里，换成显式
+          // unknown。phi 本身不判死，其他读它的地方仍保留链值。
+          value = unknownValueBefore(*ret, slotType(slot),
+                                     unit->Name + ".return_unknown");
+          attachUnknownValueMetadata(value, "return_binding_uses_clobber_value",
+                                     Function.getName(), "<return>",
+                                     unit->Name, "return_binding");
         }
+        // 返回绑定只在缺失/类型不符/clobber 占位时降级成 unknown；其他
+        // 情况保留链值，由重写后清理遍按签名解析成真实返回值。
         if (!reason.empty()) {
           SignatureState.Warnings.push_back(
               returnSlotWarning(Function, slot, reason));
@@ -6487,7 +6599,18 @@ private:
         }
         values.push_back(value);
       }
-      SignatureState.FunctionReturns[&Function][ret] = std::move(values);
+      if (PostSignatureCleanup && recordBinding &&
+          ret->getReturnValue() != nullptr) {
+        // 重写时 ret 先建 unknown，这里按最终链值更新。
+        llvm::IRBuilder<> builder(ret);
+        llvm::Value *retValue = buildReturnValue(builder, shapeIt->second, values);
+        if (retValue != nullptr && retValue != ret->getReturnValue()) {
+          ret->setOperand(0, retValue);
+        }
+      }
+      if (recordBinding) {
+        SignatureState.FunctionReturns[&Function][ret] = std::move(values);
+      }
     }
   }
 
@@ -7592,11 +7715,40 @@ void rewriteSignatureShapes(
         llvm::Value *value =
             extractReturnRange(builder, *shape, *newCall, rangeHelper.Range);
         if (value == nullptr || value->getType() != helper->getType()) {
-          llvm::StringRef reason =
-              value == nullptr ? "range_return_helper_rewrite_missing_value"
-                               : "range_return_helper_rewrite_type_mismatch";
-          state.Warnings.push_back(
-              callRangeWarning(*newCall, rangeHelper.Range, "return", reason));
+          // 第一遍的证据集是"调用后被读的 ABI 输出寄存器"（含 ST0/ZMM0
+          // 这类只被 clobber 的），返回槽由签名决定。callee 的返回槽里
+          // 没有这个寄存器时，解析失败是预期行为，静默转成 unknown；
+          // 只有确实在返回槽里却解析不出来才值得告警。
+          // 返回槽判定要和 extractReturnRange 的覆盖条件一致：只有当请求
+          // 的 range 完全落在某个返回槽的位段内才算"确实在返回槽里"。
+          // ZMM0[64:64]/[128:384] 这类上层 lane（keep-high 部分写）不在
+          // double 返回槽覆盖范围内，按 clobber 静默转 unknown。
+          bool inReturnSlot = false;
+          for (const NativeSignatureSlot &slot : shape->Returns) {
+            if (slot.Unit == nullptr ||
+                slot.Unit->Global != rangeHelper.Range.Global) {
+              continue;
+            }
+            uint64_t slotEnd = slot.OffsetBits + slot.SizeBits;
+            uint64_t rangeEnd =
+                rangeHelper.Range.BitOffset + rangeHelper.Range.BitWidth;
+            if (rangeHelper.Range.BitOffset >= slot.OffsetBits &&
+                rangeEnd <= slotEnd) {
+              inReturnSlot = true;
+              break;
+            }
+          }
+          llvm::StringRef reason;
+          if (inReturnSlot) {
+            reason = value == nullptr
+                         ? "range_return_helper_rewrite_missing_value"
+                         : "range_return_helper_rewrite_type_mismatch";
+            state.Warnings.push_back(
+                callRangeWarning(*newCall, rangeHelper.Range, "return",
+                                 reason));
+          } else {
+            reason = "range_return_helper_clobbered_register";
+          }
           std::string regName = registerNameForRange(rangeHelper.Range);
           value = unknownValueAt(builder, helper->getType(),
                                  "range_return_unknown");
@@ -7849,6 +8001,12 @@ runNativeRegisterSummarySSA(llvm::Module &module,
     markSignatureCallArgStores(signatureState, summary);
     rewriteSignatureShapes(module, signatureState, units, abi, summary);
     eraseUnusedSummaryHelperDeclarations(module);
+    // 重写会用 takeName 替换函数对象（createReplacementFunction），按旧函数
+    // 指针组织的 facts 在清理遍查不到（rangeMayComeFromEntry 等走缺省回退）。
+    // summary 内部按函数名记录，重写后按名字重新解析一次，清理遍才能用上
+    // 分析结果（比如 MayEntry=false 的寄存器不允许入口读）。
+    std::map<llvm::Function *, FunctionSummaryFacts> cleanupFacts =
+        summaryFactsByFunction(registerSummary, module);
     if (options.EnableResidueRemoval) {
       constexpr unsigned maxPostRewriteCleanupIterations = 10;
       for (unsigned iteration = 0; iteration < maxPostRewriteCleanupIterations;
@@ -7863,9 +8021,10 @@ runNativeRegisterSummarySSA(llvm::Module &module,
             continue;
           }
           NativeRegisterSummarySSAFunctionSummary cleanupFn;
-          FunctionBuilder cleanup(function, units, facts, abi, options,
+          FunctionBuilder cleanup(function, units, cleanupFacts, abi, options,
                                   cleanupFn, signatureState);
-          cleanup.removeDeadStoresAfterSignatureRewrite();
+          cleanup.removeDeadStoresAfterSignatureRewrite(
+              /*collectReturns=*/iteration == 0);
           deadStoresRemovedThisIteration += cleanupFn.DeadStoresRemoved;
         }
         summary.DeadStoresRemoved += deadStoresRemovedThisIteration;

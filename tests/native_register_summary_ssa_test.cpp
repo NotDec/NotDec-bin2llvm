@@ -1950,8 +1950,13 @@ bool testDemandedReturnCreatesCallValue() {
   builder.CreateRet(loaded);
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  return expect(summary.CallReturnValues == 1,
+  // 第一遍统一生成 clobber 占位，返回槽由签名决定（见
+  // logs/20260805-12-native-unify-call-return-plan.md）；这里断言占位
+  // 证据存在、返回链把寄存器 load 换掉即可。
+  return expect(summary.CallClobberValues >= 1,
                 "demanded return helper was not created") &&
+         expect(summary.CallReturnValues == 0,
+                "first pass must not distinguish return helpers") &&
          expect(summary.DeadLoadsRemoved == 1,
                 "return replaced load was not removed") &&
          verifyOk(module, "module failed verifier after demanded return test");
@@ -1993,7 +1998,7 @@ bool testExternalReturnUsesRangeCallValue() {
     }
   }
 
-  return expect(summary.CallReturnValues == 1,
+  return expect(summary.CallClobberValues >= 1,
                 "external return range helper was not created") &&
          expect(rewritten != nullptr,
                 "rewritten external return callee missing") &&
@@ -2043,7 +2048,7 @@ bool testIndirectCallReturnHelperIsRewritten() {
     }
   }
 
-  return expect(summary.CallReturnValues == 1,
+  return expect(summary.CallClobberValues >= 1,
                 "indirect call did not create return helper before rewrite") &&
          expect(summary.CallsRewritten >= 1,
                 "indirect callsite was not rewritten") &&
@@ -4261,10 +4266,15 @@ bool testKnownVarArgUsesSseCountForFloatTail() {
                 "R8");
   storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 1),
                 "RAX");
-  storeRegister(
+  llvm::StoreInst *zmmStore = storeRegister(
       builder, zmm0,
       llvm::ConstantInt::get(zmmType, llvm::APInt(512, 0x3ff0000000000000ULL)),
       "ZMM0");
+  // 真实 lifted IR 会给 SSE 浮点写打 notdec.register.float_write 标记；
+  // 只有带这个标记的 XMM 槽才算浮点参数证据（movq/punpcklqdq 整数打包不算）。
+  zmmStore->setMetadata(
+      "notdec.register.float_write",
+      llvm::MDNode::get(context, llvm::MDString::get(context, "1")));
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
@@ -4727,23 +4737,122 @@ bool testUnknownExternalTreatsRdxAsClobberNotReturn() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  bool hasRdxClobberWarning = false;
   bool hasRdxReturnWarning = false;
   for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
        summary.Warnings) {
     if (warning.RegisterName != "RDX") {
       continue;
     }
-    hasRdxClobberWarning |= warning.Kind == "clobber";
     hasRdxReturnWarning |= warning.Kind == "return";
   }
+  // 重写会用 takeName 替换函数对象，按名字重新取。
+  llvm::Function *rewrittenFunction =
+      module.getFunction("unknown_external_rdx_after");
+  llvm::Value *rdxReturn = nullptr;
+  if (rewrittenFunction != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenFunction)) {
+      if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&inst)) {
+        rdxReturn = ret->getReturnValue();
+      }
+    }
+  }
 
-  return expect(hasRdxClobberWarning,
-                "unknown external RDX did not become clobber warning") &&
-         expect(!hasRdxReturnWarning,
+  // RDX 被调用 clobber 后读出来，不能变成 unknown_external 的返回槽：
+  // 值应显式降级成 unknown，而不是在 IR 里残留 summary_clobber helper。
+  return expect(!hasRdxReturnWarning,
                 "unknown external RDX was still treated as return") &&
+         expect(isUnknownValueCall(rdxReturn),
+                "unknown external RDX value was not materialized as unknown") &&
+         expect(!moduleHasUsedFunctionNamed(
+                    module, "notdec.register.summary_clobber.i64"),
+                "unknown external RDX left a clobber helper in the IR") &&
          verifyOk(module,
                   "module failed verifier after unknown external RDX test");
+}
+
+bool testUnknownExternalFloatReturnPicksSingleXmmSlot() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unknown-float-return-single-slot", context);
+
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_unknown_float_return_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+  notdec::bin2llvm::NativeAbiParamEntry integerOutput;
+  integerOutput.MinSize = 1;
+  integerOutput.MaxSize = 8;
+  integerOutput.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  integerOutput.Storage.Name = "RAX";
+  abi.Outputs.push_back(integerOutput);
+  notdec::bin2llvm::NativeAbiParamEntry floatOutput;
+  floatOutput.MinSize = 1;
+  floatOutput.MaxSize = 8;
+  floatOutput.MetaType = "float";
+  floatOutput.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  floatOutput.Storage.Name = "XMM0_Qa";
+  abi.Outputs.push_back(floatOutput);
+  for (llvm::StringRef name : {"RAX", "XMM0"}) {
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = name.str();
+    abi.Effects.push_back(killed);
+  }
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::Type *zmmType = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", zmmType, 4608, 64);
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *external =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "unknown_external_float_return", module);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "reads_float_and_rax_after_call", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::AllocaInst *intSink = builder.CreateAlloca(llvm::Type::getInt64Ty(context));
+  llvm::AllocaInst *zmmSink = builder.CreateAlloca(zmmType);
+  builder.CreateCall(calleeType, external);
+  // RAX 和 XMM0（ZMM0 低 64 位）调用后都被读：RAX 是 clobber 复用，XMM0
+  // 是真实浮点返回。未知外部只能取一个返回槽，浮点优先，RAX 不能混进
+  // 返回结构体（否则 round() 会变成 { i64, double } 之类）。
+  llvm::Value *raxLoad = loadRegister(builder, rax, "RAX", "rax.after");
+  builder.CreateStore(raxLoad, intSink);
+  llvm::Value *zmmLoad = loadRegister(builder, zmm0, "ZMM0", "zmm.after");
+  builder.CreateStore(zmmLoad, zmmSink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenFunction =
+      module.getFunction("reads_float_and_rax_after_call");
+  llvm::CallInst *call = nullptr;
+  if (rewrittenFunction != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenFunction)) {
+      auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (candidate != nullptr && candidate->getCalledFunction() != nullptr &&
+          candidate->getCalledFunction()->getName() ==
+              "unknown_external_float_return") {
+        call = candidate;
+      }
+    }
+  }
+
+  // 未知外部浮点返回：只取 XMM0 一个 double 槽，RAX 不被带进来。
+  return expect(call != nullptr,
+                "unknown external float return call missing") &&
+         expect(call != nullptr && call->getType()->isDoubleTy(),
+                "unknown external float return was not rewritten to double") &&
+         expect(call != nullptr && !call->getType()->isStructTy(),
+                "unknown external float return picked extra integer slots") &&
+         verifyOk(module,
+                  "module failed verifier after float return slot test");
 }
 
 bool testUnknownExternalClobberArgBecomesUnknown() {
@@ -9030,6 +9139,7 @@ int main() {
   ok &= testMismatchedDirectCallUseUsesReturnExtract();
   ok &= testKnownExternalUsesSingleIntegerReturn();
   ok &= testUnknownExternalTreatsRdxAsClobberNotReturn();
+  ok &= testUnknownExternalFloatReturnPicksSingleXmmSlot();
   ok &= testUnknownExternalClobberArgBecomesUnknown();
   ok &= testInternalReturnDoesNotExposeExternalClobber();
   ok &= testClobberReturnPhiDoesNotMaterializeHelper();
