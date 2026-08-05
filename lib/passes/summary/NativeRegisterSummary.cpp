@@ -2267,8 +2267,15 @@ private:
               isX64Low32GprWrite(*partial, unitIt->second)) {
             eraseDemand(live, partial->Global);
           } else {
-            addDemand(live, partial->Global,
-                      valueDemand(partial->Value, valueDemands));
+            // partial write 定义写入位：擦除这些位的 live demand（写覆盖旧
+            // 需求），未写位保留（读改写需要旧值）。写入值自己的位需求由
+            // value 链上的显式 load 追踪，不能反过来加到 global 上——否则
+            // 调用点之后的传参写（如 lua_pushnumber 的 double 参数写 ZMM0）
+            // 会把 ZMM0 需求误传给更早的 callee，给不返回 double 的函数
+            // 误加 ZMM0 返回槽。
+            llvm::APInt writeMask = registerRangeMask(
+                partial->Global, partial->BitOffset, partial->WriteWidth);
+            eraseDemand(live, partial->Global, writeMask);
           }
           continue;
         }
