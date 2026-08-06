@@ -289,17 +289,23 @@ PcodeToLLVM
 7. **外部调用参数推断**
    - 入口：`inferExternalCallShapes(...)`。
    - unknown external：
-     - 每个 callsite 只统计从 arg0 开始连续的 `LocalDefinition` 前缀。
-     - 同一 callee 有多个 callsite 时取最大前缀，生成临时 fixed prototype。
+     - 每个 callsite 分别统计整数和浮点（SSE）寄存器序列从 arg0 开始的连续
+       `LocalDefinition` 前缀，两类序列独立计数再加总。
+     - 同一 callee 有多个 callsite 时取最大 arity；优先用浮点参数最多的 callsite
+       生成混合 `TypedParams`（整型 `PointerSized` + 浮点 `Double`），让浮点参数
+       能绑定到 XMM 槽而不是溢到整型/栈槽。
+     - 推断产物写回临时 prototype，且 `MaxReturnRegisters = UINT_MAX`，标记为
+       “不可信返回形状”（见第 12 步）。
      - 不一致、成功推断和零证据分别输出 warning。
    - known vararg：
      - declaration prototype 只保存固定参数。
      - 从未被固定参数占用的整数 ABI slot 开始，逐 callsite 统计连续
        `LocalDefinition` tail。
+     - SSE 浮点 tail 也支持：`RAX` 低字节（`al`）是 XMM 参数计数；XMM 槽只有当
+       写入带 `notdec.register.float_write` 标记（真实浮点写）才算证据，整数打包
+       （`movq` / `punpcklqdq`）不算。
      - 每个 callsite 单独保存最终输入 shape，不在 callee 级取最大值。
      - bounded vararg 使用 `MaxArgs - FixedArgs` 限制额外参数数。
-   - 当前只推断整数 vararg tail。额外浮点参数的源码顺序无法仅凭 XMM 写入恢复，
-     不在这里猜测。
 
 8. **第二遍 NativeRegisterSummary**
    - 使用 known + inferred external prototype，以及 known vararg 的 callsite shape。
@@ -325,20 +331,30 @@ PcodeToLLVM
      - 规划 register range。现在是 range-aware SummarySSA，不再只有整寄存器粒度。
      - 为入口值创建 canonical entry read 或 range entry read。
      - 按 CFG 构造 SSA value，必要时插入 PHI。
-     - 用 call effect 生成 return/clobber value。
+     - 调用点对每个 ABI 输出寄存器统一生成“调用后状态”占位（`summary_clobber`），
+       第一遍不再区分 return/clobber；“是不是返回寄存器”唯一由签名
+       （`shape.Returns`）决定。
      - 用 zero-demand metadata 标记被 demand 剪掉的 lane。
-     - 收集函数返回值。
+     - 第一遍只读退出点槽位产生“调用后被读”证据（
+       `collectFunctionReturnValues(recordBinding=false)`）；返回绑定收集移到
+       重写后的清理遍（见第 16 步）。
      - 按最终 callsite shape 收集 argument store binding。
 
-11. **间接 call 参数形状收窄**
-    - 入口：`refineIndirectCallsiteParamShapes(...)`。
+11. **间接 call / 内部函数参数形状收窄**
+    - 入口：`refineIndirectCallsiteParamShapes(...)` / `refineInternalStackParamShapes(...)`。
     - 对 indirect call 使用 callsite binding 收窄参数数量。
+    - 对内部函数，如果所有直接调用点都没用满推断出的栈参数前缀，按调用点前缀
+      截断栈参数数量和对应 binding。
 
 12. **补外部返回值**
     - 入口：`addDemandedExternalReturns(...)`。
-    - 如果 call 后有 demanded `summary_return` / range return helper，给外部 declaration
-      增加对应 ABI return slot。
-    - 对 RDX 这类非主返回寄存器保持保守，避免误判为第二返回值。
+    - 可信原型（内置/JSON 表，`MaxReturnRegisters != UINT_MAX`）按 `MaxReturnRegisters`
+      上限补 ABI return slot。
+    - 未知外部（含 arity 推断产物）走保守规则：
+      - 浮点返回（XMM0 优先，ST0 仅在有 x87 证据时）和整型返回（RAX，RDX 排除）
+        互斥，只取一类；ZMM1 等后续 SSE 输出一律当调用 clobber。
+      - 旧 call 的非 void LLVM 返回类型（lifting/原型恢复给的声明）是最高优先级证据；
+        void call 退回“调用后状态占位被实际读取”的证据（死占位不算）。
 
 13. **标记 call 参数 store 可删除**
     - 入口：`markSignatureCallArgStores(...)`。
@@ -359,7 +375,13 @@ PcodeToLLVM
     - 只在 SummarySSA residue removal 开启时运行。
     - 最多 10 轮。
     - 每轮可选跑 `InstCombine`。
-    - 然后 `removeDeadStoresAfterSignatureRewrite()` 删除签名重写后暴露的死 register store。
+    - 然后 `removeDeadStoresAfterSignatureRewrite()`：
+      - 只在重写后第一轮收集返回绑定（`collectReturns=true`）并按最终链值更新 ret
+        （重写时 ret 先建 unknown；后续轮次 partial-write helper 被删后范围退化成
+        整寄存器，返回链会整体变 unknown）。
+      - 删除签名重写后暴露的死 register store。
+    - 清理遍用的 summary facts 按函数名重建（重写会用 `takeName` 替换函数对象，
+      按旧指针组织的 facts 查不到）。
     - 如果本轮没有新删 store，停止。
 
 17. **NativeStackFrameCleanup**
@@ -375,7 +397,7 @@ PcodeToLLVM
 
 19. **SummarySSA residue cleanup**
     - 只在 SummarySSA residue removal 开启时运行。
-    - 删除死 `summary_return` / `summary_clobber` helper。
+    - 删除死 `summary_clobber` helper（第一遍已不产生 `summary_return` 占位）。
     - 删除死 canonical entry read / range entry read。
     - 删除未使用 helper declaration。
     - 收集剩余 helper warning，写到 `--register-ssa-warning-out`。
@@ -438,8 +460,12 @@ external/NotDec-bin2llvm/
 
 - DDISASM / GTIRB 是当前 CFG 主来源。p-code lowering 不主动猜 jump table。
 - `.eh_frame` 是 range / boundary hint，不是源码函数来源。
-- 外部函数原型会影响 signature rewrite；但 bottom-up register summary 目前还没有完整按原型收窄
-  external call input，这是接下来要修的点。
+- 第一遍 register summary 已经按 known prototype 的 input slots 收窄 external call 的寄存器
+  读取（`applyExternalCallShape`）；未定型 `FixedArgs` 仍按 i64 槽位，具体类型依赖原型表的
+  `TypedParams`/`TypedReturn` 或后续推断。
+- 未知外部返回推断是保守启发式：浮点/整型返回互斥且最多取一个浮点槽（XMM0 优先、ST0
+  次之）。已知边界：调用后同时读 XMM0 和 ST0 的 long double 函数会误选 XMM0；更准的做法是
+  后向数据流（调用后被读的寄存器值是否到达本函数 ret），改动面大，押后。
 - `main` 在 executable 里会保留 external linkage，其他 lifted 函数默认 internal linkage。
 - register metadata 是 debug 辅助，不是 cleanup 后的新事实。final cleanup 只在函数没有剩余
   register residue 时清掉它。
