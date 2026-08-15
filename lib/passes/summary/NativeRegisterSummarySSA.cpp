@@ -2008,15 +2008,35 @@ bool isLikelyX86_64SysVAbi(const AbiFacts &abi) {
 
 unsigned localDefinitionPrefix(
     llvm::ArrayRef<NativeRegisterCallsiteSlotEvidence> slots) {
-  unsigned prefix = 0;
+  // 参数证据 = 调用点前槽被显式写（LocalDefinition），入口值透传
+  // （ForwardedEntry）在 local 之前算"有值"：wrapper 函数把自己收到的
+  // 参数（第一个参数通常是 handle）直接传下去时，该寄存器从未被写过，
+  // 只会留下 Entry 标记。local 之后的 entry 是入口残留不是参数，直接
+  // 截断（避免 local 之后夹 entry 再续 local 的过估）。没有任何 local
+  // 时按 0 处理。
+  unsigned leadingEntry = 0;
   for (const NativeRegisterCallsiteSlotEvidence &slot : slots) {
-    if (slot.Index != prefix ||
-        slot.Origin != NativeRegisterCallsiteValueOrigin::LocalDefinition) {
+    if (slot.Index != leadingEntry) {
       break;
     }
-    ++prefix;
+    if (slot.Origin != NativeRegisterCallsiteValueOrigin::ForwardedEntry) {
+      break;
+    }
+    ++leadingEntry;
   }
-  return prefix;
+  unsigned localCount = 0;
+  for (const NativeRegisterCallsiteSlotEvidence &slot : slots.drop_front(
+           std::min<size_t>(leadingEntry, slots.size()))) {
+    if (slot.Origin != NativeRegisterCallsiteValueOrigin::LocalDefinition) {
+      break;
+    }
+    ++localCount;
+  }
+  // 纯 entry（没有任何 local）是"入口寄存器没被用过"，不是参数证据。
+  if (localCount == 0) {
+    return 0;
+  }
+  return leadingEntry + localCount;
 }
 
 std::vector<NativeRegisterCallsiteSlotEvidence>
@@ -4867,8 +4887,15 @@ private:
       const SummaryRegisterFact &fact = regIt->second;
       if (fact.ExitDemand && fact.MayNonEntry) {
         // 返回需求只取"被本函数改过"（MayNonEntry）的位：ExitDemandMask
-        // 可能包含写保留位，那些位不是返回值。
-        llvm::APInt returnedMask = fact.ExitDemandMask & fact.MayNonEntryMask;
+        // 可能包含写保留位，那些位不是返回值。两个 mask 来自 hex 文本，
+        // 前导零丢失会让宽度不一致，统一按寄存器宽度对齐再求交集。
+        unsigned width = registerBitWidth(unit);
+        if (width == 0) {
+          continue;
+        }
+        llvm::APInt returnedMask =
+            fact.ExitDemandMask.zextOrTrunc(width) &
+            fact.MayNonEntryMask.zextOrTrunc(width);
         if (returnedMask.getBitWidth() != 0 && !returnedMask.isZero()) {
           insertMaskRanges(live, global, returnedMask);
         }
