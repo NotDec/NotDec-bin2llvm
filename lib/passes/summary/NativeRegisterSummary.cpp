@@ -885,13 +885,18 @@ registerStore(llvm::StoreInst &store,
 
 bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
   llvm::Function *callee = call.getCalledFunction();
-  return callee != nullptr &&
-         (callee->getName().starts_with("notdec.register.") ||
-          // x87 instructions are folded into library-style calls: they own the
-          // FPU stack and touch no general register, so no ABI clobber/input
-          // should be derived for them.
-          isNativeX87IntrinsicName(callee->getName()) ||
-          isNativeRegisterValueRangeName(callee->getName()));
+  if (callee == nullptr) {
+    return false;
+  }
+  // notdec.unknown.* 是 lifting / SSA 生成的 unknown 占位函数，不是真实
+  // 外部函数：它们的"调用点"不能参与外部参数推断或 ABI clobber 推导。
+  return callee->getName().starts_with("notdec.register.") ||
+         callee->getName().starts_with("notdec.unknown.") ||
+         // x87 instructions are folded into library-style calls: they own the
+         // FPU stack and touch no general register, so no ABI clobber/input
+         // should be derived for them.
+         isNativeX87IntrinsicName(callee->getName()) ||
+         isNativeRegisterValueRangeName(callee->getName());
 }
 
 bool isAnalyzableCall(const llvm::Instruction &inst) {
