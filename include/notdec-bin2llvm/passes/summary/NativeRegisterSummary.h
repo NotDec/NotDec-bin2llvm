@@ -132,12 +132,20 @@ struct NativeRegisterSummaryOptions {
 // Per-register result for one function. MayEntry/MayNonEntry describe the value
 // visible at normal exits; ReadEntry records whether the function entry value
 // may have been read before being killed.
+// The bool fields are the whole-register projection (mask non-zero); the
+// *MaskHex fields carry the exact bit ranges, which is what later passes use
+// for parameter/return width decisions.
 struct NativeRegisterSummaryRegister {
   std::string Name;
   bool ReadEntry = false;
   bool MayEntry = true;
   bool MayNonEntry = false;
   bool ExitDemand = false;
+  // Bit-level facts.  Empty masks mean the whole-register boolean is the only
+  // known fact (all-zero / all-one as appropriate).
+  std::string ReadEntryMaskHex;
+  std::string MayEntryMaskHex;
+  std::string MayNonEntryMaskHex;
   // Bit-level demand refines ReadEntry/ExitDemand for wide backing registers.
   // Empty masks mean the old whole-register boolean is the only known fact.
   std::string EntryDemandMaskHex;

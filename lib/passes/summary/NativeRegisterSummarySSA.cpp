@@ -70,10 +70,14 @@ struct RegisterAccess {
 };
 
 struct SummaryRegisterFact {
+  // bool 字段是 mask 的整寄存器投影；精确判断用 mask 字段。
   bool ReadEntry = false;
   bool MayEntry = true;
   bool MayNonEntry = false;
   bool ExitDemand = false;
+  llvm::APInt ReadEntryMask;
+  llvm::APInt MayEntryMask;
+  llvm::APInt MayNonEntryMask;
   llvm::APInt EntryDemandMask;
   llvm::APInt ExitDemandMask;
 };
@@ -1097,6 +1101,9 @@ summaryFactsByFunction(const NativeRegisterSummary &summary,
       fact.MayEntry = reg.MayEntry;
       fact.MayNonEntry = reg.MayNonEntry;
       fact.ExitDemand = reg.ExitDemand;
+      fact.ReadEntryMask = parseMask(reg.ReadEntryMaskHex);
+      fact.MayEntryMask = parseMask(reg.MayEntryMaskHex);
+      fact.MayNonEntryMask = parseMask(reg.MayNonEntryMaskHex);
       fact.EntryDemandMask = parseMask(reg.EntryDemandMaskHex);
       fact.ExitDemandMask = parseMask(reg.ExitDemandMaskHex);
       facts.Registers.emplace(reg.Name, std::move(fact));
@@ -1538,30 +1545,36 @@ SignatureShape shapeForInternalFunction(
         abi.InternalReturnRegisters.count(unit.Name) == 0) {
       return;
     }
+    // 参数宽度以 ReadEntryMask 为准："入口值在被覆盖前被读过"的位才是
+    // 函数真正需要的参数位。不用 EntryDemandMask：它是反向 liveness 的
+    // "入口处有有效值"，包含写保留（partial write 读改写）这类没被语义
+    // 读过的位，会把参数宽度撑大。旧产物没有 ReadEntryMask 时退回
+    // EntryDemandMask，再退到整寄存器。
+    llvm::APInt paramMask = regIt->second.ReadEntryMask;
+    if (paramMask.getBitWidth() == 0) {
+      paramMask = regIt->second.EntryDemandMask;
+    }
     if (floatSlot != nullptr) {
-      if (std::optional<NativeSignatureSlot> slot =
-              floatSlotForDemand(function.getContext(), *floatSlot, units,
-                                 regIt->second.EntryDemandMask)) {
-        shape.Params.push_back(*slot);
-      } else if (regIt->second.EntryDemandMask.getBitWidth() != 0 &&
-                 !regIt->second.EntryDemandMask.isZero()) {
-        if (std::optional<NativeSignatureSlot> rangeSlot =
-                integerSlotForSingleDemandRange(
-                    unit, regIt->second.EntryDemandMask)) {
+      if (paramMask.getBitWidth() != 0 && !paramMask.isZero()) {
+        if (std::optional<NativeSignatureSlot> slot =
+                floatSlotForDemand(function.getContext(), *floatSlot, units,
+                                   paramMask)) {
+          shape.Params.push_back(*slot);
+        } else if (std::optional<NativeSignatureSlot> rangeSlot =
+                       integerSlotForSingleDemandRange(unit, paramMask)) {
           shape.Params.push_back(*rangeSlot);
         } else {
           shape.Params.push_back(integerSignatureSlot(unit));
         }
       } else {
         // ReadEntry already says the internal function needs an incoming
-        // value.  If the demand walker did not recover a float lane mask, use
+        // value.  If the mask walker did not recover a float lane mask, use
         // the backing register type rather than leaving an entry global load
         // in the IR.
         shape.Params.push_back(integerSignatureSlot(unit));
       }
     } else if (std::optional<NativeSignatureSlot> rangeSlot =
-                   integerSlotForSingleDemandRange(
-                       unit, regIt->second.EntryDemandMask)) {
+                   integerSlotForSingleDemandRange(unit, paramMask)) {
       shape.Params.push_back(*rangeSlot);
     } else {
       shape.Params.push_back(integerSignatureSlot(unit));
@@ -3941,7 +3954,7 @@ private:
       if (regIt == factsIt->second.Registers.end()) {
         continue;
       }
-      addRangeBoundariesForMask(global, regIt->second.EntryDemandMask);
+      addRangeBoundariesForMask(global, regIt->second.ReadEntryMask);
       addRangeBoundariesForMask(global, regIt->second.ExitDemandMask);
     }
   }
@@ -4378,7 +4391,8 @@ private:
       llvm::Value *value = nullptr;
       value = readAccessRangeIfDominating(
           partial->Global, partial->BitOffset, partial->ReadWidth, call,
-          unitIt->second.Name + ".partial_range", domTree);
+          unitIt->second.Name + ".partial_range", domTree,
+          /*allowUnknownSegments=*/true);
       if (value == nullptr || value->getType() != call->getType()) {
         continue;
       }
@@ -4852,7 +4866,12 @@ private:
       }
       const SummaryRegisterFact &fact = regIt->second;
       if (fact.ExitDemand && fact.MayNonEntry) {
-        insertMaskRanges(live, global, fact.ExitDemandMask);
+        // 返回需求只取"被本函数改过"（MayNonEntry）的位：ExitDemandMask
+        // 可能包含写保留位，那些位不是返回值。
+        llvm::APInt returnedMask = fact.ExitDemandMask & fact.MayNonEntryMask;
+        if (returnedMask.getBitWidth() != 0 && !returnedMask.isZero()) {
+          insertMaskRanges(live, global, returnedMask);
+        }
       }
     }
   }
@@ -5691,7 +5710,19 @@ private:
     if (regIt == fnIt->second.Registers.end()) {
       return true;
     }
-    return regIt->second.MayEntry;
+    // 按 bit 判断：range 覆盖的位里，只要还有位可能仍是入口值，该 range
+    // 就可能来自入口。被本函数覆盖过的位（MayEntry=0）不再误当入口。
+    const llvm::APInt &mayEntry = regIt->second.MayEntryMask;
+    if (mayEntry.getBitWidth() == 0) {
+      return regIt->second.MayEntry;
+    }
+    if (range.BitOffset >= mayEntry.getBitWidth()) {
+      return false;
+    }
+    uint64_t bits = std::min<uint64_t>(
+        range.BitWidth, mayEntry.getBitWidth() - range.BitOffset);
+    return bits != 0 &&
+           !mayEntry.extractBits(bits, range.BitOffset).isZero();
   }
 
   llvm::Value *entryRangeInput(const RegisterRangeKey &range) {

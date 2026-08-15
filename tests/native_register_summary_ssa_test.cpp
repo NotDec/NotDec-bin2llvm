@@ -4913,20 +4913,26 @@ bool testUnknownExternalClobberArgBecomesUnknown() {
   builder.CreateRetVoid();
 
   notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  // 必须按名字重新取。
+  llvm::Function *rewritten = module.getFunction("clobber_arg_caller");
   bool secondUsesClobber = false;
-  for (llvm::Instruction &inst : llvm::instructions(function)) {
-    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
-    if (call == nullptr || call->getCalledFunction() == nullptr ||
-        call->getCalledFunction()->getName() != "second_unknown") {
-      continue;
-    }
-    for (llvm::Value *arg : call->args()) {
-      secondUsesClobber |= valueNameContains(arg, "summary_clobber") ||
-                           valueNameContains(arg, "RDX.clobber");
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call == nullptr || call->getCalledFunction() == nullptr ||
+          call->getCalledFunction()->getName() != "second_unknown") {
+        continue;
+      }
+      for (llvm::Value *arg : call->args()) {
+        secondUsesClobber |= valueNameContains(arg, "summary_clobber") ||
+                             valueNameContains(arg, "RDX.clobber");
+      }
     }
   }
 
-  return expect(!secondUsesClobber,
+  return expect(rewritten != nullptr, "clobber_arg_caller missing after rewrite") &&
+         expect(!secondUsesClobber,
                 "unknown external call kept clobber-derived argument") &&
          verifyOk(module,
                   "module failed verifier after clobber arg cleanup test");
@@ -5752,14 +5758,19 @@ bool testNarrowEntryRangeDoesNotCreateWholeEntryLoad() {
   builder.CreateRetVoid();
 
   notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
-  options.EnableResidueRemoval = false;
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  // 必须按名字重新取。
+  llvm::Function *rewritten =
+      module.getFunction("notdec_native_entry_rdi32_no_full_load");
 
-  return expect(summary.RangeEntryInputs == 1,
+  return expect(rewritten != nullptr,
+                "narrow entry range callee missing after rewrite") &&
+         expect(summary.RangeEntryInputs == 1,
                 "narrow entry range did not create one segment entry input") &&
-         expect(!hasRegisterLoad(*function, "RDI"),
+         expect(rewritten == nullptr || !hasRegisterLoad(*rewritten, "RDI"),
                 "narrow entry range created whole RDI entry load") &&
-         expect(!hasPartialReadCall(*function),
+         expect(rewritten == nullptr || !hasPartialReadCall(*rewritten),
                 "narrow entry range left partial read helper") &&
          verifyOk(module,
                   "module failed verifier after narrow entry range input test");
@@ -7398,11 +7409,14 @@ bool testPartialWriteHelperIsConsumedBySummarySSA() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  // 必须按名字重新取。
+  llvm::Function *rewritten = module.getFunction("partial_write_readback");
   return expect(summary.LoadsReplaced == 1,
                 "partial write readback load was not replaced") &&
-         expect(!hasPartialWriteCall(*function),
+         expect(rewritten == nullptr || !hasPartialWriteCall(*rewritten),
                 "partial write helper call remained after summary SSA") &&
-         expect(!hasRegisterLoad(*function, "RAX"),
+         expect(rewritten == nullptr || !hasRegisterLoad(*rewritten, "RAX"),
                 "raw RAX load remained after partial write rewrite") &&
          verifyOk(module,
                   "module failed verifier after partial write helper test");
@@ -7442,11 +7456,14 @@ bool testPartialReadHelperIsConsumedBySummarySSA() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  // 必须按名字重新取。
+  llvm::Function *rewritten = module.getFunction("partial_write_then_read");
   return expect(summary.LoadsReplaced == 1,
                 "partial read helper was not replaced") &&
-         expect(!hasPartialReadCall(*function),
+         expect(rewritten == nullptr || !hasPartialReadCall(*rewritten),
                 "partial read helper call remained after summary SSA") &&
-         expect(!hasRegisterLoad(*function, "RAX"),
+         expect(rewritten == nullptr || !hasRegisterLoad(*rewritten, "RAX"),
                 "raw RAX load remained after partial read rewrite") &&
          verifyOk(module,
                   "module failed verifier after partial read helper test");
@@ -7482,11 +7499,14 @@ bool testFullStoreFeedsPartialReadThroughRangeSSA() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  // 必须按名字重新取。
+  llvm::Function *rewritten = module.getFunction("full_store_partial_read");
   return expect(summary.LoadsReplaced >= 1,
                 "full store partial read was not replaced") &&
-         expect(!hasPartialReadCall(*function),
+         expect(rewritten == nullptr || !hasPartialReadCall(*rewritten),
                 "full store partial read helper call remained") &&
-         expect(!hasRegisterLoad(*function, "RAX"),
+         expect(rewritten == nullptr || !hasRegisterLoad(*rewritten, "RAX"),
                 "full store partial read left raw RAX load") &&
          verifyOk(module,
                   "module failed verifier after full store partial read test");
@@ -7793,20 +7813,26 @@ bool testBranchPartialReadUsesNarrowRangePhi() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  // 必须按名字重新取。
+  llvm::Function *rewritten =
+      module.getFunction("branch_partial_read_range_phi");
   unsigned i64Phis = 0;
-  for (llvm::Instruction &inst : llvm::instructions(function)) {
-    auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
-    if (phi == nullptr) {
-      continue;
-    }
-    if (phi->getType()->isIntegerTy(64)) {
-      ++i64Phis;
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
+      auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
+      if (phi == nullptr) {
+        continue;
+      }
+      if (phi->getType()->isIntegerTy(64)) {
+        ++i64Phis;
+      }
     }
   }
 
   return expect(summary.LoadsReplaced >= 1,
                 "branch partial read was not replaced") &&
-         expect(!hasPartialReadCall(*function),
+         expect(rewritten == nullptr || !hasPartialReadCall(*rewritten),
                 "branch partial read helper call remained") &&
          expect(summary.PhisCreated >= 1,
                 "branch partial read did not create a range phi") &&
@@ -8027,11 +8053,15 @@ bool testDeadPartialWriteUsesRangeLiveness() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  // 必须按名字重新取。
+  llvm::Function *rewritten =
+      module.getFunction("dead_partial_write_range_liveness");
   return expect(summary.DeadStoresRemoved >= 1,
                 "dead low partial write was not removed") &&
-         expect(!hasPartialWriteCall(*function),
+         expect(rewritten == nullptr || !hasPartialWriteCall(*rewritten),
                 "dead low partial write helper remained") &&
-         expect(!hasPartialReadCall(*function),
+         expect(rewritten == nullptr || !hasPartialReadCall(*rewritten),
                 "high partial read helper remained") &&
          verifyOk(module,
                   "module failed verifier after partial write liveness test");

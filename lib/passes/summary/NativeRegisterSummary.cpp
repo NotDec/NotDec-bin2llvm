@@ -130,26 +130,51 @@ entrySlotToNativeFrameKey(llvm::Function &function,
 struct ValueOrigin {
   llvm::GlobalVariable *Base = nullptr;
   int64_t Offset = 0;
+  // 该值实际来自 Base 寄存器中的哪些位：整寄存器读是全宽，窄 partial
+  // read 只带读到的位区间。入口读（ReadEntry）按这个范围记录，避免窄值
+  // 沿整寄存器扩散成全宽参数。
+  llvm::APInt Mask;
 
   bool operator==(const ValueOrigin &other) const {
-    return Base == other.Base && Offset == other.Offset;
+    return Base == other.Base && Offset == other.Offset && Mask == other.Mask;
   }
 
   bool operator!=(const ValueOrigin &other) const { return !(*this == other); }
 };
 
-// Forward abstract state for one backing register. Missing map entries use this
-// default value, but only inside a reachable block state.
+// Forward abstract state for one backing register, kept per bit range so a
+// partial write only kills the written bits and a read only marks the read
+// bits.  The three facts are bit masks (bit i set means fact i holds):
+//   MayEntry    : exit may still hold the entry value on bit i
+//   MayNonEntry : bit i may have been rewritten inside the function
+//   ReadEntry   : the entry value on bit i was read before being killed
+// Missing map entries use this default value, but only inside a reachable
+// block state.
 struct Cell {
-  bool MayEntry = true;
-  bool MayNonEntry = false;
-  bool ReadEntry = false;
+  llvm::APInt MayEntry;
+  llvm::APInt MayNonEntry;
+  llvm::APInt ReadEntry;
 
   bool operator==(const Cell &other) const {
     return MayEntry == other.MayEntry && MayNonEntry == other.MayNonEntry &&
            ReadEntry == other.ReadEntry;
   }
 };
+
+unsigned registerBitWidth(llvm::GlobalVariable *global);
+
+// Default cell for a register that was never touched: the whole register may
+// still be the entry value.
+Cell defaultCell(llvm::GlobalVariable *global) {
+  Cell cell;
+  unsigned width = registerBitWidth(global);
+  if (width != 0) {
+    cell.MayEntry = llvm::APInt::getAllOnes(width);
+    cell.MayNonEntry = llvm::APInt(width, 0);
+    cell.ReadEntry = llvm::APInt(width, 0);
+  }
+  return cell;
+}
 
 // Callsite inference needs to distinguish explicit argument definitions from
 // entry forwarding and previous-call clobbers.  Keep that information beside
@@ -391,12 +416,17 @@ llvm::APInt storageMaskForUnit(const NativeAbiStorage &storage,
 }
 
 std::string maskToHex(const llvm::APInt &mask) {
-  if (mask.getBitWidth() == 0) {
+  if (mask.getBitWidth() == 0 || mask.isZero()) {
     return "";
   }
   llvm::SmallVector<char, 64> text;
   mask.toStringUnsigned(text, 16);
   return std::string(text.begin(), text.end());
+}
+
+// mask 非零的 bool 投影：宽度 0（无信息）也按 false 处理。
+bool maskNonZero(const llvm::APInt &mask) {
+  return mask.getBitWidth() != 0 && !mask.isZero();
 }
 
 unsigned globalBitWidth(llvm::GlobalVariable *global) {
@@ -942,13 +972,17 @@ collectAbiFacts(const llvm::Module &module,
 }
 
 Cell &cellFor(State &state, llvm::GlobalVariable *global) {
-  return state.Cells[global];
+  auto [it, inserted] = state.Cells.try_emplace(global);
+  if (inserted) {
+    it->second = defaultCell(global);
+  }
+  return it->second;
 }
 
 Cell cellIn(const State &state, llvm::GlobalVariable *global) {
   auto it = state.Cells.find(global);
   if (it == state.Cells.end()) {
-    return Cell{};
+    return defaultCell(global);
   }
   return it->second;
 }
@@ -956,24 +990,30 @@ Cell cellIn(const State &state, llvm::GlobalVariable *global) {
 Cell cellIn(const FunctionEffect &effect, llvm::GlobalVariable *global) {
   auto it = effect.Registers.find(global);
   if (it == effect.Registers.end()) {
-    return Cell{};
+    return defaultCell(global);
   }
   return it->second;
 }
 
 bool joinCell(Cell &lhs, const Cell &rhs) {
   Cell old = lhs;
-  lhs.MayEntry = lhs.MayEntry || rhs.MayEntry;
-  lhs.MayNonEntry = lhs.MayNonEntry || rhs.MayNonEntry;
-  lhs.ReadEntry = lhs.ReadEntry || rhs.ReadEntry;
+  lhs.MayEntry |= rhs.MayEntry;
+  lhs.MayNonEntry |= rhs.MayNonEntry;
+  lhs.ReadEntry |= rhs.ReadEntry;
   return !(lhs == old);
 }
 
 void joinReadEntryOnly(std::map<llvm::GlobalVariable *, Cell> &target,
                        const State &source) {
   for (const auto &[global, cell] : source.Cells) {
-    if (cell.ReadEntry) {
-      target[global].ReadEntry = true;
+    if (cell.ReadEntry.getBitWidth() == 0 || cell.ReadEntry.isZero()) {
+      continue;
+    }
+    auto [it, inserted] = target.try_emplace(global, defaultCell(global));
+    if (inserted) {
+      it->second.ReadEntry = cell.ReadEntry;
+    } else {
+      it->second.ReadEntry |= cell.ReadEntry;
     }
   }
 }
@@ -1012,6 +1052,12 @@ llvm::APInt registerRangeMask(llvm::GlobalVariable *global, unsigned offsetBits,
   unsigned boundedSize = sizeBits == 0 ? width - offsetBits
                                        : std::min(sizeBits, width - offsetBits);
   return llvm::APInt::getLowBitsSet(width, boundedSize).shl(offsetBits);
+}
+
+// 整寄存器读写的全宽 mask。
+llvm::APInt fullRegisterMask(llvm::GlobalVariable *global) {
+  unsigned width = registerBitWidth(global);
+  return width == 0 ? llvm::APInt() : llvm::APInt::getAllOnes(width);
 }
 
 enum class RegisterOriginKind {
@@ -1081,14 +1127,14 @@ bool joinState(State &target, const State &source) {
   }
   bool changed = false;
   for (const auto &[global, cell] : source.Cells) {
-    changed |= joinCell(target.Cells[global], cell);
+    changed |= joinCell(cellFor(target, global), cell);
   }
   // Sparse maps treat missing cells as untouched. If target already contains a
   // register and source omits it, the join still has to include that default
   // untouched path; otherwise predecessor order would change the result.
   for (auto &[global, cell] : target.Cells) {
     if (source.Cells.count(global) == 0) {
-      changed |= joinCell(cell, Cell{});
+      changed |= joinCell(cell, defaultCell(global));
     }
   }
   std::set<llvm::GlobalVariable *> originGlobals;
@@ -1159,23 +1205,30 @@ bool joinState(State &target, const State &source) {
   return changed;
 }
 
-void readRegister(State &state, llvm::GlobalVariable *global) {
+// readMask 置位的位，如果该位此刻仍可能是入口值，就记为"入口值被读过"。
+// 按 bit 处理：被覆盖过的位（MayEntry=0）即使被读也不算入口读。
+void readRegister(State &state, llvm::GlobalVariable *global,
+                  const llvm::APInt &readMask) {
+  if (readMask.getBitWidth() == 0 || readMask.isZero()) {
+    return;
+  }
   Cell &cell = cellFor(state, global);
-  cell.ReadEntry = cell.ReadEntry || cell.MayEntry;
+  llvm::APInt bounded = readMask.zextOrTrunc(cell.MayEntry.getBitWidth());
+  cell.ReadEntry |= (cell.MayEntry & bounded);
 }
 
-void writeRegister(State &state, llvm::GlobalVariable *global) {
+// writeMask 置位的位：入口值被覆盖，变成非入口定义。整寄存器写就是全宽
+// mask，部分写只传写到的位区间，不再需要在整寄存器粒度下保守保留
+// MayEntry。
+void writeRegister(State &state, llvm::GlobalVariable *global,
+                   const llvm::APInt &writeMask) {
+  if (writeMask.getBitWidth() == 0 || writeMask.isZero()) {
+    return;
+  }
   Cell &cell = cellFor(state, global);
-  cell.MayEntry = false;
-  cell.MayNonEntry = true;
-}
-
-void partialWriteRegister(State &state, llvm::GlobalVariable *global) {
-  // A partial write replaces only some bits.  At the current whole-register
-  // summary granularity, the untouched bits may still be the entry value, so do
-  // not kill MayEntry.  The call itself is still a non-entry definition.
-  Cell &cell = cellFor(state, global);
-  cell.MayNonEntry = true;
+  llvm::APInt bounded = writeMask.zextOrTrunc(cell.MayEntry.getBitWidth());
+  cell.MayEntry &= ~bounded;
+  cell.MayNonEntry |= bounded;
 }
 
 bool isX64GprName(llvm::StringRef name) {
@@ -1196,10 +1249,15 @@ bool isX64Low32GprWrite(const NativeRegisterPartialWriteInfo &partial,
          isX64GprName(unit.Name);
 }
 
-void restoreRegister(State &state, llvm::GlobalVariable *global) {
+// 保存的入口值写回寄存器：只有恢复的位重新成为入口值。
+void restoreRegister(State &state, llvm::GlobalVariable *global,
+                     const llvm::APInt &restoreMask) {
+  if (restoreMask.getBitWidth() == 0 || restoreMask.isZero()) {
+    return;
+  }
   Cell &cell = cellFor(state, global);
-  cell.MayEntry = true;
-  cell.MayNonEntry = false;
+  cell.MayEntry |= restoreMask;
+  cell.MayNonEntry &= ~restoreMask;
 }
 
 bool isKeepHighPartialStoreValue(llvm::Value *value,
@@ -1514,8 +1572,15 @@ private:
     if (exits.Reachable) {
       flow.Effect.Registers = std::move(exits.Cells);
       for (const auto &[global, cell] : noReturnReads) {
-        if (cell.ReadEntry) {
-          flow.Effect.Registers[global].ReadEntry = true;
+        if (cell.ReadEntry.getBitWidth() == 0 || cell.ReadEntry.isZero()) {
+          continue;
+        }
+        auto [it, inserted] =
+            flow.Effect.Registers.try_emplace(global, defaultCell(global));
+        if (inserted) {
+          it->second.ReadEntry = cell.ReadEntry;
+        } else {
+          it->second.ReadEntry |= cell.ReadEntry;
         }
       }
     } else if (sawNoReturnExit) {
@@ -1759,14 +1824,21 @@ private:
       if (access.Unit != nullptr) {
         Cell before = cellIn(state, access.Unit->Global);
         bool keepHighUse = isKeepHighPartialLoadUse(*load, access.Unit->Global);
-        bool pureEntryValue = before.MayEntry && !before.MayNonEntry;
+        // 整寄存器 load 只有在所有位都可能仍是入口值时，load 结果才是纯
+        // 入口值（ValueOrigins 只按整寄存器追踪）。
+        bool pureEntryValue =
+            before.MayEntry.getBitWidth() != 0 &&
+            before.MayEntry.isAllOnes() && before.MayNonEntry.isZero();
         if (!isIgnored(*access.Unit, Options) && !keepHighUse &&
             !pureEntryValue) {
-          readRegister(state, access.Unit->Global);
+          readRegister(state, access.Unit->Global,
+                       fullRegisterMask(access.Unit->Global));
         }
         if (pureEntryValue) {
           if (access.Unit->Global != stackPointerGlobal()) {
-            state.ValueOrigins[load] = ValueOrigin{access.Unit->Global, 0};
+            state.ValueOrigins[load] =
+                ValueOrigin{access.Unit->Global, 0,
+                            fullRegisterMask(access.Unit->Global)};
           }
         } else {
           state.ValueOrigins.erase(load);
@@ -1777,7 +1849,8 @@ private:
               fixedStackSlot(load->getPointerOperand(), *load)) {
         auto saved = state.StackSlots.find(*slot);
         if (saved != state.StackSlots.end()) {
-          state.ValueOrigins[load] = ValueOrigin{saved->second, 0};
+          state.ValueOrigins[load] =
+              ValueOrigin{saved->second, 0, fullRegisterMask(saved->second)};
         } else {
           state.ValueOrigins.erase(load);
         }
@@ -1793,7 +1866,8 @@ private:
         }
         if (isKeepHighPartialStoreValue(store->getValueOperand(),
                                         access.Unit->Global)) {
-          writeRegister(state, access.Unit->Global);
+          writeRegister(state, access.Unit->Global,
+                        fullRegisterMask(access.Unit->Global));
           setFullRegisterOrigin(state, access.Unit->Global,
                                 RegisterOriginKind::Mixed);
           state.ValueOrigins.erase(store);
@@ -1803,12 +1877,19 @@ private:
             entryValueOrigin(store->getValueOperand(), state);
         if (origin && origin->Base == access.Unit->Global &&
             origin->Offset == 0) {
-          restoreRegister(state, access.Unit->Global);
+          // 入口值写回：只恢复该值实际覆盖的位（整寄存器值全宽，窄值只
+          // 恢复窄位）。
+          llvm::APInt restoreMask =
+              origin->Mask.getBitWidth() == 0
+                  ? fullRegisterMask(access.Unit->Global)
+                  : origin->Mask;
+          restoreRegister(state, access.Unit->Global, restoreMask);
           setFullRegisterOrigin(state, access.Unit->Global,
                                 RegisterOriginKind::Entry);
         } else {
           markEntryValueRead(store->getValueOperand(), state);
-          writeRegister(state, access.Unit->Global);
+          writeRegister(state, access.Unit->Global,
+                        fullRegisterMask(access.Unit->Global));
           RegisterOriginKind storedKind =
               registerOriginKindForStoredValue(store->getValueOperand(),
                                                state);
@@ -1865,10 +1946,20 @@ private:
         auto unitIt = Units.find(partialRead->Global);
         if (unitIt != Units.end() && !isIgnored(unitIt->second, Options)) {
           Cell before = cellIn(state, partialRead->Global);
-          if (before.MayEntry && !before.MayNonEntry) {
-            state.ValueOrigins[&inst] = ValueOrigin{partialRead->Global, 0};
+          bool pureEntryValue =
+              before.MayEntry.getBitWidth() != 0 &&
+              before.MayEntry.isAllOnes() &&
+              before.MayNonEntry.isZero();
+          llvm::APInt readMask =
+              registerRangeMask(partialRead->Global, partialRead->BitOffset,
+                                partialRead->ReadWidth);
+          // 无论是否纯入口值，都按读到的位记录入口读（被覆盖的位不会
+          // 置位）；纯入口时才把值标记成入口派生，供后续 store 转发。
+          readRegister(state, partialRead->Global, readMask);
+          if (pureEntryValue) {
+            state.ValueOrigins[&inst] =
+                ValueOrigin{partialRead->Global, 0, readMask};
           } else {
-            readRegister(state, partialRead->Global);
             state.ValueOrigins.erase(&inst);
           }
         } else {
@@ -1885,8 +1976,12 @@ private:
           RegisterOriginKind partialKind =
               registerOriginKindForStoredValue(partial->Value, state);
           bool floatWrite = hasFloatWriteMetadata(*call);
+          llvm::APInt writeMask = registerRangeMask(
+              partial->Global, partial->BitOffset, partial->WriteWidth);
           if (isX64Low32GprWrite(*partial, unitIt->second)) {
-            writeRegister(state, partial->Global);
+            // 写 EAX 会清零 RAX 高 32 位，整寄存器都变成非入口定义。
+            writeRegister(state, partial->Global,
+                          fullRegisterMask(partial->Global));
             setFullRegisterOrigin(state, partial->Global, partialKind);
             if (partialKind == RegisterOriginKind::Local) {
               recordRegisterFloatWrite(
@@ -1896,12 +1991,12 @@ private:
                   floatWrite);
             }
           } else {
-            partialWriteRegister(state, partial->Global);
-            llvm::APInt mask = registerRangeMask(
-                partial->Global, partial->BitOffset, partial->WriteWidth);
-            setRegisterOrigin(state, partial->Global, mask, partialKind);
+            // 部分写只覆盖写到的位：未写位保留入口值，只有写到的位变成
+            // 非入口定义。整寄存器粒度的保守 MayEntry 保留不再需要。
+            writeRegister(state, partial->Global, writeMask);
+            setRegisterOrigin(state, partial->Global, writeMask, partialKind);
             if (partialKind == RegisterOriginKind::Local) {
-              recordRegisterFloatWrite(state, partial->Global, mask,
+              recordRegisterFloatWrite(state, partial->Global, writeMask,
                                        floatWrite);
             }
           }
@@ -1982,19 +2077,17 @@ private:
     return RegisterOriginKind::Local;
   }
 
-  llvm::GlobalVariable *entryRegisterOrigin(llvm::Value *value,
-                                            const State &state) const {
+  void markEntryValueRead(llvm::Value *value, State &state) const {
     std::optional<ValueOrigin> origin = entryValueOrigin(value, state);
     if (!origin || origin->Offset != 0) {
-      return nullptr;
+      return;
     }
-    return origin->Base;
-  }
-
-  void markEntryValueRead(llvm::Value *value, State &state) const {
-    if (llvm::GlobalVariable *origin = entryRegisterOrigin(value, state)) {
-      readRegister(state, origin);
-    }
+    // 按该值实际用到的位记录入口读：整寄存器值是全宽，窄 partial read
+    // 值只带读到的位，避免入口读沿整寄存器扩散。
+    llvm::APInt mask = origin->Mask.getBitWidth() == 0
+                           ? fullRegisterMask(origin->Base)
+                           : origin->Mask;
+    readRegister(state, origin->Base, mask);
   }
 
   void markInstructionEntryValueReads(llvm::Instruction &inst,
@@ -2082,8 +2175,8 @@ private:
         continue;
       }
       Cell cell = cellIn(adjusted, global);
-      if (cell.MayNonEntry && hasSavedEntryRegister(state, global)) {
-        restoreRegister(adjusted, global);
+      if (!cell.MayNonEntry.isZero() && hasSavedEntryRegister(state, global)) {
+        restoreRegister(adjusted, global, fullRegisterMask(global));
       }
     }
     return adjusted;
@@ -2138,14 +2231,19 @@ private:
       Cell pre = cellIn(state, global);
       Cell callee = cellIn(effect, global);
       Cell post;
-      post.ReadEntry = pre.ReadEntry || (callee.ReadEntry && pre.MayEntry);
-      post.MayEntry = callee.MayEntry && pre.MayEntry;
+      // 三个事实都按 bit 组合：callee 只改写的位影响调用者对应位，未写
+      // 位保持调用者状态。
+      post.ReadEntry = pre.ReadEntry | (callee.ReadEntry & pre.MayEntry);
+      post.MayEntry = callee.MayEntry & pre.MayEntry;
       post.MayNonEntry =
-          (callee.MayEntry && pre.MayNonEntry) || callee.MayNonEntry;
+          (callee.MayEntry & pre.MayNonEntry) | callee.MayNonEntry;
       state.Cells[global] = post;
-      if (!callee.MayEntry && callee.MayNonEntry) {
+      bool calleeWroteAll = callee.MayEntry.isZero() && !callee.MayNonEntry.isZero();
+      bool calleeWroteSome =
+          !callee.MayEntry.isZero() && !callee.MayNonEntry.isZero();
+      if (calleeWroteAll) {
         setFullRegisterOrigin(state, global, RegisterOriginKind::CallClobber);
-      } else if (callee.MayEntry && callee.MayNonEntry) {
+      } else if (calleeWroteSome) {
         setFullRegisterOrigin(state, global, RegisterOriginKind::Mixed);
       }
     }
@@ -2163,7 +2261,11 @@ private:
       }
       const RegisterUnit &unit = Units.at(unitIt->second);
       if (!isIgnored(unit, Options)) {
-        readRegister(state, unit.Global);
+        // 只把 slot 覆盖的位当作"入口值被读过"：调用点传参只准备了自己
+        // 的位，其余位是调用者自己的状态，不归 callee 读。
+        readRegister(state, unit.Global,
+                     registerRangeMask(unit.Global, input.OffsetBits,
+                                       input.SizeBits));
       }
     }
   }
@@ -2174,7 +2276,7 @@ private:
         continue;
       }
       if (Abi.Inputs.count(unit.Name) != 0) {
-        readRegister(state, global);
+        readRegister(state, global, fullRegisterMask(global));
       }
     }
   }
@@ -2189,7 +2291,7 @@ private:
       if (clobberMask.getBitWidth() == 0 || clobberMask.isZero()) {
         continue;
       }
-      writeRegister(state, global);
+      writeRegister(state, global, clobberMask);
       setRegisterOrigin(state, global, clobberMask,
                         RegisterOriginKind::CallClobber);
     }
@@ -2370,11 +2472,15 @@ private:
           continue;
         }
         Cell calleeCell = cellIn(effect, global);
-        if (calleeCell.MayNonEntry) {
-          addDemand(additions[callee], global, mask);
+        // 只把 callee 实际改写（MayNonEntry）的位加进 callee 的退出需求；
+        // 调用后仍可能是入口值（MayEntry）的位，live 需求保留。
+        llvm::APInt nonEntryBits = calleeCell.MayNonEntry & mask;
+        if (maskNonZero(nonEntryBits)) {
+          addDemand(additions[callee], global, nonEntryBits);
         }
-        if (!calleeCell.MayEntry) {
-          eraseDemand(live, global);
+        llvm::APInt killedBits = ~calleeCell.MayEntry & mask;
+        if (maskNonZero(killedBits)) {
+          eraseDemand(live, global, killedBits);
         }
       }
       return;
@@ -2452,14 +2558,26 @@ private:
                                     const FunctionDemand &demand) const {
     const RegisterUnit &unit = Units.at(global);
     bool exitDemand = demand.ExitDemand.count(global) != 0;
+    // bool 字段是 mask 的投影（mask 非零），mask 字段给出按位信息。
     std::vector<llvm::Metadata *> fields{
         llvm::MDString::get(context, "name=" + unit.Name),
         llvm::MDString::get(context, std::string("read_entry=") +
-                                         (cell.ReadEntry ? "true" : "false")),
+                                         (maskNonZero(cell.ReadEntry)
+                                              ? "true"
+                                              : "false")),
+        llvm::MDString::get(context, "read_entry_mask=0x" +
+                                         maskToHex(cell.ReadEntry)),
         llvm::MDString::get(context, std::string("may_entry=") +
-                                         (cell.MayEntry ? "true" : "false")),
-        llvm::MDString::get(context, std::string("may_non_entry=") +
-                                         (cell.MayNonEntry ? "true" : "false")),
+                                         (maskNonZero(cell.MayEntry) ? "true"
+                                                                     : "false")),
+        llvm::MDString::get(context,
+                            "may_entry_mask=0x" + maskToHex(cell.MayEntry)),
+        llvm::MDString::get(context,
+                            std::string("may_non_entry=") +
+                                (maskNonZero(cell.MayNonEntry) ? "true"
+                                                               : "false")),
+        llvm::MDString::get(context, "may_non_entry_mask=0x" +
+                                         maskToHex(cell.MayNonEntry)),
         llvm::MDString::get(context, std::string("exit_demand=") +
                                          (exitDemand ? "true" : "false")),
     };
@@ -2493,16 +2611,16 @@ private:
         Cell cell = cellIn(effect, global);
         bool exitDemand = demand.ExitDemand.count(global) != 0;
         all.push_back(registerSummaryNode(context, global, cell, demand));
-        if (cell.ReadEntry) {
+        if (maskNonZero(cell.ReadEntry)) {
           reads.push_back(registerNode(context, unit));
         }
-        if (cell.MayEntry && !cell.MayNonEntry) {
+        if (maskNonZero(cell.MayEntry) && cell.MayNonEntry.isZero()) {
           preserves.push_back(registerNode(context, unit));
         }
-        if (cell.MayNonEntry) {
+        if (maskNonZero(cell.MayNonEntry)) {
           modifies.push_back(registerNode(context, unit));
         }
-        if (exitDemand && cell.MayNonEntry &&
+        if (exitDemand && maskNonZero(cell.MayNonEntry) &&
             Abi.Outputs.count(unit.Name) != 0) {
           demandedReturns.push_back(registerNode(context, unit));
         }
@@ -2562,24 +2680,29 @@ private:
         bool exitDemand = demand.ExitDemand.count(global) != 0;
         NativeRegisterSummaryRegister reg;
         reg.Name = unit.Name;
-        reg.ReadEntry = cell.ReadEntry;
-        reg.MayEntry = cell.MayEntry;
-        reg.MayNonEntry = cell.MayNonEntry;
+        // bool 字段保留为 mask 非零的投影，测试和计数器继续用它们；
+        // 精确的按位信息在新增的 *MaskHex 字段里。
+        reg.ReadEntry = maskNonZero(cell.ReadEntry);
+        reg.MayEntry = maskNonZero(cell.MayEntry);
+        reg.MayNonEntry = maskNonZero(cell.MayNonEntry);
         reg.ExitDemand = exitDemand;
+        reg.ReadEntryMaskHex = maskToHex(cell.ReadEntry);
+        reg.MayEntryMaskHex = maskToHex(cell.MayEntry);
+        reg.MayNonEntryMaskHex = maskToHex(cell.MayNonEntry);
         reg.EntryDemandMaskHex =
             maskToHex(demandFor(demand.EntryDemand, global));
         reg.ExitDemandMaskHex = maskToHex(demandFor(demand.ExitDemand, global));
         fn.Registers.push_back(reg);
-        if (cell.ReadEntry) {
+        if (reg.ReadEntry) {
           ++fn.ReadEntryRegisters;
         }
-        if (cell.MayNonEntry) {
+        if (reg.MayNonEntry) {
           ++fn.ModifiedRegisters;
         }
-        if (cell.MayEntry && !cell.MayNonEntry) {
+        if (reg.MayEntry && !reg.MayNonEntry) {
           ++fn.PreservedRegisters;
         }
-        if (exitDemand && cell.MayNonEntry && Abi.Outputs.count(unit.Name)) {
+        if (exitDemand && reg.MayNonEntry && Abi.Outputs.count(unit.Name)) {
           ++fn.DemandedReturns;
         }
       }

@@ -322,13 +322,91 @@ bool testPartialWriteDoesNotReadEntryByItself() {
   const auto *fn = functionSummary(summary, "partial_write_rax");
   const auto *raxSummary =
       fn == nullptr ? nullptr : registerSummary(*fn, "RAX");
+  auto lower = [](std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return text;
+  };
   return expect(raxSummary != nullptr, "missing partial write RAX summary") &&
          expect(!raxSummary->ReadEntry,
                 "partial write helper was incorrectly marked readEntry") &&
          expect(raxSummary->MayEntry,
                 "partial write did not preserve untouched RAX bits") &&
          expect(raxSummary->MayNonEntry,
-                "partial write was not marked as modifying RAX");
+                "partial write was not marked as modifying RAX") &&
+         expect(lower(raxSummary->ReadEntryMaskHex) == "",
+                "partial write read entry bits") &&
+         expect(lower(raxSummary->MayEntryMaskHex) == "ffffffff",
+                "partial write killed untouched low bits") &&
+         expect(lower(raxSummary->MayNonEntryMaskHex) == "ffffffff00000000",
+                "partial write did not mark written high bits");
+}
+
+// 部分写覆盖的位，之后即使被读，也不该算"读了入口值"；未覆盖的位仍然
+// 是入口读。这是 bit 粒度 effect 相对整寄存器 bool 的关键改进。
+bool testPartialWriteBitwiseReadEntry() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-partial-write-bitwise-read-entry", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt32Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "partial_write_bitwise", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rax->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  builder.CreateCall(
+      partialWrite,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 7),
+       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)});
+  llvm::Value *killed = builder.CreateCall(
+      partialRead,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32)},
+      "killed_high");
+  builder.CreateStore(killed, sink);
+  llvm::Value *kept = builder.CreateCall(
+      partialRead,
+      {rax, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "kept_low");
+  builder.CreateStore(kept, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "partial_write_bitwise");
+  const auto *raxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RAX");
+  std::string readMask =
+      raxSummary == nullptr ? "" : raxSummary->ReadEntryMaskHex;
+  std::transform(
+      readMask.begin(), readMask.end(), readMask.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  std::string mayEntryMask =
+      raxSummary == nullptr ? "" : raxSummary->MayEntryMaskHex;
+  std::transform(
+      mayEntryMask.begin(), mayEntryMask.end(), mayEntryMask.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  std::string mayNonEntryMask =
+      raxSummary == nullptr ? "" : raxSummary->MayNonEntryMaskHex;
+  std::transform(
+      mayNonEntryMask.begin(), mayNonEntryMask.end(), mayNonEntryMask.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return expect(raxSummary != nullptr, "missing bitwise RAX summary") &&
+         expect(readMask == "ffffffff",
+                "killed bits were counted as entry reads, kept bits were not") &&
+         expect(mayEntryMask == "ffffffff",
+                "untouched low bits lost entry preservation") &&
+         expect(mayNonEntryMask == "ffffffff00000000",
+                "partial write high bits were not marked modified");
 }
 
 bool testPartialReadReadsEntry() {
@@ -1012,6 +1090,7 @@ int main() {
   bool ok = true;
   ok &= testKilledReadDoesNotBecomeInput();
   ok &= testPartialWriteDoesNotReadEntryByItself();
+  ok &= testPartialWriteBitwiseReadEntry();
   ok &= testPartialReadReadsEntry();
   ok &= testKnownVarArgExternalKeepsFullInputDemand();
   ok &= testUnknownExternalNoInputsDoesNotReadAbiArguments();
