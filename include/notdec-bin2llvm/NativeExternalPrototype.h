@@ -22,6 +22,9 @@ struct NativeExternalPrototype {
     PointerSized,
     Float,
     Double,
+    // x86 ELF SysV long double: 80-bit x87 payload, passed through the stack
+    // and returned in ST0.  Other long double ABIs are intentionally excluded.
+    LongDouble,
   };
 
   unsigned FixedArgs = 0;

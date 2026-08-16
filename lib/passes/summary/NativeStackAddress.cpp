@@ -356,6 +356,23 @@ NativeStackAddressAnalysis::addressForInteger(llvm::Value *value) const {
         return frame;
       }
     }
+    if (auto *phi = llvm::dyn_cast<llvm::PHINode>(candidate)) {
+      // SummarySSA can leave a loop-invariant stack base as a phi containing
+      // self edges plus one concrete entry value.  Accept only that exact form;
+      // a phi with two distinct real incoming values is not one stack address.
+      llvm::Value *concreteIncoming = nullptr;
+      for (llvm::Value *incoming : phi->incoming_values()) {
+        if (incoming == phi) {
+          continue;
+        }
+        if (concreteIncoming != nullptr && concreteIncoming != incoming) {
+          return std::nullopt;
+        }
+        concreteIncoming = incoming;
+      }
+      return concreteIncoming == nullptr ? std::nullopt
+                                         : visit(concreteIncoming);
+    }
     auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(candidate);
     if (binary == nullptr) {
       return std::nullopt;

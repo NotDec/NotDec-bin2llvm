@@ -1147,6 +1147,8 @@ llvm::Type *llvmTypeForKnownValue(llvm::Module &module,
     return llvm::Type::getFloatTy(context);
   case NativeExternalPrototype::ValueType::Double:
     return llvm::Type::getDoubleTy(context);
+  case NativeExternalPrototype::ValueType::LongDouble:
+    return llvm::Type::getX86_FP80Ty(context);
   }
   return llvm::Type::getInt64Ty(context);
 }
@@ -1649,6 +1651,16 @@ typedParamSlot(NativeExternalPrototype::ValueType type, unsigned &integerIndex,
                const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
                const AbiFacts &abi, llvm::Module &module) {
   llvm::Type *llvmType = llvmTypeForKnownValue(module, type);
+  if (type == NativeExternalPrototype::ValueType::LongDouble) {
+    // SysV x86 long double is an x87 memory-class argument.  It must bypass
+    // the XMM pentries even though its LLVM type is floating-point.
+    if (abi.StackInputsInOrder.empty()) {
+      return std::nullopt;
+    }
+    return signatureStackSlotFromAbi(
+        abi.StackInputsInOrder.front(), stackIndex++, llvmType,
+        NativeSignatureSlotKind::FloatStack);
+  }
   if (isFloatKnownValue(type)) {
     if (floatIndex < abi.FloatInputsInOrder.size()) {
       return signatureSlotFromAbi(abi.FloatInputsInOrder[floatIndex++], units,
@@ -1697,6 +1709,17 @@ typedReturnSlot(NativeExternalPrototype::ValueType type,
                 const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
                 const AbiFacts &abi, llvm::Module &module) {
   llvm::Type *llvmType = llvmTypeForKnownValue(module, type);
+  if (type == NativeExternalPrototype::ValueType::LongDouble) {
+    // XMM0 is earlier in the generic float output list.  Select ST0 explicitly
+    // so an x87 long double return cannot be mistaken for a double return.
+    for (const AbiFacts::RegisterSlot &slot : abi.FloatOutputsInOrder) {
+      if (slot.UnitName == "ST0") {
+        return signatureSlotFromAbi(slot, units, llvmType,
+                                    NativeSignatureSlotKind::FloatRegister);
+      }
+    }
+    return std::nullopt;
+  }
   if (isFloatKnownValue(type)) {
     if (abi.FloatOutputsInOrder.empty()) {
       return std::nullopt;
@@ -2633,6 +2656,13 @@ void addDemandedExternalReturns(
                                                       : known->MaxReturnRegisters)
             : std::nullopt;
 
+    // A typed return is the complete trusted prototype.  Post-call register
+    // placeholders are clobber bookkeeping and must not append RAX (or another
+    // ABI output) to an explicitly selected XMM/ST0 return.
+    if (known != nullptr && known->TypedReturn) {
+      continue;
+    }
+
     auto addReturnSlot = [&](const RegisterUnit &unit, bool floatSlot) {
       if (signatureHasReturnForRegister(shapeIt->second, unit)) {
         return;
@@ -2960,7 +2990,7 @@ public:
       foldDuplicatePartialReadXors();
       rewriteLoads();
       addIndirectCallsiteShapes(SignatureState, Units, Abi);
-      collectSignatureCallArgs();
+      collectSignatureCallArgs(/*stackSlotsOnly=*/false);
       // 第一遍只读退出点前 ABI 输出槽位生成"调用后被读"证据
       // （RangeReturnHelpers），供 addDemandedExternalReturns 给未知外部
       // 补返回槽（sqrtl 的 ST0 就靠它）；不记录返回绑定、不改 ret。
@@ -2969,6 +2999,9 @@ public:
       collectFunctionReturnValues(/*recordBinding=*/false);
       rewritePartialWrites();
       finalizePendingPhis();
+      // Stack addresses can depend on loop-carried RSP/RBP range phis.  Bind
+      // stack arguments only after those phis have reached their final value.
+      collectSignatureCallArgs(/*stackSlotsOnly=*/true);
       if (Options.EnableResidueRemoval) {
         removeDeadStoresByLiveness();
         // Keep replaced reads/xors/loads physically alive until every range
@@ -5874,10 +5907,9 @@ private:
     return false;
   }
 
-  void collectSignatureCallArgs() {
-    // Register SSA has finished changing the current function at this point.
-    // Build fresh address facts here rather than carrying raw Instruction*
-    // through earlier rewriting.
+  void collectSignatureCallArgs(bool stackSlotsOnly) {
+    // Build fresh address facts in both collection phases rather than carrying
+    // raw Instruction* through register and phi rewriting.
     StackAddresses = std::make_unique<NativeStackAddressAnalysis>(
         Function, stackPointerGlobal(), Abi.StackPointer);
     std::vector<llvm::CallBase *> calls;
@@ -5902,12 +5934,28 @@ private:
         continue;
       }
       std::vector<CallArgStoreBinding> bindings =
-          callArgStoreBindings(*call, *shape);
+          callArgStoreBindings(*call, *shape, stackSlotsOnly);
       if (bindings.empty() && shape->Params.empty() && shape->Returns.empty()) {
         continue;
       }
 
-      SignatureState.CallArgs[call] = bindings;
+      std::vector<CallArgStoreBinding> &recorded =
+          SignatureState.CallArgs[call];
+      if (!stackSlotsOnly) {
+        recorded = bindings;
+      } else {
+        for (CallArgStoreBinding &binding : bindings) {
+          auto existing = std::find_if(
+              recorded.begin(), recorded.end(), [&](const auto &candidate) {
+                return candidate.Index == binding.Index;
+              });
+          if (existing == recorded.end()) {
+            recorded.push_back(binding);
+          } else {
+            *existing = binding;
+          }
+        }
+      }
       if (callee == nullptr ||
           !isUnknownExternalFunction(
               *callee, externalPrototypesForState(SignatureState))) {
@@ -6016,11 +6064,17 @@ private:
   }
 
   std::vector<CallArgStoreBinding>
-  callArgStoreBindings(llvm::CallBase &call, const SignatureShape &shape) {
+  callArgStoreBindings(llvm::CallBase &call, const SignatureShape &shape,
+                       bool stackSlotsOnly) {
     std::vector<CallArgStoreBinding> bindings;
     std::vector<NativeSignatureSlot> slots = callParamSlots(call, shape);
     for (auto [index, slot] : llvm::enumerate(slots)) {
       const RegisterUnit *unit = slot.Unit;
+      bool isStackSlot = slot.Kind == NativeSignatureSlotKind::IntegerStack ||
+                         slot.Kind == NativeSignatureSlotKind::FloatStack;
+      if (isStackSlot != stackSlotsOnly) {
+        continue;
+      }
       llvm::Value *value = resolve(readSlotValueBefore(call, slot));
       if (value == nullptr) {
         SignatureState.Warnings.push_back(callSlotWarning(
@@ -6036,8 +6090,6 @@ private:
         SignatureState.Warnings.push_back(callSlotWarning(
             call, slot, "call_arg", "call_arg_binding_uses_clobber_value"));
       }
-      bool isStackSlot = slot.Kind == NativeSignatureSlotKind::IntegerStack ||
-                         slot.Kind == NativeSignatureSlotKind::FloatStack;
       llvm::StoreInst *store =
           isStackSlot ? findNearestStackStoreBeforeCall(call, slot)
                       : findNearestStoreBeforeCall(call, *unit);
@@ -6143,11 +6195,21 @@ private:
     if (value->getType() == targetType) {
       return value;
     }
-    if (!value->getType()->isIntegerTy() || !targetType->isIntegerTy()) {
-      return nullptr;
-    }
     llvm::IRBuilder<> builder(&call);
-    return builder.CreateZExtOrTrunc(value, targetType, "stack.arg.cast");
+    if (value->getType()->isIntegerTy() && targetType->isIntegerTy()) {
+      return builder.CreateZExtOrTrunc(value, targetType, "stack.arg.cast");
+    }
+    bool integerFloatPair =
+        (value->getType()->isIntegerTy() &&
+         targetType->isFloatingPointTy()) ||
+        (value->getType()->isFloatingPointTy() && targetType->isIntegerTy());
+    if (integerFloatPair && value->getType()->getScalarSizeInBits() ==
+                                targetType->getScalarSizeInBits()) {
+      // Lifted x87 stack stores carry the raw 80 bits as i80.  The trusted
+      // external declaration consumes the same bits as LLVM x86_fp80.
+      return builder.CreateBitCast(value, targetType, "stack.arg.float_cast");
+    }
+    return nullptr;
   }
 
   // The ABI evidence grid steps by pointer-sized slots (4 bytes on i386, 8 on
@@ -6193,18 +6255,26 @@ private:
 
   std::optional<NativeStackAddress>
   callsiteStackAddress(llvm::CallBase &call, const NativeSignatureSlot &slot) {
+    const auto *callInst = llvm::dyn_cast<llvm::CallInst>(&call);
+    const bool isTailCall = callInst != nullptr && callInst->isTailCall();
     if (slot.StackOffset >
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-        Abi.StackShift >
-            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        (!isTailCall && Abi.StackShift >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))) {
       return std::nullopt;
+    }
+    int64_t slotOffset = static_cast<int64_t>(slot.StackOffset);
+    if (isTailCall) {
+      // Tail-call stack arguments remain caller-owned entry-frame slots.  Do
+      // not let a relative/aligned SP value in the epilogue change that base.
+      return NativeStackAddress{NativeStackAddressKind::EntryStackPointer,
+                                nullptr, slotOffset};
     }
     std::optional<NativeStackAddress> current =
         stackAddressAnalysis().stackPointerBefore(call);
     if (!current) {
       return std::nullopt;
     }
-    int64_t slotOffset = static_cast<int64_t>(slot.StackOffset);
     int64_t stackShift = static_cast<int64_t>(Abi.StackShift);
     int64_t delta = slotOffset >= stackShift ? slotOffset - stackShift
                                              : -(stackShift - slotOffset);

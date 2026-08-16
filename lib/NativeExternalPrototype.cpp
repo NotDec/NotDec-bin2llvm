@@ -37,6 +37,10 @@ bool parseValueType(llvm::StringRef text, ValueType &type) {
     type = ValueType::Double;
     return true;
   }
+  if (text == "long_double") {
+    type = ValueType::LongDouble;
+    return true;
+  }
   return false;
 }
 
@@ -631,6 +635,13 @@ const NativeExternalPrototypeMap &defaultNativeExternalPrototypes() {
       {"srandom", {1, false}},
       {"srand", {1, false}},
       {"sqrt", {0, false, false, 1, {ValueType::Double}, ValueType::Double}},
+      {"sqrtl",
+       {1,
+        false,
+        false,
+        1,
+        {ValueType::LongDouble},
+        ValueType::LongDouble}},
       {"sscanf", {2, true}},
       {"stat", {2, false}},
       {"stat64", {2, false}},

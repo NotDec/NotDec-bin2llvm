@@ -1,4 +1,5 @@
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/NativeExternalPrototype.h"
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
@@ -5179,6 +5180,46 @@ bool testExternalPrototypeJsonOverridesInferredArity() {
                   "module failed verifier after JSON prototype priority test");
 }
 
+bool testExternalPrototypeJsonAcceptsLongDouble() {
+  llvm::SmallString<128> jsonPath;
+  int jsonFd = -1;
+  std::error_code error = llvm::sys::fs::createTemporaryFile(
+      "notdec-external-long-double-prototype", "json", jsonFd, jsonPath);
+  if (error) {
+    std::cerr << "failed to create long double prototype JSON: "
+              << error.message() << '\n';
+    return false;
+  }
+  {
+    llvm::raw_fd_ostream json(jsonFd, true);
+    json << R"({"json_sqrtl":{"params":["long_double"],"return":"long_double"}})";
+  }
+
+  std::string errorMessage;
+  std::optional<notdec::bin2llvm::NativeExternalPrototypeMap> prototypes =
+      notdec::bin2llvm::loadNativeExternalPrototypesJson(jsonPath,
+                                                         errorMessage);
+  (void)llvm::sys::fs::remove(jsonPath);
+  if (!prototypes) {
+    std::cerr << "failed to parse long double prototype JSON: " << errorMessage
+              << '\n';
+    return false;
+  }
+
+  const notdec::bin2llvm::NativeExternalPrototype *prototype =
+      notdec::bin2llvm::lookupNativeExternalPrototype(*prototypes,
+                                                      "json_sqrtl");
+  using ValueType = notdec::bin2llvm::NativeExternalPrototype::ValueType;
+  return expect(prototype != nullptr,
+                "long double JSON prototype was not loaded") &&
+         expect(prototype->FixedArgs == 1 &&
+                    prototype->TypedParams ==
+                        std::vector<ValueType>{ValueType::LongDouble},
+                "long double JSON parameter was not parsed") &&
+         expect(prototype->TypedReturn == ValueType::LongDouble,
+                "long double JSON return was not parsed");
+}
+
 bool testUnknownExternalArityStopsAtClobberArg() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-unknown-external-clobber-arity", context);
@@ -7347,6 +7388,118 @@ bool testKnownUnaryLibmUsesFloatAbiSlots() {
   return ok;
 }
 
+bool testKnownSqrtlUsesLongDoubleStackAndSt0() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-sqrtl-long-double-abi", context);
+  module.setDataLayout("e-p:64:64");
+  attachX64StackTestAbi(module);
+
+  auto *i64 = llvm::Type::getInt64Ty(context);
+  auto *i80 = llvm::Type::getIntNTy(context, 80);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  (void)createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *st0 =
+      createRegisterGlobal(module, "ST0", i80, 0x1100, 10);
+  auto *sink = new llvm::GlobalVariable(
+      module, i80, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "sqrtl_result_sink");
+  auto *leaveLoop = new llvm::GlobalVariable(
+      module, llvm::Type::getInt1Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sqrtl_leave_loop");
+
+  auto *oldSqrtlType = llvm::FunctionType::get(i64, {}, false);
+  llvm::Function *sqrtlFunction = llvm::Function::Create(
+      oldSqrtlType, llvm::GlobalValue::ExternalLinkage, "sqrtl", module);
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::ExternalLinkage, "sqrtl_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::BasicBlock *loop = llvm::BasicBlock::Create(context, "loop", caller);
+  llvm::BasicBlock *tail = llvm::BasicBlock::Create(context, "tail", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *rspValue = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::Value *frameBase = builder.CreateSub(
+      rspValue, llvm::ConstantInt::get(i64, 8), "frame.base");
+  builder.CreateBr(loop);
+
+  builder.SetInsertPoint(loop);
+  llvm::PHINode *loopFrame = builder.CreatePHI(i64, 2, "frame.loop");
+  loopFrame->addIncoming(frameBase, entry);
+  loopFrame->addIncoming(loopFrame, loop);
+  llvm::Value *leave =
+      builder.CreateLoad(llvm::Type::getInt1Ty(context), leaveLoop);
+  builder.CreateCondBr(leave, tail, loop);
+
+  builder.SetInsertPoint(tail);
+  llvm::Value *argAddress = builder.CreateAdd(
+      loopFrame, llvm::ConstantInt::get(i64, 16), "sqrtl.arg.addr");
+  llvm::Value *argPointer = builder.CreateIntToPtr(
+      argAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(i80, 42), argPointer);
+  llvm::Value *restoredRsp = builder.CreateAdd(
+      frameBase, llvm::ConstantInt::get(i64, 8), "rsp.restored");
+  storeRegister(builder, rsp, restoredRsp, "RSP");
+  llvm::CallInst *sqrtlCall = builder.CreateCall(oldSqrtlType, sqrtlFunction);
+  sqrtlCall->setTailCallKind(llvm::CallInst::TCK_Tail);
+  llvm::Value *result = loadRegister(builder, st0, "ST0", "sqrtl.result", 10);
+  builder.CreateStore(result, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenSqrtl = module.getFunction("sqrtl");
+  llvm::Function *rewrittenCaller = module.getFunction("sqrtl_caller");
+  llvm::CallInst *rewrittenCall = nullptr;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() == rewrittenSqrtl) {
+        rewrittenCall = call;
+      }
+    }
+  }
+
+  bool argumentPreservesI80Bits = false;
+  if (rewrittenCall != nullptr && rewrittenCall->arg_size() == 1) {
+    llvm::Value *argument = rewrittenCall->getArgOperand(0);
+    if (auto *bitcast = llvm::dyn_cast<llvm::BitCastInst>(argument)) {
+      argumentPreservesI80Bits =
+          bitcast->getOperand(0)->getType()->isIntegerTy(80);
+    } else if (auto *constant = llvm::dyn_cast<llvm::ConstantFP>(argument)) {
+      // InstCombine folds a constant i80 -> x86_fp80 bitcast.  Compare the
+      // payload bits so the test still checks the stack value, not its spelling.
+      argumentPreservesI80Bits =
+          constant->getValueAPF().bitcastToAPInt() == llvm::APInt(80, 42);
+    }
+  }
+  bool hasSqrtlWarning = std::any_of(
+      summary.Warnings.begin(), summary.Warnings.end(),
+      [](const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning) {
+        return warning.CalleeName == "sqrtl";
+      });
+
+  return expect(rewrittenSqrtl != nullptr, "sqrtl declaration missing") &&
+         expect(rewrittenSqrtl->getReturnType()->isX86_FP80Ty(),
+                "sqrtl return was not rewritten to x86_fp80") &&
+         expect(rewrittenSqrtl->arg_size() == 1 &&
+                    rewrittenSqrtl->getArg(0)->getType()->isX86_FP80Ty(),
+                "sqrtl parameter was not rewritten to x86_fp80") &&
+         expect(rewrittenCall != nullptr &&
+                    rewrittenCall->getType()->isX86_FP80Ty(),
+                "sqrtl call return was not rewritten to x86_fp80") &&
+         expect(rewrittenCall != nullptr && rewrittenCall->isTailCall(),
+                "sqrtl call lost its tail marker") &&
+         expect(argumentPreservesI80Bits,
+                "sqrtl stack argument did not preserve the i80 payload") &&
+         expect(rewrittenCaller != nullptr &&
+                    !hasRegisterLoad(*rewrittenCaller, "ST0"),
+                "sqrtl return left a raw ST0 load") &&
+         expect(!hasSqrtlWarning, "sqrtl left a register SSA warning") &&
+         verifyOk(module,
+                  "module failed verifier after sqrtl long double rewrite");
+}
+
 bool testPartialKeepHighStoreIsDemandRewritten() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-demand", context);
@@ -9186,6 +9339,7 @@ int main() {
   ok &= testClobberReturnPhiDoesNotMaterializeHelper();
   ok &= testUnknownExternalArityUsesMaxCallsitePrefix();
   ok &= testExternalPrototypeJsonOverridesInferredArity();
+  ok &= testExternalPrototypeJsonAcceptsLongDouble();
   ok &= testUnknownExternalArityStopsAtClobberArg();
   ok &= testUnknownExternalArityStopsAtPhiClobberArg();
   ok &= testUnknownExternalArityCountsExplicitBinaryArg();
@@ -9236,6 +9390,7 @@ int main() {
   ok &= testUnknownExternalIntegerClobberUsesRangeCallValue();
   ok &= testKnownPowUsesFloatAbiSlots();
   ok &= testKnownUnaryLibmUsesFloatAbiSlots();
+  ok &= testKnownSqrtlUsesLongDoubleStackAndSt0();
   ok &= testPartialKeepHighStoreIsDemandRewritten();
   ok &= testPartialWriteHelperIsConsumedBySummarySSA();
   ok &= testPartialReadHelperIsConsumedBySummarySSA();

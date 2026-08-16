@@ -766,6 +766,56 @@ bool testI386AlignedStackCallsiteEvidenceUsesCurrentEsp() {
                 "aligned i386 stack store was not matched at current ESP");
 }
 
+bool testI386TailStackCallsiteEvidenceKeepsCalleeOffset() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-i386-tail-stack-evidence", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackEvidenceAbi(module);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  llvm::GlobalVariable *esp = createRegisterGlobal(module, "ESP", i32, 0, 4);
+
+  auto *callType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external = llvm::Function::Create(
+      callType, llvm::GlobalValue::ExternalLinkage, "unknown_tail_target",
+      module);
+  llvm::Function *function = llvm::Function::Create(
+      callType, llvm::GlobalValue::ExternalLinkage, "tail_stack_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *entryEsp = loadRegister(builder, esp, "ESP", "entry.esp");
+  llvm::Value *argAddress =
+      builder.CreateAdd(entryEsp, llvm::ConstantInt::get(i32, 4), "arg.addr");
+  llvm::Value *argPointer =
+      builder.CreateIntToPtr(argAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(i32, 55), argPointer);
+  // SummarySSA can leave the restored tail-call SP in a relative coordinate.
+  // The outgoing slot is still anchored on the entry stack pointer.
+  llvm::Value *relativeEsp = builder.CreateAnd(
+      entryEsp, llvm::ConstantInt::get(i32, -16, true), "esp.relative");
+  storeRegisterValue(builder, esp, relativeEsp, "ESP");
+  llvm::CallInst *call = builder.CreateCall(callType, external);
+  call->setTailCallKind(llvm::CallInst::TCK_Tail);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummaryOptions options;
+  options.AttachMetadata = false;
+  options.IgnoredRegisters.insert("ESP");
+  options.UnknownExternalInputPolicy =
+      notdec::bin2llvm::NativeRegisterUnknownExternalInputPolicy::NoInputs;
+  options.CollectExternalCallsiteEvidence = true;
+  options.ExternalEvidenceSlots = {stackInputSlot(4)};
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module, options);
+  const auto *callsite =
+      unknownExternalCallsite(summary, "unknown_tail_target");
+  using Origin = notdec::bin2llvm::NativeRegisterCallsiteValueOrigin;
+  return expect(callsite != nullptr, "missing i386 tail stack evidence") &&
+         expect(callsite->Slots.size() == 1,
+                "i386 tail stack evidence slot count mismatch") &&
+         expect(callsite->Slots[0].Origin == Origin::LocalDefinition,
+                "i386 tail stack store lost the callee-entry offset");
+}
+
 bool testI386RewrittenFrameStackEvidenceMatchesAllocaSlot() {
   llvm::LLVMContext context;
   llvm::Module module("summary-i386-rewritten-frame-evidence", context);
@@ -1098,6 +1148,7 @@ int main() {
   ok &= testKnownVarArgUsesFixedThenCallsiteInputs();
   ok &= testUnknownExternalCallsiteEvidenceClassifiesOrigins();
   ok &= testI386AlignedStackCallsiteEvidenceUsesCurrentEsp();
+  ok &= testI386TailStackCallsiteEvidenceKeepsCalleeOffset();
   ok &= testI386RewrittenFrameStackEvidenceMatchesAllocaSlot();
   ok &= testCalleeReadPropagatesToCallerEntry();
   ok &= testSparseJoinKeepsUntouchedPath();

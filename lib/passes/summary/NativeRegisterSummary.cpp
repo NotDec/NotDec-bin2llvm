@@ -2129,19 +2129,30 @@ private:
   callsiteStackSlot(llvm::CallBase &call,
                     const NativeRegisterCallInputSlot &slot) const {
     llvm::Function *function = call.getFunction();
+    const auto *callInst = llvm::dyn_cast<llvm::CallInst>(&call);
+    const bool isTailCall = callInst != nullptr && callInst->isTailCall();
     if (function == nullptr ||
         slot.StackOffset >
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-        Abi.StackShift >
-            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        (!isTailCall && Abi.StackShift >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))) {
       return std::nullopt;
+    }
+    int64_t stackOffset = static_cast<int64_t>(slot.StackOffset);
+    if (isTailCall) {
+      // A tail jump reuses the caller's return address.  Its callee-entry stack
+      // slots therefore stay in the caller's entry-SP coordinate even when a
+      // relative/aligned SP value remains in the lifted epilogue.
+      return stackSlotKey(NativeStackAddress{
+          NativeStackAddressKind::EntryStackPointer, nullptr, stackOffset});
     }
     std::optional<NativeStackAddress> current =
         stackAddressAnalysis(*function).stackPointerBefore(call);
     if (!current) {
       return std::nullopt;
     }
-    int64_t stackOffset = static_cast<int64_t>(slot.StackOffset);
+    // A normal CALL pushes a return address, so cspec callee-entry offsets are
+    // shifted back to caller-side stores.
     int64_t stackShift = static_cast<int64_t>(Abi.StackShift);
     int64_t delta = stackOffset >= stackShift ? stackOffset - stackShift
                                               : -(stackShift - stackOffset);
