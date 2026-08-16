@@ -2865,7 +2865,10 @@ bool testI386InternalStackInputIsRewritten() {
   attachI386StackTestAbi(module);
   auto *i32 = llvm::Type::getInt32Ty(context);
   llvm::GlobalVariable *esp = createRegisterGlobal(module, "ESP", i32, 0, 4);
-  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+  llvm::GlobalVariable *eax = createRegisterGlobal(module, "EAX", i32, 0, 4);
+  auto *eaxSink = new llvm::GlobalVariable(
+      module, i32, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "stack_caller_eax_sink");
 
   auto *calleeType = llvm::FunctionType::get(i32, {}, false);
   llvm::Function *callee = llvm::Function::Create(
@@ -2895,15 +2898,23 @@ bool testI386InternalStackInputIsRewritten() {
       callerEsp, llvm::PointerType::get(context, 0));
   callerBuilder.CreateStore(llvm::ConstantInt::get(i32, 123), storePointer);
   callerBuilder.CreateCall(calleeType, callee);
+  // caller 要求 EAX 返回，但 callee 没有本地 EAX 定义。返回绑定会查入口
+  // 参数，此时必须安全跳过 Unit == nullptr 的栈参数槽。
+  llvm::LoadInst *result =
+      loadRegister(callerBuilder, eax, "EAX", "caller.result", 4);
+  callerBuilder.CreateStore(result, eaxSink);
   callerBuilder.CreateRetVoid();
 
   (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   llvm::Function *rewrittenCallee = module.getFunction("stack_callee");
+  llvm::Function *rewrittenCaller = module.getFunction("stack_caller");
   llvm::CallInst *rewrittenCall = nullptr;
-  for (llvm::Instruction &inst : llvm::instructions(caller)) {
-    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
-    if (call != nullptr && call->getCalledFunction() == rewrittenCallee) {
-      rewrittenCall = call;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() == rewrittenCallee) {
+        rewrittenCall = call;
+      }
     }
   }
   auto *constant =

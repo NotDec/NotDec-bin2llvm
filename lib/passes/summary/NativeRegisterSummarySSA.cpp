@@ -5604,7 +5604,8 @@ private:
       if (arg == Function.arg_end()) {
         return {nullptr, nullptr};
       }
-      if (slot.Unit == &unit || slot.Unit->Global == unit.Global) {
+      if (slot.Unit != nullptr &&
+          (slot.Unit == &unit || slot.Unit->Global == unit.Global)) {
         return {arg, &slot};
       }
       ++arg;
