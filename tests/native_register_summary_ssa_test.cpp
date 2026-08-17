@@ -2934,6 +2934,118 @@ bool testI386InternalStackInputIsRewritten() {
                   "module failed verifier after i386 internal stack rewrite");
 }
 
+bool testTrimmedInternalStackInputDoesNotLeaveBindingWarning() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-trimmed-internal-stack-warning", context);
+  module.setDataLayout("e-p:32:32");
+  attachI386StackTestAbi(module);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  llvm::GlobalVariable *esp = createRegisterGlobal(module, "ESP", i32, 0, 4);
+  (void)createRegisterGlobal(module, "EAX", i32, 0, 4);
+  auto *sink = new llvm::GlobalVariable(module, i32, false,
+                                        llvm::GlobalValue::ExternalLinkage,
+                                        nullptr, "trimmed_stack_input_sink");
+
+  // The callee initially has a stack+4 input, but the only caller has no
+  // outgoing store for it.  Final shape refinement must remove that candidate
+  // without preserving the collection phase's missing-binding warning.
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "trimmed_stack_input_callee", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(calleeEntry);
+  llvm::Value *calleeEsp = loadRegister(builder, esp, "ESP", "callee.esp", 4);
+  llvm::Value *argAddress =
+      builder.CreateAdd(calleeEsp, llvm::ConstantInt::get(i32, 4), "arg.addr");
+  llvm::Value *argPointer =
+      builder.CreateIntToPtr(argAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(builder.CreateLoad(i32, argPointer), sink);
+  builder.CreateRetVoid();
+
+  llvm::Function *caller =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "trimmed_stack_input_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  builder.CreateCall(voidType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewrittenCallee =
+      module.getFunction("trimmed_stack_input_callee");
+  llvm::CallInst *rewrittenCall = nullptr;
+  if (llvm::Function *rewrittenCaller =
+          module.getFunction("trimmed_stack_input_caller")) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() == rewrittenCallee) {
+        rewrittenCall = call;
+      }
+    }
+  }
+  bool hasCallArgWarning = std::any_of(
+      summary.Warnings.begin(), summary.Warnings.end(),
+      [](const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning) {
+        return warning.CalleeName == "trimmed_stack_input_callee" &&
+               warning.Kind == "call_arg";
+      });
+
+  return expect(rewrittenCallee != nullptr,
+                "trimmed internal stack callee missing") &&
+         expect(rewrittenCallee->arg_empty(),
+                "unbound internal stack input was not trimmed") &&
+         expect(rewrittenCall != nullptr && rewrittenCall->arg_empty(),
+                "trimmed internal stack call kept an argument") &&
+         expect(!hasCallArgWarning,
+                "trimmed internal stack input left a call-arg warning") &&
+         verifyOk(module,
+                  "module failed verifier after stack warning refinement");
+}
+
+bool testFinalCallArgClobberWarningIsKept() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-call-arg-warning", context);
+  attachTestAbi(module);
+  (void)createRegisterGlobal(module, "RDI");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *clobber = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "warning_clobber", module);
+  llvm::Function *freeFn = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "free", module);
+  llvm::Function *caller =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "final_call_arg_warning_caller", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCall(voidType, clobber);
+  builder.CreateCall(voidType, freeFn);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  bool hasFinalWarning = false;
+  bool hasCollectionWarning = false;
+  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+       summary.Warnings) {
+    if (warning.CalleeName != "free" || warning.Kind != "call_arg") {
+      continue;
+    }
+    hasFinalWarning |= warning.Reason == "call_arg_uses_clobber_value";
+    hasCollectionWarning |=
+        llvm::StringRef(warning.Reason).starts_with("call_arg_binding_");
+  }
+
+  return expect(hasFinalWarning,
+                "final clobber-derived call argument was not reported") &&
+         expect(!hasCollectionWarning,
+                "collection-phase call argument warning remained") &&
+         verifyOk(module,
+                  "module failed verifier after final call-arg warning test");
+}
+
 bool testI386AdjustedEspStackInputIsRewritten() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-i386-adjusted-esp-stack", context);
@@ -9307,6 +9419,8 @@ int main() {
   ok &= testX64KnownExternalUsesCspecStackOverflowOffset();
   ok &= testX64AlignedStackPointerOutgoingArgIsBound();
   ok &= testI386InternalStackInputIsRewritten();
+  ok &= testTrimmedInternalStackInputDoesNotLeaveBindingWarning();
+  ok &= testFinalCallArgClobberWarningIsKept();
   ok &= testI386AdjustedEspStackInputIsRewritten();
   ok &= testI386NegativeEspLoadDoesNotBecomeStackInput();
   ok &= testI386AlignedEspLoadDoesNotBecomeStackInput();

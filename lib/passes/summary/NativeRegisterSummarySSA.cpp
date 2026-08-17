@@ -6068,6 +6068,11 @@ private:
                        bool stackSlotsOnly) {
     std::vector<CallArgStoreBinding> bindings;
     std::vector<NativeSignatureSlot> slots = callParamSlots(call, shape);
+    // This collection still runs against the initial signature.  Missing or
+    // clobber-derived values are evidence used to trim an internal stack
+    // parameter prefix, so reporting them here leaves stale warnings after
+    // refineInternalStackParamShapes().  rewriteSignatureShapes() diagnoses
+    // only the slots retained by the final shape.
     for (auto [index, slot] : llvm::enumerate(slots)) {
       const RegisterUnit *unit = slot.Unit;
       bool isStackSlot = slot.Kind == NativeSignatureSlotKind::IntegerStack ||
@@ -6077,22 +6082,14 @@ private:
       }
       llvm::Value *value = resolve(readSlotValueBefore(call, slot));
       if (value == nullptr) {
-        SignatureState.Warnings.push_back(callSlotWarning(
-            call, slot, "call_arg", "call_arg_binding_missing"));
         break;
       }
       if (value->getType() != slotType(slot)) {
-        SignatureState.Warnings.push_back(
-            callSlotWarning(call, slot, "call_arg", "call_arg_type_mismatch"));
         break;
       }
-      if (mayDependOnSummaryClobberValue(value)) {
-        SignatureState.Warnings.push_back(callSlotWarning(
-            call, slot, "call_arg", "call_arg_binding_uses_clobber_value"));
-      }
-      llvm::StoreInst *store =
-          isStackSlot ? findNearestStackStoreBeforeCall(call, slot)
-                      : findNearestStoreBeforeCall(call, *unit);
+      llvm::StoreInst *store = isStackSlot
+                                   ? findNearestStackStoreBeforeCall(call, slot)
+                                   : findNearestStoreBeforeCall(call, *unit);
       bindings.push_back(CallArgStoreBinding{store, unit, value, value,
                                              slotType(slot),
                                              static_cast<unsigned>(index)});
@@ -7711,6 +7708,30 @@ void rewriteSignatureShapes(
       newCallee = oldCall->getCalledOperand();
       newCallType = functionTypeForShape(module.getContext(), *shape);
     }
+    // A replacement function takes the old callee's name before call
+    // arguments are rebuilt.  Warnings made from oldCall would therefore lose
+    // the direct callee name.  Keep the final callee name explicitly until the
+    // new call exists.
+    const std::string rewrittenCalleeName =
+        oldCallee == nullptr
+            ? std::string("<indirect>")
+            : llvm::cast<llvm::Function>(newCallee)->getName().str();
+    auto finalCallSlotWarning = [&](const NativeSignatureSlot &slot,
+                                    llvm::StringRef kind,
+                                    llvm::StringRef reason) {
+      NativeRegisterSummarySSAWarning warning =
+          callSlotWarning(*oldCall, slot, kind, reason);
+      warning.CalleeName = rewrittenCalleeName;
+      return warning;
+    };
+    auto finalCallRegisterWarning = [&](llvm::StringRef registerName,
+                                        llvm::StringRef kind,
+                                        llvm::StringRef reason) {
+      NativeRegisterSummarySSAWarning warning =
+          callRegisterWarning(*oldCall, registerName, kind, reason);
+      warning.CalleeName = rewrittenCalleeName;
+      return warning;
+    };
     std::vector<llvm::Value *> args;
     args.reserve(bindings.size());
     llvm::IRBuilder<> oldCallBuilder(oldCall);
@@ -7728,21 +7749,21 @@ void rewriteSignatureShapes(
       } else if (value->getType() != slotType(slot)) {
         reason = "call_arg_rewrite_type_mismatch";
       } else if (valueMayDependOnUnknownPlaceholder(value)) {
-        state.Warnings.push_back(callSlotWarning(
-            *oldCall, slot, "call_arg", "call_arg_uses_unknown_value"));
+        state.Warnings.push_back(finalCallSlotWarning(
+            slot, "call_arg", "call_arg_uses_unknown_value"));
       } else if (mayDependOnSummaryClobberValue(value)) {
-        state.Warnings.push_back(callSlotWarning(
-            *oldCall, slot, "call_arg", "call_arg_uses_clobber_value"));
+        state.Warnings.push_back(finalCallSlotWarning(
+            slot, "call_arg", "call_arg_uses_clobber_value"));
       }
       if (!reason.empty()) {
         state.Warnings.push_back(
-            callSlotWarning(*oldCall, slot, "call_arg", reason));
+            finalCallSlotWarning(slot, "call_arg", reason));
         std::string regName = slotRegisterName(slot);
         value = unknownValueAt(oldCallBuilder, slotType(slot),
                                regName + ".arg_unknown");
-        attachUnknownValueMetadata(
-            value, reason, oldCall->getFunction()->getName(),
-            calleeNameForWarning(*oldCall), regName, "call_arg");
+        attachUnknownValueMetadata(value, reason,
+                                   oldCall->getFunction()->getName(),
+                                   rewrittenCalleeName, regName, "call_arg");
       }
       args.push_back(value);
     }
@@ -7758,9 +7779,9 @@ void rewriteSignatureShapes(
         value = remapValue(value);
         value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);
         if (mayDependOnSummaryClobberValue(value)) {
-          state.Warnings.push_back(callRegisterWarning(
-              *oldCall, binding.Unit == nullptr ? "" : binding.Unit->Name,
-              "call_arg", "vararg_arg_uses_clobber_value"));
+          state.Warnings.push_back(finalCallRegisterWarning(
+              binding.Unit == nullptr ? "" : binding.Unit->Name, "call_arg",
+              "vararg_arg_uses_clobber_value"));
         }
         bool unknownValue = valueMayDependOnUnknownPlaceholder(value);
         if (isLikelyX86_64SysVAbi(abi) &&
@@ -7769,22 +7790,22 @@ void rewriteSignatureShapes(
           llvm::StringRef reason = unknownValue
                                        ? "vararg_arg_uses_unknown_value"
                                        : "vararg_arg_unproven_zero";
-          state.Warnings.push_back(callRegisterWarning(
-              *oldCall, binding.Unit == nullptr ? "" : binding.Unit->Name,
-              "call_arg", reason));
+          state.Warnings.push_back(finalCallRegisterWarning(
+              binding.Unit == nullptr ? "" : binding.Unit->Name, "call_arg",
+              reason));
           llvm::Function *unknown =
               getOrInsertVarArgUnknownHelper(module, value->getType());
           value = oldCallBuilder.CreateCall(unknown);
           attachUnknownValueMetadata(
               value, reason, oldCall->getFunction()->getName(),
-              calleeNameForWarning(*oldCall),
+              rewrittenCalleeName,
               binding.Unit == nullptr ? "" : binding.Unit->Name, "call_arg");
         }
         if (binding.ValueType != nullptr &&
             value->getType() != binding.ValueType) {
-          state.Warnings.push_back(callRegisterWarning(
-              *oldCall, binding.Unit == nullptr ? "" : binding.Unit->Name,
-              "call_arg", "vararg_arg_type_mismatch"));
+          state.Warnings.push_back(finalCallRegisterWarning(
+              binding.Unit == nullptr ? "" : binding.Unit->Name, "call_arg",
+              "vararg_arg_type_mismatch"));
           continue;
         }
         args.push_back(value);
@@ -7818,12 +7839,12 @@ void rewriteSignatureShapes(
                                        ? "return_helper_rewrite_missing_value"
                                        : "return_helper_rewrite_type_mismatch";
           state.Warnings.push_back(
-              callRegisterWarning(*oldCall, name, "return", reason));
+              callRegisterWarning(*newCall, name, "return", reason));
           value = unknownValueAt(builder, helper->getType(),
                                  name + ".return_unknown");
           attachUnknownValueMetadata(
               value, reason, oldCall->getFunction()->getName(),
-              calleeNameForWarning(*oldCall), name, "return");
+              calleeNameForWarning(*newCall), name, "return");
         }
         valueMap[helper] = value;
         helper->replaceAllUsesWith(value);
