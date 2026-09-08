@@ -1,144 +1,33 @@
-# Work guidelines
+# bin2llvm 工作规范
 
-## 0. 语言风格
+保持白话和具体。实现前先说明假设、取舍和最小修改方案，讨论一致后再改；不要顺手重构相邻代码或删除无关内容。
 
-即使是在说话和思考的时候，也要保持简洁，不造抽象层次的风格。**这一点非常重要，必须从头到尾始终贯彻，即使是在自己思考的过程中**
-1. 说白话，使用更简洁务实的说法，不要过度抽象，不要引入自己造的名词，不要用新术语把问题重新命名。
-2. 不要在特别简单的，比如命名，比如用户已经意识到的，或者肯定知道的问题上大费笔墨，而是思考那些真正关键的地方，真正和当前事情相关，更重要的地方。
+## 记录、验证和性能
 
-## 1. Think Before Coding
+- 新数据结构前写注释说明设计原因。
+- 复杂代码工作使用 `logs/`：plan 顶部保留用户原始 prompt，说明背景、目标、路线、风险和判断标准；实现记录列出文件、行、函数、验证命令和结果。实现已有 plan 时更新原 plan。复杂修改还要评估实现效果、增加的理解成本和维护成本。
+- 已讨论一致且验证通过的修改默认直接提交。每次修改都检查性能；涉及类型恢复、结构体合并、pointer analysis 或 pipeline 时，按相同条件对比 fortune 用例。
+- IR 只能用 `/sn640/NotDec/llvm-22.1.0.obj` 下的 LLVM 22 工具验证，不能用系统 `llvm-as` 或 `opt`。
 
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
+## native 路线
 
-Before implementing:
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
+目标是为 Bench2 真实二进制生成语义正确的 LLVM IR；能被 `llvm-as` 接受只是底线。数据和产物位于 `/sn640/NotDec-Exp/Bench2`：`rootfs/`、`manifest/benchmark-targets.tsv`、`manifest/benchmark-needed.tsv`、`bin2llvm-ir/`。需要对照 Ghidra 时直接读 `/sn640/ghidra`。
 
-## 2. Simplicity First
+native 计划必须说明已有 native 状态，列出 Ghidra 源码文件和关键函数，区分需要复刻的策略与保守暂缓的部分，再写阶段、判断标准、风险和不做什么。本格式只用于 native bin2llvm。
 
-**Minimum code that solves the problem. Nothing speculative.**
+## 寄存器消除路线
 
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No "flexibility" or "configurability" that wasn't requested.
-- No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
+当前默认且后续重点是 `summary`：
 
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+- 代码在 `include/notdec-bin2llvm/passes/summary/`、`lib/passes/summary/`。
+- `NativeRegisterSummary` 与 `NativeRegisterSummarySSA` 负责寄存器 SSA、寄存器消除和 native 函数签名重写。
+- `notdec-native-llvm` 默认使用该路；只有传 `--heritage-register-ssa-pass` 才走旧路。
+- 新的寄存器消除、call/internal signature rewrite 都基于 summary 结果，不依赖 Ghidra `notdec.prototype.*` metadata。相关 plan/记录在 `logs/20260616-01-native-prototype-recovery-stage2/`。
 
-## 3. Surgical Changes
+`heritage` 仅用于对照、历史测试和编译维护：代码在 `include/notdec-bin2llvm/passes/heritage/`、`lib/passes/heritage/`，核心为 `NativeHeritageSSA` 和 `NativePrototypeRecovery`。不要把 summary 新功能写回旧路，除非保持现有测试或构建所必需。
 
-**Touch only what you must. Clean up only your own mess.**
+## EVM PHI 约束
 
-When editing existing code:
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it - don't delete it.
+EVM PHI 修复不能退回旧的 slot + mem2reg 模式。优先检查真实 CFG/SSA 语义或修复 Gigahorse 导出；语义不明确时先记录归类，不用 slot fallback 掩盖问题。
 
-When your changes create orphans:
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
-
-The test: Every changed line should trace directly to the user's request.
-
-# 项目规范
-
-2. 代码一定要多写注释，特别是新引入的数据结构前，说明背后的设计理念。
-3. （非Goal模式下的）工作流程：收到需求 -> 思考后告诉用户打算怎么更改 -> 讨论一致后再开始实现。复杂代码修改实现完后再写文档到 `logs/`；简单文档修改、注释修改、错别字修正不需要写日志。
-   实现完计划并完成验证后，默认必须直接提交，不要停在未提交状态；涉及 submodule 时，先在 submodule 内提交，再提交顶层指针和日志。
-4. 写修改日志时，必须明确指出修改了哪个文件的哪一行，涉及哪些函数。
-5. 尽量复用并改进之前的日志，最好每个功能都单独一个日志。
-6. plan日志重点写问题背景、目标、期望效果、大致技术路线、风险和判断标准，要让没有上下文的人也能看懂；不要过早写成具体实现清单、命令清单或行号清单。实现记录才需要明确写修改了哪个文件的哪一行、涉及哪些函数、验证命令和性能结果。只有复杂代码修改需要从实现效果、复杂度（增加其他人对项目的理解成本）、后期维护成本三个角度评分，并思考有没有更好的方案。
-   `logs/` 下的 plan 文档顶部必须先保留本次用户的原始 prompt，然后再写背景、目标、路线、风险和判断标准。
-7. 如果当前的任务是对之前的plan日志的实现，则不需要单独创建日志，而是将实现情况写入之前的计划日志，比如将计划的步骤在标题中标记为已完成，记录实现细节，以及调整计划时考虑不全而实现时有所改变的部分。同时也不要使得日志文件过于冗长，简洁一些，包括语言风格上，以及没有真正实现，或者试错的思路都尽量简写。
-8. 每次改动后都要关注是否造成性能下降。涉及类型恢复、结构体合并、pointer analysis、pass pipeline 时，至少对比 fortune 当前关注用例的同口径运行时间。
-9. evm2llvm 的 PHI 修复不能退回旧的 slot 模式 + mem2reg 思路。遇到 `PHIIncoming`
-   语义问题时，要优先确认真实 CFG/SSA 语义，或者修复 Gigahorse 侧导出；如果问题复杂，
-   先记录和归类，不要用 slot fallback 掩盖问题。
-
-## 6. 近期目标
-
-bin2LLVM 子项目近期目标：围绕 Bench2 这些真实项目生成 LLVM IR，并且语义要对。
-“能被 `llvm-as` 接受”只是底线，不能代替语义正确。
-
-## 6.1 native 寄存器消除两条链路
-
-当前 native 寄存器消除有两条历史不同的链路，开发时必须先确认自己在改哪一条。
-
-### 新链路：summary
-
-这是当前默认链路，也是后续开发重点。
-
-- 代码目录：
-  - `include/notdec-bin2llvm/passes/summary/`
-  - `lib/passes/summary/`
-- 当前核心 pass：
-  - `NativeRegisterSummary`
-  - `NativeRegisterSummarySSA`
-- `NativeRegisterSummarySSA` 同时负责 summary 链路的寄存器 SSA、寄存器消除和 native function signature rewrite。
-- 入口行为：
-  - `notdec-native-llvm` 默认运行 `NativeRegisterSummarySSA`。
-  - 不传 `--heritage-register-ssa-pass` 时，不走旧链路。
-  - 默认 summary 链路不运行 `NativePrototypeRecovery`。
-- 开发要求：
-  - 新的寄存器消除、call signature rewrite、internal function signature rewrite 都应基于 summary 链路的结果。
-  - 不依赖 Ghidra trial/use 风格的 `notdec.prototype.*` metadata。
-  - 计划和实现记录统一放到 `logs/20260616-01-native-prototype-recovery-stage2/`。
-
-### 旧链路：heritage
-
-这是之前模仿 Ghidra heritage/trial/use 思路写出来的链路，接近弃用。
-现在只保留用于对照、历史测试和必要的编译维护，不再作为新功能承载路线。
-
-- 代码目录：
-  - `include/notdec-bin2llvm/passes/heritage/`
-  - `lib/passes/heritage/`
-- 当前核心 pass：
-  - `NativeHeritageSSA`
-  - `NativePrototypeRecovery`
-- 入口行为：
-  - 只有显式传 `--heritage-register-ssa-pass` 才运行 `NativeHeritageSSA`。
-  - `NativePrototypeRecovery` 也只在该模式下运行。
-- 开发要求：
-  - 不要把新 summary 链路的新功能写回这里。
-  - `NativePrototypeRecovery` 属于旧链路，不作为新链路 internal signature rewrite 的实现基础。
-  - 除非是保持现有测试或旧用例不坏，不再主动扩展 `NativeHeritageSSA` / `NativePrototypeRecovery`。
-
-Bench2 真实项目集合在 `/sn640/NotDec-Exp/Bench2`：
-
-- `rootfs/`：已收集的真实项目二进制和依赖。
-- `manifest/benchmark-targets.tsv`：当前选中的 ELF / shared object 目标。
-- `manifest/benchmark-needed.tsv`：目标的动态依赖。
-- `bin2llvm-ir/`：bin2llvm 相关 JSON、`.ll`、`.bc`、日志和 Ghidra project。
-
-本地 Ghidra 源码在 `/sn640/ghidra`。需要查 Ghidra 实现时直接从这里找，不要全盘搜索。
-
-bin2llvm native 链路写计划时，优先按这个结构写，范围只限
-`external/NotDec-bin2llvm` 的 native 路线：
-
-1. 先说明当前目标和已有 native 状态。
-2. 再介绍 Ghidra 相关实现，明确写出源码文件和关键函数。
-3. 然后说明 native 侧要复刻哪些策略，哪些地方要保守处理或暂时不做。
-4. 最后写阶段计划、判断标准、风险和不做什么。
-
-这个写法只用于 bin2llvm native 链路；主 NotDec pass、evm2llvm、wasm2llvm、
-llvm2c 等其他任务仍按普通项目规范写计划。
-
-## 7. 构建
-
-当前仓库依赖本地 LLVM 22：
-
-- `/sn640/NotDec/llvm-22.1.0.obj`
-
-不要用系统 `/usr/bin/llvm-as`、`/usr/bin/opt` 验证当前 IR；它们可能仍是旧 LLVM。
-需要直接使用：
-
-- `llvm-22.1.0.obj/bin/llvm-as`
-- `llvm-22.1.0.obj/bin/opt`
-
-## 11. 本文件维护原则
-
-当本文件涉及的内容变化时，应同步更新本文件：
+本目录的调试参数、Bench2 命令和产物位置见 `DEBUG.md`；规则变化时同步更新本文件。
