@@ -91,7 +91,6 @@ run_default_summary_rewrite_check() {
 
   "$NATIVE_LLVM" "$input_ir" \
     --no-instcombine-pass \
-    --rewrite-prototype-signatures \
     -o "$out_ll" \
     2> "$stderr_txt"
 

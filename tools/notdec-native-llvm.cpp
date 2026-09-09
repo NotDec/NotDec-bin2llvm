@@ -4,8 +4,6 @@
 #include "notdec-bin2llvm/NativeAnalysis.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
-#include "notdec-bin2llvm/passes/heritage/NativePrototypeRecovery.h"
-#include "notdec-bin2llvm/passes/heritage/NativeHeritageSSA.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
@@ -71,13 +69,9 @@ struct CliOptions {
   notdec::bin2llvm::PcodeMemoryModel MemoryModel =
       notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
   bool DisableRegisterSSAPass = false;
-  bool UseHeritageRegisterSSAPass = false;
   bool DisableSummaryRegisterResidueRemoval = false;
   bool PrintRegisterSSASummary = false;
   bool DisableInstCombinePass = false;
-  bool DisablePrototypeRecoveryPass = false;
-  bool PrintPrototypeRecoverySummary = false;
-  bool RewritePrototypeSignatures = false;
   bool SkipRuntimeFunctions = false;
 };
 
@@ -108,13 +102,10 @@ void printUsage(const char *argv0) {
                "[--register-ssa-warning-out <path>] "
                "[--external-prototypes <path>] "
                "[--no-instcombine-pass] "
-               "[--no-register-ssa-pass] [--heritage-register-ssa-pass] "
+               "[--no-register-ssa-pass] "
                "[--summary-register-ssa-pass] "
                "[--no-summary-register-residue-removal] "
                "[--register-ssa-summary] "
-               "[--no-prototype-recovery-pass] "
-               "[--prototype-recovery-summary] "
-               "[--rewrite-prototype-signatures] "
                "[--skip-runtime] "
                "[--native-decode-mode gtirb|internal] [--gtirb <path>] "
                "[--decode-seed-limit <count>] "
@@ -180,10 +171,6 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     if (flag == "--summary-register-ssa-pass") {
       continue;
     }
-    if (flag == "--heritage-register-ssa-pass") {
-      options.UseHeritageRegisterSSAPass = true;
-      continue;
-    }
     if (flag == "--no-summary-register-residue-removal") {
       options.DisableSummaryRegisterResidueRemoval = true;
       continue;
@@ -194,18 +181,6 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
     if (flag == "--register-ssa-summary") {
       options.PrintRegisterSSASummary = true;
-      continue;
-    }
-    if (flag == "--no-prototype-recovery-pass") {
-      options.DisablePrototypeRecoveryPass = true;
-      continue;
-    }
-    if (flag == "--prototype-recovery-summary") {
-      options.PrintPrototypeRecoverySummary = true;
-      continue;
-    }
-    if (flag == "--rewrite-prototype-signatures") {
-      options.RewritePrototypeSignatures = true;
       continue;
     }
     if (flag == "--skip-runtime") {
@@ -311,17 +286,6 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
   }
   if (options.OutputPath.empty()) {
     std::cerr << "missing -o <output.ll>\n";
-    return std::nullopt;
-  }
-  if (options.DisableRegisterSSAPass && options.UseHeritageRegisterSSAPass) {
-    std::cerr << "--heritage-register-ssa-pass conflicts with "
-                 "--no-register-ssa-pass\n";
-    return std::nullopt;
-  }
-  if (options.UseHeritageRegisterSSAPass &&
-      options.DisableSummaryRegisterResidueRemoval) {
-    std::cerr << "--no-summary-register-residue-removal conflicts with "
-                 "--heritage-register-ssa-pass\n";
     return std::nullopt;
   }
   return options;
@@ -998,24 +962,6 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
   if (options.DisableRegisterSSAPass) {
     return true;
   }
-  if (options.UseHeritageRegisterSSAPass) {
-    notdec::bin2llvm::NativeHeritageSSAOptions passOptions;
-    passOptions.EnableRewrite = true;
-    passOptions.PrintSummary = options.PrintRegisterSSASummary;
-    notdec::bin2llvm::runNativeHeritageSSA(module, passOptions);
-    if (!options.RegisterSSAWarningPath.empty()) {
-      notdec::bin2llvm::NativeRegisterSummarySSASummary emptySummary;
-      if (!writeRegisterSSAWarnings(emptySummary,
-                                    options.RegisterSSAWarningPath)) {
-        return false;
-      }
-    }
-    if (llvm::verifyModule(module, &llvm::errs())) {
-      std::cerr << "module verification failed after heritage SSA pass\n";
-      return false;
-    }
-    return true;
-  }
 
   notdec::bin2llvm::NativeRegisterSummarySSAOptions passOptions;
   passOptions.EnableRewrite = true;
@@ -1067,25 +1013,6 @@ bool runInstCombinePassIfEnabled(llvm::Module &module,
 
   if (llvm::verifyModule(module, &llvm::errs())) {
     std::cerr << "module verification failed after instcombine pass\n";
-    return false;
-  }
-  return true;
-}
-
-bool runPrototypeRecoveryPassIfEnabled(llvm::Module &module,
-                                       const CliOptions &options) {
-  if (options.DisablePrototypeRecoveryPass) {
-    return true;
-  }
-  if (!options.UseHeritageRegisterSSAPass) {
-    return true;
-  }
-  notdec::bin2llvm::NativePrototypeRecoveryOptions passOptions;
-  passOptions.PrintSummary = options.PrintPrototypeRecoverySummary;
-  passOptions.RewriteSignatures = options.RewritePrototypeSignatures;
-  notdec::bin2llvm::runNativePrototypeRecovery(module, passOptions);
-  if (llvm::verifyModule(module, &llvm::errs())) {
-    std::cerr << "module verification failed after prototype recovery pass\n";
     return false;
   }
   return true;
@@ -1156,9 +1083,6 @@ int main(int argc, char **argv) {
         return 1;
       }
       if (!runInstCombinePassIfEnabled(*module, *options)) {
-        return 1;
-      }
-      if (!runPrototypeRecoveryPassIfEnabled(*module, *options)) {
         return 1;
       }
       if (!runPostRewritePeepholePass(*module, *options)) {
@@ -1299,9 +1223,6 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (!runInstCombinePassIfEnabled(*module, *options)) {
-      return 1;
-    }
-    if (!runPrototypeRecoveryPassIfEnabled(*module, *options)) {
       return 1;
     }
     if (!runPostRewritePeepholePass(*module, *options)) {

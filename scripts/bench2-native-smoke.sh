@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Keep the Bench2 smoke entry explicit.  The native path is still changing, so
-# this script checks only stable facts: discovery finds functions and LLVM 22 can
-# assemble and verify the generated IR.
+# Keep the Bench2 smoke entry explicit. The smoke checks discovery facts,
+# SummarySSA rewrite metrics, and LLVM 22 assembly/verification.
 BUILD_DIR="${NOTDEC_BIN2LLVM_BUILD_DIR:-/tmp/notdec-bin2llvm-build}"
 BENCH2_ROOT="${BENCH2_ROOT:-/sn640/NotDec-Exp/Bench2/rootfs}"
-BENCH2_IR_ROOT="${BENCH2_IR_ROOT:-/sn640/NotDec-Exp/Bench2/bin2llvm-ir}"
 OUT_DIR="${OUT_DIR:-/tmp/notdec-bin2llvm-bench2-smoke}"
 LLVM_BIN="${LLVM_BIN:-/sn640/NotDec/llvm-22.1.0.obj/bin}"
 
 usage() {
   cat <<'EOF'
 usage: bench2-native-smoke.sh [--build-dir DIR] [--bench2-root DIR]
-                              [--bench2-ir-root DIR] [--out-dir DIR]
-                              [--llvm-bin DIR]
+                              [--out-dir DIR] [--llvm-bin DIR]
 EOF
 }
 
@@ -26,10 +23,6 @@ while [[ $# -gt 0 ]]; do
     ;;
   --bench2-root)
     BENCH2_ROOT="$2"
-    shift 2
-    ;;
-  --bench2-ir-root)
-    BENCH2_IR_ROOT="$2"
     shift 2
     ;;
   --out-dir)
@@ -53,7 +46,6 @@ done
 
 DISCOVER="$BUILD_DIR/bin/notdec-native-discover"
 NATIVE_LLVM="$BUILD_DIR/bin/notdec-native-llvm"
-HERITAGE_CHECK="$BUILD_DIR/bin/notdec-heritage-module-check"
 LLVM_AS="$LLVM_BIN/llvm-as"
 OPT="$LLVM_BIN/opt"
 
@@ -160,7 +152,7 @@ forbid_ir_regex() {
   fi
 }
 
-check_prototype_metadata() {
+check_summary_metadata() {
   local name="$1"
   local ll="$2"
 
@@ -168,10 +160,6 @@ check_prototype_metadata() {
     "$name ABI metadata"
   require_ir_pattern "$ll" "!notdec.register.external_inputs" \
     "$name register SSA external input metadata"
-  require_ir_pattern "$ll" "!notdec.prototype.input_candidates" \
-    "$name prototype input candidate metadata"
-  require_ir_pattern "$ll" "!notdec.prototype.return_candidates" \
-    "$name prototype return candidate metadata"
 }
 
 summary_number_first() {
@@ -389,52 +377,20 @@ for key in required:
 PY
 }
 
-parse_heritage_metric() {
+parse_summary_ssa_metric() {
   local file="$1"
   local label="$2"
-  sed -n "s/[[:space:]]*$label:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" |
+  sed -n "s/.*[[:space:]]$label=\\([0-9][0-9]*\\).*/\\1/p" "$file" |
     head -n 1
 }
 
-require_heritage_metric() {
-  local value="$1"
-  local file="$2"
-  local label="$3"
-  if [[ -z "$value" ]]; then
-    echo "missing heritage metric $label in $file" >&2
-    exit 1
-  fi
-}
-
-parse_prototype_metric() {
-  local file="$1"
-  local label="$2"
-  sed -n "s/[[:space:]]*$label:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" |
-    head -n 1
-}
-
-require_positive_prototype_metric() {
+require_summary_ssa_metric() {
   local name="$1"
   local value="$2"
   local file="$3"
   local label="$4"
   if [[ -z "$value" ]]; then
-    echo "$name: missing prototype recovery metric $label in $file" >&2
-    exit 1
-  fi
-  if ((value == 0)); then
-    echo "$name: prototype recovery metric $label is zero in $file" >&2
-    exit 1
-  fi
-}
-
-require_prototype_metric() {
-  local name="$1"
-  local value="$2"
-  local file="$3"
-  local label="$4"
-  if [[ -z "$value" ]]; then
-    echo "$name: missing prototype recovery metric $label in $file" >&2
+    echo "$name: missing SummarySSA metric $label in $file" >&2
     exit 1
   fi
 }
@@ -510,14 +466,8 @@ TARGET_PATHS=(
 mkdir -p "$OUT_DIR"
 echo "out_dir=$OUT_DIR"
 METRICS="$OUT_DIR/metrics.tsv"
-printf 'target\telapsed_seconds\tfunction_seeds\tseed_confidence_high\tseed_confidence_medium\tseed_confidence_low\tconfirmed_functions\tbasic_blocks\tinstructions\txrefs_total\txrefs_flow\txrefs_call\txrefs_data\txrefs_string\tunresolved_total\tunresolved_indirect_call\tunresolved_indirect_branch\tprototype_functions\tprototype_external_inputs\tprototype_input_candidates\tprototype_return_candidates\tsignature_rewrite_seen\tsignature_rewrite_rewritten\tsignature_rewrite_skipped\n' \
+printf 'target\telapsed_seconds\tfunction_seeds\tseed_confidence_high\tseed_confidence_medium\tseed_confidence_low\tconfirmed_functions\tbasic_blocks\tinstructions\txrefs_total\txrefs_flow\txrefs_call\txrefs_data\txrefs_string\tunresolved_total\tunresolved_indirect_call\tunresolved_indirect_branch\tsummary_functions\tsummary_loads\tsummary_stores\tsummary_calls_rewritten\tsummary_functions_rewritten\trerun_summary_functions\trerun_summary_loads\trerun_summary_stores\trerun_summary_calls_rewritten\trerun_summary_functions_rewritten\n' \
   >"$METRICS"
-HERITAGE_METRICS="$OUT_DIR/heritage-metrics.tsv"
-printf 'target\theritage_available\tfunctions\texternals\tfailures\tdirect_calls\tresolved_internal_calls\tresolved_external_calls\tunknown_calls\n' \
-  >"$HERITAGE_METRICS"
-COMPARE_METRICS="$OUT_DIR/native-heritage-compare.tsv"
-printf 'target\theritage_available\tnative_confirmed_functions\theritage_functions\tnative_call_xrefs\theritage_direct_calls\tnative_unresolved_total\theritage_unknown_calls\n' \
-  >"$COMPARE_METRICS"
 
 for index in "${!TARGET_NAMES[@]}"; do
   name="${TARGET_NAMES[$index]}"
@@ -567,7 +517,7 @@ for index in "${!TARGET_NAMES[@]}"; do
   "$DISCOVER" --xrefs-json "$target" >"$xrefs" 2>"$xrefs_stderr"
   check_xref_sources "$name" "$xrefs"
 
-  "$NATIVE_LLVM" "$target" --all-confirmed --prototype-recovery-summary \
+  "$NATIVE_LLVM" "$target" --all-confirmed --register-ssa-summary \
     -o "$ll" \
     >"$native_stdout" 2>"$native_stderr"
   "$LLVM_AS" "$ll" -o "$bc" >"$llvm_as_stdout" 2>"$llvm_as_stderr"
@@ -576,25 +526,31 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_summary_number "$unresolved_indirect_branch" "$summary" \
     "unresolved_indirect_flows.indirect branch"
   check_ir_features "$name" "$ll" "$unresolved_indirect_branch"
-  check_prototype_metadata "$name" "$ll"
-  prototype_functions="$(parse_prototype_metric "$native_stderr" "functions")"
-  prototype_external_inputs="$(parse_prototype_metric "$native_stderr" \
-    "external inputs")"
-  prototype_input_candidates="$(parse_prototype_metric "$native_stderr" \
-    "input candidates")"
-  prototype_return_candidates="$(parse_prototype_metric "$native_stderr" \
-    "return candidates")"
-  require_positive_prototype_metric "$name" "$prototype_functions" \
-    "$native_stderr" "functions"
-  require_positive_prototype_metric "$name" "$prototype_external_inputs" \
-    "$native_stderr" "external inputs"
-  require_positive_prototype_metric "$name" "$prototype_input_candidates" \
-    "$native_stderr" "input candidates"
-  require_positive_prototype_metric "$name" "$prototype_return_candidates" \
-    "$native_stderr" "return candidates"
+  check_summary_metadata "$name" "$ll"
+  summary_functions="$(parse_summary_ssa_metric "$native_stderr" "functions")"
+  summary_loads="$(parse_summary_ssa_metric "$native_stderr" "loads")"
+  summary_stores="$(parse_summary_ssa_metric "$native_stderr" "stores")"
+  summary_calls_rewritten="$(parse_summary_ssa_metric "$native_stderr" \
+    "calls_rewritten")"
+  summary_functions_rewritten="$(parse_summary_ssa_metric "$native_stderr" \
+    "functions_rewritten")"
+  require_summary_ssa_metric "$name" "$summary_functions" "$native_stderr" \
+    "functions"
+  require_summary_ssa_metric "$name" "$summary_loads" "$native_stderr" \
+    "loads"
+  require_summary_ssa_metric "$name" "$summary_stores" "$native_stderr" \
+    "stores"
+  require_summary_ssa_metric "$name" "$summary_calls_rewritten" \
+    "$native_stderr" "calls_rewritten"
+  require_summary_ssa_metric "$name" "$summary_functions_rewritten" \
+    "$native_stderr" "functions_rewritten"
+  if ((summary_functions == 0)); then
+    echo "$name: SummarySSA saw no functions" >&2
+    exit 1
+  fi
 
-  "$NATIVE_LLVM" "$target" --all-confirmed --prototype-recovery-summary \
-    --rewrite-prototype-signatures -o "$rewrite_ll" \
+  "$NATIVE_LLVM" "$target" --all-confirmed --register-ssa-summary \
+    -o "$rewrite_ll" \
     >"$rewrite_stdout" 2>"$rewrite_stderr"
   "$LLVM_AS" "$rewrite_ll" -o "$rewrite_bc" \
     >"$rewrite_llvm_as_stdout" 2>"$rewrite_llvm_as_stderr"
@@ -602,18 +558,26 @@ for index in "${!TARGET_NAMES[@]}"; do
     >"$rewrite_opt_stdout" 2>"$rewrite_opt_stderr"
   check_ir_features "$name signature rewrite" "$rewrite_ll" \
     "$unresolved_indirect_branch"
-  signature_rewrite_seen="$(parse_prototype_metric "$rewrite_stderr" \
-    "signature rewrite seen functions")"
-  signature_rewrite_rewritten="$(parse_prototype_metric "$rewrite_stderr" \
-    "signature rewrite rewritten functions")"
-  signature_rewrite_skipped="$(parse_prototype_metric "$rewrite_stderr" \
-    "signature rewrite skipped functions")"
-  require_prototype_metric "$name" "$signature_rewrite_seen" "$rewrite_stderr" \
-    "signature rewrite seen functions"
-  require_prototype_metric "$name" "$signature_rewrite_rewritten" \
-    "$rewrite_stderr" "signature rewrite rewritten functions"
-  require_prototype_metric "$name" "$signature_rewrite_skipped" \
-    "$rewrite_stderr" "signature rewrite skipped functions"
+  check_summary_metadata "$name signature rewrite" "$rewrite_ll"
+  rerun_summary_functions="$(parse_summary_ssa_metric "$rewrite_stderr" \
+    "functions")"
+  rerun_summary_loads="$(parse_summary_ssa_metric "$rewrite_stderr" "loads")"
+  rerun_summary_stores="$(parse_summary_ssa_metric "$rewrite_stderr" "stores")"
+  rerun_summary_calls_rewritten="$(parse_summary_ssa_metric "$rewrite_stderr" \
+    "calls_rewritten")"
+  rerun_summary_functions_rewritten="$(parse_summary_ssa_metric "$rewrite_stderr" \
+    "functions_rewritten")"
+  require_summary_ssa_metric "$name signature rewrite" \
+    "$rerun_summary_functions" "$rewrite_stderr" "functions"
+  require_summary_ssa_metric "$name signature rewrite" "$rerun_summary_loads" \
+    "$rewrite_stderr" "loads"
+  require_summary_ssa_metric "$name signature rewrite" "$rerun_summary_stores" \
+    "$rewrite_stderr" "stores"
+  require_summary_ssa_metric "$name signature rewrite" \
+    "$rerun_summary_calls_rewritten" "$rewrite_stderr" "calls_rewritten"
+  require_summary_ssa_metric "$name signature rewrite" \
+    "$rerun_summary_functions_rewritten" "$rewrite_stderr" \
+    "functions_rewritten"
 
   if [[ "$name" == "libuv" ]]; then
     single_ll="$OUT_DIR/$name.single-function.ll"
@@ -703,57 +667,18 @@ for index in "${!TARGET_NAMES[@]}"; do
   require_summary_number "$unresolved_indirect_call" "$summary" "unresolved_indirect_flows.indirect call"
   require_summary_number "$unresolved_indirect_branch" "$summary" "unresolved_indirect_flows.indirect branch"
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$name" "$elapsed_seconds" "$function_seeds" \
     "$seed_confidence_high" "$seed_confidence_medium" \
     "$seed_confidence_low" "$confirmed_functions" "$basic_blocks" \
     "$instructions" "$xrefs_total" "$xrefs_flow" "$xrefs_call" \
     "$xrefs_data" "$xrefs_string" "$unresolved_total" \
     "$unresolved_indirect_call" "$unresolved_indirect_branch" \
-    "$prototype_functions" "$prototype_external_inputs" \
-    "$prototype_input_candidates" "$prototype_return_candidates" \
-    "$signature_rewrite_seen" "$signature_rewrite_rewritten" \
-    "$signature_rewrite_skipped" >>"$METRICS"
-
-  heritage_module="$BENCH2_IR_ROOT/$name/module-limit5.json"
-  if [[ -f "$heritage_module" ]]; then
-    require_executable "$HERITAGE_CHECK"
-    heritage_check_stdout="$OUT_DIR/$name.heritage-module-check.stdout"
-    heritage_check_stderr="$OUT_DIR/$name.heritage-module-check.stderr"
-    "$HERITAGE_CHECK" "$heritage_module" \
-      >"$heritage_check_stdout" 2>"$heritage_check_stderr"
-
-    heritage_functions="$(parse_heritage_metric "$heritage_check_stdout" "functions")"
-    heritage_externals="$(parse_heritage_metric "$heritage_check_stdout" "externals")"
-    heritage_failures="$(parse_heritage_metric "$heritage_check_stdout" "failures")"
-    heritage_direct_calls="$(parse_heritage_metric "$heritage_check_stdout" "direct calls")"
-    heritage_resolved_internal="$(parse_heritage_metric "$heritage_check_stdout" "resolved internal calls")"
-    heritage_resolved_external="$(parse_heritage_metric "$heritage_check_stdout" "resolved external calls")"
-    heritage_unknown_calls="$(parse_heritage_metric "$heritage_check_stdout" "unknown calls")"
-
-    require_heritage_metric "$heritage_functions" "$heritage_check_stdout" "functions"
-    require_heritage_metric "$heritage_externals" "$heritage_check_stdout" "externals"
-    require_heritage_metric "$heritage_failures" "$heritage_check_stdout" "failures"
-    require_heritage_metric "$heritage_direct_calls" "$heritage_check_stdout" "direct calls"
-    require_heritage_metric "$heritage_resolved_internal" "$heritage_check_stdout" "resolved internal calls"
-    require_heritage_metric "$heritage_resolved_external" "$heritage_check_stdout" "resolved external calls"
-    require_heritage_metric "$heritage_unknown_calls" "$heritage_check_stdout" "unknown calls"
-
-    printf '%s\t1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$name" "$heritage_functions" "$heritage_externals" \
-      "$heritage_failures" "$heritage_direct_calls" \
-      "$heritage_resolved_internal" "$heritage_resolved_external" \
-      "$heritage_unknown_calls" >>"$HERITAGE_METRICS"
-    printf '%s\t1\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$name" "$confirmed_functions" "$heritage_functions" "$xrefs_call" \
-      "$heritage_direct_calls" "$unresolved_total" \
-      "$heritage_unknown_calls" >>"$COMPARE_METRICS"
-  else
-    printf '%s\t0\t\t\t\t\t\t\t\n' "$name" >>"$HERITAGE_METRICS"
-    printf '%s\t0\t%s\t\t%s\t\t%s\t\n' \
-      "$name" "$confirmed_functions" "$xrefs_call" "$unresolved_total" \
-      >>"$COMPARE_METRICS"
-  fi
+    "$summary_functions" "$summary_loads" "$summary_stores" \
+    "$summary_calls_rewritten" "$summary_functions_rewritten" \
+    "$rerun_summary_functions" "$rerun_summary_loads" \
+    "$rerun_summary_stores" "$rerun_summary_calls_rewritten" \
+    "$rerun_summary_functions_rewritten" >>"$METRICS"
 
   echo "$name ok elapsed=${elapsed_seconds}s summary=$summary ll=$ll"
 done

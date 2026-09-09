@@ -18,8 +18,8 @@ usage: bench2-native-scale-audit.sh --target PROJECT:ROLE [--target PROJECT:ROLE
                                    [--build-dir DIR] [--bench2-root DIR]
                                    [--manifest FILE] [--out-dir DIR]
 
-Runs all-confirmed native LLVM generation with register/prototype passes disabled
-for selected Bench2 targets and seed limits.  This is for scale diagnosis, not
+Runs all-confirmed native LLVM generation with register passes disabled for
+selected Bench2 targets and seed limits. This is for scale diagnosis, not
 semantic verification.
 EOF
 }
@@ -141,7 +141,7 @@ for target in "${TARGETS[@]}"; do
     set +e
     timeout "$TIMEOUT_SECONDS"s "$NATIVE_LLVM" "$binary" --all-confirmed \
       --decode-seed-limit "$limit" --no-instcombine-pass \
-      --no-register-ssa-pass --no-prototype-recovery-pass -o "$ll" \
+      --no-register-ssa-pass -o "$ll" \
       >"$stdout" 2>"$stderr"
     rc="$?"
     set -e

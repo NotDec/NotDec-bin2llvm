@@ -1,17 +1,13 @@
 add_library(notdec-bin2llvm-core STATIC
-  HeritagePcode.cpp
-  HeritageToLLVM.cpp
   ModuleBuilder.cpp
   NativeAbi.cpp
   NativeExternalPrototype.cpp
-  NativePrototypeModel.cpp
   NativeRegisterPartialRead.cpp
   NativeX87Intrinsic.cpp
   NativeRegisterPartialWrite.cpp
   NativeRegisterValueRange.cpp
   Pcode.cpp
   PcodeToLLVM.cpp
-  passes/heritage/NativePrototypeRecovery.cpp
   passes/summary/NativeStackAddress.cpp
   passes/summary/NativeStackFrame.cpp
   passes/summary/NativeStackCanaryCleanup.cpp
@@ -19,7 +15,6 @@ add_library(notdec-bin2llvm-core STATIC
   passes/summary/NativeRegisterPeephole.cpp
   passes/summary/NativeRegisterSummarySSA.cpp
   passes/summary/NativeRegisterFinalCleanup.cpp
-  passes/heritage/NativeHeritageSSA.cpp
   RegisterStorage.cpp
 )
 

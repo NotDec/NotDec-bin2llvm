@@ -153,8 +153,8 @@ Construction》）：用到寄存器时再往前查，不用预先算复杂的�
   -> LLVM IR
 ```
 
-旧链路（按需 SSA + Ghidra trial/use 风格）改名 heritage 对照链，退居二线；summary 链成为默认主链
-（2026-06-18）。
+旧链路（按需 SSA + Ghidra trial/use 风格）在 2026-06-18 退居二线；summary 链成为默认主链，
+并于 2026-09 从仓库中删除旧实现及其工具入口。
 
 **为什么改（关键问题）**：函数签名（参数/返回）推断需要三个信息，SSA 给不出：
 
@@ -484,4 +484,4 @@ ELF 机器码
 - 外部 libm 的 long double 原型（`sqrtl`/`round`）、`complex long double` 返回、多 long double
   结构体返回押后。
 - 栈参数绑定（调用前压栈的参数恢复成 call 参数）从 2026-07-25 起持续推进，尚未完全收口。
-- 旧 heritage 对照链路保留在代码里（`lib/passes/heritage/`），只用于对照，不再演进。
+- 旧 heritage 对照链路已从活跃代码、构建配置和工具入口中删除；历史实现只保留在 logs 和 git 历史中。

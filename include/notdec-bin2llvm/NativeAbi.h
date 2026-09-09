@@ -24,8 +24,8 @@ enum class NativeAbiEffectKind {
 };
 
 // A small storage descriptor copied from Ghidra cspec pentry/effect records.
-// Later prototype recovery code needs a uniform view of register and stack
-// locations, but this first step intentionally keeps only the XML facts.
+// SummarySSA and external-call shaping use one uniform view of register and
+// stack locations while keeping this layer limited to XML facts.
 struct NativeAbiStorage {
   NativeAbiStorageKind Kind = NativeAbiStorageKind::Register;
   std::string Name;
@@ -51,8 +51,8 @@ struct NativeAbiEffect {
 };
 
 // NativeAbiSpec is the native-side minimum copy of Ghidra's default ProtoModel.
-// It is intentionally data-only; matching and recovery rules live in later
-// stages of the prototype pass.
+// It is intentionally data-only; matching and call-shape rules live in the
+// SummarySSA pipeline.
 struct NativeAbiSpec {
   std::string PrototypeName;
   std::string StackPointerRegister;

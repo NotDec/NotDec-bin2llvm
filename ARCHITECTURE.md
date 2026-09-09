@@ -14,8 +14,7 @@ ELF
   -> .ll / .bc
 ```
 
-旧的 Ghidra heritage JSON 链路还在代码里，但 Bench2 当前重点不是它。本文只在必要时提到
-legacy 入口，避免和 native 主链路混在一起。
+旧的 Ghidra JSON/heritage 链路已从本仓库删除；本文只描述仍在使用的 native 主链路。
 
 ## 1. 入口工具
 
@@ -55,8 +54,7 @@ legacy 入口，避免和 native 主链路混在一起。
 - `-a <addr> -l <len>`：手动指定线性地址范围。
 - `--skip-runtime`：跳过 `_start`、init/fini、PLT resolver 等 runtime 辅助函数。
 - `--no-register-ssa-pass`：只看 p-code lowering 后的原始寄存器 IR。
-- `--summary-register-ssa-pass`：默认的新 SummarySSA 链路。
-- `--heritage-register-ssa-pass`：旧的 heritage SSA 链路，只用于对照。
+- `--summary-register-ssa-pass`：SummarySSA 的兼容显式别名；当前默认即为该链路。
 - `--external-prototypes <json>`：加载额外外部函数原型。
 
 ## 2. 整体流程
@@ -116,11 +114,7 @@ legacy 入口，避免和 native 主链路混在一起。
    - 再跑一次 `InstCombine + SimplifyCFG`。
    - 目的是折叠 SummarySSA/signature rewrite 后暴露出来的局部 IR。
 
-10. **prototype recovery**
-    - 当前只在旧 `--heritage-register-ssa-pass` 路径启用。
-    - 默认 SummarySSA 路径不跑 `NativePrototypeRecovery`。
-
-11. **final register cleanup**
+10. **final register cleanup**
     - 入口：`runNativeRegisterFinalCleanup(...)`。
     - 跑 GlobalDCE。
     - 删除死 register read、未使用 register global、未使用 helper declaration。
@@ -128,7 +122,7 @@ legacy 入口，避免和 native 主链路混在一起。
       `notdec.register.summary_ssa*` metadata。
     - 再跑一次 GlobalDCE，并统计剩余寄存器访问。
 
-12. **验证和输出**
+11. **验证和输出**
     - 每个关键阶段后用 `llvm::verifyModule(...)`。
     - 最后写出目标路径，通常是 `.ll`，也可以按工具支持写 `.bc`。
 
@@ -219,7 +213,6 @@ PcodeToLLVM
   -> InstCombine + SimplifyCFG
   -> NativeRegisterSummarySSA
   -> InstCombine + SimplifyCFG
-  -> optional legacy NativePrototypeRecovery
   -> NativeRegisterFinalCleanup
   -> verify
   -> write .ll / .bc

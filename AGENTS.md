@@ -21,10 +21,10 @@ native 计划必须说明已有 native 状态，列出 Ghidra 源码文件和关
 
 - 代码在 `include/notdec-bin2llvm/passes/summary/`、`lib/passes/summary/`。
 - `NativeRegisterSummary` 与 `NativeRegisterSummarySSA` 负责寄存器 SSA、寄存器消除和 native 函数签名重写。
-- `notdec-native-llvm` 默认使用该路；只有传 `--heritage-register-ssa-pass` 才走旧路。
+- `notdec-native-llvm` 默认且唯一使用该路；`--summary-register-ssa-pass` 仅保留为兼容别名。
 - 新的寄存器消除、call/internal signature rewrite 都基于 summary 结果，不依赖 Ghidra `notdec.prototype.*` metadata。相关 plan/记录在 `logs/20260616-01-native-prototype-recovery-stage2/`。
 
-`heritage` 仅用于对照、历史测试和编译维护：代码在 `include/notdec-bin2llvm/passes/heritage/`、`lib/passes/heritage/`，核心为 `NativeHeritageSSA` 和 `NativePrototypeRecovery`。不要把 summary 新功能写回旧路，除非保持现有测试或构建所必需。
+旧 heritage pass、prototype recovery、Ghidra JSON schema、工具和 exporter 已删除；相关历史只保留在 logs 和 git 历史中。不要重新引入旧路，SummarySSA 新功能直接落在 `passes/summary/`。
 
 ## EVM PHI 约束
 

@@ -85,9 +85,9 @@ enum class PcodeOpcode {
   Unsupported,
 };
 
-// A varnode is the smallest P-Code storage reference.  Register metadata is
-// optional because JSON heritage input already carries it, while raw Sleigh
-// P-Code has to recover it from the architecture definition.
+// A varnode is the smallest P-Code storage reference. Register metadata is
+// optional because some synthetic inputs provide only space/offset/size, while
+// raw Sleigh P-Code recovers it from the architecture definition.
 struct VarnodeView {
   std::string Space;
   uint64_t Offset = 0;
@@ -105,10 +105,10 @@ struct PcodeOpView {
   // fallthrough return address to the stack.
   uint64_t InstructionSize = 0;
   // Mnemonic of the machine instruction that emitted this p-code op (e.g.
-  // "FSTP", "FILD").  Empty for heritage JSON input, which has no mnemonic.
-  // x87 classification dispatches on this first and uses the p-code only for
+  // "FSTP", "FILD"). May be empty for synthetic or low-level inputs. x87
+  // classification dispatches on this first and uses the p-code only for
   // operand values, instead of reverse-engineering the instruction from the
-  // p-code shape.
+  // p-code shape when the mnemonic is available.
   std::string Mnemonic;
   // Operand text of the machine instruction (e.g. "AX", "word ptr [RBP + -0x2]").
   // Empty when the instruction has no operands (e.g. "FABS").  Together with

@@ -154,8 +154,8 @@ uint32_t x87StackIndex(const VarnodeView &varnode) {
       return index;
     }
   }
-  // The 0x1106 (real .sla) and 0x1100 (heritage) conventions both give the
-  // right index: (0x1106-0x1100)/0x10 truncates to 0.
+  // Architecture register tables can use either 0x1106 or the slot-aligned
+  // 0x1100 convention; both give the same index after truncation.
   return static_cast<uint32_t>((varnode.Offset - 0x1100) / 0x10);
 }
 
@@ -187,8 +187,8 @@ bool touchesX87Stack(const PcodeProgram &program, size_t start, size_t end) {
 // Registers for the x87 window model: ST0/ST1 become real LLVM register
 // globals so the register summary can reason about them (e.g. SysV long
 // double returns in ST0); ST2..ST7 are library-internal state and never get
-// globals.  Heritage JSON and unit tests often omit ST registers from the
-// list, so append default ST0/ST1 entries when missing to keep the window
+// globals. Synthetic PcodeProgram inputs and some register tables omit ST
+// registers, so append default ST0/ST1 entries when missing to keep the window
 // backed by concrete globals.
 std::vector<RegisterInfo>
 x87WindowRegisters(const std::vector<RegisterInfo> &registers) {
@@ -239,9 +239,8 @@ x87WindowRegisters(const std::vector<RegisterInfo> &registers) {
   return result;
 }
 
-// Register varnode view for an ST slot, matching the offsets used by the
-// p-code (real .sla 0x1106 vs heritage 0x1100).  Falls back to the heritage
-// convention when the register list carries no usable entry.
+// Register varnode view for an ST slot. Falls back to the slot-aligned offset
+// when the register list carries no usable entry.
 VarnodeView x87StackVarnode(const std::vector<RegisterInfo> &registers,
                             uint32_t index) {
   for (const RegisterInfo &reg : registers) {
@@ -971,8 +970,8 @@ private:
   }
 
   // Dispatch x87 classification by the machine instruction mnemonic when one
-  // is available (native lifting); heritage JSON input carries no mnemonic
-  // and falls back to the p-code shape classifier below.
+  // is available; synthetic or low-level PcodeProgram inputs fall back to the
+  // p-code shape classifier below.
   std::optional<X87WindowSpec>
   classifyX87Intrinsic(const PcodeProgram &program, size_t start,
                        size_t end) {
@@ -1509,10 +1508,10 @@ private:
 
     return std::nullopt;
   }
-  // Recognize one x87 instruction from its p-code expansion (heritage JSON
-  // fallback, where no mnemonic is available).  Returns the window lowering
-  // description, or nullopt when the instruction does not match a known shape
-  // and has to fall back to ordinary p-code lowering.
+  // Recognize one x87 instruction from its p-code expansion when no mnemonic
+  // is available. Returns the window lowering description, or nullopt when the
+  // instruction does not match a known shape and has to fall back to ordinary
+  // p-code lowering.
   std::optional<X87WindowSpec>
   classifyX87ByShape(const PcodeProgram &program, size_t start, size_t end) {
     bool hasStackVarnode = false;

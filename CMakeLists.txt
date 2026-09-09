@@ -164,52 +164,6 @@ if (BUILD_TESTING)
       "${NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR}/Ghidra/Processors/x86/data/languages/x86-64-gcc.cspec"
   )
 
-  add_executable(native_prototype_model_test
-    tests/native_prototype_model_test.cpp
-  )
-
-  target_link_libraries(native_prototype_model_test
-    PRIVATE
-      notdec-bin2llvm-core
-  )
-
-  add_test(
-    NAME notdec.native_prototype_model.register
-    COMMAND
-      native_prototype_model_test
-      "${NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR}/Ghidra/Processors/x86/data/languages/x86-64-gcc.cspec"
-  )
-
-  add_executable(native_prototype_recovery_test
-    tests/native_prototype_recovery_test.cpp
-  )
-
-  target_link_libraries(native_prototype_recovery_test
-    PRIVATE
-      notdec-bin2llvm-core
-  )
-
-  add_test(
-    NAME notdec.native_prototype_recovery.input_candidates
-    COMMAND
-      native_prototype_recovery_test
-  )
-
-  add_executable(native_register_effects_test
-    tests/native_register_effects_test.cpp
-  )
-
-  target_link_libraries(native_register_effects_test
-    PRIVATE
-      notdec-bin2llvm-core
-  )
-
-  add_test(
-    NAME notdec.native_register_effects.preserved
-    COMMAND
-      native_register_effects_test
-  )
-
   add_executable(native_register_summary_test
     tests/native_register_summary_test.cpp
   )
@@ -255,21 +209,6 @@ if (BUILD_TESTING)
       pcode_to_llvm_test
   )
 
-  add_executable(heritage_to_llvm_test
-    tests/heritage_to_llvm_test.cpp
-  )
-
-  target_link_libraries(heritage_to_llvm_test
-    PRIVATE
-      notdec-bin2llvm-core
-  )
-
-  add_test(
-    NAME notdec.heritage_to_llvm.forward_defs
-    COMMAND
-      heritage_to_llvm_test
-  )
-
   if (TARGET notdec-bin2llvm-native)
     add_executable(native_analysis_facts_test
       tests/native_analysis_facts_test.cpp
@@ -287,18 +226,4 @@ if (BUILD_TESTING)
     )
   endif ()
 
-  add_executable(native_instcombine_metadata_test
-    tests/native_instcombine_metadata_test.cpp
-  )
-
-  target_link_libraries(native_instcombine_metadata_test
-    PRIVATE
-      notdec-bin2llvm-core
-  )
-
-  add_test(
-    NAME notdec.native_instcombine.metadata
-    COMMAND
-      native_instcombine_metadata_test
-  )
 endif ()
