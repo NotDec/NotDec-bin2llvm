@@ -612,6 +612,34 @@ bool functionHasZeroDemandOperandMetadata(const llvm::Function &function) {
   return false;
 }
 
+bool functionHasPoisonZeroDemandOperand(const llvm::Function &function) {
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    const llvm::MDNode *metadata =
+        inst.getMetadata("notdec.register.summary_ssa.zero_demand_operand");
+    if (metadata == nullptr) {
+      continue;
+    }
+    bool hasPoisonReplacementMetadata = false;
+    for (const llvm::MDOperand &entryOperand : metadata->operands()) {
+      const auto *entry =
+          llvm::dyn_cast_or_null<llvm::MDNode>(entryOperand.get());
+      if (metadataHasField(entry, "replacement=poison")) {
+        hasPoisonReplacementMetadata = true;
+        break;
+      }
+    }
+    if (!hasPoisonReplacementMetadata) {
+      continue;
+    }
+    for (const llvm::Use &operand : inst.operands()) {
+      if (llvm::isa<llvm::PoisonValue>(operand.get())) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool functionHasInstructionNameContaining(const llvm::Function &function,
                                           llvm::StringRef needle) {
   for (const llvm::Instruction &inst : llvm::instructions(function)) {
@@ -8596,16 +8624,16 @@ bool testRecordedReturnValueSurvivesPartialDemandRewrite() {
                   "module failed verifier after return partial-demand test");
 }
 
-bool testPartialDemandZeroReplacementIsMarked() {
+bool testPartialDemandPoisonReplacementIsMarked() {
   llvm::LLVMContext context;
-  llvm::Module module("summary-ssa-partial-demand-zero-metadata", context);
+  llvm::Module module("summary-ssa-partial-demand-poison-metadata", context);
   attachTestAbi(module);
   llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
 
   auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   llvm::Function *function =
       llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
-                             "partial_zero_metadata", module);
+                             "partial_poison_metadata", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
@@ -8624,11 +8652,13 @@ bool testPartialDemandZeroReplacementIsMarked() {
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
 
   return expect(summary.PartialDemandMatched >= 1,
-                "partial zero replacement was not applied") &&
+                "partial poison replacement was not applied") &&
          expect(functionHasZeroDemandOperandMetadata(*function),
-                "partial zero replacement was not marked") &&
+                "partial poison replacement was not marked") &&
+         expect(functionHasPoisonZeroDemandOperand(*function),
+                "zero-demand operand was not replaced with poison") &&
          verifyOk(module,
-                  "module failed verifier after partial zero metadata test");
+                  "module failed verifier after partial poison metadata test");
 }
 
 bool testPartialZmmKeepHighStoreIsDemandRewritten() {
@@ -9524,7 +9554,7 @@ int main() {
   ok &= testPartialWriteHelperNameSurvivesSignatureRewrite();
   ok &= testPartialReadHelperNameSurvivesSignatureRewrite();
   ok &= testRecordedReturnValueSurvivesPartialDemandRewrite();
-  ok &= testPartialDemandZeroReplacementIsMarked();
+  ok &= testPartialDemandPoisonReplacementIsMarked();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();

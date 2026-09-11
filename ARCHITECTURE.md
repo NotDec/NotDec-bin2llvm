@@ -327,7 +327,8 @@ PcodeToLLVM
      - 调用点对每个 ABI 输出寄存器统一生成“调用后状态”占位（`summary_clobber`），
        第一遍不再区分 return/clobber；“是不是返回寄存器”唯一由签名
        （`shape.Returns`）决定。
-     - 用 zero-demand metadata 标记被 demand 剪掉的 lane。
+     - 用 zero-demand metadata 标记被 demand 剪掉的 lane，并用裸 `poison` 替代
+       其数据流 operand，避免把遗漏的 observer 静默变成常量 0。
      - 第一遍只读退出点槽位产生“调用后被读”证据（
        `collectFunctionReturnValues(recordBinding=false)`）；返回绑定收集移到
        重写后的清理遍（见第 16 步）。

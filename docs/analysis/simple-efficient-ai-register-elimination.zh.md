@@ -175,7 +175,7 @@ store (or keep, insert), @REG
 
 这里读取 `old` 不表示函数语义上使用了 `REG` 的入口值。它可能只是为了保留写入范围之外的 lane。summary pass 会识别这种 keep-high pattern，避免把这个 load 当成输入证据。
 
-之后 SummarySSA 还有更强的 partial-demand rewrite。如果只有写入 lane 被 demand，旧的 preserved lane 可以替换成 0，并用 `notdec.register.summary_ssa.zero_demand_operand` 标记。这样生成的 IR 更容易 debug：由 demand pruning 引入的 0 是显式的。
+之后 SummarySSA 还有更强的 partial-demand rewrite。如果只有写入 lane 被 demand，旧的 preserved lane 可以替换成 poison，并用 `notdec.register.summary_ssa.zero_demand_operand` 标记。这个 metadata 表示 demand mask 为零；poison 可以避免把漏掉的 observer 静默伪装成合法的常量 0。
 
 ### 2.6 Top-Down Demand Analysis
 

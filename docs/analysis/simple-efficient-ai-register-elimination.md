@@ -230,9 +230,10 @@ recognizes this keep-high pattern and avoids turning that load into input
 evidence.
 
 Later, SummarySSA has a stronger partial-demand rewrite.  If only the written
-lane is demanded, the old preserved lane can be replaced by zero and marked with
-`notdec.register.summary_ssa.zero_demand_operand`.  This makes the generated IR
-easier to debug: zeros introduced by demand pruning are explicit.
+lane is demanded, the old preserved lane can be replaced by poison and marked
+with `notdec.register.summary_ssa.zero_demand_operand`.  The metadata records
+that the demand mask was zero, while the poison keeps a missed observer from
+being silently turned into a valid-looking constant.
 
 ### 2.6 Top-Down Demand Analysis
 

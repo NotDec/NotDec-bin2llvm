@@ -468,12 +468,13 @@ void attachZeroDemandOperandMetadata(llvm::Instruction &instruction,
     }
   }
 
-  // The zero constant cannot carry metadata.  Mark the user instruction instead
-  // so leaked synthetic zeros can be traced without changing the optimized IR.
+  // Poison cannot carry metadata.  Mark the user instruction instead so a
+  // demand-pruned operand can be traced without changing the operand type.
   std::vector<llvm::Metadata *> fields = {
       llvm::MDString::get(context, "operand=" + std::to_string(operandIndex)),
       llvm::MDString::get(context,
                           "original_type=" + llvmTypeName(original.getType())),
+      llvm::MDString::get(context, "replacement=poison"),
   };
   if (original.hasName()) {
     fields.push_back(llvm::MDString::get(
@@ -3185,11 +3186,16 @@ private:
     return PartialDemandState::trimmedMask(it->second, width);
   }
 
-  llvm::Constant *undemandedStoreOperandZero(llvm::Type *type) const {
+  // A zero-demand operand is intentionally poison rather than zero.  Zero
+  // hides a missed observer (for example a return binding registered later in
+  // the pipeline); poison keeps that analysis error visible in the resulting
+  // IR.  Restrict this to integer register-store dataflow, matching the old
+  // zero replacement boundary.
+  llvm::Value *undemandedStoreOperandPoison(llvm::Type *type) const {
     if (type == nullptr || !type->isIntegerTy()) {
       return nullptr;
     }
-    return llvm::ConstantInt::get(type, 0);
+    return llvm::PoisonValue::get(type);
   }
 
   llvm::Value *
@@ -3361,17 +3367,19 @@ private:
       }
 
       // This only rewrites register-store dataflow.  Replacing an undemanded
-      // integer operand with zero preserves every bit that has a real observer
-      // and lets normal DCE remove stale register loads.
-      llvm::Constant *zero = undemandedStoreOperandZero(operand->getType());
-      if (zero == nullptr) {
+      // integer operand with poison keeps a missed observer visible instead of
+      // silently manufacturing a valid-looking zero; normal DCE can still
+      // remove stale register loads when the demand result is correct.
+      llvm::Value *poison =
+          undemandedStoreOperandPoison(operand->getType());
+      if (poison == nullptr) {
         changed |=
             rewriteUndemandedRegisterStoreOperands(operand, demands, visiting);
         continue;
       }
 
       attachZeroDemandOperandMetadata(*inst, currentOperandIndex, *operand);
-      operandUse.set(zero);
+      operandUse.set(poison);
       if (auto *operandInst = llvm::dyn_cast<llvm::Instruction>(operand)) {
         eraseTriviallyDeadNonPhiTree(operandInst);
       }

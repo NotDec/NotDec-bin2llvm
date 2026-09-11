@@ -537,3 +537,20 @@ fortune 本轮耗时：`elapsed=8.59 user=8.56 sys=0.03 maxrss=170008`。
 更好的方案：
 
 长期看，最好把 `DemandMask` 从单个 `APInt` 抽成小类，统一处理 bit range、lane range、mask 截断和 shift。当前先用 `APInt` 是为了少改代码，并且已经能覆盖整数和一批 ZMM lane 组合。
+
+## 2026-09-11 后续修订：zero-demand 改用 poison
+
+`script_parse_url` 的 wrk IR 暴露出原方案的诊断风险：partial-demand 在返回
+binding 登记前把无 demand 的寄存器数据流替换成真实常量 `0`，后续即使漏掉了
+返回观察，也只会得到一个看似合法的恒定返回值。
+
+因此撤销“zero-demand 填 0”的实现取舍，但不改变 demand transfer 或改写边界：
+`rewriteUndemandedRegisterStoreOperands()` 仍只处理寄存器 store 数据流中的整数
+operand；当 demand mask 为零时改用 LLVM 裸 `poison`。保留
+`notdec.register.summary_ssa.zero_demand_operand` metadata，并增加
+`replacement=poison` 字段，用于定位发生过这类替换。
+
+这里选择裸 `poison` 而非 `freeze poison`，因为目标是让遗漏的 observer 直接在
+IR 中可见。它可能在后续优化中传播到控制流、指针或返回值；这不是用更宽松值
+掩盖的理由，而是应继续追查 demand 或 binding 阶段的信号。其他 unknown fallback
+仍按现有 opaque unknown helper 规则处理。
