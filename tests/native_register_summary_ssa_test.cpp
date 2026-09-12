@@ -5129,7 +5129,7 @@ bool testInternalReturnDoesNotExposeExternalClobber() {
   bool helperLeft = false;
   for (llvm::Function &function : module) {
     if (function.getName().starts_with("notdec.register.summary_clobber")) {
-      helperLeft = !function.use_empty();
+      helperLeft |= !function.use_empty();
     }
   }
 
@@ -5139,16 +5139,18 @@ bool testInternalReturnDoesNotExposeExternalClobber() {
                   "module failed verifier after clobber return cleanup test");
 }
 
-bool testClobberReturnPhiDoesNotMaterializeHelper() {
+bool testClobberReturnPhiPreservesMixedPath() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-clobber-return-phi", context);
-  attachTestAbi(module);
+  attachTestAbiWithInputs(module, {"RDI"});
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
-  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
 
   auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
-  llvm::Function *external = llvm::Function::Create(
-      voidType, llvm::GlobalValue::ExternalLinkage, "unknown_external", module);
+  auto *freeType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *freeFn = llvm::Function::Create(
+      freeType, llvm::GlobalValue::ExternalLinkage, "free", module);
   llvm::Function *callee =
       llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
                              "notdec_native_clobber_return_phi", module);
@@ -5162,33 +5164,97 @@ bool testClobberReturnPhiDoesNotMaterializeHelper() {
   llvm::IRBuilder<> builder(entry);
   storeRegister(builder, rax, llvm::ConstantInt::get(rax->getValueType(), 7),
                 "RAX");
-  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), clobberPath,
-                       knownPath);
+  llvm::LoadInst *branchInput = loadRegister(builder, rdi, "RDI", "branch");
+  llvm::Value *condition = builder.CreateICmpNE(
+      branchInput, llvm::ConstantInt::get(rdi->getValueType(), 0), "condition");
+  builder.CreateCondBr(condition, clobberPath, knownPath);
 
   builder.SetInsertPoint(clobberPath);
-  builder.CreateCall(voidType, external);
+  builder.CreateCall(freeType, freeFn, {branchInput});
   builder.CreateBr(done);
 
   builder.SetInsertPoint(knownPath);
-  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 3),
-                "RDX");
   builder.CreateBr(done);
 
   builder.SetInsertPoint(done);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *caller =
+      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+                             "notdec_native_clobber_return_phi_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  builder.CreateCall(voidType, callee);
+  llvm::LoadInst *result = loadRegister(builder, rax, "RAX", "result");
+  llvm::AllocaInst *sink = builder.CreateAlloca(rax->getValueType());
+  builder.CreateStore(result, sink);
+  builder.CreateRetVoid();
+
+  llvm::SmallString<128> jsonPath;
+  int jsonFd = -1;
+  std::error_code error = llvm::sys::fs::createTemporaryFile(
+      "notdec-mixed-clobber-return", "json", jsonFd, jsonPath);
+  if (error) {
+    std::cerr << "failed to create mixed clobber return prototype JSON: "
+              << error.message() << '\n';
+    return false;
+  }
+  {
+    llvm::raw_fd_ostream json(jsonFd, true);
+    json << R"({"free":{"return":"void","fixed_args":1}})";
+  }
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.ExternalPrototypeJsonPath = jsonPath.str().str();
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  (void)llvm::sys::fs::remove(jsonPath);
+  llvm::Function *rewritten =
+      module.getFunction("notdec_native_clobber_return_phi");
   bool helperLeft = false;
   for (llvm::Function &function : module) {
     if (function.getName().starts_with("notdec.register.summary_clobber")) {
-      helperLeft = !function.use_empty();
+      helperLeft |= !function.use_empty();
     }
   }
-
-  return expect(!helperLeft,
-                "clobber return phi materialized summary_clobber helper") &&
+  bool hasMixedReturnPhi = false;
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
+      auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
+      if (phi == nullptr || !phi->getType()->isIntegerTy(64) ||
+          phi->getNumIncomingValues() < 2) {
+        continue;
+      }
+      bool hasConcreteIncoming = false;
+      bool hasClobberIncoming = false;
+      for (llvm::Value *incoming : phi->incoming_values()) {
+        hasConcreteIncoming |= llvm::isa<llvm::ConstantInt>(incoming);
+        hasClobberIncoming |= valueNameContains(incoming, "summary_clobber") ||
+                              valueNameContains(incoming, "RAX.clobber");
+      }
+      hasMixedReturnPhi |= hasConcreteIncoming && hasClobberIncoming;
+    }
+  }
+  bool hasMixedWarning = std::any_of(
+      summary.Warnings.begin(), summary.Warnings.end(),
+      [](const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning) {
+        return warning.FunctionName == "notdec_native_clobber_return_phi" &&
+               warning.RegisterName == "RAX" &&
+               warning.Reason == "return_binding_preserved_mixed_clobber";
+      });
+  return expect(rewritten != nullptr,
+                "mixed clobber return callee missing after rewrite") &&
+         expect(rewritten->getReturnType()->isIntegerTy(64),
+                "mixed clobber return did not infer an i64 return") &&
+         expect(hasMixedReturnPhi,
+                "mixed clobber return path was collapsed instead of preserving PHI") &&
+         expect(helperLeft,
+                "mixed clobber return path did not preserve summary_clobber") &&
+         expect(hasMixedWarning,
+                "mixed clobber return preservation warning was not emitted") &&
          verifyOk(module,
-                  "module failed verifier after clobber return phi test");
+                  "module failed verifier after mixed clobber return phi test");
 }
 
 bool testUnknownExternalArityUsesMaxCallsitePrefix() {
@@ -5757,7 +5823,7 @@ bool testInternalSignatureRewriteUsesNonAbiReturn() {
   bool callReturnsRBX = false;
   for (llvm::Function &function : module) {
     if (function.getName().starts_with("notdec.register.summary_return")) {
-      helperLeft = !function.use_empty();
+      helperLeft |= !function.use_empty();
     }
   }
   if (llvm::Function *rewrittenCaller =
@@ -9480,7 +9546,7 @@ int main() {
   ok &= testUnknownExternalFloatReturnPicksSingleXmmSlot();
   ok &= testUnknownExternalClobberArgBecomesUnknown();
   ok &= testInternalReturnDoesNotExposeExternalClobber();
-  ok &= testClobberReturnPhiDoesNotMaterializeHelper();
+  ok &= testClobberReturnPhiPreservesMixedPath();
   ok &= testUnknownExternalArityUsesMaxCallsitePrefix();
   ok &= testExternalPrototypeJsonOverridesInferredArity();
   ok &= testExternalPrototypeJsonAcceptsLongDouble();

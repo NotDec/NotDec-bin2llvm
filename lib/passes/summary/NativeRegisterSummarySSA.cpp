@@ -2767,38 +2767,61 @@ bool isDirectSummaryClobberValue(const llvm::Value *value) {
          callee->getName().starts_with("notdec.register.summary_clobber");
 }
 
-bool mayDependOnSummaryClobberValue(
+// Classify all reachable source leaves of a value graph.  Clobbers and opaque
+// unknowns are filtered; ordinary calls/instructions count as real sources.
+enum : unsigned {
+  SourceReal = 1u << 0,
+  SourceClobber = 1u << 1,
+  SourceUnknown = 1u << 2,
+};
+
+unsigned classifyValueSources(
     const llvm::Value *value,
     llvm::SmallPtrSetImpl<const llvm::Value *> &visiting) {
   if (value == nullptr || !visiting.insert(value).second) {
-    return false;
+    return 0;
+  }
+  if (llvm::isa<llvm::PoisonValue>(value) ||
+      llvm::isa<llvm::UndefValue>(value)) {
+    return SourceUnknown;
   }
   if (isDirectSummaryClobberValue(value)) {
-    return true;
+    return SourceClobber;
   }
-  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
-    return llvm::any_of(
-        phi->incoming_values(), [&](const llvm::Value *incoming) {
-          return mayDependOnSummaryClobberValue(incoming, visiting);
-        });
+  if (auto *call = llvm::dyn_cast<llvm::CallBase>(value)) {
+    llvm::Function *callee = call->getCalledFunction();
+    if (callee != nullptr &&
+        (isNotDecOpaqueUnknownName(callee->getName()) ||
+         callee->getName().starts_with("notdec.register.vararg_unknown."))) {
+      return SourceUnknown;
+    }
+    return SourceReal;
   }
   if (auto *select = llvm::dyn_cast<llvm::SelectInst>(value)) {
-    return mayDependOnSummaryClobberValue(select->getTrueValue(), visiting) ||
-           mayDependOnSummaryClobberValue(select->getFalseValue(), visiting);
+    return classifyValueSources(select->getTrueValue(), visiting) |
+           classifyValueSources(select->getFalseValue(), visiting);
   }
-  if (auto *cast = llvm::dyn_cast<llvm::CastInst>(value)) {
-    return mayDependOnSummaryClobberValue(cast->getOperand(0), visiting);
+  auto *user = llvm::dyn_cast<llvm::User>(value);
+  if (user != nullptr &&
+      (llvm::isa<llvm::PHINode>(user) || llvm::isa<llvm::CastInst>(user) ||
+       llvm::isa<llvm::UnaryOperator>(user) ||
+       llvm::isa<llvm::BinaryOperator>(user))) {
+    unsigned sources = 0;
+    for (const llvm::Use &operand : user->operands()) {
+      sources |= classifyValueSources(operand.get(), visiting);
+    }
+    return sources;
   }
-  if (auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(value)) {
-    return mayDependOnSummaryClobberValue(binary->getOperand(0), visiting) ||
-           mayDependOnSummaryClobberValue(binary->getOperand(1), visiting);
-  }
-  return false;
+  return SourceReal;
+}
+
+unsigned classifyValueSources(const llvm::Value *value) {
+  llvm::SmallPtrSet<const llvm::Value *, 16> visiting;
+  return classifyValueSources(value, visiting);
 }
 
 bool mayDependOnSummaryClobberValue(const llvm::Value *value) {
-  llvm::SmallPtrSet<const llvm::Value *, 8> visiting;
-  return mayDependOnSummaryClobberValue(value, visiting);
+  return (classifyValueSources(value) & SourceClobber) != 0;
 }
 
 unsigned
@@ -6710,19 +6733,27 @@ private:
           reason = "return_binding_missing";
         } else if (value->getType() != slotType(slot)) {
           reason = "return_binding_type_mismatch";
-        } else if (PostSignatureCleanup &&
-                   mayDependOnSummaryClobberValue(value)) {
-          // callee 没把该寄存器作为返回槽时，链上只有 summary_clobber
-          // 占位；ret 不能把占位当真实返回值留在 IR 里，换成显式
-          // unknown。phi 本身不判死，其他读它的地方仍保留链值。
-          value = unknownValueBefore(*ret, slotType(slot),
-                                     unit->Name + ".return_unknown");
-          attachUnknownValueMetadata(value, "return_binding_uses_clobber_value",
-                                     Function.getName(), "<return>",
-                                     unit->Name, "return_binding");
+        } else if (PostSignatureCleanup) {
+          // A clobber is unknown for this path, not proof that every path is
+          // unknown.  Preserve a mixed value graph so the concrete path stays
+          // visible; only collapse a graph made solely of unknown leaves.
+          const unsigned sources = classifyValueSources(value);
+          if ((sources & SourceClobber) != 0) {
+            if ((sources & SourceReal) != 0) {
+              SignatureState.Warnings.push_back(returnSlotWarning(
+                  Function, slot, "return_binding_preserved_mixed_clobber"));
+            } else {
+              value = unknownValueBefore(*ret, slotType(slot),
+                                         unit->Name + ".return_unknown");
+              attachUnknownValueMetadata(
+                  value, "return_binding_uses_clobber_value",
+                  Function.getName(), "<return>", unit->Name,
+                  "return_binding");
+            }
+          }
         }
-        // 返回绑定只在缺失/类型不符/clobber 占位时降级成 unknown；其他
-        // 情况保留链值，由重写后清理遍按签名解析成真实返回值。
+        // 返回绑定只在缺失/类型不符/纯 clobber/unknown 图时降级成 unknown；
+        // 混合路径保留原值图，由重写后清理遍按签名解析成真实返回值。
         if (!reason.empty()) {
           SignatureState.Warnings.push_back(
               returnSlotWarning(Function, slot, reason));

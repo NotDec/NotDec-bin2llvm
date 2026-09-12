@@ -110,3 +110,43 @@ partial-demand rewrite 之后才登记，漏掉的返回观察使 RAX 链被静�
 - 维护成本：低；只改一个替换点和一组测试。后续若 partial-demand 规则扩大到
   非整数类型，必须重新评估 poison 是否应直接传播，以及是否需要专门的诊断
   metadata/输出，而不能重新静默填 0。
+
+## 2026-09-12 后续修订：保留混合 clobber 返回分支
+
+用户原始要求：
+
+> 还是修复一下那一块，保留分支逻辑，暴露问题，而不是通过删除分支去掩盖问题。只要有任何不是clobber unknown就保留吧。
+> 这里对循环的解释还是不太看懂，summary_return是什么，怎么生成的
+
+### 背景与目标
+
+`collectFunctionReturnValues()` 当前用
+`mayDependOnSummaryClobberValue()` 检查整个返回值；只要 PHI/选择/计算链中有
+一个 `summary_clobber`，就把整个返回绑定替换成一个 opaque unknown。这会删除
+真实分支提供的返回信息，也会让后续 IR 难以定位具体是哪条路径不可信。
+
+本次只修返回绑定：若返回值图中存在至少一条非 clobber、非显式 unknown 的路径，
+保留原值图和 PHI 分支，让 clobber helper 留在最终 IR 中并由 residue warning
+暴露；只有纯 clobber/unknown 图才继续折叠为单一 unknown。call 参数使用的
+clobber 前缀判定不改。
+
+### 最小路线与判断标准
+
+1. 增加返回值图的“是否存在非 clobber 路径”判断，支持 PHI、select、cast、
+   unary/binary value glue，并把 poison/undef、opaque unknown 和直接
+   `summary_clobber` 当作 unknown leaf。
+2. 在返回 binding 中仅对纯 clobber/unknown 值做整体降级；混合值保留原图并
+   记录 `return_binding_preserved_mixed_clobber` warning。
+3. 增加回归测试：一个出口路径写入真实 RAX，另一路经过已知 void 外部调用造成
+   clobber，caller 观察 callee 的 RAX 返回；确认返回 PHI 和 clobber warning
+   均保留。
+4. 用 LLVM 22 的 `llvm-as`/`opt -passes=verify` 验证，跑 native 单测、全量
+   ctest，并重新检查 wrk/fortune 的 warning、产物和性能。
+
+### 取舍、风险与不做什么
+
+- 保留混合值会使 `summary_clobber` helper 进入最终 IR；这是有意的诊断信号，
+  不是最终语义已经正确的证明。
+- 纯 clobber/unknown 仍折叠，避免无分支信息的 helper 残留泛滥。
+- 不重新引入 `summary_return`，不改变第 8 代“返回槽由签名决定”的阶段顺序，
+  不处理本次之外的 partial-demand return seed 问题。
