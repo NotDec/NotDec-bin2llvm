@@ -1625,8 +1625,7 @@ private:
   const NativeExternalCallShape *
   knownVarArgExternalShape(const llvm::CallBase &call) const {
     llvm::Function *callee = call.getCalledFunction();
-    if (callee == nullptr || !callee->isDeclaration() ||
-        callee->isIntrinsic()) {
+    if (callee == nullptr || callee->isIntrinsic()) {
       return nullptr;
     }
     auto shapeIt = Options.ExternalCallShapes.find(callee->getName().str());
@@ -2200,20 +2199,24 @@ private:
 
   void transferCall(llvm::CallBase &call, State &state) {
     llvm::Function *callee = call.getCalledFunction();
+    // A trusted vararg prototype (for example the in-binary aprintf helper)
+    // overrides body-derived fixed arguments.  Without this, the variadic
+    // register save area makes every ABI input look like a fixed parameter and
+    // the fake reads propagate back into all callers.
+    if (const NativeExternalCallShape *shape = externalCallShape(call)) {
+      applyExternalCallEffect(state, *shape);
+      consumeCallerStackArgEvidence(state);
+      if (shape->NoReturn) {
+        markNoReturnExit(state);
+      }
+      return;
+    }
     if (callee != nullptr && !callee->isDeclaration() &&
         Effects.count(callee) != 0) {
       const FunctionEffect &effect = Effects[callee];
       applyFunctionEffect(effect, state);
       consumeCallerStackArgEvidence(state);
       if (effect.NoReturn) {
-        markNoReturnExit(state);
-      }
-      return;
-    }
-    if (const NativeExternalCallShape *shape = externalCallShape(call)) {
-      applyExternalCallEffect(state, *shape);
-      consumeCallerStackArgEvidence(state);
-      if (shape->NoReturn) {
         markNoReturnExit(state);
       }
       return;

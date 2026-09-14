@@ -190,6 +190,13 @@ bool loadPrototypeArray(const llvm::json::Array &array,
 
 const NativeExternalPrototypeMap &defaultNativeExternalPrototypes() {
   static const NativeExternalPrototypeMap prototypes = {
+      {"aprintf",
+       {2,
+        true,
+        false,
+        1,
+        {ValueType::PointerSized, ValueType::PointerSized},
+        ValueType::PointerSized}},
       {"__assert_fail", {4, false, true}},
       {"__ctype_b_loc", {0, false, false, 1, {}, ValueType::PointerSized}},
       {"__ctype_tolower_loc",

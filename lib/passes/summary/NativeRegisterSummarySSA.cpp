@@ -292,7 +292,15 @@ struct NativeSignatureSlot {
   unsigned OffsetBits = 0;
   unsigned SizeBits = 0;
   llvm::Type *LlvmType = nullptr;
+  // True when this stack parameter has direct incoming-load evidence or was
+  // propagated from a tail-call callee.  Such parameters must not be trimmed
+  // only because one callsite binding prefix is short.
+  bool PreserveParam = false;
 };
+
+bool isStackSignatureSlot(const NativeSignatureSlot &slot);
+bool sameStackSignatureSlot(const NativeSignatureSlot &lhs,
+                            const NativeSignatureSlot &rhs);
 
 struct SignatureShape {
   std::vector<NativeSignatureSlot> Params;
@@ -1946,14 +1954,22 @@ NativeExternalCallShapeMap buildExternalCallShapes(
     const AbiFacts &abi, const NativeExternalPrototypeMap &prototypes) {
   NativeExternalCallShapeMap result;
   for (llvm::Function &function : module) {
-    if (!function.isDeclaration() || function.isIntrinsic() ||
-        knownExternalPrototype(prototypes, function.getName()) == nullptr) {
+    if (function.isIntrinsic()) {
+      continue;
+    }
+    const KnownExternalPrototype *known =
+        knownExternalPrototype(prototypes, function.getName());
+    if (known == nullptr) {
+      continue;
+    }
+    // Internal definitions normally follow interprocedural register allocation,
+    // not the external ABI.  A trusted vararg prototype is the exception used
+    // for lifted helpers such as aprintf.
+    if (!function.isDeclaration() && !known->VarArg) {
       continue;
     }
     SignatureShape signature =
         shapeForKnownExternal(function, units, abi, prototypes);
-    const KnownExternalPrototype *known =
-        knownExternalPrototype(prototypes, function.getName());
     NativeExternalCallShape callShape;
     callShape.FixedArgs = known->FixedArgs;
     callShape.VarArg = known->VarArg;
@@ -3040,14 +3056,30 @@ void refineInternalStackParamShapes(SignatureRewriteState &state) {
 
     unsigned finalArity = shape.Params.size();
     bool hasDirectCall = false;
+    bool hasTailCall = false;
     for (auto &[call, bindings] : state.CallArgs) {
       if (call == nullptr || call->getCalledFunction() != function) {
         continue;
       }
       hasDirectCall = true;
+      if (auto *callInst = llvm::dyn_cast<llvm::CallInst>(call);
+          callInst != nullptr && callInst->isTailCall()) {
+        hasTailCall = true;
+      }
       finalArity = std::min(finalArity, callsiteBoundArgPrefix(bindings));
     }
     if (!hasDirectCall || finalArity >= shape.Params.size()) {
+      continue;
+    }
+    // Tail jumps preserve the caller's incoming stack slots.  Propagated
+    // wrapper stack params are likewise authoritative even though their own
+    // caller may be a normal call.
+    bool hasPreservedParam =
+        std::any_of(shape.Params.begin(), shape.Params.end(),
+                    [](const NativeSignatureSlot &slot) {
+                      return slot.PreserveParam && isStackSignatureSlot(slot);
+                    });
+    if (hasTailCall || hasPreservedParam) {
       continue;
     }
     shape.Params.resize(finalArity);
@@ -3092,8 +3124,12 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
         isNativeRegisterPartialWriteName(function.getName())) {
       continue;
     }
-    SignatureShape shape =
+    const KnownExternalPrototype *known =
         function.isDeclaration()
+            ? nullptr
+            : knownExternalPrototype(prototypes, function.getName());
+    SignatureShape shape =
+        function.isDeclaration() || (known != nullptr && known->VarArg)
             ? shapeForKnownExternal(function, units, abi, prototypes)
             : shapeForInternalFunction(function, units, summaryFacts, abi);
     if (!shape.Params.empty() || !shape.Returns.empty() || shape.VarArg) {
@@ -3101,6 +3137,74 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
     }
   }
   return shapes;
+}
+
+bool isStackSignatureSlot(const NativeSignatureSlot &slot) {
+  return slot.Kind == NativeSignatureSlotKind::IntegerStack ||
+         slot.Kind == NativeSignatureSlotKind::FloatStack;
+}
+
+bool sameStackSignatureSlot(const NativeSignatureSlot &lhs,
+                            const NativeSignatureSlot &rhs) {
+  return lhs.StackSpace == rhs.StackSpace &&
+         lhs.StackOffset == rhs.StackOffset &&
+         lhs.StackSize == rhs.StackSize;
+}
+
+// Tail calls preserve the caller's incoming stack slots.  If a callee exposes
+// a recovered stack parameter, every caller that reaches it through a tail
+// call must expose the same slot so the rewrite can forward it.
+void propagateTailCallStackParams(llvm::Module &module,
+                                  SignatureRewriteState &state) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (llvm::Function &caller : module) {
+      if (caller.isDeclaration()) {
+        continue;
+      }
+      auto callerIt = state.Shapes.find(&caller);
+      if (callerIt == state.Shapes.end()) {
+        continue;
+      }
+      for (llvm::Instruction &inst : llvm::instructions(caller)) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+        if (call == nullptr || !call->isTailCall()) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr || callee == &caller) {
+          continue;
+        }
+        auto calleeIt = state.Shapes.find(callee);
+        if (calleeIt == state.Shapes.end()) {
+          continue;
+        }
+        for (const NativeSignatureSlot &calleeSlot : calleeIt->second.Params) {
+          if (!isStackSignatureSlot(calleeSlot)) {
+            continue;
+          }
+          auto existing = std::find_if(
+              callerIt->second.Params.begin(), callerIt->second.Params.end(),
+              [&](const NativeSignatureSlot &slot) {
+                return isStackSignatureSlot(slot) &&
+                       sameStackSignatureSlot(slot, calleeSlot);
+              });
+          if (existing != callerIt->second.Params.end()) {
+            if (!existing->PreserveParam) {
+              existing->PreserveParam = true;
+              changed = true;
+            }
+            continue;
+          }
+          NativeSignatureSlot propagated = calleeSlot;
+          propagated.PreserveParam = true;
+          callerIt->second.Params.push_back(std::move(propagated));
+          changed = true;
+        }
+      }
+    }
+  }
 }
 
 const SignatureShape *shapeForCall(const SignatureRewriteState &state,
@@ -7565,6 +7669,9 @@ void rewriteInternalFunctionBody(
           }
           continue;
         }
+        if (slot.Unit == nullptr || slot.Unit->Global == nullptr) {
+          continue;
+        }
         if (load != nullptr &&
             load->getMetadata("notdec.register.summary_ssa.entry") != nullptr) {
           auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
@@ -7812,17 +7919,20 @@ void rewriteSignatureShapes(
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     const AbiFacts &abi, NativeRegisterSummarySSASummary &summary) {
   std::map<llvm::Function *, llvm::Function *> replacements;
+  std::map<llvm::Function *, const SignatureShape *> rewrittenFunctionShapes;
   std::vector<std::pair<llvm::Function *, SignatureShape>> replacementShapes;
   for (auto &[function, shape] : state.Shapes) {
     llvm::FunctionType *newType =
         functionTypeForShape(module.getContext(), shape);
     if (function->getFunctionType() == newType) {
       replacements[function] = function;
+      rewrittenFunctionShapes[function] = &shape;
       continue;
     }
     llvm::Function *newFunction =
         createReplacementFunction(*function, *newType);
     replacements[function] = newFunction;
+    rewrittenFunctionShapes[newFunction] = &shape;
     replacementShapes.emplace_back(newFunction, shape);
     if (!function->isDeclaration()) {
       rewriteInternalFunctionBody(*function, *newFunction, shape, state, units,
@@ -7899,6 +8009,41 @@ void rewriteSignatureShapes(
       warning.CalleeName = rewrittenCalleeName;
       return warning;
     };
+    // Tail calls reuse the caller's incoming stack slots.  The wrapper may have
+    // gained the corresponding stack parameter through propagation but have no
+    // explicit store binding; pass the new caller argument directly to the
+    // callee's matching stack slot.
+    auto tailCallStackValue = [&](const NativeSignatureSlot &slot)
+        -> llvm::Value * {
+      if (!isStackSignatureSlot(slot)) {
+        return nullptr;
+      }
+      auto *oldCallInst = llvm::dyn_cast<llvm::CallInst>(oldCall);
+      if (oldCallInst == nullptr || !oldCallInst->isTailCall()) {
+        return nullptr;
+      }
+      llvm::Function *newCaller = oldCall->getFunction();
+      if (newCaller == nullptr) {
+        return nullptr;
+      }
+      auto callerShapeIt = rewrittenFunctionShapes.find(newCaller);
+      if (callerShapeIt == rewrittenFunctionShapes.end()) {
+        return nullptr;
+      }
+      const std::vector<NativeSignatureSlot> &callerParams =
+          callerShapeIt->second->Params;
+      for (unsigned index = 0; index < callerParams.size(); ++index) {
+        const NativeSignatureSlot &callerSlot = callerParams[index];
+        if (!isStackSignatureSlot(callerSlot) ||
+            !sameStackSignatureSlot(callerSlot, slot)) {
+          continue;
+        }
+        if (index < newCaller->arg_size()) {
+          return newCaller->getArg(index);
+        }
+      }
+      return nullptr;
+    };
     std::vector<llvm::Value *> args;
     args.reserve(bindings.size());
     llvm::IRBuilder<> oldCallBuilder(oldCall);
@@ -7906,6 +8051,9 @@ void rewriteSignatureShapes(
       const NativeSignatureSlot &slot = shape->Params[index];
       const CallArgStoreBinding *binding = bindingForIndex(bindings, index);
       llvm::Value *value = binding == nullptr ? nullptr : binding->Value;
+      if (value == nullptr) {
+        value = tailCallStackValue(slot);
+      }
       if (value != nullptr) {
         value = remapValue(value);
         value = localizeCallArgument(*oldCall->getFunction(), *oldCall, value);
@@ -8295,6 +8443,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   if (options.EnableRewrite) {
     signatureState.Shapes = buildInitialSignatureShapes(
         module, units, facts, abi, externalPrototypes);
+    propagateTailCallStackParams(module, signatureState);
   }
 
   NativeRegisterSummarySSASummary summary;

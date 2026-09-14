@@ -349,6 +349,10 @@ PcodeToLLVM
       旧 call 返回类型优先，否则只看 live read evidence，浮点/整型互斥，整型只
       取 RAX（RDX 默认排除）。未读的 after-call ABI 输出占位不再膨胀成多寄存器
       聚合返回。
+    - 已知 vararg 原型可以覆盖有函数体的内部 helper（例如 `aprintf`）：固定参数
+      只保留原型前缀，variadic register save area 的入口读取不再被当成固定参数。
+    - tail call 会继承 callee 的 stack 参数；rewrite 时若调用点没有显式 store
+      binding，直接把 caller 新签名中的对应 stack argument 传给 callee。
 
 12. **补外部返回值**
     - 入口：`addDemandedExternalReturns(...)`。
