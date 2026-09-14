@@ -150,3 +150,82 @@ clobber 前缀判定不改。
 - 纯 clobber/unknown 仍折叠，避免无分支信息的 helper 残留泛滥。
 - 不重新引入 `summary_return`，不改变第 8 代“返回槽由签名决定”的阶段顺序，
   不处理本次之外的 partial-demand return seed 问题。
+
+## 2026-09-12 后续修订：返回槽观察点同步进 partial-demand
+
+用户原始要求：
+
+> 第 8 代把真正的 return binding 延迟到了重写后的清理阶段，这是正确的架构
+> 方向，但 partial-demand 没有同步适配。
+> `script_parse_url` 第一遍 SSA 读取 RAX 返回槽，但 recordBinding=false 没有
+> 保存到 FunctionReturns；partial-demand 看不到该返回槽正在被观察，把旧高位
+> 替换成 poison；签名重写后才确认 RAX 是返回值，返回绑定这时已经拿到 poison。
+
+### 背景与根因
+
+`collectFunctionReturnValues(recordBinding=false)` 会在第一遍 SSA 构建后、
+`rewritePartialWrites()` 之前，通过 `readSlotValueBefore()` 读取当前
+`shape.Returns` 的每个返回槽。这个值就是“返回槽是真实观察点”的证据，但旧实现
+只把 `recordBinding=true` 时的值存进 `SignatureState.FunctionReturns`；第一遍
+`recordBinding=false` 的值被直接丢弃。
+
+随后 `computePartialDemands()` 的 seed 只包含 `FunctionReturns`、旧的
+`ret->getReturnValue()` 以及普通 call/branch/load observer。第一遍时
+`FunctionReturns` 为空，`ret` 也还没有最终返回槽值，因此 partial-demand 看不到
+RAX 返回槽；遇到 part-write 的 preserved high lane 时把它替换成 `poison`。签名
+重写后的 cleanup 再收集返回绑定时，只能读到已经 poison 化的链。
+
+`script_parse_url` 的 wrk 结果从旧实现的
+`phi i32 [ 0, %bb_e83e ], [ 0, %entry ]` 变成
+`phi i32 [ poison, %bb_e83e ], [ 0, %entry ]`，就是这条路径暴露出来的。
+
+`hasNonClobberReturnPath()` 也修不了这一类问题：它识别的是 `summary_clobber`
+和 opaque unknown 叶子，而这里出问题的是 `poison`，不是 clobber。
+
+### 最小修改方案与实现
+
+1. `FunctionBuilder` 增加 `ReturnObservationValues`，记录所有
+   `collectFunctionReturnValues()` 计算出的返回槽值，不区分
+   `recordBinding`。它只作为 demand seed，不参与最终返回绑定，避免旧值跨
+   signature rewrite 存活的问题。
+2. `computePartialDemands()` 在 seeding 阶段先把这些返回槽 observer 以 full
+   mask 入队，再做普通 FunctionReturns / ret / call / branch 等 seed。
+3. `removeDeadStoresAfterSignatureRewrite()` 中把
+   `collectFunctionReturnValues()` 移到本轮 `rewritePartialWrites()` 之前：
+   cleanup 第一轮收集返回绑定时，先把这些槽登记为 observer，再跑 partial-demand，
+   避免同一类 poison 污染。
+4. `native_register_summary_ssa_test` 的
+   `testRecordedReturnValueSurvivesPartialDemandRewrite` 增加断言：
+   关闭 post-rewrite InstCombine，递归检查 callee 的 `ret` 值图，
+   不允许 delayed return observation 路径出现 `poison`。
+
+### 验证命令与结果
+
+- 修复前先跑新断言：`build/bin/native_register_summary_ssa_test` 失败并输出
+  `partial-demand poisoned a delayed return observation`，确认测试能捕获该
+  回归。
+- 修复后 `cmake --build build --target native_register_summary_ssa_test -j`
+  以及 `./build/bin/native_register_summary_ssa_test` 通过。
+- `ctest --test-dir build --output-on-failure`：12/12 通过；重新构建
+  `notdec-native-llvm` 后，`notdec.native_llvm.realworld_fortune_x86_64/i386`
+  也通过。
+- 重新生成 wrk：
+  `/tmp/notdec-partial-return-fix2/wrk.native.ll`。
+  `script_parse_url` 中的
+  `phi i32 [ poison, %bb_e83e ], [ 0, %entry ]`
+  已变为
+  `phi i32 [ %notdec.reg.extract.lower88, %bb_e83e ], [ 0, %entry ]`。
+  wrk IR 中 `poison` 从修复前的 12 处降到 10 处。
+- 使用 `/sn640/NotDec/llvm-22.1.0.obj/bin/llvm-as` 和
+  `opt -passes=verify` 验证新 wrk IR：通过。
+
+### 取舍、风险与不做什么
+
+- 返回 observation 和最终 return binding 继续分离：observation 只负责
+  demand，binding 仍延迟到 signature rewrite 后的 cleanup，保持第 8 代方向。
+- observer seed 可能让少量本来可省的 preserved lane 被保留，这是正确性优先的
+  取舍；如果后续要收窄，应先区分“返回槽真实 observer”和“只为 binding 读取的
+  临时链”，而不是重新依赖 FunctionReturns。
+- 本次不改变 partial-demand 的 transfer 规则，不重新引入 `summary_return`，
+  也不处理 `script_parse_url` 返回语义是否还有其他源头问题；只修复 delayed
+  return observation 被 poison 的问题。

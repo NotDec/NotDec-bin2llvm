@@ -332,13 +332,23 @@ PcodeToLLVM
      - 第一遍只读退出点槽位产生“调用后被读”证据（
        `collectFunctionReturnValues(recordBinding=false)`）；返回绑定收集移到
        重写后的清理遍（见第 16 步）。
+     - 上述返回槽读取同时记录为 partial-demand 的 observer seed。即使真正
+       返回绑定延迟，返回槽对应 bit 也不会被 zero-demand rewrite 误判成死值
+       并替换成 `poison`。
      - 按最终 callsite shape 收集 argument store binding。
 
 11. **间接 call / 内部函数参数形状收窄**
     - 入口：`refineIndirectCallsiteParamShapes(...)` / `refineInternalStackParamShapes(...)`。
     - 对 indirect call 使用 callsite binding 收窄参数数量。
+    - 间接调用的初始参数形状来自 `NativeRegisterSummary` 的 callsite
+      provenance：只数连续 `LocalDefinition` 前缀（允许 wrapper 式
+      `ForwardedEntry`）；入口残留和 call clobber 不再被当成参数。
     - 对内部函数，如果所有直接调用点都没用满推断出的栈参数前缀，按调用点前缀
       截断栈参数数量和对应 binding。
+    - `addIndirectCallsiteShapes(...)` 对间接调用复用未知外部的保守返回规则：
+      旧 call 返回类型优先，否则只看 live read evidence，浮点/整型互斥，整型只
+      取 RAX（RDX 默认排除）。未读的 after-call ABI 输出占位不再膨胀成多寄存器
+      聚合返回。
 
 12. **补外部返回值**
     - 入口：`addDemandedExternalReturns(...)`。
@@ -373,6 +383,9 @@ PcodeToLLVM
       - 只在重写后第一轮收集返回绑定（`collectReturns=true`）并按最终链值更新 ret
         （重写时 ret 先建 unknown；后续轮次 partial-write helper 被删后范围退化成
         整寄存器，返回链会整体变 unknown）。
+      - 返回绑定收集先于本轮 `rewritePartialWrites()`：收集时同时登记返回槽
+        observer seed，保证 partial-demand 不会先污染马上要变成返回值的 preserved
+        lane。
       - 删除签名重写后暴露的死 register store。
     - 清理遍用的 summary facts 按函数名重建（重写会用 `takeName` 替换函数对象，
       按旧指针组织的 facts 查不到）。

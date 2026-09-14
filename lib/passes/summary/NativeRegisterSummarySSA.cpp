@@ -320,6 +320,13 @@ struct SignatureRewriteState {
   // Keep their inferred type on the callsite, then rebuild the call with the
   // typed function pointer during signature rewrite.
   std::map<llvm::CallBase *, SignatureShape> IndirectCallShapes;
+  // Per-callsite parameter evidence for indirect calls.  The evidence is
+  // collected by NativeRegisterSummary from LocalDefinition / ForwardedEntry /
+  // CallClobber provenance before SSA rewriting; this avoids treating every
+  // ABI input register as a parameter just because it has some current SSA
+  // value at the call.
+  std::map<const llvm::CallBase *, std::vector<NativeRegisterCallInputSlot>>
+      IndirectCallInputs;
   std::map<llvm::CallBase *, std::vector<CallArgStoreBinding>> CallArgs;
   std::map<llvm::CallBase *, std::map<std::string, llvm::CallInst *>>
       ReturnHelpers;
@@ -2107,6 +2114,66 @@ callInputSlot(const NativeRegisterCallsiteSlotEvidence &slot) {
   return input;
 }
 
+std::optional<NativeSignatureSlot>
+makeSignatureSlotForCallInput(
+    const NativeRegisterCallInputSlot &input,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    llvm::LLVMContext &context) {
+  if (input.Kind == NativeRegisterCallInputSlotKind::Stack) {
+    if (input.Float) {
+      llvm::Type *type = floatTypeForSizeBits(context, input.SizeBits);
+      if (type == nullptr) {
+        return std::nullopt;
+      }
+      NativeSignatureSlot slot;
+      slot.Kind = NativeSignatureSlotKind::FloatStack;
+      slot.AbiName =
+          input.StackSpace + "+" + std::to_string(input.StackOffset);
+      slot.StackSpace = input.StackSpace;
+      slot.StackOffset = input.StackOffset;
+      slot.StackSize = input.StackSize;
+      slot.StackAlign = input.StackAlign;
+      slot.OffsetBits = 0;
+      slot.SizeBits = input.SizeBits;
+      slot.LlvmType = type;
+      return slot;
+    }
+    llvm::Type *type = llvm::IntegerType::get(context, input.SizeBits);
+    NativeSignatureSlot slot;
+    slot.Kind = NativeSignatureSlotKind::IntegerStack;
+    slot.AbiName = input.StackSpace + "+" + std::to_string(input.StackOffset);
+    slot.StackSpace = input.StackSpace;
+    slot.StackOffset = input.StackOffset;
+    slot.StackSize = input.StackSize;
+    slot.StackAlign = input.StackAlign;
+    slot.OffsetBits = 0;
+    slot.SizeBits = input.SizeBits;
+    slot.LlvmType = type;
+    return slot;
+  }
+
+  const RegisterUnit *unit = unitByName(units, input.UnitName);
+  if (unit == nullptr) {
+    return std::nullopt;
+  }
+  if (!input.Float) {
+    return integerSignatureSlot(*unit);
+  }
+  llvm::Type *type = floatTypeForSizeBits(context, input.SizeBits);
+  if (type == nullptr) {
+    return std::nullopt;
+  }
+  NativeSignatureSlot slot;
+  slot.Kind = NativeSignatureSlotKind::FloatRegister;
+  slot.Unit = unit;
+  slot.AbiName = input.UnitName;
+  slot.MetaType = "float";
+  slot.OffsetBits = input.OffsetBits;
+  slot.SizeBits = input.SizeBits;
+  slot.LlvmType = type;
+  return slot;
+}
+
 std::optional<unsigned> constantLowByteBeforeCall(
     const NativeRegisterExternalCallsite &callsite,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -2515,6 +2582,50 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
   return callsiteShapes;
 }
 
+// Build per-callsite parameter evidence for indirect calls from the same
+// provenance slots used by unknown external arity inference.  A current SSA
+// value is not enough: an entry leftover or a previous call clobber can have
+// an SSA definition and still not be an outgoing argument.  LocalDefinition
+// provides the strong evidence; leading ForwardedEntry is handled by
+// localDefinitionPrefix() for wrapper-style pass-through.
+void inferIndirectCallInputs(
+    const NativeRegisterSummary &baseSummary,
+    std::map<const llvm::CallBase *,
+             std::vector<NativeRegisterCallInputSlot>> &out) {
+  for (const NativeRegisterExternalCallsite &callsite :
+       baseSummary.ExternalCallsites) {
+    if (callsite.Call == nullptr || !callsite.Indirect ||
+        callsite.Kind != NativeRegisterExternalCallsiteKind::UnknownExternal) {
+      continue;
+    }
+    std::vector<NativeRegisterCallsiteSlotEvidence> integerSlots =
+        renumberedSlotsByKind(callsite, false);
+    std::vector<NativeRegisterCallsiteSlotEvidence> floatSlots =
+        renumberedSlotsByKind(callsite, true);
+    unsigned integerCount = localDefinitionPrefix(integerSlots);
+    unsigned floatCount = localDefinitionPrefix(floatSlots);
+    if (integerCount == 0 && floatCount == 0) {
+      continue;
+    }
+
+    std::vector<NativeRegisterCallInputSlot> inputs;
+    unsigned integerSeen = 0;
+    unsigned floatSeen = 0;
+    for (const NativeRegisterCallsiteSlotEvidence &slot : callsite.Slots) {
+      if (slot.Float) {
+        if (floatSeen++ < floatCount) {
+          inputs.push_back(callInputSlot(slot));
+        }
+      } else if (integerSeen++ < integerCount) {
+        inputs.push_back(callInputSlot(slot));
+      }
+    }
+    if (!inputs.empty()) {
+      out[callsite.Call] = std::move(inputs);
+    }
+  }
+}
+
 
 bool signatureHasReturnForRegister(const SignatureShape &shape,
                                    const RegisterUnit &unit) {
@@ -2526,21 +2637,83 @@ bool signatureHasReturnForRegister(const SignatureShape &shape,
   return false;
 }
 
-void addReturnSlotForRange(
-    SignatureShape &shape, const RegisterRangeKey &range,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
-  auto unitIt = units.find(range.Global);
-  if (unitIt == units.end()) {
+// Conservative return-slot selection for unknown callables (unknown external
+// and indirect calls).  The call target may have any ABI-visible return type;
+// post-call register reads alone are not enough to build a multi-register
+// aggregate return.  The old LLVM call type is the strongest evidence when it
+// is not void; otherwise live post-call reads choose at most one class:
+// floating output (XMM0 preferred, ST0 only with x87 evidence) or integer
+// output (RAX and, for non-indirect unknowns, other non-RDX outputs).
+void addConservativeUnknownReturnSlots(
+    SignatureShape &shape, llvm::Type *oldReturnType,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const AbiFacts &abi,
+    const std::function<bool(llvm::StringRef)> &hasLiveReadEvidence) {
+  auto addReturnSlot = [&](const RegisterUnit &unit, bool floatSlot) {
+    if (signatureHasReturnForRegister(shape, unit)) {
+      return;
+    }
+    std::optional<NativeSignatureSlot> slot =
+        floatSlot ? floatReturnSlotForUnit(unit, units, abi)
+                  : integerReturnSlotForUnit(unit, abi);
+    if (slot) {
+      shape.Returns.push_back(*slot);
+    }
+  };
+
+  const bool oldTypeFloat =
+      oldReturnType != nullptr && oldReturnType->isFloatingPointTy();
+  const bool oldTypeSt0 =
+      oldTypeFloat && oldReturnType->getPrimitiveSizeInBits() > 64;
+
+  const AbiFacts::RegisterSlot *firstFloat = nullptr;
+  if (!abi.FloatOutputsInOrder.empty()) {
+    firstFloat = &abi.FloatOutputsInOrder.front();
+  }
+  const AbiFacts::RegisterSlot *firstInt = nullptr;
+  if (!abi.IntegerOutputsInOrder.empty()) {
+    firstInt = &abi.IntegerOutputsInOrder.front();
+  }
+  const RegisterUnit *st0 = unitByName(units, "ST0");
+
+  // Floating returns and integer returns are mutually exclusive in the
+  // conservative model.  XMM0 is the ordinary SSE return; ST0 is only used
+  // when there is explicit x87 return evidence.
+  if (!oldTypeSt0 && firstFloat != nullptr &&
+      (oldTypeFloat || hasLiveReadEvidence(firstFloat->UnitName))) {
+    if (const RegisterUnit *unit = unitByName(units, firstFloat->UnitName)) {
+      addReturnSlot(*unit, true);
+      return;
+    }
+  }
+  if (st0 != nullptr && (oldTypeSt0 || hasLiveReadEvidence("ST0"))) {
+    addReturnSlot(*st0, true);
     return;
   }
-  const RegisterUnit &unit = unitIt->second;
-  if (signatureHasReturnForRegister(shape, unit)) {
-    return;
+
+  // Integer return: RAX is the first output; RDX is treated as a clobber
+  // unless a trusted prototype explicitly says otherwise.  For direct unknown
+  // externals this matches SysV practice; indirect calls use the same policy.
+  for (const std::string &name : abi.OutputsInOrder) {
+    if (isFloatAbiOutputUnit(abi, name)) {
+      continue;
+    }
+    if (isLikelyNonReturnIntegerAbiOutput(abi, name)) {
+      break;
+    }
+    const bool isFirstInt = firstInt != nullptr && name == firstInt->UnitName;
+    const bool demanded =
+        isFirstInt ? ((oldReturnType != nullptr &&
+                       !oldReturnType->isVoidTy()) ||
+                      hasLiveReadEvidence(name))
+                   : hasLiveReadEvidence(name);
+    if (!demanded) {
+      continue;
+    }
+    if (const RegisterUnit *unit = unitByName(units, name)) {
+      addReturnSlot(*unit, false);
+    }
   }
-  // Indirect calls often have several demanded ranges from the same ABI return
-  // register, e.g. RAX[0:32] and RAX[32:64].  Use the whole register return and
-  // let extractReturnRange() split out the exact bits for each helper.
-  shape.Returns.push_back(integerSignatureSlot(unit));
 }
 
 void addAbiInputParamSlots(
@@ -2562,15 +2735,36 @@ void addIndirectCallsiteShapes(
     SignatureRewriteState &state,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     const AbiFacts &abi) {
+  auto addIndirectInputParams = [&](llvm::CallBase *call,
+                                    SignatureShape &shape) {
+    if (!shape.Params.empty()) {
+      return;
+    }
+    auto inputIt = state.IndirectCallInputs.find(call);
+    if (inputIt == state.IndirectCallInputs.end()) {
+      addAbiInputParamSlots(shape, units, abi);
+      return;
+    }
+    for (const NativeRegisterCallInputSlot &input : inputIt->second) {
+      if (std::optional<NativeSignatureSlot> slot =
+              makeSignatureSlotForCallInput(input, units,
+                                            call->getContext())) {
+        shape.Params.push_back(*slot);
+      }
+    }
+  };
+
   for (const auto &[call, helpers] : state.ReturnHelpers) {
     if (call == nullptr || call->getParent() == nullptr ||
         call->getCalledFunction() != nullptr) {
       continue;
     }
     SignatureShape &shape = state.IndirectCallShapes[call];
-    addAbiInputParamSlots(shape, units, abi);
+    addIndirectInputParams(call, shape);
     for (const auto &[name, helper] : helpers) {
-      (void)helper;
+      if (helper == nullptr || helper->use_empty()) {
+        continue;
+      }
       const RegisterUnit *unit = unitByName(units, name);
       if (unit != nullptr && !signatureHasReturnForRegister(shape, *unit)) {
         shape.Returns.push_back(integerSignatureSlot(*unit));
@@ -2584,10 +2778,27 @@ void addIndirectCallsiteShapes(
       continue;
     }
     SignatureShape &shape = state.IndirectCallShapes[call];
-    addAbiInputParamSlots(shape, units, abi);
-    for (const RangeReturnHelper &helper : helpers) {
-      addReturnSlotForRange(shape, helper.Range, units);
-    }
+    addIndirectInputParams(call, shape);
+    // RangeReturnHelpers are generated for every ABI output register after an
+    // analyzable call, including outputs that are never read.  An indirect
+    // callee is unknown, so apply the same conservative single-class return
+    // policy as direct unknown externals: old call return type first, then
+    // live post-call reads, but never promote every live ABI output into a
+    // multi-register aggregate.
+    auto hasLiveReadEvidence = [&](llvm::StringRef name) {
+      for (const RangeReturnHelper &helper : helpers) {
+        if (helper.Helper == nullptr || helper.Helper->use_empty()) {
+          continue;
+        }
+        auto unitIt = units.find(helper.Range.Global);
+        if (unitIt != units.end() && unitIt->second.Name == name) {
+          return true;
+        }
+      }
+      return false;
+    };
+    addConservativeUnknownReturnSlots(shape, call->getType(), units, abi,
+                                      hasLiveReadEvidence);
   }
 }
 
@@ -2695,65 +2906,12 @@ void addDemandedExternalReturns(
       continue;
     }
 
-    const AbiFacts::RegisterSlot *firstFloat = nullptr;
-    if (!abi.FloatOutputsInOrder.empty()) {
-      firstFloat = &abi.FloatOutputsInOrder.front();
-    }
-    const AbiFacts::RegisterSlot *firstInt = nullptr;
-    if (!abi.IntegerOutputsInOrder.empty()) {
-      firstInt = &abi.IntegerOutputsInOrder.front();
-    }
-    const RegisterUnit *st0 = unitByName(units, "ST0");
-
     // 未知外部（含 arity 推断产物）：SysV 下普通函数返回要么走整型
     // （RAX，结构体可带 RDX 等），要么走浮点（XMM0 或 x87 ST0），浮点
-    // 返回和整型返回互斥，保守只取一类。浮点最多 1 个返回槽：XMM0
-    // （float/double）优先，有 x87 证据才 ST0（long double）；ZMM1 等
-    // 后续 SSE 输出一律当调用 clobber。旧 call 的 LLVM 返回类型是
-    // lifting/原型恢复对返回寄存器的直接声明，优先级最高；call 是 void
-    // 时退回"调用后被实际读取"的证据。
-    llvm::Type *oldReturnType = call->getType();
-    const bool oldTypeFloat = oldReturnType->isFloatingPointTy();
-    const bool oldTypeSt0 =
-        oldTypeFloat && oldReturnType->getPrimitiveSizeInBits() > 64;
-    if (!oldTypeSt0 && firstFloat != nullptr &&
-        (oldTypeFloat ||
-         hasLiveReadEvidence(firstFloat->UnitName))) {
-      if (const RegisterUnit *unit =
-              unitByName(units, firstFloat->UnitName)) {
-        addReturnSlot(*unit, true);
-        continue;
-      }
-    }
-    if (st0 != nullptr && (oldTypeSt0 || hasLiveReadEvidence("ST0"))) {
-      addReturnSlot(*st0, true);
-      continue;
-    }
-    // 整型返回槽：RAX（第一个整型输出）起，其余整型输出除 RDX 外按读
-    // 证据补（真实 SysV 上 IntegerOutputsInOrder 只有 RAX/RDX，RDX 被
-    // 排除后就是 RAX 一个）。RAX 本身额外接受旧 call 的非 void 整型返回
-    // 类型作为证据（原型恢复给出 i64 返回时，结果可能被直接 store 回
-    // 寄存器全局，见 addDemandedExternalReturns 调用方的测试模式）。
-    for (const std::string &name : abi.OutputsInOrder) {
-      if (isFloatAbiOutputUnit(abi, name)) {
-        continue;
-      }
-      if (isLikelyNonReturnIntegerAbiOutput(abi, name)) {
-        break;
-      }
-      const bool isFirstInt = firstInt != nullptr && name == firstInt->UnitName;
-      const bool demanded =
-          isFirstInt
-              ? (!oldReturnType->isVoidTy() || hasLiveReadEvidence(name))
-              : hasLiveReadEvidence(name);
-      if (!demanded) {
-        continue;
-      }
-      const RegisterUnit *unit = unitByName(units, name);
-      if (unit != nullptr) {
-        addReturnSlot(*unit, false);
-      }
-    }
+    // 返回和整型返回互斥，保守只取一类。具体规则见
+    // addConservativeUnknownReturnSlots()。
+    addConservativeUnknownReturnSlots(shapeIt->second, call->getType(), units,
+                                      abi, hasLiveReadEvidence);
   }
 }
 
@@ -3018,6 +3176,8 @@ public:
       // 第一遍只读退出点前 ABI 输出槽位生成"调用后被读"证据
       // （RangeReturnHelpers），供 addDemandedExternalReturns 给未知外部
       // 补返回槽（sqrtl 的 ST0 就靠它）；不记录返回绑定、不改 ret。
+      // 但返回槽值本身仍是 partial-demand 的 observer，会记录到
+      // ReturnObservationValues，不能被延迟绑定一起丢掉。
       // 真正的返回绑定在重写后的清理遍收集：第一遍时 callee 返回槽可能
       // 还没补全，且链上占位跨函数重写存活不了。
       collectFunctionReturnValues(/*recordBinding=*/false);
@@ -3048,6 +3208,11 @@ public:
   // helper 提供的范围边界（32 位低半段），一旦第一轮把 helper 当死代码删掉，
   // 后续轮次范围退化成整寄存器，返回链会整体变成 unknown。ret 更新产生的
   // 指令都是活值，不会被后续轮次的死代码清理误删。
+  //
+  // Important: collect before rewritePartialWrites().  collectFunctionReturnValues()
+  // both records the delayed return binding and, just as importantly, records the
+  // return-slot values as partial-demand observers.  If partial-demand runs first,
+  // it can poison an undemanded preserved lane that later becomes the return value.
   void removeDeadStoresAfterSignatureRewrite(bool collectReturns = true) {
     Summary.FunctionName = Function.getName().str();
     PostSignatureCleanup = true;
@@ -3056,10 +3221,10 @@ public:
     rewritePartialReads();
     foldDuplicatePartialReadXors();
     rewriteLoads();
-    rewritePartialWrites();
     if (collectReturns) {
       collectFunctionReturnValues();
     }
+    rewritePartialWrites();
     // This cleanup run still creates new range helper calls while rewriting
     // loads/writes, so physical deletion stays after liveness cleanup.
     removeDeadStoresByLiveness();
@@ -3082,6 +3247,11 @@ private:
   std::vector<llvm::WeakVH> ReplacedLoads;
   std::vector<llvm::WeakVH> ReplacedPartialReads;
   std::vector<llvm::WeakVH> FoldedZeroXors;
+  // Return slots are demand observers even before final return bindings are
+  // collected.  Keep the slot values produced by collectFunctionReturnValues()
+  // here so computePartialDemands() can seed them before the delayed binding
+  // phase.  This is deliberately separate from FunctionReturns.
+  std::vector<llvm::WeakVH> ReturnObservationValues;
   std::map<BlockRangeKey, llvm::Value *> EntryRangeValue;
   std::map<BlockRangeKey, llvm::Value *> ExitRangeValue;
   std::map<BlockRangeKey, llvm::PHINode *> PendingRangePhi;
@@ -3572,6 +3742,13 @@ private:
         seedOperand(op->getOperand(0));
       }
     };
+
+    for (llvm::WeakVH &handle : ReturnObservationValues) {
+      if (llvm::Value *value =
+              llvm::dyn_cast_or_null<llvm::Value>(handle)) {
+        seedOperand(resolve(value));
+      }
+    }
 
     if (auto returnsIt = SignatureState.FunctionReturns.find(&Function);
         returnsIt != SignatureState.FunctionReturns.end()) {
@@ -6011,62 +6188,8 @@ private:
 
   std::optional<NativeSignatureSlot>
   signatureSlotForCallInput(const NativeRegisterCallInputSlot &input) const {
-    if (input.Kind == NativeRegisterCallInputSlotKind::Stack) {
-      if (input.Float) {
-        llvm::Type *type =
-            floatTypeForSizeBits(Function.getContext(), input.SizeBits);
-        if (type == nullptr) {
-          return std::nullopt;
-        }
-        NativeSignatureSlot slot;
-        slot.Kind = NativeSignatureSlotKind::FloatStack;
-        slot.AbiName =
-            input.StackSpace + "+" + std::to_string(input.StackOffset);
-        slot.StackSpace = input.StackSpace;
-        slot.StackOffset = input.StackOffset;
-        slot.StackSize = input.StackSize;
-        slot.StackAlign = input.StackAlign;
-        slot.OffsetBits = 0;
-        slot.SizeBits = input.SizeBits;
-        slot.LlvmType = type;
-        return slot;
-      }
-      llvm::Type *type =
-          llvm::IntegerType::get(Function.getContext(), input.SizeBits);
-      NativeSignatureSlot slot;
-      slot.Kind = NativeSignatureSlotKind::IntegerStack;
-      slot.AbiName = input.StackSpace + "+" + std::to_string(input.StackOffset);
-      slot.StackSpace = input.StackSpace;
-      slot.StackOffset = input.StackOffset;
-      slot.StackSize = input.StackSize;
-      slot.StackAlign = input.StackAlign;
-      slot.OffsetBits = 0;
-      slot.SizeBits = input.SizeBits;
-      slot.LlvmType = type;
-      return slot;
-    }
-    const RegisterUnit *unit = unitByName(input.UnitName);
-    if (unit == nullptr) {
-      return std::nullopt;
-    }
-    if (!input.Float) {
-      return integerSignatureSlot(*unit);
-    }
-
-    llvm::Type *type =
-        floatTypeForSizeBits(Function.getContext(), input.SizeBits);
-    if (type == nullptr) {
-      return std::nullopt;
-    }
-    NativeSignatureSlot slot;
-    slot.Kind = NativeSignatureSlotKind::FloatRegister;
-    slot.Unit = unit;
-    slot.AbiName = input.UnitName;
-    slot.MetaType = "float";
-    slot.OffsetBits = input.OffsetBits;
-    slot.SizeBits = input.SizeBits;
-    slot.LlvmType = type;
-    return slot;
+    return makeSignatureSlotForCallInput(input, Units,
+                                         Function.getContext());
   }
 
   std::vector<NativeSignatureSlot> callParamSlots(llvm::CallBase &call,
@@ -6728,6 +6851,7 @@ private:
         llvm::Value *value = resolve(
             readSlotValueBefore(*ret, slot, unit->Name + ".return_range",
                                 /*allowUnknownSegments=*/true));
+        llvm::Value *observedValue = value;
         llvm::StringRef reason;
         if (value == nullptr) {
           reason = "return_binding_missing";
@@ -6763,6 +6887,10 @@ private:
                                      "<return>", unit->Name, "return_binding");
         }
         values.push_back(value);
+        if (observedValue != nullptr &&
+            observedValue->getType() == slotType(slot)) {
+          ReturnObservationValues.emplace_back(observedValue);
+        }
       }
       if (PostSignatureCleanup && recordBinding &&
           ret->getReturnValue() != nullptr) {
@@ -8162,6 +8290,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   SignatureRewriteState signatureState;
   signatureState.ExternalPrototypes = &externalPrototypes;
   signatureState.ExternalCallsiteShapes = &externalCallsiteShapes;
+  inferIndirectCallInputs(baseRegisterSummary, signatureState.IndirectCallInputs);
   signatureState.Warnings = std::move(inferenceWarnings);
   if (options.EnableRewrite) {
     signatureState.Shapes = buildInitialSignatureShapes(

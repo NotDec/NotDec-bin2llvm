@@ -133,6 +133,50 @@ void attachTestAbi(llvm::Module &module) {
   attachTestAbiWithInputs(module, {"RDI"});
 }
 
+void attachMultiOutputTestAbi(llvm::Module &module) {
+  notdec::bin2llvm::NativeAbiSpec abi;
+  abi.PrototypeName = "__summary_ssa_multi_output_test";
+  abi.StackPointerRegister = "RSP";
+  abi.StackPointerSpace = "register";
+
+  notdec::bin2llvm::NativeAbiParamEntry input;
+  input.MinSize = 1;
+  input.MaxSize = 8;
+  input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+  input.Storage.Name = "RDI";
+  abi.Inputs.push_back(input);
+
+  auto addOutput = [&](llvm::StringRef name, uint32_t minSize,
+                       uint32_t maxSize) {
+    notdec::bin2llvm::NativeAbiParamEntry output;
+    output.MinSize = minSize;
+    output.MaxSize = maxSize;
+    output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    output.Storage.Name = name.str();
+    abi.Outputs.push_back(output);
+
+    notdec::bin2llvm::NativeAbiEffect killed;
+    killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+    killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    killed.Storage.Name = name.str();
+    abi.Effects.push_back(killed);
+  };
+  addOutput("RAX", 1, 8);
+  addOutput("RDX", 1, 8);
+  addOutput("XMM0", 1, 16);
+  addOutput("ST0", 10, 16);
+
+  for (llvm::StringRef name : {"RBX", "RBP"}) {
+    notdec::bin2llvm::NativeAbiEffect unaffected;
+    unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
+    unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    unaffected.Storage.Name = name.str();
+    abi.Effects.push_back(unaffected);
+  }
+
+  notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+}
+
 void addStackInput(notdec::bin2llvm::NativeAbiSpec &abi,
                    const std::string &space, uint64_t offset, uint32_t align,
                    uint32_t maxSize = 64) {
@@ -635,6 +679,42 @@ bool functionHasPoisonZeroDemandOperand(const llvm::Function &function) {
       if (llvm::isa<llvm::PoisonValue>(operand.get())) {
         return true;
       }
+    }
+  }
+  return false;
+}
+
+bool valueGraphContainsPoison(
+    const llvm::Value *value,
+    llvm::SmallPtrSetImpl<const llvm::Value *> &visiting) {
+  if (value == nullptr || !visiting.insert(value).second) {
+    return false;
+  }
+  if (llvm::isa<llvm::PoisonValue>(value)) {
+    return true;
+  }
+  auto *user = llvm::dyn_cast<llvm::User>(value);
+  if (user == nullptr) {
+    return false;
+  }
+  for (const llvm::Use &operand : user->operands()) {
+    if (valueGraphContainsPoison(operand.get(), visiting)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool valueGraphContainsPoison(const llvm::Value *value) {
+  llvm::SmallPtrSet<const llvm::Value *, 16> visiting;
+  return valueGraphContainsPoison(value, visiting);
+}
+
+bool functionReturnGraphsContainPoison(const llvm::Function &function) {
+  for (const llvm::BasicBlock &block : function) {
+    auto *ret = llvm::dyn_cast<llvm::ReturnInst>(block.getTerminator());
+    if (ret != nullptr && valueGraphContainsPoison(ret->getReturnValue())) {
+      return true;
     }
   }
   return false;
@@ -2088,6 +2168,109 @@ bool testIndirectCallReturnHelperIsRewritten() {
                 "indirect call return helper remained") &&
          verifyOk(module,
                   "module failed verifier after indirect call return rewrite");
+}
+
+bool testIndirectConservativeReturnShapeExcludesRdx() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-indirect-conservative-return", context);
+  attachMultiOutputTestAbi(module);
+  createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  createRegisterGlobal(module, "XMM0", llvm::Type::getIntNTy(context, 128),
+                        0x1200, 16);
+  createRegisterGlobal(module, "ST0", llvm::Type::getIntNTy(context, 80),
+                        0x1100, 10);
+
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *caller =
+      llvm::Function::Create(callerType, llvm::GlobalValue::ExternalLinkage,
+                             "uses_conservative_indirect_return", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *callee = builder.CreateIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x1234),
+      llvm::PointerType::get(context, 0), "callee.ptr");
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  builder.CreateCall(voidType, callee);
+  llvm::Value *returnedRax = loadRegister(builder, rax, "RAX", "ret_rax");
+  llvm::Value *returnedRdx = loadRegister(builder, rdx, "RDX", "ret_rdx");
+  builder.CreateRet(builder.CreateAdd(returnedRax, returnedRdx));
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+
+  bool typedIndirectReturn = false;
+  for (llvm::Instruction &inst : llvm::instructions(*caller)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call != nullptr && call->getCalledFunction() == nullptr &&
+        call->getType()->isIntegerTy(64)) {
+      typedIndirectReturn = true;
+    }
+  }
+
+  return expect(summary.CallsRewritten >= 1,
+                "indirect callsite was not rewritten") &&
+         expect(typedIndirectReturn,
+                "live RDX was incorrectly promoted to a second return") &&
+         expect(!moduleHasUsedFunctionNamed(
+                    module, "notdec.register.summary_return.i64"),
+                "indirect return helper remained") &&
+         verifyOk(module,
+                  "module failed verifier after indirect conservative return test");
+}
+
+bool testIndirectCallInputsUseLocalDefinitionEvidence() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-indirect-inputs", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  createRegisterGlobal(module, "RCX");
+  createRegisterGlobal(module, "R8");
+  createRegisterGlobal(module, "R9");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {});
+  llvm::Function *caller = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "uses_indirect_input_evidence",
+      module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 11),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 22),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 33),
+                "RDX");
+  llvm::Value *callee = builder.CreateIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x1234),
+      llvm::PointerType::get(context, 0), "callee.ptr");
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  builder.CreateCall(voidType, callee);
+  llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "ret_rax");
+  builder.CreateRet(loaded);
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+
+  unsigned indirectArgCount = 0;
+  bool rebuilt = false;
+  for (llvm::Instruction &inst : llvm::instructions(*caller)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call != nullptr && call->getCalledFunction() == nullptr) {
+      indirectArgCount = call->arg_size();
+      rebuilt = true;
+    }
+  }
+
+  return expect(summary.CallsRewritten >= 1,
+                "indirect callsite was not rewritten") &&
+         expect(rebuilt, "indirect call was not found after rewrite") &&
+         expect(indirectArgCount == 3,
+                "indirect arity did not follow LocalDefinition evidence") &&
+         verifyOk(module,
+                  "module failed verifier after indirect input evidence test");
 }
 
 bool testIntrinsicDoesNotCreateCallValue() {
@@ -8681,11 +8864,19 @@ bool testRecordedReturnValueSurvivesPartialDemandRewrite() {
   builder.CreateStore(returned, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnablePostRewriteInstCombine = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  llvm::Function *rewrittenCallee =
+      module.getFunction("return_entry_or_partial");
   return expect(summary.FunctionsRewritten >= 1,
                 "callee signature was not rewritten for RAX return") &&
          expect(summary.PartialDemandCandidates >= 1,
                 "partial return path was not seen by demand rewrite") &&
+         expect(rewrittenCallee != nullptr,
+                "rewritten callee was not found") &&
+         expect(!functionReturnGraphsContainPoison(*rewrittenCallee),
+                "partial-demand poisoned a delayed return observation") &&
          verifyOk(module,
                   "module failed verifier after return partial-demand test");
 }
@@ -9500,6 +9691,8 @@ int main() {
   ok &= testDemandedReturnCreatesCallValue();
   ok &= testExternalReturnUsesRangeCallValue();
   ok &= testIndirectCallReturnHelperIsRewritten();
+  ok &= testIndirectConservativeReturnShapeExcludesRdx();
+  ok &= testIndirectCallInputsUseLocalDefinitionEvidence();
   ok &= testIntrinsicDoesNotCreateCallValue();
   ok &= testOverwrittenStoreIsRemoved();
   ok &= testCrossBlockDeadStoreIsRemoved();
