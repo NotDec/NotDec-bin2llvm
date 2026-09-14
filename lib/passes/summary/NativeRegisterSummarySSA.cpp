@@ -6394,10 +6394,36 @@ private:
     std::vector<RegisterRangeKey> ranges = plannedRangesCovering(
         slot.Unit->Global, slot.OffsetBits, slot.SizeBits);
     llvm::DominatorTree domTree(Function);
-    llvm::Value *bits = assembleRangeReadIfDominating(
-        ranges, slot.OffsetBits, slot.SizeBits, &before, name, domTree,
-        allowUnknownSegments);
-    bits = resolve(bits);
+    llvm::Value *bits = nullptr;
+    if (ranges.empty()) {
+      // The requested slot may be narrower than the only planned range (for
+      // example a 32-bit ESI read of a 64-bit RSI store).  Read the containing
+      // range and extract the requested bits instead of failing the cover
+      // check.
+      auto plannedIt = PlannedRanges.find(slot.Unit->Global);
+      if (plannedIt != PlannedRanges.end()) {
+        for (const RegisterRangeKey &range : plannedIt->second) {
+          uint64_t rangeEnd = range.BitOffset + range.BitWidth;
+          uint64_t slotEnd = slot.OffsetBits + slot.SizeBits;
+          if (range.BitOffset <= slot.OffsetBits && rangeEnd >= slotEnd) {
+            llvm::Value *full =
+                resolve(readRangeBefore(*before.getParent(), range, &before,
+                                        domTree));
+            if (full != nullptr && full->getType() == rangeType(range)) {
+              bits = extractBitsFromIntegerValue(
+                  full, slot.SizeBits, slot.OffsetBits - range.BitOffset,
+                  &before, name);
+            }
+            break;
+          }
+        }
+      }
+    } else {
+      bits = assembleRangeReadIfDominating(
+          ranges, slot.OffsetBits, slot.SizeBits, &before, name, domTree,
+          allowUnknownSegments);
+      bits = resolve(bits);
+    }
     if (bits == nullptr) {
       return nullptr;
     }
