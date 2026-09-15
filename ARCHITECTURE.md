@@ -326,6 +326,8 @@ PcodeToLLVM
      - 规划 register range。现在是 range-aware SummarySSA，不再只有整寄存器粒度。
      - 窄 slot / 窄 range 读取可以先找完整包含它的 planned range，再用 value
        extract 截出请求的 bit 段，避免“32 位参数读 64 位寄存器”因覆盖检查失败。
+     - ST0/ST1 的 x87 window-shift load（push/pop/fxch 槽位搬移）只转移内部
+       状态，不参与真实 demand/clobber 传播。
      - 为入口值创建 canonical entry read 或 range entry read。
      - 按 CFG 构造 SSA value，必要时插入 PHI。
      - 调用点对每个 ABI 输出寄存器统一生成“调用后状态”占位（`summary_clobber`），

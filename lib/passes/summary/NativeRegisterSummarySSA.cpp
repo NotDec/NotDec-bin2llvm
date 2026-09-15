@@ -758,9 +758,65 @@ llvm::MDNode *registerAccessNode(llvm::LLVMContext &context,
   return llvm::MDNode::get(context, fields);
 }
 
+// x87 窗口移位读（push/pop/fxch 的槽位搬移）只转移窗口内部状态，不产生对
+// ST0/ST1 值的真实需求。lifting 会打 notdec.x87.window.shift 标记，但
+// InstCombine 可能重写 load 丢掉标记，因此再按 use 形态兜底识别。
+bool isX87WindowShiftLoad(
+    llvm::LoadInst &load,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+      load.getPointerOperand()->stripPointerCasts());
+  if (global == nullptr) {
+    return false;
+  }
+  auto it = units.find(global);
+  if (it == units.end()) {
+    return false;
+  }
+  const RegisterUnit &unit = it->second;
+  if (unit.Name != "ST0" && unit.Name != "ST1") {
+    return false;
+  }
+  if (load.getNumUses() == 0) {
+    return false;
+  }
+  for (llvm::User *user : load.users()) {
+    llvm::Value *value = user;
+    while (auto *cast = llvm::dyn_cast<llvm::CastInst>(value)) {
+      if (!cast->hasOneUse()) {
+        break;
+      }
+      value = *cast->user_begin();
+    }
+    bool internal = false;
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(value)) {
+      auto *target = llvm::dyn_cast<llvm::GlobalVariable>(
+          store->getPointerOperand()->stripPointerCasts());
+      if (target != nullptr && units.count(target) != 0) {
+        internal = true;
+      }
+    }
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(value)) {
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee != nullptr &&
+          isNativeX87IntrinsicName(callee->getName())) {
+        internal = true;
+      }
+    }
+    if (!internal) {
+      return false;
+    }
+  }
+  return true;
+}
+
 RegisterAccess
 registerLoad(llvm::LoadInst &load,
              const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  if (load.getMetadata("notdec.x87.window.shift") != nullptr ||
+      isX87WindowShiftLoad(load, units)) {
+    return {};
+  }
   auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
       load.getPointerOperand()->stripPointerCasts());
   if (global == nullptr) {

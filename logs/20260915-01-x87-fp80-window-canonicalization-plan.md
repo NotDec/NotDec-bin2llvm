@@ -104,3 +104,31 @@ x87 的 `i80` vs `x86_fp80` 类型不一致与 ABI 无关，i386 也有同样问
 
 - 全量 ctest：12/12 通过，包括 `realworld_fortune_i386`。
 - x86-64 行为与之前一致。
+
+## 后续修订：SummarySSA 跳过 x87 window shift load
+
+i386 fortune 在 canonicalization 之后仍有一条：
+
+```text
+notdec_native_19b0  __fprintf_chk  ST1  clobber  remaining_summary_clobber_value
+```
+
+原因是：
+
+- `x87WindowPush()` 会读取 old ST1 并传给 `notdec.x87.push`；
+- 这个 old ST1 只是 x87 窗口内部搬移，不是真实值消费；
+- `NativeRegisterSummary` 已经跳过带 `notdec.x87.window.shift` 的 load；
+- 但 `NativeRegisterSummarySSA::registerLoad()` 没有同样的跳过逻辑；
+- 于是一次外部调用后的 ST1 clobber 被当成真实读取，进入 push/pop 链并留下 warning。
+
+修复：
+
+- 在 `NativeRegisterSummarySSA` 中增加同款 `isX87WindowShiftLoad()` 兜底识别；
+- `registerLoad()` 对 window-shift load 返回空 `RegisterAccess`，不再生成/传播
+  ST0/ST1 的 clobber 占位。
+
+效果：
+
+- i386 fortune 的 `__fprintf_chk ST1` warning 消失；
+- wrk 总 warning：330 -> 318；
+- formatter 相关 warning 仍为 0。
