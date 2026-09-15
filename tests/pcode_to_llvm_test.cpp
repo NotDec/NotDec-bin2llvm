@@ -258,6 +258,65 @@ notdec::bin2llvm::PcodeOpView branchIndOp(uint64_t address) {
   return op;
 }
 
+// sleigh 对静态地址的内存写不是 CPUI_STORE，而是 "ram 空间 varnode = 值" 的
+// COPY/算术赋值。这里断言这种赋值会落成真实 store，而不是只进 SSA 缓存。
+bool testStaticMemoryWriteIsLiftedAsStore() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = 0x1000;
+  op.InstructionSize = 7;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::Copy;
+  op.OpcodeName = "COPY";
+  op.Output = ramVarnode(0x143a0, 8);
+  op.Inputs.push_back(constVarnode(0x1234, 8));
+  program.Ops.push_back(op);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "static_memory_write";
+  // native 主链用 IntToPtr 内存模型：静态地址一律是 inttoptr 常量表达式。
+  config.MemoryModel = notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr, "lowered function is missing")) {
+    return false;
+  }
+
+  bool stored = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store == nullptr) {
+      continue;
+    }
+    auto *target =
+        llvm::dyn_cast<llvm::ConstantExpr>(store->getPointerOperand());
+    if (target == nullptr ||
+        target->getOpcode() != llvm::Instruction::IntToPtr) {
+      continue;
+    }
+    auto *address = llvm::dyn_cast<llvm::ConstantInt>(target->getOperand(0));
+    if (address != nullptr && address->getZExtValue() == 0x143a0) {
+      stored = true;
+    }
+  }
+
+  if (!stored) {
+    module->print(llvm::errs(), nullptr);
+  }
+  return expect(stored, "static address write was not lifted as a store") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after static memory write test");
+}
+
 bool testUnreachablePcodeBlocksAreRemoved() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -3120,5 +3179,6 @@ int main() {
   ok &= testX87FstenvFoldsToIntrinsicCall();
   ok &= testX87FldenvFoldsToIntrinsicCall();
   ok &= testX87FabsChsFoldsToDirectUnary();
+  ok &= testStaticMemoryWriteIsLiftedAsStore();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

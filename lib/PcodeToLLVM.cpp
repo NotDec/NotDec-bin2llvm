@@ -3133,6 +3133,19 @@ private:
       }
     }
 
+    // Ghidra 的 sleigh 把静态地址的内存访问建模成 ram 空间 varnode 的读写
+    // （例如 `0x5a61: (ram,0x142e0,8) = COPY (register,0x0,8)`），而不是
+    // CPUI_STORE/CPUI_LOAD。这里的赋值必须落成真实 store，否则所有静态地址写入
+    // 只会停留在 SSA 缓存里：函数指针表、全局计数器这类写会直接从 IR 里消失。
+    // 不写回缓存，读侧继续走 load，避免跨动态写/调用读到过期的缓存值。
+    if (varnode.Space == "ram") {
+      llvm::Value *address = llvm::ConstantInt::get(
+          intType(pointerByteSize()), varnode.Offset);
+      Builder.CreateStore(resized, memoryPointer(address))
+          ->setAlignment(llvm::Align(1));
+      return;
+    }
+
     if (auto *instruction = llvm::dyn_cast<llvm::Instruction>(resized)) {
       instruction->setName(valueName(varnode));
     }
