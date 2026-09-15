@@ -174,3 +174,39 @@ build/bin/notdec-native-llvm wrk --all-confirmed --register-ssa-summary \
    直接调用提升。
 3. `http_parser_execute` 里还有 20+ 个 `inttoptr` 间接调用无法回溯到 slot
    （`%RCX.full_range.part_insert...`），属于寄存器值域问题，不在本轮范围。
+
+# 附：FUN_9990 / FUN_99d0 的定位（本轮未改完，代码已回退）
+
+这两个函数（http_parser 的 header_field / header_value 回调）仍然缺失。本轮定位：
+
+- `--no-summary-register-residue-removal` 的 IR 里，`main` 把回调地址组成
+  128 位值写进自己的 frame：
+
+  ```llvm
+  store i64 ptrtoint (ptr @FUN_99d0 to i64), ptr @RAX
+  %10 = zext i64 ptrtoint (ptr @FUN_99d0 to i64) to i128
+  call void @notdec.partial_write.i512.i128(ptr @ZMM3, i128 %10, i64 0)
+  ... 同样方式处理 @FUN_9990 ...
+  store i128 %notdec.reg.insert.lower907, ptr %notdec_stack.native.ptr2237
+  ```
+
+  也就是说地址**已经到达** frame store（06 号 log 里 "地址没到达 settings store"
+  的判断在这个版本已经不成立）。
+
+- 用临时插桩跟踪 `FUN_9990` 的 use 数：SSA pass 全程（rewrite、post-rewrite
+  InstCombine、dead-store 清理、stack frame cleanup）都保持 `uses=1`，
+  说明**不是** SSA/stack cleanup 删的。
+
+- 引用消失发生在 SSA pass 之后的 `runInstCombinePassIfEnabled()` 或其后的 pass。
+  最可能的是 InstCombine 自己的 "store 到从不被读取的 alloca" 死存储消除：
+  它用 LLVM 自己的逃逸判断，看不到我们 pass 内部的 "escaped frame" 结论。
+
+- 试过一版补丁：在 `NativeStackFrame.cpp` 的 `collectEscapedStackAllocas()` 里
+  增加"整数形式的栈地址传出去（实参/存值/返回值）也算逃逸"（`valueDerivesFromStackPointer`）。
+  结果：wrk 运行时间 82s -> 106s（+29%），define 数仍是 85，目标函数没有回来，
+  所以整段回退，没有提交。
+
+结论/下一步：要么让 "frame escaped" 这个事实以 InstCombine 能看懂的形式表达
+（例如把 `ptrtoint(gep(alloca))` 换成 `@llvm.used` 风格的保持，或在 final cleanup
+之前禁止对 `notdec_stack.native` 做 alloca 死存储消除），要么在 final cleanup 阶段
+再做一次 "escaped frame store 保护"。需要单独一轮设计和测量。
