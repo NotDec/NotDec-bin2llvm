@@ -78,6 +78,9 @@ llvm::Function *getOrInsertUnknownValueHelper(llvm::Module &module,
 
 llvm::Value *unknownValueAt(llvm::IRBuilder<> &builder, llvm::Module &module,
                             llvm::Type *type, llvm::Twine name) {
+  // Keep the unknown as an opaque helper call: freeze(poison) would be refined
+  // to a concrete value by the optimizer (see the note in
+  // NativeRegisterSummarySSA.cpp).
   return builder.CreateCall(getOrInsertUnknownValueHelper(module, type), {},
                             name);
 }

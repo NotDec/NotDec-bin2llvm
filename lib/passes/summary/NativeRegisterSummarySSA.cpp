@@ -416,6 +416,11 @@ llvm::Value *unknownValueAt(llvm::IRBuilder<> &builder, llvm::Type *type,
   if (block == nullptr || block->getModule() == nullptr) {
     return llvm::PoisonValue::get(type);
   }
+  // NOTE: freeze(poison) is *not* usable here.  LLVM is allowed to refine an
+  // unconstrained freeze to any concrete value (InstCombine turns a returned
+  // freeze(poison) into 0), which would silently replace "unknown register
+  // value" with a specific value and drop !notdec.unknown.source.  The opaque
+  // helper call is the only representation the optimizer will not fold.
   return builder.CreateCall(
       getOrInsertUnknownValueHelper(*block->getModule(), type), {}, name);
 }
