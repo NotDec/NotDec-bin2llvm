@@ -1,3 +1,4 @@
+#include "notdec-bin2llvm/NativeDataImage.h"
 #include "notdec-bin2llvm/NativeFunctionPointerPromotion.h"
 #include "notdec-bin2llvm/NativeRelocationData.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
@@ -1695,6 +1696,246 @@ bool testModifiedFunctionPointerSlotIsNotPromoted() {
                 "module failed verifier after writable slot test");
 }
 
+// Data image tests.  These exercise the second-stage relocation model: whole
+// non-executable segments become LLVM globals and inttoptr address chains are
+// rewritten to GEPs into those globals.
+
+llvm::GlobalVariable *findDataImageGlobal(llvm::Module &module,
+                                          llvm::StringRef name) {
+  return module.getNamedGlobal(name);
+}
+
+bool testDataImageSegmentBecomesGlobal() {
+  llvm::LLVMContext context;
+  llvm::Module module("data-image-segment", context);
+  module.setDataLayout("e-p:64:64");
+
+  auto *functionType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {}, false);
+  llvm::Function *caller = llvm::Function::Create(
+      functionType, llvm::GlobalValue::ExternalLinkage, "image_caller",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Constant *address = llvm::ConstantExpr::getIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x1004),
+      llvm::PointerType::get(context, 0));
+  llvm::Value *loaded =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), address);
+  builder.CreateRet(loaded);
+
+  std::vector<uint8_t> bytes = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
+  std::vector<notdec::bin2llvm::NativeDataImageSegment> segments = {
+      {0x1000, 8, false, bytes}};
+  std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot> slots;
+  std::vector<uint64_t> bases;
+  auto summary = notdec::bin2llvm::materializeNativeDataImage(
+      module, segments, slots, bases);
+
+  llvm::GlobalVariable *image = findDataImageGlobal(module, "notdec.image.0x1000");
+  bool pointerIsImageGep = false;
+  if (image != nullptr && image->hasInitializer()) {
+    for (llvm::Instruction &instruction : llvm::instructions(caller)) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (load == nullptr) {
+        continue;
+      }
+      auto *gep = llvm::dyn_cast<llvm::ConstantExpr>(load->getPointerOperand());
+      if (gep != nullptr &&
+          gep->getOpcode() == llvm::Instruction::GetElementPtr &&
+          gep->getOperand(0)->stripPointerCasts() == image) {
+        pointerIsImageGep = true;
+      }
+    }
+  }
+  bool bytesMatch = false;
+  if (image != nullptr) {
+    if (auto *array =
+            llvm::dyn_cast<llvm::ConstantDataArray>(image->getInitializer())) {
+      bytesMatch =
+          array->getRawDataValues() ==
+          llvm::StringRef(reinterpret_cast<const char *>(bytes.data()),
+                          bytes.size());
+    }
+  }
+
+  return expect(summary.SegmentsCreated == 1, "segment global was not created") &&
+         expect(summary.StaticAccesses == 1,
+                "constant inttoptr access was not rewritten") &&
+         expect(pointerIsImageGep,
+                "load pointer is not a GEP into the image global") &&
+         expect(bytesMatch, "image initializer bytes do not match the segment") &&
+         expect(!llvm::verifyModule(module, &llvm::errs()),
+                "module failed verifier after data image modeling");
+}
+
+bool testDataImageBasePlusOffsetAccess() {
+  llvm::LLVMContext context;
+  llvm::Module module("data-image-base-offset", context);
+  module.setDataLayout("e-p:64:64");
+
+  auto *functionType = llvm::FunctionType::get(
+      llvm::Type::getInt8Ty(context), {llvm::Type::getInt64Ty(context)},
+      false);
+  llvm::Function *caller = llvm::Function::Create(
+      functionType, llvm::GlobalValue::ExternalLinkage, "offset_caller",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *index = builder.CreateAnd(
+      caller->getArg(0), llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 7));
+  llvm::Value *address = builder.CreateAdd(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x2000), index);
+  llvm::Value *pointer = builder.CreateIntToPtr(
+      address, llvm::PointerType::get(context, 0));
+  llvm::Value *loaded =
+      builder.CreateLoad(llvm::Type::getInt8Ty(context), pointer);
+  builder.CreateRet(loaded);
+
+  std::vector<uint8_t> bytes(16, 0x42);
+  std::vector<notdec::bin2llvm::NativeDataImageSegment> segments = {
+      {0x2000, 16, false, bytes}};
+  std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot> slots;
+  std::vector<uint64_t> bases = {0x2000};
+  auto summary = notdec::bin2llvm::materializeNativeDataImage(
+      module, segments, slots, bases);
+
+  llvm::GlobalVariable *image = findDataImageGlobal(module, "notdec.image.0x2000");
+  bool dynamicGepUsesImage = false;
+  for (llvm::Instruction &instruction : llvm::instructions(caller)) {
+    auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&instruction);
+    if (gep == nullptr ||
+        llvm::isa<llvm::Constant>(gep->getOperand(1))) {
+      continue;
+    }
+    llvm::Value *base = gep->getPointerOperand();
+    if (auto *expression = llvm::dyn_cast<llvm::ConstantExpr>(base)) {
+      if (expression->getOpcode() == llvm::Instruction::GetElementPtr) {
+        base = expression->getOperand(0);
+      }
+    }
+    dynamicGepUsesImage |= base->stripPointerCasts() == image;
+  }
+
+  return expect(summary.BaseOffsetAccesses == 1,
+                "base+offset access was not rewritten") &&
+         expect(dynamicGepUsesImage,
+                "base+offset access is not a two-index GEP into the image") &&
+         expect(!llvm::verifyModule(module, &llvm::errs()),
+                "module failed verifier after base+offset rewriting");
+}
+
+bool testDataImageUnconfirmedBaseStaysRaw() {
+  llvm::LLVMContext context;
+  llvm::Module module("data-image-unconfirmed-base", context);
+  module.setDataLayout("e-p:64:64");
+
+  auto *functionType = llvm::FunctionType::get(
+      llvm::Type::getInt8Ty(context), {llvm::Type::getInt64Ty(context)},
+      false);
+  llvm::Function *caller = llvm::Function::Create(
+      functionType, llvm::GlobalValue::ExternalLinkage, "raw_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *address = builder.CreateAdd(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x2008),
+      caller->getArg(0));
+  llvm::Value *pointer = builder.CreateIntToPtr(
+      address, llvm::PointerType::get(context, 0));
+  llvm::Value *loaded =
+      builder.CreateLoad(llvm::Type::getInt8Ty(context), pointer);
+  builder.CreateRet(loaded);
+
+  std::vector<uint8_t> bytes(16, 0x42);
+  std::vector<notdec::bin2llvm::NativeDataImageSegment> segments = {
+      {0x2000, 16, false, bytes}};
+  std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot> slots;
+  std::vector<uint64_t> bases;
+  auto summary = notdec::bin2llvm::materializeNativeDataImage(
+      module, segments, slots, bases);
+
+  bool intToPtrKept = false;
+  for (llvm::Instruction &instruction : llvm::instructions(caller)) {
+    intToPtrKept |= llvm::isa<llvm::IntToPtrInst>(&instruction);
+  }
+
+  return expect(summary.BaseOffsetAccesses == 0,
+                "unconfirmed base was rewritten as an image address") &&
+         expect(intToPtrKept, "raw inttoptr access disappeared") &&
+         expect(!llvm::verifyModule(module, &llvm::errs()),
+                "module failed verifier after rejected base+offset rewrite");
+}
+
+bool testDataImageFunctionSlotPromotesToDirectCall() {
+  llvm::LLVMContext context;
+  llvm::Module module("data-image-function-slot", context);
+  module.setDataLayout("e-p:64:64");
+
+  auto *functionType = llvm::FunctionType::get(
+      llvm::Type::getInt64Ty(context), {llvm::Type::getInt64Ty(context)},
+      false);
+  llvm::Function *target = llvm::Function::Create(
+      functionType, llvm::GlobalValue::InternalLinkage, "image_slot_target",
+      module);
+  llvm::BasicBlock *targetEntry =
+      llvm::BasicBlock::Create(context, "entry", target);
+  llvm::IRBuilder<> targetBuilder(targetEntry);
+  targetBuilder.CreateRet(target->getArg(0));
+
+  llvm::Function *caller = llvm::Function::Create(
+      functionType, llvm::GlobalValue::ExternalLinkage, "image_slot_caller",
+      module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(callerEntry);
+  llvm::Constant *slotAddress = llvm::ConstantExpr::getIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x3008),
+      llvm::PointerType::get(context, 0));
+  llvm::Value *loaded =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), slotAddress);
+  llvm::Value *callee = builder.CreateIntToPtr(
+      loaded, llvm::PointerType::get(context, 0));
+  llvm::CallInst *call =
+      builder.CreateCall(functionType, callee, {caller->getArg(0)});
+  builder.CreateRet(call);
+
+  std::vector<uint8_t> bytes(16, 0);
+  std::vector<notdec::bin2llvm::NativeDataImageSegment> segments = {
+      {0x3000, 16, false, bytes}};
+  std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot> slots = {
+      {0x3008, 8, "image_slot_target"}};
+  std::vector<uint64_t> bases;
+  auto imageSummary = notdec::bin2llvm::materializeNativeDataImage(
+      module, segments, slots, bases);
+  auto promotionSummary =
+      notdec::bin2llvm::runNativeFunctionPointerPromotion(module);
+
+  llvm::CallBase *rewrittenCall = nullptr;
+  for (llvm::Instruction &instruction : llvm::instructions(caller)) {
+    if (auto *candidate = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+      rewrittenCall = candidate;
+    }
+  }
+
+  return expect(imageSummary.SegmentsCreated == 1,
+                "data image segment was not created") &&
+         expect(imageSummary.FunctionSlots == 1,
+                "function pointer slot was not symbolized") &&
+         expect(promotionSummary.SlotsWithKnownSingleTarget == 1,
+                "image function pointer slot was not recognized") &&
+         expect(promotionSummary.IndirectCallsPromoted == 1,
+                "call through image slot was not promoted") &&
+         expect(rewrittenCall != nullptr &&
+                    rewrittenCall->getCalledFunction() == target,
+                "call through image slot was not rewritten to the target") &&
+         expect(!llvm::verifyModule(module, &llvm::errs()),
+                "module failed verifier after image slot promotion");
+}
+
+
 bool testPartialRegisterWriteUsesPartialWriteHelper() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -3020,6 +3261,10 @@ int main() {
   ok &= testRelocatedFunctionPointerSlotBecomesGlobal();
   ok &= testFunctionPointerSlotPromotesToDirectCall();
   ok &= testModifiedFunctionPointerSlotIsNotPromoted();
+  ok &= testDataImageSegmentBecomesGlobal();
+  ok &= testDataImageBasePlusOffsetAccess();
+  ok &= testDataImageUnconfirmedBaseStaysRaw();
+  ok &= testDataImageFunctionSlotPromotesToDirectCall();
   ok &= testPartialRegisterWriteUsesPartialWriteHelper();
   ok &= testPartialRegisterReadUsesPartialReadHelper();
   ok &= testX87FildlFoldsToWindowPush();

@@ -209,7 +209,7 @@ ELF
 PcodeToLLVM
   -> attach memory map metadata
   -> attach ABI metadata
-  -> NativeRelocationData
+  -> NativeDataImage
   -> verify
   -> InstCombine + SimplifyCFG
   -> NativeRegisterSummarySSA
@@ -221,23 +221,34 @@ PcodeToLLVM
   -> write .ll / .bc
 ```
 
-### 5.1 NativeRelocationData
+### 5.1 NativeDataImage
 
 位置：
 
-- `include/notdec-bin2llvm/NativeRelocationData.h`
-- `lib/NativeRelocationData.cpp`
+- `include/notdec-bin2llvm/NativeDataImage.h`
+- `lib/NativeDataImage.cpp`
 
-这是 relocation function pointer slot 的低层建模步骤。对 discovery 已经计算出
-computed value 的 pointer-size relocation slot，pass 会建立内部 LLVM global：
+这是 data image 的低层建模步骤。对含“已确认数据地址”的非可执行 LOAD segment，
+pass 建立内部 LLVM global，initializer 是 segment 的实际字节（`.bss` 尾部补零）：
 
 ```llvm
-@notdec.reloc.0x142c0 = internal global i64 ptrtoint (ptr @sock_connect to i64)
+@notdec.image.0x135f0 = internal global <{ i64, [840 x i8], i64, ... }>
+  <{ i64 ptrtoint (ptr @sock_connect to i64), ... }>
 ```
 
-并把精确的 `inttoptr(slotAddr)` 直接 load/store 改成访问该 global。当前只覆盖
-“访问地址就是槽位地址”的情况；通过 `base + offset` 访问更大 data image 的下一
-阶段仍待补。
+- 初值类型用 packed struct：字节段用 `[k x i8]`，relocation 目标已知是本地函数
+  的 pointer-size slot 用 `i64` 字段。packed 保证字段偏移等于虚拟地址偏移，同时
+  让函数指针保持 `ptrtoint(@function)` 形式（body 不被 GlobalDCE 删除）。
+- 访问统一改写为 `getelementptr i8, ptr @notdec.image.X, i64 off`：
+  `inttoptr(C)` 是常量 GEP；`inttoptr(add C, %dyn)` 是常量 GEP 再叠一个动态
+  index，覆盖 `base + offset` 表访问。
+- 动态 `base + offset` 只在前端已确认的地址基址上改写（relocation slot 地址、
+  relocation computed value、PLT GOT 地址、模块内直接 `inttoptr(C)` 的 C）。
+  否则像 `and %x, 65535` 这种落在 segment 里的小常量会被误当成基址。
+- image 覆盖不到的 slot 继续用上一版的 `@notdec.reloc.0xADDR` 独立 global 兜底。
+
+已知边界：只有常量锚定的访问进入 image；参数、从内存读出的指针这类动态地址仍是
+裸 `inttoptr`，需要后续 IPA 值集传播才能接上。
 
 ### 5.2 NativeFunctionPointerPromotion
 
@@ -249,16 +260,20 @@ computed value 的 pointer-size relocation slot，pass 会建立内部 LLVM glob
 在签名重写之后，这个 pass 识别：
 
 ```text
-load @notdec.reloc.<slot>
+load @notdec.reloc.<slot>          (旧式独立 slot global)
+load (gep @notdec.image.X, off)    (data image 字段)
   -> inttoptr
   -> call %fn
 ```
 
 的间接调用形状。只有满足以下条件时才替换成 direct call：
 
-- slot 的 initializer 是唯一的 `ptrtoint(@function)`；
-- 模块内没有对该 slot 的未知 store，也没有把地址 escape 出去；
-- 候选目标只有一个。
+- 字段的 initializer 是唯一的 `ptrtoint(@function)`；
+- 对该 global 没有未知 store（动态 offset 的 store、地址 escape 都算未知），
+  并且没有覆盖该字段的其它 store；
+- 候选目标只有一个；
+- slot 地址没有在模块里以裸 `ConstantInt` operand 出现过（说明地址可能经参数
+  传给别的函数写过，本地分析看不到）。
 
 多目标和未知写入当前只统计 warning/counter，保留 indirect call。后续可以按
 guarded switch 的方式做保守提升。
