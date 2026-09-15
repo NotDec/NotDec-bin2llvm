@@ -1,6 +1,8 @@
 add_library(notdec-bin2llvm-core STATIC
   ModuleBuilder.cpp
   NativeAbi.cpp
+  NativeRelocationData.cpp
+  NativeFunctionPointerPromotion.cpp
   NativeExternalPrototype.cpp
   NativeRegisterPartialRead.cpp
   NativeX87Intrinsic.cpp

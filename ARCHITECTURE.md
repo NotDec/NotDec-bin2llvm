@@ -209,14 +209,59 @@ ELF
 PcodeToLLVM
   -> attach memory map metadata
   -> attach ABI metadata
+  -> NativeRelocationData
   -> verify
   -> InstCombine + SimplifyCFG
   -> NativeRegisterSummarySSA
   -> InstCombine + SimplifyCFG
+  -> NativeFunctionPointerPromotion
+  -> NativeRegisterPostRewritePeephole
   -> NativeRegisterFinalCleanup
   -> verify
   -> write .ll / .bc
 ```
+
+### 5.1 NativeRelocationData
+
+位置：
+
+- `include/notdec-bin2llvm/NativeRelocationData.h`
+- `lib/NativeRelocationData.cpp`
+
+这是 relocation function pointer slot 的低层建模步骤。对 discovery 已经计算出
+computed value 的 pointer-size relocation slot，pass 会建立内部 LLVM global：
+
+```llvm
+@notdec.reloc.0x142c0 = internal global i64 ptrtoint (ptr @sock_connect to i64)
+```
+
+并把精确的 `inttoptr(slotAddr)` 直接 load/store 改成访问该 global。当前只覆盖
+“访问地址就是槽位地址”的情况；通过 `base + offset` 访问更大 data image 的下一
+阶段仍待补。
+
+### 5.2 NativeFunctionPointerPromotion
+
+位置：
+
+- `include/notdec-bin2llvm/NativeFunctionPointerPromotion.h`
+- `lib/NativeFunctionPointerPromotion.cpp`
+
+在签名重写之后，这个 pass 识别：
+
+```text
+load @notdec.reloc.<slot>
+  -> inttoptr
+  -> call %fn
+```
+
+的间接调用形状。只有满足以下条件时才替换成 direct call：
+
+- slot 的 initializer 是唯一的 `ptrtoint(@function)`；
+- 模块内没有对该 slot 的未知 store，也没有把地址 escape 出去；
+- 候选目标只有一个。
+
+多目标和未知写入当前只统计 warning/counter，保留 indirect call。后续可以按
+guarded switch 的方式做保守提升。
 
 ### 5.1 InstCombine + SimplifyCFG
 

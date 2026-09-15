@@ -1,9 +1,12 @@
+#include "notdec-bin2llvm/NativeFunctionPointerPromotion.h"
+#include "notdec-bin2llvm/NativeRelocationData.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
@@ -1505,6 +1508,193 @@ bool testFunctionAddressConstantBecomesFunctionReference() {
                 "module failed verifier after code address materialization");
 }
 
+bool testRelocatedFunctionPointerSlotBecomesGlobal() {
+  llvm::LLVMContext context;
+  llvm::Module module("relocation-function-pointer-slot", context);
+  module.setDataLayout("e-p:64:64");
+
+  auto *slotCalleeType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {}, false);
+  llvm::Function *slotCallee = llvm::Function::Create(
+      slotCalleeType, llvm::GlobalValue::InternalLinkage, "slot_callee",
+      module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", slotCallee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  calleeBuilder.CreateRet(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 42));
+
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {}, false);
+  llvm::Function *caller =
+      llvm::Function::Create(callerType, llvm::GlobalValue::ExternalLinkage,
+                             "slot_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(callerEntry);
+  llvm::Constant *slotAddress = llvm::ConstantExpr::getIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x2000),
+      llvm::PointerType::get(context, 0));
+  builder.CreateStore(
+      llvm::ConstantExpr::getPtrToInt(slotCallee,
+                                      llvm::Type::getInt64Ty(context)),
+      slotAddress);
+  llvm::Value *loaded = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                           slotAddress);
+  builder.CreateRet(loaded);
+
+  std::vector<notdec::bin2llvm::NativeFunctionPointerSlot> slots = {
+      {0x2000, 8, "slot_callee"}};
+  auto summary =
+      notdec::bin2llvm::materializeNativeFunctionPointerSlots(module, slots);
+
+  llvm::GlobalVariable *slotGlobal =
+      module.getNamedGlobal("notdec.reloc.0x2000");
+  bool globalInitializerUsesFunction = false;
+  if (slotGlobal != nullptr && slotGlobal->hasInitializer()) {
+    if (auto *constant =
+            llvm::dyn_cast<llvm::ConstantExpr>(slotGlobal->getInitializer())) {
+      globalInitializerUsesFunction =
+          constant->getOpcode() == llvm::Instruction::PtrToInt &&
+          constant->getOperand(0)->stripPointerCasts() == slotCallee;
+    }
+  }
+  bool loadUsesGlobal = false;
+  bool storeUsesGlobal = false;
+  for (llvm::Instruction &inst : llvm::instructions(caller)) {
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      loadUsesGlobal = load->getPointerOperand() == slotGlobal;
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      storeUsesGlobal = store->getPointerOperand() == slotGlobal;
+    }
+  }
+
+  return expect(slotGlobal != nullptr, "relocation slot global missing") &&
+         expect(globalInitializerUsesFunction,
+                "relocation slot initializer is not ptrtoint(@function)") &&
+         expect(summary.SlotsCreated == 1,
+                "relocation slot creation was not counted") &&
+         expect(summary.AccessesRewritten == 2,
+                "relocation slot accesses were not rewritten") &&
+         expect(loadUsesGlobal, "load still uses inttoptr(slot)") &&
+         expect(storeUsesGlobal, "store still uses inttoptr(slot)") &&
+         expect(!llvm::verifyModule(module, &llvm::errs()),
+                "module failed verifier after relocation slot modeling");
+}
+
+bool testFunctionPointerSlotPromotesToDirectCall() {
+  llvm::LLVMContext context;
+  llvm::Module module("function-pointer-slot-promotion", context);
+  module.setDataLayout("e-p:64:64");
+
+  auto *functionType = llvm::FunctionType::get(
+      llvm::Type::getInt64Ty(context), {llvm::Type::getInt64Ty(context)},
+      false);
+  llvm::Function *target = llvm::Function::Create(
+      functionType, llvm::GlobalValue::InternalLinkage, "slot_target", module);
+  llvm::BasicBlock *targetEntry =
+      llvm::BasicBlock::Create(context, "entry", target);
+  llvm::IRBuilder<> targetBuilder(targetEntry);
+  targetBuilder.CreateRet(target->getArg(0));
+
+  auto *slot = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), /*isConstant=*/false,
+      llvm::GlobalValue::InternalLinkage,
+      llvm::ConstantExpr::getPtrToInt(target,
+                                      llvm::Type::getInt64Ty(context)),
+      "notdec.reloc.0x2000");
+
+  llvm::Function *caller =
+      llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
+                             "slot_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(callerEntry);
+  llvm::Value *loaded = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                           slot);
+  llvm::Value *callee = builder.CreateIntToPtr(
+      loaded, llvm::PointerType::get(context, 0));
+  builder.CreateCall(functionType, callee, {caller->getArg(0)});
+  builder.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
+
+  auto summary =
+      notdec::bin2llvm::runNativeFunctionPointerPromotion(module);
+  llvm::CallBase *rewrittenCall = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(caller)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+      rewrittenCall = call;
+    }
+  }
+
+  return expect(summary.SlotsWithKnownSingleTarget == 1,
+                "relocation slot was not recognized") &&
+         expect(summary.IndirectCallsPromoted == 1,
+                "indirect call was not promoted") &&
+         expect(rewrittenCall != nullptr &&
+                    rewrittenCall->getCalledFunction() == target,
+                "call was not rewritten to the direct target") &&
+         expect(!llvm::verifyModule(module, &llvm::errs()),
+                "module failed verifier after indirect call promotion");
+}
+
+bool testModifiedFunctionPointerSlotIsNotPromoted() {
+  llvm::LLVMContext context;
+  llvm::Module module("function-pointer-slot-writable", context);
+  module.setDataLayout("e-p:64:64");
+
+  auto *functionType = llvm::FunctionType::get(
+      llvm::Type::getInt64Ty(context), {}, false);
+  llvm::Function *target = llvm::Function::Create(
+      functionType, llvm::GlobalValue::InternalLinkage, "slot_target", module);
+  llvm::BasicBlock *targetEntry =
+      llvm::BasicBlock::Create(context, "entry", target);
+  llvm::IRBuilder<> targetBuilder(targetEntry);
+  targetBuilder.CreateRet(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
+
+  auto *slot = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), /*isConstant=*/false,
+      llvm::GlobalValue::InternalLinkage,
+      llvm::ConstantExpr::getPtrToInt(target,
+                                      llvm::Type::getInt64Ty(context)),
+      "notdec.reloc.0x3000");
+
+  llvm::Function *caller =
+      llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
+                             "slot_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(callerEntry);
+  llvm::Value *loaded = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                           slot);
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x1234), slot);
+  llvm::Value *callee = builder.CreateIntToPtr(
+      loaded, llvm::PointerType::get(context, 0));
+  builder.CreateCall(functionType, callee);
+  builder.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
+
+  auto summary =
+      notdec::bin2llvm::runNativeFunctionPointerPromotion(module);
+  llvm::CallBase *rewrittenCall = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(caller)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+      rewrittenCall = call;
+    }
+  }
+
+  return expect(summary.SlotsWithUnknownWrites == 1,
+                "unknown write to relocation slot was not detected") &&
+         expect(summary.IndirectCallsPromoted == 0,
+                "call through modified slot was incorrectly promoted") &&
+         expect(rewrittenCall != nullptr &&
+                    rewrittenCall->getCalledFunction() == nullptr,
+                "call through modified slot was rewritten") &&
+         expect(!llvm::verifyModule(module, &llvm::errs()),
+                "module failed verifier after writable slot test");
+}
+
 bool testPartialRegisterWriteUsesPartialWriteHelper() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -2827,6 +3017,9 @@ int main() {
   ok &= testNonX64DoesNotSuppressCallStackEffect();
   ok &= testX86PcThunkCallFoldsToConstantBase();
   ok &= testFunctionAddressConstantBecomesFunctionReference();
+  ok &= testRelocatedFunctionPointerSlotBecomesGlobal();
+  ok &= testFunctionPointerSlotPromotesToDirectCall();
+  ok &= testModifiedFunctionPointerSlotIsNotPromoted();
   ok &= testPartialRegisterWriteUsesPartialWriteHelper();
   ok &= testPartialRegisterReadUsesPartialReadHelper();
   ok &= testX87FildlFoldsToWindowPush();

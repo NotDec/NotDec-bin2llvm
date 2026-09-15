@@ -2,6 +2,8 @@
 #include "notdec-bin2llvm/LiefElfLoadImage.h"
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/NativeAnalysis.h"
+#include "notdec-bin2llvm/NativeFunctionPointerPromotion.h"
+#include "notdec-bin2llvm/NativeRelocationData.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
@@ -1260,15 +1262,18 @@ int main(int argc, char **argv) {
     }
 
     std::set<std::string> preservedFunctions;
+    std::vector<notdec::bin2llvm::NativeFunctionPointerSlot>
+        functionPointerSlots;
     if (selectedState) {
       NativeCallTargets plannedTargets = planNativeCallTargets(
           *selectedState, options->SkipRuntimeFunctions);
       for (const auto &[slot, target] : selectedState->relocatedPointers()) {
-        (void)slot;
         auto targetIt = plannedTargets.Direct.find(target);
         if (targetIt == plannedTargets.Direct.end()) {
           continue;
         }
+        functionPointerSlots.push_back(
+            {slot, selectedState->pointerSize(), targetIt->second});
         const notdec::bin2llvm::NativeFunction *function =
             selectedState->functionAt(target);
         if (function == nullptr ||
@@ -1278,6 +1283,16 @@ int main(int argc, char **argv) {
         }
         preservedFunctions.insert(targetIt->second);
       }
+    }
+    notdec::bin2llvm::NativeRelocationDataSummary relocationSummary =
+        notdec::bin2llvm::materializeNativeFunctionPointerSlots(
+            *module, functionPointerSlots);
+    if (options->PrintRegisterSSASummary) {
+      llvm::errs() << "Native relocation slots: created="
+                   << relocationSummary.SlotsCreated
+                   << " reused=" << relocationSummary.SlotsReused
+                   << " accesses=" << relocationSummary.AccessesRewritten
+                   << '\n';
     }
 
     if (llvm::verifyModule(*module, &llvm::errs())) {
@@ -1292,6 +1307,20 @@ int main(int argc, char **argv) {
     }
     if (!runInstCombinePassIfEnabled(*module, *options)) {
       return 1;
+    }
+    notdec::bin2llvm::NativeFunctionPointerPromotionSummary
+        promotionSummary =
+            notdec::bin2llvm::runNativeFunctionPointerPromotion(*module);
+    if (options->PrintRegisterSSASummary) {
+      llvm::errs() << "Native function pointer promotion: seen="
+                   << promotionSummary.IndirectCallsSeen
+                   << " promoted=" << promotionSummary.IndirectCallsPromoted
+                   << " slots="
+                   << promotionSummary.SlotsWithKnownSingleTarget
+                   << " unknown_writes="
+                   << promotionSummary.SlotsWithUnknownWrites
+                   << " multiple_targets="
+                   << promotionSummary.SlotsWithMultipleTargets << '\n';
     }
     if (!runPostRewritePeepholePass(*module, *options)) {
       return 1;
