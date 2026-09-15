@@ -185,6 +185,10 @@ ELF
 
 - register 是 LLVM global，例如 `@RAX`、`@RDI`、`@ZMM0`。
 - RAM 访问用 `inttoptr` 或 global-array memory model。
+- 静态地址的内存访问同样是真实 load/store：sleigh 把 `*[ram]:size <const>` 建模成
+  ram 空间 varnode 的读/写（不是 `CPUI_LOAD`/`CPUI_STORE`），lifter 的 `read()`/
+  `write()` 都会把它落成 `load`/`store`，例如
+  `store i64 %v, ptr inttoptr (i64 0x143a0 to ptr)`。
 - p-code unique varnode 变成局部 SSA value。
 - partial register access 用 intrinsic 表示：
   - `notdec.partial_read.<full>.<part>(ptr @REG, offset)`
