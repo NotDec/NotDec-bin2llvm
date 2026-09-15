@@ -206,6 +206,11 @@ build/bin/notdec-native-llvm wrk --all-confirmed --register-ssa-summary \
   结果：wrk 运行时间 82s -> 106s（+29%），define 数仍是 85，目标函数没有回来，
   所以整段回退，没有提交。
 
+（更正：11 号 log 把这条追到底了——根因是 `main` 里 settings 指针在寄存器模型里被
+重建成 `notdec.register.summary_clobber` 的 unknown，frame 在 IR 里不再有读它的
+指针，于是 InstCombine 的"只写不读 alloca"消除是合法的。见
+`logs/20260915-11-native-lifting-performance-plan.md` 最后一节。）
+
 结论/下一步：要么让 "frame escaped" 这个事实以 InstCombine 能看懂的形式表达
 （例如把 `ptrtoint(gep(alloca))` 换成 `@llvm.used` 风格的保持，或在 final cleanup
 之前禁止对 `notdec_stack.native` 做 alloca 死存储消除），要么在 final cleanup 阶段
