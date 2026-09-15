@@ -4169,30 +4169,38 @@ private:
         break;
       }
       case llvm::Instruction::Shl:
-        if (auto *shift =
-                llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
-          unsigned amount = shift->getLimitedValue();
+      case llvm::Instruction::LShr:
+      case llvm::Instruction::AShr: {
+        auto *shift = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1));
+        if (shift == nullptr) {
+          // 动态移位量没有逐位映射关系：任何源位都可能被移到 demanded 位置，
+          // 移位量本身也完全参与结果。两者都必须保持全量 demand，否则
+          // partial demand 会把移位量整块替换成 poison，结果随之变成 poison，
+          // InstCombine/SimplifyCFG 再把依赖它的分支折叠成常量，删掉另一条
+          // 分支上的真实调用和基本块。
+          enqueue(inst->getOperand(0), fullMaskFor(inst->getOperand(0)));
+          enqueue(inst->getOperand(1), fullMaskFor(inst->getOperand(1)));
+          break;
+        }
+        unsigned amount = shift->getLimitedValue();
+        switch (inst->getOpcode()) {
+        case llvm::Instruction::Shl:
           enqueue(inst->getOperand(0),
                   shlSourceDemand(inputDemand, amount,
                                   valueBitWidth(inst->getOperand(0))));
-        } else {
-          enqueue(inst->getOperand(0), inputDemand);
-        }
-        break;
-      case llvm::Instruction::LShr:
-        if (auto *shift =
-                llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1))) {
-          unsigned amount = shift->getLimitedValue();
+          break;
+        case llvm::Instruction::LShr:
           enqueue(inst->getOperand(0),
                   lshrSourceDemand(inputDemand, amount,
                                    valueBitWidth(inst->getOperand(0))));
-        } else {
+          break;
+        default:
+          // AShr 符号位扩散没有逐位逆映射，保持原有 demand 行为。
           enqueue(inst->getOperand(0), inputDemand);
+          break;
         }
         break;
-      case llvm::Instruction::AShr:
-        enqueue(inst->getOperand(0), inputDemand);
-        break;
+      }
       case llvm::Instruction::PtrToInt:
       case llvm::Instruction::IntToPtr:
       case llvm::Instruction::AddrSpaceCast:

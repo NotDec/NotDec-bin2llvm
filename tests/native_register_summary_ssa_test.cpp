@@ -9060,6 +9060,85 @@ bool testPartialDemandPoisonReplacementIsMarked() {
                   "module failed verifier after partial poison metadata test");
 }
 
+// 动态移位量（`lshr %value, %amount`，例如 bt 展开）没有逐位需求映射：
+// partial demand 必须保留移位量本身，把它整块替换成 poison 会让结果变成
+// poison，后续 InstCombine/SimplifyCFG 会把依赖它的分支折叠成常量，丢掉另一条
+// 分支上的真实代码。这里断言移位量在 demand 重写后仍然是活值。
+bool testPartialDemandKeepsDynamicShiftAmount() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-demand-dynamic-shift", context);
+  // RDX 必须是 ABI 输入，入口读才对应真实参数；否则入口读会先被换成 unknown。
+  attachTestAbiWithInputs(module, {"RDI", "RDX"});
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "partial_dynamic_shift", module);
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "dynamic_shift_side_effect",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *taken =
+      llvm::BasicBlock::Create(context, "taken", function);
+  llvm::BasicBlock *fallthrough =
+      llvm::BasicBlock::Create(context, "fallthrough", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Type *valueType = rdx->getValueType();
+  llvm::Value *value = loadRegister(builder, rdx, "RDX", "value");
+  llvm::Value *amount = builder.CreateAnd(
+      value, llvm::ConstantInt::get(valueType, 31), "amount");
+  llvm::Value *shifted = builder.CreateLShr(value, amount, "shifted");
+  llvm::Value *bit = builder.CreateAnd(
+      shifted, llvm::ConstantInt::get(valueType, 1), "bit");
+  llvm::Value *flag = builder.CreateICmpNE(
+      bit, llvm::ConstantInt::get(valueType, 0), "flag");
+  storeRegister(builder, rdx, shifted, "RDX");
+  builder.CreateCondBr(flag, taken, fallthrough);
+
+  // 两条分支必须不一样，否则 SimplifyCFG 会把分支连同条件一起折掉，
+  // 测不到 partial demand 对移位量的处理。
+  builder.SetInsertPoint(taken);
+  builder.CreateCall(callee, {});
+  builder.CreateRetVoid();
+  builder.SetInsertPoint(fallthrough);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  // 签名重写会换掉 Function 对象，按名字重新取。
+  function = module.getFunction("partial_dynamic_shift");
+  unsigned shiftCount = 0;
+  bool poisonedShiftOperand = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (inst.getOpcode() != llvm::Instruction::LShr &&
+        inst.getOpcode() != llvm::Instruction::Shl) {
+      continue;
+    }
+    ++shiftCount;
+    for (llvm::Use &operand : inst.operands()) {
+      poisonedShiftOperand |= llvm::isa<llvm::PoisonValue>(operand.get());
+    }
+  }
+  // 移位量被替换成 poison 时整条 `shift -> and -> icmp -> br` 链都会被
+  // 常量折叠掉，所以 shiftCount 也会掉到 0；两种表现都算失败。
+  if (shiftCount == 0 || poisonedShiftOperand) {
+    module.print(llvm::errs(), nullptr);
+  }
+
+  return expect(summary.PartialDemandCandidates >= 1,
+                "dynamic shift store was not seen as a partial demand "
+                "candidate") &&
+         expect(shiftCount >= 1,
+                "dynamic shift disappeared from the function") &&
+         expect(!poisonedShiftOperand,
+                "dynamic shift operand was replaced with poison") &&
+         verifyOk(module,
+                  "module failed verifier after dynamic shift demand test");
+}
+
 bool testPartialZmmKeepHighStoreIsDemandRewritten() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-zmm-demand", context);
@@ -9958,6 +10037,7 @@ int main() {
   ok &= testPartialReadHelperNameSurvivesSignatureRewrite();
   ok &= testRecordedReturnValueSurvivesPartialDemandRewrite();
   ok &= testPartialDemandPoisonReplacementIsMarked();
+  ok &= testPartialDemandKeepsDynamicShiftAmount();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();
