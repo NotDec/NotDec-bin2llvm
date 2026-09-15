@@ -255,6 +255,32 @@ Native data image: segments=2 skipped=0 slots=20 static=78 base_offset=3 fallbac
 - lighttpd / memcached / tmux / redis / python `--decode-seed-limit 20` 抽查
   segment 数与 IR 规模。
 
+# 评分与下一步
+
+- 实现效果：7/10。`.rodata`/`.data`/`.got`/`.bss` 现在是真实 LLVM object，
+  常量地址和 `base + offset` 访问都落在同一个 object 里；函数指针槽位保持
+  `ptrtoint(@function)`；wrk 的 promotion 没有退化，warning/residue 完全不变。
+  扣分点：动态地址（参数、从 image 读出的指针）仍然分叉在裸 `inttoptr` 上，
+  大目标上 `promoted` 都是 0（被动态 store 的保守 Unknown 挡住）。
+- 复杂度：7/10。一个 pass 450 行左右，规则集中；但白名单和 addend provenance
+  两条规则都是实现中踩坑加上的，维护者需要理解"什么才算地址"。
+- 维护成本：6/10。guarded promotion 需要复用这里 image 字段的枚举和写分析；
+  IPA 值集传播要接在 `resolve()` 上。
+
+下一步（按优先级）：
+
+1. **guarded multi-target promotion**：把 `load (gep @image, base+%idx)` 的候选
+   目标集合做成 `icmp/switch + fallback indirect call`，这样 `unknown_writes`
+   和 `multiple_targets` 不再一刀切地挡住提升；需要先能枚举 "table 区间内的
+   槽位集合"。
+2. **跨函数参数地址传播**：`call @f(i64 &g)` 之后 callee 的
+   `inttoptr(%param)` 还接不上；做一个保守的 IPA（所有直接调用点一致才传播，
+   地址 escape 就放弃）。
+3. `@llvm.used` 兜底移除：等 data image 里的 `ptrtoint(@function)` 覆盖了所有
+   真实表引用之后再删。
+4. FUN_a260 的 `FS_OFFSET` residue：和本轮发现的 TLS lowering 问题同源
+   （有些 `%fs:` 访问被表示成裸偏移），可以一起看。
+
 # 实现记录（2026-09-15）
 
 ## 文件
@@ -337,16 +363,16 @@ Native function pointer promotion: seen=54 promoted=20 slots=18 unknown_writes=0
 `--decode-seed-limit 20 --no-register-ssa-pass`（大目标在 SummarySSA 上本来就
 verify 失败，这是改动前就存在的情况，用一个能跑完的配置看 data image 规模）：
 
-| 目标 | segments | slots | static | base_offset | unresolved | promotion |
-| --- | --- | --- | --- | --- | --- | --- |
-| memcached | 3 | 48 | 1730 | 1223 | 11043 | seen=55 promoted=0 |
-| tmux | 见运行记录 | | | | | |
-| redis | 见运行记录 | | | | | |
-| python3.12 | 见运行记录 | | | | | |
+| 目标 | segments | slots | static | base_offset | unresolved | promotion | 备注 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| memcached | 3 | 48 | 1724 | 46 | 11935 | seen=55 promoted=0 | 修 addend 前 base_offset=1627 |
+| tmux | 3 | 505 | 1259 | 6474 | 55312 | seen=100 promoted=0 | IR 68.7MB，403s / RSS 1.05GB |
+| lighttpd | 2 | 12 | 403 | 0 | 19948 | seen=117 promoted=0 | 178s / RSS 358MB，IR 17.7MB |
 
-memcached 的 `base_offset=1223` 说明白名单基址 + 动态 index 的真实表访问已经
-接上；`promoted=0` 是因为该配置下动态 GEP store 把整个 segment 标成
-Unknown（保守），guarded promotion 阶段再处理。
+memcached 的 `base_offset=46` 说明白名单基址 + 动态 index 的真实表访问已经接上
+（修 addend 规则前是 1627，其中大部分是 FS/RSP 误判）；`promoted=0` 是因为该
+配置下动态 GEP store 把整个 segment 标成 Unknown（保守），guarded promotion
+阶段再处理。tmux 有 505 个函数指针槽位，说明 pointer table 规模可以很大。
 
 # 风险
 
