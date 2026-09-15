@@ -263,6 +263,8 @@ PcodeToLLVM
 5. **canonicalizeRegisterPointerPhiLoads**
    - 修 InstCombine 可能生成的 register pointer PHI load。
    - 让后续 register summary 能继续按 register global 识别访问。
+   - x86-64 上同时把 ST0/ST1 的 `x86_fp80` load/store 规范回 `i80` + bitcast，
+     避免 `registerLoad/registerStore` 因 `x86_fp80 != i80` 而忽略 x87 窗口访问。
 
 6. **第一遍 NativeRegisterSummary**
    - 入口：`runNativeRegisterSummary(...)`。

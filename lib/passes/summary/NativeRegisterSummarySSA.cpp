@@ -889,6 +889,72 @@ uint64_t canonicalizeRegisterPointerPhiLoads(
   return rewritten;
 }
 
+uint64_t canonicalizeX87WindowAccesses(
+    llvm::Module &module,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+  std::vector<llvm::Instruction *> accesses;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+      auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+      if (load == nullptr && store == nullptr) {
+        continue;
+      }
+      llvm::Value *pointer = load != nullptr ? load->getPointerOperand()
+                                             : store->getPointerOperand();
+      llvm::GlobalVariable *global = registerGlobalFromValue(pointer, units);
+      if (global == nullptr) {
+        continue;
+      }
+      const RegisterUnit &unit = units.find(global)->second;
+      if (unit.Name != "ST0" && unit.Name != "ST1") {
+        continue;
+      }
+      llvm::Type *accessType = load != nullptr ? load->getType()
+                                               : store->getValueOperand()
+                                                     ->getType();
+      if (accessType->isX86_FP80Ty()) {
+        accesses.push_back(&inst);
+      }
+    }
+  }
+
+  uint64_t rewritten = 0;
+  for (llvm::Instruction *inst : accesses) {
+    if (inst->getParent() == nullptr) {
+      continue;
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(inst)) {
+      llvm::IRBuilder<> builder(load);
+      auto *bits = builder.CreateLoad(
+          llvm::IntegerType::get(module.getContext(), 80),
+          load->getPointerOperand(), "x87.fp80.bits");
+      bits->setAlignment(load->getAlign());
+      bits->copyMetadata(*load);
+      llvm::Value *value =
+          builder.CreateBitCast(bits, load->getType(), "x87.fp80.value");
+      load->replaceAllUsesWith(value);
+      load->eraseFromParent();
+      ++rewritten;
+      continue;
+    }
+    auto *store = llvm::cast<llvm::StoreInst>(inst);
+    llvm::IRBuilder<> builder(store);
+    llvm::Value *bits = builder.CreateBitCast(
+        store->getValueOperand(),
+        llvm::IntegerType::get(module.getContext(), 80), "x87.fp80.bits");
+    auto *newStore = builder.CreateStore(bits, store->getPointerOperand());
+    newStore->setAlignment(store->getAlign());
+    newStore->copyMetadata(*store);
+    store->eraseFromParent();
+    ++rewritten;
+  }
+  return rewritten;
+}
+
 bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
   llvm::Function *callee = call.getCalledFunction();
   return callee != nullptr &&
@@ -8425,6 +8491,9 @@ runNativeRegisterSummarySSA(llvm::Module &module,
     printNativeRegisterPreSummaryPeepholeSummary(peepholeSummary, llvm::errs());
   }
   AbiFacts abi = collectAbiFacts(module, units);
+  if (isLikelyX86_64SysVAbi(abi)) {
+    (void)canonicalizeX87WindowAccesses(module, units);
+  }
 
   NativeRegisterSummaryOptions baseSummaryOptions;
   baseSummaryOptions.AttachMetadata = false;
