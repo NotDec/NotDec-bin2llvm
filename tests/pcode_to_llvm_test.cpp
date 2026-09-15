@@ -1869,6 +1869,56 @@ bool testDataImageUnconfirmedBaseStaysRaw() {
                 "module failed verifier after rejected base+offset rewrite");
 }
 
+bool testDataImageRejectsRegisterBaseAddend() {
+  llvm::LLVMContext context;
+  llvm::Module module("data-image-register-base", context);
+  module.setDataLayout("e-p:64:64");
+
+  auto *fsOffset = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), /*isConstant=*/false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "FS_OFFSET");
+  fsOffset->setMetadata(
+      "notdec.register",
+      llvm::MDNode::get(context, {llvm::MDString::get(context, "FS_OFFSET")}));
+
+  auto *functionType = llvm::FunctionType::get(
+      llvm::Type::getInt64Ty(context), {}, false);
+  llvm::Function *caller = llvm::Function::Create(
+      functionType, llvm::GlobalValue::ExternalLinkage, "tls_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *fsBase =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsOffset);
+  llvm::Value *address = builder.CreateAdd(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x4000), fsBase);
+  llvm::Value *pointer = builder.CreateIntToPtr(
+      address, llvm::PointerType::get(context, 0));
+  llvm::Value *loaded =
+      builder.CreateLoad(llvm::Type::getInt64Ty(context), pointer);
+  builder.CreateRet(loaded);
+
+  std::vector<uint8_t> bytes(16, 0);
+  std::vector<notdec::bin2llvm::NativeDataImageSegment> segments = {
+      {0x4000, 16, false, bytes}};
+  std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot> slots;
+  std::vector<uint64_t> bases;
+  auto summary = notdec::bin2llvm::materializeNativeDataImage(
+      module, segments, slots, bases);
+
+  bool intToPtrKept = false;
+  for (llvm::Instruction &instruction : llvm::instructions(caller)) {
+    intToPtrKept |= llvm::isa<llvm::IntToPtrInst>(&instruction);
+  }
+
+  return expect(summary.BaseOffsetAccesses == 0,
+                "register base addend was treated as a data index") &&
+         expect(intToPtrKept,
+                "TLS-based access was rewritten into the data image") &&
+         expect(!llvm::verifyModule(module, &llvm::errs()),
+                "module failed verifier after TLS base rejection");
+}
+
 bool testDataImageFunctionSlotPromotesToDirectCall() {
   llvm::LLVMContext context;
   llvm::Module module("data-image-function-slot", context);
@@ -3264,6 +3314,7 @@ int main() {
   ok &= testDataImageSegmentBecomesGlobal();
   ok &= testDataImageBasePlusOffsetAccess();
   ok &= testDataImageUnconfirmedBaseStaysRaw();
+  ok &= testDataImageRejectsRegisterBaseAddend();
   ok &= testDataImageFunctionSlotPromotesToDirectCall();
   ok &= testPartialRegisterWriteUsesPartialWriteHelper();
   ok &= testPartialRegisterReadUsesPartialReadHelper();

@@ -90,6 +90,71 @@ std::string slotGlobalName(uint64_t address) {
   return os.str();
 }
 
+// A dynamic addend must be an index, not another address space base.  TLS and
+// the native stack frame reach inttoptr chains as register globals or stack
+// addresses; combining one of those with a data address would silently
+// redirect TLS/stack accesses into the image (for example the x86-64 stack
+// guard access "add 40, FS_OFFSET" where 40 is also a genuine inttoptr target
+// inside the ELF header segment).
+bool dynamicAddendIsAddressBase(llvm::Value *value, unsigned depth = 0) {
+  if (value == nullptr || depth > MaxAddressChainDepth) {
+    return true;
+  }
+  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(value)) {
+    llvm::Value *pointer = load->getPointerOperand()->stripPointerCasts();
+    auto *global = llvm::dyn_cast<llvm::GlobalVariable>(pointer);
+    return global != nullptr && global->hasMetadata("notdec.register");
+  }
+  if (auto *argument = llvm::dyn_cast<llvm::Argument>(value)) {
+    llvm::StringRef name = argument->getName();
+    for (llvm::StringRef prefix : {"RSP", "ESP", "RBP", "EBP"}) {
+      if (name.starts_with(prefix)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (llvm::isa<llvm::AllocaInst>(value)) {
+    return true;
+  }
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      if (dynamicAddendIsAddressBase(incoming, depth + 1)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  auto *op = llvm::dyn_cast<llvm::Operator>(value);
+  if (op == nullptr) {
+    return false;
+  }
+  switch (op->getOpcode()) {
+  case llvm::Instruction::Add:
+  case llvm::Instruction::Sub:
+  case llvm::Instruction::Or:
+  case llvm::Instruction::Xor:
+  case llvm::Instruction::And:
+  case llvm::Instruction::Select:
+    for (const llvm::Use &operand : op->operands()) {
+      if (dynamicAddendIsAddressBase(operand.get(), depth + 1)) {
+        return true;
+      }
+    }
+    return false;
+  case llvm::Instruction::ZExt:
+  case llvm::Instruction::SExt:
+  case llvm::Instruction::Trunc:
+  case llvm::Instruction::PtrToInt:
+    return dynamicAddendIsAddressBase(op->getOperand(0), depth + 1);
+  case llvm::Instruction::GetElementPtr:
+    // The addend is itself an address instead of an index.
+    return true;
+  default:
+    return false;
+  }
+}
+
 struct ResolvedAddress {
   const Region *Target = nullptr;
   int64_t Offset = 0;
@@ -265,7 +330,9 @@ private:
                        NativeDataImageSummary &summary) {
     ResolvedAddress resolved = resolve(instruction.getOperand(0), 0);
     if (!resolved.Valid ||
-        (resolved.Dynamic != nullptr && !resolved.BaseKnown)) {
+        (resolved.Dynamic != nullptr &&
+         (!resolved.BaseKnown ||
+          dynamicAddendIsAddressBase(resolved.Dynamic)))) {
       ++summary.UnresolvedIntToPtrs;
       return;
     }

@@ -245,6 +245,11 @@ pass 建立内部 LLVM global，initializer 是 segment 的实际字节（`.bss`
 - 动态 `base + offset` 只在前端已确认的地址基址上改写（relocation slot 地址、
   relocation computed value、PLT GOT 地址、模块内直接 `inttoptr(C)` 的 C）。
   否则像 `and %x, 65535` 这种落在 segment 里的小常量会被误当成基址。
+- 动态 addend 还必须是 index，不能是别的地址空间基址：
+  `dynamicAddendIsAddressBase()` 拒绝 load 自 `!notdec.register` global
+  （`FS_OFFSET`/`GS_OFFSET`/`RSP`）、`RSP.entry` 这类参数、alloca/GEP。
+  否则 `mov rax, fs:0x28` 的 `add 40, %FS_OFFSET` 会被改写成
+  `@notdec.image.0x0 + 40 + %FS_OFFSET`。
 - image 覆盖不到的 slot 继续用上一版的 `@notdec.reloc.0xADDR` 独立 global 兜底。
 
 已知边界：只有常量锚定的访问进入 image；参数、从内存读出的指针这类动态地址仍是

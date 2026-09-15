@@ -101,6 +101,36 @@ object，顺便把 relocation slot 的初值（函数指针、字符串指针）
 同类风险还有 `and i64 %x, 65535`：`0xffff` 落在 wrk `.rodata` 的
 `0xf000..0x10c82` 内。这也是本轮不做全局常量改写的原因。
 
+## 动态 addend 不能是别的地址空间（memcached 抽查发现）
+
+memcached 抽查时 `base_offset` 一度是 1627，检查 IR 发现里面有：
+
+```llvm
+; x86-64 stack guard：mov rax, fs:0x28
+%FS_OFFSET = load i64, ptr @FS_OFFSET
+%notdec.image.ptr = getelementptr i8, ptr getelementptr (i8, ptr @notdec.image.0x0, i64 40), i64 %FS_OFFSET
+```
+
+以及 `add 8, %RSP` → `@notdec.image.0x0 + 8 + %RSP`。原因有两层：
+
+1. 这些是 `%fs:0x28` / `[rsp+8]` 访问，lowering 里有一部分被表示成裸
+   `inttoptr (i64 40)` / `inttoptr (i64 8)`（TLS 偏移），这些常量按
+   “直接 inttoptr 就是地址”规则进了确认基址集合；
+2. 常量 8/16/40 又恰好落在 `@notdec.image.0x0`（ELF header segment）里，于是
+   `add 40, %FS_OFFSET` 被当成 “image + 40 + FS 基址”。
+
+修法：动态访问除了要求常量基址已确认，还要求 **addend 不是别的地址空间基址**。
+`dynamicAddendIsAddressBase()` 沿 `add/sub/or/xor/and/zext/sext/trunc/ptrtoint/
+phi/select` 走一遍，遇到以下情况就拒绝：
+
+- load 自带 `!notdec.register` metadata 的 global（`@FS_OFFSET`、`@GS_OFFSET`、
+  `@RSP` 等寄存器模型 global）；
+- 参数名以 `RSP/ESP/RBP/EBP` 开头（SSA 后的 `%RSP.entry`）；
+- `alloca` 或 `getelementptr`（addend 本身就是地址，不是 index）。
+
+注意只查 addend，不查常量基址：`&settings + index`（index 是寄存器/栈上读出的
+整数）仍然会改写。
+
 ## 已知语义边界（明确记录，不在本轮修）
 
 改写后，**常量地址访问**落在 image object 上，**动态地址访问**（参数、
