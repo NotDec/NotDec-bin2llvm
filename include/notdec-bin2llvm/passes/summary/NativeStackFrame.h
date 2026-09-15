@@ -42,6 +42,11 @@ struct NativeStackFrameCleanupSummary {
   uint64_t StackAllocaLoadsRemoved = 0;
   uint64_t StackAllocaStoresRemoved = 0;
   uint64_t StackAllocasRemoved = 0;
+  // Native frames whose address escapes (a pointer into the frame is passed to
+  // a call, converted to an integer, stored, ...).  Stores into those frames
+  // are never treated as dead.
+  uint64_t EscapedStackObjects = 0;
+  uint64_t EscapedFrameStoresKept = 0;
 };
 
 // Summary chain stack handling.  It only localizes fixed negative offsets from

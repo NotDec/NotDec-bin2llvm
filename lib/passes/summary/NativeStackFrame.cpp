@@ -607,6 +607,175 @@ bool stackAllocaPointer(llvm::Value *value) {
   return gep != nullptr && stackAllocaPointer(gep->getPointerOperand());
 }
 
+llvm::AllocaInst *stackAllocaBase(llvm::Value *value) {
+  value = value->stripPointerCasts();
+  if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(value)) {
+    if (alloca->hasName() &&
+        alloca->getName().starts_with("notdec_stack.native")) {
+      return alloca;
+    }
+    return nullptr;
+  }
+  if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value)) {
+    return stackAllocaBase(gep->getPointerOperand());
+  }
+  return nullptr;
+}
+
+bool constantCarriesFunctionAddress(llvm::Constant *constant) {
+  if (constant == nullptr) {
+    return false;
+  }
+  if (auto *expression = llvm::dyn_cast<llvm::ConstantExpr>(constant)) {
+    if (expression->getOpcode() == llvm::Instruction::PtrToInt &&
+        expression->getNumOperands() == 1 &&
+        llvm::isa<llvm::Function>(expression->getOperand(0))) {
+      return true;
+    }
+    for (const llvm::Use &operand : expression->operands()) {
+      if (constantCarriesFunctionAddress(
+              llvm::dyn_cast<llvm::Constant>(operand.get()))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Register state that only lives in the register model: entry-state reads, call
+// clobbers, partial reads, and the bit manipulation that rebuilds them.  Such a
+// value is a spill when stored into the frame, not frame content, so it keeps
+// the plain "dead unless locally loaded" rule even in an escaped frame.
+// Anything else (function addresses, memory loads, arguments, real call
+// results) is observable by a callee and must be kept.
+bool valueIsRegisterSpill(llvm::Value *value, unsigned depth = 0) {
+  if (value == nullptr || depth > 8) {
+    return false;
+  }
+  if (llvm::isa<llvm::Argument>(value)) {
+    return false;
+  }
+  if (auto *constant = llvm::dyn_cast<llvm::Constant>(value)) {
+    return false;
+  }
+  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(value)) {
+    auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+        load->getPointerOperand()->stripPointerCasts());
+    return global != nullptr && global->hasMetadata("notdec.register");
+  }
+  if (auto *call = llvm::dyn_cast<llvm::CallBase>(value)) {
+    llvm::Function *callee = call->getCalledFunction();
+    if (callee == nullptr) {
+      return false;
+    }
+    llvm::StringRef name = callee->getName();
+    return name.starts_with("notdec.register.") ||
+           name.starts_with("notdec.reg.") ||
+           name.starts_with("notdec.partial_read.") ||
+           name.starts_with("notdec.partial_write.") ||
+           name.starts_with("notdec.unknown.");
+  }
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+    bool sawRegister = false;
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      if (llvm::isa<llvm::Constant>(incoming)) {
+        continue;
+      }
+      if (!valueIsRegisterSpill(incoming, depth + 1)) {
+        return false;
+      }
+      sawRegister = true;
+    }
+    return sawRegister;
+  }
+  auto *op = llvm::dyn_cast<llvm::Operator>(value);
+  if (op == nullptr) {
+    return false;
+  }
+  switch (op->getOpcode()) {
+  case llvm::Instruction::Add:
+  case llvm::Instruction::Sub:
+  case llvm::Instruction::And:
+  case llvm::Instruction::Or:
+  case llvm::Instruction::Xor:
+  case llvm::Instruction::Shl:
+  case llvm::Instruction::LShr:
+  case llvm::Instruction::AShr:
+  case llvm::Instruction::Select:
+  case llvm::Instruction::ZExt:
+  case llvm::Instruction::SExt:
+  case llvm::Instruction::Trunc:
+  case llvm::Instruction::BitCast:
+  case llvm::Instruction::GetElementPtr: {
+    bool sawRegister = false;
+    for (const llvm::Use &operand : op->operands()) {
+      auto *constant = llvm::dyn_cast<llvm::Constant>(operand.get());
+      if (constant != nullptr) {
+        if (constantCarriesFunctionAddress(constant)) {
+          return false;
+        }
+        continue;
+      }
+      if (!valueIsRegisterSpill(operand.get(), depth + 1)) {
+        return false;
+      }
+      sawRegister = true;
+    }
+    return sawRegister;
+  }
+  default:
+    return false;
+  }
+}
+
+// A native frame whose address is used for anything other than memory accesses
+// and pointer arithmetic can be read or written by a callee, so none of its
+// stores are provably dead.  The escape set is object (alloca) level: passing
+// one field of the frame by pointer makes the whole object address-taken.
+std::set<llvm::AllocaInst *>
+collectEscapedStackAllocas(llvm::Function &function) {
+  std::set<llvm::AllocaInst *> escaped;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    for (llvm::Use &operand : inst.operands()) {
+      llvm::Value *value = operand.get();
+      llvm::AllocaInst *alloca = stackAllocaBase(value);
+      if (alloca == nullptr) {
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (load->getPointerOperand() == value) {
+          continue;
+        }
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        if (store->getPointerOperand() == value) {
+          continue;
+        }
+      }
+      if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&inst)) {
+        if (gep->getPointerOperand() == value) {
+          continue;
+        }
+      }
+      // Only pointer-preserving casts stay inside the object.  PtrToIntInst is
+      // also a CastInst, and converting the frame address to an integer is a
+      // real escape (it may be handed to a callee or stored).
+      if (auto *cast = llvm::dyn_cast<llvm::BitCastInst>(&inst)) {
+        if (cast->getOperand(0) == value) {
+          continue;
+        }
+      }
+      if (auto *cast = llvm::dyn_cast<llvm::AddrSpaceCastInst>(&inst)) {
+        if (cast->getOperand(0) == value) {
+          continue;
+        }
+      }
+      escaped.insert(alloca);
+    }
+  }
+  return escaped;
+}
+
 bool stackAllocaStoreIsLoaded(llvm::StoreInst &store,
                               const std::vector<llvm::LoadInst *> &loads) {
   llvm::Value *storePointer = store.getPointerOperand()->stripPointerCasts();
@@ -620,6 +789,8 @@ bool stackAllocaStoreIsLoaded(llvm::StoreInst &store,
 
 void cleanupStackAllocaAccesses(llvm::Function &function,
                                 NativeStackFrameCleanupSummary &summary) {
+  const std::set<llvm::AllocaInst *> escaped = collectEscapedStackAllocas(function);
+  summary.EscapedStackObjects += escaped.size();
   bool changed = true;
   while (changed) {
     changed = false;
@@ -675,6 +846,15 @@ void cleanupStackAllocaAccesses(llvm::Function &function,
       }
     }
     for (llvm::StoreInst *store : stackStores) {
+      // An escaped frame can be read by a callee, so its content stores are
+      // never dead.  Pure register spills keep the plain liveness rule: they
+      // are caller/callee register bookkeeping, not frame content.
+      llvm::AllocaInst *alloca = stackAllocaBase(store->getPointerOperand());
+      if (alloca != nullptr && escaped.count(alloca) != 0 &&
+          !valueIsRegisterSpill(store->getValueOperand())) {
+        ++summary.EscapedFrameStoresKept;
+        continue;
+      }
       if (store->getParent() != nullptr && !store->isVolatile() &&
           !store->isAtomic() && !stackAllocaStoreIsLoaded(*store, stackLoads)) {
         eraseInstructionOnly(*store);
@@ -901,7 +1081,9 @@ void printNativeStackFrameCleanupSummary(
      << " register_stores=" << summary.RegisterStoresRemoved
      << " alloca_loads=" << summary.StackAllocaLoadsRemoved
      << " alloca_stores=" << summary.StackAllocaStoresRemoved
-     << " allocas=" << summary.StackAllocasRemoved << '\n';
+     << " allocas=" << summary.StackAllocasRemoved
+     << " escaped_objects=" << summary.EscapedStackObjects
+     << " escaped_stores_kept=" << summary.EscapedFrameStoresKept << '\n';
 }
 
 } // namespace notdec::bin2llvm
