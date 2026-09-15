@@ -239,6 +239,16 @@ Native function pointer promotion: seen=54 promoted=20 slots=18 unknown_writes=0
 fortune 回归：x86_64 define 13 / warning 35 行 / residue 1 行；i386 define 40 /
 warning 9 行 / residue 16 行，与重构前一致。ctest 12/12。
 
+lighttpd 抽查（`--decode-seed-limit 20 --no-register-ssa-pass`，177s / RSS 358MB）：
+
+```text
+Native function pointer promotion: seen=117 promoted=0 slots=8 unknown_writes=0 escaped=4 multiple_targets=0
+```
+
+比 image 版本更精确：image 时是 `slots=0 unknown_writes=12`（一个动态 store 就把整个
+segment 判 Unknown），现在 8 个 slot 干净、4 个 slot 地址以裸常量传出去（escape），
+117 个间接调用都是动态来源，所以 promoted 仍是 0。
+
 ## 说明
 
 - image 的两个 commit（9c6de13、bb14b4d）保留在历史里，本次改动把它们撤回；
