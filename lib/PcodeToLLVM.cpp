@@ -2214,8 +2214,13 @@ private:
     }
 
     std::set<size_t> starts;
+    // 排序一次：覆盖率检查会对每个 p-code op 遍历一遍 block ranges，
+    // 之前每次遍历都重新构造并排序 vector（main 这类函数上是 O(ops*blocks log blocks)）。
+    const std::vector<std::pair<uint64_t, uint64_t>> nativeRanges =
+        usesNativeCfg() ? sortedNativeRanges()
+                        : std::vector<std::pair<uint64_t, uint64_t>>();
     if (usesNativeCfg()) {
-      for (const auto &[blockAddress, blockEnd] : sortedNativeRanges()) {
+      for (const auto &[blockAddress, blockEnd] : nativeRanges) {
         if (blockEnd <= blockAddress) {
           std::ostringstream os;
           os << "native block 0x" << std::hex << blockAddress
@@ -2300,7 +2305,7 @@ private:
     if (usesNativeCfg()) {
       for (const PcodeOpView &op : program.Ops) {
         bool covered = false;
-        for (const auto &[blockAddress, blockEnd] : sortedNativeRanges()) {
+        for (const auto &[blockAddress, blockEnd] : nativeRanges) {
           if (op.Address >= blockAddress && op.Address < blockEnd) {
             covered = true;
             break;
