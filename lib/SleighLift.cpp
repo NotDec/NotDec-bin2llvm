@@ -464,6 +464,45 @@ bool SleighInstructionDecoder::isValid() const {
   return Pimpl != nullptr && Pimpl->Valid;
 }
 
+PcodeProgram SleighInstructionDecoder::collectPcode(
+    const std::vector<std::pair<uint64_t, uint64_t>> &ranges,
+    bool preserveRangeOrder, std::ostream &errorStream) {
+  PcodeProgram program;
+  if (!isValid()) {
+    return program;
+  }
+  program.IsBigEndian = Pimpl->IsBigEndian;
+  program.Registers = Pimpl->Registers;
+
+  // Address order is the default for raw range lifting.  Native function
+  // lifting may pass entry-first ranges so cold fragments before the hot entry
+  // do not become the first real LLVM block in the function.
+  std::vector<std::pair<uint64_t, uint64_t>> sortedRanges = ranges;
+  if (!preserveRangeOrder) {
+    std::sort(sortedRanges.begin(), sortedRanges.end(),
+              [](const auto &lhs, const auto &rhs) {
+                return lhs.first < rhs.first;
+              });
+  }
+
+  PcodeCollector collector(Pimpl->Engine, program);
+  AssemblyCollector asmCollector;
+  for (const auto &[start, endOffset] : sortedRanges) {
+    if (start >= endOffset) {
+      continue;
+    }
+    ghidra::Address current(Pimpl->Engine.getDefaultCodeSpace(), start);
+    ghidra::Address end(Pimpl->Engine.getDefaultCodeSpace(), endOffset);
+    while (current < end) {
+      if (!appendInstructionPcode(Pimpl->Engine, collector, asmCollector,
+                                  current, errorStream, program)) {
+        return program;
+      }
+    }
+  }
+  return program;
+}
+
 SleighInstructionDecode
 SleighInstructionDecoder::decode(uint64_t address, uint64_t maxInstructions,
                                  uint64_t maxBytes, std::ostream &errorStream) {

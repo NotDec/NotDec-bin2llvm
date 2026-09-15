@@ -867,6 +867,11 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
 
   unsigned appended = 0;
   unsigned skippedRuntime = 0;
+  // One parsed SLEIGH spec for every function.  Reparsing the .sla per
+  // function used to dominate the confirmed-module build (about a third of a
+  // wrk run); the discovery decoder already reuses one engine the same way.
+  notdec::bin2llvm::SleighInstructionDecoder pcodeDecoder(loadImage, specOptions,
+                                                          std::cerr);
   for (const auto &[entry, function] : state.functions()) {
     (void)entry;
     if (!shouldLowerNativeFunction(state, function, skipRuntimeFunctions)) {
@@ -879,9 +884,8 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
       continue;
     }
 
-    auto program = notdec::bin2llvm::collectSleighPcodeRanges(
-        loadImage, specOptions, blockRanges(function), std::cerr,
-        /*preserveRangeOrder=*/true);
+    auto program = pcodeDecoder.collectPcode(
+        blockRanges(function), /*preserveRangeOrder=*/true, std::cerr);
     if (program.Ops.empty() && function.Blocks.empty()) {
       std::cerr << "skip native function 0x" << std::hex << function.Entry
                 << std::dec << ": empty p-code\n";

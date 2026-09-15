@@ -64,6 +64,14 @@ public:
   SleighInstructionDecode decode(uint64_t address, uint64_t maxInstructions,
                                  uint64_t maxBytes, std::ostream &errorStream);
 
+  // Collect p-code for one range set with the decoder's already initialized
+  // engine.  Native function lifting walks hundreds of functions; reparsing
+  // the .sla for each of them costs more than the actual lifting.
+  PcodeProgram collectPcode(const std::vector<std::pair<uint64_t, uint64_t>>
+                                &ranges,
+                            bool preserveRangeOrder,
+                            std::ostream &errorStream);
+
 private:
   struct Impl;
   std::unique_ptr<Impl> Pimpl;
