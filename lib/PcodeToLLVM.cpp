@@ -3044,6 +3044,11 @@ private:
   llvm::Value *read(const VarnodeView &varnode) {
     llvm::Type *type = intType(varnode.Size);
     if (varnode.Space == "const") {
+      if (varnode.Size == pointerByteSize()) {
+        if (llvm::Function *function = functionForCodeAddress(varnode.Offset)) {
+          return Builder.CreatePtrToInt(function, type);
+        }
+      }
       return llvm::ConstantInt::get(
           type, llvm::APInt(bitWidth(varnode.Size), varnode.Offset));
     }
@@ -3082,6 +3087,26 @@ private:
       return std::nullopt;
     }
     return it->second;
+  }
+
+  // A pointer-sized constant equal to a known function entry is almost always
+  // an address-taken code pointer.  Materialize it as ptrtoint(ptr @function)
+  // so the function body stays reachable through a real LLVM use and later
+  // pipeline stages see a function reference instead of a bare integer.
+  llvm::Function *functionForCodeAddress(uint64_t address) {
+    auto found = Config.CodeAddressTargets.find(address);
+    if (found == Config.CodeAddressTargets.end()) {
+      return nullptr;
+    }
+    llvm::Function *function = Module.getFunction(found->second);
+    if (function != nullptr) {
+      return function;
+    }
+    auto *functionType =
+        llvm::FunctionType::get(llvm::Type::getVoidTy(Context), false);
+    return llvm::Function::Create(
+        functionType, llvm::GlobalValue::ExternalLinkage, found->second,
+        &Module);
   }
 
   void setSourceRam(const VarnodeView &varnode, std::optional<uint64_t> source) {

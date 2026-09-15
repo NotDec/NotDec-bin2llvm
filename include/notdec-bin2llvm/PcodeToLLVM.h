@@ -40,6 +40,15 @@ struct PcodeLoweringConfig {
   // the module builder has to provide the symbol name when it knows one.
   std::unordered_map<uint64_t, std::string> DirectCallTargets;
 
+  // Address-to-symbol table used when a pointer-sized constant is a function
+  // address (for example a callback passed to pthread_create).  Keeping these
+  // as real LLVM function references, instead of bare integer constants, both
+  // preserves the referenced function body and gives later passes a function
+  // use to work with.  The set is intentionally narrower than
+  // DirectCallTargets: thunks and PLT stubs are not materializable as ordinary
+  // internal functions.
+  std::unordered_map<uint64_t, std::string> CodeAddressTargets;
+
   // Address-to-symbol table for dynamic-linker PLT stubs.  This is separate
   // from DirectCallTargets so a PLT call is not mistaken for a local function
   // even if the stub bytes were decoded earlier.

@@ -5971,6 +5971,74 @@ bool testInternalSignatureRewriteUsesArgsAndReturn() {
                   "module failed verifier after internal signature rewrite");
 }
 
+bool testAddressTakenInternalFunctionUseFollowsRewrite() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-address-taken-function-rewrite", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage,
+      "notdec_native_address_taken_callee", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(calleeEntry);
+  llvm::LoadInst *input = loadRegister(builder, rdi, "RDI", "input");
+  storeRegister(builder, rax, input, "RAX");
+  builder.CreateRetVoid();
+
+  llvm::Function *caller = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage,
+      "notdec_native_address_taken_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 7),
+                "RDI");
+  builder.CreateCall(voidType, callee);
+  llvm::LoadInst *result = loadRegister(builder, rax, "RAX", "result");
+  (void)result;
+  auto *slot = builder.CreateIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x4000),
+      llvm::PointerType::get(context, 0));
+  builder.CreateStore(
+      llvm::ConstantExpr::getPtrToInt(callee,
+                                      llvm::Type::getInt64Ty(context)),
+      slot);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten =
+      module.getFunction("notdec_native_address_taken_callee");
+  llvm::Function *rewrittenCaller =
+      module.getFunction("notdec_native_address_taken_caller");
+  bool addressUseRewritten = false;
+  if (rewrittenCaller != nullptr && rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+      for (llvm::Value *operand : inst.operands()) {
+        auto *constant = llvm::dyn_cast<llvm::ConstantExpr>(operand);
+        if (constant != nullptr &&
+            constant->getOpcode() == llvm::Instruction::PtrToInt &&
+            constant->getOperand(0)->stripPointerCasts() == rewritten) {
+          addressUseRewritten = true;
+        }
+      }
+    }
+  }
+
+  return expect(rewritten != nullptr, "rewritten address-taken callee missing") &&
+         expect(rewrittenCaller != nullptr,
+                "rewritten address-taken caller missing") &&
+         expect(addressUseRewritten,
+                "ptrtoint use still referenced the old function") &&
+         expect(summary.FunctionsRewritten >= 1,
+                "address-taken function was not rewritten") &&
+         verifyOk(module,
+                  "module failed verifier after address-taken rewrite");
+}
+
 bool testInternalSignatureRewriteUsesNonAbiReturn() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-internal-non-abi-return", context);
@@ -9824,6 +9892,7 @@ int main() {
   ok &= testInternalCallArgBindingsKeepLaterArgsAfterEntryInput();
   ok &= testInternalSignatureParamsUseAbiOrder();
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
+  ok &= testAddressTakenInternalFunctionUseFollowsRewrite();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
   ok &= testInternalSignatureRewriteUsesReadEntryReturnRegisterArg();
   ok &= testInternalSignatureRewriteUsesNarrowEntryRangeArg();

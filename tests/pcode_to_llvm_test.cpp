@@ -1444,6 +1444,67 @@ bool testX86PcThunkCallFoldsToConstantBase() {
                 "module failed verifier after thunk fold");
 }
 
+bool testFunctionAddressConstantBecomesFunctionReference() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+
+  notdec::bin2llvm::PcodeOpView store;
+  store.Address = 0x1000;
+  store.InstructionSize = 5;
+  store.Opcode = notdec::bin2llvm::PcodeOpcode::Store;
+  store.OpcodeName = "STORE";
+  store.Inputs.push_back(constVarnode(0, 8));
+  store.Inputs.push_back(constVarnode(0x3000, 8));
+  store.Inputs.push_back(constVarnode(0x2000, 8));
+  program.Ops.push_back(store);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "code_address_store";
+  config.EntryAddress = 0x1000;
+  config.DirectCallTargets.emplace(0x2000, "known_code_address_callee");
+  config.CodeAddressTargets.emplace(0x2000, "known_code_address_callee");
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  llvm::Function *callee = module->getFunction("known_code_address_callee");
+  if (!expect(function != nullptr, "code address store function missing") ||
+      !expect(callee != nullptr, "code address callee declaration missing")) {
+    return false;
+  }
+
+  bool sawFunctionReference = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store == nullptr) {
+      continue;
+    }
+    llvm::Value *value = store->getValueOperand();
+    if (auto *constant = llvm::dyn_cast<llvm::ConstantExpr>(value)) {
+      if (constant->getOpcode() == llvm::Instruction::PtrToInt) {
+        sawFunctionReference =
+            constant->getOperand(0)->stripPointerCasts() == callee;
+      }
+    } else if (auto *cast = llvm::dyn_cast<llvm::PtrToIntInst>(value)) {
+      sawFunctionReference =
+          cast->getPointerOperand()->stripPointerCasts() == callee;
+    }
+  }
+
+  return expect(sawFunctionReference,
+                "pointer-sized code address did not become ptrtoint @function") &&
+         expect(!callee->use_empty(),
+                "materialized code address was not a function use") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after code address materialization");
+}
+
 bool testPartialRegisterWriteUsesPartialWriteHelper() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -2765,6 +2826,7 @@ int main() {
   ok &= testX64ReturnSuppressesReturnAddressStackEffect();
   ok &= testNonX64DoesNotSuppressCallStackEffect();
   ok &= testX86PcThunkCallFoldsToConstantBase();
+  ok &= testFunctionAddressConstantBecomesFunctionReference();
   ok &= testPartialRegisterWriteUsesPartialWriteHelper();
   ok &= testPartialRegisterReadUsesPartialReadHelper();
   ok &= testX87FildlFoldsToWindowPush();

@@ -8062,6 +8062,37 @@ foldFullInsertOfExtracts(llvm::Value *value,
   return source;
 }
 
+// Function signature rewriting replaces each internal Function object with a
+// fresh one and takes over its name.  Address-taken references materialized by
+// PcodeToLLVM are ConstantExpr(ptrtoint @function) values rather than calls, so
+// move those operands to the replacement before the old declaration is erased.
+void redirectAddressTakenUses(llvm::Function &oldFunction,
+                              llvm::Function &newFunction) {
+  std::vector<std::pair<llvm::ConstantExpr *, llvm::Constant *>> replacements;
+  for (llvm::User *user : oldFunction.users()) {
+    auto *constant = llvm::dyn_cast<llvm::ConstantExpr>(user);
+    if (constant == nullptr ||
+        constant->getOpcode() != llvm::Instruction::PtrToInt) {
+      continue;
+    }
+    replacements.emplace_back(
+        constant,
+        llvm::ConstantExpr::getPtrToInt(&newFunction, constant->getType()));
+  }
+  for (auto &[oldConstant, newConstant] : replacements) {
+    if (oldConstant == newConstant) {
+      continue;
+    }
+    // RAUW only moves the ConstantExpr's users.  The old expression itself
+    // still lists oldFunction as an operand, so destroy it after it becomes
+    // dead; otherwise oldFunction keeps a use and cannot be erased.
+    oldConstant->replaceAllUsesWith(newConstant);
+    if (oldConstant->use_empty()) {
+      oldConstant->destroyConstant();
+    }
+  }
+}
+
 void rewriteSignatureShapes(
     llvm::Module &module, SignatureRewriteState &state,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -8398,8 +8429,11 @@ void rewriteSignatureShapes(
   }
 
   for (auto &[oldFunction, newFunction] : replacements) {
-    if (oldFunction != newFunction && oldFunction->use_empty() &&
-        oldFunction->empty()) {
+    if (oldFunction == newFunction) {
+      continue;
+    }
+    redirectAddressTakenUses(*oldFunction, *newFunction);
+    if (oldFunction->use_empty() && oldFunction->empty()) {
       oldFunction->eraseFromParent();
     }
   }

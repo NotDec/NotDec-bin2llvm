@@ -8,6 +8,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Metadata.h"
@@ -845,9 +846,20 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
   NativeCallTargets callTargets =
       planNativeCallTargets(state, skipRuntimeFunctions);
   std::unordered_map<uint64_t, std::string> thunkCallTargets;
+  std::unordered_map<uint64_t, std::string> codeAddressTargets;
   for (const auto &[entry, function] : state.functions()) {
     if (function.IsPcThunk) {
       thunkCallTargets.emplace(entry, function.PcThunkRegister);
+      continue;
+    }
+    // PLT stubs are external call targets, not local functions.  Do not
+    // materialize an address that belongs to an external stub as a local body.
+    if (callTargets.External.count(entry) != 0) {
+      continue;
+    }
+    auto target = callTargets.Direct.find(entry);
+    if (target != callTargets.Direct.end()) {
+      codeAddressTargets.emplace(entry, target->second);
     }
   }
 
@@ -885,6 +897,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
     config.EntryFunctionName = nameIt->second;
     config.EntryFunctionLinkage = nativeFunctionLinkage(state, function);
     config.DirectCallTargets = callTargets.Direct;
+    config.CodeAddressTargets = codeAddressTargets;
     config.ExternalCallTargets = callTargets.External;
     config.IndirectExternalCallTargets = callTargets.IndirectExternal;
     config.ThunkCallTargets = thunkCallTargets;
@@ -1027,7 +1040,41 @@ bool hasExternallyVisibleFunctionDefinition(const llvm::Module &module) {
   return false;
 }
 
-bool runFinalCleanupPass(llvm::Module &module) {
+void preserveAddressTakenFunctions(
+    llvm::Module &module, const std::set<std::string> &functionNames) {
+  if (functionNames.empty()) {
+    return;
+  }
+
+  llvm::LLVMContext &context = module.getContext();
+  llvm::Type *pointerType = llvm::PointerType::get(context, 0);
+  std::vector<llvm::Constant *> functions;
+  for (const std::string &name : functionNames) {
+    llvm::Function *function = module.getFunction(name);
+    if (function == nullptr || function->isDeclaration()) {
+      continue;
+    }
+    functions.push_back(function);
+  }
+  if (functions.empty()) {
+    return;
+  }
+
+  // Keep address-taken internal bodies alive through the final GlobalDCE.
+  // Without this, only direct-call reachability is represented in the module
+  // even though the original code can enter these functions through a function
+  // pointer stored in code or relocated data.
+  auto *arrayType = llvm::ArrayType::get(pointerType, functions.size());
+  auto *initializer = llvm::ConstantArray::get(arrayType, functions);
+  auto *used = new llvm::GlobalVariable(
+      module, arrayType, /*isConstant=*/false,
+      llvm::GlobalValue::AppendingLinkage, initializer, "llvm.used");
+  used->setSection("llvm.metadata");
+}
+
+bool runFinalCleanupPass(llvm::Module &module,
+                         const std::set<std::string> &preservedFunctions = {}) {
+  preserveAddressTakenFunctions(module, preservedFunctions);
   notdec::bin2llvm::NativeRegisterFinalCleanupOptions passOptions;
   // If entry-point recovery has not found a public root yet, GlobalDCE would
   // delete every internal native function and hide the actual frontend state.
@@ -1212,6 +1259,27 @@ int main(int argc, char **argv) {
       return 1;
     }
 
+    std::set<std::string> preservedFunctions;
+    if (selectedState) {
+      NativeCallTargets plannedTargets = planNativeCallTargets(
+          *selectedState, options->SkipRuntimeFunctions);
+      for (const auto &[slot, target] : selectedState->relocatedPointers()) {
+        (void)slot;
+        auto targetIt = plannedTargets.Direct.find(target);
+        if (targetIt == plannedTargets.Direct.end()) {
+          continue;
+        }
+        const notdec::bin2llvm::NativeFunction *function =
+            selectedState->functionAt(target);
+        if (function == nullptr ||
+            notdec::bin2llvm::isNativeRuntimeFunction(*selectedState,
+                                                      *function)) {
+          continue;
+        }
+        preservedFunctions.insert(targetIt->second);
+      }
+    }
+
     if (llvm::verifyModule(*module, &llvm::errs())) {
       std::cerr << "module verification failed\n";
       return 1;
@@ -1228,7 +1296,7 @@ int main(int argc, char **argv) {
     if (!runPostRewritePeepholePass(*module, *options)) {
       return 1;
     }
-    if (!runFinalCleanupPass(*module)) {
+    if (!runFinalCleanupPass(*module, preservedFunctions)) {
       return 1;
     }
 
