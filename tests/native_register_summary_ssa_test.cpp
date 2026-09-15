@@ -6985,6 +6985,80 @@ bool testStackFrameAddressPassedToCallIsLocalized() {
                   "module failed verifier after stack call arg rewrite");
 }
 
+bool testLateStackCleanupReusesExistingNativeFrameAlloca() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-late-stack-cleanup-reuse", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "late_stack_sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage,
+      "late_stack_cleanup_reuse", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  auto *stackType = llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 216);
+  llvm::AllocaInst *storage =
+      builder.CreateAlloca(stackType, nullptr, "notdec_stack.native");
+  storage->setAlignment(llvm::Align(16));
+  llvm::Value *existingSlot = builder.CreateInBoundsGEP(
+      llvm::Type::getInt8Ty(context), storage,
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8));
+  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 7),
+                      existingSlot);
+
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::Value *slotAddress = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -208, true));
+  llvm::Value *slot =
+      builder.CreateIntToPtr(slotAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(llvm::ConstantInt::get(rsp->getValueType(), 11), slot);
+  llvm::LoadInst *loaded =
+      builder.CreateLoad(rsp->getValueType(), existingSlot);
+  builder.CreateStore(loaded, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeStackFrameCleanupOptions options;
+  options.StackPointerRegister = "RSP";
+  options.Registers = {"RSP"};
+  auto summary =
+      notdec::bin2llvm::runNativeStackFrameCleanup(module, options);
+
+  unsigned allocaCount = 0;
+  bool rawStoreUsesExistingSlot = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&inst)) {
+      allocaCount += alloca->hasName() &&
+                     alloca->getName().starts_with("notdec_stack.native");
+      continue;
+    }
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store == nullptr) {
+      continue;
+    }
+    auto *stored = llvm::dyn_cast<llvm::ConstantInt>(store->getValueOperand());
+    if (stored != nullptr && stored->getZExtValue() == 11 &&
+        store->getPointerOperand()->stripPointerCasts() == existingSlot) {
+      rawStoreUsesExistingSlot = true;
+    }
+  }
+
+  return expect(summary.AccessesRewritten >= 1,
+                "late stack cleanup did not rewrite entry-SP access") &&
+         expect(allocaCount == 1,
+                "late stack cleanup created a second native frame alloca") &&
+         expect(rawStoreUsesExistingSlot,
+                "late stack cleanup did not reuse the existing frame slot") &&
+         expect(rsp->use_empty(),
+                "late stack cleanup left a dead RSP entry read") &&
+         verifyOk(module, "module failed verifier after late stack cleanup");
+}
+
 bool testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-post-cleanup-abi-store", context);
@@ -9767,6 +9841,7 @@ int main() {
   ok &= testFramePointerRewriteDoesNotHideRbpRegisterFlow();
   ok &= testSummarySSARemovesDeadStackFrameStore();
   ok &= testStackFrameAddressPassedToCallIsLocalized();
+  ok &= testLateStackCleanupReusesExistingNativeFrameAlloca();
   ok &= testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall();
   ok &= testNoReturnExternalDoesNotCreateSummaryReturn();
   ok &= testExternalPrototypeJsonOverlaysDefaultNoReturn();

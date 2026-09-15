@@ -820,3 +820,107 @@ store 继续喂给 load，语义和重写前的内存传参一致。
 - 复杂度：3/10，一个块内扫描拆分 + 一个前驱回扫 + 一条 load。
 - 维护成本：3/10，跨块匹配依赖块内相对分组锚定（前驱内锚定不可靠，
   因为前驱只含 push 序列的不连续子集）；无锚点时保守不绑定。
+
+# 实现记录（2026-09-15，late cleanup 复用已有 native stack alloca）
+
+## 本轮 prompt
+
+```text
+RSP.entry 栈指针读取的残留可能是栈空间分配识别那一块逻辑不够完善，看看是不是这样，怎么修复。当前已经修复到一半了好像，接着之前的工作
+```
+
+后续补充：当前主要看的是 wrk 这个 case 的 bin2llvm 转 IR 结果，这里面还有 RSP 残留。
+
+## 问题定位
+
+以当前 `build/bin/notdec-native-llvm` 重新生成 wrk（命令见验证一节）后，residue audit
+仍报告 3 条 `RSP.entry` load：
+
+- `script_create`：`RSP.entry - 208` 的字面内存访问；
+- `FUN_74f0`：`RSP.entry - 80`；
+- `http_parser_execute`：`RSP.entry - 64..-168` 的一组访问。
+
+三个函数都已经有初始 `NativeStackFrameRewrite` 建出的 `notdec_stack.native` alloca，
+剩余访问是 SummarySSA 把部分当前 RSP 值重写成 `RSP.entry + 负常量` 后暴露出来的。
+late `NativeStackFrameCleanup` 会再次调用 `rewriteFunctionStackAccesses()`，但该函数
+开头有：
+
+```cpp
+if (hasExistingStackAlloca(function)) {
+  return false;
+}
+```
+
+因此只要函数已有 native frame alloca，后续 SSA 化出来的 entry-SP 访问就永远不会被
+本地化。问题不在 NativeStackAddressAnalysis 识别不出这些地址，而是“已有栈帧 alloca
+怎么继续合并使用”这一层缺失，确实属于栈空间分配识别链路只做了一半。
+
+## 修改
+
+文件：`lib/passes/summary/NativeStackFrame.cpp`
+
+- 用 `findNativeStackFrameAlloca()` 取代原来的 `hasExistingStackAlloca()` bool 查询。
+  它只接受标准 `[N x i8]` 形状，并从分配类型元素数还原 `frameLow = -N`（IRBuilder
+  生成的 alloca 显式 array-size operand 默认是 1，不能当 N 用）。发现第二个
+  native frame alloca 或形状不标准时标记 Ambiguous，调用方保守跳过，不误合并。
+- `rewriteFunctionStackAccesses()` 不再发现已有 alloca 就整个函数放弃：
+  - 新收集到的 entry-SP 负偏移全部落在已有 `[frameLow, 0)` 内时，复用同一个
+    alloca，GEP index 用 `offset - frameLow`；
+  - 新偏移低于已有 `frameLow` 时仍保守返回，不创建第二个不别名 alloca，避免破坏
+    局部栈别名语义；
+  - 复用前按已有 GEP 的 constant byte offset 预填 `offset -> GEP` 映射，使 late
+    cleanup 与早期 rewrite 对同一个 native offset 使用同一个指针，保留 cleanup
+    依赖的 pointer identity。
+- 新增单测 `testLateStackCleanupReusesExistingNativeFrameAlloca`：
+  手工构造 `[216 x i8]` 已有 alloca + 已有 offset 8 GEP，再给 `RSP.entry - 208`
+  的原始 store；调用 `runNativeStackFrameCleanup()` 后验证只有一个 alloca、原始
+  store 复用了已有 offset 8 GEP、dead `@RSP` read 被删除。
+
+## 验证
+
+生成 wrk：
+
+```bash
+build/bin/notdec-native-llvm \
+  /sn640/NotDec-Exp/Bench2/rootfs/usr/bin/wrk \
+  --all-confirmed \
+  --summary-json-out /tmp/notdec-rsp-fix-final/wrk.summary.json \
+  --register-ssa-warning-out /tmp/notdec-rsp-fix-final/wrk.warn.tsv \
+  -o /tmp/notdec-rsp-fix-final/wrk.native.ll
+```
+
+结果：
+
+- 修改前 residue audit：`gpr load access full full no 3`。
+- 修改后 residue audit：只剩表头，`RSP.entry` load 为 0。
+- 修改前后 register SSA warning TSV 完全一致（当前 code baseline 对比）。
+- LLVM 22 `llvm-as` + `opt -passes=verify` 通过。
+
+回归：
+
+```bash
+cmake --build build --target native_register_summary_ssa_test \
+  native_register_summary_test pcode_to_llvm_test notdec-native-llvm -j$(nproc)
+build/bin/native_register_summary_ssa_test
+build/bin/native_register_summary_test
+build/bin/pcode_to_llvm_test
+ctest --test-dir build --output-on-failure
+NOTDEC_NATIVE_FORTUNE_X86_64_OUT_DIR=/tmp/notdec-rsp-fortune-x64 \
+  scripts/native-fortune-x86_64-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+NOTDEC_NATIVE_FORTUNE_I386_OUT_DIR=/tmp/notdec-rsp-fortune-i386 \
+  scripts/native-fortune-i386-regression.sh build/bin/notdec-native-llvm \
+  /sn640/NotDec/llvm-22.1.0.obj/bin "$PWD" "$PWD/build"
+```
+
+- 单测与 ctest 12/12 通过。
+- fortune x86_64 / i386 回归脚本通过；warning 与 residue 记录和基线一致。
+- wrk 全量命令耗时 `1:22.37`、RSS `137064KB`（修改前同 build 对照 `1:33.37`、
+  `134756KB`；耗时差异来自机器波动，内存差 ~2MB 在噪声范围）。
+
+## 评分
+
+- 实现效果：9/10。wrk 的 3 条 RSP.entry 残留清零，warning 不变，i386/x64 不退化。
+- 复杂度：5/10。新增一个 alloca 查询结构和一个 GEP 复用映射，没有改地址分析本身。
+- 维护成本：5/10。已有 alloca 的 frameLow 约定和“只复用、不扩展”边界已写注释；
+  如果以后确实出现比既有 alloca 更低的 entry-SP 访问，需要单独做 alloca 扩缩重写。

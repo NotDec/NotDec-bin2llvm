@@ -154,17 +154,67 @@ std::optional<uint64_t> memoryAccessSize(const llvm::DataLayout &layout,
                            : std::optional<uint64_t>(size.getFixedValue());
 }
 
-bool hasExistingStackAlloca(const llvm::Function &function) {
-  for (const llvm::BasicBlock &block : function) {
-    for (const llvm::Instruction &instruction : block) {
+// Recover the native frame alloca created by an earlier stack rewrite.  Its
+// byte count is the absolute value of the lowest native offset, so later
+// cleanup passes can reuse the same allocation instead of shadowing it with a
+// second, non-aliasing alloca.  The current pipeline creates exactly one such
+// alloca per function; if the IR contains anything else, stay conservative and
+// let the caller skip this function.
+struct NativeStackFrameAllocaInfo {
+  llvm::AllocaInst *Storage = nullptr;
+  int64_t FrameLow = 0;
+  bool Ambiguous = false;
+};
+
+NativeStackFrameAllocaInfo findNativeStackFrameAlloca(llvm::Function &function) {
+  NativeStackFrameAllocaInfo result;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
       auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
-      if (alloca != nullptr && alloca->hasName() &&
-          alloca->getName().starts_with("notdec_stack")) {
-        return true;
+      if (alloca == nullptr || !alloca->hasName() ||
+          !alloca->getName().starts_with("notdec_stack.native")) {
+        continue;
       }
+      if (result.Storage != nullptr) {
+        result.Ambiguous = true;
+        return result;
+      }
+      auto *arrayType =
+          llvm::dyn_cast<llvm::ArrayType>(alloca->getAllocatedType());
+      auto *count =
+          llvm::dyn_cast_or_null<llvm::ConstantInt>(alloca->getArraySize());
+      if (arrayType == nullptr || count == nullptr ||
+          !arrayType->getElementType()->isIntegerTy(8)) {
+        result.Ambiguous = true;
+        return result;
+      }
+      // IRBuilder makes the allocated type [N x i8] and leaves the explicit
+      // alloca array-size operand at its default of one.  Recover N from the
+      // allocated type; keep the operand multiplication for completeness.
+      const llvm::APInt &countValue = count->getValue();
+      if (countValue.getActiveBits() > 64) {
+        result.Ambiguous = true;
+        return result;
+      }
+      uint64_t elementCount = arrayType->getNumElements();
+      uint64_t allocaCount = countValue.getZExtValue();
+      if (allocaCount == 0 ||
+          elementCount >
+              std::numeric_limits<uint64_t>::max() / allocaCount) {
+        result.Ambiguous = true;
+        return result;
+      }
+      uint64_t size = elementCount * allocaCount;
+      if (size == 0 ||
+          size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        result.Ambiguous = true;
+        return result;
+      }
+      result.Storage = alloca;
+      result.FrameLow = -static_cast<int64_t>(size);
     }
   }
-  return false;
+  return result;
 }
 
 std::optional<llvm::Value *> mergeKnownValueAtBlockEntry(
@@ -342,13 +392,17 @@ bool valueFeedsEntryStackInput(llvm::Value &value,
 bool rewriteFunctionStackAccesses(llvm::Function &function,
                                   llvm::StringRef stackRegisterName,
                                   NativeStackFrameRewriteSummary &summary) {
-  if (hasExistingStackAlloca(function)) {
-    return false;
-  }
   llvm::Module *module = function.getParent();
   if (module == nullptr) {
     return false;
   }
+  NativeStackFrameAllocaInfo existingFrame =
+      findNativeStackFrameAlloca(function);
+  if (existingFrame.Ambiguous) {
+    return false;
+  }
+  llvm::AllocaInst *storage = existingFrame.Storage;
+  int64_t frameLow = existingFrame.FrameLow;
   llvm::GlobalVariable *stackPointer =
       findNativeStackPointerGlobal(*module, stackRegisterName);
   if (stackPointer == nullptr) {
@@ -427,18 +481,27 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
   if (!low || (pointerAddresses.empty() && integerAddresses.empty())) {
     return false;
   }
-  uint64_t frameSize = static_cast<uint64_t>(-*low);
-  if (frameSize > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+
+  if (storage == nullptr) {
+    uint64_t frameSize = static_cast<uint64_t>(-*low);
+    if (frameSize >
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+      return false;
+    }
+    llvm::IRBuilder<> entryBuilder(&function.getEntryBlock(),
+                                   function.getEntryBlock().begin());
+    auto *byteType = llvm::Type::getInt8Ty(function.getContext());
+    auto *arrayType = llvm::ArrayType::get(byteType, frameSize);
+    storage =
+        entryBuilder.CreateAlloca(arrayType, nullptr, "notdec_stack.native");
+    storage->setAlignment(llvm::Align(16));
+    frameLow = *low;
+  } else if (*low < frameLow) {
+    // The existing alloca does not cover the full native range.  Extending it
+    // would require rewriting every old user; stay conservative instead of
+    // creating a second, non-aliasing alloca.
     return false;
   }
-
-  llvm::IRBuilder<> entryBuilder(&function.getEntryBlock(),
-                                 function.getEntryBlock().begin());
-  auto *byteType = llvm::Type::getInt8Ty(function.getContext());
-  auto *arrayType = llvm::ArrayType::get(byteType, frameSize);
-  llvm::AllocaInst *storage =
-      entryBuilder.CreateAlloca(arrayType, nullptr, "notdec_stack.native");
-  storage->setAlignment(llvm::Align(16));
 
   // Keep one entry-dominating pointer per concrete native stack offset.  The
   // cleanup pass may compare rewritten stack accesses by pointer identity, so
@@ -446,13 +509,33 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
   llvm::IRBuilder<> stackValueBuilder(storage->getNextNode());
   std::map<int64_t, llvm::Value *> stackPointers;
   std::map<std::pair<int64_t, llvm::Type *>, llvm::Value *> stackIntegers;
+  if (existingFrame.Storage != nullptr) {
+    // Reuse existing GEPs for already-localized offsets so a late cleanup pass
+    // keeps aliasing the same alloca slot instead of cloning an equivalent
+    // pointer with a different identity.
+    for (llvm::User *user : storage->users()) {
+      auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user);
+      if (gep == nullptr || gep->getPointerOperand() != storage) {
+        continue;
+      }
+      llvm::APInt byteOffset(
+          layout.getIndexSizeInBits(gep->getPointerAddressSpace()), 0);
+      if (!gep->accumulateConstantOffset(layout, byteOffset)) {
+        continue;
+      }
+      int64_t nativeOffset =
+          frameLow + static_cast<int64_t>(byteOffset.getSExtValue());
+      stackPointers.emplace(nativeOffset, gep);
+    }
+  }
   auto stackPointerForOffset = [&](int64_t offset) -> llvm::Value * {
     auto found = stackPointers.find(offset);
     if (found != stackPointers.end()) {
       return found->second;
     }
     llvm::Value *pointer = createStackFramePointer(
-        stackValueBuilder, *storage, *low, offset, "notdec_stack.native.ptr");
+        stackValueBuilder, *storage, frameLow, offset,
+        "notdec_stack.native.ptr");
     stackPointers[offset] = pointer;
     return pointer;
   };
