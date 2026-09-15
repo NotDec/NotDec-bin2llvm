@@ -83,3 +83,24 @@ wrk 总 warning：
 
 warning 数略增，是因为以前被忽略的 x87 `ST0/ST1` clobber 现在可见并进入诊断；
 但 formatter 的参数值链已经不再接错。
+
+## 后续修订：i386 也启用
+
+x87 的 `i80` vs `x86_fp80` 类型不一致与 ABI 无关，i386 也有同样问题。
+之前只对 x86-64 启用，是因为 i386 regression 断言要求最终 IR 必须保留
+`@ST0` / `@ST1` 文本。
+
+现在改为：
+
+- 所有 ABI 都运行 `canonicalizeX87WindowAccesses()`；
+- i386 regression 不再要求 `@ST0` / `@ST1` 全局文本存在；
+- 改为检查语义不变量：
+  - `notdec.x87.push` / `notdec.x87.pop` 存在；
+  - 不存在 `@ST2..@ST7` 全局；
+  - residue audit 中没有 `ST0` / `ST1` 残留访问；
+  - warning 中没有 `ST2..ST7`。
+
+验证：
+
+- 全量 ctest：12/12 通过，包括 `realworld_fortune_i386`。
+- x86-64 行为与之前一致。

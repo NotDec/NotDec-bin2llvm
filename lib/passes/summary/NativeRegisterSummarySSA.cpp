@@ -8491,9 +8491,7 @@ runNativeRegisterSummarySSA(llvm::Module &module,
     printNativeRegisterPreSummaryPeepholeSummary(peepholeSummary, llvm::errs());
   }
   AbiFacts abi = collectAbiFacts(module, units);
-  if (isLikelyX86_64SysVAbi(abi)) {
-    (void)canonicalizeX87WindowAccesses(module, units);
-  }
+  (void)canonicalizeX87WindowAccesses(module, units);
 
   NativeRegisterSummaryOptions baseSummaryOptions;
   baseSummaryOptions.AttachMetadata = false;

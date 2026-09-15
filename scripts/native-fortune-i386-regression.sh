@@ -116,10 +116,10 @@ require_line_prefix "define " "$OUT_LL"
 require_contains "stackpointer.register=ESP" "$OUT_LL"
 require_not_contains "stackpointer.register=RSP" "$OUT_LL"
 
-# x87 窗口模型：ST0/ST1 是真实寄存器全局（i80），ST2..ST7 留在
-# notdec.x87.* 库内部状态（不建全局）。窗口展开用 push/pop intrinsic 衔接库。
-require_contains "@ST0" "$OUT_LL"
-require_contains "@ST1" "$OUT_LL"
+# x87 窗口模型：ST0/ST1 是真实寄存器全局（i80），展开后可以被 SSA
+# 完全吸收并由 cleanup 删除；ST2..ST7 必须留在 notdec.x87.* 库内部状态。
+# 因此这里检查语义不变量：push/pop 衔接存在、没有 ST2..ST7 全局、没有
+# ST0/ST1 残留寄存器访问。
 require_not_contains "@ST2" "$OUT_LL"
 require_not_contains "@ST3" "$OUT_LL"
 require_not_contains "@ST4" "$OUT_LL"
@@ -130,6 +130,10 @@ require_contains "notdec.x87.push" "$OUT_LL"
 require_contains "notdec.x87.pop" "$OUT_LL"
 if grep -P '\tST[2-7]\t' "$WARNING_TSV"; then
   echo "unexpected x87 register SSA warning for ST2..ST7 in $WARNING_TSV" >&2
+  exit 1
+fi
+if grep -P '\tST[01]\t' "$RESIDUE_TSV"; then
+  echo "unexpected ST0/ST1 register residue in $RESIDUE_TSV" >&2
   exit 1
 fi
 
