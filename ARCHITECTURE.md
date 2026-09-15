@@ -209,7 +209,7 @@ ELF
 PcodeToLLVM
   -> attach memory map metadata
   -> attach ABI metadata
-  -> NativeDataImage
+  -> attach relocation function pointer metadata
   -> verify
   -> InstCombine + SimplifyCFG
   -> NativeRegisterSummarySSA
@@ -221,39 +221,28 @@ PcodeToLLVM
   -> write .ll / .bc
 ```
 
-### 5.1 NativeDataImage
+当前阶段 native 链路只做两件事：lifting 阶段和底层汇编保持一一对应，以及处理
+arch-specific 特性。数据段内容建模、结构体指针传递、IPA 值集传播属于后面的阶段，
+不在这里做；IR 里的数据访问保持 `inttoptr(绝对地址)` 的 lifting 形态。
+
+### 5.1 NativeRelocationMetadata
 
 位置：
 
-- `include/notdec-bin2llvm/NativeDataImage.h`
-- `lib/NativeDataImage.cpp`
+- `include/notdec-bin2llvm/NativeRelocationMetadata.h`
+- `lib/NativeRelocationMetadata.cpp`
 
-这是 data image 的低层建模步骤。对含“已确认数据地址”的非可执行 LOAD segment，
-pass 建立内部 LLVM global，initializer 是 segment 的实际字节（`.bss` 尾部补零）：
+discovery 已经算出每个 relocation slot 的 computed value，tool 把“目标是本地函数”
+的 pointer-size slot 挂成模块 metadata（不改写任何指令）：
 
 ```llvm
-@notdec.image.0x135f0 = internal global <{ i64, [840 x i8], i64, ... }>
-  <{ i64 ptrtoint (ptr @sock_connect to i64), ... }>
+!notdec.relocation.function_pointer = !{!0, !1}
+!0 = !{i64 82624, i64 8, !"sock_connect"}   ; 0x142c0
 ```
 
-- 初值类型用 packed struct：字节段用 `[k x i8]`，relocation 目标已知是本地函数
-  的 pointer-size slot 用 `i64` 字段。packed 保证字段偏移等于虚拟地址偏移，同时
-  让函数指针保持 `ptrtoint(@function)` 形式（body 不被 GlobalDCE 删除）。
-- 访问统一改写为 `getelementptr i8, ptr @notdec.image.X, i64 off`：
-  `inttoptr(C)` 是常量 GEP；`inttoptr(add C, %dyn)` 是常量 GEP 再叠一个动态
-  index，覆盖 `base + offset` 表访问。
-- 动态 `base + offset` 只在前端已确认的地址基址上改写（relocation slot 地址、
-  relocation computed value、PLT GOT 地址、模块内直接 `inttoptr(C)` 的 C）。
-  否则像 `and %x, 65535` 这种落在 segment 里的小常量会被误当成基址。
-- 动态 addend 还必须是 index，不能是别的地址空间基址：
-  `dynamicAddendIsAddressBase()` 拒绝 load 自 `!notdec.register` global
-  （`FS_OFFSET`/`GS_OFFSET`/`RSP`）、`RSP.entry` 这类参数、alloca/GEP。
-  否则 `mov rax, fs:0x28` 的 `add 40, %FS_OFFSET` 会被改写成
-  `@notdec.image.0x0 + 40 + %FS_OFFSET`。
-- image 覆盖不到的 slot 继续用上一版的 `@notdec.reloc.0xADDR` 独立 global 兜底。
-
-已知边界：只有常量锚定的访问进入 image；参数、从内存读出的指针这类动态地址仍是
-裸 `inttoptr`，需要后续 IPA 值集传播才能接上。
+- 只登记非 runtime 的本地函数目标，和 `@llvm.used` 保 body 的集合一致；
+- metadata 能随 `.ll` 往返，`notdec-native-llvm` 的 IR 输入路径读不到就跳过；
+- 不建 global、不建 data image、不改任何 load/store。
 
 ### 5.2 NativeFunctionPointerPromotion
 
@@ -262,26 +251,27 @@ pass 建立内部 LLVM global，initializer 是 segment 的实际字节（`.bss`
 - `include/notdec-bin2llvm/NativeFunctionPointerPromotion.h`
 - `lib/NativeFunctionPointerPromotion.cpp`
 
-在签名重写之后，这个 pass 识别：
+在签名重写之后，这个 pass 读上面的 metadata，识别：
 
 ```text
-load @notdec.reloc.<slot>          (旧式独立 slot global)
-load (gep @notdec.image.X, off)    (data image 字段)
-  -> inttoptr
+load i64, ptr inttoptr (<slot address>)
+  -> inttoptr / bitcast
   -> call %fn
 ```
 
 的间接调用形状。只有满足以下条件时才替换成 direct call：
 
-- 字段的 initializer 是唯一的 `ptrtoint(@function)`；
-- 对该 global 没有未知 store（动态 offset 的 store、地址 escape 都算未知），
-  并且没有覆盖该字段的其它 store；
-- 候选目标只有一个；
-- slot 地址没有在模块里以裸 `ConstantInt` operand 出现过（说明地址可能经参数
-  传给别的函数写过，本地分析看不到）。
+- 调用目标能沿 cast 链回溯到某个登记 slot 的精确地址（含常量 offset 的 GEP）；
+- 该 slot 没有未知写：store 到 `inttoptr(该地址)` 且值不是同一个函数算未知；
+  store 的地址是 `inttoptr(add/sub/or(该地址, 动态))` 也算未知（动态偏移可能命中）；
+- slot 地址没有以裸 `ConstantInt` 出现在别处（当参数传给别的函数、写进内存等），
+  否则 callee 可能写了它而本 pass 看不到；
+- 候选目标只有一个。
 
-多目标和未知写入当前只统计 warning/counter，保留 indirect call。后续可以按
-guarded switch 的方式做保守提升。
+多目标、未知写、地址 escape 只统计 counter，保留 indirect call。guarded promotion
+和跨函数参数传播不在本阶段。
+
+### 5.3 InstCombine + SimplifyCFG
 
 ### 5.1 InstCombine + SimplifyCFG
 

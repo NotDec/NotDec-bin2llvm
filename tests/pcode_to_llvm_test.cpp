@@ -1,6 +1,5 @@
-#include "notdec-bin2llvm/NativeDataImage.h"
 #include "notdec-bin2llvm/NativeFunctionPointerPromotion.h"
-#include "notdec-bin2llvm/NativeRelocationData.h"
+#include "notdec-bin2llvm/NativeRelocationMetadata.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 
 #include "llvm/IR/BasicBlock.h"
@@ -1509,79 +1508,44 @@ bool testFunctionAddressConstantBecomesFunctionReference() {
                 "module failed verifier after code address materialization");
 }
 
-bool testRelocatedFunctionPointerSlotBecomesGlobal() {
+bool testFunctionPointerMetadataRoundTrip() {
   llvm::LLVMContext context;
-  llvm::Module module("relocation-function-pointer-slot", context);
+  llvm::Module module("relocation-metadata", context);
   module.setDataLayout("e-p:64:64");
 
-  auto *slotCalleeType =
+  auto *functionType =
       llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {}, false);
-  llvm::Function *slotCallee = llvm::Function::Create(
-      slotCalleeType, llvm::GlobalValue::InternalLinkage, "slot_callee",
-      module);
-  llvm::BasicBlock *calleeEntry =
-      llvm::BasicBlock::Create(context, "entry", slotCallee);
-  llvm::IRBuilder<> calleeBuilder(calleeEntry);
-  calleeBuilder.CreateRet(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 42));
-
-  auto *callerType =
-      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {}, false);
-  llvm::Function *caller =
-      llvm::Function::Create(callerType, llvm::GlobalValue::ExternalLinkage,
-                             "slot_caller", module);
-  llvm::BasicBlock *callerEntry =
-      llvm::BasicBlock::Create(context, "entry", caller);
-  llvm::IRBuilder<> builder(callerEntry);
-  llvm::Constant *slotAddress = llvm::ConstantExpr::getIntToPtr(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x2000),
-      llvm::PointerType::get(context, 0));
-  builder.CreateStore(
-      llvm::ConstantExpr::getPtrToInt(slotCallee,
-                                      llvm::Type::getInt64Ty(context)),
-      slotAddress);
-  llvm::Value *loaded = builder.CreateLoad(llvm::Type::getInt64Ty(context),
-                                           slotAddress);
-  builder.CreateRet(loaded);
+  llvm::Function *target = llvm::Function::Create(
+      functionType, llvm::GlobalValue::InternalLinkage, "slot_target", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", target);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateRet(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
 
   std::vector<notdec::bin2llvm::NativeFunctionPointerSlot> slots = {
-      {0x2000, 8, "slot_callee"}};
-  auto summary =
-      notdec::bin2llvm::materializeNativeFunctionPointerSlots(module, slots);
+      {0x2000, 8, "slot_target"}, {0x2008, 8, "missing_target"}};
+  notdec::bin2llvm::attachNativeFunctionPointerMetadata(module, slots);
+  auto parsed = notdec::bin2llvm::readNativeFunctionPointerMetadata(module);
 
-  llvm::GlobalVariable *slotGlobal =
-      module.getNamedGlobal("notdec.reloc.0x2000");
-  bool globalInitializerUsesFunction = false;
-  if (slotGlobal != nullptr && slotGlobal->hasInitializer()) {
-    if (auto *constant =
-            llvm::dyn_cast<llvm::ConstantExpr>(slotGlobal->getInitializer())) {
-      globalInitializerUsesFunction =
-          constant->getOpcode() == llvm::Instruction::PtrToInt &&
-          constant->getOperand(0)->stripPointerCasts() == slotCallee;
+  bool foundTarget = false;
+  bool missingTargetIsNull = false;
+  for (const auto &slot : parsed) {
+    if (slot.Address == 0x2000 && slot.Width == 8 &&
+        slot.Target == target) {
+      foundTarget = true;
     }
-  }
-  bool loadUsesGlobal = false;
-  bool storeUsesGlobal = false;
-  for (llvm::Instruction &inst : llvm::instructions(caller)) {
-    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
-      loadUsesGlobal = load->getPointerOperand() == slotGlobal;
-    }
-    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
-      storeUsesGlobal = store->getPointerOperand() == slotGlobal;
+    if (slot.Address == 0x2008) {
+      missingTargetIsNull = slot.Target == nullptr;
     }
   }
 
-  return expect(slotGlobal != nullptr, "relocation slot global missing") &&
-         expect(globalInitializerUsesFunction,
-                "relocation slot initializer is not ptrtoint(@function)") &&
-         expect(summary.SlotsCreated == 1,
-                "relocation slot creation was not counted") &&
-         expect(summary.AccessesRewritten == 2,
-                "relocation slot accesses were not rewritten") &&
-         expect(loadUsesGlobal, "load still uses inttoptr(slot)") &&
-         expect(storeUsesGlobal, "store still uses inttoptr(slot)") &&
+  return expect(parsed.size() == 2, "metadata round-trip lost slots") &&
+         expect(foundTarget, "metadata function target was not resolved") &&
+         expect(missingTargetIsNull,
+                "missing metadata target was not reported as null") &&
          expect(!llvm::verifyModule(module, &llvm::errs()),
-                "module failed verifier after relocation slot modeling");
+                "module failed verifier after metadata attach");
 }
 
 bool testFunctionPointerSlotPromotesToDirectCall() {
@@ -1599,28 +1563,27 @@ bool testFunctionPointerSlotPromotesToDirectCall() {
   llvm::IRBuilder<> targetBuilder(targetEntry);
   targetBuilder.CreateRet(target->getArg(0));
 
-  auto *slot = new llvm::GlobalVariable(
-      module, llvm::Type::getInt64Ty(context), /*isConstant=*/false,
-      llvm::GlobalValue::InternalLinkage,
-      llvm::ConstantExpr::getPtrToInt(target,
-                                      llvm::Type::getInt64Ty(context)),
-      "notdec.reloc.0x2000");
-
-  llvm::Function *caller =
-      llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
-                             "slot_caller", module);
+  llvm::Function *caller = llvm::Function::Create(
+      functionType, llvm::GlobalValue::ExternalLinkage, "slot_caller", module);
   llvm::BasicBlock *callerEntry =
       llvm::BasicBlock::Create(context, "entry", caller);
   llvm::IRBuilder<> builder(callerEntry);
-  llvm::Value *loaded = builder.CreateLoad(llvm::Type::getInt64Ty(context),
-                                           slot);
+  llvm::Constant *slotAddress = llvm::ConstantExpr::getIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x2000),
+      llvm::PointerType::get(context, 0));
+  llvm::Value *loaded = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), slotAddress);
   llvm::Value *callee = builder.CreateIntToPtr(
       loaded, llvm::PointerType::get(context, 0));
   builder.CreateCall(functionType, callee, {caller->getArg(0)});
-  builder.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
+  builder.CreateRet(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
 
-  auto summary =
-      notdec::bin2llvm::runNativeFunctionPointerPromotion(module);
+  std::vector<notdec::bin2llvm::NativeFunctionPointerSlot> slots = {
+      {0x2000, 8, "slot_target"}};
+  notdec::bin2llvm::attachNativeFunctionPointerMetadata(module, slots);
+  auto summary = notdec::bin2llvm::runNativeFunctionPointerPromotion(module);
+
   llvm::CallBase *rewrittenCall = nullptr;
   for (llvm::Instruction &inst : llvm::instructions(caller)) {
     if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
@@ -1644,8 +1607,8 @@ bool testModifiedFunctionPointerSlotIsNotPromoted() {
   llvm::Module module("function-pointer-slot-writable", context);
   module.setDataLayout("e-p:64:64");
 
-  auto *functionType = llvm::FunctionType::get(
-      llvm::Type::getInt64Ty(context), {}, false);
+  auto *functionType =
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {}, false);
   llvm::Function *target = llvm::Function::Create(
       functionType, llvm::GlobalValue::InternalLinkage, "slot_target", module);
   llvm::BasicBlock *targetEntry =
@@ -1654,30 +1617,30 @@ bool testModifiedFunctionPointerSlotIsNotPromoted() {
   targetBuilder.CreateRet(
       llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
 
-  auto *slot = new llvm::GlobalVariable(
-      module, llvm::Type::getInt64Ty(context), /*isConstant=*/false,
-      llvm::GlobalValue::InternalLinkage,
-      llvm::ConstantExpr::getPtrToInt(target,
-                                      llvm::Type::getInt64Ty(context)),
-      "notdec.reloc.0x3000");
-
-  llvm::Function *caller =
-      llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
-                             "slot_caller", module);
+  llvm::Function *caller = llvm::Function::Create(
+      functionType, llvm::GlobalValue::ExternalLinkage, "slot_caller", module);
   llvm::BasicBlock *callerEntry =
       llvm::BasicBlock::Create(context, "entry", caller);
   llvm::IRBuilder<> builder(callerEntry);
-  llvm::Value *loaded = builder.CreateLoad(llvm::Type::getInt64Ty(context),
-                                           slot);
+  llvm::Constant *slotAddress = llvm::ConstantExpr::getIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x3000),
+      llvm::PointerType::get(context, 0));
+  llvm::Value *loaded = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), slotAddress);
   builder.CreateStore(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x1234), slot);
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x1234),
+      slotAddress);
   llvm::Value *callee = builder.CreateIntToPtr(
       loaded, llvm::PointerType::get(context, 0));
   builder.CreateCall(functionType, callee);
-  builder.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
+  builder.CreateRet(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
 
-  auto summary =
-      notdec::bin2llvm::runNativeFunctionPointerPromotion(module);
+  std::vector<notdec::bin2llvm::NativeFunctionPointerSlot> slots = {
+      {0x3000, 8, "slot_target"}};
+  notdec::bin2llvm::attachNativeFunctionPointerMetadata(module, slots);
+  auto summary = notdec::bin2llvm::runNativeFunctionPointerPromotion(module);
+
   llvm::CallBase *rewrittenCall = nullptr;
   for (llvm::Instruction &inst : llvm::instructions(caller)) {
     if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
@@ -1696,293 +1659,123 @@ bool testModifiedFunctionPointerSlotIsNotPromoted() {
                 "module failed verifier after writable slot test");
 }
 
-// Data image tests.  These exercise the second-stage relocation model: whole
-// non-executable segments become LLVM globals and inttoptr address chains are
-// rewritten to GEPs into those globals.
-
-llvm::GlobalVariable *findDataImageGlobal(llvm::Module &module,
-                                          llvm::StringRef name) {
-  return module.getNamedGlobal(name);
-}
-
-bool testDataImageSegmentBecomesGlobal() {
+bool testEscapedFunctionPointerSlotIsNotPromoted() {
   llvm::LLVMContext context;
-  llvm::Module module("data-image-segment", context);
+  llvm::Module module("function-pointer-slot-escaped", context);
   module.setDataLayout("e-p:64:64");
 
   auto *functionType =
       llvm::FunctionType::get(llvm::Type::getInt64Ty(context), {}, false);
+  llvm::Function *target = llvm::Function::Create(
+      functionType, llvm::GlobalValue::InternalLinkage, "slot_target", module);
+  llvm::BasicBlock *targetEntry =
+      llvm::BasicBlock::Create(context, "entry", target);
+  llvm::IRBuilder<> targetBuilder(targetEntry);
+  targetBuilder.CreateRet(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1));
+
+  auto *registerType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)},
+      false);
+  llvm::Function *escape = llvm::Function::Create(
+      registerType, llvm::GlobalValue::ExternalLinkage, "escape_sink", module);
+
   llvm::Function *caller = llvm::Function::Create(
-      functionType, llvm::GlobalValue::ExternalLinkage, "image_caller",
-      module);
-  llvm::BasicBlock *entry =
+      functionType, llvm::GlobalValue::ExternalLinkage, "slot_caller", module);
+  llvm::BasicBlock *callerEntry =
       llvm::BasicBlock::Create(context, "entry", caller);
-  llvm::IRBuilder<> builder(entry);
-  llvm::Constant *address = llvm::ConstantExpr::getIntToPtr(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x1004),
+  llvm::IRBuilder<> builder(callerEntry);
+  llvm::Constant *slotAddress = llvm::ConstantExpr::getIntToPtr(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x4000),
       llvm::PointerType::get(context, 0));
-  llvm::Value *loaded =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), address);
-  builder.CreateRet(loaded);
+  llvm::Value *loaded = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), slotAddress);
+  // The slot address is passed as a plain integer: a callee could write it.
+  builder.CreateCall(
+      escape,
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x4000)});
+  llvm::Value *callee = builder.CreateIntToPtr(
+      loaded, llvm::PointerType::get(context, 0));
+  builder.CreateCall(functionType, callee);
+  builder.CreateRet(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
 
-  std::vector<uint8_t> bytes = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'};
-  std::vector<notdec::bin2llvm::NativeDataImageSegment> segments = {
-      {0x1000, 8, false, bytes}};
-  std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot> slots;
-  std::vector<uint64_t> bases;
-  auto summary = notdec::bin2llvm::materializeNativeDataImage(
-      module, segments, slots, bases);
+  std::vector<notdec::bin2llvm::NativeFunctionPointerSlot> slots = {
+      {0x4000, 8, "slot_target"}};
+  notdec::bin2llvm::attachNativeFunctionPointerMetadata(module, slots);
+  auto summary = notdec::bin2llvm::runNativeFunctionPointerPromotion(module);
 
-  llvm::GlobalVariable *image = findDataImageGlobal(module, "notdec.image.0x1000");
-  bool pointerIsImageGep = false;
-  if (image != nullptr && image->hasInitializer()) {
-    for (llvm::Instruction &instruction : llvm::instructions(caller)) {
-      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
-      if (load == nullptr) {
-        continue;
-      }
-      auto *gep = llvm::dyn_cast<llvm::ConstantExpr>(load->getPointerOperand());
-      if (gep != nullptr &&
-          gep->getOpcode() == llvm::Instruction::GetElementPtr &&
-          gep->getOperand(0)->stripPointerCasts() == image) {
-        pointerIsImageGep = true;
+  llvm::CallBase *rewrittenCall = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(caller)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+      if (call->getCalledFunction() != escape) {
+        rewrittenCall = call;
       }
     }
   }
-  bool bytesMatch = false;
-  if (image != nullptr) {
-    if (auto *array =
-            llvm::dyn_cast<llvm::ConstantDataArray>(image->getInitializer())) {
-      bytesMatch =
-          array->getRawDataValues() ==
-          llvm::StringRef(reinterpret_cast<const char *>(bytes.data()),
-                          bytes.size());
-    }
-  }
 
-  return expect(summary.SegmentsCreated == 1, "segment global was not created") &&
-         expect(summary.StaticAccesses == 1,
-                "constant inttoptr access was not rewritten") &&
-         expect(pointerIsImageGep,
-                "load pointer is not a GEP into the image global") &&
-         expect(bytesMatch, "image initializer bytes do not match the segment") &&
+  return expect(summary.SlotsWithEscapedAddress == 1,
+                "escaped slot address was not detected") &&
+         expect(summary.IndirectCallsPromoted == 0,
+                "call through escaped slot was incorrectly promoted") &&
+         expect(rewrittenCall != nullptr &&
+                    rewrittenCall->getCalledFunction() == nullptr,
+                "call through escaped slot was rewritten") &&
          expect(!llvm::verifyModule(module, &llvm::errs()),
-                "module failed verifier after data image modeling");
+                "module failed verifier after escaped slot test");
 }
 
-bool testDataImageBasePlusOffsetAccess() {
+bool testDynamicStoreMarksFunctionPointerSlotUnknown() {
   llvm::LLVMContext context;
-  llvm::Module module("data-image-base-offset", context);
-  module.setDataLayout("e-p:64:64");
-
-  auto *functionType = llvm::FunctionType::get(
-      llvm::Type::getInt8Ty(context), {llvm::Type::getInt64Ty(context)},
-      false);
-  llvm::Function *caller = llvm::Function::Create(
-      functionType, llvm::GlobalValue::ExternalLinkage, "offset_caller",
-      module);
-  llvm::BasicBlock *entry =
-      llvm::BasicBlock::Create(context, "entry", caller);
-  llvm::IRBuilder<> builder(entry);
-  llvm::Value *index = builder.CreateAnd(
-      caller->getArg(0), llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 7));
-  llvm::Value *address = builder.CreateAdd(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x2000), index);
-  llvm::Value *pointer = builder.CreateIntToPtr(
-      address, llvm::PointerType::get(context, 0));
-  llvm::Value *loaded =
-      builder.CreateLoad(llvm::Type::getInt8Ty(context), pointer);
-  builder.CreateRet(loaded);
-
-  std::vector<uint8_t> bytes(16, 0x42);
-  std::vector<notdec::bin2llvm::NativeDataImageSegment> segments = {
-      {0x2000, 16, false, bytes}};
-  std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot> slots;
-  std::vector<uint64_t> bases = {0x2000};
-  auto summary = notdec::bin2llvm::materializeNativeDataImage(
-      module, segments, slots, bases);
-
-  llvm::GlobalVariable *image = findDataImageGlobal(module, "notdec.image.0x2000");
-  bool dynamicGepUsesImage = false;
-  for (llvm::Instruction &instruction : llvm::instructions(caller)) {
-    auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&instruction);
-    if (gep == nullptr ||
-        llvm::isa<llvm::Constant>(gep->getOperand(1))) {
-      continue;
-    }
-    llvm::Value *base = gep->getPointerOperand();
-    if (auto *expression = llvm::dyn_cast<llvm::ConstantExpr>(base)) {
-      if (expression->getOpcode() == llvm::Instruction::GetElementPtr) {
-        base = expression->getOperand(0);
-      }
-    }
-    dynamicGepUsesImage |= base->stripPointerCasts() == image;
-  }
-
-  return expect(summary.BaseOffsetAccesses == 1,
-                "base+offset access was not rewritten") &&
-         expect(dynamicGepUsesImage,
-                "base+offset access is not a two-index GEP into the image") &&
-         expect(!llvm::verifyModule(module, &llvm::errs()),
-                "module failed verifier after base+offset rewriting");
-}
-
-bool testDataImageUnconfirmedBaseStaysRaw() {
-  llvm::LLVMContext context;
-  llvm::Module module("data-image-unconfirmed-base", context);
-  module.setDataLayout("e-p:64:64");
-
-  auto *functionType = llvm::FunctionType::get(
-      llvm::Type::getInt8Ty(context), {llvm::Type::getInt64Ty(context)},
-      false);
-  llvm::Function *caller = llvm::Function::Create(
-      functionType, llvm::GlobalValue::ExternalLinkage, "raw_caller", module);
-  llvm::BasicBlock *entry =
-      llvm::BasicBlock::Create(context, "entry", caller);
-  llvm::IRBuilder<> builder(entry);
-  llvm::Value *address = builder.CreateAdd(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x2008),
-      caller->getArg(0));
-  llvm::Value *pointer = builder.CreateIntToPtr(
-      address, llvm::PointerType::get(context, 0));
-  llvm::Value *loaded =
-      builder.CreateLoad(llvm::Type::getInt8Ty(context), pointer);
-  builder.CreateRet(loaded);
-
-  std::vector<uint8_t> bytes(16, 0x42);
-  std::vector<notdec::bin2llvm::NativeDataImageSegment> segments = {
-      {0x2000, 16, false, bytes}};
-  std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot> slots;
-  std::vector<uint64_t> bases;
-  auto summary = notdec::bin2llvm::materializeNativeDataImage(
-      module, segments, slots, bases);
-
-  bool intToPtrKept = false;
-  for (llvm::Instruction &instruction : llvm::instructions(caller)) {
-    intToPtrKept |= llvm::isa<llvm::IntToPtrInst>(&instruction);
-  }
-
-  return expect(summary.BaseOffsetAccesses == 0,
-                "unconfirmed base was rewritten as an image address") &&
-         expect(intToPtrKept, "raw inttoptr access disappeared") &&
-         expect(!llvm::verifyModule(module, &llvm::errs()),
-                "module failed verifier after rejected base+offset rewrite");
-}
-
-bool testDataImageRejectsRegisterBaseAddend() {
-  llvm::LLVMContext context;
-  llvm::Module module("data-image-register-base", context);
-  module.setDataLayout("e-p:64:64");
-
-  auto *fsOffset = new llvm::GlobalVariable(
-      module, llvm::Type::getInt64Ty(context), /*isConstant=*/false,
-      llvm::GlobalValue::ExternalLinkage, nullptr, "FS_OFFSET");
-  fsOffset->setMetadata(
-      "notdec.register",
-      llvm::MDNode::get(context, {llvm::MDString::get(context, "FS_OFFSET")}));
-
-  auto *functionType = llvm::FunctionType::get(
-      llvm::Type::getInt64Ty(context), {}, false);
-  llvm::Function *caller = llvm::Function::Create(
-      functionType, llvm::GlobalValue::ExternalLinkage, "tls_caller", module);
-  llvm::BasicBlock *entry =
-      llvm::BasicBlock::Create(context, "entry", caller);
-  llvm::IRBuilder<> builder(entry);
-  llvm::Value *fsBase =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), fsOffset);
-  llvm::Value *address = builder.CreateAdd(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x4000), fsBase);
-  llvm::Value *pointer = builder.CreateIntToPtr(
-      address, llvm::PointerType::get(context, 0));
-  llvm::Value *loaded =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), pointer);
-  builder.CreateRet(loaded);
-
-  std::vector<uint8_t> bytes(16, 0);
-  std::vector<notdec::bin2llvm::NativeDataImageSegment> segments = {
-      {0x4000, 16, false, bytes}};
-  std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot> slots;
-  std::vector<uint64_t> bases;
-  auto summary = notdec::bin2llvm::materializeNativeDataImage(
-      module, segments, slots, bases);
-
-  bool intToPtrKept = false;
-  for (llvm::Instruction &instruction : llvm::instructions(caller)) {
-    intToPtrKept |= llvm::isa<llvm::IntToPtrInst>(&instruction);
-  }
-
-  return expect(summary.BaseOffsetAccesses == 0,
-                "register base addend was treated as a data index") &&
-         expect(intToPtrKept,
-                "TLS-based access was rewritten into the data image") &&
-         expect(!llvm::verifyModule(module, &llvm::errs()),
-                "module failed verifier after TLS base rejection");
-}
-
-bool testDataImageFunctionSlotPromotesToDirectCall() {
-  llvm::LLVMContext context;
-  llvm::Module module("data-image-function-slot", context);
+  llvm::Module module("function-pointer-slot-dynamic-write", context);
   module.setDataLayout("e-p:64:64");
 
   auto *functionType = llvm::FunctionType::get(
       llvm::Type::getInt64Ty(context), {llvm::Type::getInt64Ty(context)},
       false);
   llvm::Function *target = llvm::Function::Create(
-      functionType, llvm::GlobalValue::InternalLinkage, "image_slot_target",
-      module);
+      functionType, llvm::GlobalValue::InternalLinkage, "slot_target", module);
   llvm::BasicBlock *targetEntry =
       llvm::BasicBlock::Create(context, "entry", target);
   llvm::IRBuilder<> targetBuilder(targetEntry);
   targetBuilder.CreateRet(target->getArg(0));
 
   llvm::Function *caller = llvm::Function::Create(
-      functionType, llvm::GlobalValue::ExternalLinkage, "image_slot_caller",
-      module);
+      functionType, llvm::GlobalValue::ExternalLinkage, "slot_caller", module);
   llvm::BasicBlock *callerEntry =
       llvm::BasicBlock::Create(context, "entry", caller);
   llvm::IRBuilder<> builder(callerEntry);
   llvm::Constant *slotAddress = llvm::ConstantExpr::getIntToPtr(
-      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x3008),
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x5000),
       llvm::PointerType::get(context, 0));
-  llvm::Value *loaded =
-      builder.CreateLoad(llvm::Type::getInt64Ty(context), slotAddress);
+  llvm::Value *loaded = builder.CreateLoad(
+      llvm::Type::getInt64Ty(context), slotAddress);
+  llvm::Value *index = builder.CreateAnd(
+      caller->getArg(0),
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8));
+  llvm::Value *dynamicAddress = builder.CreateAdd(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0x5000), index);
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0),
+      builder.CreateIntToPtr(dynamicAddress,
+                             llvm::PointerType::get(context, 0)));
   llvm::Value *callee = builder.CreateIntToPtr(
       loaded, llvm::PointerType::get(context, 0));
-  llvm::CallInst *call =
-      builder.CreateCall(functionType, callee, {caller->getArg(0)});
-  builder.CreateRet(call);
+  builder.CreateCall(functionType, callee, {caller->getArg(0)});
+  builder.CreateRet(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0));
 
-  std::vector<uint8_t> bytes(16, 0);
-  std::vector<notdec::bin2llvm::NativeDataImageSegment> segments = {
-      {0x3000, 16, false, bytes}};
-  std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot> slots = {
-      {0x3008, 8, "image_slot_target"}};
-  std::vector<uint64_t> bases;
-  auto imageSummary = notdec::bin2llvm::materializeNativeDataImage(
-      module, segments, slots, bases);
-  auto promotionSummary =
-      notdec::bin2llvm::runNativeFunctionPointerPromotion(module);
+  std::vector<notdec::bin2llvm::NativeFunctionPointerSlot> slots = {
+      {0x5000, 8, "slot_target"}};
+  notdec::bin2llvm::attachNativeFunctionPointerMetadata(module, slots);
+  auto summary = notdec::bin2llvm::runNativeFunctionPointerPromotion(module);
 
-  llvm::CallBase *rewrittenCall = nullptr;
-  for (llvm::Instruction &instruction : llvm::instructions(caller)) {
-    if (auto *candidate = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
-      rewrittenCall = candidate;
-    }
-  }
-
-  return expect(imageSummary.SegmentsCreated == 1,
-                "data image segment was not created") &&
-         expect(imageSummary.FunctionSlots == 1,
-                "function pointer slot was not symbolized") &&
-         expect(promotionSummary.SlotsWithKnownSingleTarget == 1,
-                "image function pointer slot was not recognized") &&
-         expect(promotionSummary.IndirectCallsPromoted == 1,
-                "call through image slot was not promoted") &&
-         expect(rewrittenCall != nullptr &&
-                    rewrittenCall->getCalledFunction() == target,
-                "call through image slot was not rewritten to the target") &&
+  return expect(summary.SlotsWithUnknownWrites == 1,
+                "dynamic store from a slot base was not detected") &&
+         expect(summary.IndirectCallsPromoted == 0,
+                "call through dynamically written slot was promoted") &&
          expect(!llvm::verifyModule(module, &llvm::errs()),
-                "module failed verifier after image slot promotion");
+                "module failed verifier after dynamic write test");
 }
 
 
@@ -3308,14 +3101,11 @@ int main() {
   ok &= testNonX64DoesNotSuppressCallStackEffect();
   ok &= testX86PcThunkCallFoldsToConstantBase();
   ok &= testFunctionAddressConstantBecomesFunctionReference();
-  ok &= testRelocatedFunctionPointerSlotBecomesGlobal();
+  ok &= testFunctionPointerMetadataRoundTrip();
   ok &= testFunctionPointerSlotPromotesToDirectCall();
   ok &= testModifiedFunctionPointerSlotIsNotPromoted();
-  ok &= testDataImageSegmentBecomesGlobal();
-  ok &= testDataImageBasePlusOffsetAccess();
-  ok &= testDataImageUnconfirmedBaseStaysRaw();
-  ok &= testDataImageRejectsRegisterBaseAddend();
-  ok &= testDataImageFunctionSlotPromotesToDirectCall();
+  ok &= testEscapedFunctionPointerSlotIsNotPromoted();
+  ok &= testDynamicStoreMarksFunctionPointerSlotUnknown();
   ok &= testPartialRegisterWriteUsesPartialWriteHelper();
   ok &= testPartialRegisterReadUsesPartialReadHelper();
   ok &= testX87FildlFoldsToWindowPush();

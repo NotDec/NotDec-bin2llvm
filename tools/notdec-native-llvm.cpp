@@ -2,9 +2,8 @@
 #include "notdec-bin2llvm/LiefElfLoadImage.h"
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/NativeAnalysis.h"
-#include "notdec-bin2llvm/NativeDataImage.h"
 #include "notdec-bin2llvm/NativeFunctionPointerPromotion.h"
-#include "notdec-bin2llvm/NativeRelocationData.h"
+#include "notdec-bin2llvm/NativeRelocationMetadata.h"
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
@@ -1263,7 +1262,7 @@ int main(int argc, char **argv) {
     }
 
     std::set<std::string> preservedFunctions;
-    std::vector<notdec::bin2llvm::NativeDataImageFunctionSlot>
+    std::vector<notdec::bin2llvm::NativeFunctionPointerSlot>
         functionPointerSlots;
     if (selectedState) {
       NativeCallTargets plannedTargets = planNativeCallTargets(
@@ -1288,6 +1287,10 @@ int main(int argc, char **argv) {
         preservedFunctions.insert(targetIt->second);
       }
     }
+    // Record the slot facts on the module; the IR keeps its lifted
+    // absolute-address form and the promotion matcher reads this metadata.
+    notdec::bin2llvm::attachNativeFunctionPointerMetadata(*module,
+                                                          functionPointerSlots);
 
     if (llvm::verifyModule(*module, &llvm::errs())) {
       std::cerr << "module verification failed\n";
@@ -1302,66 +1305,6 @@ int main(int argc, char **argv) {
     if (!runInstCombinePassIfEnabled(*module, *options)) {
       return 1;
     }
-    // The data image runs after register elimination: i386 computes data
-    // addresses through registers, and only SummarySSA plus InstCombine expose
-    // them as inttoptr constants this pass can resolve.
-    notdec::bin2llvm::NativeDataImageSummary dataImageSummary;
-    notdec::bin2llvm::NativeRelocationDataSummary relocationSummary;
-    if (options->MemoryModel == notdec::bin2llvm::PcodeMemoryModel::IntToPtr) {
-      notdec::bin2llvm::NativeProgramState fallbackState(*binary);
-      const notdec::bin2llvm::NativeProgramState &memoryState =
-          selectedState ? *selectedState : fallbackState;
-      std::vector<notdec::bin2llvm::NativeDataImageSegment> segments;
-      segments.reserve(memoryState.memoryRanges().size());
-      for (const notdec::bin2llvm::NativeMemoryRange &range :
-           memoryState.memoryRanges()) {
-        segments.push_back({range.Start, range.Size, range.Executable,
-                            range.Bytes});
-      }
-      // Relocation slots and their computed values are the addresses the
-      // frontend already proved are data; they gate base+offset rewriting.
-      std::vector<uint64_t> knownAddressBases;
-      knownAddressBases.reserve(memoryState.relocatedPointers().size() * 2 +
-                                memoryState.pltEntries().size());
-      for (const auto &[slot, value] : memoryState.relocatedPointers()) {
-        knownAddressBases.push_back(slot);
-        knownAddressBases.push_back(value);
-      }
-      for (const notdec::bin2llvm::NativePltEntry &entry :
-           memoryState.pltEntries()) {
-        knownAddressBases.push_back(entry.GotAddress);
-      }
-      dataImageSummary = notdec::bin2llvm::materializeNativeDataImage(
-          *module, segments, functionPointerSlots, knownAddressBases);
-      if (options->PrintRegisterSSASummary) {
-        llvm::errs() << "Native data image: segments="
-                     << dataImageSummary.SegmentsCreated
-                     << " skipped=" << dataImageSummary.SegmentsSkipped
-                     << " slots=" << dataImageSummary.FunctionSlots
-                     << " static=" << dataImageSummary.StaticAccesses
-                     << " base_offset=" << dataImageSummary.BaseOffsetAccesses
-                     << " fallback=" << dataImageSummary.FallbackSlots
-                     << " unresolved=" << dataImageSummary.UnresolvedIntToPtrs
-                     << '\n';
-      }
-    } else {
-      std::vector<notdec::bin2llvm::NativeFunctionPointerSlot> slotGlobals;
-      for (const notdec::bin2llvm::NativeDataImageFunctionSlot &slot :
-           functionPointerSlots) {
-        slotGlobals.push_back({slot.Address, slot.Width, slot.FunctionName});
-      }
-      relocationSummary =
-          notdec::bin2llvm::materializeNativeFunctionPointerSlots(
-              *module, slotGlobals);
-      if (options->PrintRegisterSSASummary) {
-        llvm::errs() << "Native relocation slots: created="
-                     << relocationSummary.SlotsCreated
-                     << " reused=" << relocationSummary.SlotsReused
-                     << " accesses=" << relocationSummary.AccessesRewritten
-                     << '\n';
-      }
-    }
-
     notdec::bin2llvm::NativeFunctionPointerPromotionSummary
         promotionSummary =
             notdec::bin2llvm::runNativeFunctionPointerPromotion(*module);
@@ -1373,6 +1316,8 @@ int main(int argc, char **argv) {
                    << promotionSummary.SlotsWithKnownSingleTarget
                    << " unknown_writes="
                    << promotionSummary.SlotsWithUnknownWrites
+                   << " escaped="
+                   << promotionSummary.SlotsWithEscapedAddress
                    << " multiple_targets="
                    << promotionSummary.SlotsWithMultipleTargets << '\n';
     }
