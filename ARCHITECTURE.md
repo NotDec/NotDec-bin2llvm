@@ -337,6 +337,10 @@ load i64, ptr inttoptr (<slot address>)
    - 让后续 register summary 能继续按 register global 识别访问。
    - 所有 ABI 都把 ST0/ST1 的 `x86_fp80` load/store 规范回 `i80` + bitcast，
      避免 `registerLoad/registerStore` 因 `x86_fp80 != i80` 而忽略 x87 窗口访问。
+   - range 状态这条线也要同样处理：pre-SSA InstCombine 会把上面的 bitcast 折回
+     `store x86_fp80 %v, ptr @ST0`，此时 store 的值类型与 `i80` global 不同，
+     `transferRangeInstruction()` 会用 `coerceStoreValueToRangeWidth()` 先 bitcast
+     再记录；否则这次写被静默丢掉，x87 返回槽退化成 `notdec.unknown`。
 
 6. **第一遍 NativeRegisterSummary**
    - 入口：`runNativeRegisterSummary(...)`。

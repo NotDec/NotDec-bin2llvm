@@ -5615,6 +5615,36 @@ private:
     return readBefore;
   }
 
+  // x87 窗口规范化（以及前一轮 InstCombine 折叠 bitcast 之后）会用
+  // `store x86_fp80 %v, ptr @ST0` 写 i80 的 global：位宽相同、类型不同。
+  // range 状态只认 rangeType()（i80）的值，所以先 bitcast 再记录；
+  // 否则这次写会被静默丢掉，返回槽退化成 notdec.unknown。
+  // 只接受标量整数/浮点（指针要先 ptrtoint，不在这里处理）。
+  llvm::Value *coerceStoreValueToRangeWidth(llvm::Value *value,
+                                            const RegisterUnit &unit,
+                                            llvm::Instruction *insertBefore) {
+    value = resolve(value);
+    if (value == nullptr || insertBefore == nullptr) {
+      return nullptr;
+    }
+    llvm::Type *type = value->getType();
+    if (type == nullptr ||
+        (!type->isIntegerTy() && !type->isFloatingPointTy())) {
+      return nullptr;
+    }
+    unsigned width = registerBitWidth(unit);
+    if (width == 0 || valueBitWidth(value) != width) {
+      return nullptr;
+    }
+    auto *integerType = llvm::IntegerType::get(Function.getContext(), width);
+    if (type == integerType) {
+      return value;
+    }
+    llvm::IRBuilder<> builder(insertBefore);
+    return builder.CreateBitCast(value, integerType,
+                                 unit.Name + ".range_store.bits");
+  }
+
   llvm::Value *writeSegment(llvm::Instruction &writeInst,
                             const RegisterRangeKey &range, llvm::Value *value) {
     value = resolve(value);
@@ -5744,12 +5774,19 @@ private:
     llvm::BasicBlock &block = *inst.getParent();
     if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
       RegisterAccess access = registerStore(*store, Units);
-      if (access.Unit != nullptr && access.IsStorageValue) {
-        (void)writeAccessRange(*store, access.Unit->Global, 0,
-                               registerBitWidth(*access.Unit),
-                               resolve(store->getValueOperand()), 0,
-                               rangeWriteInsertPoint(*store, readBefore),
-                               access.Unit->Name + ".range_store");
+      if (access.Unit != nullptr) {
+        llvm::Instruction *insertBefore =
+            rangeWriteInsertPoint(*store, readBefore);
+        llvm::Value *source =
+            access.IsStorageValue
+                ? resolve(store->getValueOperand())
+                : coerceStoreValueToRangeWidth(store->getValueOperand(),
+                                               *access.Unit, insertBefore);
+        if (source != nullptr) {
+          (void)writeAccessRange(
+              *store, access.Unit->Global, 0, registerBitWidth(*access.Unit),
+              source, 0, insertBefore, access.Unit->Name + ".range_store");
+        }
       }
       return true;
     }

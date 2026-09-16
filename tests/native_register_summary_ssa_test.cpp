@@ -1721,6 +1721,60 @@ bool testX87StackReturnBecomesX86Fp80ReturnSlot() {
                   "module failed verifier after x87 stack return test");
 }
 
+// x87 窗口规范化（以及前一轮 InstCombine 折叠它的 bitcast 之后）用
+// `store x86_fp80 %v, ptr @ST0` 写 i80 的 ST0 global：位宽相同、类型不同。
+// range 状态必须仍能看见这类写，否则返回槽会退化成 notdec.unknown。
+bool testX87Fp80StoreStillFeedsRange() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-x87-fp80-store", context);
+  attachTestAbi(module);
+
+  llvm::GlobalVariable *st0 = createRegisterGlobal(
+      module, "ST0", llvm::Type::getIntNTy(context, 80), 0x1100, 10);
+
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::InternalLinkage, "x87_fp80_store", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *value = builder.CreateSIToFP(
+      function->getArg(0), llvm::Type::getX86_FP80Ty(context), "fp80");
+  builder.CreateStore(value, st0);
+  builder.CreateRetVoid();
+
+  // 调用者（root 函数）在调用后读 @ST0 存进内存，让被调函数拿到 ST0 的 ExitDemand。
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::InternalLinkage, "x87_fp80_store_caller",
+      module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "caller_entry", caller);
+  llvm::IRBuilder<> callerBuilder(callerEntry);
+  llvm::AllocaInst *slot =
+      callerBuilder.CreateAlloca(llvm::Type::getIntNTy(context, 80));
+  callerBuilder.CreateCall(
+      function->getFunctionType(), function,
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  llvm::LoadInst *st0Load =
+      callerBuilder.CreateLoad(llvm::Type::getIntNTy(context, 80), st0);
+  st0Load->setMetadata("notdec.register.access",
+                       registerAccessMetadata(context, "ST0"));
+  callerBuilder.CreateStore(st0Load, slot);
+  callerBuilder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("x87_fp80_store");
+  return expect(rewritten != nullptr, "x87 fp80 store function missing") &&
+         expect(rewritten->getReturnType()->isX86_FP80Ty(),
+                "x86_fp80 ST0 store was not recovered as a return slot") &&
+         expect(!moduleHasUsedFunctionNamed(module, "notdec.unknown.i80"),
+                "x86_fp80 store into the i80 ST0 global was dropped") &&
+         verifyOk(module, "module failed verifier after x87 fp80 store test");
+}
+
 bool testRegisterPointerPhiLoadIsCanonicalized() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-register-pointer-phi-load", context);
@@ -10125,6 +10179,7 @@ int main() {
   ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
   ok &= testPartialReadLoopPassthroughUsesDominatorTree();
   ok &= testX87StackReturnBecomesX86Fp80ReturnSlot();
+  ok &= testX87Fp80StoreStillFeedsRange();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();
   ok &= testUnknownPhiIncomingUsesFrozenPoison();
   ok &= testSelfOnlyPhiBecomesOpaqueUnknown();
