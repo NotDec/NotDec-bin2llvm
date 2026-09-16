@@ -2200,18 +2200,23 @@ unsigned localDefinitionPrefix(
     ++leadingEntry;
   }
   unsigned localCount = 0;
+  unsigned trailingConsumed = 0;
   for (const NativeRegisterCallsiteSlotEvidence &slot : slots.drop_front(
            std::min<size_t>(leadingEntry, slots.size()))) {
     if (slot.Origin != NativeRegisterCallsiteValueOrigin::LocalDefinition) {
       break;
     }
     ++localCount;
+    // 已被读过的 local 只在连续证据的尾部排除：尾部之外（后面还有别的局部
+    // 实参）说明这个寄存器仍然要给调用留值，例如 suffix 先放进 R8、再
+    // `mov %r8,%rdx` 填 prefix，此时 R8 和 RDX 都是实参。
+    trailingConsumed = slot.ConsumedLocal ? trailingConsumed + 1 : 0;
   }
   // 纯 entry（没有任何 local）是"入口寄存器没被用过"，不是参数证据。
   if (localCount == 0) {
     return 0;
   }
-  return leadingEntry + localCount;
+  return leadingEntry + localCount - trailingConsumed;
 }
 
 std::vector<NativeRegisterCallsiteSlotEvidence>

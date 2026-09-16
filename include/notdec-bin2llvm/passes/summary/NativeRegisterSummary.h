@@ -87,6 +87,11 @@ struct NativeRegisterCallsiteSlotEvidence {
   bool StoreIsFloat = false;
   NativeRegisterCallsiteValueOrigin Origin =
       NativeRegisterCallsiteValueOrigin::Unknown;
+  // LocalDefinition 的值在调用点前已经被读过（本块内最后一次写之后、调用点之前
+  // 有对同一寄存器的 load）：它多半只是给别的用途/实参准备的临时值
+  // （`lea name,%rcx; mov %rcx,%rdx; call f`、或先 `mov %rcx,-0x90(%rbp)`
+  // 再调用）。推断时只在"连续证据的尾部"把它排除，见 localDefinitionPrefix()。
+  bool ConsumedLocal = false;
 };
 
 enum class NativeRegisterExternalCallsiteKind {

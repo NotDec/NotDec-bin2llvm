@@ -1636,6 +1636,35 @@ private:
     return &shapeIt->second;
   }
 
+  // An argument register holds a value that is still waiting for the call.  A
+  // local value that was read between its last write and the call was consumed
+  // by that read, so it may only be a scratch copy.  Only the current block is
+  // scanned: a value written in an earlier block has nothing in between here
+  // that could have consumed it.
+  bool registerValuePendingAtCall(const llvm::GlobalVariable &global,
+                                  const llvm::CallBase &call) const {
+    const llvm::BasicBlock *block = call.getParent();
+    if (block == nullptr) {
+      return true;
+    }
+    for (auto it = call.getIterator(); it != block->begin();) {
+      --it;
+      const llvm::Instruction &instruction = *it;
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+        if (load->getPointerOperand()->stripPointerCasts() == &global) {
+          return false;
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+        if (store->getPointerOperand()->stripPointerCasts() == &global) {
+          return true;
+        }
+      }
+    }
+    return true;
+  }
+
   NativeRegisterCallsiteValueOrigin
   callsiteOrigin(const State &state, llvm::CallBase &call,
                  const NativeRegisterCallInputSlot &slot,
@@ -1726,6 +1755,14 @@ private:
       StackSlotKey resolvedKey;
       evidence.Origin =
           callsiteOrigin(state, call, slot, &resolvedKey);
+      if (evidence.Origin ==
+              NativeRegisterCallsiteValueOrigin::LocalDefinition &&
+          slot.Kind != NativeRegisterCallInputSlotKind::Stack) {
+        auto unitIt = UnitsByName.find(slot.UnitName);
+        evidence.ConsumedLocal =
+            unitIt != UnitsByName.end() &&
+            !registerValuePendingAtCall(*unitIt->second, call);
+      }
       if (slot.Kind == NativeRegisterCallInputSlotKind::Stack &&
           evidence.Origin == NativeRegisterCallsiteValueOrigin::LocalDefinition) {
         auto storeIt = state.StackSlotStores.find(resolvedKey);

@@ -5508,6 +5508,104 @@ bool testUnknownExternalArityUsesMaxCallsitePrefix() {
                   "module failed verifier after unknown external arity test");
 }
 
+// A register that was already consumed before the call is a scratch value, not
+// an argument: script_create materializes callback/name constants in RCX, uses
+// them for frame stores and only then calls out, so the call must still infer
+// three integer arguments (RDI, RSI, RDX), not four.
+bool testConsumedScratchRegisterIsNotAnExternalArgument() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-scratch-register-arity", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX"});
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "scratch_arity", module);
+  llvm::Function *function =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "scratch_arity_callers", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::AllocaInst *saved =
+      builder.CreateAlloca(llvm::Type::getInt64Ty(context), nullptr, "saved");
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 4),
+                "RDX");
+  // RCX is only materialized for the frame store; at the call it is stale.
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 3),
+                "RCX");
+  llvm::LoadInst *scratch = loadRegister(builder, rcx, "RCX", "scratch");
+  builder.CreateStore(scratch, saved);
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("scratch_arity");
+  return expect(rewritten != nullptr, "scratch arity callee missing") &&
+         expect(rewritten->arg_size() == 3,
+                "consumed scratch register was counted as an argument") &&
+         verifyOk(module,
+                  "module failed verifier after scratch register arity test");
+}
+
+// The same pattern the other way around: the compiler fills a later argument
+// register first (suffix in R8) and copies it down into an earlier one (prefix
+// in RDX).  Both registers are real arguments, so the consumed copy must not
+// truncate the evidence that follows it.
+bool testConsumedRegisterBeforeLaterArgumentKeepsArity() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-consumed-register-middle", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+  llvm::GlobalVariable *r9 = createRegisterGlobal(module, "R9");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "middle_arity", module);
+  llvm::Function *function =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "middle_arity_callers", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 3),
+                "RCX");
+  storeRegister(builder, r8, llvm::ConstantInt::get(r8->getValueType(), 4),
+                "R8");
+  llvm::LoadInst *copied = loadRegister(builder, rcx, "RCX", "copied");
+  storeRegister(builder, rdx, copied, "RDX");
+  storeRegister(builder, r9, llvm::ConstantInt::get(r9->getValueType(), 5),
+                "R9");
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("middle_arity");
+  return expect(rewritten != nullptr, "middle arity callee missing") &&
+         expect(rewritten->arg_size() == 6,
+                "consumed argument register dropped later argument evidence") &&
+         verifyOk(module, "module failed verifier after middle arity test");
+}
+
 bool testExternalPrototypeJsonOverridesInferredArity() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-external-json-priority", context);
@@ -10086,6 +10184,8 @@ int main() {
   ok &= testInternalReturnDoesNotExposeExternalClobber();
   ok &= testClobberReturnPhiPreservesMixedPath();
   ok &= testUnknownExternalArityUsesMaxCallsitePrefix();
+  ok &= testConsumedScratchRegisterIsNotAnExternalArgument();
+  ok &= testConsumedRegisterBeforeLaterArgumentKeepsArity();
   ok &= testExternalPrototypeJsonOverridesInferredArity();
   ok &= testExternalPrototypeJsonAcceptsLongDouble();
   ok &= testUnknownExternalArityStopsAtClobberArg();

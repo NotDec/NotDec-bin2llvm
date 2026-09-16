@@ -337,6 +337,10 @@ load i64, ptr inttoptr (<slot address>)
      - `ForwardedEntry`
      - `Mixed`
      - `CallClobber`
+   - 另有一个 `ConsumedLocal` 标记：`LocalDefinition` 的值在本块内最后一次写
+     之后、调用点之前被对同一寄存器的 load 读过，说明它多半只是给别的用途准备的
+     临时值（`lea name,%rcx; mov %rcx,%rdx; call f`，或 `lea name,%rcx;
+     mov %rcx,-0x90(%rbp); call f`）。
    - bottom-up 最后一轮已经得到稳定 block `In/Out`；callsite evidence 直接复用该状态，
      不重新求解 CFG。
 
@@ -344,7 +348,8 @@ load i64, ptr inttoptr (<slot address>)
    - 入口：`inferExternalCallShapes(...)`。
    - unknown external：
      - 每个 callsite 分别统计整数和浮点（SSE）寄存器序列从 arg0 开始的连续
-       `LocalDefinition` 前缀，两类序列独立计数再加总。
+       `LocalDefinition` 前缀，两类序列独立计数再加总；连续证据**尾部**的
+       `ConsumedLocal` 槽（见第 6 步）不算实参，中间的不受影响。
      - 同一 callee 有多个 callsite 时取最大 arity；优先用浮点参数最多的 callsite
        生成混合 `TypedParams`（整型 `PointerSized` + 浮点 `Double`），让浮点参数
        能绑定到 XMM 槽而不是溢到整型/栈槽。
@@ -407,7 +412,8 @@ load i64, ptr inttoptr (<slot address>)
     - 对 indirect call 使用 callsite binding 收窄参数数量。
     - 间接调用的初始参数形状来自 `NativeRegisterSummary` 的 callsite
       provenance：只数连续 `LocalDefinition` 前缀（允许 wrapper 式
-      `ForwardedEntry`）；入口残留和 call clobber 不再被当成参数。
+      `ForwardedEntry`）；入口残留、call clobber 和尾部的 `ConsumedLocal`
+      临时副本都不再被当成参数（见第 6 步）。
     - 对内部函数，如果所有直接调用点都没用满推断出的栈参数前缀，按调用点前缀
       截断栈参数数量和对应 binding。
     - `addIndirectCallsiteShapes(...)` 对间接调用复用未知外部的保守返回规则：
