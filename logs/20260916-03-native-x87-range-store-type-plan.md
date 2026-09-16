@@ -131,3 +131,88 @@ memcached：完全中性（同一份对照 `memcached.ecse2`）。
 | `sasl_listmech` | 8 参 | 8 参 |
 
 ctest：12/12（含 fortune x86_64/i386）。
+
+## 附：剩下 2 条 ST0 unknown 的详细定位
+
+结论：这两条**不是**类型不匹配（那是已修的 5 条），而是 **x87 栈顶下面的空槽被
+push/pop/xchg 旋转后浮到 ST0**，模型给 `notdec.unknown` 是诚实的；两条都不影响
+函数算出来的结果。
+
+### 证据 1：pre-SSA 的原始序列
+
+FUN_81d0 entry（pre-SSA 25922-25928）：
+
+```llvm
+%arg  = load i80, ptr [RBP+16]     ; 入参 long double（stack+8.arg）
+%old0 = load i80, ptr @ST0         ; ← 栈顶下面的槽
+%old1 = load x86_fp80, ptr @ST1
+store i80 %arg,  ptr @ST0          ; 压栈：新顶
+store i80 %old0, ptr @ST1          ; 旧顶下移
+call void @notdec.x87.push(%old1)
+```
+
+FUN_81d0 `bb_821c`（pre-SSA 25986-25989）——关键：
+
+```llvm
+%a = load i80, ptr @ST0
+%b = load i80, ptr @ST1
+store i80 %b, ptr @ST0             ; ST0 ← 旧 ST1（就是 entry 里那个未定义槽）
+store i80 %a, ptr @ST1
+```
+
+即 bb_821c 把 ST1 里那个未定义槽**换回了 ST0**。SysV 下 ST0/ST1 在函数入口本来
+就是未定义的（psABI 要求 x87 栈在调用边界为空，long double 参数走内存），所以这条
+路径上 ST0 确实没有值 → unknown 忠实。
+
+stats_mean（pre-SSA 26452-26455）是函数里**第一次**碰 ST0/ST1：
+
+```llvm
+%old0 = load i80, ptr @ST0
+%old1 = load x86_fp80, ptr @ST1
+store x86_fp80 <新值>, ptr @ST0
+store i80 %old0, ptr @ST1
+```
+
+循环入口之前没有任何 ST0 写（pre-SSA 里第一个 ST0 store 就是这一次），所以循环头
+携带的 ST0 初值本来就是未定义的。
+
+### 证据 2：临时插桩 trace
+
+（`NOTDEC_RANGE_TRACE=1` 只对这两个函数打印 rstore/rphi/rread，分析完已回退）
+
+FUN_81d0：
+
+```text
+[rstore] entry   isStorage=1 source=v wrote=1
+[rstore] bb_821c isStorage=1 source=v wrote=1      ← swap 那次写
+[rphi]   bb_823b <- bb_821c exit=v typed=v dom=1   ← phi 拿到的就是 swap 后的未定义槽
+```
+
+stats_mean：
+
+```text
+[rread] bb_83cd cur=null unknownDef=0
+[rread] bb_83bc cur=null unknownDef=0
+[rread] entry   cur=null unknownDef=0
+[rphi]  bb_83d0 <- bb_83cd exit=null typed=null dom=0   ← 循环头 ST0 入边确实无定义
+```
+
+即**不是丢写、也不是缓存顺序问题**：FUN_81d0 每条 ST0 写都 `wrote=1`；stats_mean
+链路上 ST0 确实无定义。
+
+### 为什么不影响结果 / 可选后续
+
+- FUN_81d0 的 unknown 参与 `%x87.fp80.value245` 的 phi + `fcmp ugt`，最后进
+  `store i80 %ST0..., ptr %notdec_stack.native`（`aprintf` 的出参槽）；
+- stats_mean 的 unknown 是循环头 ST0 phi 的合法入边，被循环体第一次 shift-read 用掉；
+- 但两者表示的都是 ABI 未定义的槽位，两个函数的返回值都来自显式 store 的值。
+
+可选处理（都不建议单独开一轮）：
+
+1. 保持现状：保守、忠实，只是 2 条 IR 噪音；
+2. 把"下移槽的读"归入窗口移位内部动作（像 `isX87WindowShiftLoad` 那样不产生
+   demand）：unknown 消失，但语义变成"ST0 保持旧值"——对未定义槽同样合法，只是不如
+   unknown 诚实；
+3. 用 `poison`/`undef` 表示死槽：能让 LLVM 折叠整条链，但 poison 会传播（可能被
+   当 UB），不符合项目现在"unknown 用不透明调用"的约定。
+
