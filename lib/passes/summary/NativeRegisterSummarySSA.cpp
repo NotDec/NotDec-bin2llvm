@@ -541,11 +541,15 @@ bool isKnownExternalFunction(const llvm::Function &function,
 
 bool isUnknownExternalFunction(const llvm::Function &function,
                                const NativeExternalPrototypeMap &prototypes) {
-  // 所有 notdec.* 都是我们自己的内置 intrinsic，不是"未知外部函数"：
-  // unknown 占位、partial read/write、寄存器值域工具、x87 库、frame keep-alive
-  // 都由各自的语义表达寄存器影响，不能按未知外部调用来处理。
+  // notdec.register.* 是内置 intrinsic 命名空间（外加历史前缀），不是"未知外部
+  // 函数"：寄存器影响由各自的语义表达，不能按未知外部调用来处理。
   return function.isDeclaration() && !function.isIntrinsic() &&
-         !function.getName().starts_with("notdec.") &&
+         !function.getName().starts_with("notdec.register.") &&
+         !isNotDecOpaqueUnknownName(function.getName()) &&
+         !isNativeRegisterValueRangeName(function.getName()) &&
+         !isNativeRegisterPartialReadName(function.getName()) &&
+         !isNativeRegisterPartialWriteName(function.getName()) &&
+         !isNativeX87IntrinsicName(function.getName()) &&
          !isKnownExternalFunction(function, prototypes);
 }
 
@@ -3240,11 +3244,14 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
     const AbiFacts &abi, const NativeExternalPrototypeMap &prototypes) {
   std::map<llvm::Function *, SignatureShape> shapes;
   for (llvm::Function &function : module) {
-    // 所有 notdec.* 都是内置 intrinsic（unknown 占位、partial 读写、寄存器值域、
-    // x87 库、frame keep-alive……）：它们不参与签名重写，也就不会在调用点生成
-    // summary_clobber 占位。新增 notdec.* intrinsic 不需要再往名单里补。
+    // 内置 intrinsic（notdec.register.* 命名空间 + 历史前缀）不参与签名重写，
+    // 也就不会在调用点生成 summary_clobber 占位。
     if (function.isIntrinsic() ||
-        function.getName().starts_with("notdec.")) {
+        function.getName().starts_with("notdec.register.") ||
+        isNotDecOpaqueUnknownName(function.getName()) ||
+        isNativeRegisterValueRangeName(function.getName()) ||
+        isNativeRegisterPartialReadName(function.getName()) ||
+        isNativeRegisterPartialWriteName(function.getName())) {
       continue;
     }
     const KnownExternalPrototype *known =

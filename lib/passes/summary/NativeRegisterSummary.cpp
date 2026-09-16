@@ -888,12 +888,15 @@ bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
   if (callee == nullptr) {
     return false;
   }
-  // 所有 notdec.* 都是 lifting / SSA 生成的内置 intrinsic：unknown 占位、
-  // partial read/write、寄存器值域工具、x87 库、native frame keep-alive……
-  // 它们不是真实外部函数，调用点不参与外部参数推断或 ABI clobber 推导；
-  // 对寄存器的影响一律由它们自己的语义（指针参数、返回值）显式表达。
-  // 这样以后新增 notdec.* intrinsic 不需要再往名单里补。
-  return callee->getName().starts_with("notdec.");
+  // notdec.register.* 是寄存器模型内置 intrinsic 的命名空间：unknown 占位、
+  // frame keep-alive 等等。它们不是真实外部函数，调用点不参与外部参数推断或
+  // ABI clobber 推导；对寄存器的影响一律由它们自己的语义（指针参数、返回值）
+  // 显式表达。以后新增 intrinsic 统一用这个前缀，不需要再往名单里补。
+  // 下面几个是历史前缀，语义相同，保留兼容。
+  return callee->getName().starts_with("notdec.register.") ||
+         callee->getName().starts_with("notdec.unknown.") ||
+         isNativeX87IntrinsicName(callee->getName()) ||
+         isNativeRegisterValueRangeName(callee->getName());
 }
 
 bool isAnalyzableCall(const llvm::Instruction &inst) {
