@@ -7009,6 +7009,68 @@ bool testSummarySSARemovesDeadStackFrameStore() {
                   "module failed verifier after stack-frame cleanup test");
 }
 
+// A callee can read the frame through a pointer the register model rebuilt as
+// an unknown clobber, and LLVM's own escape analysis cannot see that.  The
+// rewrite therefore marks the frame address-taken with
+// notdec.register.native_frame.keep so that InstCombine keeps the frame and its
+// content stores.
+bool testNativeFrameContentStoreSurvivesSummarySSA() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-native-frame-keep-alive", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+
+  auto *calleeType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "frame_keep_alive_callee", module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "frame_keep_alive", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::Value *slotAddress = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -8, true));
+  llvm::Value *slot =
+      builder.CreateIntToPtr(slotAddress, llvm::PointerType::get(context, 0));
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 12345), slot);
+  builder.CreateCall(
+      callee, {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)summary;
+  bool hasKeepCall = false;
+  bool contentStoreKept = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      llvm::Function *called = call->getCalledFunction();
+      hasKeepCall |= called != nullptr &&
+                     called->getName() == "notdec.register.native_frame.keep";
+      continue;
+    }
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    auto *stored =
+        store == nullptr
+            ? nullptr
+            : llvm::dyn_cast<llvm::ConstantInt>(store->getValueOperand());
+    if (stored != nullptr && stored->getZExtValue() == 12345) {
+      contentStoreKept = true;
+    }
+  }
+
+  return expect(hasKeepCall,
+                "native frame was not marked address-taken for the pipeline") &&
+         expect(contentStoreKept,
+                "content store into a possibly-escaping frame was removed") &&
+         verifyOk(module, "module failed verifier after frame keep-alive test");
+}
+
 bool testStackFrameAddressPassedToCallIsLocalized() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-stack-frame-call-arg", context);
@@ -7125,6 +7187,68 @@ bool testLateStackCleanupReusesExistingNativeFrameAlloca() {
          expect(rsp->use_empty(),
                 "late stack cleanup left a dead RSP entry read") &&
          verifyOk(module, "module failed verifier after late stack cleanup");
+}
+
+// The frame rewrite runs twice in one pipeline (the early rewrite and the late
+// cleanup).  The second run reuses the slot GEPs the first run left after the
+// alloca, but it also creates values for the accesses the first run did not
+// localize.  Those new values must be inserted after the pointers they consume,
+// so a reused GEP has to move into the pointer cluster as well instead of
+// staying at its old, later position.
+bool testLateStackIntegerAccessReusesDominatedFrameSlot() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-late-stack-integer-reuse", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+
+  auto *calleeType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "takes_stack_integer", module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "late_stack_integer_reuse", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  // Simulate the cluster a previous rewrite left behind: the frame alloca and
+  // one slot GEP at native offset -208 (frameLow -216 + 8).
+  auto *stackType = llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 216);
+  llvm::AllocaInst *storage =
+      builder.CreateAlloca(stackType, nullptr, "notdec_stack.native");
+  storage->setAlignment(llvm::Align(16));
+  llvm::Value *existingSlot = builder.CreateInBoundsGEP(
+      llvm::Type::getInt8Ty(context), storage,
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8));
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 7), existingSlot);
+
+  // A late entry-SP address consumed as an integer forces the cleanup to
+  // materialize ptrtoint(slot) in the pointer cluster.
+  llvm::LoadInst *rspEntry = loadRegister(builder, rsp, "RSP", "rsp.entry");
+  llvm::Value *slotAddress = builder.CreateAdd(
+      rspEntry, llvm::ConstantInt::get(rsp->getValueType(), -208, true));
+  llvm::CallInst *call = builder.CreateCall(callee, {slotAddress});
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeStackFrameCleanupOptions options;
+  options.StackPointerRegister = "RSP";
+  options.Registers = {"RSP"};
+  auto summary = notdec::bin2llvm::runNativeStackFrameCleanup(module, options);
+  auto *integer = llvm::dyn_cast<llvm::PtrToIntInst>(call->getArgOperand(0));
+
+  return expect(summary.AccessesRewritten >= 1,
+                "late stack cleanup did not rewrite entry-SP integer access") &&
+         expect(integer != nullptr &&
+                    integer->getPointerOperand()->stripPointerCasts() ==
+                        existingSlot->stripPointerCasts(),
+                "late stack cleanup did not reuse the existing frame slot") &&
+         verifyOk(module,
+                  "module failed verifier after late stack integer reuse");
 }
 
 bool testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall() {
@@ -9988,8 +10112,10 @@ int main() {
   ok &= testFramePointerLoadFeedsStackRewriteWithoutGlobalIgnore();
   ok &= testFramePointerRewriteDoesNotHideRbpRegisterFlow();
   ok &= testSummarySSARemovesDeadStackFrameStore();
+  ok &= testNativeFrameContentStoreSurvivesSummarySSA();
   ok &= testStackFrameAddressPassedToCallIsLocalized();
   ok &= testLateStackCleanupReusesExistingNativeFrameAlloca();
+  ok &= testLateStackIntegerAccessReusesDominatedFrameSlot();
   ok &= testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall();
   ok &= testNoReturnExternalDoesNotCreateSummaryReturn();
   ok &= testExternalPrototypeJsonOverlaysDefaultNoReturn();

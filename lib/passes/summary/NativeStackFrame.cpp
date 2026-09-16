@@ -19,6 +19,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -389,6 +390,58 @@ bool valueFeedsEntryStackInput(llvm::Value &value,
   return false;
 }
 
+// A frame can only be observed outside its own function through a call: a
+// callee reads it via a pointer the register model may have rebuilt as an
+// unknown clobber.  Without any call the frame provably stays local, so its
+// dead stores keep the plain liveness rule and no marker is needed.
+bool functionCanObserveFrame(llvm::Function &function) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      if (llvm::isa<llvm::CallBase>(&instruction)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// The rewrite recovers frame slots the register model lost track of, but LLVM's
+// own escape analysis only sees the IR: when the pointer that reads the frame
+// was rebuilt as an unknown clobber, the frame looks store-only and InstCombine
+// removes it together with the callback addresses stored into it.  Passing the
+// frame to a notdec.register.* intrinsic marks the object address-taken for the
+// rest of the pipeline; the register model treats notdec.register.* calls as
+// register-neutral, so the marker itself adds no register effect.
+void attachNativeFrameKeepAlive(llvm::Function &function,
+                                llvm::AllocaInst &storage) {
+  constexpr llvm::StringLiteral keepName = "notdec.register.native_frame.keep";
+  llvm::Module *module = storage.getModule();
+  if (module == nullptr || !functionCanObserveFrame(function)) {
+    return;
+  }
+  llvm::LLVMContext &context = module->getContext();
+  auto *pointerType = llvm::PointerType::get(context, 0);
+  auto *keepType = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                                           {pointerType}, /*isVarArg=*/false);
+  for (llvm::User *user : storage.users()) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName() == keepName) {
+      return;
+    }
+  }
+  llvm::Function *keep = module->getFunction(keepName);
+  if (keep == nullptr) {
+    keep = llvm::Function::Create(keepType, llvm::GlobalValue::ExternalLinkage,
+                                  keepName, module);
+  } else if (keep->getFunctionType() != keepType) {
+    return;
+  }
+  llvm::IRBuilder<> builder(storage.getParent(),
+                            std::next(storage.getIterator()));
+  builder.CreateCall(keep, {&storage});
+}
+
 bool rewriteFunctionStackAccesses(llvm::Function &function,
                                   llvm::StringRef stackRegisterName,
                                   NativeStackFrameRewriteSummary &summary) {
@@ -503,10 +556,13 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
     return false;
   }
 
-  // Keep one entry-dominating pointer per concrete native stack offset.  The
-  // cleanup pass may compare rewritten stack accesses by pointer identity, so
-  // repeated offsets should not produce unrelated GEP values.
-  llvm::IRBuilder<> stackValueBuilder(storage->getNextNode());
+  // Every frame-derived value lives in one cluster directly after the alloca.
+  // The rewrite runs twice in one pipeline (the early rewrite and the late
+  // cleanup) and the second run reuses the slot GEPs of the first one, so a
+  // reused GEP is moved back into the cluster: the values created below are
+  // inserted there as well, and a reused pointer that stayed at its old, later
+  // position would be used before its definition by the new ptrtoint.
+  llvm::Instruction *clusterTail = storage;
   std::map<int64_t, llvm::Value *> stackPointers;
   std::map<std::pair<int64_t, llvm::Type *>, llvm::Value *> stackIntegers;
   if (existingFrame.Storage != nullptr) {
@@ -525,9 +581,15 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
       }
       int64_t nativeOffset =
           frameLow + static_cast<int64_t>(byteOffset.getSExtValue());
-      stackPointers.emplace(nativeOffset, gep);
+      if (!stackPointers.emplace(nativeOffset, gep).second) {
+        continue;
+      }
+      gep->moveAfter(clusterTail);
+      clusterTail = gep;
     }
   }
+  llvm::IRBuilder<> stackValueBuilder(storage->getParent(),
+                                      std::next(clusterTail->getIterator()));
   auto stackPointerForOffset = [&](int64_t offset) -> llvm::Value * {
     auto found = stackPointers.find(offset);
     if (found != stackPointers.end()) {
@@ -590,6 +652,7 @@ bool rewriteFunctionStackAccesses(llvm::Function &function,
     }
     return false;
   }
+  attachNativeFrameKeepAlive(function, *storage);
   summary.AccessesRewritten += rewritten;
   return true;
 }
