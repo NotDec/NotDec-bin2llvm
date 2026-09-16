@@ -41,4 +41,36 @@
    `FUN_9990`/`FUN_99d0` 回来（define 85 -> 87）、warning 仍 348 行、
    residue 1 行、IR +<1%、时间 ~41s。
 
+## 追加：按上面第 1 条试过一轮，仍未通过
+
+改动（未提交，已回退）：
+
+1. `attachNativeFrameKeepAlive()`：入口插 `call void @notdec.register.native_frame.keep(ptr %frame)`；
+2. `isFrameClusterInstruction()` + GEP 复用只认 entry block 里紧跟 alloca 的"帧指针簇"
+   （GEP + keep-alive 调用），避免复用定义在使用点之后的旧 GEP；
+3. 非 spill 帧 store 一律保留。
+
+结果：仍然 `module verification failed after summary register SSA pass`，
+两处 `Instruction does not dominate all uses`，形态是
+
+```text
+%notdec_stack.native.ptr2238 = getelementptr inbounds nuw i8, ptr %notdec_stack.native, i64 192
+%notdec_stack.native.int921 = ptrtoint ptr %notdec_stack.native.ptr2238 to i64
+```
+
+即：帧能活得更久之后，仍然存在**在 alloca 簇之外被复用/创建的 `notdec_stack.native.ptrNNNN`**
+（编号形态说明不是 `createStackFramePointer()` 那个带名字的路径，或是在簇被清理后
+`storage->getNextNode()` 已经指向别处时新建的），它们的 `ptrtoint` 用户出现在更早的位置。
+运行时间也从 41s 涨到 67s（保留的 IR 更多）。
+
+下一步（比上一轮更具体）：
+
+1. 找出所有创建 `notdec_stack.native.ptr*` 的路径（`grep -n "notdec_stack.native.ptr"
+   lib/`），统一走"紧跟 alloca 插入"的单一 helper；`NativeRegisterSummarySSA` 里
+   寄存器 spill 的栈槽也走同一套。
+2. 或者更省事：不做 keep-alive，改成在 `rewriteFunctionStackAccesses` **结束时**
+   统一把簇里的 GEP/ptrtoint 提到 entry block 最前面（alloca 之后），保证支配。
+3. 修完再重跑本轮的三条改动，预期不变：`FUN_9990`/`FUN_99d0` 回来、warning 348 行、
+   residue 1 行。
+
 本轮已提交的只有前缀收紧（wrk 中性：348 行 diff 0、IR +26 B、ctest 12/12）。
