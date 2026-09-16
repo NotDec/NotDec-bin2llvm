@@ -111,7 +111,10 @@ ELF
    - 这是当前寄存器消除和函数签名重写的主 pass，详细顺序见下一节。
 
 9. **第二次 LLVM cleanup**
-   - 再跑一次 `InstCombine + SimplifyCFG`。
+   - 先跑 `EarlyCSE`，再跑 `InstCombine + SimplifyCFG`。
+   - 寄存器重写按"每个使用点"重建同一条 lane insert/extract 链，它们在 SSA 上是
+     不同的 Value，LLVM 看不出 `sub X, X` 是 0；EarlyCSE 合并这些重复链之后，
+     InstCombine 才能继续折叠（wrk 上这一步消掉 21 条 unknown）。
    - 目的是折叠 SummarySSA/signature rewrite 后暴露出来的局部 IR。
 
 10. **final register cleanup**
@@ -122,7 +125,13 @@ ELF
       `notdec.register.summary_ssa*` metadata。
     - 再跑一次 GlobalDCE，并统计剩余寄存器访问。
 
-11. **验证和输出**
+11. **final cleanup 后的收尾 cleanup**
+    - 再跑一次 `EarlyCSE + InstCombine + SimplifyCFG`。
+    - `NativeRegisterFinalCleanup` 会把 `notdec.reg.*` 值域辅助调用降成显式
+      insert/extract 链，这里收尾折叠（wrk 的 IR 体积主要在这一步降下来，
+      实测 -49% 指令数）。
+
+12. **验证和输出**
     - 每个关键阶段后用 `llvm::verifyModule(...)`。
     - 最后写出目标路径，通常是 `.ll`，也可以按工具支持写 `.bc`。
 
@@ -217,10 +226,11 @@ PcodeToLLVM
   -> verify
   -> InstCombine + SimplifyCFG
   -> NativeRegisterSummarySSA
-  -> InstCombine + SimplifyCFG
+  -> EarlyCSE + InstCombine + SimplifyCFG
   -> NativeFunctionPointerPromotion
   -> NativeRegisterPostRewritePeephole
   -> NativeRegisterFinalCleanup
+  -> EarlyCSE + InstCombine + SimplifyCFG
   -> verify
   -> write .ll / .bc
 ```
@@ -285,10 +295,13 @@ load i64, ptr inttoptr (<slot address>)
 
 每次运行都只对非 declaration 函数跑：
 
-1. `InstCombine`
-2. `SimplifyCFG`
+1. `EarlyCSE`（仅 `runEarlyCSEFirst=true` 的调用点：寄存器重写之后、final
+   cleanup 之后）
+2. `InstCombine`
+3. `SimplifyCFG`
 
-这一步只做通用 LLVM 局部化简，不负责寄存器语义。
+这一步只做通用 LLVM 局部化简，不负责寄存器语义。EarlyCSE 是必需的：寄存器模型会
+按使用点重复生成同构的 lane 链，没有 CSE 时 InstCombine 看不到它们是同一个值。
 
 ### 5.2 NativeRegisterSummarySSA
 

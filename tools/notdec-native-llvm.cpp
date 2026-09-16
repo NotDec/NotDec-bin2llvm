@@ -11,8 +11,8 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 
 #include "llvm/IR/Constants.h"
-#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -22,6 +22,7 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 
 #include <LIEF/ELF/Binary.hpp>
@@ -1002,8 +1003,14 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
   return true;
 }
 
+// 寄存器重写会按"每个使用点"重建同一条 lane insert/extract 链，它们在 SSA 上是
+// 不同的 Value，LLVM 看不出 `sub X, X` 是 0，于是整段链（连带 notdec.unknown
+// 调用）留在 IR 里。EarlyCSE 合并这些重复链，后面的 InstCombine 才能继续折叠。
+// 只在寄存器重写之后（以及 final cleanup 之后）跑：SSA 之前跑会改变证据分析看到
+// 的 IR，口径变化要单独实验。
 bool runInstCombinePassIfEnabled(llvm::Module &module,
-                                 const CliOptions &options) {
+                                 const CliOptions &options,
+                                 bool runEarlyCSEFirst = false) {
   if (options.DisableInstCombinePass) {
     return true;
   }
@@ -1022,6 +1029,9 @@ bool runInstCombinePassIfEnabled(llvm::Module &module,
                                moduleAnalysis);
 
   llvm::FunctionPassManager functionPasses;
+  if (runEarlyCSEFirst) {
+    functionPasses.addPass(llvm::EarlyCSEPass());
+  }
   functionPasses.addPass(llvm::InstCombinePass());
   functionPasses.addPass(llvm::SimplifyCFGPass());
   for (llvm::Function &function : module) {
@@ -1135,13 +1145,20 @@ int main(int argc, char **argv) {
       if (!runRegisterSSAPassIfEnabled(*module, *options)) {
         return 1;
       }
-      if (!runInstCombinePassIfEnabled(*module, *options)) {
+      if (!runInstCombinePassIfEnabled(*module, *options,
+                                       /*runEarlyCSEFirst=*/true)) {
         return 1;
       }
       if (!runPostRewritePeepholePass(*module, *options)) {
         return 1;
       }
       if (!runFinalCleanupPass(*module)) {
+        return 1;
+      }
+      // final cleanup 把 notdec.reg.* 辅助调用降成显式 insert/extract 链，
+      // 这里再收一次尾，别让重复链进入最终 IR。
+      if (!runInstCombinePassIfEnabled(*module, *options,
+                                       /*runEarlyCSEFirst=*/true)) {
         return 1;
       }
       return writeModule(*module, options->OutputPath);
@@ -1306,7 +1323,8 @@ int main(int argc, char **argv) {
     if (!runRegisterSSAPassIfEnabled(*module, *options)) {
       return 1;
     }
-    if (!runInstCombinePassIfEnabled(*module, *options)) {
+    if (!runInstCombinePassIfEnabled(*module, *options,
+                                     /*runEarlyCSEFirst=*/true)) {
       return 1;
     }
     notdec::bin2llvm::NativeFunctionPointerPromotionSummary
@@ -1329,6 +1347,12 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (!runFinalCleanupPass(*module, preservedFunctions)) {
+      return 1;
+    }
+    // final cleanup 把 notdec.reg.* 辅助调用降成显式 insert/extract 链，
+    // 这里再收一次尾，别让重复链进入最终 IR。
+    if (!runInstCombinePassIfEnabled(*module, *options,
+                                     /*runEarlyCSEFirst=*/true)) {
       return 1;
     }
 
