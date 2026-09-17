@@ -94,3 +94,31 @@ summary `modifies` 仍列出 RBX/RBP（存了再读回来证不出相等）。�
 2. wrk 的 unknown-external 返回模型：RDX 34 条（28 条来自间接调用）——收紧“未知外部调用
    返回寄存器”的判定，或给 http_parser 回调补原型；
 3. wrk 的 x87 窗口 21 条（入口/调用后真实未定义，抽查后确认是否还有可恢复的）。
+
+## 尝试：窄段入口值退回整寄存器（已量、已回退）
+
+按用户要求试了“窄段自己的入口事实被否掉时，退回整寄存器入口值 + 取段”：在
+`entryRangeInput` 里把 `rangeMayComeFromEntry` 从“直接 return nullptr”改成“整寄存器走
+`entryRegisterLoad`、窄段走 `materializeCoveredAccess(整寄存器入口值, 段)`”。
+
+**效果（memcached）**：unknown 26 → **12**，`main` 的 3 条 RDI 段 unknown 消失、改成 1 条
+`load i64, ptr @RDI` + 取段；wrk 57 → 55；两个 IR verify OK。剩下的 12 条是 R9 6（内部
+调用后读 caller-saved）和 4 条 `fopen`/`fclose`/`strcmp`/`CALLOTHER` 的 RDX clobber 残留。
+
+**但单测挂了 2 个**（`raw RAX load remained after partial read rewrite`、
+`branch full load left raw RAX load`）：这些用例明确要求“段级入口事实被否时不要合成
+整寄存器 raw load”。也就是说 `rangeMayComeFromEntry` 这道闸门是**刻意的**：它宁可给
+unknown/走 clobber，也不让 pass 凭空多出一条寄存器 global 读。
+
+**结论与后续**：值本身是对的（memcached 上确实恢复了 argc），但绕过闸门会破坏
+“partial read 消费后不应残留 raw 寄存器 load”的既有约定。正解应当是把**事实**修正对，
+而不是在入口兜底处绕过它：
+
+1. `rangeMayComeFromEntry` 用的是**整函数**级的 must 事实（“这些位在函数里被写过”），
+   但挡住的是**当前位置**的判断；应改成按读取点判断（本块/前驱有没有这段的定义）；
+2. 段级入口需求要升格成整寄存器需求，让 `main` 拿到 `%RDI.arg`（源码 IR 是
+   `i32 @main(i32 %argc, ptr %argv)`）；
+3. 6 条调用后 RDX 另查。
+
+本轮不改代码（回退到 `3104cf7` 的状态：memcached 26、wrk 57），把测到的数据和
+闸门原因记在这里。
