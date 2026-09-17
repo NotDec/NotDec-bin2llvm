@@ -1902,17 +1902,17 @@ bool testX87WindowShiftLoadFollowsRangeState() {
     }
   }
 
-  bool laterPushReadsST1 = false;
-  for (size_t index = 1; index < pushArgs.size(); ++index) {
-    laterPushReadsST1 |= isLoadFromValue(pushArgs[index], st1);
+  bool pushReadsST1 = false;
+  for (llvm::Value *argument : pushArgs) {
+    pushReadsST1 |= isLoadFromValue(argument, st1);
   }
   uint32_t st1Loads = countLoadsFromGlobal(*rewritten, st1);
 
   return expect(pushArgs.size() == 3,
                 "x87 window shift pushes were not preserved") &&
-         expect(!laterPushReadsST1,
+         expect(!pushReadsST1,
                 "x87 window shift read still re-reads the @ST1 global") &&
-         expect(st1Loads <= 1,
+         expect(st1Loads == 0,
                 "x87 window shift read left a stale @ST1 load behind") &&
          verifyOk(module,
                   "module failed verifier after x87 window shift load test");

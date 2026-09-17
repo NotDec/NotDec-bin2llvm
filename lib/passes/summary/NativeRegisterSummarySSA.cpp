@@ -4932,10 +4932,15 @@ private:
       if (access.Unit == nullptr || !access.IsStorageValue) {
         continue;
       }
-      llvm::Value *value =
-          x87WindowShift
-              ? readBlockLocalValueBefore(*load, *access.Unit)
-              : readValueBefore(*load->getParent(), *access.Unit, load);
+      llvm::Value *value = nullptr;
+      if (x87WindowShift) {
+        // 搬移读先只看本块（不触发 entry/phi 解析、不造 unknown）；本块没有定义时
+        // 再退回完整 range 解析，让跨块的已知值（phi）也能替换掉读 global 的形态。
+        value = readBlockLocalValueBefore(*load, *access.Unit);
+      }
+      if (value == nullptr) {
+        value = readValueBefore(*load->getParent(), *access.Unit, load);
+      }
       value = resolve(value);
       if (value == nullptr || value == load ||
           value->getType() != load->getType()) {
