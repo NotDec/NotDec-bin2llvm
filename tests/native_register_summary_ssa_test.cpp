@@ -1918,6 +1918,162 @@ bool testX87WindowShiftLoadFollowsRangeState() {
                   "module failed verifier after x87 window shift load test");
 }
 
+// partial read 的结果只被存进"没人读"的 native frame 槽位时不产生入口需求。
+// memcached 里几个向量函数的序言把 ZMM0..ZMM7 存进栈帧后再没读过，如果照旧
+// 记成入口读，签名会多出没人用的向量参数、每个调用点还要造 unknown 去填。
+// 函数里是否还有任何形式在读 @global：除了参数/unknown，pass 也可能保留一条
+// 入口 partial read 直接从寄存器 global 读。
+bool functionReadsRegisterGlobal(const llvm::Function &function,
+                                 const llvm::GlobalVariable *global) {
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (load->getPointerOperand()->stripPointerCasts() == global) {
+          return true;
+        }
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      std::optional<notdec::bin2llvm::NativeRegisterPartialReadInfo> read =
+          notdec::bin2llvm::parseNativeRegisterPartialRead(*call);
+      if (read && read->Global == global) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool testDeadFrameSpillPartialReadCreatesNoEntryParam() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-dead-frame-spill-read", context);
+  attachTestAbi(module);
+  llvm::Type *i512 = llvm::Type::getIntNTy(context, 512);
+  llvm::Type *i128 = llvm::Type::getIntNTy(context, 128);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", i512, 0x2000, 64);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0), i128, 512, 128);
+
+  auto *calleeType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::InternalLinkage, "dead_frame_spill", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  llvm::AllocaInst *frame = calleeBuilder.CreateAlloca(
+      llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 64), nullptr,
+      "notdec_stack.native");
+  llvm::Value *slot = calleeBuilder.CreateConstGEP1_64(
+      llvm::Type::getInt8Ty(context), frame, 8, "slot");
+  llvm::Value *spilled = calleeBuilder.CreateCall(
+      partialRead,
+      {zmm0, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "spill");
+  calleeBuilder.CreateStore(spilled, slot);
+  calleeBuilder.CreateRetVoid();
+
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::InternalLinkage, "dead_frame_spill_caller",
+      module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "caller_entry", caller);
+  llvm::IRBuilder<> callerBuilder(callerEntry);
+  callerBuilder.CreateCall(
+      callee->getFunctionType(), callee,
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  callerBuilder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("dead_frame_spill");
+  if (rewritten == nullptr) {
+    return expect(false, "dead frame spill function was removed");
+  }
+  bool hasZmmParam = false;
+  for (llvm::Argument &argument : rewritten->args()) {
+    hasZmmParam |= argument.getName().starts_with("ZMM0");
+  }
+  return expect(!hasZmmParam,
+                "dead frame spill still demanded a ZMM0 entry parameter") &&
+         expect(!moduleHasUsedFunctionNamed(module, "notdec.unknown.i128"),
+                "dead frame spill created an unknown vector value") &&
+         verifyOk(module,
+                  "module failed verifier after dead frame spill test");
+}
+
+// 反向对照：同一个槽位只要有 load 能读到，这个值就必须被保留（参数或 unknown
+// 都可以，但不能凭空消失）。
+bool testLiveFrameSpillPartialReadKeepsValue() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-live-frame-spill-read", context);
+  attachTestAbi(module);
+  llvm::Type *i512 = llvm::Type::getIntNTy(context, 512);
+  llvm::Type *i128 = llvm::Type::getIntNTy(context, 128);
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", i512, 0x2000, 64);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0), i128, 512, 128);
+  auto *sink = new llvm::GlobalVariable(
+      module, i128, false, llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *calleeType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::InternalLinkage, "live_frame_spill", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  llvm::AllocaInst *frame = calleeBuilder.CreateAlloca(
+      llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 64), nullptr,
+      "notdec_stack.native");
+  llvm::Value *slot = calleeBuilder.CreateConstGEP1_64(
+      llvm::Type::getInt8Ty(context), frame, 8, "slot");
+  llvm::Value *spilled = calleeBuilder.CreateCall(
+      partialRead,
+      {zmm0, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "spill");
+  calleeBuilder.CreateStore(spilled, slot);
+  llvm::Value *reloaded = calleeBuilder.CreateLoad(i128, slot, "reloaded");
+  calleeBuilder.CreateStore(reloaded, sink);
+  calleeBuilder.CreateRetVoid();
+
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::InternalLinkage, "live_frame_spill_caller",
+      module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "caller_entry", caller);
+  llvm::IRBuilder<> callerBuilder(callerEntry);
+  callerBuilder.CreateCall(
+      callee->getFunctionType(), callee,
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
+  callerBuilder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("live_frame_spill");
+  if (rewritten == nullptr) {
+    return expect(false, "live frame spill function was removed");
+  }
+  bool hasZmmParam = false;
+  for (llvm::Argument &argument : rewritten->args()) {
+    hasZmmParam |= argument.getName().starts_with("ZMM0");
+  }
+  bool hasUnknown = moduleHasUsedFunctionNamed(module, "notdec.unknown.i128");
+  return expect(hasZmmParam || hasUnknown ||
+                    functionReadsRegisterGlobal(*rewritten, zmm0),
+                "live frame spill lost the vector value entirely") &&
+         verifyOk(module,
+                  "module failed verifier after live frame spill test");
+}
+
 bool testRegisterPointerPhiLoadIsCanonicalized() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-register-pointer-phi-load", context);
@@ -10324,6 +10480,8 @@ int main() {
   ok &= testX87StackReturnBecomesX86Fp80ReturnSlot();
   ok &= testX87Fp80StoreStillFeedsRange();
   ok &= testX87WindowShiftLoadFollowsRangeState();
+  ok &= testDeadFrameSpillPartialReadCreatesNoEntryParam();
+  ok &= testLiveFrameSpillPartialReadKeepsValue();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();
   ok &= testUnknownPhiIncomingUsesFrozenPoison();
   ok &= testSelfOnlyPhiBecomesOpaqueUnknown();

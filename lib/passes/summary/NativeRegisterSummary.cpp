@@ -56,6 +56,70 @@ RegisterAccess
 registerStore(llvm::StoreInst &store,
               const std::map<llvm::GlobalVariable *, RegisterUnit> &units);
 
+// native frame 槽位指针：notdec_stack.native 的 alloca（或它的 GEP/bitcast）。
+bool isNativeFrameSlotPointer(llvm::Value *value) {
+  value = value->stripPointerCasts();
+  if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(value)) {
+    return alloca->hasName() &&
+           alloca->getName().starts_with("notdec_stack.native");
+  }
+  if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value)) {
+    return isNativeFrameSlotPointer(gep->getPointerOperand());
+  }
+  return false;
+}
+
+// 该槽位指针上没有 load 能读到它。判据和帧清理的 stackAllocaStoreIsLoaded 保持
+// 一致：只认指针相等的 load；对子偏移/位转换保守地当成"会被读到"。
+bool frameSlotPointerIsNeverLoaded(llvm::Value *pointer) {
+  pointer = pointer->stripPointerCasts();
+  for (llvm::User *user : pointer->users()) {
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(user)) {
+      if (load->getPointerOperand()->stripPointerCasts() == pointer) {
+        return false;
+      }
+      continue;
+    }
+    if (llvm::isa<llvm::GetElementPtrInst>(user) ||
+        llvm::isa<llvm::CastInst>(user)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// partial read 的结果只被存进"没人读"的 native frame 槽位（或者是死值）时，这个
+// 读不构成对寄存器入口值/调用点值的需求：值存下来之后再没有 load 能观察到它，
+// 帧清理本来就会把这种寄存器溢出 store 当死值删掉。memcached 里几个向量函数的
+// 序言把 ZMM0..ZMM7 存进栈帧后再没读过，就是这种形态；不排掉的话签名会多出没人
+// 用的向量参数，每个调用点还要造 unknown 去填。
+bool partialReadFeedsOnlyDeadFrameSlots(llvm::CallBase &call) {
+  if (call.use_empty()) {
+    return true;
+  }
+  bool sawStore = false;
+  for (llvm::User *user : call.users()) {
+    llvm::Value *value = user;
+    while (auto *cast = llvm::dyn_cast<llvm::CastInst>(value)) {
+      if (!cast->hasOneUse()) {
+        break;
+      }
+      value = *cast->user_begin();
+    }
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(value);
+    if (store == nullptr) {
+      return false;
+    }
+    llvm::Value *pointer = store->getPointerOperand()->stripPointerCasts();
+    if (!isNativeFrameSlotPointer(pointer) ||
+        !frameSlotPointerIsNeverLoaded(pointer)) {
+      return false;
+    }
+    sawStore = true;
+  }
+  return sawStore;
+}
+
 // 识别 ST0/ST1 的窗口内部搬移读（见下方定义）。
 bool isX87WindowShiftLoad(
     llvm::LoadInst &load,
@@ -1985,7 +2049,8 @@ private:
           parseNativeRegisterPartialRead(*call);
       if (partialRead) {
         auto unitIt = Units.find(partialRead->Global);
-        if (unitIt != Units.end() && !isIgnored(unitIt->second, Options)) {
+        if (unitIt != Units.end() && !isIgnored(unitIt->second, Options) &&
+            !partialReadFeedsOnlyDeadFrameSlots(*call)) {
           Cell before = cellIn(state, partialRead->Global);
           bool pureEntryValue =
               before.MayEntry.getBitWidth() != 0 &&
@@ -2464,7 +2529,10 @@ private:
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
         if (std::optional<NativeRegisterPartialReadInfo> partial =
                 parseNativeRegisterPartialRead(*call)) {
-          addDemand(live, partial->Global, valueDemand(call, valueDemands));
+          // 只喂给"没人读"的帧槽的死读不产生需求（见 helper 注释）。
+          if (!partialReadFeedsOnlyDeadFrameSlots(*call)) {
+            addDemand(live, partial->Global, valueDemand(call, valueDemands));
+          }
           continue;
         }
         if (std::optional<NativeRegisterPartialWriteInfo> partial =
