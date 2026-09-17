@@ -816,11 +816,18 @@ bool isX87WindowShiftLoad(
   return true;
 }
 
+// x87 窗口搬移读（push/pop 时把旧栈顶搬到相邻槽）在 summary 侧不算真实读取，
+// 默认返回空 access。但 range 重写必须能看到它：lifter 已经把搬移显式写成
+// `store 旧 ST0 -> @ST1`，range 状态里存着对应值；如果这条搬移读继续读
+// @ST1 global，就会拿到 summary 已经不再维护（甚至删掉写入）的旧值，push/fxch
+// 只能得到错误的数。调用方用 includeX87WindowShift 打开。
 RegisterAccess
 registerLoad(llvm::LoadInst &load,
-             const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
-  if (load.getMetadata("notdec.x87.window.shift") != nullptr ||
-      isX87WindowShiftLoad(load, units)) {
+             const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+             bool includeX87WindowShift = false) {
+  if (!includeX87WindowShift &&
+      (load.getMetadata("notdec.x87.window.shift") != nullptr ||
+       isX87WindowShiftLoad(load, units))) {
     return {};
   }
   auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
@@ -4300,7 +4307,8 @@ private:
     for (llvm::BasicBlock &block : Function) {
       for (llvm::Instruction &inst : block) {
         if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
-          RegisterAccess access = registerLoad(*load, Units);
+          RegisterAccess access =
+              registerLoad(*load, Units, /*includeX87WindowShift=*/true);
           if (access.Unit != nullptr) {
             ++Summary.LoadsSeen;
             if (access.IsStorageValue &&
@@ -4916,11 +4924,18 @@ private:
   void rewriteLoads() {
     for (llvm::LoadInst *load : Loads) {
       RegisterAccess access = registerLoad(*load, Units);
+      bool x87WindowShift = false;
+      if (access.Unit == nullptr) {
+        access = registerLoad(*load, Units, /*includeX87WindowShift=*/true);
+        x87WindowShift = access.Unit != nullptr;
+      }
       if (access.Unit == nullptr || !access.IsStorageValue) {
         continue;
       }
       llvm::Value *value =
-          readValueBefore(*load->getParent(), *access.Unit, load);
+          x87WindowShift
+              ? readBlockLocalValueBefore(*load, *access.Unit)
+              : readValueBefore(*load->getParent(), *access.Unit, load);
       value = resolve(value);
       if (value == nullptr || value == load ||
           value->getType() != load->getType()) {
@@ -6059,6 +6074,35 @@ private:
       return rangeValue;
     }
     return nullptr;
+  }
+
+  // x87 窗口搬移读（push/pop 的槽位搬移）用它：只认"本块里前面刚写过"的值。
+  // 搬移读总是紧跟在写之后（lifter 生成的 store -> @ST0; store 旧 ST0 -> @ST1），
+  // 这里只做本块的 range transfer，不触发 entry/phi 解析，避免为了替换搬移读顺手
+  // 造出新的 unknown；拿不到值就保持原来的寄存器 load。
+  // 窗口内的 ST0/ST1 访问在 runNativeRegisterSummarySSA 开头已经过
+  // canonicalizeX87WindowAccesses 规范化成 i80 load + bitcast，这里只需要同类型
+  // 的值。
+  llvm::Value *readBlockLocalValueBefore(llvm::LoadInst &load,
+                                         const RegisterUnit &unit) {
+    llvm::BasicBlock &block = *load.getParent();
+    if (!transferRangeBlockUntil(block, &load)) {
+      return nullptr;
+    }
+    std::vector<RegisterRangeKey> ranges =
+        plannedRangesCovering(unit.Global, 0, registerBitWidth(unit));
+    if (ranges.size() != 1) {
+      return nullptr;
+    }
+    llvm::Value *rangeValue =
+        resolve(currentSegment(block, ranges.front(), &load));
+    if (rangeValue == nullptr) {
+      return nullptr;
+    }
+    if (rangeValue->getType() != load.getType()) {
+      return nullptr;
+    }
+    return rangeValue;
   }
 
   bool isCompletePhi(const llvm::PHINode &phi) const {

@@ -3,6 +3,7 @@
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
+#include "notdec-bin2llvm/NativeX87Intrinsic.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
@@ -1773,6 +1774,148 @@ bool testX87Fp80StoreStillFeedsRange() {
          expect(!moduleHasUsedFunctionNamed(module, "notdec.unknown.i80"),
                 "x86_fp80 store into the i80 ST0 global was dropped") &&
          verifyOk(module, "module failed verifier after x87 fp80 store test");
+}
+
+// x87 窗口搬移读（push 的 ST1 <- 旧 ST0）在 lifting 里是从 @ST1 读回来的：
+//     fld v:  store v -> @ST0;  store 旧 ST0 -> @ST1;  push(旧 ST1)
+// 也就是说 push 的参数就是刚写进 @ST1 的那个值。summary SSA 会把窗口内部的
+// store 收进 range 状态、不再维护 @ST1，所以这类搬移读必须换成 range 状态里的
+// SSA 值；否则 push 会读到没人再写的 @ST1（相邻两次 push 还会被 CSE 成同一个
+// 值，语义直接错）。这里同时覆盖 lifter 的 i80 load + bitcast 形态（靠 use 形态
+// 识别窗口搬移）和 InstCombine 折叠出的 x86_fp80 load 形态（带 window.shift 标记）。
+bool isLoadFromValue(llvm::Value *value, const llvm::GlobalVariable *global) {
+  while (auto *cast = llvm::dyn_cast<llvm::CastInst>(value)) {
+    value = cast->getOperand(0);
+  }
+  auto *load = llvm::dyn_cast<llvm::LoadInst>(value);
+  return load != nullptr &&
+         load->getPointerOperand()->stripPointerCasts() == global;
+}
+
+uint32_t countLoadsFromGlobal(const llvm::Function &function,
+                              const llvm::GlobalVariable *global) {
+  uint32_t count = 0;
+  for (const llvm::BasicBlock &block : function) {
+    for (const llvm::Instruction &inst : block) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (load->getPointerOperand()->stripPointerCasts() == global) {
+          ++count;
+        }
+      }
+    }
+  }
+  return count;
+}
+
+bool testX87WindowShiftLoadFollowsRangeState() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-x87-window-shift-load", context);
+  attachTestAbi(module);
+
+  llvm::Type *int80 = llvm::Type::getIntNTy(context, 80);
+  llvm::Type *fp80 = llvm::Type::getX86_FP80Ty(context);
+  llvm::GlobalVariable *st0 =
+      createRegisterGlobal(module, "ST0", int80, 0x1100, 10);
+  llvm::GlobalVariable *st1 =
+      createRegisterGlobal(module, "ST1", int80, 0x1110, 10);
+
+  llvm::Function *push = notdec::bin2llvm::getOrInsertNativeX87Intrinsic(
+      module, "notdec.x87.push", llvm::Type::getVoidTy(context), {fp80},
+      false);
+
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::InternalLinkage, "x87_window_shift_load", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+
+  auto newSt0Value = [&](llvm::StringRef name) {
+    return builder.CreateBitCast(
+        builder.CreateSIToFP(function->getArg(0), fp80, name), int80,
+        name + ".bits");
+  };
+  auto shiftStore = [&](llvm::GlobalVariable *target, llvm::Value *value,
+                        llvm::StringRef name) {
+    llvm::StoreInst *store = builder.CreateStore(value, target);
+    store->setMetadata("notdec.register.access",
+                       registerAccessMetadata(context, name.str(), 10));
+  };
+
+  // 第一次 push：@ST0/@ST1 在本块内还没有定义，两条入口搬移读保持原样。
+  llvm::Value *old0 = builder.CreateLoad(int80, st0, "old0");
+  llvm::Value *old1 = builder.CreateLoad(int80, st1, "old1");
+  llvm::Value *v1 = newSt0Value("v1");
+  shiftStore(st0, v1, "ST0");
+  shiftStore(st1, old0, "ST1");
+  builder.CreateCall(push, {builder.CreateBitCast(old1, fp80, "old1.fp80")});
+
+  // 第二次 push：搬移读的旧 ST1 = 上一次写进 @ST1 的 %old0，必须解析成 SSA 值
+  // 而不是重新读 @ST1。
+  llvm::Value *prev0 = builder.CreateLoad(int80, st0, "prev0");
+  llvm::Value *prev1 = builder.CreateLoad(int80, st1, "prev1");
+  llvm::Value *v2 = newSt0Value("v2");
+  shiftStore(st0, v2, "ST0");
+  shiftStore(st1, prev0, "ST1");
+  builder.CreateCall(push, {builder.CreateBitCast(prev1, fp80, "prev1.fp80")});
+
+  // 第三次 push：InstCombine 把 i80 load + bitcast 折叠成 x86_fp80 load，
+  // 位宽相同但类型与 range 状态里的 i80 值不同。
+  llvm::LoadInst *shifted = builder.CreateLoad(fp80, st1, "shifted");
+  shifted->setMetadata("notdec.x87.window.shift", llvm::MDNode::get(context, {}));
+  llvm::Value *prev0b = builder.CreateLoad(int80, st0, "prev0b");
+  llvm::Value *v3 = newSt0Value("v3");
+  shiftStore(st0, v3, "ST0");
+  shiftStore(st1, prev0b, "ST1");
+  builder.CreateCall(push, {shifted});
+  builder.CreateRetVoid();
+
+  // 调用者：让被改写的函数有真实调用点（与其它 x87 测试一致）。
+  auto *callerType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::InternalLinkage, "x87_window_shift_caller",
+      module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "caller_entry", caller);
+  llvm::IRBuilder<> callerBuilder(callerEntry);
+  callerBuilder.CreateCall(
+      function->getFunctionType(), function,
+      {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 7)});
+  callerBuilder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("x87_window_shift_load");
+  if (rewritten == nullptr) {
+    return expect(false, "x87 window shift function was removed");
+  }
+
+  std::vector<llvm::Value *> pushArgs;
+  for (llvm::BasicBlock &block : *rewritten) {
+    for (llvm::Instruction &inst : block) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() != nullptr &&
+          call->getCalledFunction()->getName() == "notdec.x87.push") {
+        pushArgs.push_back(call->getArgOperand(0));
+      }
+    }
+  }
+
+  bool laterPushReadsST1 = false;
+  for (size_t index = 1; index < pushArgs.size(); ++index) {
+    laterPushReadsST1 |= isLoadFromValue(pushArgs[index], st1);
+  }
+  uint32_t st1Loads = countLoadsFromGlobal(*rewritten, st1);
+
+  return expect(pushArgs.size() == 3,
+                "x87 window shift pushes were not preserved") &&
+         expect(!laterPushReadsST1,
+                "x87 window shift read still re-reads the @ST1 global") &&
+         expect(st1Loads <= 1,
+                "x87 window shift read left a stale @ST1 load behind") &&
+         verifyOk(module,
+                  "module failed verifier after x87 window shift load test");
 }
 
 bool testRegisterPointerPhiLoadIsCanonicalized() {
@@ -10180,6 +10323,7 @@ int main() {
   ok &= testPartialReadLoopPassthroughUsesDominatorTree();
   ok &= testX87StackReturnBecomesX86Fp80ReturnSlot();
   ok &= testX87Fp80StoreStillFeedsRange();
+  ok &= testX87WindowShiftLoadFollowsRangeState();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();
   ok &= testUnknownPhiIncomingUsesFrozenPoison();
   ok &= testSelfOnlyPhiBecomesOpaqueUnknown();
