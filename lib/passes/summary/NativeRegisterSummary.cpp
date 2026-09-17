@@ -2349,6 +2349,14 @@ private:
       if (isIgnored(unit, Options)) {
         continue;
       }
+      // callee-saved（ABI unaffected）寄存器由 ABI 保证 callee 原样保留：callee
+      // summary 里的 may_non_entry 只说明它内部“存了又读回来”证不出相等，不能
+      // 当成调用后的新值。否则调用方会为一次普通调用凭空造出 RBP/RBX 的
+      // unknown（memcached FUN_16bb0 调 FUN_15820 就是这种）。对外部调用，
+      // applyAbiCallClobbers 已经做同样的跳过。
+      if (Abi.Unaffected.count(unit.Name) != 0) {
+        continue;
+      }
       Cell pre = cellIn(state, global);
       Cell callee = cellIn(effect, global);
       Cell post;

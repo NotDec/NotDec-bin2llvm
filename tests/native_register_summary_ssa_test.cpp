@@ -2074,6 +2074,117 @@ bool testLiveFrameSpillPartialReadKeepsValue() {
                   "module failed verifier after live frame spill test");
 }
 
+// callee-saved（ABI unaffected）寄存器在内部调用后必须保持调用方的值：callee 的
+// summary 里 may_entry & may_non_entry（例如把 RBX 当临时寄存器、再恢复回去）不能
+// 被当成“调用后有了新值”，否则调用方会凭空造 unknown。memcached FUN_16bb0 调
+// FUN_15820 就是这种形态。
+bool testCalleeSavedRegisterSurvivesInternalCall() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-callee-saved-call", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rbx = createRegisterGlobal(module, "RBX");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {},
+                                             false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::InternalLinkage, "rbx_touch", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  llvm::LoadInst *read = calleeBuilder.CreateLoad(
+      llvm::Type::getInt64Ty(context), rbx, "rbx.entry");
+  read->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, "RBX"));
+  llvm::StoreInst *write = calleeBuilder.CreateStore(read, rbx);
+  write->setMetadata("notdec.register.access",
+                     registerAccessMetadata(context, "RBX"));
+  calleeBuilder.CreateRetVoid();
+
+  auto *callerType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {},
+                                             false);
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::InternalLinkage, "rbx_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "caller_entry", caller);
+  llvm::IRBuilder<> callerBuilder(callerEntry);
+  llvm::StoreInst *seed = callerBuilder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 1234), rbx);
+  seed->setMetadata("notdec.register.access",
+                    registerAccessMetadata(context, "RBX"));
+  callerBuilder.CreateCall(callee->getFunctionType(), callee);
+  llvm::LoadInst *reload = callerBuilder.CreateLoad(
+      llvm::Type::getInt64Ty(context), rbx, "rbx.after");
+  reload->setMetadata("notdec.register.access",
+                      registerAccessMetadata(context, "RBX"));
+  callerBuilder.CreateStore(reload, sink);
+  callerBuilder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("rbx_caller");
+  if (rewritten == nullptr) {
+    return expect(false, "callee-saved caller was removed");
+  }
+  return expect(!moduleHasUsedFunctionNamed(module, "notdec.unknown.i64"),
+                "callee-saved register after an internal call became unknown") &&
+         verifyOk(module, "module failed verifier after callee-saved call test");
+}
+
+// SysV 要求 DF（方向标志）在函数入口和调用返回后为 0：入口读和调用后的读都应该
+// 直接解析成常量 0，而不是 unknown（memcached 里有 22 条这种）。
+bool testDirectionFlagIsZeroAtBoundaries() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-direction-flag", context);
+  attachTestAbi(module);
+  llvm::Type *i8 = llvm::Type::getInt8Ty(context);
+  llvm::GlobalVariable *df = createRegisterGlobal(module, "DF", i8, 0x1200, 1);
+  auto *sink = new llvm::GlobalVariable(module, i8, false,
+                                        llvm::GlobalValue::ExternalLinkage,
+                                        nullptr, "sink");
+
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {},
+                                             false);
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::InternalLinkage, "df_touch", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  llvm::StoreInst *set = calleeBuilder.CreateStore(
+      llvm::ConstantInt::get(i8, 1), df); // 内部 std：可能写 1
+  set->setMetadata("notdec.register.access",
+                   registerAccessMetadata(context, "DF", 1));
+  calleeBuilder.CreateRetVoid();
+
+  auto *callerType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {},
+                                             false);
+  llvm::Function *caller = llvm::Function::Create(
+      callerType, llvm::GlobalValue::InternalLinkage, "df_caller", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "caller_entry", caller);
+  llvm::IRBuilder<> callerBuilder(callerEntry);
+  llvm::LoadInst *entryRead = callerBuilder.CreateLoad(i8, df, "df.entry");
+  entryRead->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, "DF", 1));
+  callerBuilder.CreateStore(entryRead, sink);
+  callerBuilder.CreateCall(callee->getFunctionType(), callee);
+  llvm::LoadInst *afterCall = callerBuilder.CreateLoad(i8, df, "df.after");
+  afterCall->setMetadata("notdec.register.access",
+                         registerAccessMetadata(context, "DF", 1));
+  callerBuilder.CreateStore(afterCall, sink);
+  callerBuilder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("df_caller");
+  if (rewritten == nullptr) {
+    return expect(false, "direction flag caller was removed");
+  }
+  return expect(!moduleHasUsedFunctionNamed(module, "notdec.unknown.i8"),
+                "direction flag became unknown at a function boundary") &&
+         verifyOk(module, "module failed verifier after direction flag test");
+}
+
 bool testRegisterPointerPhiLoadIsCanonicalized() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-register-pointer-phi-load", context);
@@ -10482,6 +10593,8 @@ int main() {
   ok &= testX87WindowShiftLoadFollowsRangeState();
   ok &= testDeadFrameSpillPartialReadCreatesNoEntryParam();
   ok &= testLiveFrameSpillPartialReadKeepsValue();
+  ok &= testCalleeSavedRegisterSurvivesInternalCall();
+  ok &= testDirectionFlagIsZeroAtBoundaries();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();
   ok &= testUnknownPhiIncomingUsesFrozenPoison();
   ok &= testSelfOnlyPhiBecomesOpaqueUnknown();

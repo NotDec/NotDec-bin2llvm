@@ -1053,9 +1053,10 @@ bool isSegmentBaseUnit(llvm::StringRef name) {
 
 // x86 方向标志 DF 在 SysV ABI 里函数入口、返回以及外部调用返回后都必须为 0。
 // cspec 的 <unaffected> 通常不含 DF，通用调用点 clobber 逻辑会把它当未知值，
-// 导致 rep cmpsb 展开循环的指针方向丢失。把 DF 的调用点值定为常量 0：
-// 域上仍是调用点写入（NonEntry），不会误成入口参数，std/cld 的局部写不受影响。
-bool isPostCallZeroRegister(llvm::StringRef name) {
+// 导致 rep cmpsb 展开循环的指针方向丢失。把 DF 的函数边界值定为常量 0：
+// 调用点仍是调用点写入（NonEntry），入口读也是 0（ABI 规定），std/cld 的局部
+// 写不受影响。
+bool isAbiBoundaryZeroRegister(llvm::StringRef name) {
   return name == "DF";
 }
 
@@ -6336,6 +6337,16 @@ private:
     if (unit == nullptr) {
       return nullptr;
     }
+    if (isAbiBoundaryZeroRegister(unit->Name)) {
+      // DF 在函数入口按 ABI 就是 0（见 isAbiBoundaryZeroRegister 注释）：走到
+      // 入口解析说明这条路径上没有本函数写过的 DF 定义（cld/std 会写），按 ABI
+      // 直接给常量 0，不要退化成 unknown。
+      llvm::Value *zero = llvm::ConstantInt::get(rangeType(range), 0);
+      EntryRangeInputs.emplace(range, zero);
+      EntryInputRanges.emplace(zero, range);
+      ++Summary.RangeEntryInputs;
+      return zero;
+    }
     if (PostSignatureCleanup) {
       llvm::Instruction *insertBefore =
           &*Function.getEntryBlock().getFirstInsertionPt();
@@ -6380,6 +6391,19 @@ private:
       if (callPreservesRegisterByAbi(unit)) {
         return CallRegisterEffect::Preserve;
       }
+      return CallRegisterEffect::Clobber;
+    }
+    // ABI unaffected（callee-saved）寄存器由 ABI 保证原样保留，优先于 callee 的
+    // summary 事实：callee 的 may_non_entry 只说明它内部改过（例如把 RBP 当帧
+    // 指针用、再从事先存好的槽里恢复），不能当成调用后的新值，否则调用方会为
+    // 一次普通调用凭空造出 RBP/RBX 的 unknown（memcached FUN_16bb0 就是这种）。
+    if (callPreservesRegisterByAbi(unit)) {
+      return CallRegisterEffect::Preserve;
+    }
+    // DF 在调用后按 ABI 是常量 0（见 isAbiBoundaryZeroRegister 注释）：走 Clobber
+    // 路径，让 callRangeValue 直接给 0；不能因为 callee 内部写过 DF 就退化成
+    // Unknown 占位。
+    if (isAbiBoundaryZeroRegister(unit.Name)) {
       return CallRegisterEffect::Clobber;
     }
     if (callee != nullptr && !callee->isDeclaration()) {
@@ -7075,9 +7099,9 @@ private:
     if (insertBefore == nullptr) {
       return llvm::UndefValue::get(rangeType(range));
     }
-    if (isPostCallZeroRegister(unit->Name)) {
+    if (isAbiBoundaryZeroRegister(unit->Name)) {
       // DF 在调用点（外部 clobber 或内部函数返回）都是 ABI 保证的常量 0，
-      // 见 isPostCallZeroRegister 注释。直接生成 0，避免 cmpsb 展开循环
+      // 见 isAbiBoundaryZeroRegister 注释。直接生成 0，避免 cmpsb 展开循环
       // 的方向被 summary_clobber / range_return_unknown 占位污染。
       llvm::Value *value = llvm::ConstantInt::get(rangeType(range), 0);
       CallRangeValues.emplace(key, value);
