@@ -216,3 +216,15 @@ stats_mean：
 3. 用 `poison`/`undef` 表示死槽：能让 LLVM 折叠整条链，但 poison 会传播（可能被
    当 UB），不符合项目现在"unknown 用不透明调用"的约定。
 
+## 更正（2026-09-17）
+
+上面的结论“两条 ST0 unknown 都是 ABI 未定义的槽位、unknown 忠实”**不成立**：
+
+- FUN_81d0 的 ST0 unknown 不是未定义槽。pre-SSA 里 `fldt` 的栈上 long double 参数先
+  `store -> @ST0`，下一次 `fld` 又把它 `store -> @ST1`，`fxch` 再从 @ST1 读回来；summary 已经
+  把窗口内的 store 收进 range 状态（IR 里不再写 @ST1），而这条窗口搬移读还在读 global，
+  拿回的是没人再维护的旧值，于是 `i80 %"stack+8.arg"` 在最终 IR 里 0 使用。
+- stats_mean 的那条同类（循环头的 ST0 值其实是本块 store 写的），修复后也变成已知值。
+- 修复见 `logs/20260917-01-native-x87-window-shift-load-plan.md`：修好后 FUN_81d0 的参数恢复
+  流动，wrk unknown 38 → 37，memcached 1181 不变。
+
