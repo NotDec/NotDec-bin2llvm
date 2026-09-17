@@ -149,13 +149,79 @@ wrk 整体 `load x86_fp80, ptr @ST1` 39 → 30（少 9 条读 global 的搬移�
 - 理解成本：`registerLoad()` 多一个 `includeX87WindowShift` 开关，需要知道“需求分析跳过
   搬移读、range 重写要看见搬移读”这个分工。
 - 维护成本：`readBlockLocalValueBefore` 只认本块、单 range、同类型三个条件，比较保守；
-  跨块搬移读仍然读 global（见下）。
+  跨块形态由下面的退回分支补上（见“补全”一节）。
 
 ## 遗留 / 不做什么
 
-- **跨块搬移读仍读 global**：FUN_7300 第 3 次 push 的旧 ST1 是第 2 次 push 写在 bb_732f 的
-  值，而读发生在 bb_7359（跨块），本块查不到定义 → 保持原样。该值实际是已知的（第一次
-  `fld` 的值 A），所以这是同类问题的未修分支；要修就得走完整 phi/entry 解析，实测会额外
-  引入 unknown（方案 A 的 45 条），留待单独一轮。
+- ~~跨块搬移读仍读 global~~：本块版（commit `7bdf6e4`）的这条缺口已在下面“补全”一节修掉
+  （用户选定完整语义）：FUN_7300 第 3 次 push 现在拿到第一次 `fld` 的值 A。
 - 没有改 `registerLoad()` 的默认行为，没有动 x87 库语义：搬移读依然不产生 demand。
 - 没有引入 poison/undef 表示死槽（沿用项目“unknown 用不透明调用”的约定）。
+
+## 补全：跨块搬移读也走 range 解析（2026-09-17，用户选定“完整语义”）
+
+本块版只覆盖“写和读在同一个基本块”的形态。补全就是在 `rewriteLoads()` 里加一层退回：
+
+```cpp
+llvm::Value *value = nullptr;
+if (x87WindowShift) {
+  // 先只看本块：不触发 entry/phi 解析、不造 unknown
+  value = readBlockLocalValueBefore(*load, *access.Unit);
+}
+if (value == nullptr) {
+  // 本块没有定义（跨块 / 入口 / 调用后）时退回完整 range 解析
+  value = readValueBefore(*load->getParent(), *access.Unit, load);
+}
+```
+
+也就是让搬移读和普通寄存器读走同一套解析：有定义就用定义（含跨块 phi），没有定义
+就按 pass 既有约定给 `notdec.unknown`。结果是窗口读 global 的形态在 wrk/memcached 里
+彻底消失（`load ... @ST0/@ST1` 都为 0），`@ST0/@ST1` 只作为跨函数 ABI 通道保留。
+
+### 验证（同一棵树；HEAD `84e3323` 为基线，A = 本块版 `7bdf6e4`，B = 完整版）
+
+| 指标 | HEAD | A（本块版） | B（完整版） |
+|---|---|---|---|
+| wrk unknown | 38 | 37 | 57 |
+| wrk `load ... @ST0/@ST1` | 39+13 | 30+16 | **0+0** |
+| wrk IR bytes | 1,015,851 | 1,017,022 | 1,025,789 |
+| wrk warning 行 | 299 | 305 | 311 |
+| wrk defines | 87 | 87 | 87 |
+| memcached unknown | 1181 | 1181 | 1181 |
+| memcached IR bytes | 5,652,931 | 5,652,970 | 5,653,614 |
+| memcached warning 行 | 4970 | 4970 | 4970–4974 |
+| fortune i386 unk / bytes / warn | 1 / 247,592 / 8 | 1 / 247,731 / 8 | 2 / 248,050 / 9 |
+| fortune x86_64 unk / bytes / warn | 0 / 293,801 / 34 | 0 / 293,800 / 34 | 0 / 293,816 / 34 |
+| verify（LLVM 22） | OK | OK | OK |
+| ctest | 12/12 | 12/12 | 12/12 |
+
+（memcached 的 bytes/warning 行在跑动之间有 ±700 B / ±4 行抖动，来源是 pass 内部
+`DenseMap<Instruction*>` 之类的指针序迭代；unknown 计数稳定。本次对比里 memcached 的
+unknown 始终 1181。）
+
+B 相对 A 的按函数变化（wrk；全部是跨块搬移读被解析掉）：
+
+| 函数 | unknown | clobber | `load ... @ST1` |
+|---|---|---|---|
+| FUN_7300 | 0 → 0 | 0 → 0 | 1 → 0（改用第一次 `fld` 的值 A，函数体 −34 B） |
+| FUN_81d0 | 0 → 2 | — | 2 → 0 |
+| FUN_8530 | 0 → 2 | 0 → 2 | 7 → 0 |
+| format_time_us | 0 → 2 | — | 1 → 0 |
+| main | 0 → 3 | 3 → 7 | 6 → 0 |
+| stats_mean | 0 → 5 | — | 5 → 0 |
+| stats_percentile | 0 → 2 | — | 1 → 0 |
+| stats_stdev | 0 → 2 | — | 4 → 0 |
+| stats_within_stdev | 0 → 2 | — | 3 → 0 |
+
+多出来的 20 条 unknown 全部落在“该点 range 状态确实没有定义”的窗口槽上：函数入口的
+ST0/ST1（SysV 要求调用边界 x87 栈为空，本来就是未定义）和外部调用之后没有被 summary
+建模的槽位。以前这些位置写的是 `load ... @ST0/@ST1`，读到的是零初始化 global（或上一次
+调用留下的陈旧值），等于假装有值；现在与普通寄存器没有定义时的处理一致，给
+`notdec.unknown`。这是这一轮唯一需要取舍的点：语义忠实（unknown）换来 unknown 计数
+37 → 57，用户选择忠实。
+
+单测同步收紧：`testX87WindowShiftLoadFollowsRangeState` 现在断言
+`countLoadsFromGlobal(ST1) == 0`，并且三个 push 的参数都不再是 @ST1 的 load。
+
+结论：窗口搬移语义到这里补全——lifter 产生的 ST0/ST1 读写全部由 range 状态吸收，
+`@ST0/@ST1` 只保留跨函数的 ABI 通道角色。
