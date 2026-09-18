@@ -122,3 +122,15 @@ unknown/走 clobber，也不让 pass 凭空多出一条寄存器 global 读。
 
 本轮不改代码（回退到 `3104cf7` 的状态：memcached 26、wrk 57），把测到的数据和
 闸门原因记在这里。
+
+## 下一步调查（已做一半，2026-09-17）
+
+- 事实层面：当前 IR 里**有 5 个节点** `name=RDI, read_entry=true`（例 !136/!324/!354），说明
+  “RDI 入口读记入需求”这条机制本身是通的；`main` 的 `read_entry=false, mask=0x` 是个案。
+- `main` 原始 lift 里，第一次读 RDI 是 `partial_read.i64.i32(ptr @RDI, 0)`（argc），紧跟着就
+  出现 `store i64 48, ptr @RDI`（RDI 被当 scratch 复用），说明 main 里 RDI 既有“入口读”又
+  有“本函数写”，summary 的按位 `ReadEntry |= readMask & MayEntry` 在这条链上没记到入口读。
+- 待做：对 `main` 的 RDI cell 做一次定点 trace（第一个 RDI 读之前到底有没有 @RDI 写、是
+  `store` 还是 `partial_write`、在哪个块），确认是事实计算把它标成 non-entry，还是读取点
+  判定（①）需要先修；随后按“① 按读取点判定 + ② 按位记需求”落地，验收标准：内部函数不得
+  残留入口 raw 寄存器读，`main` 形如 `(i32 %argc, ptr %argv)`。
