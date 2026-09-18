@@ -134,3 +134,108 @@ unknown/走 clobber，也不让 pass 凭空多出一条寄存器 global 读。
   `store` 还是 `partial_write`、在哪个块），确认是事实计算把它标成 non-entry，还是读取点
   判定（①）需要先修；随后按“① 按读取点判定 + ② 按位记需求”落地，验收标准：内部函数不得
   残留入口 raw 寄存器读，`main` 形如 `(i32 %argc, ptr %argv)`。
+
+
+## 调查结论与落地：帧指针匹配（2026-09-18）
+
+本轮用户要求（原话摘录）：
+
+> 在 memcached 剩 26 条、wrk 剩 57 条 notdec.unknown 的前提下，先查清 main 的 RDI（argc）
+> 为什么 read_entry=false，再修 entryRangeInput；不要绕过 rangeMayComeFromEntry 闸门。
+> 验收：内部函数无入口 raw 读、main 形如 (i32 %argc, ptr %argv)、单测/ctest/fortune/verify 全绿。
+> 补充要求：只针对编译器一般产生的 RBP 形态做简单匹配（"要么整函数是栈指针，要么完全不是"），
+> 代码注释和文档要说清楚编译器对 RBP 的使用规律和当前代码的假设。
+
+### 根因：事实计算错了，不是读取点判定
+
+1. main 原始 lift 第一条 RDI 访问是 `partial_read.i64.i32(ptr @RDI, i64 0)`（argc），
+   此前没有任何 @RDI 写，`store i64 48, ptr @RDI` 在其后——是真入口读。
+2. 该读结果存进 `%notdec_stack.native.ptr10742`（alloca+280）。在 summary 看到的 IR 里
+   这个 GEP 只有 store、没有 load，于是 `partialReadFeedsOnlyDeadFrameSlots` 判成
+   "死溢出"：前向不记 `ReadEntry`、反向不产生需求。
+3. 同一内存的读在 `bb_6e98`，拼写是早期帧重写没折过来的
+   `inttoptr(add (%RBP268 = load @RBP), -1992)`（RBP=入口SP-8，-1992-8+2280=280）。
+   晚期帧清理（SSA 重写之后）才把它折成 ptr10742（旧指标 `stack_frame_accesses_rewritten=591`）。
+4. 早期没折的原因：`replaceFramePointerLoads` 的数据流把"前驱还没扫到"和"前驱已知没有值"
+   都当成 `nullptr`，第一轮扫描时循环头被自己的回边毒化，结论自我确认、修不回来。
+   用 Python 精确复刻 C++ 语义：main 821 个块只有 entry 一个块知道 RBP 的值，
+   `bb_6e98` 的 39 个前驱全是"没有值"。
+5. 因果链：丢读 → `addParamForUnit` 要求 `ReadEntry` → 不加 `%RDI.arg`；同时 range 重写的
+   `rangeMayComeFromEntry` 用 exit 级 `MayEntryMask`（main 的 RDI 全 0）→ 3 条 unknown
+   （offset 0/8/16）。所以修 `entryRangeInput` 是治标；闸门本身不用动。
+
+### 中间实验（已量、已弃用）：帧指针数据流三值格
+
+给数据流加 TOP（还没算）/ None / Value 三态，从全 TOP 单调下降迭代到最大不动点。
+效果与最终方案相同（memcached 26→12、raw 入口 load 15→6、晚期帧清理 591→0），
+但概念上要解释"为什么 TOP 不能当成 None"。补丁保留在
+`/tmp/nb-frame/exp-frame-pointer-lattice.patch`。
+
+### 采用方案：按编译器模型整函数匹配
+
+LLVM 依据（`/sn640/NotDec/llvm-source`）：
+
+- `X86RegisterInfo.cpp` `getFrameRegister`：`return TFI->hasFP(MF) ? FramePtr : StackPtr;`
+  ——"哪个寄存器当帧基址"是整函数属性。
+- `X86FrameLowering.cpp` `hasFPImpl` 全是整函数条件。
+- 同文件 `assert(MF.getRegInfo().isReserved(MachineFramePtr) && "FP reserved")`：用帧指针时
+  RBP 被保留，不参与寄存器分配。
+
+机器码形态：序言 `push %rbp`（保存调用方值）+ `mov %rbp, %rsp`（或 `lea`）；收尾
+`mov %rsp, %rbp; pop %rbp`（或 `leave`）。不用帧指针的函数没有"设置"，RBP 是普通
+callee-saved 寄存器。
+
+实测 memcached 的 pass 输入（201 个有 @RBP 写的函数）：恰好一次设置 191（187 有恢复 +
+4 无恢复），完全没有设置 10，怪形态 0。
+
+实现（`NativeStackFrame.cpp` `replaceFramePointerLoads`）：
+
+1. 分类写：值由 RSP 派生的 store 是"设置"，其余（收尾恢复、`partial_write`、认不出的
+   store）是"其它写"。写识别用"指针就是帧指针全局"+"访问元数据"两条判据，并把
+   `partial_write` 也算写——堵住旧实现"看不见的写 → 拿过期值替换"的洞。
+2. 设置必须唯一；不唯一整函数不折。
+3. "其它写"之后可达的块用一次 BFS 标出来，这些块不折；写所在块内按指令顺序判断。
+4. 其余位置只要唯一设置支配这条 load（`llvm::DominatorTree`），就把 `load @RBP` 替换成
+   设置时存进去的值。
+
+假设（每条不成立时只是少折，不会折错）：一个函数只用一种帧基址；调用不改帧指针
+（ABI callee-saved）；认不出的写一律算写；毒化是块级的。
+
+### 验证
+
+| 指标 | 改前（89deb08） | 改后 |
+|---|---|---|
+| memcached unknown | 26 | **12**（重复 3 次一致） |
+| memcached IR bytes | 4,037,772 | 4,025,704~4,025,706 |
+| memcached warning / defines | 822 / 230 | 822 / 230 |
+| memcached raw 入口寄存器 load | 15 | **6**（余下 6 条 pre-existing） |
+| wrk unknown / bytes / warn / defines | 57 / 1,022,548 / 311 / 87 | 同左 |
+| main 签名 | `i64 @main(i64 %RSI.arg)` | `i64 @main(i32 %RDI.arg, i64 %RSI.arg)` |
+| 单测（含 3 个新用例） | 通过 | 通过 |
+| ctest | 12/12 | 12/12 |
+| fortune i386 | 2 / 248,998 / 8 | 2 / 248,998 / 8 |
+| fortune x86_64 | 0 / 293,789 / 34 | 0 / 293,754 / 34 |
+| `opt -passes=verify` | OK | OK |
+
+消失的 14 条：main 3 条 RDI + `FUN_2d310`/`FUN_18bd0`/`FUN_176e0`/`FUN_18130`/
+`FUN_e460`/`FUN_14030` 等函数的入口段读；这些函数各自长出正确参数（如 `FUN_18130` 加
+`i32 %RDI.arg`、`FUN_18bd0` 加 `double %ZMM0.arg`）。顺带消掉 9 条本来违反红线的
+`%RSP.entry`/`%RBP.entry` raw 入口 load（FUN_de20/e460/f780/300c0/f920/15820/2f2e0）。
+
+新增单测（`tests/native_register_summary_ssa_test.cpp`，都走
+`runNativeStackFrameRewrite` 公开入口）：
+
+- `testFramePointerLoadFoldsAcrossLoop`：循环体里的 `load @RBP` 必须折掉（原始 bug）。
+- `testFramePointerLoadAfterRestoreIsKept`：收尾恢复之后的 `load @RBP` 不能折。
+- `testTwoFramePointerSettersAreNotFolded`：两次互不支配的设置 → 整函数不折。
+
+### 代价与遗留
+
+- 毒化是块级的：收尾恢复块可达的块里，即使某条具体路径不经过恢复也不折（实测
+  memcached/wrk 无代价）。收益是代码里没有不动点、没有值身份比较。
+- 不匹配编译器形态的函数保持原样，只是少折。
+- memcached 剩余 12 条 = R9 6（`FUN_294b0` 入口段）+ RDX 5（CALLOTHER×2 / fopen / fclose /
+  strcmp）+ RAX 1（`FUN_1a380` 只有一句 `ret unknown`）；wrk 57 条不变。
+- 另有 6 条 pre-existing raw 入口 load（FUN_19ac0/19b10 RAX、FUN_22b30 RSP、FUN_2be30
+  R14/R15、main RBX）不在本轮射程。
+
