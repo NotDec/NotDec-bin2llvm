@@ -324,7 +324,17 @@ load i64, ptr inttoptr (<slot address>)
    - 入口：`runNativeStackFrameRewrite(...)`。
    - 从 ABI metadata 读取 stack pointer register。
    - 把 RSP 相关栈访问恢复为 `notdec_stack.native` alloca / GEP 形式。
-   - 对 RBP 只替换当前值已证明来自 RSP 的局部 load；RBP 仍可能承载参数或普通局部值。
+   - 帧指针（RBP/EBP/BP）按**编译器模型整函数匹配**：LLVM 的
+     `X86RegisterInfo::getFrameRegister` 只在 `hasFP` 时返回 RBP，且用帧指针时 RBP 是
+     reserved 寄存器（`X86FrameLowering.cpp` 的 "FP reserved" 断言），所以机器码里对它的
+     写只有"序言一次 `mov rbp, rsp`（值为 RSP 派生）"和"收尾若干次从保存槽恢复"两类；
+     不用帧指针的函数则一次设置都没有，RBP 只是普通 callee-saved 寄存器。
+     `replaceFramePointerLoads` 据此分类写：值由 RSP 派生的 store 是**设置**，其余
+     （收尾恢复、`partial_write`、认不出的 store）是**其它写**。设置唯一、支配某条
+     `load @RBP`、且没有其它写能到达它时，把该 load 折成设置的值；设置不唯一、
+     或用块级可达性发现收尾恢复能到达该 load 时不折。
+   - 不认识的写一律当"其它写"（宁可少折也不拿过期值替换）；RBP 不匹配编译器形态时
+     保持原样，raw `load @RBP` 留给后续 register summary / SSA 处理。
    - ignored register 集合只加入由这条链路完整接管的 stack pointer，当前 x86-64 为 RSP。
 
 4. **NativeStackCanaryCleanup**

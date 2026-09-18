@@ -1,12 +1,16 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
 #include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackAddress.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -218,93 +222,158 @@ NativeStackFrameAllocaInfo findNativeStackFrameAlloca(llvm::Function &function) 
   return result;
 }
 
-std::optional<llvm::Value *> mergeKnownValueAtBlockEntry(
-    llvm::BasicBlock &block,
-    const std::map<llvm::BasicBlock *, llvm::Value *> &blockOut) {
-  llvm::Value *merged = nullptr;
-  bool sawPredecessor = false;
-  for (llvm::BasicBlock *predecessor : llvm::predecessors(&block)) {
-    sawPredecessor = true;
-    auto found = blockOut.find(predecessor);
-    if (found == blockOut.end() || found->second == nullptr) {
-      return std::nullopt;
-    }
-    if (merged == nullptr) {
-      merged = found->second;
-    } else if (merged != found->second) {
-      return std::nullopt;
-    }
-  }
-  if (!sawPredecessor) {
-    return std::nullopt;
-  }
-  return merged;
-}
+// ===== 帧指针 load 折叠：按编译器模型匹配 =====
+//
+// 编译器怎么用 RBP（llvm-source）：
+//   - X86RegisterInfo::getFrameRegister: return hasFP(MF) ? FramePtr : StackPtr;
+//     即"哪个寄存器当帧基址"是整函数属性，不存在函数中间换基址。
+//   - X86FrameLowering::hasFPImpl 全是整函数条件（可变长栈对象、取过帧地址、
+//     强制带帧指针……）。
+//   - 用帧指针时 RBP 被保留，不参与寄存器分配：
+//     X86FrameLowering.cpp: assert(MF.getRegInfo().isReserved(MachineFramePtr) &&
+//                                  "FP reserved");
+//   所以机器码里对 RBP 的写只有两种：
+//     序言: push %rbp                → store (load @RBP), [rsp-8]   （保存调用方值）
+//           mov %rbp, %rsp / lea     → store (load @RSP), @RBP     （设置帧基址）
+//     收尾: mov %rsp, %rbp; pop %rbp → @RBP = load [rbp-8]         （恢复调用方值）
+//           （或 leave）
+//   不用帧指针的函数则一次设置都没有，RBP 是一个普通 callee-saved 寄存器。
+//
+// 于是不需要逐点数据流，四条判据就够：
+//   1) 分类：值为 RSP 派生的 store 是"设置"，其余（收尾恢复、partial_write、
+//      认不出的 store）是"其它写"；
+//   2) 设置必须唯一（编译器模型保证整函数只有一个帧基址）；不唯一就整函数不折；
+//   3) "其它写"之后可达的块里不折；写所在块内按指令顺序判断；
+//   4) 其余位置只要设置支配这条 load，load 读的就是设置的值。
+// 支配 + 可达性保证：每条到该 load 的路径都经过设置，且没有别的写能到达它。
+//
+// 代码假设（每条不成立时都只是"少折"，不会折错）：
+//   - 一个函数只用一种帧基址；多个设置、或设置被别的写夹住 → 整函数不折；
+//   - 调用不会改帧指针（ABI callee-saved，项目统一假设）；
+//   - 认不出的写一律算写：partial_write 到帧指针、没有访问元数据的 store 都算，
+//     避免旧实现"看不见的写 → 拿过期值替换"；
+//   - 毒化是块级的：收尾块可达的块里，即使某条具体路径不经过恢复也不折。
+// 匹配不上就保留 raw load，交给后面的 pass。
+//
+// 对不认识的写一律当"其它写"：partial_write 到帧指针、没有访问元数据的 store
+// 都算写。这比旧实现更保守（旧实现只认带元数据的 store，可能拿过期值替换）。
 
-llvm::Value *knownFrameValueAfterBlock(llvm::BasicBlock &block,
-                                       llvm::Value *currentValue,
-                                       llvm::StringRef frameRegisterName,
-                                       llvm::StringRef stackRegisterName) {
-  for (llvm::Instruction &instruction : block) {
-    auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
-    if (store == nullptr || !isRegisterAccess(*store, frameRegisterName)) {
+llvm::GlobalVariable *findFramePointerGlobal(llvm::Module &module,
+                                             llvm::StringRef name) {
+  llvm::GlobalVariable *result = nullptr;
+  for (llvm::GlobalVariable &global : module.globals()) {
+    if (registerName(global) != name) {
       continue;
     }
-    llvm::Value *storedValue = store->getValueOperand();
-    currentValue = valueUsesRegisterLoad(*storedValue, stackRegisterName)
-                       ? storedValue
-                       : nullptr;
+    if (result != nullptr && result != &global) {
+      return nullptr;
+    }
+    result = &global;
   }
-  return currentValue;
+  return result;
+}
+
+// 该指令是否写帧指针寄存器。store 以指针为准，同时保留访问元数据判据（防止
+// 换过拼写的别名全局）；partial_write helper 按参数里的全局判断。
+bool isFramePointerWrite(llvm::Instruction &instruction,
+                         llvm::GlobalVariable *framePointer,
+                         llvm::StringRef frameRegisterName) {
+  if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+    return store->getPointerOperand()->stripPointerCasts() == framePointer ||
+           isRegisterAccess(*store, frameRegisterName);
+  }
+  if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+    if (std::optional<NativeRegisterPartialWriteInfo> partial =
+            parseNativeRegisterPartialWrite(*call)) {
+      return partial->Global == framePointer;
+    }
+  }
+  return false;
+}
+
+bool isFramePointerSetter(llvm::Instruction &instruction,
+                          llvm::StringRef stackRegisterName) {
+  auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+  return store != nullptr &&
+         valueUsesRegisterLoad(*store->getValueOperand(), stackRegisterName);
 }
 
 uint64_t replaceFramePointerLoads(llvm::Function &function,
                                   llvm::StringRef frameRegisterName,
                                   llvm::StringRef stackRegisterName) {
-  std::map<llvm::BasicBlock *, llvm::Value *> blockOut;
-  bool changed = true;
-  size_t iterations = 0;
-  size_t maxIterations = std::max<size_t>(1, function.size() * 4);
-  while (changed && iterations++ < maxIterations) {
-    changed = false;
-    for (llvm::BasicBlock &block : function) {
-      llvm::Value *entryValue = nullptr;
-      if (auto merged = mergeKnownValueAtBlockEntry(block, blockOut)) {
-        entryValue = *merged;
+  llvm::Module *module = function.getParent();
+  if (module == nullptr) {
+    return 0;
+  }
+  llvm::GlobalVariable *framePointer =
+      findFramePointerGlobal(*module, frameRegisterName);
+  if (framePointer == nullptr) {
+    return 0;
+  }
+
+  // 1) 收集写：值为 RSP 派生的 store 是"设置"，其余（收尾恢复、partial_write、
+  //    认不出的 store）是"其它写"。
+  llvm::SmallVector<llvm::Instruction *, 4> setters;
+  llvm::SmallPtrSet<llvm::BasicBlock *, 8> otherWriteBlocks;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      if (!isFramePointerWrite(instruction, framePointer, frameRegisterName)) {
+        continue;
       }
-      llvm::Value *outValue = knownFrameValueAfterBlock(
-          block, entryValue, frameRegisterName, stackRegisterName);
-      auto found = blockOut.find(&block);
-      if (found == blockOut.end() || found->second != outValue) {
-        blockOut[&block] = outValue;
-        changed = true;
+      if (isFramePointerSetter(instruction, stackRegisterName)) {
+        setters.push_back(&instruction);
+      } else {
+        otherWriteBlocks.insert(&block);
       }
     }
   }
+  // 编译器模型保证"设置"只有一次（序言里的 mov rbp, rsp / lea）：RBP 要么整
+  // 函数是帧指针，要么完全不是。不是唯一就不折——多条路径给出不同帧基址时，
+  // 逐点判断要回到数据流，不值得。
+  if (setters.size() != 1) {
+    return 0;
+  }
+  llvm::Instruction *setter = setters.front();
 
+  // 2) "其它写"之后可达的块里帧基址已不可信。写所在块本身按块内指令顺序处理
+  //    （写之前的 load 仍可折），所以 BFS 从写所在块的后继开始。
+  llvm::SmallPtrSet<llvm::BasicBlock *, 32> poisoned;
+  llvm::SmallVector<llvm::BasicBlock *, 16> worklist;
+  auto poisonSuccessors = [&](llvm::BasicBlock *block) {
+    for (llvm::BasicBlock *successor : llvm::successors(block)) {
+      if (poisoned.insert(successor).second) {
+        worklist.push_back(successor);
+      }
+    }
+  };
+  for (llvm::BasicBlock *block : otherWriteBlocks) {
+    poisonSuccessors(block);
+  }
+  while (!worklist.empty()) {
+    poisonSuccessors(worklist.pop_back_val());
+  }
+
+  // 3) 唯一设置支配 load、且没有其它写能达到它时，load 读的就是设置的值。
+  llvm::DominatorTree dominatorTree(function);
+  llvm::Value *frameBaseValue =
+      llvm::cast<llvm::StoreInst>(setter)->getValueOperand();
   std::vector<llvm::LoadInst *> deadLoads;
   for (llvm::BasicBlock &block : function) {
-    llvm::Value *currentValue = nullptr;
-    if (auto merged = mergeKnownValueAtBlockEntry(block, blockOut)) {
-      currentValue = *merged;
-    }
+    bool blocked = poisoned.count(&block) != 0;
     for (llvm::Instruction &instruction : block) {
       if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
-        if (currentValue != nullptr &&
-            loadReadsRegister(*load, frameRegisterName)) {
-          load->replaceAllUsesWith(currentValue);
+        if (!blocked && loadReadsRegister(*load, frameRegisterName) &&
+            dominatorTree.dominates(setter, load)) {
+          load->replaceAllUsesWith(frameBaseValue);
           deadLoads.push_back(load);
-          continue;
         }
-      }
-      auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
-      if (store == nullptr || !isRegisterAccess(*store, frameRegisterName)) {
         continue;
       }
-      llvm::Value *storedValue = store->getValueOperand();
-      currentValue = valueUsesRegisterLoad(*storedValue, stackRegisterName)
-                         ? storedValue
-                         : nullptr;
+      if (!isFramePointerWrite(instruction, framePointer, frameRegisterName)) {
+        continue;
+      }
+      // 设置之后又变回帧基址；其它写之后本块内的 load 不再折。
+      blocked = &instruction != setter;
     }
   }
 

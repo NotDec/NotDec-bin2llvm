@@ -10581,6 +10581,151 @@ bool testFinalCleanupLowersValueRangeHelpers() {
                   "module failed verifier after value range helper cleanup");
 }
 
+bool testFramePointerLoadFoldsAcrossLoop() {
+  llvm::LLVMContext context;
+  llvm::Module module("frame-pointer-loop", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rbp = createRegisterGlobal(module, "RBP");
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "frame_pointer_loop", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *loop = llvm::BasicBlock::Create(context, "loop", function);
+  llvm::BasicBlock *exit = llvm::BasicBlock::Create(context, "exit", function);
+
+  llvm::IRBuilder<> builder(entry);
+  // 序言：RBP = RSP（编译器里的 mov rbp, rsp）。按编译器模型，RBP 在这个
+  // 函数里整函数都是帧基址。
+  llvm::Value *stackPointer = loadRegister(builder, rsp, "RSP", "sp");
+  storeRegister(builder, rbp, stackPointer, "RBP");
+  builder.CreateBr(loop);
+
+  // 循环体里的 load @RBP 必须折成序言存进去的值，而不是留在 IR 里当入口读。
+  builder.SetInsertPoint(loop);
+  llvm::Value *frame = loadRegister(builder, rbp, "RBP", "frame");
+  builder.CreateStore(frame, sink);
+  builder.CreateCondBr(llvm::ConstantInt::getFalse(context), loop, exit);
+
+  builder.SetInsertPoint(exit);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeStackFrameRewrite(module);
+
+  return expect(!hasRegisterLoad(*function, "RBP"),
+                "frame pointer load in a loop was not folded") &&
+         verifyOk(module,
+                  "module failed verifier after frame pointer loop fold");
+}
+
+bool testFramePointerLoadAfterRestoreIsKept() {
+  llvm::LLVMContext context;
+  llvm::Module module("frame-pointer-restore", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rbp = createRegisterGlobal(module, "RBP");
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "frame_pointer_restore",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *restore =
+      llvm::BasicBlock::Create(context, "restore", function);
+  llvm::BasicBlock *after =
+      llvm::BasicBlock::Create(context, "after", function);
+
+  llvm::IRBuilder<> builder(entry);
+  llvm::AllocaInst *slot =
+      builder.CreateAlloca(llvm::Type::getInt64Ty(context), nullptr, "slot");
+  llvm::Value *stackPointer = loadRegister(builder, rsp, "RSP", "sp");
+  storeRegister(builder, rbp, stackPointer, "RBP");
+  builder.CreateBr(restore);
+
+  // 收尾恢复：RBP 被写回调用方的值，之后再读 RBP 就不是帧基址了。
+  builder.SetInsertPoint(restore);
+  llvm::Value *saved = builder.CreateLoad(llvm::Type::getInt64Ty(context),
+                                          slot, "saved");
+  storeRegister(builder, rbp, saved, "RBP");
+  builder.CreateBr(after);
+
+  builder.SetInsertPoint(after);
+  llvm::Value *frame = loadRegister(builder, rbp, "RBP", "frame");
+  builder.CreateStore(frame, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeStackFrameRewrite(module);
+
+  return expect(hasRegisterLoad(*function, "RBP"),
+                "frame pointer load after the restore was folded") &&
+         verifyOk(module,
+                  "module failed verifier after frame pointer restore test");
+}
+
+bool testTwoFramePointerSettersAreNotFolded() {
+  llvm::LLVMContext context;
+  llvm::Module module("frame-pointer-two-setters", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rbp = createRegisterGlobal(module, "RBP");
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  auto *condition = new llvm::GlobalVariable(
+      module, llvm::Type::getInt1Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "condition");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage,
+      "frame_pointer_two_setters", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", function);
+  llvm::BasicBlock *right =
+      llvm::BasicBlock::Create(context, "right", function);
+  llvm::BasicBlock *merge =
+      llvm::BasicBlock::Create(context, "merge", function);
+
+  // 两次"设置"（互不支配）：编译器模型里不该出现（帧指针整函数只有一次
+  // 序言设置），保守起见不折任何 load。
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *cond =
+      builder.CreateLoad(llvm::Type::getInt1Ty(context), condition, "cond");
+  builder.CreateCondBr(cond, left, right);
+
+  builder.SetInsertPoint(left);
+  llvm::Value *leftSp = loadRegister(builder, rsp, "RSP", "left.sp");
+  storeRegister(builder, rbp, leftSp, "RBP");
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(right);
+  llvm::Value *rightSp = loadRegister(builder, rsp, "RSP", "right.sp");
+  storeRegister(builder, rbp, rightSp, "RBP");
+  builder.CreateBr(merge);
+
+  builder.SetInsertPoint(merge);
+  llvm::Value *frame = loadRegister(builder, rbp, "RBP", "frame");
+  builder.CreateStore(frame, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeStackFrameRewrite(module);
+
+  return expect(hasRegisterLoad(*function, "RBP"),
+                "load after two frame pointer setters was folded") &&
+         verifyOk(module,
+                  "module failed verifier after two setter frame test");
+}
+
 } // namespace
 
 int main() {
@@ -10593,6 +10738,9 @@ int main() {
   ok &= testX87WindowShiftLoadFollowsRangeState();
   ok &= testDeadFrameSpillPartialReadCreatesNoEntryParam();
   ok &= testLiveFrameSpillPartialReadKeepsValue();
+  ok &= testFramePointerLoadFoldsAcrossLoop();
+  ok &= testFramePointerLoadAfterRestoreIsKept();
+  ok &= testTwoFramePointerSettersAreNotFolded();
   ok &= testCalleeSavedRegisterSurvivesInternalCall();
   ok &= testDirectionFlagIsZeroAtBoundaries();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();
