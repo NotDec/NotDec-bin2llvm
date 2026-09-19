@@ -552,6 +552,27 @@ bool writeRegisterSSAWarnings(
   return true;
 }
 
+// 盘点最终 IR 里剩下的 notdec.unknown 占位：打印归因直方图，用来回答
+// "剩下的 unknown 到底是什么"（调用边界丢的 / 入口闸门拒绝的 / 真有缺口）。
+// 只在 --register-ssa-summary 下打印：默认路径的 stderr 必须保持干净
+// （cli-signature-rewrite smoke 用 require_empty 检查）。
+void reportRemainingUnknownValues(llvm::Module &module) {
+  std::map<std::string, uint64_t> counts =
+      notdec::bin2llvm::countRemainingUnknownValues(module);
+  uint64_t total = 0;
+  for (const auto &[key, count] : counts) {
+    (void)key;
+    total += count;
+  }
+  std::cerr << "notdec.unknown remaining: total=" << total;
+  bool first = true;
+  for (const auto &[key, count] : counts) {
+    std::cerr << (first ? " [" : ", ") << key << "=" << count;
+    first = false;
+  }
+  std::cerr << (first ? "" : "]") << '\n';
+}
+
 bool resolveFunctionRange(const notdec::bin2llvm::NativeProgramState &state,
                           CliOptions &options) {
   if (!options.FunctionEntry && options.FunctionName.empty()) {
@@ -1164,6 +1185,9 @@ int main(int argc, char **argv) {
       // 这次 InstCombine 可能删掉某个 unknown 占位的最后一个使用者；unknown
       // 调用本身不会被当死代码删（call 有副作用语义），补一次清理。
       notdec::bin2llvm::eraseDeadUnknownValueCalls(*module);
+      if (options->PrintRegisterSSASummary) {
+        reportRemainingUnknownValues(*module);
+      }
       return writeModule(*module, options->OutputPath);
     }
 
@@ -1360,6 +1384,9 @@ int main(int argc, char **argv) {
     }
     // 同上：最后一次 InstCombine 之后补一次死 unknown 清理。
     notdec::bin2llvm::eraseDeadUnknownValueCalls(*module);
+    if (options->PrintRegisterSSASummary) {
+      reportRemainingUnknownValues(*module);
+    }
 
     return writeModule(*module, options->OutputPath);
   } catch (const ghidra::LowlevelError &error) {

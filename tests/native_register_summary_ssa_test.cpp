@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -10762,6 +10763,110 @@ bool testEraseDeadUnknownValueCalls() {
          verifyOk(module, "module failed verifier after dead unknown sweep");
 }
 
+// 调用边界丢掉的值必须能指名道姓：Mixed 效果（callee 有的路径保留、有的路径
+// 改写）造成的 notdec.unknown 要带 reason=call_effect_mixed + callee=<name>，
+// 而不是只有一个笼统的 range_unknown；countRemainingUnknownValues() 也要按这个
+// 成因归类，批跑时才能回答"剩下的 unknown 到底是什么"。
+bool testMixedCallBoundaryAttributesUnknownToCallee() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-mixed-call-unknown-attribution", context);
+  attachTestAbi(module);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  auto *i64Type = llvm::Type::getInt64Ty(context);
+  auto *sink = new llvm::GlobalVariable(
+      module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "sink");
+  auto *flag = new llvm::GlobalVariable(
+      module, llvm::Type::getInt1Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "flag");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  // callee：true 路径把 RDI 写成常量（非入口值），false 路径不动 RDI
+  // ⇒ RDI 的出口 provenance 是 Mixed，调用点只能用占位值。
+  llvm::Function *callee = llvm::Function::Create(
+      voidType, llvm::GlobalValue::InternalLinkage, "mixed_rdi_callee", module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::BasicBlock *calleeWrite =
+      llvm::BasicBlock::Create(context, "write", callee);
+  llvm::BasicBlock *calleeDone =
+      llvm::BasicBlock::Create(context, "done", callee);
+  llvm::IRBuilder<> calleeBuilder(calleeEntry);
+  llvm::Value *calleeCond =
+      calleeBuilder.CreateLoad(llvm::Type::getInt1Ty(context), flag, "cond");
+  calleeBuilder.CreateCondBr(calleeCond, calleeWrite, calleeDone);
+  calleeBuilder.SetInsertPoint(calleeWrite);
+  storeRegister(calleeBuilder, rdi, llvm::ConstantInt::get(i64Type, 7), "RDI");
+  calleeBuilder.CreateBr(calleeDone);
+  calleeBuilder.SetInsertPoint(calleeDone);
+  calleeBuilder.CreateRetVoid();
+
+  // caller：entry 先读 RDI（ReadEntry=true ⇒ 签名里出现 RDI 参数），调用 Mixed
+  // callee 之后，在没有本地定义的 merge 块再读 RDI：值只能是调用边界丢的。
+  llvm::Function *caller = llvm::Function::Create(
+      voidType, llvm::GlobalValue::InternalLinkage, "mixed_rdi_caller", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::BasicBlock *left = llvm::BasicBlock::Create(context, "left", caller);
+  llvm::BasicBlock *right = llvm::BasicBlock::Create(context, "right", caller);
+  llvm::BasicBlock *merge = llvm::BasicBlock::Create(context, "merge", caller);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *input = loadRegister(builder, rdi, "RDI", "input");
+  builder.CreateStore(input, sink);
+  builder.CreateCall(voidType, callee);
+  llvm::Value *cond =
+      builder.CreateLoad(llvm::Type::getInt1Ty(context), flag, "cond2");
+  builder.CreateCondBr(cond, left, right);
+  // 两个分支各自留下不同的副作用，避免 SimplifyCFG 把 left/right 合掉、
+  // 把 phi 折成一个非 phi 值（那样 unknown 会被 InstCombine 重建并丢 metadata）。
+  builder.SetInsertPoint(left);
+  builder.CreateStore(llvm::ConstantInt::get(i64Type, 1), sink);
+  builder.CreateBr(merge);
+  builder.SetInsertPoint(right);
+  builder.CreateStore(llvm::ConstantInt::get(i64Type, 2), sink);
+  builder.CreateBr(merge);
+  builder.SetInsertPoint(merge);
+  llvm::Value *after = loadRegister(builder, rdi, "RDI", "after");
+  builder.CreateStore(after, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("mixed_rdi_caller");
+  std::map<std::string, uint64_t> counts =
+      notdec::bin2llvm::countRemainingUnknownValues(module);
+
+  bool reasonAttributed = false;
+  bool calleeAttributed = false;
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr || call->getCalledFunction() == nullptr ||
+          !call->getCalledFunction()->getName().starts_with("notdec.unknown.")) {
+        continue;
+      }
+      if (llvm::MDNode *source = call->getMetadata("notdec.unknown.source")) {
+        for (const llvm::MDOperand &operand : source->operands()) {
+          auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+          if (text == nullptr) {
+            continue;
+          }
+          reasonAttributed |= text->getString() == "reason=call_effect_mixed";
+          calleeAttributed |= text->getString() == "callee=mixed_rdi_callee";
+        }
+      }
+    }
+  }
+
+  return expect(rewritten != nullptr, "mixed call caller missing") &&
+         expect(reasonAttributed,
+                "mixed call boundary unknown was not attributed to the call") &&
+         expect(calleeAttributed,
+                "mixed call boundary unknown did not name the callee") &&
+         expect(counts.count("call_effect_mixed:mixed_rdi_callee:RDI") != 0,
+                "remaining unknown tally did not group by mixed call callee") &&
+         verifyOk(module,
+                  "module failed verifier after unknown attribution test");
+}
+
 } // namespace
 
 int main() {
@@ -10778,6 +10883,7 @@ int main() {
   ok &= testFramePointerLoadAfterRestoreIsKept();
   ok &= testTwoFramePointerSettersAreNotFolded();
   ok &= testEraseDeadUnknownValueCalls();
+  ok &= testMixedCallBoundaryAttributesUnknownToCallee();
   ok &= testCalleeSavedRegisterSurvivesInternalCall();
   ok &= testDirectionFlagIsZeroAtBoundaries();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();

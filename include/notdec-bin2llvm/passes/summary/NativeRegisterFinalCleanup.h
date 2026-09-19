@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <string>
 
 namespace llvm {
 class Module;
@@ -41,6 +43,13 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
 // 删掉某个 unknown 的最后一个使用者，而调用指令本身有副作用语义、不会被当死代码
 // 删掉。
 uint64_t eraseDeadUnknownValueCalls(llvm::Module &module);
+
+// 盘点最终 IR 里剩下的 notdec.unknown.* 占位，按 !notdec.unknown.source 的
+// reason/callee/register 归因（key 形如 "call_effect_mixed:FUN_17e10:R9"）。
+// 只在 tool 的最后一次 InstCombine + eraseDeadUnknownValueCalls 之后调用，
+// 用来回答"剩下的 unknown 到底是什么"，而不是只报一个总数。
+std::map<std::string, uint64_t>
+countRemainingUnknownValues(llvm::Module &module);
 
 void printNativeRegisterFinalCleanupSummary(
     const NativeRegisterFinalCleanupSummary &summary, llvm::raw_ostream &os);

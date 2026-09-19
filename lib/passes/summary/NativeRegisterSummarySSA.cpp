@@ -3510,6 +3510,16 @@ private:
   // block entry value.  PHI completion can then materialize an explicit unknown
   // incoming instead of silently reusing an entry register.
   std::set<BlockRangeKey> UnknownCurrentDef;
+  // 值丢失的成因，与 UnknownCurrentDef 同 key。只用于把 notdec.unknown 的
+  // !notdec.unknown.source 归因到真正丢失它的那个调用点/寄存器，不参与任何
+  // 值决策：标记块时写入调用成因，解析返回 nullptr 时沿访问过的 block 传播，
+  // phi 兜底就能说出"这个 unknown 是哪个 callee 的 Mixed 效果造成的"，而不是
+  // 只报一个笼统的 range_unknown。写过定义（CurrentDef）后成因随之清除。
+  struct RangeLossCause {
+    std::string Reason;
+    std::string Callee;
+  };
+  std::map<BlockRangeKey, RangeLossCause> RangeLossCauses;
   // The last instruction whose effects have been applied to CurrentDef for a
   // block.  This lets multiple reads in the same block continue from the
   // previous transfer point instead of rebuilding the block state each time.
@@ -4798,7 +4808,7 @@ private:
             UnknownCurrentDef.count({before->getParent(), range}) != 0) {
           return nullptr;
         }
-        segment = unknownRangeBefore(*before, range, ".range_unknown");
+        segment = attributedRangeUnknown(*before, range, ".range_unknown");
         if (segment == nullptr || segment->getType() != rangeType(range) ||
             !valueDominatesUse(segment, before, domTree)) {
           return nullptr;
@@ -5575,7 +5585,8 @@ private:
 
   llvm::Value *unknownRangeBefore(llvm::Instruction &insertBefore,
                                   const RegisterRangeKey &range,
-                                  llvm::Twine suffix) {
+                                  llvm::Twine suffix,
+                                  llvm::StringRef callee = "") {
     const RegisterUnit *unit = unitForRange(range);
     if (unit == nullptr || range.BitWidth == 0) {
       return nullptr;
@@ -5591,9 +5602,23 @@ private:
     }
     std::string detail = "offset=" + std::to_string(range.BitOffset) +
                          ",width=" + std::to_string(range.BitWidth);
-    attachUnknownValueMetadata(value, reason, Function.getName(), "",
+    attachUnknownValueMetadata(value, reason, Function.getName(), callee,
                                unit->Name, "range_ssa", detail);
     return value;
+  }
+
+  // phi 兜底/缺段兜底物化 unknown 时统一走这里：把 RangeLossCauses 里记录的
+  // 成因写进 !notdec.unknown.source（reason + callee），没有归因就退回
+  // range_unknown。value name 只带 reason，不把 callee 名塞进符号。
+  llvm::Value *attributedRangeUnknown(llvm::Instruction &insertBefore,
+                                      const RegisterRangeKey &range,
+                                      llvm::StringRef fallbackReason) {
+    const RangeLossCause *cause =
+        rangeLossCause({insertBefore.getParent(), range});
+    if (cause == nullptr || cause->Reason.empty()) {
+      return unknownRangeBefore(insertBefore, range, fallbackReason);
+    }
+    return unknownRangeBefore(insertBefore, range, cause->Reason, cause->Callee);
   }
 
   llvm::Value *rangeTypedValueOrUnknown(llvm::Value *value,
@@ -5674,6 +5699,7 @@ private:
     }
     CurrentDef[{writeInst.getParent(), range}] = RangedSSAValue{value, range};
     UnknownCurrentDef.erase({writeInst.getParent(), range});
+    RangeLossCauses.erase({writeInst.getParent(), range});
     return value;
   }
 
@@ -5693,6 +5719,7 @@ private:
       CurrentDef[{writeInst.getParent(), range}] =
           RangedSSAValue{value, coveredRange};
       UnknownCurrentDef.erase({writeInst.getParent(), range});
+      RangeLossCauses.erase({writeInst.getParent(), range});
     }
     return true;
   }
@@ -5785,9 +5812,30 @@ private:
   }
 
   void markBlockRangeUnknown(llvm::BasicBlock &block,
-                             const RegisterRangeKey &range) {
+                             const RegisterRangeKey &range,
+                             const RangeLossCause &cause = {}) {
     CurrentDef.erase({&block, range});
     UnknownCurrentDef.insert({&block, range});
+    if (!cause.Reason.empty()) {
+      RangeLossCauses[{&block, range}] = cause;
+    }
+  }
+
+  // 把 src 的成因复制到 dst；只用于诊断归因，dst 已有成因时不覆盖。
+  void inheritRangeLossCause(const BlockRangeKey &dst,
+                             const BlockRangeKey &src) {
+    if (RangeLossCauses.count(dst) != 0) {
+      return;
+    }
+    auto it = RangeLossCauses.find(src);
+    if (it != RangeLossCauses.end()) {
+      RangeLossCauses[dst] = it->second;
+    }
+  }
+
+  const RangeLossCause *rangeLossCause(const BlockRangeKey &key) const {
+    auto it = RangeLossCauses.find(key);
+    return it == RangeLossCauses.end() ? nullptr : &it->second;
   }
 
   bool transferRangeInstruction(llvm::Instruction &inst,
@@ -5850,8 +5898,9 @@ private:
           clearBlockRangeDefs(block, global);
           continue;
         }
+        RangeLossCause cause = unknownCallEffectCause(*call);
         for (const RegisterRangeKey &range : ranges) {
-          markBlockRangeUnknown(block, range);
+          markBlockRangeUnknown(block, range, cause);
         }
         continue;
       }
@@ -5868,6 +5917,7 @@ private:
         if (value != nullptr && value->getType() == rangeType(range)) {
           CurrentDef[{&block, range}] = RangedSSAValue{value, range};
           UnknownCurrentDef.erase({&block, range});
+          RangeLossCauses.erase({&block, range});
         }
       }
     }
@@ -5940,7 +5990,7 @@ private:
                                           llvm::pred_end(&block));
     llvm::Value *value = nullptr;
     if (preds.empty()) {
-      value = entryRangeInput(range);
+      value = entryRangeInput(block, range);
     } else if (preds.size() == 1) {
       value = readRangeExit(*preds.front(), range, domTree);
       if (PendingRangePhi.count(key) != 0) {
@@ -5951,6 +6001,12 @@ private:
     }
     ResolvingRangeEntry.erase(key);
     EntryRangeValue[key] = resolve(value);
+    if (EntryRangeValue[key] == nullptr) {
+      // 值丢失时把成因沿 pred 传上来，phi 兜底才能指名到具体调用点。
+      for (llvm::BasicBlock *pred : preds) {
+        inheritRangeLossCause(key, {pred, range});
+      }
+    }
     return EntryRangeValue[key];
   }
 
@@ -6024,7 +6080,7 @@ private:
       if (incoming == nullptr) {
         incoming =
             terminator != nullptr
-                ? unknownRangeBefore(*terminator, range, ".range_unknown")
+                ? attributedRangeUnknown(*terminator, range, ".range_unknown")
                 : llvm::UndefValue::get(rangeType(range));
       }
       phi->addIncoming(incoming, pred);
@@ -6328,7 +6384,8 @@ private:
            !mayEntry.extractBits(bits, range.BitOffset).isZero();
   }
 
-  llvm::Value *entryRangeInput(const RegisterRangeKey &range) {
+  llvm::Value *entryRangeInput(llvm::BasicBlock &block,
+                               const RegisterRangeKey &range) {
     if (auto cached = EntryRangeInputs.find(range);
         cached != EntryRangeInputs.end()) {
       return resolve(cached->second);
@@ -6357,11 +6414,20 @@ private:
       }
     }
     if (!rangeMayComeFromEntry(range)) {
+      // 入口值存在但闸门拒绝（summary 说这些位不可能还来自入口）。记成因，
+      // 让 phi 兜底物化的 unknown 带上 entry_range_rejected，而不是只有
+      // range_unknown：这一类是"事实不允许"，不是"调用边界丢掉"。
+      RangeLossCause cause;
+      cause.Reason = "entry_range_rejected";
+      RangeLossCauses[{&block, range}] = cause;
       return nullptr;
     }
     llvm::Instruction *insertBefore =
         &*Function.getEntryBlock().getFirstInsertionPt();
     if (insertBefore == nullptr) {
+      RangeLossCause cause;
+      cause.Reason = "entry_value_unavailable";
+      RangeLossCauses[{&block, range}] = cause;
       return nullptr;
     }
     llvm::Value *value = nullptr;
@@ -6372,12 +6438,31 @@ private:
       value = entryPartialRead(*unit, range, *insertBefore);
     }
     if (value == nullptr) {
+      RangeLossCause cause;
+      cause.Reason = "entry_value_unavailable";
+      RangeLossCauses[{&block, range}] = cause;
       return nullptr;
     }
     EntryRangeInputs.emplace(range, value);
     EntryInputRanges.emplace(value, range);
     ++Summary.RangeEntryInputs;
     return value;
+  }
+
+  // callEffect 返回 Unknown 时的成因，只喂给 RangeLossCause 做归因：
+  //   callee_summary_missing - 内部 callee 没有 summary facts（callEffect :6412）
+  //   call_effect_mixed      - callee 对该寄存器的出口 provenance 既可能保留
+  //                            又可能改写（callEffect 的 Mixed 分支）
+  RangeLossCause unknownCallEffectCause(const llvm::CallBase &call) const {
+    RangeLossCause cause;
+    llvm::Function *callee = call.getCalledFunction();
+    cause.Callee =
+        callee != nullptr ? callee->getName().str() : std::string("<indirect>");
+    cause.Reason = callee != nullptr && !callee->isDeclaration() &&
+                           SummaryFacts.find(callee) == SummaryFacts.end()
+                       ? "callee_summary_missing"
+                       : "call_effect_mixed";
+    return cause;
   }
 
   CallRegisterEffect callEffect(const llvm::CallBase &call,

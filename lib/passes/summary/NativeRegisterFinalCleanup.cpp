@@ -20,8 +20,12 @@
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/DCE.h"
 
+#include "llvm/IR/Metadata.h"
+
 #include <array>
+#include <map>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace notdec::bin2llvm {
@@ -420,6 +424,54 @@ uint64_t eraseDeadUnknownValueCalls(llvm::Module &module) {
     ++removed;
   }
   return removed;
+}
+
+std::map<std::string, uint64_t>
+countRemainingUnknownValues(llvm::Module &module) {
+  std::map<std::string, uint64_t> counts;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee == nullptr || !isOpaqueUnknownHelperName(callee->getName())) {
+        continue;
+      }
+      std::string reason = "unknown";
+      std::string calleeName;
+      std::string registerName;
+      if (llvm::MDNode *source = call->getMetadata("notdec.unknown.source")) {
+        for (const llvm::MDOperand &operand : source->operands()) {
+          auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+          if (text == nullptr) {
+            continue;
+          }
+          llvm::StringRef value = text->getString();
+          if (value.consume_front("reason=")) {
+            reason = value.str();
+          } else if (value.consume_front("callee=")) {
+            calleeName = value.str();
+          } else if (value.consume_front("register=")) {
+            registerName = value.str();
+          }
+        }
+      }
+      std::string key = reason;
+      if (!calleeName.empty()) {
+        key += ":" + calleeName;
+      }
+      if (!registerName.empty()) {
+        key += ":" + registerName;
+      }
+      ++counts[key];
+    }
+  }
+  return counts;
 }
 
 NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
