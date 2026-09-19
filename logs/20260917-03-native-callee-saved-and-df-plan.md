@@ -239,3 +239,67 @@ callee-saved 寄存器。
 - 另有 6 条 pre-existing raw 入口 load（FUN_19ac0/19b10 RAX、FUN_22b30 RSP、FUN_2be30
   R14/R15、main RBX）不在本轮射程。
 
+
+## 死 unknown 的来龙去脉（2026-09-18 续）
+
+本轮用户问题（原话）：
+
+> 看看那个死代码真的是死代码吗，那段部分没被用到为什么会创建对应 unknown?
+
+调查发现两类，都是清理时序问题，不是"为死代码创建 unknown"：
+
+### 一类：创建时活着，之后才变死（strcmp 那条 + wrk 20 条）
+
+- unknown 代表的读是真实的。`FUN_1e900` 里 strcmp 之后原始 lift 读
+  `%EDX = partial_read.i64.i32(ptr @RDX, 0)`（本块只写了 DL，高 24 位追溯到调用点），
+  值一路走 `partial_write @R15` - 读回 - zext - store @R15。
+- 后续签名重写 / 死 store 删除 / InstCombine 把消费者链删掉，unknown 变成没人用。
+- tool 的 pipeline 顺序是关键：`SSA 重写 - InstCombine - peephole - final cleanup
+  （内部有 eraseDeadUnknownValueCalls）- 再一次 InstCombine - 写文件`。最后一次
+  InstCombine 跑在死 unknown 清理**之后**（它用来折叠 final cleanup 降级出的
+  insert/extract 链），它删掉的最后一个使用者没人再扫。wrk 的 57 条里有 20 条属于
+  这种残留（`unknowns.py` 标 dead/unused=20）。
+- 修法：把 `eraseDeadUnknownValueCalls` 从匿名命名空间提出来（声明进
+  `NativeRegisterFinalCleanup.h`），在 tool 两条 pipeline 的最后一次 InstCombine
+  之后各补一次。
+
+### 二类：创建时就死了（fopen/fclose 的 RDX 两条）
+
+- 加 trace 后看到 `[helper-trace] uses=0 reg=RDX type=i24`：`rewriteSignatureShapes`
+  解析 helper 时它在 IR 里已经没有使用者，代码不看 `use_empty()` 就物化
+  `notdec.unknown` 并写进内部 valueMap；后续链通过 valueMap 引用到它，于是"为死
+  helper 造的 unknown"反而被用了。
+- 分类本身也不对：RDX 在 fopen 之后是 clobber（fopen 只返回 RAX），本该像同一调用
+  点的 RCX/R8/R9 一样保留 `summary_clobber` 占位，却被当成"返回槽解析失败"。
+- 修法：解析失败且 `helper->use_empty()` 时删 helper、不造 unknown；能解析出真实
+  返回值的死 helper 仍照常解析（避免丢返回值）。
+
+### 结果
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| memcached unknown | 12 | **9** |
+| memcached IR bytes | 4,025,704 | 4,021,243 |
+| memcached warning | 822 | 828 |
+| wrk unknown | 57 | **37**（剩余全部 dead=0；删掉的 20 条正是原 dead 集合） |
+| wrk IR bytes | 1,022,621 | 1,019,316 |
+| wrk warning | 311 | 311 |
+| 单测 / ctest / fortune x2 / verify | — | 全绿（ctest 12/12，fortune 两个退出 0） |
+
+warning 822 增加到 828 的 +6 全是 `remaining_summary_clobber_value`（原来被 unknown 掩盖的
+clobber 占位现在如实报告；同一调用点其它寄存器本来就有同类 warning），另有
+`call_arg_uses_unknown_value` 变成更准确的 `call_arg_uses_clobber_value`。
+
+单测新增 `testEraseDeadUnknownValueCalls`（无使用者的 `notdec.unknown` 被清掉、
+有使用者的保留）。二类修复需要 pass 内部 valueMap 链才能构造，单测不易复现，由 CLI
+层的 unknown 计数与 fortune residue audit 覆盖。
+
+### 剩余
+
+- memcached 9 条 = R9 6（`FUN_294b0` 循环内 range phi/段解析）+ CALLOTHER 2
+  （`FUN_1fa40`）+ RAX 1（`FUN_1a380` 整函数 `ret unknown`）。
+- wrk 37 条 = 间接调用返回模型 14（`callee:<indirect>`）+ ST0/ST1 窗口 15 +
+  `__printf_chk` 2 + strcmp 2 + gettimeofday 1 + 其它。
+- 另有 6 条 pre-existing raw 入口 load 不在射程。
+
+
