@@ -1161,6 +1161,9 @@ int main(int argc, char **argv) {
                                        /*runEarlyCSEFirst=*/true)) {
         return 1;
       }
+      // 这次 InstCombine 可能删掉某个 unknown 占位的最后一个使用者；unknown
+      // 调用本身不会被当死代码删（call 有副作用语义），补一次清理。
+      notdec::bin2llvm::eraseDeadUnknownValueCalls(*module);
       return writeModule(*module, options->OutputPath);
     }
 
@@ -1355,6 +1358,8 @@ int main(int argc, char **argv) {
                                      /*runEarlyCSEFirst=*/true)) {
       return 1;
     }
+    // 同上：最后一次 InstCombine 之后补一次死 unknown 清理。
+    notdec::bin2llvm::eraseDeadUnknownValueCalls(*module);
 
     return writeModule(*module, options->OutputPath);
   } catch (const ghidra::LowlevelError &error) {

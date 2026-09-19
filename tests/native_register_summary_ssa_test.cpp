@@ -10726,6 +10726,42 @@ bool testTwoFramePointerSettersAreNotFolded() {
                   "module failed verifier after two setter frame test");
 }
 
+bool testEraseDeadUnknownValueCalls() {
+  llvm::LLVMContext context;
+  llvm::Module module("final-cleanup-dead-unknown", context);
+  auto *i64Type = llvm::Type::getInt64Ty(context);
+  auto *sink = new llvm::GlobalVariable(
+      module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "sink");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "dead_unknown_sweep", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::FunctionCallee unknown = module.getOrInsertFunction(
+      "notdec.unknown.i64", llvm::FunctionType::get(i64Type, {}, false));
+  builder.CreateCall(unknown);
+  llvm::Value *live = builder.CreateCall(unknown);
+  builder.CreateStore(live, sink);
+  builder.CreateRetVoid();
+
+  uint64_t removed = notdec::bin2llvm::eraseDeadUnknownValueCalls(module);
+  unsigned remaining = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName() == "notdec.unknown.i64") {
+      ++remaining;
+    }
+  }
+
+  return expect(removed == 1, "unused unknown call was not removed") &&
+         expect(remaining == 1, "used unknown call was removed") &&
+         verifyOk(module, "module failed verifier after dead unknown sweep");
+}
+
 } // namespace
 
 int main() {
@@ -10741,6 +10777,7 @@ int main() {
   ok &= testFramePointerLoadFoldsAcrossLoop();
   ok &= testFramePointerLoadAfterRestoreIsKept();
   ok &= testTwoFramePointerSettersAreNotFolded();
+  ok &= testEraseDeadUnknownValueCalls();
   ok &= testCalleeSavedRegisterSurvivesInternalCall();
   ok &= testDirectionFlagIsZeroAtBoundaries();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();

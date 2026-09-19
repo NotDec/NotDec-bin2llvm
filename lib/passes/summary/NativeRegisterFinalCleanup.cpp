@@ -257,35 +257,6 @@ uint64_t eraseDeadRegisterReads(llvm::Module &module) {
   return removed;
 }
 
-uint64_t eraseDeadUnknownValueCalls(llvm::Module &module) {
-  std::vector<llvm::CallBase *> deadCalls;
-  for (llvm::Function &function : module) {
-    if (function.isDeclaration()) {
-      continue;
-    }
-    for (llvm::Instruction &inst : llvm::instructions(function)) {
-      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
-      if (call == nullptr || !call->use_empty()) {
-        continue;
-      }
-      llvm::Function *callee = call->getCalledFunction();
-      if (callee != nullptr && isOpaqueUnknownHelperName(callee->getName())) {
-        deadCalls.push_back(call);
-      }
-    }
-  }
-
-  uint64_t removed = 0;
-  for (llvm::CallBase *call : deadCalls) {
-    if (call->getParent() == nullptr || !call->use_empty()) {
-      continue;
-    }
-    call->eraseFromParent();
-    ++removed;
-  }
-  return removed;
-}
-
 uint64_t eraseUnusedRegisterGlobals(llvm::Module &module) {
   std::vector<llvm::GlobalVariable *> deadGlobals;
   for (llvm::GlobalVariable &global : module.globals()) {
@@ -417,6 +388,39 @@ void runLocalDeadCodeCleanup(llvm::Module &module) {
 }
 
 } // namespace
+
+// notdec.unknown.* 是占位调用：重写和 DCE 之后使用者可能已经没了，但调用指令
+// 本身不会被当死代码删掉（普通 call 有副作用语义）。最终 IR 之前要再扫一次，
+// 因为 tool 在 final cleanup 之后还会跑一次 InstCombine，它可能删掉最后一个
+// 使用者。
+uint64_t eraseDeadUnknownValueCalls(llvm::Module &module) {
+  std::vector<llvm::CallBase *> deadCalls;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr || !call->use_empty()) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee != nullptr && isOpaqueUnknownHelperName(callee->getName())) {
+        deadCalls.push_back(call);
+      }
+    }
+  }
+
+  uint64_t removed = 0;
+  for (llvm::CallBase *call : deadCalls) {
+    if (call->getParent() == nullptr || !call->use_empty()) {
+      continue;
+    }
+    call->eraseFromParent();
+    ++removed;
+  }
+  return removed;
+}
 
 NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
     llvm::Module &module, const NativeRegisterFinalCleanupOptions &options) {

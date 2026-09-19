@@ -8460,6 +8460,13 @@ void rewriteSignatureShapes(
         llvm::Value *value =
             extractReturnRegister(builder, *shape, *newCall, name);
         if (value == nullptr || value->getType() != helper->getType()) {
+          // 解析不出返回值、helper 又已经没人用：它是重写过程中被摘掉的死
+          // helper，不要为它再物化一个 unknown 占位（那会留下没人用的
+          // notdec.unknown 调用），直接收集删除。
+          if (helper->use_empty()) {
+            helpersToErase.push_back(helper);
+            continue;
+          }
           llvm::StringRef reason = value == nullptr
                                        ? "return_helper_rewrite_missing_value"
                                        : "return_helper_rewrite_type_mismatch";
@@ -8490,6 +8497,11 @@ void rewriteSignatureShapes(
         llvm::Value *value =
             extractReturnRange(builder, *shape, *newCall, rangeHelper.Range);
         if (value == nullptr || value->getType() != helper->getType()) {
+          // 同 register helper：死 helper 不造 unknown，直接删。
+          if (helper->use_empty()) {
+            helpersToErase.push_back(helper);
+            continue;
+          }
           // 第一遍的证据集是"调用后被读的 ABI 输出寄存器"（含 ST0/ZMM0
           // 这类只被 clobber 的），返回槽由签名决定。callee 的返回槽里
           // 没有这个寄存器时，解析失败是预期行为，静默转成 unknown；

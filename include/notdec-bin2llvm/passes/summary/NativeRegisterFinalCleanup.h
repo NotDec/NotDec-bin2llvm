@@ -36,6 +36,12 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
     llvm::Module &module,
     const NativeRegisterFinalCleanupOptions &options = {});
 
+// 清掉没人用的 notdec.unknown.* 占位调用。runNativeRegisterFinalCleanup 内部会
+// 调一次；tool 在最后一次 InstCombine 之后还要再调一次——那次 InstCombine 可能
+// 删掉某个 unknown 的最后一个使用者，而调用指令本身有副作用语义、不会被当死代码
+// 删掉。
+uint64_t eraseDeadUnknownValueCalls(llvm::Module &module);
+
 void printNativeRegisterFinalCleanupSummary(
     const NativeRegisterFinalCleanupSummary &summary, llvm::raw_ostream &os);
 
