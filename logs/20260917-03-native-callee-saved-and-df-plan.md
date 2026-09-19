@@ -302,4 +302,129 @@ clobber 占位现在如实报告；同一调用点其它寄存器本来就有同
   `__printf_chk` 2 + strcmp 2 + gettimeofday 1 + 其它。
 - 另有 6 条 pre-existing raw 入口 load 不在射程。
 
+## unknown 归因与成因盘点（2026-09-19 续）
+
+本轮用户要求（原话）：
+
+> 为什么是创建 unknown 值？而不是保留原始的寄存器操作呢？现在的 unknown 调用的方式感觉
+> 有点太偏离语义了
+
+> 对 先把参数用起来吧，有个参数的语义还是稍微清楚一些
+
+> 对 归因这步做一下吧，然后再盘点一下当前的问题到底是什么，如果要修复的话，最好怎么做
+
+### 上一轮结论更正：4 条 R9 不是"虚报"
+
+上一轮根据事实表面（`!271` 有 `read_entry=true/read_entry_mask=全 1` 但 `may_entry_mask=0`）判断
+memcached `FUN_294b0` 的 4 条 R9 unknown（`bb_29500`/`bb_29c30` 各 2）是 `rangeMayComeFromEntry`
+口径不一致造成的虚报，**这是错的**：漏看了 `FUN_294b0` entry 块里的 `call void @FUN_17e10()`
+（pre-SSA 275160，entry 块里唯一的非 helper 调用）。加 trace 跑完整 memcached 后的真实链路：
+
+```text
+[read-null]      blk=entry      reg=R9 off=0 w=32 phase=build reason=unknown-marked
+[exit-resolved]  blk=entry      reg=R9 off=0 w=32 value=null cached=0
+[entry-resolved] blk=bb_29c30   reg=R9 off=0 w=32 value=null
+[read-null]      blk=bb_29c30   reg=R9 off=0 w=32 reason=entry-null
+[phi-unknown]    fn=FUN_294b0   reg=R9 off=0 w=32 pred=bb_29c30 exit_null=1
+```
+
+- entry 块自己被 `markBlockRangeUnknown`：FUN_17e10 的 R9 summary 是 Mixed
+  （`!250 = name=R9, may_entry=true/mask 全 1, may_non_entry=true/mask 全 1`；FUN_17e10 的签名只有
+  `%RDI.arg`，说明它内部把 R9 当 caller-saved 临时寄存器写）→ `callEffect` 走 Unknown →
+  标记 entry 的 R9[0,32)/[32,64)。
+- entry 被标记后 `readRangeBefore(entry, ...)` 在 `UnknownCurrentDef` 闸门直接得 null，于是
+  bb_29c30/bb_29500/bb_29542 的 exit 解析全为 null，`completeRangePhi` 兜底物化 unknown。
+  trace 里根本没有 `[entry] fn=FUN_294b0 reg=R9` 这一行 —— 怀疑的 mask 口径问题在这 6 条上
+  没被走到。
+- 所以 6 条 R9 全是"调用边界的真实丢失"；`%R9.arg` 是死参数（唯一需要入口 R9 的读是
+  `call @FUN_293a0(...)` 的第 5 个参数，它在 FUN_17e10 之后，入口值不能顶替）。
+- "把参数用起来"这条路线对本例不适用，已放弃。
+
+### 实现：unknown 成因归因
+
+目标：`notdec.unknown` 的 `!notdec.unknown.source` 不再只有一个笼统的 `range_unknown`，而是能说出
+"是哪个 callee 在调用边界把它弄丢的"，并能在批跑输出里按成因盘点。
+
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
+  - `:3518` `struct RangeLossCause {Reason, Callee}` + `:3522` `RangeLossCauses`
+    （与 `UnknownCurrentDef` 同 key；只做诊断归因，不参与任何值决策）。
+  - `:5814` `markBlockRangeUnknown(block, range, cause)` 记录成因；`writeSegment`/
+    `writeCoveredValue`/call-value 写入处分三处 `RangeLossCauses.erase`。
+  - `:6456` `unknownCallEffectCause()`：`callee_summary_missing`（内部 callee 无 facts）vs
+    `call_effect_mixed`（Mixed；带 callee 名，间接调用记 `<indirect>`）。
+  - `:5990` `readRangeEntry` 结果为 null 时沿 pred 继承成因；`:6418` 闸门拒绝记
+    `entry_range_rejected`，入口值取不到记 `entry_value_unavailable`。
+  - `:5613` `attributedRangeUnknown()`：phi 兜底/缺段兜底统一走它，把 reason+callee 写进 metadata；
+    `unknownRangeBefore` 增加 callee 参数。
+- `lib/passes/summary/NativeRegisterFinalCleanup.cpp:430` `countRemainingUnknownValues()`：
+  按 `reason:callee:register` 统计最终 IR 里剩下的 `notdec.unknown.*`；声明在
+  `include/notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h:52`。
+- `tools/notdec-native-llvm.cpp:559` `reportRemainingUnknownValues()`：在两个 pipeline 的最后一次
+  `eraseDeadUnknownValueCalls` 之后打印一行直方图，**只在 `--register-ssa-summary` 下打印**
+  （默认 stderr 必须干净：`scripts/native-llvm-cli-signature-rewrite-smoke.sh` 用 `require_empty`）。
+- `tests/native_register_summary_ssa_test.cpp:10770`
+  `testMixedCallBoundaryAttributesUnknownToCallee`：造一个"一条路径写 RDI、另一条不动"的 Mixed
+  callee，caller 在调用后跨块读 RDI，断言 unknown 带 `reason=call_effect_mixed` +
+  `callee=mixed_rdi_callee`，且计数按该 key 归类。
+  坑：测试里两个分支不能都是空块，否则 SimplifyCFG 折掉 phi，InstCombine 重建 unknown 时会丢
+  metadata（归因只能算 best-effort）。
+
+### 验证
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| memcached unknown | 9 | **9**（不变，原因见盘点） |
+| wrk unknown | 37 | **37**（不变） |
+| 单测 / ctest | 绿 / 12-12 | 绿 / **12/12**（含 fortune x86_64+i386） |
+| memcached/wrk `llvm-as` + `opt -passes=verify` | OK | OK |
+
+新增归因输出（`--register-ssa-summary`，两次运行一致；unknown 计数与分组集合一致，IR 字节有
+已知 ±百字节级指针序抖动）：
+
+```text
+memcached total=9  [call_effect_mixed:FUN_15330:R9=2, call_effect_mixed:FUN_17e10:R9=4,
+                    entry_range_rejected:RAX=1,
+                    range_return_helper_clobbered_register:notdec_pcode_CALLOTHER_i64:RDX=2]
+wrk       total=37 [entry_range_rejected:ST0=7, entry_range_rejected:ST1=8,
+                    range_return_helper_clobbered_register:<indirect>:RDX=14,
+                    range_return_helper_clobbered_register:__printf_chk:ST0=2,
+                    range_return_helper_clobbered_register:strcmp:ST0=2,
+                    range_return_helper_clobbered_register:gettimeofday:ST0=1,
+                    range_return_helper_clobbered_register:luaL_checknumber:ST0=1,
+                    range_return_helper_clobbered_register:luaL_checkudata:RDX=1,
+                    range_return_helper_clobbered_register:memchr:RDX=1]
+```
+
+### 盘点：剩下的 unknown 到底是什么（memcached 9 + wrk 37 = 46）
+
+| 组 | 数量 | 性质 | 建议 |
+|---|---|---|---|
+| `call_effect_mixed:<callee>:R9` | 6（mc） | 调用边界真实丢失：callee 的出口 provenance 是 Mixed（可能保留、可能改写），调用方拿不到 | **不改**；要消除只能让 Mixed callee 把该寄存器当返回值带回来（P3） |
+| `range_return_helper_clobbered_register` | 24（mc 2 + wrk 22） | 被请求的寄存器在该调用点**不是返回值而是 clobber**：`__printf_chk`/`strcmp`/`gettimeofday` 的 ST0、间接调用的 RDX、CALLOTHER 的 RDX。同一调用点的其它 clobber 寄存器已经有 `notdec.register.summary_clobber` 占位（wrk `gettimeofday` 处 ST0=unknown 与 ST1=clobber 并排，就是证据） | **P1：接到 call-tied clobber 占位** |
+| `entry_range_rejected:ST0/ST1` | 15（wrk） | x87 窗口临时值：入口 ST0/ST1 本来就不是"调用方传进来的值"（见 `logs/20260917-01-native-x87-window-shift-load-plan.md`） | **暂不动**；要动属于表示层或窗口模型扩展 |
+| `entry_range_rejected:RAX` | 1（mc `FUN_1a380`） | `%RAXentry_range_rejected = call @notdec.unknown.i64(); ret`：返回槽解析失败落到入口 range 路径 | 单独小调查（根因在返回绑定，不在入口闸门） |
+
+### 如果要修，最好怎么做
+
+- **P1（建议下一轮，收益最大、语义最干净）**：`range_return_helper_clobbered_register` 的兜底改成
+  与调用点绑定的 clobber 占位。改点在 `NativeRegisterSummarySSA.cpp:8622` 附近（`RangeReturnHelpers`
+  解析失败且"不在返回槽内"的分支，当前直接 `unknownValueAt`），复用同一调用点已有的
+  clobber 占位工厂（`notdec.register.summary_clobber.<ty>` + `!notdec.register.summary_ssa.call_value`）。
+  预计 memcached 9→7、wrk 37→15，之后 unknown 计数基本只反映真正的建模缺口。风险：warning 口径
+  变化（`call_arg_uses_unknown_value` → `call_arg_uses_clobber_value`、`remaining_summary_clobber_value`
+  增加）要同步期望值；间接调用点的 clobber 占位唯一性要确认。
+- **P2**：ST0/ST1 入口窗口那 15 条另立策略（`entry_range_rejected` 这个 reason 已经把"窗口拒绝"
+  和"调用边界丢失"分开，先留作基线）。
+- **P3（不建议现在做）**：让 Mixed callee 返回被改写的寄存器（调用点对 Mixed 位也产生 exit
+  demand、callee 加返回槽）。能消掉 memcached 6 条，但那是把机器级临时值如实带回，签名/调用点
+  改动面大、语义收益低；真要做，先用 P1 把"占位与调用点绑定"铺好。
+- **P4**：`FUN_1a380` 的 1 条 RAX 单独看。
+
+### 本轮不做什么
+
+- 不改 `rangeMayComeFromEntry` 的 mask 选择：怀疑的口径问题在本例没被走到，改了消不掉这 6 条，
+  反而会把"入口值被拒绝"与"调用边界丢失"混在一起；现在 `entry_range_rejected` 已能把两者分开。
+- 不动 x87 窗口建模和间接调用返回模型（P1 先把表示层统一，再谈精度）。
+
+
 
