@@ -11,6 +11,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackAddress.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
+#include "notdec-bin2llvm/passes/summary/NativeVarArgRewrite.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -1676,6 +1677,11 @@ SignatureShape shapeForInternalFunction(
 
   const FunctionSummaryFacts &facts = factsIt->second;
   std::set<std::string> addedParamUnits;
+
+  // 变参识别结果（NativeVarArgRewrite 的 !notdec.vararg）：函数体里的手写保存区
+  // 已经换成 llvm.va_start，变参寄存器不再是入口参数；签名要带 ...，调用点才能
+  // 只传固定参数 + 真正的变参。固定参数仍然由 facts 的 ReadEntry 决定。
+  shape.VarArg = isNativeVarArgFunction(function);
 
   // Internal native functions can be compiled with interprocedural register
   // allocation, so their real interface is not limited to the external ABI.
@@ -6634,6 +6640,42 @@ private:
                                          Function.getContext());
   }
 
+  // 内部变参 callee（NativeVarArgRewrite 识别出来的）没有 external callsite
+  // evidence：按 ABI 把固定参数之后的输入寄存器槽也当变参传下去。真正的变参值
+  // 原样传递，依赖 unknown / 可证为 0 的未证明值在 rewrite 里换成
+  // vararg_unknown 占位，最后由 lowerVarArgUnknownHelpers 降级成 poison——变参
+  // 语义不变，但不再为源码没用到的寄存器凑固定参数值。
+  void appendAbiVarArgSlots(std::vector<NativeSignatureSlot> &slots) const {
+    auto covered = [&](const RegisterUnit &unit) {
+      return std::any_of(
+          slots.begin(), slots.end(), [&](const NativeSignatureSlot &slot) {
+            return slot.Unit != nullptr && slot.Unit->Global == unit.Global;
+          });
+    };
+    for (const AbiFacts::RegisterSlot &regSlot : Abi.IntegerInputsInOrder) {
+      const RegisterUnit *unit =
+          notdec::bin2llvm::unitByName(Units, regSlot.UnitName);
+      if (unit == nullptr || covered(*unit)) {
+        continue;
+      }
+      slots.push_back(integerSignatureSlot(*unit));
+    }
+    for (const AbiFacts::RegisterSlot &regSlot : Abi.FloatInputsInOrder) {
+      const RegisterUnit *unit =
+          notdec::bin2llvm::unitByName(Units, regSlot.UnitName);
+      if (unit == nullptr || covered(*unit)) {
+        continue;
+      }
+      unsigned bits = unit->Global->getValueType()->getScalarSizeInBits();
+      std::optional<NativeSignatureSlot> slot = floatSlotForDemand(
+          Function.getContext(), regSlot, Units,
+          bits == 0 ? llvm::APInt() : llvm::APInt::getAllOnes(bits));
+      if (slot.has_value()) {
+        slots.push_back(*slot);
+      }
+    }
+  }
+
   std::vector<NativeSignatureSlot> callParamSlots(llvm::CallBase &call,
                                                   const SignatureShape &shape) {
     std::vector<NativeSignatureSlot> slots = shape.Params;
@@ -6644,6 +6686,11 @@ private:
         externalCallsiteShapeForCall(SignatureState, call);
     if (callsiteShape == nullptr ||
         callsiteShape->Inputs.size() <= shape.Params.size()) {
+      llvm::Function *callee = call.getCalledFunction();
+      if (callee != nullptr && !callee->isDeclaration() &&
+          isNativeVarArgFunction(*callee)) {
+        appendAbiVarArgSlots(slots);
+      }
       return slots;
     }
     for (unsigned index = shape.Params.size();
@@ -8811,6 +8858,20 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   AbiFacts abi = collectAbiFacts(module, units);
   (void)canonicalizeX87WindowAccesses(module, units);
 
+  // 变参恢复：识别编译器生成的寄存器保存区 + 手写 va_list 初始化，换成
+  // llvm.va_start，并挂 !notdec.vararg 让签名推断带 ...（这样调用点只传固定
+  // 参数 + 真正的变参，不再为 R8/R9 凑垃圾值）。语义与依据见
+  // logs/20260919-01-native-vararg-recovery-plan.md。
+  NativeVarArgRewriteOptions varArgOptions;
+  varArgOptions.RewriteVarArgs =
+      options.EnableVarArgRecovery && options.EnableRewrite;
+  varArgOptions.AttachMetadata = options.EnableVarArgRecovery;
+  NativeVarArgRewriteSummary varArgSummary =
+      runNativeVarArgRewrite(module, varArgOptions);
+  if (options.PrintSummary) {
+    printNativeVarArgRewriteSummary(varArgSummary, llvm::errs());
+  }
+
   NativeRegisterSummaryOptions baseSummaryOptions;
   baseSummaryOptions.AttachMetadata = false;
   baseSummaryOptions.IgnoredRegisters = effectiveOptions.IgnoredRegisters;
@@ -8858,6 +8919,9 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   }
 
   NativeRegisterSummarySSASummary summary;
+  summary.VarArgFunctionsDetected = varArgSummary.FunctionsDetected;
+  summary.VarArgFunctionsRewritten = varArgSummary.FunctionsRewritten;
+  summary.VarArgFunctions = varArgSummary.RewrittenFunctions;
   summary.StackCanaryChecksRemoved = canarySummary.CanaryChecksRemoved;
   summary.StackCanaryFailBlocksRemoved = canarySummary.FailBlocksRemoved;
   summary.StackCanaryFailFunctionsRemoved = canarySummary.FailFunctionsRemoved;
@@ -8989,6 +9053,8 @@ void printNativeRegisterSummarySSASummary(
      << " stack_frame_alloca_stores_removed="
      << summary.StackFrameAllocaStoresRemoved
      << " stack_frame_allocas_removed=" << summary.StackFrameAllocasRemoved
+     << " vararg_functions_detected=" << summary.VarArgFunctionsDetected
+     << " vararg_functions_rewritten=" << summary.VarArgFunctionsRewritten
      << " stack_canary_checks_removed=" << summary.StackCanaryChecksRemoved
      << " stack_canary_fail_blocks_removed="
      << summary.StackCanaryFailBlocksRemoved

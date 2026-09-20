@@ -9,6 +9,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
+#include "notdec-bin2llvm/passes/summary/NativeVarArgRewrite.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallString.h"
@@ -10867,6 +10868,153 @@ bool testMixedCallBoundaryAttributesUnknownToCallee() {
                   "module failed verifier after unknown attribution test");
 }
 
+
+// 变参识别：lift 里编译器生成的寄存器保存区 + 手写 va_list 初始化，要能被识别成
+// llvm.va_start + 变参签名（固定参数 = 仍然被直接读的参数寄存器），而不是把变参
+// 寄存器当固定参数。模式依据见 logs/20260919-01-native-vararg-recovery-plan.md。
+bool testVarArgPrologueBecomesVaStart() {
+  llvm::LLVMContext context;
+  llvm::Module module("vararg-rewrite", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  auto *i64Type = llvm::Type::getInt64Ty(context);
+  auto *i128Type = llvm::Type::getInt128Ty(context);
+  auto *i512Type = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+  llvm::GlobalVariable *r9 = createRegisterGlobal(module, "R9");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", i512Type, 0, 64);
+  auto *sink = new llvm::GlobalVariable(
+      module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "sink");
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *useVaList = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                              {llvm::PointerType::get(context, 0)}, false),
+      llvm::GlobalValue::ExternalLinkage, "use_va_list", module);
+
+  llvm::Function *function = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {i64Type}, false),
+      llvm::GlobalValue::InternalLinkage, "native_vararg_wrapper", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *xmmSave =
+      llvm::BasicBlock::Create(context, "xmm_save", function);
+  llvm::BasicBlock *done = llvm::BasicBlock::Create(context, "done", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::AllocaInst *frame =
+      builder.CreateAlloca(llvm::ArrayType::get(llvm::Type::getInt8Ty(context),
+                                               400),
+                           nullptr, "frame");
+  auto framePointer = [&](uint64_t offset) {
+    return builder.CreateGEP(llvm::Type::getInt8Ty(context), frame,
+                             llvm::ConstantInt::get(i64Type, offset));
+  };
+  // 固定参数 RDI 直接读（保持它是固定参数）。
+  llvm::Value *fixed = loadRegister(builder, rdi, "RDI", "fixed");
+  builder.CreateStore(fixed, sink);
+  // 保存区：R8/R9 落在 base=208 的 +32/+40（gp_offset=8 → 1 个固定 GP 参数）。
+  llvm::Function *partialReadI64 =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+      module, llvm::PointerType::get(context, 0), i64Type, 64, 64);
+  llvm::Value *savedR8 = loadRegister(builder, r8, "R8", "saved_r8");
+  builder.CreateStore(savedR8, framePointer(240));
+  llvm::Value *savedR9 = loadRegister(builder, r9, "R9", "saved_r9");
+  builder.CreateStore(savedR9, framePointer(248));
+  // 手写 va_list（+0 gp_offset、+4 fp_offset、+8 overflow、+16 reg_save_area）。
+  llvm::GlobalVariable *overflow = new llvm::GlobalVariable(
+      module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "overflow_area");
+  llvm::Value *overflowValue = loadRegister(builder, overflow, "overflow");
+  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 8),
+                      framePointer(0));
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 48),
+      framePointer(4));
+  builder.CreateStore(overflowValue, framePointer(8));
+  builder.CreateStore(
+      builder.CreatePtrToInt(framePointer(208), i64Type), framePointer(16));
+  // AL 测试（test al, al）→ 条件保存 XMM。
+  llvm::Value *al = builder.CreateCall(
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0),
+          llvm::Type::getInt8Ty(context), 64, 8),
+      {rax, llvm::ConstantInt::get(i64Type, 0)}, "al");
+  llvm::Value *alZero = builder.CreateICmpEQ(
+      al, llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0));
+  builder.CreateCondBr(alZero, done, xmmSave);
+  builder.SetInsertPoint(xmmSave);
+  llvm::Value *savedZmm = builder.CreateCall(
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0), i128Type, 512, 128),
+      {zmm0, llvm::ConstantInt::get(i64Type, 0)}, "saved_zmm0");
+  builder.CreateStore(savedZmm, framePointer(256));
+  builder.CreateBr(done);
+  builder.SetInsertPoint(done);
+  builder.CreateCall(useVaList, {framePointer(0)});
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeVarArgRewriteOptions options;
+  notdec::bin2llvm::NativeVarArgRewriteSummary summary =
+      notdec::bin2llvm::runNativeVarArgRewrite(module, options);
+
+  std::optional<notdec::bin2llvm::NativeVarArgInfo> info =
+      notdec::bin2llvm::nativeVarArgInfo(*function);
+  unsigned vaStarts = 0;
+  for (llvm::Instruction &inst : llvm::instructions(*function)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName().starts_with("llvm.va_start")) {
+      ++vaStarts;
+    }
+  }
+  bool rawVarArgReads = false;
+  for (llvm::Instruction &inst : llvm::instructions(*function)) {
+    auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+    if (load != nullptr &&
+        (load->getPointerOperand()->stripPointerCasts() == r8 ||
+         load->getPointerOperand()->stripPointerCasts() == r9 ||
+         load->getPointerOperand()->stripPointerCasts() == zmm0)) {
+      rawVarArgReads = true;
+    }
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    std::optional<notdec::bin2llvm::NativeRegisterPartialReadInfo> read =
+        call == nullptr ? std::nullopt
+                        : notdec::bin2llvm::parseNativeRegisterPartialRead(*call);
+    if (read.has_value() && read->Global != nullptr &&
+        (read->Global == r8 || read->Global == r9 || read->Global == zmm0)) {
+      rawVarArgReads = true;
+    }
+  }
+
+  return expect(summary.FunctionsDetected == 1,
+                "vararg prologue was not detected") &&
+         expect(summary.FunctionsRewritten == 1,
+                "vararg prologue was not rewritten") &&
+         expect(notdec::bin2llvm::isNativeVarArgFunction(*function),
+                "vararg metadata missing") &&
+         expect(info.has_value() && info->FixedGp == 1,
+                "vararg fixed_gp was not recovered") &&
+         expect(vaStarts == 1, "llvm.va_start was not inserted") &&
+         expect(!rawVarArgReads,
+                "vararg register reads survived the rewrite");
+  // 注意：此刻函数类型还没改成变参（签名重写在 summary SSA 里做），
+  // llvm.va_start 在非变参函数里会被 verifier 拒绝，所以这里先不 verify。
+
+  // 走完整 summary SSA：签名要带 ...（固定参数只剩 RDI）。
+  llvm::Function *rewritten = module.getFunction("native_vararg_wrapper");
+  if (!expect(rewritten != nullptr, "vararg function missing after SSA")) {
+    return false;
+  }
+  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *finalFunction = module.getFunction("native_vararg_wrapper");
+  return expect(finalFunction != nullptr, "vararg function lost after SSA") &&
+         expect(finalFunction->isVarArg(),
+                "vararg function signature is not variadic") &&
+         expect(finalFunction->arg_size() == 1,
+                "vararg function kept garbage fixed parameters") &&
+         verifyOk(module, "module failed verifier after vararg SSA");
+}
 } // namespace
 
 int main() {
@@ -10884,6 +11032,7 @@ int main() {
   ok &= testTwoFramePointerSettersAreNotFolded();
   ok &= testEraseDeadUnknownValueCalls();
   ok &= testMixedCallBoundaryAttributesUnknownToCallee();
+  ok &= testVarArgPrologueBecomesVaStart();
   ok &= testCalleeSavedRegisterSurvivesInternalCall();
   ok &= testDirectionFlagIsZeroAtBoundaries();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();

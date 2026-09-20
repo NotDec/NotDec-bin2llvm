@@ -74,6 +74,7 @@ struct CliOptions {
       notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
   bool DisableRegisterSSAPass = false;
   bool DisableSummaryRegisterResidueRemoval = false;
+  bool DisableVarArgRecovery = false;
   bool PrintRegisterSSASummary = false;
   bool DisableInstCombinePass = false;
   bool SkipRuntimeFunctions = false;
@@ -109,6 +110,7 @@ void printUsage(const char *argv0) {
                "[--no-register-ssa-pass] "
                "[--summary-register-ssa-pass] "
                "[--no-summary-register-residue-removal] "
+               "[--no-vararg-recovery] "
                "[--register-ssa-summary] "
                "[--skip-runtime] "
                "[--native-decode-mode gtirb|internal] [--gtirb <path>] "
@@ -177,6 +179,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
     if (flag == "--no-summary-register-residue-removal") {
       options.DisableSummaryRegisterResidueRemoval = true;
+      continue;
+    }
+    if (flag == "--no-vararg-recovery") {
+      options.DisableVarArgRecovery = true;
       continue;
     }
     if (flag == "--no-instcombine-pass") {
@@ -1009,6 +1015,7 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
   passOptions.EnableResidueRemoval =
       !options.DisableSummaryRegisterResidueRemoval;
   passOptions.EnablePostRewriteInstCombine = !options.DisableInstCombinePass;
+  passOptions.EnableVarArgRecovery = !options.DisableVarArgRecovery;
   passOptions.PrintSummary = options.PrintRegisterSSASummary;
   passOptions.ExternalPrototypeJsonPath = options.ExternalPrototypeJsonPath;
   notdec::bin2llvm::NativeRegisterSummarySSASummary summary =

@@ -20,6 +20,8 @@ struct NativeRegisterSummarySSAOptions {
   // --no-instcombine-pass can still disable all InstCombine work.
   bool EnablePostRewriteInstCombine = true;
   bool AttachMetadata = true;
+  // 识别编译器生成的变参序言并恢复成 llvm.va_start + 变参签名（默认开）。
+  bool EnableVarArgRecovery = true;
   bool PrintSummary = false;
   std::string ExternalPrototypeJsonPath;
   std::set<std::string> IgnoredRegisters;
@@ -97,6 +99,10 @@ struct NativeRegisterSummarySSASummary {
   uint64_t StackFrameAllocaLoadsRemoved = 0;
   uint64_t StackFrameAllocaStoresRemoved = 0;
   uint64_t StackFrameAllocasRemoved = 0;
+  // NativeVarArgRewrite 的结果：识别到/改写成功的变参函数（签名带 ...）。
+  uint64_t VarArgFunctionsDetected = 0;
+  uint64_t VarArgFunctionsRewritten = 0;
+  std::vector<std::string> VarArgFunctions;
   uint64_t StackCanaryChecksRemoved = 0;
   uint64_t StackCanaryFailBlocksRemoved = 0;
   uint64_t StackCanaryFailFunctionsRemoved = 0;
