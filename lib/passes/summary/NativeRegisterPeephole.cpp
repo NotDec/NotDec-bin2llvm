@@ -303,6 +303,60 @@ std::optional<uint64_t> solveMagicDivisor(const llvm::APInt &magic,
   return divisor.getZExtValue();
 }
 
+// 无符号 add 修正形态的等价性：`h = floor(x*M/2^N)`、`e = M*d - 2^N`，
+// 代入 `x = q*d + r` 得到
+//   q_out = q + floor((r + floor((q*e + r*M)/2^N)) / 2^extra)，extra = s + 1，
+// 所以只要 `E(q,r) = r + floor((q*e + r*M)/2^N) < 2^extra` 对全部可行 (q,r)
+// 成立就够了。E 对 q、r 都单调，而可行域是 `q*d + r <= 2^inputBits - 1` 的阶梯，
+// 最大值只可能在两个角点 (q_max, r_max) 和 (q_max-1, d-1) 取到 —— 两次 APInt
+// 检查就是完整证明，不需要抽样。
+std::optional<uint64_t>
+solveUnsignedAddMagicDivisor(const llvm::APInt &magic, unsigned highShift,
+                             unsigned extraShift, unsigned inputBits,
+                             unsigned valueWidth) {
+  if (magic.isZero() || valueWidth == 0 || valueWidth > 64 ||
+      magic.getActiveBits() > valueWidth || inputBits == 0 ||
+      inputBits > valueWidth || highShift < valueWidth ||
+      highShift > 2 * valueWidth || extraShift == 0 ||
+      extraShift > valueWidth) {
+    return std::nullopt;
+  }
+  unsigned width = 2 * valueWidth + inputBits + extraShift + 8;
+  llvm::APInt powerOfTwo = llvm::APInt::getOneBitSet(width, highShift);
+  llvm::APInt wideMagic = magic.zext(width);
+  llvm::APInt divisor = powerOfTwo.udiv(wideMagic);
+  if (!powerOfTwo.urem(wideMagic).isZero()) {
+    divisor += 1;
+  }
+  if (divisor.ult(3) || divisor.getActiveBits() > valueWidth) {
+    return std::nullopt;
+  }
+  llvm::APInt product = wideMagic * divisor;
+  llvm::APInt previous = (wideMagic - 1) * divisor;
+  if (product.ult(powerOfTwo) || !previous.ult(powerOfTwo)) {
+    return std::nullopt; // M != ceil(2^N / d)。
+  }
+  llvm::APInt error = product - powerOfTwo;
+  llvm::APInt limit = llvm::APInt::getOneBitSet(width, extraShift);
+  llvm::APInt maxX = llvm::APInt::getLowBitsSet(width, inputBits);
+  llvm::APInt qMax = (maxX - 1).udiv(divisor);
+  llvm::APInt rMax = (maxX - 1) - qMax * divisor;
+  auto worstError = [&](const llvm::APInt &q, const llvm::APInt &r) {
+    return r + (q * error + r * wideMagic).lshr(highShift);
+  };
+  llvm::APInt worst = worstError(qMax, rMax);
+  if (!qMax.isZero()) {
+    llvm::APInt other = worstError(qMax - 1, divisor - 1);
+    if (worst.ult(other)) {
+      worst = other;
+    }
+  }
+  if (!worst.ult(limit)) {
+    return std::nullopt;
+  }
+  return divisor.getZExtValue();
+}
+
 struct MagicMulChain {
   llvm::Value *Scaled = nullptr; // 被除数（无符号是 zext 的源，有符号是 sext 的源）。
   llvm::Instruction *Root = nullptr; // 要替换掉的那个 iW 值。
@@ -311,7 +365,84 @@ struct MagicMulChain {
   unsigned InputBits = 0; // 被除数的值上界（< 2^InputBits）。
   unsigned Width = 0; // W：被除数位宽，也是 udiv/sdiv 的位宽。
   bool Signed = false;
+  // 无符号 add 修正形态：`h = mulhi_u(x, M)` 之后是
+  // `((x - h) >> 1 + h) >> s`，等价于 `floor((x + h) / 2^(s+1))`。
+  // Shift 仍是取 h 的移位 N（一般为 W），ExtraShift = s + 1。
+  bool AddCorrection = false;
+  unsigned ExtraShift = 0;
 };
+
+// `%m = mul i(2W) (zext|sext iW %x), <常量>`：两种除法共用的乘积解析。
+struct MagicProduct {
+  llvm::Value *Scaled = nullptr;
+  llvm::ConstantInt *Magic = nullptr;
+  bool Signed = false;
+};
+
+std::optional<MagicProduct> parseMagicProduct(llvm::Instruction &mul,
+                                              unsigned width) {
+  auto *mulType = llvm::dyn_cast<llvm::IntegerType>(mul.getType());
+  if (mul.getOpcode() != llvm::Instruction::Mul || mulType == nullptr ||
+      mulType->getBitWidth() != 2 * width) {
+    return std::nullopt;
+  }
+  MagicProduct product;
+  for (llvm::Value *operand : mul.operands()) {
+    if (auto *constant = llvm::dyn_cast<llvm::ConstantInt>(operand)) {
+      if (product.Magic != nullptr) {
+        return std::nullopt;
+      }
+      product.Magic = constant;
+      continue;
+    }
+    if (product.Scaled != nullptr) {
+      return std::nullopt;
+    }
+    product.Scaled = operand;
+  }
+  if (product.Magic == nullptr || product.Scaled == nullptr) {
+    return std::nullopt;
+  }
+  if (auto *extend = llvm::dyn_cast<llvm::ZExtInst>(product.Scaled)) {
+    product.Signed = false;
+    product.Scaled = extend->getOperand(0);
+  } else if (auto *extend = llvm::dyn_cast<llvm::SExtInst>(product.Scaled)) {
+    product.Signed = true;
+    product.Scaled = extend->getOperand(0);
+  } else {
+    return std::nullopt;
+  }
+  if (!product.Scaled->getType()->isIntegerTy(width)) {
+    return std::nullopt;
+  }
+  return product;
+}
+
+// `%h = trunc i(2W) (lshr i(2W) %m, N) to iW`：取乘积高半段。
+std::optional<std::pair<llvm::Instruction *, unsigned>>
+parseHighHalf(llvm::Instruction &trunc, unsigned width) {
+  if (!llvm::isa<llvm::TruncInst>(trunc) ||
+      !trunc.getType()->isIntegerTy(width)) {
+    return std::nullopt;
+  }
+  auto *high = llvm::dyn_cast<llvm::Instruction>(trunc.getOperand(0));
+  if (high == nullptr || high->getOpcode() != llvm::Instruction::LShr) {
+    return std::nullopt;
+  }
+  auto *amount = llvm::dyn_cast<llvm::ConstantInt>(high->getOperand(1));
+  if (amount == nullptr) {
+    return std::nullopt;
+  }
+  unsigned highShift = (unsigned)amount->getValue().getLimitedValue(2 * width);
+  if (highShift < width || highShift > 2 * width) {
+    return std::nullopt;
+  }
+  auto *mul = llvm::dyn_cast<llvm::Instruction>(high->getOperand(0));
+  if (mul == nullptr || mul->getOpcode() != llvm::Instruction::Mul) {
+    return std::nullopt;
+  }
+  return std::make_pair(mul, highShift);
+}
 
 // `lshr iW %y, k` 的结果恒小于 2^(W-k)，反解可以用更窄的范围。
 unsigned dividendBitBound(llvm::Value *dividend, unsigned width) {
@@ -480,62 +611,181 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
     }
     shiftedBase = ashr->getOperand(0);
   }
-  auto *trunc = llvm::dyn_cast<llvm::TruncInst>(shiftedBase);
-  if (trunc == nullptr || trunc->getType() != rootType) {
-    return std::nullopt;
-  }
-  auto *high = llvm::dyn_cast<llvm::Instruction>(trunc->getOperand(0));
-  if (high == nullptr || high->getOpcode() != llvm::Instruction::LShr) {
-    return std::nullopt;
-  }
-  auto *amount = llvm::dyn_cast<llvm::ConstantInt>(high->getOperand(1));
-  if (amount == nullptr ||
-      amount->getValue() != llvm::APInt(2 * width, width)) {
-    return std::nullopt; // 只认 `>> W` 取高半段。
-  }
-  auto *mul = llvm::dyn_cast<llvm::Instruction>(high->getOperand(0));
-  if (mul == nullptr || mul->getOpcode() != llvm::Instruction::Mul) {
-    return std::nullopt;
-  }
-  auto *mulType = llvm::dyn_cast<llvm::IntegerType>(mul->getType());
-  if (mulType == nullptr || mulType->getBitWidth() != 2 * width) {
-    return std::nullopt;
-  }
-
-  llvm::ConstantInt *magic = nullptr;
+  llvm::APInt magicValue;
   llvm::Value *scaled = nullptr;
-  for (llvm::Value *operand : mul->operands()) {
-    if (auto *constant = llvm::dyn_cast<llvm::ConstantInt>(operand)) {
-      magic = constant;
-      continue;
-    }
-    if (scaled != nullptr) {
+  if (auto *trunc = llvm::dyn_cast<llvm::TruncInst>(shiftedBase)) {
+    // 简单形态：%shifted 直接来自 `trunc(lshr(mul, W))`。
+    if (trunc->getType() != rootType) {
       return std::nullopt;
     }
-    scaled = operand;
-  }
-  if (magic == nullptr || scaled == nullptr || magic->getValue().isNegative()) {
-    return std::nullopt; // 负魔数是 `x + mulhi` 那种形态，不认。
-  }
-  auto *extend = llvm::dyn_cast<llvm::SExtInst>(scaled);
-  if (extend == nullptr ||
-      !extend->getOperand(0)->getType()->isIntegerTy(width)) {
-    return std::nullopt;
-  }
-  // 符号位只能来自高半段（同一个 trunc）或被除数本身，两者都等于 [x < 0]。
-  llvm::Value *signSource = sign->getOperand(0);
-  if (signSource != trunc && signSource != extend->getOperand(0)) {
-    return std::nullopt;
+    std::optional<std::pair<llvm::Instruction *, unsigned>> highHalf =
+        parseHighHalf(*trunc, width);
+    if (!highHalf || highHalf->second != width) {
+      return std::nullopt; // 只认 `>> W` 取高半段。
+    }
+    std::optional<MagicProduct> product =
+        parseMagicProduct(*highHalf->first, width);
+    if (!product || !product->Signed ||
+        product->Magic->getValue().isNegative()) {
+      return std::nullopt; // 负魔数走下面的 `+x` 形态。
+    }
+    scaled = product->Scaled;
+    magicValue = product->Magic->getValue();
+    // 符号位来自高半段（同一个 trunc）或被除数本身，两者都等于 [x < 0]。
+    llvm::Value *signSource = sign->getOperand(0);
+    if (signSource != trunc && signSource != scaled) {
+      return std::nullopt;
+    }
+  } else {
+    // `+x` 形态：`%t = add iW %x, %h`（注意是加不是减），符号位取自同一个 %t。
+    // 机器里乘的是负常量 M_neg；因为 `floor(x*M_neg/2^W) = floor(x*M_u/2^W) - x`
+    // （M_u = M_neg + 2^W），外面再 `+ x` 正好把它还原成 M_u 的简单形态，
+    // 所以取常量的低 W 位当 M_u，照原来的有符号条件验证。
+    auto *sum = llvm::dyn_cast<llvm::Instruction>(shiftedBase);
+    if (sum == nullptr || sum->getOpcode() != llvm::Instruction::Add ||
+        sign->getOperand(0) != sum) {
+      return std::nullopt;
+    }
+    llvm::Instruction *highValue = nullptr;
+    llvm::Value *dividend = nullptr;
+    for (llvm::Value *operand : sum->operands()) {
+      auto *inst = llvm::dyn_cast<llvm::Instruction>(operand);
+      if (inst != nullptr && llvm::isa<llvm::TruncInst>(inst)) {
+        if (highValue != nullptr) {
+          return std::nullopt;
+        }
+        highValue = inst;
+        continue;
+      }
+      if (dividend != nullptr) {
+        return std::nullopt;
+      }
+      dividend = operand;
+    }
+    if (highValue == nullptr || dividend == nullptr) {
+      return std::nullopt;
+    }
+    std::optional<std::pair<llvm::Instruction *, unsigned>> highHalf =
+        parseHighHalf(*highValue, width);
+    if (!highHalf || highHalf->second != width) {
+      return std::nullopt;
+    }
+    std::optional<MagicProduct> product =
+        parseMagicProduct(*highHalf->first, width);
+    if (!product || !product->Signed || product->Scaled != dividend ||
+        !product->Magic->getValue().isNegative()) {
+      return std::nullopt;
+    }
+    scaled = dividend;
+    magicValue = product->Magic->getValue().trunc(width);
   }
 
   MagicMulChain chain;
-  chain.Scaled = extend->getOperand(0);
+  chain.Scaled = scaled;
   chain.Root = &root;
-  chain.Magic = magic->getValue();
+  chain.Magic = magicValue;
   chain.Shift = width + extraShift;
   chain.Width = width;
   chain.InputBits = width - 1; // 有符号：|x| < 2^(W-1)。
   chain.Signed = true;
+  return chain;
+}
+
+// 无符号 add 修正形态：
+//   %h = trunc i(2W) (lshr i(2W) (mul i(2W) (zext iW %x), M), N)
+//   %d = sub iW %x, %h
+//   %s1 = lshr iW %d, 1
+//   %a = add iW %s1, %h
+//   %root = lshr iW %a, s
+std::optional<MagicMulChain>
+matchUnsignedAddMagicMulChain(llvm::Instruction &root) {
+  if (root.getOpcode() != llvm::Instruction::LShr) {
+    return std::nullopt;
+  }
+  auto *rootType = llvm::dyn_cast<llvm::IntegerType>(root.getType());
+  if (rootType == nullptr || rootType->getBitWidth() > 64) {
+    return std::nullopt;
+  }
+  unsigned width = rootType->getBitWidth();
+  auto *finalAmount = llvm::dyn_cast<llvm::ConstantInt>(root.getOperand(1));
+  if (finalAmount == nullptr) {
+    return std::nullopt;
+  }
+  unsigned finalShift = (unsigned)finalAmount->getValue().getLimitedValue(width);
+  if (finalShift == 0 || finalShift >= width) {
+    return std::nullopt;
+  }
+  auto *sum = llvm::dyn_cast<llvm::BinaryOperator>(root.getOperand(0));
+  if (sum == nullptr || sum->getOpcode() != llvm::Instruction::Add) {
+    return std::nullopt;
+  }
+  llvm::Instruction *highValue = nullptr;
+  llvm::Instruction *halved = nullptr;
+  for (llvm::Value *operand : sum->operands()) {
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(operand);
+    if (inst == nullptr) {
+      return std::nullopt;
+    }
+    if (llvm::isa<llvm::TruncInst>(inst)) {
+      highValue = inst;
+      continue;
+    }
+    if (inst->getOpcode() == llvm::Instruction::LShr) {
+      halved = inst;
+      continue;
+    }
+    return std::nullopt;
+  }
+  if (highValue == nullptr || halved == nullptr) {
+    return std::nullopt;
+  }
+  auto *halvedAmount = llvm::dyn_cast<llvm::ConstantInt>(halved->getOperand(1));
+  if (halvedAmount == nullptr || !halvedAmount->getValue().isOne()) {
+    return std::nullopt; // 只认 `>> 1` 那一步。
+  }
+  auto *difference =
+      llvm::dyn_cast<llvm::BinaryOperator>(halved->getOperand(0));
+  if (difference == nullptr ||
+      difference->getOpcode() != llvm::Instruction::Sub) {
+    return std::nullopt;
+  }
+  llvm::Value *dividend = nullptr;
+  bool subtractedHigh = false;
+  for (llvm::Value *operand : difference->operands()) {
+    if (operand == highValue) {
+      subtractedHigh = true;
+      continue;
+    }
+    if (dividend != nullptr) {
+      return std::nullopt;
+    }
+    dividend = operand;
+  }
+  if (!subtractedHigh || dividend == nullptr) {
+    return std::nullopt;
+  }
+
+  std::optional<std::pair<llvm::Instruction *, unsigned>> highHalf =
+      parseHighHalf(*highValue, width);
+  if (!highHalf) {
+    return std::nullopt;
+  }
+  std::optional<MagicProduct> product =
+      parseMagicProduct(*highHalf->first, width);
+  if (!product || product->Signed || product->Scaled != dividend) {
+    return std::nullopt;
+  }
+
+  MagicMulChain chain;
+  chain.Scaled = dividend;
+  chain.Root = &root;
+  chain.Magic = product->Magic->getValue();
+  chain.Shift = highHalf->second;
+  chain.Width = width;
+  chain.InputBits = dividendBitBound(dividend, width);
+  chain.Signed = false;
+  chain.AddCorrection = true;
+  chain.ExtraShift = finalShift + 1;
   return chain;
 }
 
@@ -567,13 +817,21 @@ bool rewriteConstantDivision(llvm::Instruction &root,
                              NativeRegisterPostRewritePeepholeSummary &summary) {
   std::optional<MagicMulChain> chain = matchSignedMagicMulChain(root);
   if (!chain) {
+    chain = matchUnsignedAddMagicMulChain(root);
+  }
+  if (!chain) {
     chain = matchMagicMulChain(root);
   }
   if (!chain) {
     return false;
   }
-  std::optional<uint64_t> divisor = solveMagicDivisor(
-      chain->Magic, chain->Shift, chain->InputBits, chain->Width);
+  std::optional<uint64_t> divisor =
+      chain->AddCorrection
+          ? solveUnsignedAddMagicDivisor(chain->Magic, chain->Shift,
+                                         chain->ExtraShift, chain->InputBits,
+                                         chain->Width)
+          : solveMagicDivisor(chain->Magic, chain->Shift, chain->InputBits,
+                              chain->Width);
   if (!divisor) {
     return false;
   }

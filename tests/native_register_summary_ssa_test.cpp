@@ -10668,45 +10668,6 @@ bool testConstantDivisionMagicFold() {
          allFolded &&
          verifyOk(module, "module failed verifier after magic division fold");
 }
-
-bool testConstantDivisionAddCorrectionFormIsLeftAlone() {
-  llvm::LLVMContext context;
-  llvm::Module module("summary-ssa-constant-division-add-form", context);
-  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
-  llvm::Type *i128 = llvm::Type::getInt128Ty(context);
-  // clang -O2 的 x/7：`mulhi(M,x); t=(x-mulhi)>>1; q=(t+mulhi)>>2`。这个形态
-  // 需要 add 修正，识别器不认，必须原样保留。
-  auto *type = llvm::FunctionType::get(i64, {i64}, false);
-  llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "div7_add_form", module);
-  llvm::BasicBlock *entry =
-      llvm::BasicBlock::Create(context, "entry", function);
-  llvm::IRBuilder<> builder(entry);
-  llvm::Value *x = function->getArg(0);
-  llvm::Value *wide = builder.CreateZExt(x, i128);
-  llvm::Value *product =
-      builder.CreateMul(wide, llvm::ConstantInt::get(i128, 0x2492492492492493ULL));
-  llvm::Value *high =
-      builder.CreateLShr(product, llvm::ConstantInt::get(i128, 64));
-  llvm::Value *truncated = builder.CreateTrunc(high, i64);
-  llvm::Value *difference = builder.CreateSub(x, truncated);
-  llvm::Value *halved = builder.CreateLShr(difference, llvm::ConstantInt::get(i64, 1));
-  llvm::Value *sum = builder.CreateAdd(halved, truncated);
-  builder.CreateRet(builder.CreateLShr(
-      sum, llvm::ConstantInt::get(i64, 2), "quotient"));
-
-  auto peephole =
-      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
-
-  return expect(peephole.ConstantDivisionsRecognized == 0,
-                "add-corrected magic division must not be folded") &&
-         expect(functionHasMul(*function),
-                "add-corrected magic divide lost its multiply") &&
-         expect(!functionHasUdivBy(*function, 7),
-                "add-corrected magic divide was folded to an ill-formed udiv") &&
-         verifyOk(module, "module failed verifier after add-form skip");
-}
-
 bool testConstantDivisionUnknownMagicIsLeftAlone() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-constant-division-unknown-magic", context);
@@ -10916,41 +10877,114 @@ bool testSignedConstantDivisionMagicFoldX86_64() {
          verifyOk(module, "module failed verifier after x64 signed fold");
 }
 
-// clang -O2 x86-64 的 x/100 用的是负魔数 `(high + x) >> s + sign` 形态：本轮
-// 不认，必须原样保留（否则会把一个没验证过的等价关系当成除法）。
-bool testSignedConstantDivisionAddFormIsLeftAlone() {
-  llvm::LLVMContext context;
-  llvm::Module module("summary-ssa-signed-division-add-form", context);
-  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
-                                       {llvm::Type::getInt64Ty(context)}, false);
+// 无符号 add 修正形态（clang 在魔数乘法"不够"时用）：
+//   h = mulhi_u(x, M); q = ((x - h) >> 1 + h) >> s
+// 表里的 (M, s) 来自 clang -O2 -S 的实际输出。
+llvm::Function *buildUnsignedAddFormFunction(llvm::Module &module,
+                                             llvm::StringRef name,
+                                             const MagicDivisionCase &testCase,
+                                             unsigned width) {
+  llvm::LLVMContext &context = module.getContext();
+  llvm::Type *valueType = llvm::IntegerType::get(context, width);
+  llvm::Type *wideType = llvm::IntegerType::get(context, 2 * width);
+  auto *type = llvm::FunctionType::get(valueType, {valueType}, false);
   llvm::Function *function = llvm::Function::Create(
-      type, llvm::GlobalValue::ExternalLinkage, "signed_add_form", module);
+      type, llvm::GlobalValue::ExternalLinkage, name, module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
   llvm::IRBuilder<> builder(entry);
   llvm::Value *x = function->getArg(0);
-  llvm::Value *wide = builder.CreateSExt(x, llvm::Type::getInt128Ty(context));
-  llvm::Value *product = builder.CreateNSWMul(
-      wide, llvm::ConstantInt::get(llvm::Type::getInt128Ty(context),
-                                   0xA3D70A3D70A3D70BULL));
+  llvm::Value *wide = builder.CreateZExt(x, wideType);
+  llvm::Value *product = builder.CreateNUWMul(
+      wide, llvm::ConstantInt::get(wideType, testCase.Magic));
   llvm::Value *high = builder.CreateLShr(
-      product, llvm::ConstantInt::get(llvm::Type::getInt128Ty(context), 64));
-  llvm::Value *truncated = builder.CreateTrunc(high, llvm::Type::getInt64Ty(context));
-  llvm::Value *sum = builder.CreateAdd(truncated, x);
-  llvm::Value *shifted = builder.CreateAShr(
-      sum, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 6));
-  llvm::Value *sign =
-      builder.CreateLShr(sum, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 63));
+      product, llvm::ConstantInt::get(wideType, width));
+  llvm::Value *h = builder.CreateTrunc(high, valueType, "high_half");
+  llvm::Value *difference = builder.CreateSub(x, h);
+  llvm::Value *halved = builder.CreateLShr(
+      difference, llvm::ConstantInt::get(valueType, 1));
+  llvm::Value *sum = builder.CreateAdd(halved, h);
+  builder.CreateRet(builder.CreateLShr(
+      sum, llvm::ConstantInt::get(valueType, testCase.PostShift), "quotient"));
+  return function;
+}
+
+bool testUnsignedAddCorrectionMagicFold() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unsigned-add-correction", context);
+  // clang -O2 x86-64：x/7 → M=0x2492492492492493、shrq $2（前面还有 >>1）。
+  //                     x/4095 → M=0x10010010010011、shrq $11。
+  const MagicDivisionCase cases[] = {
+      {7, 0x2492492492492493ULL, 2},
+      {4095, 0x10010010010011ULL, 11},
+  };
+  for (const MagicDivisionCase &testCase : cases) {
+    buildUnsignedAddFormFunction(
+        module, "uadd_" + std::to_string(testCase.ExpectedDivisor), testCase,
+        64);
+  }
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool allFolded = true;
+  for (const MagicDivisionCase &testCase : cases) {
+    llvm::Function *function = module.getFunction(
+        "uadd_" + std::to_string(testCase.ExpectedDivisor));
+    allFolded &=
+        expect(function != nullptr, "unsigned add-form function is missing") &&
+        expect(functionHasUdivBy(*function, testCase.ExpectedDivisor),
+               "unsigned add-form chain was not folded back to udiv") &&
+        expect(!functionHasMul(*function),
+               "unsigned add-form chain survived the udiv fold");
+  }
+
+  return expect(peephole.ConstantDivisionsRecognized == std::size(cases),
+                "unexpected number of recognized add-form divisions") &&
+         expect(peephole.SignedConstantDivisionsRecognized == 0,
+                "add-form fold counted as signed") &&
+         allFolded &&
+         verifyOk(module, "module failed verifier after add-form fold");
+}
+
+// 有符号负魔数 `+x` 形态（clang -O2 x86-64 的 int64_t x/100）：
+//   h = mulhi_s(x, M_neg); t = x + h; q = (t >>_arith 6) + sign(t)
+bool testSignedNegativeMagicAddXFormFold() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-signed-negative-magic-addx", context);
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  llvm::Type *i128 = llvm::Type::getInt128Ty(context);
+  auto *type = llvm::FunctionType::get(i64, {i64}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "saddx_100", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *x = function->getArg(0);
+  llvm::Value *wide = builder.CreateSExt(x, i128);
+  // 机器里的常量是 64 位 0xA3D70A3D70A3D70B，按有符号解释是负数，lift 成
+  // 符号扩展过的 i128 常量。
+  llvm::Value *product = builder.CreateNSWMul(
+      wide, llvm::ConstantInt::get(
+                i128, llvm::APInt(64, 0xA3D70A3D70A3D70BULL).sext(128)));
+  llvm::Value *high = builder.CreateLShr(product, llvm::ConstantInt::get(i128, 64));
+  llvm::Value *h = builder.CreateTrunc(high, i64, "high_half");
+  llvm::Value *sum = builder.CreateAdd(x, h);
+  llvm::Value *shifted =
+      builder.CreateAShr(sum, llvm::ConstantInt::get(i64, 6));
+  llvm::Value *sign = builder.CreateLShr(sum, llvm::ConstantInt::get(i64, 63));
   builder.CreateRet(builder.CreateAdd(shifted, sign, "quotient"));
 
   auto peephole =
       notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
 
-  return expect(peephole.SignedConstantDivisionsRecognized == 0,
-                "signed add-form division must not be folded") &&
-         expect(functionHasMul(*function),
-                "signed add-form division lost its multiply") &&
-         verifyOk(module, "module failed verifier after signed add-form skip");
+  return expect(peephole.SignedConstantDivisionsRecognized == 1,
+                "negative-magic add-x form was not recognized") &&
+         expect(functionHasSdivBy(*function, 100),
+                "negative-magic add-x form did not fold to sdiv 100") &&
+         expect(!functionHasMul(*function),
+                "negative-magic add-x form survived the sdiv fold") &&
+         verifyOk(module, "module failed verifier after add-x fold");
 }
 
 bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
@@ -11798,8 +11832,8 @@ int main() {
   ok &= testConstantDivisionMagicFoldI386();
   ok &= testSignedConstantDivisionMagicFoldI386();
   ok &= testSignedConstantDivisionMagicFoldX86_64();
-  ok &= testSignedConstantDivisionAddFormIsLeftAlone();
-  ok &= testConstantDivisionAddCorrectionFormIsLeftAlone();
+  ok &= testUnsignedAddCorrectionMagicFold();
+  ok &= testSignedNegativeMagicAddXFormFold();
   ok &= testConstantDivisionUnknownMagicIsLeftAlone();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
   ok &= testFinalCleanupDropsDeadUnknownValueCalls();
