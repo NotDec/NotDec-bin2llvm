@@ -253,14 +253,22 @@ llvm::Value *simplifyInsertedValueExtract(llvm::TruncInst &trunc) {
 // 2^(W-k)，L 可以收到 W-k —— clang 正是按这个更窄的范围挑魔数的，d=25 那种
 // 魔数只有把 L 收窄才成立。
 //
-// 不认的形态（整体跳过，不半改）：带 add 修正的魔数形态（clang -O2 的 x/7、
-// x/4095 是 `mulhi; sub; shr; add; shr`）、有符号除法（sext + sign 修正链）。
+// 有符号除法（`int x/d`）的 lift 形态是
+// `%h = lshr i(2W) (mul nsw (sext x), M), W`、`%q = ashr iW (trunc %h), s`、
+// `%sign = lshr iW (trunc %h), W-1`、`add iW %q, %sign`（s = 0 时 %q 就是那个
+// trunc）。它算的是 `floor_s(x*M/2^(W+s)) + [x<0]`：x >= 0 时就是 GM 的
+// `floor(x/d)`；x < 0 时逐项展开可以证明同一个条件
+// `e * 2^(W-1) <= 2^K`（e = M*d - 2^K）就够，所以两种除法共用一套反解，
+// 只是把 L 从 W 换成 W-1。反过来，`x + mulhi`（负魔数）那种形态不认。
+//
+// 不认的形态（整体跳过，不半改）：带 add 修正的无符号魔数形态（clang -O2 的
+// x/7、x/4095 是 `mulhi; sub; shr; add; shr`）、有符号的负魔数 `+x` 形态。
 // 除数本身不设上界：反解是 O(1) 的，而且 x/10^9 这类大除数很常见。
 
-std::optional<uint64_t> solveUnsignedMagicDivisor(const llvm::APInt &magic,
-                                                  unsigned shift,
-                                                  unsigned inputBits,
-                                                  unsigned valueWidth) {
+std::optional<uint64_t> solveMagicDivisor(const llvm::APInt &magic,
+                                           unsigned shift,
+                                           unsigned inputBits,
+                                           unsigned valueWidth) {
   if (magic.isZero() || valueWidth == 0 || valueWidth > 64 ||
       magic.getActiveBits() > valueWidth || inputBits == 0 ||
       inputBits > valueWidth || shift < valueWidth ||
@@ -296,12 +304,13 @@ std::optional<uint64_t> solveUnsignedMagicDivisor(const llvm::APInt &magic,
 }
 
 struct MagicMulChain {
-  llvm::Value *Scaled = nullptr; // zext 的源，iW 被除数。
+  llvm::Value *Scaled = nullptr; // 被除数（无符号是 zext 的源，有符号是 sext 的源）。
   llvm::Instruction *Root = nullptr; // 要替换掉的那个 iW 值。
   llvm::APInt Magic;
   unsigned Shift = 0; // 2W 位乘积总共右移多少位。
   unsigned InputBits = 0; // 被除数的值上界（< 2^InputBits）。
-  unsigned Width = 0; // W：被除数位宽，也是 udiv 的位宽。
+  unsigned Width = 0; // W：被除数位宽，也是 udiv/sdiv 的位宽。
+  bool Signed = false;
 };
 
 // `lshr iW %y, k` 的结果恒小于 2^(W-k)，反解可以用更窄的范围。
@@ -406,6 +415,127 @@ std::optional<MagicMulChain> matchMagicMulChain(llvm::Instruction &root) {
   chain.Shift = totalShift;
   chain.Width = width;
   chain.InputBits = dividendBitBound(chain.Scaled, width);
+  chain.Signed = false;
+  return chain;
+}
+
+// `%root = add iW %shifted, %sign`（顺序任意）：
+//   %shifted = ashr iW %truncated, s（s >= 1）或直接就是 %truncated（s == 0）
+//   %sign    = lshr iW <同一个 trunc 或被除数>, W-1
+//   %truncated = trunc i(2W) (lshr i(2W) %m, W) to iW
+//   %m = mul i(2W) (sext iW %x), M
+std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
+  if (root.getOpcode() != llvm::Instruction::Add) {
+    return std::nullopt;
+  }
+  auto *rootType = llvm::dyn_cast<llvm::IntegerType>(root.getType());
+  if (rootType == nullptr || rootType->getBitWidth() > 64) {
+    return std::nullopt;
+  }
+  unsigned width = rootType->getBitWidth();
+  if (width < 2) {
+    return std::nullopt;
+  }
+
+  llvm::Value *shifted = nullptr;
+  llvm::Instruction *sign = nullptr;
+  for (llvm::Value *operand : root.operands()) {
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(operand);
+    if (inst == nullptr) {
+      return std::nullopt;
+    }
+    if (inst->getOpcode() == llvm::Instruction::LShr) {
+      auto *amount = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1));
+      if (amount == nullptr ||
+          amount->getValue() != llvm::APInt(width, width - 1)) {
+        return std::nullopt; // 符号位必须是 >> (W-1)。
+      }
+      sign = inst;
+      continue;
+    }
+    if (inst->getOpcode() == llvm::Instruction::AShr ||
+        llvm::isa<llvm::TruncInst>(inst)) {
+      if (shifted != nullptr) {
+        return std::nullopt;
+      }
+      shifted = operand;
+      continue;
+    }
+    return std::nullopt;
+  }
+  if (shifted == nullptr || sign == nullptr) {
+    return std::nullopt;
+  }
+
+  unsigned extraShift = 0;
+  llvm::Value *shiftedBase = shifted;
+  if (auto *ashr = llvm::dyn_cast<llvm::BinaryOperator>(shifted)) {
+    auto *amount = llvm::dyn_cast<llvm::ConstantInt>(ashr->getOperand(1));
+    if (amount == nullptr) {
+      return std::nullopt;
+    }
+    extraShift = (unsigned)amount->getValue().getLimitedValue(width);
+    if (extraShift == 0 || extraShift >= width) {
+      return std::nullopt;
+    }
+    shiftedBase = ashr->getOperand(0);
+  }
+  auto *trunc = llvm::dyn_cast<llvm::TruncInst>(shiftedBase);
+  if (trunc == nullptr || trunc->getType() != rootType) {
+    return std::nullopt;
+  }
+  auto *high = llvm::dyn_cast<llvm::Instruction>(trunc->getOperand(0));
+  if (high == nullptr || high->getOpcode() != llvm::Instruction::LShr) {
+    return std::nullopt;
+  }
+  auto *amount = llvm::dyn_cast<llvm::ConstantInt>(high->getOperand(1));
+  if (amount == nullptr ||
+      amount->getValue() != llvm::APInt(2 * width, width)) {
+    return std::nullopt; // 只认 `>> W` 取高半段。
+  }
+  auto *mul = llvm::dyn_cast<llvm::Instruction>(high->getOperand(0));
+  if (mul == nullptr || mul->getOpcode() != llvm::Instruction::Mul) {
+    return std::nullopt;
+  }
+  auto *mulType = llvm::dyn_cast<llvm::IntegerType>(mul->getType());
+  if (mulType == nullptr || mulType->getBitWidth() != 2 * width) {
+    return std::nullopt;
+  }
+
+  llvm::ConstantInt *magic = nullptr;
+  llvm::Value *scaled = nullptr;
+  for (llvm::Value *operand : mul->operands()) {
+    if (auto *constant = llvm::dyn_cast<llvm::ConstantInt>(operand)) {
+      magic = constant;
+      continue;
+    }
+    if (scaled != nullptr) {
+      return std::nullopt;
+    }
+    scaled = operand;
+  }
+  if (magic == nullptr || scaled == nullptr || magic->getValue().isNegative()) {
+    return std::nullopt; // 负魔数是 `x + mulhi` 那种形态，不认。
+  }
+  auto *extend = llvm::dyn_cast<llvm::SExtInst>(scaled);
+  if (extend == nullptr ||
+      !extend->getOperand(0)->getType()->isIntegerTy(width)) {
+    return std::nullopt;
+  }
+  // 符号位只能来自高半段（同一个 trunc）或被除数本身，两者都等于 [x < 0]。
+  llvm::Value *signSource = sign->getOperand(0);
+  if (signSource != trunc && signSource != extend->getOperand(0)) {
+    return std::nullopt;
+  }
+
+  MagicMulChain chain;
+  chain.Scaled = extend->getOperand(0);
+  chain.Root = &root;
+  chain.Magic = magic->getValue();
+  chain.Shift = width + extraShift;
+  chain.Width = width;
+  chain.InputBits = width - 1; // 有符号：|x| < 2^(W-1)。
+  chain.Signed = true;
   return chain;
 }
 
@@ -435,20 +565,25 @@ void eraseDeadMagicMulChain(
 
 bool rewriteConstantDivision(llvm::Instruction &root,
                              NativeRegisterPostRewritePeepholeSummary &summary) {
-  std::optional<MagicMulChain> chain = matchMagicMulChain(root);
+  std::optional<MagicMulChain> chain = matchSignedMagicMulChain(root);
+  if (!chain) {
+    chain = matchMagicMulChain(root);
+  }
   if (!chain) {
     return false;
   }
-  std::optional<uint64_t> divisor = solveUnsignedMagicDivisor(
+  std::optional<uint64_t> divisor = solveMagicDivisor(
       chain->Magic, chain->Shift, chain->InputBits, chain->Width);
   if (!divisor) {
     return false;
   }
   std::string name = root.getName().str();
   llvm::IRBuilder<> builder(&root);
-  llvm::Value *quotient =
-      builder.CreateUDiv(chain->Scaled,
-                         llvm::ConstantInt::get(root.getType(), *divisor));
+  llvm::Value *denominator =
+      llvm::ConstantInt::get(root.getType(), *divisor);
+  llvm::Value *quotient = chain->Signed
+                              ? builder.CreateSDiv(chain->Scaled, denominator)
+                              : builder.CreateUDiv(chain->Scaled, denominator);
   quotient->takeName(&root);
   llvm::SmallVector<llvm::Instruction *, 4> chainOperands;
   for (llvm::Value *operand : root.operands()) {
@@ -464,7 +599,11 @@ bool rewriteConstantDivision(llvm::Instruction &root,
   if (!name.empty() && quotient->getName().empty()) {
     quotient->setName(name);
   }
-  ++summary.ConstantDivisionsRecognized;
+  if (chain->Signed) {
+    ++summary.SignedConstantDivisionsRecognized;
+  } else {
+    ++summary.ConstantDivisionsRecognized;
+  }
   return true;
 }
 
@@ -504,11 +643,13 @@ runNativeRegisterPostRewritePeephole(llvm::Module &module) {
       continue;
     }
     for (llvm::Instruction &inst : llvm::instructions(function)) {
-      // W = 32（i386 的 mull）和 W = 64（x86-64 的 mulq）都要扫。
+      // W = 32（i386 的 mull）和 W = 64（x86-64 的 mulq）都要扫；有符号除法的
+      // 根是最后那个 `add iW %q, %sign`，无符号是 trunc 或修正用的 lshr。
       if ((inst.getType()->isIntegerTy(32) ||
            inst.getType()->isIntegerTy(64)) &&
           (llvm::isa<llvm::TruncInst>(inst) ||
-           inst.getOpcode() == llvm::Instruction::LShr)) {
+           inst.getOpcode() == llvm::Instruction::LShr ||
+           inst.getOpcode() == llvm::Instruction::Add)) {
         divisionRoots.emplace_back(&inst);
       }
     }
@@ -568,7 +709,8 @@ void printNativeRegisterPostRewritePeepholeSummary(
   os << "Native register post-rewrite peephole: value_range_extracts_simplified="
      << summary.ValueRangeExtractsSimplified
      << " constant_divisions_recognized=" << summary.ConstantDivisionsRecognized
-     << '\n';
+     << " signed_constant_divisions_recognized="
+     << summary.SignedConstantDivisionsRecognized << '\n';
 }
 
 } // namespace notdec::bin2llvm

@@ -10787,6 +10787,172 @@ bool testConstantDivisionMagicFoldI386() {
                   "module failed verifier after i386 magic division fold");
 }
 
+
+// 有符号除法的 lift 形态：`sext → mul nsw → lshr W → trunc → ashr s → add 符号位`。
+// 表里的 (d, M, s) 来自 clang -O2 / -m32 -O2 的实际输出；s = 0 时没有 ashr。
+llvm::Function *buildSignedMagicDivisionFunction(llvm::Module &module,
+                                                 llvm::StringRef name,
+                                                 const MagicDivisionCase &testCase,
+                                                 unsigned width) {
+  llvm::LLVMContext &context = module.getContext();
+  llvm::Type *valueType = llvm::IntegerType::get(context, width);
+  llvm::Type *wideType = llvm::IntegerType::get(context, 2 * width);
+  auto *type = llvm::FunctionType::get(valueType, {valueType}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, name, module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *wide = builder.CreateSExt(function->getArg(0), wideType, "wide");
+  llvm::Value *product = builder.CreateNSWMul(
+      wide, llvm::ConstantInt::get(wideType, testCase.Magic));
+  llvm::Value *high = builder.CreateLShr(
+      product, llvm::ConstantInt::get(wideType, width));
+  llvm::Value *truncated = builder.CreateTrunc(high, valueType);
+  llvm::Value *shifted = truncated;
+  if (testCase.PostShift != 0) {
+    shifted = builder.CreateAShr(
+        truncated, llvm::ConstantInt::get(valueType, testCase.PostShift));
+  }
+  llvm::Value *sign = builder.CreateLShr(
+      truncated, llvm::ConstantInt::get(valueType, width - 1));
+  builder.CreateRet(builder.CreateAdd(shifted, sign, "quotient"));
+  return function;
+}
+
+bool functionHasSdivBy(const llvm::Function &function, uint64_t divisor) {
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    if (inst.getOpcode() != llvm::Instruction::SDiv) {
+      continue;
+    }
+    auto *constant = llvm::dyn_cast<llvm::ConstantInt>(inst.getOperand(1));
+    auto *type = llvm::dyn_cast<llvm::IntegerType>(inst.getType());
+    if (constant != nullptr && type != nullptr &&
+        constant->getValue() == llvm::APInt(type->getBitWidth(), divisor)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// clang -m32 -O2 -S：`imull` + `sarl` + 加符号位（x/3 没有 sarl）。
+bool testSignedConstantDivisionMagicFoldI386() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-signed-division-i386", context);
+  const MagicDivisionCase cases[] = {
+      {3, 1431655766ULL, 0},
+      {10, 1717986919ULL, 2},
+      {13, 1321528399ULL, 2},
+      {100, 1374389535ULL, 5},
+      {1000, 274877907ULL, 6},
+  };
+  for (const MagicDivisionCase &testCase : cases) {
+    buildSignedMagicDivisionFunction(module,
+                                     "i386_sdiv_" +
+                                         std::to_string(testCase.ExpectedDivisor),
+                                     testCase, 32);
+  }
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool allFolded = true;
+  for (const MagicDivisionCase &testCase : cases) {
+    llvm::Function *function = module.getFunction(
+        "i386_sdiv_" + std::to_string(testCase.ExpectedDivisor));
+    allFolded &=
+        expect(function != nullptr, "i386 signed division function is missing") &&
+        expect(functionHasSdivBy(*function, testCase.ExpectedDivisor),
+               "i386 signed magic chain was not folded back to sdiv") &&
+        expect(!functionHasMul(*function),
+               "i386 signed magic chain survived the sdiv fold");
+  }
+
+  return expect(peephole.SignedConstantDivisionsRecognized == std::size(cases),
+                "unexpected number of recognized i386 signed divisions") &&
+         expect(peephole.ConstantDivisionsRecognized == 0,
+                "i386 signed fold counted as unsigned") &&
+         allFolded &&
+         verifyOk(module, "module failed verifier after i386 signed fold");
+}
+
+bool testSignedConstantDivisionMagicFoldX86_64() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-signed-division-x86-64", context);
+  // clang -m64 -O2 -S 的 `int64_t x/d`：imulq + sarq + 加符号位。
+  const MagicDivisionCase cases[] = {
+      {3, 0x5555555555555556ULL, 0},
+      {5, 0x6666666666666667ULL, 1},
+      {7, 0x4924924924924925ULL, 1},
+      {10, 0x6666666666666667ULL, 2},
+      {13, 0x4EC4EC4EC4EC4EC5ULL, 2},
+  };
+  for (const MagicDivisionCase &testCase : cases) {
+    buildSignedMagicDivisionFunction(
+        module, "x64_sdiv_" + std::to_string(testCase.ExpectedDivisor),
+        testCase, 64);
+  }
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool allFolded = true;
+  for (const MagicDivisionCase &testCase : cases) {
+    llvm::Function *function = module.getFunction(
+        "x64_sdiv_" + std::to_string(testCase.ExpectedDivisor));
+    allFolded &=
+        expect(function != nullptr, "x64 signed division function is missing") &&
+        expect(functionHasSdivBy(*function, testCase.ExpectedDivisor),
+               "x64 signed magic chain was not folded back to sdiv") &&
+        expect(!functionHasMul(*function),
+               "x64 signed magic chain survived the sdiv fold");
+  }
+
+  return expect(peephole.SignedConstantDivisionsRecognized == std::size(cases),
+                "unexpected number of recognized x64 signed divisions") &&
+         expect(peephole.ConstantDivisionsRecognized == 0,
+                "x64 signed fold counted as unsigned") &&
+         allFolded &&
+         verifyOk(module, "module failed verifier after x64 signed fold");
+}
+
+// clang -O2 x86-64 的 x/100 用的是负魔数 `(high + x) >> s + sign` 形态：本轮
+// 不认，必须原样保留（否则会把一个没验证过的等价关系当成除法）。
+bool testSignedConstantDivisionAddFormIsLeftAlone() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-signed-division-add-form", context);
+  auto *type = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
+                                       {llvm::Type::getInt64Ty(context)}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "signed_add_form", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *x = function->getArg(0);
+  llvm::Value *wide = builder.CreateSExt(x, llvm::Type::getInt128Ty(context));
+  llvm::Value *product = builder.CreateNSWMul(
+      wide, llvm::ConstantInt::get(llvm::Type::getInt128Ty(context),
+                                   0xA3D70A3D70A3D70BULL));
+  llvm::Value *high = builder.CreateLShr(
+      product, llvm::ConstantInt::get(llvm::Type::getInt128Ty(context), 64));
+  llvm::Value *truncated = builder.CreateTrunc(high, llvm::Type::getInt64Ty(context));
+  llvm::Value *sum = builder.CreateAdd(truncated, x);
+  llvm::Value *shifted = builder.CreateAShr(
+      sum, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 6));
+  llvm::Value *sign =
+      builder.CreateLShr(sum, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 63));
+  builder.CreateRet(builder.CreateAdd(shifted, sign, "quotient"));
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  return expect(peephole.SignedConstantDivisionsRecognized == 0,
+                "signed add-form division must not be folded") &&
+         expect(functionHasMul(*function),
+                "signed add-form division lost its multiply") &&
+         verifyOk(module, "module failed verifier after signed add-form skip");
+}
+
 bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-globaldce", context);
@@ -11630,6 +11796,9 @@ int main() {
   ok &= testPostRewritePeepholeSimplifiesExtractFromInsertedRange();
   ok &= testConstantDivisionMagicFold();
   ok &= testConstantDivisionMagicFoldI386();
+  ok &= testSignedConstantDivisionMagicFoldI386();
+  ok &= testSignedConstantDivisionMagicFoldX86_64();
+  ok &= testSignedConstantDivisionAddFormIsLeftAlone();
   ok &= testConstantDivisionAddCorrectionFormIsLeftAlone();
   ok &= testConstantDivisionUnknownMagicIsLeftAlone();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();

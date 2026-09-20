@@ -29,6 +29,7 @@ struct NativeRegisterPreSummaryPeepholeSummary {
 struct NativeRegisterPostRewritePeepholeSummary {
   uint64_t ValueRangeExtractsSimplified = 0;
   uint64_t ConstantDivisionsRecognized = 0;
+  uint64_t SignedConstantDivisionsRecognized = 0;
 };
 
 NativeRegisterPreSummaryPeepholeSummary
