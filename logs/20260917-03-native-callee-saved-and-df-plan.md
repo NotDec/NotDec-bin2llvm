@@ -915,3 +915,87 @@ InstCombine 有没有把中间步骤折掉）和 ground truth 对拍，不是数
 InstCombine 没折回整除数**的边角、16 位 i386 形态（`mul i32` 的 lift），
 以及浮点除法——都不是当前样本里出现的东西，等有真实用例再说。
 
+
+
+## 边角形态：窄乘积（16 位）与窄源加宽（2026-09-20 续）
+
+用户原始 prompt：
+
+> 剩余的这些边角，要不创建一些对应的测试用例，然后也实现一下试试吧
+
+### 先扫真实产物，别凭印象列边角
+
+把 memcached / wrk / fortune-i386 产物里剩余的常量乘法按形态分类：
+
+- 绝大多数是**哈希/定点常数**（`mul i64 %x, 1609587791953885689`、`mul i64 %x, 1000000`、
+  `mul i32 %x, -862048943` 之类），不是除法，本来就该原样留着。
+- 真正的除法缺口只有 **1 处**：wrk 里一个 `gettimeofday` 附近的
+  `int64` 值其实是 `sext i32` 来的，编译器用了 32 位魔数放进 64 位乘法里——**窄源加宽**。
+- `and(ashr(x, W-1), mask)` 和 `select` 那些看着像"2 的幂除法修正"，逐个查上下文后
+  都不是（是符号扩展/掩码 idiom），所以**没做**有符号 2 的幂除法。
+- 16 位形态在样本里没有，但 i386 上有真实的 `uint16_t/int16_t` 除法，clang 会把它
+  提升到 32 位，于是有第三种乘积形态。
+
+### 形态一：窄乘积（16 位提升到 32 位）
+
+clang -m32 -O2 对 `uint16_t x/3` 生成
+`movzwl x; imull $43691; shrl $17`，lift 出来是：
+
+```llvm
+%v = zext i16 %x to i32
+%p = mul nuw i32 %v, 43691
+%q = lshr i32 %p, 17
+```
+
+乘积**自身宽**（不是 2W），没有高半段，移位 N (=17) 还小于 W (=32)。数学没变：
+还是 GM 的 `floor(x*M/2^N) = floor(x/d)`，只是把 L 取成源的位宽（16）。
+额外必须验证**乘积不溢出**：`max|x| * M < 2^(W-1)`（有符号）/`2^W`（无符号），
+否则机器码是回绕值、公式不成立——这一步在 matcher 里用 APInt 检查。
+
+有符号 16 位（`int16_t x/3`）是 `%p = mul nsw i32 (sext i16), 21846`、
+`%q = add (lshr %p, 16), (lshr %p, 31)`——注意符号位取自**乘积本身**（不是高半段），
+正好就是已经证明过的有符号公式 `floor_s(x*M/2^N) + [x*M<0]`。
+
+实现：`matchNarrowProductMagicChain`，求解器给 `solveMagicDivisor` 加了
+`allowShortShift`（窄乘积的移位可以 < W）。
+
+### 形态二：窄源加宽
+
+wrk 那处：
+
+```llvm
+%83 = sext i32 %v to i64           ; 被除数（i64）
+%w  = sext i32 %v to i128
+%p  = mul nsw i128 %w, 2361183241434822607   ; ceil(2^71/1000)
+%h  = lshr i128 %p, 64
+%t  = trunc i128 %h to i64
+%.neg = lshr i64 %83, 63           ; 符号位
+%q  = add i64 (ashr i64 %t, 7), %.neg
+```
+
+乘法的源比 W 窄（i32 而不是 i64），但被除数是同一个值的 i64 扩展。证明不变，
+只是范围收到 i32：`inputBits = 32 - 1 = 31`，条件更松。改写用那个 i64 被除数。
+实现上把 `parseMagicProduct` 的"源必须正好 W 位"放宽成"源 <= W 位并记下位宽"，
+符号位来源在那个 iW 值上时就走窄源分支。
+
+### 验证
+
+- 单测：`testNarrowProductMagicFold16Bit`（16 位无符号/有符号各一）、
+  `testNarrowSourceWideningFold`（wrk 那处 i64/i32 形态）。
+- 端到端（自建 i386 静态二进制，按地址提升）：
+  `uint16_t x/3` → `udiv i16 %stack+4.arg, 3`；
+  `int16_t x/3` → `sdiv i16 %stack+4.arg, 3`。
+- wrk：有符号识别 5 → **6**（窄源那处折成 `sdiv i64 ..., 1000`），unknown 15 不变。
+- memcached：无符号 7 → **19**（窄乘积形态额外认出了 12 处 `udiv i32`，除数
+  60/100/10000/10^6/10^8 —— 32 位时间/单位换算，魔数放在 64 位乘法里的那类），
+  有符号 0、unknown 0；哈希/定点常数照旧不动。
+- fortune-i386：有符号 5 不变；`ctest --test-dir build` 12/12；
+  产物 `llvm-as` + `opt -passes=verify` 通过。
+
+### 仍然不做
+
+16 位 **add 修正**形态（`uint16_t x/7`：sub/lshr 在 i16、add/lshr 在 i32，混宽度）——
+样本里没有、匹配要跨宽度，投入产出不划算，等有真实用例再说；
+16 位以下的 8 位形态同理。有符号 2 的幂除法（clang 用 `cmov`/`and` 修正序列）
+在三个样本里一处都没有，也先不做。
+
