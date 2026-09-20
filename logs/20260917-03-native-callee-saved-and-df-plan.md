@@ -451,3 +451,39 @@ warning 增加的都是原来被 unknown 掩盖的 \`remaining_summary_clobber_v
 
 剩余：memcached 1 条（FUN_1a380 的返回槽解析落到入口 range，属于返回绑定问题）、
 wrk 15 条（x87 窗口 ST0/ST1 入口值，属于窗口建模/表示层话题）。
+
+## 常数除法魔数识别（设计，待实现；2026-09-19 续）
+
+背景：memcached 最后 1 条 unknown 是 \`FUN_1a380\` —— raw lift 里是编译器生成的
+"除以常数"（魔数乘法）helper，寄存器消除后 body 被清空、返回槽退化成入口 RAX 兜底、
+被 \`rangeMayComeFromEntry\` 拒绝 → \`entry_range_rejected:RAX\`。用户提议：在最早
+（寄存器没消除时）按编译器生成的魔数模式做匹配，把它折成普通 SSA/除法。
+
+对照结论（已实测确认）：
+
+- raw lift 里是 \`store i64 -6148914691236517205 (=0xAAAAAAAAAAAAAAAB) → @RAX\`，
+  后接 \`shl %RSI, 2\` + \`zext i64→i128\` + \`mul\` + \`lshr 128,64\` + \`trunc\`，即
+  \`mulhi\` 形态；\`0xAAAAAAAAAAAAAAAB\` 正是 **无符号除以 3** 的魔数（注：\`0xAAAA...AA\`
+  是它减一，别混）。
+- \`clang -O2\` ground truth：\`x/3\`→\`0xAAAAAAAAAAAAAAAB\`+\`mulq\`+\`shrq $1\`；
+  \`x/7\`→\`0x2492492492492493\`；\`x/512\`/\`x/4096\` 走纯 shift；\`x*0xAAAA...AA\` 才会
+  出现 \`0xAAAAAAAAAAAAAA\`。
+- LLVM 源码位置：\`lib/CodeGen/SelectionDAG/TargetLowering.cpp:6705 BuildUDIV\`、
+  \`:6537 BuildSDIV\`、\`:6471 BuildSDIVPow2\`，ISD 组合入口 \`:6421 BuildUDIVPattern\`/
+  \`:6576 BuildSDIVPattern\`；魔数算法在这些函数里用 APInt 现算，没有单独常量表。
+
+实现方案（最小）：
+
+1. 位置：\`runNativeRegisterPreSummaryPeephole\`（summary/SSA 之前，正好是"寄存器还没消除"）。
+2. 形状：同一基本块内、无 call/无内存副作用；常量装进寄存器（或 \`zext\` 常量）→
+   \`mul i128 (zext A),(zext B)\`（其中一个是常量）→ \`lshr i128,64\`（+可选 add/shr 修正）
+   → 结果写回被函数返回的寄存器；允许成对寄存器搬运噪声。
+3. 两条落法，**先做 (a)**：
+   (a) 去寄存器化：只把这条链改写成等价 SSA（保留 \`mul/lshr/trunc\` 结构），不判定除法——
+       最小、最安全，目的是让返回绑定不再踩"partial write 边界被提前删"的坑；
+   (b) 反解成 \`udiv/sdiv\`：用"有界搜索 + 复用 BuildUDIV 的生成算法"对拍 (魔数, shift)，
+       命中才改写；建议先只做无符号 + 2 的幂，\`d\` 上限 4096，超出跳过。
+4. 判据：整块命中且（若走 (b)）反解成功才改写，否则原样保留；clang ground truth 单测；
+   memcached 上 \`FUN_1a380\` 应变成正常函数、unknown 归零；ctest/fortune 不回归。
+5. 注意：这条 pass 只治这类函数；\`NativeRegisterSummarySSA.cpp:3454\` 记的"返回绑定依赖
+   partial-write 边界、helper 被提前删就退化成 unknown"的通用机制仍要单独查。
