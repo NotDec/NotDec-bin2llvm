@@ -4187,10 +4187,23 @@ private:
       case llvm::Instruction::Sub:
       case llvm::Instruction::Mul: {
         unsigned srcWidth = valueBitWidth(inst->getOperand(0));
+        unsigned resultWidth = valueBitWidth(inst);
+        // 乘积位 [0,W) 只依赖两个操作数的 [0,W)（模 2^W 可交换），位 [W,R) 依赖
+        // 操作数的全部位。操作数与结果同宽时（W == R，lift 出来的 mulq 就是
+        // `mul nuw i128 (zext),(zext)`）`~maskForLowBits(R, W)` 恒为空，旧代码
+        // 会把高位段按 lane 只 demand 操作数的同一段；两个 zext 操作数一裁剪就
+        // 得到零 demand，被 partial-demand 当成无用值替换成 poison，进而毒化整条
+        // 乘法链（连分支条件一起）。同宽乘法没有"低位段"可依赖，任何一位需求都
+        // 必须 demand 全部操作数。Add/Sub 不在此列：它们的 lane demand 只是保守
+        // 度问题，改动会放大全程序的需求面。
+        bool sameWidthMul = inst->getOpcode() == llvm::Instruction::Mul &&
+                            srcWidth >= resultWidth;
         llvm::APInt lowDemand =
             PartialDemandState::trimmedMask(inputDemand, srcWidth);
         llvm::APInt highDemand =
-            inputDemand & ~maskForLowBits(valueBitWidth(inst), srcWidth);
+            sameWidthMul
+                ? inputDemand
+                : inputDemand & ~maskForLowBits(resultWidth, srcWidth);
         if (!highDemand.isZero()) {
           enqueue(inst->getOperand(0), fullMaskFor(inst->getOperand(0)));
           enqueue(inst->getOperand(1), fullMaskFor(inst->getOperand(1)));

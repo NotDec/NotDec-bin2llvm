@@ -9827,6 +9827,100 @@ bool testPartialDemandKeepsDynamicShiftAmount() {
                   "module failed verifier after dynamic shift demand test");
 }
 
+// lift 出来的 mulq 是 `mul nuw i128 (zext),(zext)`：操作数与结果同宽。同宽乘法
+// 没有"低位段"可依赖——乘积的每一位都依赖两个操作数的全部位——但 partial demand
+// 的 Add/Sub/Mul lane 规则按 `~maskForLowBits(R, W)` 划分高低段，W == R 时这个
+// 补集恒为空，高位段被按 lane demand 成操作数的同一段；两个 zext 操作数一裁剪就
+// 得到零 demand，被 demand rewrite 当成无用值换成 poison，整条乘法链（含由它算出
+// 的分支条件）随后被 LLVM 常量折叠掉，函数体消失。这里断言这条函数里在 demand
+// 重写后没有留下任何 zero-demand poison。
+bool testPartialDemandKeepsSameWidthMulOperand() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-demand-same-width-mul", context);
+  // RSI 必须是 ABI 输入，入口读才对应真实参数；否则入口读会先被换成 unknown。
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX"});
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  llvm::Type *i128 = llvm::Type::getInt128Ty(context);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "same_width_mul_helper", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::BasicBlock *taken = llvm::BasicBlock::Create(context, "taken", callee);
+  llvm::BasicBlock *fallthrough =
+      llvm::BasicBlock::Create(context, "fallthrough", callee);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *value = loadRegister(builder, rsi, "RSI", "value");
+  llvm::Value *scaled =
+      builder.CreateShl(value, llvm::ConstantInt::get(i64, 2), "scaled");
+  // 被后面的 RDX 写覆盖的 dead register store：它的 operand 本来没有 demand。
+  storeRegister(builder, rdx, scaled, "RDX");
+  llvm::Value *lhs = builder.CreateZExt(
+      llvm::ConstantInt::get(i64, llvm::APInt(64, 0xAAAAAAAAAAAAAAABULL)), i128);
+  llvm::Value *rhs = builder.CreateZExt(scaled, i128, "mul_rhs");
+  llvm::Value *product = builder.CreateMul(lhs, rhs, "product");
+  llvm::Value *high =
+      builder.CreateLShr(product, llvm::ConstantInt::get(i128, 64), "high");
+  llvm::Value *result = builder.CreateTrunc(high, i64, "result");
+  storeRegister(builder, rdx, result, "RDX");
+  storeRegister(builder, rax, result, "RAX");
+  llvm::Value *flag =
+      builder.CreateICmpEQ(result, llvm::ConstantInt::get(i64, 0), "flag");
+  builder.CreateCondBr(flag, taken, fallthrough);
+
+  // 两条分支必须不一样，否则 SimplifyCFG 会把分支连同条件一起折掉。
+  builder.SetInsertPoint(taken);
+  builder.CreateRetVoid();
+  builder.SetInsertPoint(fallthrough);
+  builder.CreateRetVoid();
+
+  // 调用点观察 RAX 返回，乘法链才有真实 demand。
+  llvm::Function *caller = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "use_same_width_mul", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  builder.CreateCall(type, callee);
+  builder.CreateStore(loadRegister(builder, rax, "RAX", "returned"), sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  options.EnablePostRewriteInstCombine = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  // 签名重写会换掉 Function 对象，按名字重新取。
+  llvm::Function *rewritten = module.getFunction("same_width_mul_helper");
+  bool sawMul = false;
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewritten)) {
+      sawMul |= inst.getOpcode() == llvm::Instruction::Mul;
+    }
+  }
+  // 旧 lane 规则下 `%scaled` 零 demand，会被换成 poison：先毒化
+  // `zext i64 poison to i128` 的操作数，mul 结果随之变 poison，demand 链上
+  // 的所有使用点（分支、返回）一起失效。这里断言这条函数里没有任何
+  // zero-demand poison —— 同宽 mul 的操作数有真实 observer，不该被裁。
+  bool poisonedOperand =
+      rewritten != nullptr && functionHasPoisonZeroDemandOperand(*rewritten);
+  if (!sawMul || poisonedOperand) {
+    module.print(llvm::errs(), nullptr);
+  }
+
+  return expect(summary.PartialDemandCandidates >= 1,
+                "same-width mul store was not seen as a partial demand "
+                "candidate") &&
+         expect(sawMul, "same-width mul disappeared from the function") &&
+         expect(!poisonedOperand,
+                "same-width mul operand was replaced with poison") &&
+         verifyOk(module,
+                  "module failed verifier after same-width mul demand test");
+}
+
 bool testPartialZmmKeepHighStoreIsDemandRewritten() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-zmm-demand", context);
@@ -11273,6 +11367,7 @@ int main() {
   ok &= testRecordedReturnValueSurvivesPartialDemandRewrite();
   ok &= testPartialDemandPoisonReplacementIsMarked();
   ok &= testPartialDemandKeepsDynamicShiftAmount();
+  ok &= testPartialDemandKeepsSameWidthMulOperand();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();
