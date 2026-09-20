@@ -10540,6 +10540,197 @@ bool testPostRewritePeepholeSimplifiesExtractFromInsertedRange() {
                   "module failed verifier after inserted extract cleanup test");
 }
 
+
+// clang -O2 x86-64 把无符号 `x / d` 生成成
+// `movabsq $M,%rcx; mulq %rcx; movq %rdx,%rax; shrq $s,%rax`，也就是
+// `(x * M) >> (64 + s)`。下面这张表的 (d, M, s) 直接从
+// `clang -O2 -S`（llvm-22.1.0.obj）的实际输出抄下来，作为识别器的 ground
+// truth：命中就该还原成 `udiv x, d`。
+struct MagicDivisionCase {
+  // 识别器应该写出的除数。带预移位时它是内层除数（x/10^9 写成 (x>>9)/1953125），
+  // 后续 InstCombine 会把 `udiv (x>>9), 1953125` 折回 `udiv x, 10^9`。
+  uint64_t ExpectedDivisor;
+  uint64_t Magic;
+  unsigned PostShift;
+  unsigned PreShift = 0;
+};
+
+llvm::Function *buildMagicDivisionFunction(llvm::Module &module,
+                                           llvm::StringRef name,
+                                           const MagicDivisionCase &testCase,
+                                           bool foldCorrectionShift) {
+  llvm::LLVMContext &context = module.getContext();
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  llvm::Type *i128 = llvm::Type::getInt128Ty(context);
+  auto *type = llvm::FunctionType::get(i64, {i64}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, name, module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *dividend = function->getArg(0);
+  if (testCase.PreShift != 0) {
+    dividend = builder.CreateLShr(
+        dividend, llvm::ConstantInt::get(i64, testCase.PreShift), "prescaled");
+  }
+  llvm::Value *wide = builder.CreateZExt(dividend, i128, "wide");
+  llvm::Value *product =
+      builder.CreateMul(wide, llvm::ConstantInt::get(i128, testCase.Magic));
+  if (foldCorrectionShift) {
+    // InstCombine 会把 `mulhi >> 64` + trunc + `>> s` 折成 `mulhi >> (64+s)`
+    // + trunc，两种形态都要能认。
+    llvm::Value *shifted = builder.CreateLShr(
+        product, llvm::ConstantInt::get(i128, 64 + testCase.PostShift));
+    builder.CreateRet(builder.CreateTrunc(shifted, i64, "quotient"));
+    return function;
+  }
+  llvm::Value *high =
+      builder.CreateLShr(product, llvm::ConstantInt::get(i128, 64));
+  llvm::Value *truncated = builder.CreateTrunc(high, i64);
+  builder.CreateRet(builder.CreateLShr(
+      truncated, llvm::ConstantInt::get(i64, testCase.PostShift), "quotient"));
+  return function;
+}
+
+bool functionHasUdivBy(const llvm::Function &function, uint64_t divisor) {
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    if (inst.getOpcode() != llvm::Instruction::UDiv) {
+      continue;
+    }
+    auto *constant = llvm::dyn_cast<llvm::ConstantInt>(inst.getOperand(1));
+    if (constant != nullptr &&
+        constant->getValue() == llvm::APInt(64, divisor)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool functionHasMul(const llvm::Function &function) {
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    if (inst.getOpcode() == llvm::Instruction::Mul) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool testConstantDivisionMagicFold() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-constant-division-magic", context);
+  const MagicDivisionCase cases[] = {
+      {3, 0xAAAAAAAAAAAAAAABULL, 1},
+      {5, 0xCCCCCCCCCCCCCCCDULL, 2},
+      {6, 0xAAAAAAAAAAAAAAABULL, 2},
+      {9, 0xE38E38E38E38E38FULL, 3},
+      {10, 0xCCCCCCCCCCCCCCCDULL, 3},
+      {72, 0xE38E38E38E38E38FULL, 6},
+      // 除数没有上界，4097 也要认出来。
+      {4097, 0xFFF000FFF000FFF1ULL, 12},
+      // x/1000000000：clang 先 shrq $9 再对 1953125 用魔数，被除数范围收到
+      // 55 位才成立（L 不收紧的话这个魔数验证不过）。
+      {1953125, 19342813113834067ULL, 11, 9},
+  };
+  bool built = true;
+  for (const MagicDivisionCase &testCase : cases) {
+    std::string suffix = std::to_string(testCase.ExpectedDivisor);
+    built &= buildMagicDivisionFunction(module, "div_" + suffix, testCase,
+                                        /*foldCorrectionShift=*/false) !=
+             nullptr;
+    built &= buildMagicDivisionFunction(module, "folded_div_" + suffix,
+                                        testCase,
+                                        /*foldCorrectionShift=*/true) !=
+             nullptr;
+  }
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool allFolded = built;
+  for (const MagicDivisionCase &testCase : cases) {
+    std::string suffix = std::to_string(testCase.ExpectedDivisor);
+    for (const std::string &name :
+         {"div_" + suffix, "folded_div_" + suffix}) {
+      llvm::Function *function = module.getFunction(name);
+      allFolded &=
+          expect(function != nullptr, "magic division function is missing") &&
+          expect(functionHasUdivBy(*function, testCase.ExpectedDivisor),
+                 "magic multiply chain was not folded back to udiv") &&
+          expect(!functionHasMul(*function),
+                 "magic multiply chain survived the udiv fold");
+    }
+  }
+
+  return expect(peephole.ConstantDivisionsRecognized == 2 * std::size(cases),
+                "unexpected number of recognized constant divisions") &&
+         allFolded &&
+         verifyOk(module, "module failed verifier after magic division fold");
+}
+
+bool testConstantDivisionAddCorrectionFormIsLeftAlone() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-constant-division-add-form", context);
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  llvm::Type *i128 = llvm::Type::getInt128Ty(context);
+  // clang -O2 的 x/7：`mulhi(M,x); t=(x-mulhi)>>1; q=(t+mulhi)>>2`。这个形态
+  // 需要 add 修正，识别器不认，必须原样保留。
+  auto *type = llvm::FunctionType::get(i64, {i64}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "div7_add_form", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *x = function->getArg(0);
+  llvm::Value *wide = builder.CreateZExt(x, i128);
+  llvm::Value *product =
+      builder.CreateMul(wide, llvm::ConstantInt::get(i128, 0x2492492492492493ULL));
+  llvm::Value *high =
+      builder.CreateLShr(product, llvm::ConstantInt::get(i128, 64));
+  llvm::Value *truncated = builder.CreateTrunc(high, i64);
+  llvm::Value *difference = builder.CreateSub(x, truncated);
+  llvm::Value *halved = builder.CreateLShr(difference, llvm::ConstantInt::get(i64, 1));
+  llvm::Value *sum = builder.CreateAdd(halved, truncated);
+  builder.CreateRet(builder.CreateLShr(
+      sum, llvm::ConstantInt::get(i64, 2), "quotient"));
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  return expect(peephole.ConstantDivisionsRecognized == 0,
+                "add-corrected magic division must not be folded") &&
+         expect(functionHasMul(*function),
+                "add-corrected magic divide lost its multiply") &&
+         expect(!functionHasUdivBy(*function, 7),
+                "add-corrected magic divide was folded to an ill-formed udiv") &&
+         verifyOk(module, "module failed verifier after add-form skip");
+}
+
+bool testConstantDivisionUnknownMagicIsLeftAlone() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-constant-division-unknown-magic", context);
+  // 不对应任何除数的魔数（既不是 ceil(2^K/d) 也过不了误差条件）：必须整体跳过，
+  // 不能猜一个邻近的除数。
+  const MagicDivisionCase testCase = {0, 1234567890123456789ULL, 3};
+  llvm::Function *function =
+      buildMagicDivisionFunction(module, "not_a_division", testCase,
+                                 /*foldCorrectionShift=*/false);
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool sawUdiv = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    sawUdiv |= inst.getOpcode() == llvm::Instruction::UDiv;
+  }
+
+  return expect(peephole.ConstantDivisionsRecognized == 0,
+                "non-division magic must not be recognized") &&
+         expect(functionHasMul(*function),
+                "non-division magic lost its multiply") &&
+         expect(!sawUdiv, "non-division magic was folded to a udiv") &&
+         verifyOk(module, "module failed verifier after unknown magic skip");
+}
+
 bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-globaldce", context);
@@ -11381,6 +11572,9 @@ int main() {
   ok &= testFinalCleanupCountsPartialReadResidue();
   ok &= testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering();
   ok &= testPostRewritePeepholeSimplifiesExtractFromInsertedRange();
+  ok &= testConstantDivisionMagicFold();
+  ok &= testConstantDivisionAddCorrectionFormIsLeftAlone();
+  ok &= testConstantDivisionUnknownMagicIsLeftAlone();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
   ok &= testFinalCleanupDropsDeadUnknownValueCalls();
   ok &= testFinalCleanupLowersValueRangeHelpers();
