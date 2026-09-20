@@ -590,3 +590,88 @@ Add/Sub 不动：它们的 lane demand 只是保守程度问题（进位链）�
   入口/unknown"的函数，先查 demand 链上有没有 zero-demand poison，而不是先怪
   partial-write 边界。
 
+
+
+## 常数除法魔数识别（实现；2026-09-20 续）
+
+用户原始 prompt：
+
+> 对 还是单独做一轮识别吧 还是能够提升可读性的
+
+### 位置与形态（相对上一节设计的调整）
+
+落在 `runNativeRegisterPostRewritePeephole`（寄存器重写之后、final cleanup 之前），
+不是上一节设想的 pre-summary peephole。理由：识别只需要值图；pre-summary 那时链上
+还缠着 register store / partial write，post-rewrite 时链已经是干净 SSA。上一节选
+pre-summary 的动机（"寄存器还没消除时治返回绑定"）已经被同宽 mul 那个修复取代，
+换到后面只减少匹配噪声。
+
+匹配的形态（`x` 是 i64；魔数在前在后都认；链上还有别的使用者不影响改写）：
+
+```llvm
+%w = zext i64 %x to i128
+%m = mul i128 %w, <magic>
+%h = lshr i128 %m, K            ; K >= 64
+%t = trunc i128 %h to i64       ; 形态 A：root = %t
+%q = lshr i64 %t, s             ; 形态 B：root = %q，总移位 K = 64 + s
+```
+
+### 反解：Granlund-Montgomery，证明而不是抽样
+
+`M == ceil(2^K/d)` 且 `(M*d - 2^K) * 2^L <= 2^K` ⇒ `floor(x*M/2^K) == floor(x/d)`
+对全部 `x < 2^L` 成立（Hacker's Delight 4-1）。两条都验证过才改写，所以是等价变换，
+不是"看着像除法"。
+
+- `L` 取被除数本身的值上界：普通 i64 值 `L = 64`；被除数是 `lshr i64 %y, k` 时
+  `L = 64 - k`。clang 就是按这个更窄的范围挑魔数的：`x/10^9` 是 `(x>>9)/1953125`，
+  `M = 0x44B82FA09B5A53`、`K = 75`，只有把 L 收到 55 才验证得过（`e = 399807 <= 2^20`）。
+- 反解不搜索：`M == ceil(2^K/d)` 等价于 `d ∈ [2^K/M, 2^K/(M-1))`，这个区间宽度只有
+  约 `d^2/2^K`（远小于 1），所以 `d = ceil(2^K/M)` 直接算出来再验证。上一节设计里的
+  "d ∈ [3,4096] 有界搜索"因此不需要了，除数不设上界。
+
+不认的形态（整体跳过，不半改）：带 add 修正的魔数形态（`x/7`、`x/4095` 是
+`mulhi; sub; shr; add; shr`）、有符号除法（sext/ashr 链）、i32 版本（`mul i64` 形态）。
+`x/512` 这类 2 的幂本来就是纯 shift，没有魔数可认。
+
+### clang ground truth
+
+`clang -O2 -S`（llvm-22.1.0.obj，x86-64）生成的 (d, M, s) 直接抄进单测表：
+
+| d | M | s |
+|---|---|---|
+| 3 | 0xAAAAAAAAAAAAAAAB | 1 |
+| 5 | 0xCCCCCCCCCCCCCCCD | 2 |
+| 6 | 0xAAAAAAAAAAAAAAAB | 2 |
+| 9 | 0xE38E38E38E38E38F | 3 |
+| 10 | 0xCCCCCCCCCCCCCCCD | 3 |
+| 72 | 0xE38E38E38E38E38F | 6 |
+| 4097 | 0xFFF000FFF000FFF1 | 12 |
+| 10^9 | 0x44B82FA09B5A53（先 >>9） | 11 |
+
+### 单测（`tests/native_register_summary_ssa_test.cpp`）
+
+- `testConstantDivisionMagicFold`：上表每项 ×（形态 A、形态 B）都断言折成 `udiv x, d`，
+  且乘法链被收干净（`!functionHasMul`）；
+- `testConstantDivisionAddCorrectionFormIsLeftAlone`：x/7 的 add 修正形态原样保留；
+- `testConstantDivisionUnknownMagicIsLeftAlone`：不对应任何除数的魔数原样保留。
+
+### 效果与验证
+
+- `FUN_1a380`（base64 解码的长度检查）现在读作
+  `%0 = udiv i64 %unique_4c80_8, 3` / `%1 = udiv i64 %unique_4700_8, 72`，
+  和源码里的 `srclen*4/3` 对得上。
+- memcached：识别 7 处，最终 IR 里留下 6 条 `udiv`（除数 3 / 72 / 100×3 / 10^9，
+  分布在 FUN_1a380、FUN_1b9e0、FUN_1c010、FUN_1d670）；unknown 仍是 0；
+  `llvm-as` + `opt -passes=verify` 通过；耗时 4m53s（改动前同机 4m57s～5m32s，同档）。
+- wrk：识别 1 处（`udiv ..., 1000`）；unknown 15 条不变（仍是 x87 窗口 ST0/ST1）；
+  verify 通过；35s（改动前 35.4s）。
+- `ctest --test-dir build`：12/12 通过，含 fortune x86_64/i386。
+- 覆盖检查：memcached 产物里剩下的 12 条 `mul i128` 两个操作数都是运行时值的 zext
+  （真正的 64×64→128 乘法），没有漏认的魔数除法。
+
+### 代价与后续
+
+- 只扫 i64 的 trunc/lshr 根，反解 O(1)，代价可以忽略；产物里 `udiv` 更短。
+- 还没认的：add 修正形态（`x/7`、`x/4095` 这类）、有符号除法、i32 形态。
+  都是独立的形态和验证，真要做应该各自一轮，不要塞进同一个 matcher。
+
