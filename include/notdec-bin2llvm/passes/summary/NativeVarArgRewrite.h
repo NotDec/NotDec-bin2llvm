@@ -62,4 +62,11 @@ std::optional<NativeVarArgInfo> nativeVarArgInfo(const llvm::Function &function)
 void printNativeVarArgRewriteSummary(const NativeVarArgRewriteSummary &summary,
                                      llvm::raw_ostream &os);
 
+// Stage 2：把"自己取变参"的手写菱形（gp_offset/fp_offset 比较 + 保存区/溢出区
+// 双路径 + 偏移推进，见 X86ISelLowering.cpp LowerVAARG）折成 va_arg 指令。
+// 纯局部变换，不改签名/调用点；匹配不上就跳过。返回折掉的站点数。
+// 放在 summary SSA 与签名重写之后调用：那时 lift 的寄存器中转已经被展开，
+// 菱形是干净的 SSA 形态。
+uint64_t foldManualVaArgSequences(llvm::Module &module);
+
 } // namespace notdec::bin2llvm

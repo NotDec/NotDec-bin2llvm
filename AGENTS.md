@@ -13,6 +13,22 @@
 
 目标是为 Bench2 真实二进制生成语义正确的 LLVM IR；能被 `llvm-as` 接受只是底线。数据和产物位于 `/sn640/NotDec-Exp/Bench2`：`rootfs/`、`manifest/benchmark-targets.tsv`、`manifest/benchmark-needed.tsv`、`bin2llvm-ir/`。需要对照 Ghidra 时直接读 `/sn640/ghidra`。
 
+## 模式匹配类 pass 的设计理念
+
+native 侧凡是"识别编译器生成的模式"（变参序言/va_arg 展开、帧指针用法、栈 canary、
+x87 窗口等）都遵循：
+
+1. **先看编译器源码**，确定"编译器会生成什么"，再照着写匹配。例如变参序言和 va_arg
+   展开直接对照 LLVM `lib/Target/X86/X86ISelLowering.cpp` 的 `LowerVASTART`/`LowerVAARG`；
+   必要时用 LLVM 22 的 `clang`/`llc` 造 ground truth 对拍（C 例子 → 汇编、手写 `.ll` → 汇编），
+   不凭印象猜形态。
+2. **用最少的代码匹配这些固定模式**：机器码 ↔ IR 一一对应；不做通用数据流推断、不猜类型、
+   不推广到编译器不会生成的形态。识别不到就是识别不到。
+3. **要么完整命中、要么整体放弃**：匹配与改写整体成功或整体跳过（保守跳过），绝不"半改"
+   ——半改会让寄存器/栈槽的推进和手工代码对不上。
+4. **识别结果挂 metadata**（如 `!notdec.vararg`），后续签名/调用点推断只读 metadata，
+   匹配逻辑与消费方解耦，改匹配不连带动签名推断。
+
 native 计划必须说明已有 native 状态，列出 Ghidra 源码文件和关键函数，区分需要复刻的策略与保守暂缓的部分，再写阶段、判断标准、风险和不做什么。本格式只用于 native bin2llvm。
 
 ## 寄存器消除路线

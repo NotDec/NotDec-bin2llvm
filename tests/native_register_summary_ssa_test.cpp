@@ -11015,6 +11015,104 @@ bool testVarArgPrologueBecomesVaStart() {
                 "vararg function kept garbage fixed parameters") &&
          verifyOk(module, "module failed verifier after vararg SSA");
 }
+
+// Stage 2：把"自己取变参"的手写菱形折成 va_arg。这里按 summary SSA 之后的干净
+// 形态直接构造（GP i32 / FP double 两条路径各一个），外加一个"少了偏移推进"的
+// 反例，必须原样保留（要么整块命中、要么整块放弃）。
+bool testManualVaArgDiamondBecomesVaArgInstruction() {
+  llvm::LLVMContext context;
+  llvm::Module module("manual-va-arg-fold", context);
+  auto *i32Type = llvm::Type::getInt32Ty(context);
+  auto *i64Type = llvm::Type::getInt64Ty(context);
+  auto *doubleType = llvm::Type::getDoubleTy(context);
+  auto *ptrType = llvm::PointerType::get(context, 0);
+
+  auto buildConsumer = [&](llvm::StringRef name, llvm::Type *valueType,
+                           uint64_t limit, uint64_t regStride,
+                           uint64_t fieldOffset, bool withBump) {
+    llvm::Function *function = llvm::Function::Create(
+        llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                                {ptrType, ptrType}, false),
+        llvm::GlobalValue::ExternalLinkage, name, module);
+    llvm::Argument *ap = function->getArg(0);
+    llvm::Argument *sink = function->getArg(1);
+    llvm::BasicBlock *entry =
+        llvm::BasicBlock::Create(context, "entry", function);
+    llvm::BasicBlock *reg = llvm::BasicBlock::Create(context, "reg", function);
+    llvm::BasicBlock *stack =
+        llvm::BasicBlock::Create(context, "stack", function);
+    llvm::BasicBlock *join = llvm::BasicBlock::Create(context, "join", function);
+    llvm::IRBuilder<> builder(entry);
+    auto field = [&](uint64_t offset) {
+      return builder.CreateGEP(llvm::Type::getInt8Ty(context), ap,
+                               llvm::ConstantInt::get(i64Type, offset));
+    };
+    llvm::Value *offField = field(fieldOffset);
+    llvm::Value *overflowField = field(8);
+    llvm::Value *regSaveField = field(16);
+    llvm::Value *off = builder.CreateLoad(i32Type, offField, "off");
+    llvm::Value *cmp = builder.CreateICmpULT(
+        off, llvm::ConstantInt::get(i32Type, limit));
+    builder.CreateCondBr(cmp, reg, stack);
+    builder.SetInsertPoint(reg);
+    llvm::Value *base = builder.CreateLoad(ptrType, regSaveField, "reg_save");
+    llvm::Value *index = builder.CreateZExt(off, i64Type);
+    llvm::Value *addr =
+        builder.CreateGEP(llvm::Type::getInt8Ty(context), base, index);
+    if (withBump) {
+      llvm::Value *next =
+          builder.CreateAdd(off, llvm::ConstantInt::get(i32Type, regStride));
+      builder.CreateStore(next, offField);
+    }
+    llvm::Value *v1 = builder.CreateLoad(valueType, addr, "v1");
+    builder.CreateBr(join);
+    builder.SetInsertPoint(stack);
+    llvm::Value *overflow =
+        builder.CreateLoad(ptrType, overflowField, "overflow");
+    llvm::Value *q2 = builder.CreateGEP(llvm::Type::getInt8Ty(context), overflow,
+                                        llvm::ConstantInt::get(i64Type, 8));
+    builder.CreateStore(q2, overflowField);
+    llvm::Value *v2 = builder.CreateLoad(valueType, q2, "v2");
+    builder.CreateBr(join);
+    builder.SetInsertPoint(join);
+    llvm::PHINode *phi = builder.CreatePHI(valueType, 2, "v");
+    phi->addIncoming(v1, reg);
+    phi->addIncoming(v2, stack);
+    builder.CreateStore(phi, sink);
+    builder.CreateRetVoid();
+    return function;
+  };
+
+  buildConsumer("va_arg_gp", i32Type, 48, 8, 0, /*withBump=*/true);
+  buildConsumer("va_arg_fp", doubleType, 176, 16, 4, /*withBump=*/true);
+  buildConsumer("va_arg_incomplete", i32Type, 48, 8, 0, /*withBump=*/false);
+
+  llvm::Function *gp = module.getFunction("va_arg_gp");
+  llvm::Function *fp = module.getFunction("va_arg_fp");
+  llvm::Function *incomplete = module.getFunction("va_arg_incomplete");
+  uint64_t folded = notdec::bin2llvm::foldManualVaArgSequences(module);
+
+  auto vaArgs = [](llvm::Function &function) {
+    std::vector<llvm::VAArgInst *> found;
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (auto *vaArg = llvm::dyn_cast<llvm::VAArgInst>(&inst)) {
+        found.push_back(vaArg);
+      }
+    }
+    return found;
+  };
+
+  return expect(folded == 2, "manual va_arg diamonds were not folded") &&
+         expect(vaArgs(*gp).size() == 1 &&
+                    vaArgs(*gp).front()->getType() == i32Type,
+                "GP va_arg diamond was not folded to an i32 va_arg") &&
+         expect(vaArgs(*fp).size() == 1 &&
+                    vaArgs(*fp).front()->getType() == doubleType,
+                "FP va_arg diamond was not folded to a double va_arg") &&
+         expect(vaArgs(*incomplete).empty(),
+                "incomplete va_arg sequence must be left alone") &&
+         verifyOk(module, "module failed verifier after va_arg folding");
+}
 } // namespace
 
 int main() {
@@ -11033,6 +11131,7 @@ int main() {
   ok &= testEraseDeadUnknownValueCalls();
   ok &= testMixedCallBoundaryAttributesUnknownToCallee();
   ok &= testVarArgPrologueBecomesVaStart();
+  ok &= testManualVaArgDiamondBecomesVaArgInstruction();
   ok &= testCalleeSavedRegisterSurvivesInternalCall();
   ok &= testDirectionFlagIsZeroAtBoundaries();
   ok &= testRegisterPointerPhiLoadIsCanonicalized();

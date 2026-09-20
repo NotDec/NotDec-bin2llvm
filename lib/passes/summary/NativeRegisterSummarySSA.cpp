@@ -8942,6 +8942,8 @@ runNativeRegisterSummarySSA(llvm::Module &module,
     addDemandedExternalReturns(signatureState, units, abi, externalPrototypes);
     markSignatureCallArgStores(signatureState, summary);
     rewriteSignatureShapes(module, signatureState, units, abi, summary);
+    // Stage 2：签名/SSA 都稳定之后，把"自己取变参"的手写菱形折成 va_arg。
+    (void)foldManualVaArgSequences(module);
     eraseUnusedSummaryHelperDeclarations(module);
     // 重写会用 takeName 替换函数对象（createReplacementFunction），按旧函数
     // 指针组织的 facts 在清理遍查不到（rangeMayComeFromEntry 等走缺省回退）。

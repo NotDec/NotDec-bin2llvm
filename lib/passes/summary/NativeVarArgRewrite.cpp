@@ -22,6 +22,15 @@
 #include <string>
 #include <vector>
 
+// 设计理念（native 侧"识别编译器生成的模式"统一遵循，见 AGENTS.md）：
+//   1) 先读编译器自己的 lowering 代码，确定"编译器会生成什么"，再照着写匹配。
+//      变参这边就是 LLVM 的 X86 LowerVASTART / LowerVAARG（X86ISelLowering.cpp
+//      :26203 / :26261），必要时用 clang/llc 造 ground truth 对拍；
+//   2) 用最少的代码匹配这些固定模式：不做通用数据流推断、不猜类型、不推广到
+//      编译器不会生成的形态；
+//   3) 每个模式要么完整命中并整体改写，要么整体放弃（保守跳过，绝不半改）；
+//   4) 识别结果挂 metadata（这里是 !notdec.vararg），签名/调用点推断只读
+//      metadata，匹配逻辑和消费方解耦。
 namespace notdec::bin2llvm {
 namespace {
 
@@ -613,6 +622,427 @@ void printNativeVarArgRewriteSummary(const NativeVarArgRewriteSummary &summary,
     os << "]";
   }
   os << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2：把"自己取变参"的手写菱形折成 va_arg 指令。
+//
+// 模式来自编译器自己的 lowering（LLVM X86ISelLowering.cpp:26261 LowerVAARG）：
+//   %off  = load i32, ptr %ap+0(GP) / +4(FP)
+//   %cmp  = icmp ult i32 %off, 48(GP) / 176(FP)
+//   br %cmp, %reg, %stack
+//   reg:   %base = load ptr, ptr %ap+16
+//          %p    = gep i8 %base, %off
+//          %next = add i32 %off, 8(GP) / 16(FP)
+//          store %next, ptr %ap+0 / +4
+//          %v1   = load T, ptr %p
+//   stack: %q = load ptr, ptr %ap+8
+//          %q2 = gep i8 %q, 8 / 16
+//          store %q2, ptr %ap+8
+//          %v2 = load T, ptr %q2
+//   join:  %v = phi [%v1,%reg], [%v2,%stack]
+// 折成 join 之前的 "%v = va_arg ptr %ap, T"。
+//
+// 这是纯局部变换：va_arg 在后端会重新展开成同一个菱形，机器码不变，只是 IR
+// 回到 C 形态。匹配要求"要么整块命中、要么整块放弃"（绝不半改），
+// 因为错误的半折会让 gp_offset/fp_offset 的推进和手工代码对不上。
+// ---------------------------------------------------------------------------
+namespace {
+
+struct FieldRef {
+  llvm::Value *Base = nullptr;
+  uint64_t Offset = 0;
+};
+
+// 把字段指针解析成 (基址, 常量偏移)：ap+0/+4/+8/+16 这种形态。
+std::optional<FieldRef> fieldRef(llvm::Value *pointer) {
+  pointer = pointer->stripPointerCasts();
+  if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(pointer)) {
+    if (gep->getNumOperands() == 2) {
+      auto *index = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1));
+      if (index != nullptr) {
+        return FieldRef{gep->getPointerOperand()->stripPointerCasts(),
+                        index->getZExtValue()};
+      }
+    }
+    return std::nullopt;
+  }
+  return FieldRef{pointer, 0};
+}
+
+struct ManualVaArg {
+  llvm::BranchInst *Branch = nullptr;
+  llvm::BasicBlock *Reg = nullptr;
+  llvm::BasicBlock *Stack = nullptr;
+  llvm::BasicBlock *Join = nullptr;
+  llvm::PHINode *Phi = nullptr;
+  llvm::Value *VaList = nullptr;
+  llvm::Type *ValueType = nullptr;
+  uint64_t FieldOffset = 0;
+  uint64_t Stride = 0;
+};
+
+// 匹配上限常量：48 → GP（字段 +0，步长 8）；176 → FP（字段 +4，步长 16）。
+bool vaArgLimits(uint64_t limit, uint64_t &stride, uint64_t &fieldOffset) {
+  if (limit == GpSaveAreaSize) {
+    stride = 8;
+    fieldOffset = 0;
+    return true;
+  }
+  if (limit == FpOffsetBase + FpSaveAreaSize) {
+    stride = 16;
+    fieldOffset = 4;
+    return true;
+  }
+  return false;
+}
+
+// 一个分支块里，除 terminator 外只允许这些"已知用途"的指令，其余一律放弃。
+std::optional<llvm::LoadInst *>
+matchVaArgRegBlock(llvm::BasicBlock &block, llvm::BasicBlock &join,
+                   const FieldRef &field, llvm::Value &offValue,
+                   uint64_t stride, llvm::PHINode *&phi, llvm::Type *&valueType,
+                   std::set<llvm::Instruction *> &matched) {
+  auto *term = llvm::dyn_cast<llvm::BranchInst>(block.getTerminator());
+  if (term == nullptr || term->isConditional() ||
+      term->getSuccessor(0) != &join) {
+    return std::nullopt;
+  }
+  llvm::LoadInst *baseLoad = nullptr;
+  llvm::LoadInst *valueLoad = nullptr;
+  llvm::LoadInst *offsetLoad = nullptr;
+  llvm::Instruction *bumpAdd = nullptr;
+  llvm::StoreInst *bumpStore = nullptr;
+  for (llvm::Instruction &inst : block) {
+    if (inst.isTerminator()) {
+      continue;
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      if (baseLoad == nullptr) {
+        std::optional<FieldRef> ref = fieldRef(load->getPointerOperand());
+        // reg_save_area 在 va_list 的绝对偏移 +16（不是 field+16）。
+        if (ref && ref->Base == field.Base && ref->Offset == 16 &&
+            load->getType()->isPointerTy()) {
+          baseLoad = load;
+          continue;
+        }
+      }
+      if (valueLoad == nullptr) {
+        valueLoad = load;
+        continue;
+      }
+      return std::nullopt;
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      std::optional<FieldRef> ref = fieldRef(store->getPointerOperand());
+      if (bumpStore != nullptr || !ref || ref->Base != field.Base ||
+          ref->Offset != field.Offset) {
+        return std::nullopt;
+      }
+      bumpStore = store;
+      continue;
+    }
+    if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&inst)) {
+      // 地址计算用的 GEP；块里所有非终结指令最后都要在 matched 里。
+      matched.insert(gep);
+      continue;
+    }
+    if (llvm::isa<llvm::CastInst>(&inst) ||
+        llvm::isa<llvm::BinaryOperator>(&inst)) {
+      matched.insert(&inst);
+      continue;
+    }
+    return std::nullopt;
+  }
+  if (baseLoad == nullptr || valueLoad == nullptr || bumpStore == nullptr) {
+    return std::nullopt;
+  }
+  // bump：store (off + stride) 到 gp_offset/fp_offset 字段。
+  llvm::Value *off = stripValueCasts(&offValue);
+  bumpAdd = llvm::dyn_cast<llvm::Instruction>(stripValueCasts(bumpStore->getValueOperand()));
+  if (bumpAdd == nullptr) {
+    return std::nullopt;
+  }
+  if (auto *add = llvm::dyn_cast<llvm::BinaryOperator>(bumpAdd)) {
+    auto *lhs = stripValueCasts(add->getOperand(0));
+    auto *rhs = llvm::dyn_cast<llvm::ConstantInt>(add->getOperand(1));
+    if (lhs != off || rhs == nullptr || rhs->getZExtValue() != stride) {
+      return std::nullopt;
+    }
+  } else {
+    return std::nullopt;
+  }
+  // 取值地址：from baseLoad，索引是 off 本身（或它的 zext）。
+  auto *addrGep =
+      llvm::dyn_cast<llvm::GetElementPtrInst>(valueLoad->getPointerOperand());
+  if (addrGep == nullptr || addrGep->getNumOperands() != 2 ||
+      addrGep->getPointerOperand()->stripPointerCasts() != baseLoad) {
+    return std::nullopt;
+  }
+  llvm::Value *index = stripValueCasts(addrGep->getOperand(1));
+  if (index != off) {
+    return std::nullopt;
+  }
+  // phi 必须只由这一对 load 组成。
+  for (llvm::User *user : valueLoad->users()) {
+    if (user != phi) {
+      return std::nullopt;
+    }
+  }
+  valueType = valueLoad->getType();
+  matched.insert(baseLoad);
+  matched.insert(valueLoad);
+  matched.insert(bumpStore);
+  matched.insert(bumpAdd);
+  matched.insert(addrGep);
+  return valueLoad;
+}
+
+std::optional<llvm::LoadInst *>
+matchVaArgStackBlock(llvm::BasicBlock &block, llvm::BasicBlock &join,
+                     const FieldRef &field, uint64_t stride, llvm::PHINode *&phi,
+                     llvm::Type *valueType,
+                     std::set<llvm::Instruction *> &matched) {
+  auto *term = llvm::dyn_cast<llvm::BranchInst>(block.getTerminator());
+  if (term == nullptr || term->isConditional() ||
+      term->getSuccessor(0) != &join) {
+    return std::nullopt;
+  }
+  llvm::LoadInst *overflowLoad = nullptr;
+  llvm::GetElementPtrInst *nextGep = nullptr;
+  llvm::StoreInst *bumpStore = nullptr;
+  llvm::LoadInst *valueLoad = nullptr;
+  for (llvm::Instruction &inst : block) {
+    if (inst.isTerminator()) {
+      continue;
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      if (overflowLoad == nullptr) {
+        std::optional<FieldRef> ref = fieldRef(load->getPointerOperand());
+        if (ref && ref->Base == field.Base && ref->Offset == 8 &&
+            load->getType()->isPointerTy()) {
+          overflowLoad = load;
+          continue;
+        }
+      }
+      if (valueLoad == nullptr) {
+        valueLoad = load;
+        continue;
+      }
+      return std::nullopt;
+    }
+    if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&inst)) {
+      if (nextGep != nullptr) {
+        return std::nullopt;
+      }
+      nextGep = gep;
+      continue;
+    }
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      if (bumpStore != nullptr) {
+        return std::nullopt;
+      }
+      bumpStore = store;
+      continue;
+    }
+    return std::nullopt;
+  }
+  if (overflowLoad == nullptr || nextGep == nullptr || bumpStore == nullptr ||
+      valueLoad == nullptr) {
+    return std::nullopt;
+  }
+  // 溢出区的步长由值大小决定（GP/FP 都一样是 8 或值大小向上取 8），
+  // 和寄存器区的 stride 不一定相同（double 是 16 vs 8），所以只要求是常量。
+  auto *index = llvm::dyn_cast<llvm::ConstantInt>(nextGep->getOperand(1));
+  if (nextGep->getNumOperands() != 2 ||
+      nextGep->getPointerOperand()->stripPointerCasts() != overflowLoad ||
+      index == nullptr || index->getZExtValue() == 0) {
+    return std::nullopt;
+  }
+  std::optional<FieldRef> storeRef = fieldRef(bumpStore->getPointerOperand());
+  if (!storeRef || storeRef->Base != field.Base || storeRef->Offset != 8 ||
+      stripValueCasts(bumpStore->getValueOperand()) != nextGep) {
+    return std::nullopt;
+  }
+  if (stripValueCasts(valueLoad->getPointerOperand()) != nextGep ||
+      valueLoad->getType() != valueType) {
+    return std::nullopt;
+  }
+  for (llvm::User *user : valueLoad->users()) {
+    if (user != phi) {
+      return std::nullopt;
+    }
+  }
+  matched.insert(overflowLoad);
+  matched.insert(nextGep);
+  matched.insert(bumpStore);
+  matched.insert(valueLoad);
+  return valueLoad;
+}
+
+std::optional<ManualVaArg> matchManualVaArg(llvm::BranchInst &branch) {
+  if (!branch.isConditional()) {
+    return std::nullopt;
+  }
+  auto *cmp = llvm::dyn_cast<llvm::ICmpInst>(branch.getCondition());
+  if (cmp == nullptr || cmp->getPredicate() != llvm::CmpInst::ICMP_ULT) {
+    return std::nullopt;
+  }
+  auto *limit = llvm::dyn_cast<llvm::ConstantInt>(cmp->getOperand(1));
+  auto *offsetLoad = llvm::dyn_cast<llvm::LoadInst>(
+      stripValueCasts(cmp->getOperand(0)));
+  if (limit == nullptr || offsetLoad == nullptr ||
+      !offsetLoad->getType()->isIntegerTy(32)) {
+    return std::nullopt;
+  }
+  uint64_t stride = 0;
+  uint64_t fieldOffset = 0;
+  if (!vaArgLimits(limit->getZExtValue(), stride, fieldOffset)) {
+    return std::nullopt;
+  }
+  std::optional<FieldRef> field = fieldRef(offsetLoad->getPointerOperand());
+  if (!field || field->Base == nullptr || field->Offset != fieldOffset) {
+    return std::nullopt;
+  }
+  llvm::BasicBlock *first = branch.getSuccessor(0);
+  llvm::BasicBlock *second = branch.getSuccessor(1);
+  if (first == second) {
+    return std::nullopt;
+  }
+  for (unsigned order = 0; order < 2; ++order) {
+    llvm::BasicBlock *reg = order == 0 ? first : second;
+    llvm::BasicBlock *stack = order == 0 ? second : first;
+    if (reg->getSinglePredecessor() != branch.getParent() ||
+        stack->getSinglePredecessor() != branch.getParent()) {
+      continue;
+    }
+    llvm::BasicBlock *join =
+        llvm::cast<llvm::BranchInst>(reg->getTerminator())->getSuccessor(0);
+    if (join == nullptr || llvm::cast<llvm::BranchInst>(stack->getTerminator())
+                                ->getSuccessor(0) != join) {
+      continue;
+    }
+    llvm::PHINode *phi = nullptr;
+    for (llvm::Instruction &inst : *join) {
+      auto *candidate = llvm::dyn_cast<llvm::PHINode>(&inst);
+      if (candidate == nullptr) {
+        break;
+      }
+      if (candidate->getNumIncomingValues() != 2 ||
+          candidate->getIncomingBlock(0) == nullptr) {
+        continue;
+      }
+      llvm::BasicBlock *in0 = candidate->getIncomingBlock(0);
+      llvm::BasicBlock *in1 = candidate->getIncomingBlock(1);
+      if ((in0 == reg && in1 == stack) || (in0 == stack && in1 == reg)) {
+        phi = candidate;
+        break;
+      }
+    }
+    if (phi == nullptr) {
+      continue;
+    }
+    std::set<llvm::Instruction *> matched;
+    llvm::Type *valueType = nullptr;
+    std::optional<llvm::LoadInst *> regLoad =
+        matchVaArgRegBlock(*reg, *join, *field, *cmp->getOperand(0), stride, phi,
+                           valueType, matched);
+    if (!regLoad.has_value() || valueType == nullptr) {
+      continue;
+    }
+    std::optional<llvm::LoadInst *> stackLoad = matchVaArgStackBlock(
+        *stack, *join, *field, stride, phi, valueType, matched);
+    if (!stackLoad.has_value()) {
+      continue;
+    }
+    // 完整性：两块里所有非终结指令都必须在 matched 里；offset 的所有使用者
+    // 只能是那次比较或 matched 里的指令——否则删掉它们会破坏别处。
+    bool complete = true;
+    for (llvm::Instruction &inst : *reg) {
+      if (!inst.isTerminator() && matched.count(&inst) == 0) {
+        complete = false;
+        break;
+      }
+    }
+    if (complete) {
+      for (llvm::Instruction &inst : *stack) {
+        if (!inst.isTerminator() && matched.count(&inst) == 0) {
+          complete = false;
+          break;
+        }
+      }
+    }
+    if (complete) {
+      for (llvm::User *user : offsetLoad->users()) {
+        auto *userInst = llvm::dyn_cast<llvm::Instruction>(user);
+        if (userInst == nullptr ||
+            (userInst != cmp && matched.count(userInst) == 0)) {
+          complete = false;
+          break;
+        }
+      }
+    }
+    if (!complete) {
+      continue;
+    }
+    ManualVaArg result;
+    result.Branch = &branch;
+    result.Reg = reg;
+    result.Stack = stack;
+    result.Join = join;
+    result.Phi = phi;
+    result.VaList = field->Base;
+    result.ValueType = valueType;
+    result.FieldOffset = fieldOffset;
+    result.Stride = stride;
+    return result;
+  }
+  return std::nullopt;
+}
+
+} // namespace
+
+uint64_t foldManualVaArgSequences(llvm::Module &module) {
+  uint64_t folded = 0;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    std::vector<llvm::BranchInst *> branches;
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(&inst)) {
+        if (branch->isConditional()) {
+          branches.push_back(branch);
+        }
+      }
+    }
+    for (llvm::BranchInst *branch : branches) {
+      if (branch->getParent() == nullptr) {
+        continue;
+      }
+      std::optional<ManualVaArg> match = matchManualVaArg(*branch);
+      if (!match.has_value()) {
+        continue;
+      }
+      llvm::IRBuilder<> builder(branch);
+      llvm::Value *vaList = match->VaList;
+      if (!vaList->getType()->isPointerTy()) {
+        vaList = builder.CreateIntToPtr(
+            vaList, llvm::PointerType::get(function.getContext(), 0),
+            "notdec.va_arg.ap");
+      }
+      llvm::Value *value =
+          builder.CreateVAArg(vaList, match->ValueType, "notdec.va_arg");
+      match->Phi->replaceAllUsesWith(value);
+      match->Phi->eraseFromParent();
+      builder.CreateBr(match->Join);
+      branch->eraseFromParent();
+      match->Reg->eraseFromParent();
+      match->Stack->eraseFromParent();
+      ++folded;
+    }
+  }
+  return folded;
 }
 
 } // namespace notdec::bin2llvm
