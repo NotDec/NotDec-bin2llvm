@@ -487,3 +487,106 @@ wrk 15 条（x87 窗口 ST0/ST1 入口值，属于窗口建模/表示层话题�
    memcached 上 \`FUN_1a380\` 应变成正常函数、unknown 归零；ctest/fortune 不回归。
 5. 注意：这条 pass 只治这类函数；\`NativeRegisterSummarySSA.cpp:3454\` 记的"返回绑定依赖
    partial-write 边界、helper 被提前删就退化成 unknown"的通用机制仍要单独查。
+
+
+## 魔数方案实测作废：FUN_1a380 的真实根因是同宽 mul 的 lane demand（2026-09-20 续）
+
+用户原始 prompt：
+
+> 这个是之前的对话，接下来按照这个继续推进，但是不要直接就弄成 SSA 吧，因为当前在链路里面比较早
+> 不如弄成，使用寄存器 但是比原先更简单地使用的方式
+
+### 先做的实测：改写魔数乘法链消不掉这条 unknown
+
+工具支持 .ll 输入，于是直接在 `-f 0x1a380` 的 raw lift 上做 A/B，只改 IR、只看
+`notdec.unknown remaining`：
+
+| 变体 | 改法 | unknown |
+|---|---|---|
+| 对照 | 不改 | 1（`entry_range_rejected:RAX`） |
+| R1 | 常量与乘法结果都去掉寄存器往返（`store C→@RAX` + `load @RAX` 合成 SSA 值），保留 `mul/lshr/trunc` 结构和写回 | 1 |
+| R2 | 只去常量往返（`store MAGIC1/MAGIC2 → @RAX` + 对应 load） | 1 |
+
+结论：这条 unknown 跟魔数链"用不用寄存器、怎么用寄存器"无关，(a) 消不掉它。继续按
+魔数匹配做下去只是多一条不被需要的编译器模式 matcher。
+
+### 真实根因
+
+`rewritePartialWrites()`（`lib/passes/summary/NativeRegisterSummarySSA.cpp`，约 4273 行）
+对每个 register store 的数据流跑 `rewriteUndemandedRegisterStoreOperands()`，把 demand
+为零的整数 operand 换成 `poison` + `!notdec.register.summary_ssa.zero_demand_operand`
+（20260911-01 的"用 poison 暴露漏掉的 observer"设计）。FUN_1a380 的 `mulq` 被 lift 成：
+
+```llvm
+%unique_4c80_8 = shl i64 %RSI, 2
+store i64 %unique_4c80_8, ptr @RDX      ; 随即被 RDX 的新定义覆盖，这条 store 没有 demand
+%a = zext i64 0xAAAAAAAAAAAAAAAB to i128
+%b = zext i64 %unique_4c80_8 to i128
+%m = mul nuw i128 %a, %b
+%hi = lshr i128 %m, 64
+```
+
+partial demand 的 Add/Sub/Mul lane 规则（同文件约 4199 行）是：
+
+```cpp
+unsigned srcWidth = valueBitWidth(inst->getOperand(0));
+llvm::APInt lowDemand  = trimmedMask(inputDemand, srcWidth);
+llvm::APInt highDemand = inputDemand & ~maskForLowBits(valueBitWidth(inst), srcWidth);
+```
+
+`mul nuw i128` 两个操作数都是 i128，`srcWidth == resultWidth == 128`，
+`~maskForLowBits(128, 128)` 恒为空 → 永远走 lane 分支：只有 `%hi` 需求的 bit[64,128)
+被原样传给 i128 操作数，`%b = zext i64 ...` 再被 `trimmedMask(..., 64)` 一裁剪就剩零
+demand → `%unique_4c80_8` 被换成 poison → mul 变 poison → 由它算出的分支条件、RDX、
+返回值全部 poison，LLVM 按 UB 删掉函数体。签名重写后的 cleanup 读不到任何 RAX 定义，
+退回入口 range，被 `rangeMayComeFromEntry`（RAX MayEntry=0）拒绝——就是那条
+`entry_range_rejected:RAX`。
+
+定位手段（一次性，已删除不入库）：在 `attributedRangeUnknown()` 与 `entryRangeInput()`
+的拒绝分支加 `getenv` 打印，得到 `ENTRYREJECT block=entry detail=offset=0,width=64` 和
+`RANGELOSS read=ret reason=entry_range_rejected`；再在
+`removeDeadStoresAfterSignatureRewrite()` 开头 dump 函数，看到 cleanup 第一轮时函数只剩
+`entry` + 两个 RDX entry read + `ret i64 poison`，而 pass A 结束时的 dump 是完整的 13 个
+block。两者一对比就把"值被 poison"和"返回绑定读不到定义"接上了。
+
+### 修复
+
+同宽乘法没有"低位段"可依赖——乘积的每一位都依赖两个操作数的全部位——任何一位需求都
+必须 demand 全部操作数：
+
+```cpp
+bool sameWidthMul = inst->getOpcode() == llvm::Instruction::Mul &&
+                    srcWidth >= resultWidth;
+llvm::APInt highDemand = sameWidthMul ? inputDemand
+                                      : inputDemand & ~maskForLowBits(resultWidth, srcWidth);
+```
+
+Add/Sub 不动：它们的 lane demand 只是保守程度问题（进位链），一起改会把全程序的需求面
+放大。改动 15 行，理解成本低；维护上把"lane 规则只对窄操作数成立"写进了注释。
+
+### 验证
+
+- 单测：`tests/native_register_summary_ssa_test.cpp` 新增
+  `testPartialDemandKeepsSameWidthMulOperand`（dead register store + `mul i128` + 调用点
+  读 RAX，断言这条函数里没有 zero-demand poison）。把修复 revert 后该断言失败
+  （`same-width mul operand was replaced with poison`），恢复修复后通过。
+- `-f 0x1a380`：改前 `total=1 [entry_range_rejected:RAX=1]`、函数体被清空；改后
+  `total=0`，函数是 237 行的正常函数，base64 解码循环与
+  `mul 0xAAAAAAAAAAAAAAAB` 链都在（InstCombine 顺手把 `lshr 64` + `lshr 1` 折成 `lshr 65`）。
+- 全量 memcached（`--all-confirmed --register-ssa-summary`）：unknown 1 → **0**，
+  `FUN_1a380` 是 237 行的正常函数；`llvm-as` + `opt -passes=verify` 通过。
+  耗时 4m57s（改前那次 5m32s 与后台编译并行，只能算同档）。
+- wrk（`--all-confirmed --skip-runtime`）：unknown 15 条不变（仍是 x87 窗口 ST0/ST1），
+  `llvm-as` + `opt -passes=verify` 通过，35s。
+- `ctest --test-dir build`：12/12 通过，含 `realworld_fortune_x86_64`/`i386`。
+
+### 魔数识别 (b) 与返回绑定通用机制
+
+- (b)（有界搜索 `d` 反解成 `udiv/sdiv`）对这条 unknown 不是必需的，暂不做；上文
+  关于 `0xAAAAAAAAAAAAAAAB`/`BuildUDIV` 的 ground truth 仍然有效，但它是"可读性"
+  话题而不是正确性话题。
+- 返回绑定"延迟到签名重写后的 cleanup + 依赖 residue removal 保活"的通用机制没有改：
+  这次修的是它的上游（真值被 poison 掉、定义提前消失）。再遇到"返回绑定读到
+  入口/unknown"的函数，先查 demand 链上有没有 zero-demand poison，而不是先怪
+  partial-write 边界。
+
