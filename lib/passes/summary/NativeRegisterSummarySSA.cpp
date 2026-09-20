@@ -8669,11 +8669,41 @@ void rewriteSignatureShapes(
             reason = "range_return_helper_clobbered_register";
           }
           std::string regName = registerNameForRange(rangeHelper.Range);
-          value = unknownValueAt(builder, helper->getType(),
-                                 "range_return_unknown");
-          attachUnknownValueMetadata(
-              value, reason, oldCall->getFunction()->getName(),
-              calleeNameForWarning(*newCall), regName, "return");
+          if (reason == "range_return_helper_clobbered_register") {
+            // 这个寄存器在该调用点不是返回值而是 clobber：用与调用点绑定的
+            // clobber 占位（和同一调用点其它 clobber 寄存器一致），而不是
+            // notdec.unknown。两者都是 opaque 占位，但 clobber 占位说明"值来自
+            // callee 边界"，unknown 只留给真正的建模缺口。
+            llvm::Module *module = oldCall->getModule();
+            llvm::FunctionCallee clobberHelper = module->getOrInsertFunction(
+                "notdec.register.summary_clobber." +
+                    typeSuffix(*helper->getType()),
+                llvm::FunctionType::get(helper->getType(), {}, false));
+            value = builder.CreateCall(clobberHelper, {}, "notdec.range_clobber");
+            llvm::LLVMContext &context = module->getContext();
+            std::vector<llvm::Metadata *> fields;
+            fields.push_back(llvm::MDString::get(context, "name=" + regName));
+            fields.push_back(llvm::MDString::get(context, "kind=clobber"));
+            uint64_t callIndex = 0;
+            for (const llvm::Instruction &inst : *newCall->getParent()) {
+              if (&inst == newCall) {
+                break;
+              }
+              ++callIndex;
+            }
+            fields.push_back(llvm::MDString::get(
+                context, "call_index=" + std::to_string(callIndex)));
+            if (auto *valueInst = llvm::dyn_cast<llvm::Instruction>(value)) {
+              valueInst->setMetadata("notdec.register.summary_ssa.call_value",
+                                     llvm::MDNode::get(context, fields));
+            }
+          } else {
+            value = unknownValueAt(builder, helper->getType(),
+                                   "range_return_unknown");
+            attachUnknownValueMetadata(
+                value, reason, oldCall->getFunction()->getName(),
+                calleeNameForWarning(*newCall), regName, "return");
+          }
         }
         valueMap[helper] = value;
         helper->replaceAllUsesWith(value);
