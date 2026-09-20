@@ -268,10 +268,14 @@ llvm::Value *simplifyInsertedValueExtract(llvm::TruncInst &trunc) {
 std::optional<uint64_t> solveMagicDivisor(const llvm::APInt &magic,
                                            unsigned shift,
                                            unsigned inputBits,
-                                           unsigned valueWidth) {
+                                           unsigned valueWidth,
+                                           bool allowShortShift = false) {
+  // 2W 位乘积取高半段时移位一定 >= W；窄乘积形态（16 位除法提升到 32 位）
+  // 在 W 位内就算完了，移位可以更小，靠 inputBits 限住输入范围。
+  unsigned minShift = allowShortShift ? 1 : valueWidth;
   if (magic.isZero() || valueWidth == 0 || valueWidth > 64 ||
       magic.getActiveBits() > valueWidth || inputBits == 0 ||
-      inputBits > valueWidth || shift < valueWidth ||
+      inputBits > valueWidth || shift < minShift ||
       shift > 2 * valueWidth) {
     return std::nullopt;
   }
@@ -370,13 +374,16 @@ struct MagicMulChain {
   // Shift 仍是取 h 的移位 N（一般为 W），ExtraShift = s + 1。
   bool AddCorrection = false;
   unsigned ExtraShift = 0;
+  // 窄乘积形态：`mul iW` 自身宽（16 位除法被提升到 32 位），移位可以 < W。
+  bool NarrowProduct = false;
 };
 
 // `%m = mul i(2W) (zext|sext iW %x), <常量>`：两种除法共用的乘积解析。
 struct MagicProduct {
-  llvm::Value *Scaled = nullptr;
+  llvm::Value *Scaled = nullptr; // 扩展前的值（可能比 W 窄）。
   llvm::ConstantInt *Magic = nullptr;
   bool Signed = false;
+  unsigned SourceBits = 0; // Scaled 的位宽：比 W 窄时是"窄源加宽"形态。
 };
 
 std::optional<MagicProduct> parseMagicProduct(llvm::Instruction &mul,
@@ -412,9 +419,12 @@ std::optional<MagicProduct> parseMagicProduct(llvm::Instruction &mul,
   } else {
     return std::nullopt;
   }
-  if (!product.Scaled->getType()->isIntegerTy(width)) {
-    return std::nullopt;
+  auto *sourceType =
+      llvm::dyn_cast<llvm::IntegerType>(product.Scaled->getType());
+  if (sourceType == nullptr || sourceType->getBitWidth() > width) {
+    return std::nullopt; // 源比 W 宽就说明乘的不是被除数本身，不认。
   }
+  product.SourceBits = sourceType->getBitWidth();
   return product;
 }
 
@@ -613,6 +623,7 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
   }
   llvm::APInt magicValue;
   llvm::Value *scaled = nullptr;
+  unsigned inputBits = width - 1; // 有符号默认 |x| < 2^(W-1)。
   if (auto *trunc = llvm::dyn_cast<llvm::TruncInst>(shiftedBase)) {
     // 简单形态：%shifted 直接来自 `trunc(lshr(mul, W))`。
     if (trunc->getType() != rootType) {
@@ -631,10 +642,24 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
     }
     scaled = product->Scaled;
     magicValue = product->Magic->getValue();
-    // 符号位来自高半段（同一个 trunc）或被除数本身，两者都等于 [x < 0]。
     llvm::Value *signSource = sign->getOperand(0);
-    if (signSource != trunc && signSource != scaled) {
-      return std::nullopt;
+    if (product->SourceBits == width) {
+      // 符号位来自高半段（同一个 trunc）或被除数本身，两者都等于 [x < 0]。
+      if (signSource != trunc && signSource != scaled) {
+        return std::nullopt;
+      }
+    } else {
+      // 窄源加宽：乘的是 `sext iK %v`（K < W），而被除数是同一个 %v 的 iW 扩展
+      // （符号位就取自它）。按 iK 的范围验证，改写用 iW 那个值。
+      auto *wideDividend = llvm::dyn_cast<llvm::Instruction>(signSource);
+      if (wideDividend == nullptr ||
+          wideDividend->getOpcode() != llvm::Instruction::SExt ||
+          wideDividend->getOperand(0) != scaled ||
+          !wideDividend->getType()->isIntegerTy(width)) {
+        return std::nullopt;
+      }
+      scaled = wideDividend;
+      inputBits = product->SourceBits - 1;
     }
   } else {
     // `+x` 形态：`%t = add iW %x, %h`（注意是加不是减），符号位取自同一个 %t。
@@ -686,7 +711,7 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
   chain.Magic = magicValue;
   chain.Shift = width + extraShift;
   chain.Width = width;
-  chain.InputBits = width - 1; // 有符号：|x| < 2^(W-1)。
+  chain.InputBits = inputBits;
   chain.Signed = true;
   return chain;
 }
@@ -789,6 +814,124 @@ matchUnsignedAddMagicMulChain(llvm::Instruction &root) {
   return chain;
 }
 
+// 窄乘积形态（\u4f8b\u5982 16 \u4f4d\u9664\u6cd5\u88ab\u63d0\u5347\u5230 32 \u4f4d\uff09\uff1a\u4e58\u79ef\u5c31\u5728 W \u4f4d\u5185\u7b97\u5b8c\uff0c
+// \u6ca1\u6709 2W \u7684\u9ad8\u534a\u6bb5\u3002
+//   unsigned: %v = zext iK %x; %p = mul iW %v, M; %q = lshr iW %p, N
+//   signed:   %v = sext iK %x; %p = mul iW %v, M;
+//             %q = add iW (lshr iW %p, N), (lshr iW %p, W-1)
+std::optional<MagicMulChain>
+matchNarrowProductMagicChain(llvm::Instruction &root) {
+  auto *rootType = llvm::dyn_cast<llvm::IntegerType>(root.getType());
+  if (rootType == nullptr || rootType->getBitWidth() > 64) {
+    return std::nullopt;
+  }
+  unsigned width = rootType->getBitWidth();
+  llvm::Instruction *product = nullptr;
+  unsigned quotientShift = 0;
+  bool signedForm = false;
+  if (root.getOpcode() == llvm::Instruction::LShr) {
+    product = llvm::dyn_cast<llvm::Instruction>(root.getOperand(0));
+    auto *amount = llvm::dyn_cast<llvm::ConstantInt>(root.getOperand(1));
+    if (product == nullptr || amount == nullptr) {
+      return std::nullopt;
+    }
+    quotientShift = (unsigned)amount->getValue().getLimitedValue(2 * width);
+  } else if (root.getOpcode() == llvm::Instruction::Add) {
+    signedForm = true;
+    llvm::Instruction *shifted = nullptr;
+    llvm::Instruction *sign = nullptr;
+    for (llvm::Value *operand : root.operands()) {
+      auto *inst = llvm::dyn_cast<llvm::Instruction>(operand);
+      if (inst == nullptr || inst->getOpcode() != llvm::Instruction::LShr) {
+        return std::nullopt;
+      }
+      auto *amount = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1));
+      if (amount == nullptr) {
+        return std::nullopt;
+      }
+      if (amount->getValue() == llvm::APInt(width, width - 1)) {
+        sign = inst;
+      } else {
+        shifted = inst;
+        quotientShift = (unsigned)amount->getValue().getLimitedValue(2 * width);
+      }
+    }
+    if (shifted == nullptr || sign == nullptr ||
+        shifted->getOperand(0) != sign->getOperand(0)) {
+      return std::nullopt;
+    }
+    product = llvm::dyn_cast<llvm::Instruction>(shifted->getOperand(0));
+  } else {
+    return std::nullopt;
+  }
+  if (product == nullptr || product->getOpcode() != llvm::Instruction::Mul ||
+      product->getType() != rootType || quotientShift == 0 ||
+      quotientShift >= width) {
+    return std::nullopt;
+  }
+
+  llvm::ConstantInt *magic = nullptr;
+  llvm::Value *scaled = nullptr;
+  for (llvm::Value *operand : product->operands()) {
+    if (auto *constant = llvm::dyn_cast<llvm::ConstantInt>(operand)) {
+      if (magic != nullptr) {
+        return std::nullopt;
+      }
+      magic = constant;
+      continue;
+    }
+    if (scaled != nullptr) {
+      return std::nullopt;
+    }
+    scaled = operand;
+  }
+  if (magic == nullptr || scaled == nullptr) {
+    return std::nullopt;
+  }
+  llvm::Value *source = nullptr;
+  if (auto *extend = llvm::dyn_cast<llvm::ZExtInst>(scaled)) {
+    if (signedForm) {
+      return std::nullopt;
+    }
+    source = extend->getOperand(0);
+  } else if (auto *extend = llvm::dyn_cast<llvm::SExtInst>(scaled)) {
+    if (!signedForm) {
+      return std::nullopt;
+    }
+    source = extend->getOperand(0);
+  } else {
+    return std::nullopt;
+  }
+  auto *sourceType = llvm::dyn_cast<llvm::IntegerType>(source->getType());
+  if (sourceType == nullptr || sourceType->getBitWidth() >= width) {
+    return std::nullopt; // 只认比 W 窄的源（提升过的窄除法）。
+  }
+  unsigned sourceBits = sourceType->getBitWidth();
+  unsigned inputBits = signedForm ? sourceBits - 1 : sourceBits;
+
+  // 乘积必须真的在 W 位内算得下，否则机器码是回绕后的值，公式不成立。
+  unsigned checkWidth = width + sourceBits + 8;
+  llvm::APInt maxMagnitude =
+      signedForm ? llvm::APInt::getOneBitSet(checkWidth, sourceBits - 1)
+                 : llvm::APInt::getLowBitsSet(checkWidth, sourceBits);
+  llvm::APInt productMax = maxMagnitude * magic->getValue().zext(checkWidth);
+  unsigned productBits = signedForm ? width - 1 : width;
+  if (productMax.getActiveBits() > productBits) {
+    return std::nullopt;
+  }
+
+  MagicMulChain chain;
+  chain.Scaled = scaled; // 已经是 iW 的值（zext/sext 的结果）。
+  chain.Root = &root;
+  chain.Magic = magic->getValue();
+  chain.Shift = quotientShift;
+  chain.Width = width;
+  chain.InputBits = inputBits;
+  chain.Signed = signedForm;
+  chain.NarrowProduct = true;
+  return chain;
+}
+
 // 只在根已经被删掉之后调用：从根原来的操作数出发，把只为这条链活着的
 // zext/mul/lshr/trunc 收掉（每一步都要求 use_empty）。
 void eraseDeadMagicMulChain(
@@ -823,6 +966,9 @@ bool rewriteConstantDivision(llvm::Instruction &root,
     chain = matchMagicMulChain(root);
   }
   if (!chain) {
+    chain = matchNarrowProductMagicChain(root);
+  }
+  if (!chain) {
     return false;
   }
   std::optional<uint64_t> divisor =
@@ -831,7 +977,7 @@ bool rewriteConstantDivision(llvm::Instruction &root,
                                          chain->ExtraShift, chain->InputBits,
                                          chain->Width)
           : solveMagicDivisor(chain->Magic, chain->Shift, chain->InputBits,
-                              chain->Width);
+                              chain->Width, chain->NarrowProduct);
   if (!divisor) {
     return false;
   }

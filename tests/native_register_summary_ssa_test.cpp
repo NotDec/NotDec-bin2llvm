@@ -10987,6 +10987,103 @@ bool testSignedNegativeMagicAddXFormFold() {
          verifyOk(module, "module failed verifier after add-x fold");
 }
 
+
+// 窄乘积形态：16 位除法被提升到 32 位，乘积就在 32 位内算完。
+//   unsigned: %v = zext i16 %x to i32; %p = mul i32 %v, 43691; %q = lshr i32 %p, 17
+//   signed:   %v = sext i16 %x to i32; %p = mul nsw i32 %v, 21846;
+//             %q = add i32 (lshr i32 %p, 16), (lshr i32 %p, 31)
+// 常数来自 clang -m32 -O2 -S（uint16_t x/3、int16_t x/3）。
+bool testNarrowProductMagicFold16Bit() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-narrow-product-16", context);
+  llvm::Type *i16 = llvm::Type::getInt16Ty(context);
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+
+  auto build = [&](llvm::StringRef name, bool isSigned, uint64_t magic,
+                   unsigned shift) {
+    auto *type = llvm::FunctionType::get(i32, {i16}, false);
+    llvm::Function *function = llvm::Function::Create(
+        type, llvm::GlobalValue::ExternalLinkage, name, module);
+    llvm::BasicBlock *entry =
+        llvm::BasicBlock::Create(context, "entry", function);
+    llvm::IRBuilder<> builder(entry);
+    llvm::Value *wide = isSigned
+                            ? builder.CreateSExt(function->getArg(0), i32)
+                            : builder.CreateZExt(function->getArg(0), i32);
+    llvm::Value *product =
+        builder.CreateMul(wide, llvm::ConstantInt::get(i32, magic));
+    llvm::Value *shifted =
+        builder.CreateLShr(product, llvm::ConstantInt::get(i32, shift));
+    if (!isSigned) {
+      builder.CreateRet(shifted);
+      return function;
+    }
+    llvm::Value *sign =
+        builder.CreateLShr(product, llvm::ConstantInt::get(i32, 31));
+    builder.CreateRet(builder.CreateAdd(shifted, sign, "quotient"));
+    return function;
+  };
+  build("u16_div3", /*isSigned=*/false, 43691, 17);
+  build("s16_div3", /*isSigned=*/true, 21846, 16);
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  llvm::Function *unsignedFn = module.getFunction("u16_div3");
+  llvm::Function *signedFn = module.getFunction("s16_div3");
+  return expect(peephole.ConstantDivisionsRecognized == 1,
+                "narrow-product unsigned fold was not counted") &&
+         expect(peephole.SignedConstantDivisionsRecognized == 1,
+                "narrow-product signed fold was not counted") &&
+         expect(unsignedFn != nullptr && functionHasUdivBy(*unsignedFn, 3),
+                "16-bit unsigned division was not folded to udiv 3") &&
+         expect(signedFn != nullptr && functionHasSdivBy(*signedFn, 3),
+                "16-bit signed division was not folded to sdiv 3") &&
+         expect(!functionHasMul(*unsignedFn) && !functionHasMul(*signedFn),
+                "narrow-product chain survived the fold") &&
+         verifyOk(module, "module failed verifier after narrow-product fold");
+}
+
+// 窄源加宽：被除数是 `sext i32 %v` 得到的 i64，而乘法用 `sext i32 %v` 到 i128
+// （wrk 里 `gettimeofday` 附近那种 int64 但只填了 32 位的情形）。
+bool testNarrowSourceWideningFold() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-narrow-source", context);
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  llvm::Type *i128 = llvm::Type::getInt128Ty(context);
+  auto *type = llvm::FunctionType::get(i64, {i32}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "narrow_source_div1000", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *narrow = function->getArg(0);
+  llvm::Value *dividend = builder.CreateSExt(narrow, i64, "dividend");
+  llvm::Value *wide = builder.CreateSExt(narrow, i128);
+  llvm::Value *product = builder.CreateNSWMul(
+      wide, llvm::ConstantInt::get(i128, 2361183241434822607ULL));
+  llvm::Value *high =
+      builder.CreateLShr(product, llvm::ConstantInt::get(i128, 64));
+  llvm::Value *truncated = builder.CreateTrunc(high, i64);
+  llvm::Value *shifted =
+      builder.CreateAShr(truncated, llvm::ConstantInt::get(i64, 7));
+  llvm::Value *sign =
+      builder.CreateLShr(dividend, llvm::ConstantInt::get(i64, 63));
+  builder.CreateRet(builder.CreateAdd(shifted, sign, "quotient"));
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  return expect(peephole.SignedConstantDivisionsRecognized == 1,
+                "narrow-source signed division was not recognized") &&
+         expect(functionHasSdivBy(*function, 1000),
+                "narrow-source signed division did not fold to sdiv 1000") &&
+         expect(!functionHasMul(*function),
+                "narrow-source chain survived the fold") &&
+         verifyOk(module, "module failed verifier after narrow-source fold");
+}
+
 bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-globaldce", context);
@@ -11834,6 +11931,8 @@ int main() {
   ok &= testSignedConstantDivisionMagicFoldX86_64();
   ok &= testUnsignedAddCorrectionMagicFold();
   ok &= testSignedNegativeMagicAddXFormFold();
+  ok &= testNarrowProductMagicFold16Bit();
+  ok &= testNarrowSourceWideningFold();
   ok &= testConstantDivisionUnknownMagicIsLeftAlone();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
   ok &= testFinalCleanupDropsDeadUnknownValueCalls();
