@@ -238,37 +238,36 @@ llvm::Value *simplifyInsertedValueExtract(llvm::TruncInst &trunc) {
                                 readType, seen);
 }
 
-// 编译器把无符号除以常数 d 生成成 `(x * M) >> (64 + s)`（M 是 64 位魔数，
-// s 由编译器按 d 选定）。lift 出来的形态是 `mul nuw i128 (zext x), M` +
-// `lshr i128, K` + `trunc`；InstCombine 之后可能是 `lshr i128, K` 后直接
-// trunc（K = 64 + s），也可能是 `lshr 64` + `trunc` 之后再来一次修正
-// `lshr i64, s`。这里只做一件事：反解出 d 并把整条链换成 `udiv x, d`。
+// 编译器把无符号除以常数 d 生成成 `(x * M) >> (W + s)`（W 是被除数位宽，
+// M 是 W 位魔数，s 由编译器按 d 选定）。lift 出来的形态是
+// `mul i(2W) (zext x), M` + `lshr i(2W), K` + `trunc`（x86-64 的 mulq 是
+// W = 64 → i128，i386 的 mull 是 W = 32 → i64）；InstCombine 之后可能是
+// `lshr, K` 后直接 trunc（K = W + s），也可能是 `lshr W` + `trunc` 之后再来
+// 一次修正 `lshr iW, s`。这里只做一件事：反解出 d 并把整条链换成 `udiv x, d`。
 //
 // 反解用 Granlund-Montgomery 的充分条件（Hacker's Delight 4-1）：
 //   M == ceil(2^K / d) 且 (M*d - 2^K) * 2^L <= 2^K
 // 满足时 `floor(x*M/2^K) == floor(x/d)` 对全部 x < 2^L 成立。这是证明而不是
 // 抽样，所以命中即改写。L 取被除数本身的值上界：普通 i64 值 L = 64；被除数是
 // `lshr i64 %y, k`（除法前先移位，如 x/100 = (x>>2)/25）时它的值恒小于
-// 2^(64-k)，L 可以收到 64-k —— clang 正是按这个更窄的范围挑魔数的，d=25 那种
+// 2^(W-k)，L 可以收到 W-k —— clang 正是按这个更窄的范围挑魔数的，d=25 那种
 // 魔数只有把 L 收窄才成立。
 //
 // 不认的形态（整体跳过，不半改）：带 add 修正的魔数形态（clang -O2 的 x/7、
-// x/4095 是 `mulhi; sub; shr; add; shr`）、有符号除法（sext/ashr 链）。
+// x/4095 是 `mulhi; sub; shr; add; shr`）、有符号除法（sext + sign 修正链）。
 // 除数本身不设上界：反解是 O(1) 的，而且 x/10^9 这类大除数很常见。
-constexpr unsigned kMinMagicShift = 64;
-// 误差条件 (M*d - 2^K) * 2^L <= 2^K 里 e < d，d 最大到 2^64，所以 K 最大是
-// 64 + 64；这里按 64 + L 留够就行，不额外收紧。
-constexpr unsigned kMaxMagicShift = 128;
 
 std::optional<uint64_t> solveUnsignedMagicDivisor(const llvm::APInt &magic,
                                                   unsigned shift,
-                                                  unsigned inputBits) {
-  if (magic.isZero() || magic.getActiveBits() > 64 ||
-      shift < kMinMagicShift || shift > kMaxMagicShift || inputBits == 0 ||
-      inputBits > 64) {
+                                                  unsigned inputBits,
+                                                  unsigned valueWidth) {
+  if (magic.isZero() || valueWidth == 0 || valueWidth > 64 ||
+      magic.getActiveBits() > valueWidth || inputBits == 0 ||
+      inputBits > valueWidth || shift < valueWidth ||
+      shift > 2 * valueWidth) {
     return std::nullopt;
   }
-  unsigned width = shift + 128;
+  unsigned width = shift + 2 * valueWidth;
   llvm::APInt powerOfTwo = llvm::APInt::getOneBitSet(width, shift);
   llvm::APInt wideMagic = magic.zext(width);
   // M == ceil(2^K / d) 等价于 d 落在 [2^K/M, 2^K/(M-1)) 里，而这个区间宽度只有
@@ -278,7 +277,7 @@ std::optional<uint64_t> solveUnsignedMagicDivisor(const llvm::APInt &magic,
   if (!powerOfTwo.urem(wideMagic).isZero()) {
     divisor += 1;
   }
-  if (divisor.ult(3) || divisor.getActiveBits() > 64) {
+  if (divisor.ult(3) || divisor.getActiveBits() > valueWidth) {
     return std::nullopt;
   }
   llvm::APInt product = wideMagic * divisor;
@@ -297,52 +296,60 @@ std::optional<uint64_t> solveUnsignedMagicDivisor(const llvm::APInt &magic,
 }
 
 struct MagicMulChain {
-  llvm::Value *Scaled = nullptr; // zext 的源，i64 被除数。
-  llvm::Instruction *Root = nullptr; // 要替换掉的那个 i64 值。
+  llvm::Value *Scaled = nullptr; // zext 的源，iW 被除数。
+  llvm::Instruction *Root = nullptr; // 要替换掉的那个 iW 值。
   llvm::APInt Magic;
-  unsigned Shift = 0; // 128 位乘积总共右移多少位。
-  unsigned InputBits = 64; // 被除数的值上界（< 2^InputBits）。
+  unsigned Shift = 0; // 2W 位乘积总共右移多少位。
+  unsigned InputBits = 0; // 被除数的值上界（< 2^InputBits）。
+  unsigned Width = 0; // W：被除数位宽，也是 udiv 的位宽。
 };
 
-// `lshr i64 %y, k` 的结果恒小于 2^(64-k)，反解可以用更窄的范围。
-unsigned dividendBitBound(llvm::Value *dividend) {
+// `lshr iW %y, k` 的结果恒小于 2^(W-k)，反解可以用更窄的范围。
+unsigned dividendBitBound(llvm::Value *dividend, unsigned width) {
   auto *shift = llvm::dyn_cast<llvm::BinaryOperator>(dividend);
   if (shift == nullptr || shift->getOpcode() != llvm::Instruction::LShr) {
-    return 64;
+    return width;
   }
   auto *amount = llvm::dyn_cast<llvm::ConstantInt>(shift->getOperand(1));
   if (amount == nullptr || amount->getValue().getActiveBits() > 8) {
-    return 64;
+    return width;
   }
   uint64_t bits = amount->getValue().getZExtValue();
-  if (bits == 0 || bits >= 64) {
-    return 64;
+  if (bits == 0 || bits >= width) {
+    return width;
   }
-  return (unsigned)(64 - bits);
+  return (unsigned)(width - bits);
 }
 
-// `%root = trunc i128 (lshr i128 %m, K)` 或
-// `%root = lshr i64 (trunc i128 (lshr i128 %m, 64)), s`。
+// `%root = trunc i(2W) (lshr i(2W) %m, K)` 或
+// `%root = lshr iW (trunc i(2W) (lshr i(2W) %m, W)), s`。
+// W 取自乘积的一半位宽，所以 x86-64 的 mulq（i64 → i128）和 i386 的
+// mull（i32 → i64）走同一套匹配。
 std::optional<MagicMulChain> matchMagicMulChain(llvm::Instruction &root) {
+  auto *rootType = llvm::dyn_cast<llvm::IntegerType>(root.getType());
+  if (rootType == nullptr || rootType->getBitWidth() > 64) {
+    return std::nullopt;
+  }
+  unsigned width = rootType->getBitWidth();
   llvm::Value *value = &root;
   unsigned extraShift = 0;
   if (root.getOpcode() == llvm::Instruction::LShr) {
     auto *amount = llvm::dyn_cast<llvm::ConstantInt>(root.getOperand(1));
-    if (amount == nullptr ||
-        root.getType() != llvm::Type::getInt64Ty(root.getContext())) {
+    if (amount == nullptr) {
       return std::nullopt;
     }
-    extraShift = (unsigned)amount->getValue().getLimitedValue(64);
-    if (extraShift == 0 || extraShift >= 64) {
+    extraShift = (unsigned)amount->getValue().getLimitedValue(2 * width);
+    if (extraShift == 0 || extraShift >= width) {
       return std::nullopt;
     }
     value = root.getOperand(0);
   }
   auto *trunc = llvm::dyn_cast<llvm::TruncInst>(value);
-  if (trunc == nullptr ||
-      trunc->getType() != llvm::Type::getInt64Ty(root.getContext())) {
+  if (trunc == nullptr || trunc->getType() != rootType) {
     return std::nullopt;
   }
+  // trunc 必须来自 `lshr, K`（取乘积高半段）；裸的 `trunc(mul)` 是低半段，
+  // 不是除法。
   auto *high = llvm::dyn_cast<llvm::Instruction>(trunc->getOperand(0));
   if (high == nullptr || high->getOpcode() != llvm::Instruction::LShr) {
     return std::nullopt;
@@ -351,16 +358,20 @@ std::optional<MagicMulChain> matchMagicMulChain(llvm::Instruction &root) {
   if (amount == nullptr) {
     return std::nullopt;
   }
-  unsigned highShift = (unsigned)amount->getValue().getLimitedValue(128);
-  if (highShift < kMinMagicShift) {
+  unsigned highShift = (unsigned)amount->getValue().getLimitedValue(2 * width);
+  if (highShift < width) {
     return std::nullopt;
   }
   unsigned totalShift = highShift + extraShift;
-  if (totalShift > kMaxMagicShift) {
+  if (totalShift > 2 * width) {
     return std::nullopt;
   }
   auto *mul = llvm::dyn_cast<llvm::Instruction>(high->getOperand(0));
   if (mul == nullptr || mul->getOpcode() != llvm::Instruction::Mul) {
+    return std::nullopt;
+  }
+  auto *mulType = llvm::dyn_cast<llvm::IntegerType>(mul->getType());
+  if (mulType == nullptr || mulType->getBitWidth() != 2 * width) {
     return std::nullopt;
   }
 
@@ -380,8 +391,9 @@ std::optional<MagicMulChain> matchMagicMulChain(llvm::Instruction &root) {
     return std::nullopt;
   }
   auto *extend = llvm::dyn_cast<llvm::ZExtInst>(scaled);
-  if (extend == nullptr || !extend->getOperand(0)->getType()->isIntegerTy(64)) {
-    return std::nullopt; // 只认 64 位无符号操作数经 zext 进 i128 的形态。
+  if (extend == nullptr ||
+      !extend->getOperand(0)->getType()->isIntegerTy(width)) {
+    return std::nullopt; // 只认 W 位无符号操作数经 zext 进 2W 位的形态。
   }
   // 链上其它使用者不影响正确性：改写只换掉 root 的值，链上指令只有在
   // use_empty() 时才会被收掉（mulq 的低半段 trunc、CF/OF 的 icmp 常常还挂在
@@ -392,7 +404,8 @@ std::optional<MagicMulChain> matchMagicMulChain(llvm::Instruction &root) {
   chain.Root = &root;
   chain.Magic = magic->getValue();
   chain.Shift = totalShift;
-  chain.InputBits = dividendBitBound(chain.Scaled);
+  chain.Width = width;
+  chain.InputBits = dividendBitBound(chain.Scaled, width);
   return chain;
 }
 
@@ -427,7 +440,7 @@ bool rewriteConstantDivision(llvm::Instruction &root,
     return false;
   }
   std::optional<uint64_t> divisor = solveUnsignedMagicDivisor(
-      chain->Magic, chain->Shift, chain->InputBits);
+      chain->Magic, chain->Shift, chain->InputBits, chain->Width);
   if (!divisor) {
     return false;
   }
@@ -491,7 +504,9 @@ runNativeRegisterPostRewritePeephole(llvm::Module &module) {
       continue;
     }
     for (llvm::Instruction &inst : llvm::instructions(function)) {
-      if (inst.getType()->isIntegerTy(64) &&
+      // W = 32（i386 的 mull）和 W = 64（x86-64 的 mulq）都要扫。
+      if ((inst.getType()->isIntegerTy(32) ||
+           inst.getType()->isIntegerTy(64)) &&
           (llvm::isa<llvm::TruncInst>(inst) ||
            inst.getOpcode() == llvm::Instruction::LShr)) {
         divisionRoots.emplace_back(&inst);

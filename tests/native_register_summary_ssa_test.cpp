@@ -10558,10 +10558,11 @@ struct MagicDivisionCase {
 llvm::Function *buildMagicDivisionFunction(llvm::Module &module,
                                            llvm::StringRef name,
                                            const MagicDivisionCase &testCase,
-                                           bool foldCorrectionShift) {
+                                           bool foldCorrectionShift,
+                                           unsigned width = 64) {
   llvm::LLVMContext &context = module.getContext();
-  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
-  llvm::Type *i128 = llvm::Type::getInt128Ty(context);
+  llvm::Type *i64 = llvm::IntegerType::get(context, width);
+  llvm::Type *i128 = llvm::IntegerType::get(context, 2 * width);
   auto *type = llvm::FunctionType::get(i64, {i64}, false);
   llvm::Function *function = llvm::Function::Create(
       type, llvm::GlobalValue::ExternalLinkage, name, module);
@@ -10577,15 +10578,15 @@ llvm::Function *buildMagicDivisionFunction(llvm::Module &module,
   llvm::Value *product =
       builder.CreateMul(wide, llvm::ConstantInt::get(i128, testCase.Magic));
   if (foldCorrectionShift) {
-    // InstCombine 会把 `mulhi >> 64` + trunc + `>> s` 折成 `mulhi >> (64+s)`
+    // InstCombine 会把 `mulhi >> W` + trunc + `>> s` 折成 `mulhi >> (W+s)`
     // + trunc，两种形态都要能认。
     llvm::Value *shifted = builder.CreateLShr(
-        product, llvm::ConstantInt::get(i128, 64 + testCase.PostShift));
+        product, llvm::ConstantInt::get(i128, width + testCase.PostShift));
     builder.CreateRet(builder.CreateTrunc(shifted, i64, "quotient"));
     return function;
   }
   llvm::Value *high =
-      builder.CreateLShr(product, llvm::ConstantInt::get(i128, 64));
+      builder.CreateLShr(product, llvm::ConstantInt::get(i128, width));
   llvm::Value *truncated = builder.CreateTrunc(high, i64);
   builder.CreateRet(builder.CreateLShr(
       truncated, llvm::ConstantInt::get(i64, testCase.PostShift), "quotient"));
@@ -10598,8 +10599,9 @@ bool functionHasUdivBy(const llvm::Function &function, uint64_t divisor) {
       continue;
     }
     auto *constant = llvm::dyn_cast<llvm::ConstantInt>(inst.getOperand(1));
-    if (constant != nullptr &&
-        constant->getValue() == llvm::APInt(64, divisor)) {
+    auto *type = llvm::dyn_cast<llvm::IntegerType>(inst.getType());
+    if (constant != nullptr && type != nullptr &&
+        constant->getValue() == llvm::APInt(type->getBitWidth(), divisor)) {
       return true;
     }
   }
@@ -10729,6 +10731,60 @@ bool testConstantDivisionUnknownMagicIsLeftAlone() {
                 "non-division magic lost its multiply") &&
          expect(!sawUdiv, "non-division magic was folded to a udiv") &&
          verifyOk(module, "module failed verifier after unknown magic skip");
+}
+
+
+// 同一个识别器要同时认 i386 的 mull（i32 → i64）。下表 (d, M, s) 来自
+// `clang -m32 -O2 -S` 的实际输出（mull 后把 edx 右移 s）。
+bool testConstantDivisionMagicFoldI386() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-constant-division-magic-i386", context);
+  const MagicDivisionCase cases[] = {
+      {3, 0xAAAAAAABULL, 1},
+      {5, 0xCCCCCCCDULL, 2},
+      {6, 0xAAAAAAABULL, 2},
+      {9, 0x38E38E39ULL, 1},
+      {10, 0xCCCCCCCDULL, 3},
+      {100, 0x51EB851FULL, 5},
+      {1000, 0x10624DD3ULL, 6},
+      // x/10^9：clang -m32 先 shrl $9 再对 1953125 用 M = 0x44B83、s = 7。
+      {1953125, 0x44B83ULL, 7, 9},
+  };
+  bool built = true;
+  for (const MagicDivisionCase &testCase : cases) {
+    std::string suffix = std::to_string(testCase.ExpectedDivisor);
+    built &= buildMagicDivisionFunction(module, "i386_div_" + suffix, testCase,
+                                        /*foldCorrectionShift=*/false,
+                                        32) != nullptr;
+    built &= buildMagicDivisionFunction(module, "i386_folded_div_" + suffix,
+                                        testCase,
+                                        /*foldCorrectionShift=*/true, 32) !=
+             nullptr;
+  }
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool allFolded = built;
+  for (const MagicDivisionCase &testCase : cases) {
+    std::string suffix = std::to_string(testCase.ExpectedDivisor);
+    for (const std::string &name :
+         {"i386_div_" + suffix, "i386_folded_div_" + suffix}) {
+      llvm::Function *function = module.getFunction(name);
+      allFolded &=
+          expect(function != nullptr, "i386 magic division function is missing") &&
+          expect(functionHasUdivBy(*function, testCase.ExpectedDivisor),
+                 "i386 magic multiply chain was not folded back to udiv") &&
+          expect(!functionHasMul(*function),
+                 "i386 magic multiply chain survived the udiv fold");
+    }
+  }
+
+  return expect(peephole.ConstantDivisionsRecognized == 2 * std::size(cases),
+                "unexpected number of recognized i386 constant divisions") &&
+         allFolded &&
+         verifyOk(module,
+                  "module failed verifier after i386 magic division fold");
 }
 
 bool testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations() {
@@ -11573,6 +11629,7 @@ int main() {
   ok &= testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering();
   ok &= testPostRewritePeepholeSimplifiesExtractFromInsertedRange();
   ok &= testConstantDivisionMagicFold();
+  ok &= testConstantDivisionMagicFoldI386();
   ok &= testConstantDivisionAddCorrectionFormIsLeftAlone();
   ok &= testConstantDivisionUnknownMagicIsLeftAlone();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
