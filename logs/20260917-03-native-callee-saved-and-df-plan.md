@@ -426,5 +426,28 @@ wrk       total=37 [entry_range_rejected:ST0=7, entry_range_rejected:ST1=8,
   反而会把"入口值被拒绝"与"调用边界丢失"混在一起；现在 `entry_range_rejected` 已能把两者分开。
 - 不动 x87 窗口建模和间接调用返回模型（P1 先把表示层统一，再谈精度）。
 
+## P1 落地：clobbered 返回 helper 改用 call-tied clobber 占位（2026-09-19 续）
 
+盘点里的 P1：\`range_return_helper_clobbered_register\`（被请求的寄存器在该调用点不是返回值
+而是 clobber）以前直接物化 \`notdec.unknown\`，而同一调用点其它 clobber 寄存器已经有
+\`notdec.register.summary_clobber.<ty>\` 占位。
 
+- 改点：\`lib/passes/summary/NativeRegisterSummarySSA.cpp\`（\`rewriteSignatureShapes\` 里
+  \`RangeReturnHelpers\` 解析失败且不在返回槽内的分支）。现在创建与调用点绑定的 clobber
+  占位（同名 helper + \`!notdec.register.summary_ssa.call_value\` 的 name/kind=clobber/
+  call_index 元数据），不再造 unknown；在返回槽里却解析失败的情况保持 unknown 不变。
+- 效果（A/B，同一命令）：
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| memcached unknown | 3 | **1**（只剩 \`entry_range_rejected:RAX\`，FUN_1a380） |
+| wrk unknown | 37 | **15**（只剩 \`entry_range_rejected:ST0/ST1\` 窗口） |
+| memcached warning 行 | 815 | 821 |
+| wrk warning 行 | 312 | 352 |
+| 单测 / ctest / fortune x2 / verify | — | 全绿（ctest 12/12） |
+
+warning 增加的都是原来被 unknown 掩盖的 \`remaining_summary_clobber_value\`（clobber 占位
+如实报告），和上一轮 dead-unknown 清理时的口径变化一致。
+
+剩余：memcached 1 条（FUN_1a380 的返回槽解析落到入口 range，属于返回绑定问题）、
+wrk 15 条（x87 窗口 ST0/ST1 入口值，属于窗口建模/表示层话题）。
