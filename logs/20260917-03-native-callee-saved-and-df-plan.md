@@ -758,3 +758,85 @@ clang -m32 的有符号 ground truth（`int f(int x)`）：`x/100` → M = 0x51E
 `return_binding_uses_clobber_value`——间接调用返回的纯 clobber 图，属 20260911-01
 的既有行为，与本轮改动无关；`ctest` 不校验该计数。）
 
+
+
+## 有符号常数除法识别（2026-09-20 续）
+
+用户原始 prompt：
+
+> 对，把有符号的也尝试，这相关的都加上吧
+
+### 匹配的形态
+
+有符号除法（`int x/d`）和它的模运算在 lift 之后是：
+
+```llvm
+%wide = sext iW %x to i(2W)
+%m    = mul nsw i(2W) %wide, <M>       ; 正魔数
+%h    = lshr i(2W) %m, W
+%t    = trunc i(2W) %h to iW
+%q    = ashr iW %t, s                  ; s >= 1；s == 0 时没有这一条
+%sign = lshr iW %t, W-1                ; 高半段符号位（写 x 的符号位也认）
+%r    = add iW %q, %sign
+```
+
+它算的是 `floor_s(x*M / 2^(W+s)) + [x<0]`：x >= 0 时就是 GM 的 `floor(x/d)`；
+x < 0 时把 `x = -y`、`y = q*d + r` 代进去逐项展开，需要 `0 < q*e + r*M <= 2^K`
+（`e = M*d - 2^K`），它在 `e * 2^(W-1) <= 2^K` 时成立——和无符号的 GM 条件是
+同一个式子，只是 L 从 W 换成 W-1。所以两种除法共用一套 O(1) 反解，只换 L，
+改写时用 `sdiv` 而不是 `udiv`。
+
+**没做**：负魔数的 `x + mulhi` 形态（clang -O2 x86-64 的 `int64_t x/100` 是
+`mul nsw i128 %sext, -6640827866535438581` + `add x` + `ashr 6` + 符号位），
+它需要自己的等价性证明，本轮整体跳过（有单测钉住"不认"）。
+
+### ground truth（clang -O2 实际输出）
+
+i386（`imull` + `sarl`）：
+
+| d | M | s |
+|---|---|---|
+| 3 | 0x55555556 | 0 |
+| 10 | 0x66666667 | 2 |
+| 13 | 0x4EC4EC4F | 2 |
+| 100 | 0x51EB851F | 5 |
+| 1000 | 0x10624DD3 | 6 |
+
+x86-64（`imulq` + `sarq`）：
+
+| d | M | s |
+|---|---|---|
+| 3 | 0x5555555555555556 | 0 |
+| 5 | 0x6666666666666667 | 1 |
+| 7 | 0x4924924924924925 | 1 |
+| 10 | 0x6666666666666667 | 2 |
+| 13 | 0x4EC4EC4EC4EC4EC5 | 2 |
+
+（注意 `x/7` 有符号的魔数是 0x4924924924924925，不是无符号的 0x2492492492492493
+——后者对应 d = 14，在 L = W-1 下验证不过，正好说明两套条件不能混用。）
+
+### 测试与结果
+
+- 单测：`testSignedConstantDivisionMagicFoldI386`、`...FoldX86_64`（上表全部命中，
+  且断言没有被记成无符号）、`testSignedConstantDivisionAddFormIsLeftAlone`
+  （负魔数 `+x` 形态必须原样保留）。
+- i386 实测：`-f` 提升自建 `-m32` 静态二进制——`int32_t x/3` → `sdiv i32 %arg, 3`，
+  `x/100` → `sdiv i32 %arg, 100`，`x%100` → `srem i32 %arg, 100`
+  （先折出 sdiv，InstCombine 再把 `x - 100*(x/100)` 认成 srem）。
+- x86-64 实测：`int64_t x/3` → `sdiv i64 %RDI.arg, 3`；`x/100` 仍是未识别的
+  `+x` 形态（本轮不做）。
+- **fortune-i386：5 处有符号魔数全部折掉**（`constant_divisions_recognized=0`、
+  `signed_constant_divisions_recognized=5`），产物里 `mul nsw i64` 从 5 条降到 0 条，
+  读作 `srem i32 %x, 100` 和 4 条 `srem i32 %x, 26`；unknown 仍是那 1 条
+  `return_binding_uses_clobber_value`（与本次无关）。
+- x86-64 回归：memcached 无符号 7 处、有符号 0 处、unknown 0、4m47s；
+  wrk 无符号 1 处、**有符号 5 处（都是 /1000）**、unknown 15 不变、34s。
+- `ctest --test-dir build`：12/12 通过；memcached/wrk/i386/x86-64 产物全部
+  `llvm-as` + `opt -passes=verify` 通过。
+
+### 覆盖边界
+
+现在还认不出来的常数除法形态只有两类：无符号的 add 修正魔数（x/7、x/4095）和有符号的
+负魔数 `+x` 形态（x86-64 的 int64 x/100）。两者都需要各自的等价性证明，不是换个
+条件就能扩的；真要做应该各自一轮。
+
