@@ -675,3 +675,86 @@ pre-summary 的动机（"寄存器还没消除时治返回绑定"）已经被同
 - 还没认的：add 修正形态（`x/7`、`x/4095` 这类）、有符号除法、i32 形态。
   都是独立的形态和验证，真要做应该各自一轮，不要塞进同一个 matcher。
 
+
+
+## i386（32 位）常数除法识别（2026-09-20 续）
+
+用户原始 prompt：
+
+> 对，要不针对 32 位的 I386 binary 搞点测试用例，然后支持一下 I386 的情形？
+
+### 改动：把匹配做成按位宽参数化
+
+识别器原来把 W = 64 写死在类型和移位上界里。现在按"乘积位宽的一半"取 W：
+
+- `mulq`（x86-64）：`zext i64 → mul i128 → lshr i128, K → trunc i128 → i64`，W = 64；
+- `mull`（i386）：`zext i32 → mul i64 → lshr i64, K → trunc i64 → i32`，W = 32。
+
+匹配里所有常量改成由 W 推出：`mul 类型 == 2W`、`K ∈ [W, 2W]`、魔数有效位 `<= W`、
+`udiv` 的位宽 = W、被除数范围上界默认 W（`lshr x, k` 时收到 W-k）。顺带收紧了一处：
+`trunc` 必须来自 `lshr`（取乘积高半段），裸的 `trunc(mul)` 是低半段，不是除法。
+
+### i386 ground truth
+
+`clang -m32 -O2 -S`（llvm-22.1.0.obj）的实际输出（`mull` 后把 edx 右移 s）：
+
+| d | M | s |
+|---|---|---|
+| 3 | 0xAAAAAAAB | 1 |
+| 5 | 0xCCCCCCCD | 2 |
+| 6 | 0xAAAAAAAB | 2 |
+| 9 | 0x38E38E39 | 1 |
+| 10 | 0xCCCCCCCD | 3 |
+| 100 | 0x51EB851F | 5 |
+| 1000 | 0x10624DD3 | 6 |
+| 10^9 | 0x44B83（先 shrl $9） | 7 |
+
+（x/7、x/4095 在 i386 上同样是带 add 修正的形态，x/512 是纯 shift，与 64 位一致。）
+
+### 单测
+
+`testConstantDivisionMagicFoldI386`：上表每项 ×（形态 A、形态 B），在 `mul i64` 的
+32 位形态上断言折成 `udiv i32 x, d` 且链被收干净；`buildMagicDivisionFunction` 加了
+`width` 参数（默认 64，不改变原有 64 位用例）。
+
+### 端到端（真 i386 binary）
+
+`clang -m32 -O2 -static` 编了个只含 `x/3`、`x/100`、`x/1000`、`x/10^9` 的 i386 可执行
+文件，用 `-f <addr>` 逐个提升：
+
+| 函数 | 输出 |
+|---|---|
+| `div3` | `%0 = udiv i32 %stack+4.arg, 3` |
+| `div100` | `%0 = udiv i32 %stack+4.arg, 100` |
+| `div1e9` | `%0 = udiv i32 %stack+4.arg, 1000000000`（预移位被 InstCombine 折回整除数） |
+
+整个静态二进制（含 i386 libc，`--all-confirmed`）：`constant_divisions_recognized=12`、
+unknown 0；`llvm-as` + `opt -passes=verify` 通过（`e-p:32:32`）。
+
+### 回归
+
+- memcached x86-64：识别 7 处不变、unknown 0、4m50s；wrk：1 处不变、unknown 15 不变、35s。
+- `ctest --test-dir build`：12/12 通过（含 `realworld_fortune_x86_64`/`i386`）。
+- 三个 i386 与两个 x86-64 产物全部 `llvm-as` + `opt -passes=verify` 通过。
+
+### 下一轮：i386 的有符号除法（本轮**没**做）
+
+fortune-i386 样本里的常数除法魔数链**全是有符号**的（`imull` → `sarl` → 加符号位），
+所以它的 `constant_divisions_recognized=0`、5 条 `mul nsw i64` 原样保留：
+
+```llvm
+%s = sext i32 %x to i64
+%m = mul nsw i64 %s, <M>
+%.neg = lshr i32 <high 或 x>, 31
+%q = add i32 (… >>_arith s), %.neg
+```
+
+clang -m32 的有符号 ground truth（`int f(int x)`）：`x/100` → M = 0x51EB851F、`sarl $5`；
+`x/13` → M = 0x4EC4EC4F、`sarl $2`；都在 `imull` 的高半段上做算术右移，再加高半段的
+符号位。要做得另外一轮：魔数生成用 Hacker's Delight 的有符号版本（`magic()`）对拍，
+验证方式也和这里不同，不能直接复用无符号的 GM 条件。
+
+（顺带记录：fortune-i386 产物里剩 1 条 unknown，是 `notdec_native_43c0` 的
+`return_binding_uses_clobber_value`——间接调用返回的纯 clobber 图，属 20260911-01
+的既有行为，与本轮改动无关；`ctest` 不校验该计数。）
+
