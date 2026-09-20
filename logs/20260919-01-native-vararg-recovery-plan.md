@@ -213,3 +213,25 @@ call void (i64, i64, i64, i8, ...) @FUN_293a0(i64 207008, i64 %RDI.arg, i64 2051
    （callee 的 va_start 用的是后端保存的 AL）。清掉它属于另一件事（"返回寄存器不该因为
    入口读而变成参数"）。
 
+## Stage 2："自己取变参"的折叠（2026-09-19 续）
+
+用户要求："自己创建一些测试用例，把目前测不到的'自己取'这一块逻辑再完善；注释里说明设计
+理念；并在 AGENTS.md 记录'参考编译器代码、用最少的代码匹配编译器会生成的模式'。"
+
+- 实现 `foldManualVaArgSequences()`（`NativeVarArgRewrite.cpp`，声明在同名头文件）：
+  按 LLVM `LowerVAARG`（`X86ISelLowering.cpp:26261`）的菱形匹配并折成 `va_arg`：
+  `load i32 off(+0 GP/+4 FP)` → `icmp ult 48/176` → 双路径（`reg_save_area+off` / 
+  `overflow_arg_area`）+ 偏移推进 → `phi`。折成 `%v = va_arg ptr %ap, T`，
+  删掉两块并直接跳 join。在签名重写之后调用（那时 lift 的寄存器中转已展开，菱形是干净 SSA）。
+- 关键约束：offset load 使用者、两块内所有非终结指令都必须在匹配集合里；两块必须单前驱、
+  同一个 join/phi、值类型一致；溢出区步长只要求是常量（FP 是 16 vs 8）。
+  任一条不满足整体跳过。
+- 单测 `testManualVaArgDiamondBecomesVaArgInstruction`：GP(i32)/FP(double) 各折 1 条，
+  外加"少了偏移推进"的反例必须原样保留。
+- 设计理念写进 `NativeVarArgRewrite.cpp` 顶部注释与 `AGENTS.md` 新增的
+  "模式匹配类 pass 的设计理念"一节。
+
+验证：单测绿；ctest **12/12**（含 fortune x86_64/i386）；memcached 重跑：识别/改写仍 3/3、
+unknown 仍 **3**、**0 处 va_arg 折叠**（样本里确实没有"自己取"的函数）——说明新增折叠对
+现有样本无副作用，能力由单测覆盖。
+
