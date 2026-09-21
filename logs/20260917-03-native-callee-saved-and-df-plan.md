@@ -1532,6 +1532,72 @@ min-depth，也不是只看"有没有 use"）：
 - 75 个 `summary_clobber` 都是"调用后读 caller-saved"的诚实结果；
 - 最大的函数 `http_parser_execute`（6670 行）是大 switch，无结构异常。
 
+## x87 入口窗口修掉：空槽 poison + 深度精确模型（2026-09-21 续）
+
+用户原始 prompt：
+
+> 对，直接都做吧。确实符合的话，也可以都假设每个函数都符合这个约定。这个倒是可以
+> 看看LLVM源码里面的代码生成是不是这么假设的
+
+### 1. 先查 LLVM 源码：假设只在 x86-64 成立
+
+/sn640/NotDec/llvm-source/llvm/lib/Target/X86/X86CallingConv.td：
+
+- x86-64 SysV：long double 参数走**栈**（CCIfType<[f80, f128],
+  CCAssignToStack<0, 0>，约 :598 / :836），返回值在 FP0（"Long double types are
+  always returned in FP0"，约 :289）→ **入口 x87 栈一定为空**。
+- i386：CCIfType<[f80], CCAssignToReg<RC.FP_CALL>>（约 :144）——long double 参数
+  按 ABI **就在 x87 寄存器里**，入口栈非空。所以这个假设**不能推广到 32 位**。
+
+实现分别用 isLikelyX86_64SysVAbi(Abi)（A）和 pointerByteSize() == 8（B）守卫；
+i386 完全保持旧行为（fortune-i386 产物只有编译器已知的指针序 metadata 抖动，值一致）。
+
+### 2. (A) 空槽 = poison（NativeRegisterSummarySSA.cpp）
+
+entryRangeInput 里加一条和 DF 的 isAbiBoundaryZeroRegister 并列的规则：x86-64 SysV
+下 ST0..ST7 的入口读按 ABI 就是空槽，返回 **poison**，不要落到 entry_range_rejected
+→ notdec.unknown。这条对所有 ST 入口读生效（不只窗口搬移读），是 (B) 证不出深度时
+的兜底。
+
+### 3. (B) 深度精确的窗口模型（PcodeToLLVM.cpp）
+
+- computeX87BlockDepths：块内按 X87WindowSpec 累加 push/pop（Library、未识别的
+  x87 操作、间接跳转、空 native 块、非末块无终结符都判失败），块间按 CFG 不动点
+  传播；入口深度 0，**汇合深度不一致或某条路径弹空就整函数放弃**。
+- 深度可证（X87Depth 有值）时：
+  - push 在 depth<2 不读/不写不存在的旧槽，也不往库 spill；
+  - pop 在 depth<=2 不调库，新 ST1 只在 depth>=3 时从库取；
+  - 库深度从"机器深度"变成 max(depth-2, 0)，**栈顶仍然是 ST(2)**，peek/poke 的
+    槽位语义不变（runtime 的 peek(i) 只能按"相对库顶"解释，否则旧协议在 depth=3
+    时也对不上）。
+- 证不出来整函数退回旧模型；即使退回，(A) 保证不再产生入口 unknown。
+- 效果（wrk）：notdec.x87.push 55 → **19**、pop 61 → **22**；format_time_us /
+  format_time_s / stats_mean / stats_percentile 的记账调用**全消失**，算术/比较/
+  访存逐函数 diff 一致（只有 SSA 重编号）。
+
+### 4. 单测
+
+- tests/pcode_to_llvm_test.cpp 新增 testX87ShallowWindowHasNoLibraryTraffic
+  （depth 0/1 完全不碰库）、testX87DeepWindowSpillsToLibrary（第三次 push 溢出 1 次、
+  depth 3 的 pop 取回 1 次）；更新 testX87FildlFoldsToWindowPush /
+  testX87FldzFoldsToWindowPushConstant 为 depth-0 语义（不再 spill、ST1 留空）。
+- (A) 没有单独立用例：要手工搭 !notdec.abi 元数据才能让 isLikelyX86_64SysVAbi
+  成立；由 wrk e2e 覆盖（unknown 15 → 0）。
+
+### 5. 验证
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| wrk unknown | 15（ST0=7, ST1=8） | **0** |
+| wrk notdec.x87.push / pop | 55 / 61 | **19 / 22** |
+| wrk IR bytes / warning / defines | 949,686 / 319 / 89 | **937,141** / 306 / 89 |
+| memcached unknown / bytes / warning | 0 / 3,782,229 / 760 | 0 / 3,782,233 / 760 |
+| 单测 pcode_to_llvm / summary_ssa | 过 | 过（+2 用例） |
+| ctest --test-dir build | 12/12 | **12/12** |
+| fortune x86_64 unknown / residue audit | 0 / header-only | 0 / header-only |
+| llvm-as + opt -passes=verify | OK | OK（memcached / wrk） |
+| 耗时 wrk / memcached | 34.4s / 289.6s | 34.0s / 285.9s |
+
 ### 顺带：乘法的盘点结论（回答"乘法还有没有类似魔数模式"）
 
 四份产物里的剩余常量乘（memcached 157 / wrk 17 / fortune-x64 9 / fortune-i386 1）

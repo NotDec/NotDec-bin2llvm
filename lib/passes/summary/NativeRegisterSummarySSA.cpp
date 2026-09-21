@@ -1061,6 +1061,17 @@ bool isAbiBoundaryZeroRegister(llvm::StringRef name) {
   return name == "DF";
 }
 
+// x87 栈寄存器 ST0..ST7。x86-64 SysV 下 long double 参数走栈传递（LLVM
+// X86CallingConv.td：f80 -> CCAssignToStack），所以函数入口的 x87 栈一定是空的；
+// 入口读 ST0..ST7 只可能是窗口模型在搬移"空槽"（push/pop 时把不存在的旧栈顶
+// 挪位）。这类值不承载源程序语义，只喂给 notdec.x87.* 记账，给 poison 而不是
+// unknown。i386 不能这么假设：那里 f80 参数按 ABI 就在 x87 寄存器里
+// （X86CallingConv.td：f80 -> CCAssignToReg<FP_CALL>），入口读可能是真实参数。
+bool isX87StackRegisterName(llvm::StringRef name) {
+  return name.size() == 3 && name.starts_with("ST") && name[2] >= '0' &&
+         name[2] <= '7';
+}
+
 std::string
 storageUnitName(const NativeAbiStorage &storage,
                 const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -6431,6 +6442,16 @@ private:
         EntryInputRanges.emplace(value, range);
         return value;
       }
+    }
+    if (isX87StackRegisterName(unit->Name) && isLikelyX86_64SysVAbi(Abi)) {
+      // x86-64 的入口 x87 栈为空（见 isX87StackRegisterName 注释）：这里是
+      // 窗口模型对"空槽"的搬移读，值不属于源程序语义，给 poison，不要
+      // 退化成 notdec.unknown。
+      llvm::Value *empty = llvm::PoisonValue::get(rangeType(range));
+      EntryRangeInputs.emplace(range, empty);
+      EntryInputRanges.emplace(empty, range);
+      ++Summary.RangeEntryInputs;
+      return empty;
     }
     if (!rangeMayComeFromEntry(range)) {
       // 入口值存在但闸门拒绝（summary 说这些位不可能还来自入口）。记成因，

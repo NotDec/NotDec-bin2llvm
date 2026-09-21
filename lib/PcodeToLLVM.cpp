@@ -409,12 +409,26 @@ public:
     if (entryBlock == nullptr) {
       return false;
     }
+    // x87 入口深度 0（x86-64 SysV：long double 参数走栈传递，见
+    // NativeRegisterSummarySSA 的 isX87StackRegisterName）。整函数深度都能静态
+    // 证明时启用精确窗口模型；证不出来就退回旧模型（入口空槽读已由 poison
+    // 规则兜住，不会再产生 unknown）。
+    if (pointerByteSize() == 8) {
+      PreciseX87Depth = computeX87BlockDepths(program, *entryBlock);
+    }
     Builder.CreateBr(entryBlock);
 
     for (size_t blockIndex = 0; blockIndex < BlockStarts.size(); ++blockIndex) {
       size_t start = BlockStarts[blockIndex];
       size_t end = BlockEnds[blockIndex];
       Builder.SetInsertPoint(BlockForStart[start]);
+      X87Depth.reset();
+      if (PreciseX87Depth) {
+        auto depthIt = X87BlockEntryDepth.find(start);
+        if (depthIt != X87BlockEntryDepth.end()) {
+          X87Depth = depthIt->second;
+        }
+      }
       // Native mode may split one machine block into several LLVM blocks for
       // instruction-internal p-code control flow, e.g. CMOV. These internal
       // blocks still belong to the same native block, so unique temporaries
@@ -1734,27 +1748,60 @@ private:
   // Push v: ST0 <- v, ST1 <- old ST0, library push(old ST1).  The library
   // shift (old ST1 becomes its new top = ST2) is exactly the ST2..ST7 rolling
   // copies the p-code performs.
+  // 精确深度模型（X87Depth 有值）下，depth<2 的旧槽并不存在（入口 x87 栈为空，
+  // 见 computeX87BlockDepths）：不读、不写、也不往库里 spill；对应地 pop 到
+  // depth<=2 时也不调库，槽位保持"空"（下次读它之前一定先有 push 把它写实）。
+  // 这样 wrk 里只当记账用的 push/pop 会整个消失。库的栈顶仍然是 ST2，和旧模型
+  // 一致（peek/poke 的槽位含义不变）。
   void x87WindowPush(llvm::Value *value) {
-    llvm::Value *oldST0 = readX87ST(0, true);
-    llvm::Value *oldST1 = readX87ST(1, true);
+    if (!X87Depth) {
+      llvm::Value *oldST0 = readX87ST(0, true);
+      llvm::Value *oldST1 = readX87ST(1, true);
+      writeX87ST(0, value);
+      writeX87ST(1, oldST0);
+      llvm::Function *push = getOrInsertNativeX87Intrinsic(
+          Module, "notdec.x87.push", llvm::Type::getVoidTy(Context),
+          {x87Fp80()}, false);
+      Builder.CreateCall(push, {oldST1});
+      return;
+    }
+    unsigned depth = *X87Depth;
+    llvm::Value *oldST0 = depth >= 1 ? readX87ST(0, true) : nullptr;
+    llvm::Value *oldST1 = depth >= 2 ? readX87ST(1, true) : nullptr;
+    if (oldST1 != nullptr) {
+      llvm::Function *push = getOrInsertNativeX87Intrinsic(
+          Module, "notdec.x87.push", llvm::Type::getVoidTy(Context),
+          {x87Fp80()}, false);
+      Builder.CreateCall(push, {oldST1});
+    }
+    if (oldST0 != nullptr) {
+      writeX87ST(1, oldST0);
+    }
     writeX87ST(0, value);
-    writeX87ST(1, oldST0);
-    llvm::Function *push = getOrInsertNativeX87Intrinsic(
-        Module, "notdec.x87.push", llvm::Type::getVoidTy(Context),
-        {x87Fp80()}, false);
-    Builder.CreateCall(push, {oldST1});
+    ++*X87Depth;
   }
 
   // Full pop: ST0 <- old ST1, ST1 <- library pop() (the old ST2).
   void x87WindowPop() {
-    llvm::Value *oldST1 = readX87ST(1, true);
-    writeX87ST(0, oldST1);
+    if (!X87Depth) {
+      llvm::Value *oldST1 = readX87ST(1, true);
+      writeX87ST(0, oldST1);
+      x87PopIntoST1();
+      return;
+    }
+    if (*X87Depth >= 2) {
+      writeX87ST(0, readX87ST(1, true));
+    }
     x87PopIntoST1();
+    --*X87Depth;
   }
 
   // Only the ST1 half of a pop, used when the operation already computed the
   // new ST0 (faddp, fstp %st(1)): ST1 <- library pop().
   void x87PopIntoST1() {
+    if (X87Depth && *X87Depth < 3) {
+      return;  // 新 ST1 是空槽：没有值从库里出来
+    }
     llvm::Function *pop = getOrInsertNativeX87Intrinsic(
         Module, "notdec.x87.pop", x87Fp80(), {}, false);
     llvm::Value *next = Builder.CreateCall(pop, {});
@@ -1895,6 +1942,9 @@ private:
     if (spec.SlotIndex == 1) {
       // fstp %st(1): ST1 <- ST0, then pop leaves ST0 = old ST1 = old ST0.
       x87PopIntoST1();
+      if (X87Depth) {
+        --*X87Depth;
+      }
       return true;
     }
     if (spec.SlotIndex >= 2) {
@@ -1932,6 +1982,9 @@ private:
       // faddp: ST1 = op, then pop makes it the new ST0.
       writeX87ST(0, result);
       x87PopIntoST1();
+      if (X87Depth) {
+        --*X87Depth;
+      }
       return true;
     }
     // PopArithSlot: ST(i) = op(ST0, ST(i)), then pop.
@@ -2052,6 +2105,195 @@ private:
     llvm::Value *slot = x87Peek(spec.SlotIndex);
     x87Poke(spec.SlotIndex, readX87ST(0));
     writeX87ST(0, slot);
+    return true;
+  }
+
+  // 一个 block 内的 x87 净深度变化；有任何没识别成窗口操作的 x87 操作
+  // （或 fprem/fptan 这类深度效果不定的库操作）就返回 nullopt。
+  std::optional<int> x87BlockDepthDelta(size_t blockIndex) const {
+    int delta = 0;
+    for (size_t opIndex = BlockStarts[blockIndex];
+         opIndex < BlockEnds[blockIndex]; ++opIndex) {
+      auto groupIt = X87Groups.find(opIndex);
+      if (groupIt != X87Groups.end()) {
+        const X87WindowSpec &spec = groupIt->second;
+        switch (spec.Kind) {
+        case X87WindowKind::Push:
+          ++delta;
+          break;
+        case X87WindowKind::PopStore:
+        case X87WindowKind::PopSlot:
+        case X87WindowKind::PopArith:
+        case X87WindowKind::PopArithSlot:
+          --delta;
+          break;
+        case X87WindowKind::Library:
+          return std::nullopt;
+        default:
+          if (spec.Pops) {
+            --delta;
+          }
+          break;
+        }
+        opIndex = spec.End - 1;
+        continue;
+      }
+      if (SuppressedPcodeOpIndices.count(opIndex) != 0) {
+        continue;
+      }
+      const PcodeOpView &op = (*CurrentProgramOps)[opIndex];
+      if ((op.Output && isX87StackVarnode(*op.Output)) ||
+          std::any_of(op.Inputs.begin(), op.Inputs.end(),
+                      [](const VarnodeView &input) {
+                        return isX87StackVarnode(input);
+                      })) {
+        return std::nullopt;
+      }
+    }
+    return delta;
+  }
+
+  // 静态证明每个 block 入口的 x87 深度（入口 = 0）。块内按 X87WindowSpec
+  // 累加 push/pop；块间按 CFG 传播（native 用 BlockSuccessors，普通模式用
+  // 终结符；间接跳转、空 native 块、未识别操作都判失败）。汇合深度不一致、
+  // 路径上弹空、有可达 block 证不出来都返回 false，调用方整体退回旧模型。
+  bool computeX87BlockDepths(const PcodeProgram &program,
+                             llvm::BasicBlock &blockForEntry) {
+    const size_t blockCount = BlockStarts.size();
+    std::map<const llvm::BasicBlock *, size_t> indexForBlock;
+    for (size_t i = 0; i < blockCount; ++i) {
+      indexForBlock.emplace(BlockForStart[BlockStarts[i]], i);
+    }
+    auto entryIt = indexForBlock.find(&blockForEntry);
+    if (entryIt == indexForBlock.end()) {
+      return false;
+    }
+
+    std::vector<std::optional<int>> deltas(blockCount);
+    for (size_t i = 0; i < blockCount; ++i) {
+      deltas[i] = x87BlockDepthDelta(i);
+    }
+
+    std::vector<std::optional<std::vector<size_t>>> successors(blockCount);
+    for (size_t i = 0; i < blockCount; ++i) {
+      std::vector<size_t> result;
+      bool unknown = false;
+      if (usesNativeCfg()) {
+        uint64_t factAddress = 0;
+        const std::vector<uint64_t> *native =
+            nativeSuccessorsForBlockIndex(i, factAddress);
+        if (native == nullptr) {
+          unknown = true;
+        } else {
+          for (uint64_t address : *native) {
+            auto blockIt = BlockForAddress.find(address);
+            if (blockIt == BlockForAddress.end()) {
+              continue;  // 跳出函数（尾跳/外部目标）：没有内部边
+            }
+            auto indexIt = indexForBlock.find(blockIt->second);
+            if (indexIt == indexForBlock.end()) {
+              unknown = true;  // 空 native 块：不追这条边
+              break;
+            }
+            result.push_back(indexIt->second);
+          }
+        }
+      } else {
+        size_t terminatorIndex = BlockEnds[i] - 1;
+        // 末块没有终结符就是 p-code 到此为止（lowerer 会补 ret），算函数出口；
+        // 非末块没有终结符说明块结构不认识。
+        const bool lastBlock = (i + 1 == blockCount);
+        if (terminatorIndex >= program.Ops.size()) {
+          unknown = true;
+        } else {
+          const PcodeOpView &op = program.Ops[terminatorIndex];
+          if (op.Opcode == PcodeOpcode::BranchInd) {
+            unknown = true;
+          } else if (op.Opcode == PcodeOpcode::Branch ||
+                     op.Opcode == PcodeOpcode::CBranch) {
+            std::optional<uint64_t> target = directTarget(op, 0);
+            if (!target) {
+              if (auto index = relativeTargetIndex(terminatorIndex, op, 0,
+                                                   program.Ops.size())) {
+                target = program.Ops[*index].Address;
+              }
+            }
+            if (!target) {
+              unknown = true;
+            } else {
+              auto blockIt = BlockForAddress.find(*target);
+              if (blockIt != BlockForAddress.end()) {
+                auto indexIt = indexForBlock.find(blockIt->second);
+                if (indexIt == indexForBlock.end()) {
+                  unknown = true;
+                } else {
+                  result.push_back(indexIt->second);
+                }
+              }
+              if (op.Opcode == PcodeOpcode::CBranch && !unknown &&
+                  i + 1 < blockCount &&
+                  BlockStarts[i + 1] == terminatorIndex + 1) {
+                result.push_back(i + 1);
+              }
+            }
+          } else if (op.Opcode != PcodeOpcode::Return && !lastBlock) {
+            unknown = true;
+          }
+        }
+      }
+      successors[i] = unknown ? std::nullopt
+                              : std::optional<std::vector<size_t>>(std::move(result));
+    }
+
+    // 可达块必须深度可证。
+    std::vector<bool> reachable(blockCount, false);
+    std::vector<size_t> worklist{entryIt->second};
+    reachable[entryIt->second] = true;
+    while (!worklist.empty()) {
+      size_t index = worklist.back();
+      worklist.pop_back();
+      if (!deltas[index] || !successors[index]) {
+        return false;
+      }
+      for (size_t next : *successors[index]) {
+        if (!reachable[next]) {
+          reachable[next] = true;
+          worklist.push_back(next);
+        }
+      }
+    }
+
+    std::vector<std::optional<int64_t>> depth(blockCount, std::nullopt);
+    depth[entryIt->second] = 0;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (size_t i = 0; i < blockCount; ++i) {
+        if (!reachable[i] || !depth[i]) {
+          continue;
+        }
+        int64_t exitDepth = *depth[i] + *deltas[i];
+        if (exitDepth < 0) {
+          return false;
+        }
+        for (size_t next : *successors[i]) {
+          if (!depth[next]) {
+            depth[next] = exitDepth;
+            changed = true;
+          } else if (*depth[next] != exitDepth) {
+            return false;  // 汇合处深度不一致
+          }
+        }
+      }
+    }
+    for (size_t i = 0; i < blockCount; ++i) {
+      if (reachable[i]) {
+        if (!depth[i]) {
+          return false;
+        }
+        X87BlockEntryDepth[BlockStarts[i]] = static_cast<unsigned>(*depth[i]);
+      }
+    }
     return true;
   }
 
@@ -4199,6 +4441,12 @@ private:
   const std::vector<PcodeOpView> *CurrentProgramOps = nullptr;
   // 当前 lower 的 program，用来查 Sleigh userop 名字表（见 userOpName）。
   const PcodeProgram *CurrentProgram = nullptr;
+  // ---- x87 窗口深度（精确模型，仅 64 位 SysV；见 computeX87BlockDepths）----
+  // 入口深度 0；depth<2 的 push 不读不存在的旧槽、不往库里 spill，depth<=2 的
+  // pop 不调库、对应槽位保持"空"。库里的栈顶始终是 ST2，和旧模型一致。
+  std::map<size_t, unsigned> X87BlockEntryDepth;  // blockStarts 下标 -> 入口深度
+  bool PreciseX87Depth = false;
+  std::optional<unsigned> X87Depth;  // 当前位置的深度；nullopt = 退回旧模型
   llvm::BasicBlock *ExitBlock = nullptr;
   llvm::GlobalVariable *Memory = nullptr;
   std::unique_ptr<RegisterStorage> Registers;

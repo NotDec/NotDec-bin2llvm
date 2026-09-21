@@ -2170,20 +2170,21 @@ bool testX87FildlFoldsToWindowPush() {
     }
   }
 
+  // 入口 x87 栈为空：第一次 push 在 depth 0，ST1 是空槽，不读也不 spill。
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fildl function is missing") &&
-         expect(hasPush,
-                "x87 fildl did not emit notdec.x87.push for the ST2 shift") &&
+         expect(!hasPush,
+                "a depth-0 x87 fildl must not spill into the x87 library") &&
          expect(hasSIToFP,
                 "x87 fildl did not convert the i32 load to x86_fp80") &&
-         expect(hasWindowShiftMetadata,
-                "x87 fildl window shift load lost the window-shift metadata") &&
+         expect(!hasWindowShiftMetadata,
+                "a depth-0 x87 fildl must not read an empty window slot") &&
          expect(!hasOldLibraryCall,
                 "x87 fildl still emitted a notdec.x87.fild.* library call") &&
          expect(functionUsesGlobal(function, "ST0"),
                 "x87 fildl did not write the ST0 window") &&
-         expect(functionUsesGlobal(function, "ST1"),
-                "x87 fildl did not shift ST0 into the ST1 window") &&
+         expect(!functionUsesGlobal(function, "ST1"),
+                "a depth-0 x87 fildl must leave ST1 empty") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
                 "module failed verifier after x87 fildl window push");
 }
@@ -2244,14 +2245,15 @@ bool testX87FstpFoldsToWindowPopStore() {
 // fldz: INT2FLOAT(const) -> unique, rolling push, ST0 = COPY(unique).
 // Mnemonic-driven classification must fold it to notdec.x87.fldz instead of
 // matching the rolling push as a register operand.
-void addX87FldzOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address) {
+void addX87FldzOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address,
+                   uint64_t uniqueOffset = 0x72900) {
   notdec::bin2llvm::PcodeOpView convert;
   convert.Address = address;
   convert.InstructionSize = 1;
   convert.Mnemonic = "FLDZ";
   convert.Opcode = notdec::bin2llvm::PcodeOpcode::FloatInt2Float;
   convert.OpcodeName = "INT2FLOAT";
-  convert.Output = uniqueVarnode(0x72900, 10);
+  convert.Output = uniqueVarnode(uniqueOffset, 10);
   convert.Inputs.push_back(constVarnode(0, 4));
   program.Ops.push_back(convert);
 
@@ -2264,7 +2266,7 @@ void addX87FldzOps(notdec::bin2llvm::PcodeProgram &program, uint64_t address) {
   }
 
   notdec::bin2llvm::PcodeOpView write = x87CopyFromUniqueOp(
-      address, 1, 0x1100, 0x72900, "ST0");
+      address, 1, 0x1100, uniqueOffset, "ST0");
   write.Mnemonic = "FLDZ";
   program.Ops.push_back(write);
 }
@@ -2319,16 +2321,108 @@ bool testX87FldzFoldsToWindowPushConstant() {
 
   return expect(module != nullptr, errorMessage) &&
          expect(function != nullptr, "x87 fldz function is missing") &&
-         expect(hasPush,
-                "x87 fldz did not emit notdec.x87.push for the ST2 shift") &&
+         expect(!hasPush,
+                "a depth-0 x87 fldz must not spill into the x87 library") &&
          expect(!hasOldLibraryCall,
                 "x87 fldz still emitted a notdec.x87.fldz library call") &&
          expect(st0StoreConstant,
                 "x87 fldz did not push a constant into the ST0 window") &&
-         expect(functionUsesGlobal(function, "ST1"),
-                "x87 fldz did not shift ST0 into the ST1 window") &&
+         expect(!functionUsesGlobal(function, "ST1"),
+                "a depth-0 x87 fldz must leave ST1 empty") &&
          expect(!llvm::verifyModule(*module, &llvm::errs()),
                 "module failed verifier after x87 fldz window push");
+}
+
+// 入口 x87 栈为空：浅栈（depth 从不 >=2）的 push/pop 不需要经过 x87 库。
+bool testX87ShallowWindowHasNoLibraryTraffic() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FldzOps(program, 0x1000);
+  addX87FstpOps(program, 0x1001);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_shallow";
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config, errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  unsigned libraryCalls = 0;
+  bool hasStore = false;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        hasStore |= llvm::isa<llvm::StoreInst>(&instruction);
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee != nullptr && callee->getName().starts_with("notdec.x87.")) {
+          ++libraryCalls;
+        }
+      }
+    }
+  }
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 shallow function is missing") &&
+         expect(hasStore, "x87 shallow fstp did not keep its store") &&
+         expect(libraryCalls == 0,
+                "a depth-0/1 x87 window must not touch the x87 library") &&
+         expect(functionUsesGlobal(function, "ST0"),
+                "x87 shallow window did not use ST0") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after shallow x87 window");
+}
+
+// 第三次 push 才把旧 ST1 挤出窗口（经过库），随之的 pop 也要从库里取回。
+bool testX87DeepWindowSpillsToLibrary() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  addX87FldzOps(program, 0x1000, 0x72900);
+  addX87FldzOps(program, 0x1001, 0x72920);
+  addX87FldzOps(program, 0x1002, 0x72940);
+  addX87FstpOps(program, 0x1003);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "x87_deep";
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config, errorMessage);
+  llvm::Function *function =
+      module ? module->getFunction(config.EntryFunctionName) : nullptr;
+
+  unsigned pushes = 0;
+  unsigned pops = 0;
+  if (function != nullptr) {
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &instruction : block.instructionsWithoutDebug()) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr) {
+          continue;
+        }
+        pushes += callee->getName() == "notdec.x87.push" ? 1 : 0;
+        pops += callee->getName() == "notdec.x87.pop" ? 1 : 0;
+      }
+    }
+  }
+  return expect(module != nullptr, errorMessage) &&
+         expect(function != nullptr, "x87 deep function is missing") &&
+         expect(pushes == 1,
+                "only the third x87 push should spill into the library") &&
+         expect(pops == 1,
+                "the x87 pop at depth 3 should refill from the library") &&
+         expect(functionUsesGlobal(function, "ST1"),
+                "the x87 deep window did not shift ST0 into ST1") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after deep x87 window");
 }
 
 // fdivrp %st,%st(2): ST2 = FLOAT_DIV(ST2, ST0) + rolling pop.  Ghidra names
@@ -3256,6 +3350,8 @@ int main() {
   ok &= testX87FildlFoldsToWindowPush();
   ok &= testX87FstpFoldsToWindowPopStore();
   ok &= testX87FldzFoldsToWindowPushConstant();
+  ok &= testX87ShallowWindowHasNoLibraryTraffic();
+  ok &= testX87DeepWindowSpillsToLibrary();
   ok &= testX87FdivrpSt2FoldsToWindowPeekPoke();
   ok &= testX87FsubrSt3FoldsToWindowPeek();
   ok &= testX87FcomiFoldsToDirectCompare();
