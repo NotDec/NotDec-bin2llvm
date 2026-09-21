@@ -11484,6 +11484,56 @@ bool testFinalCleanupDropsDeadUnknownValueCalls() {
                   "module failed verifier after dead unknown cleanup test");
 }
 
+// 未建模 userop 的专用占位函数（notdec.register.userop.*）也是 helper 声明：
+// 调用点随 GlobalDCE 没了之后，声明不能留在产物里。
+bool testFinalCleanupDropsUnusedUserOpPlaceholders() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-userop", context);
+
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getInt64Ty(context),
+      {llvm::Type::getInt64Ty(context), llvm::Type::getInt8Ty(context)}, false);
+  llvm::Function *used = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage,
+      "notdec.register.userop.crc32.i64.i64.i8", module);
+  llvm::Function *unused = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
+                              {llvm::Type::getInt32Ty(context)}, false),
+      llvm::GlobalValue::ExternalLinkage,
+      "notdec.register.userop.cpuid.i64.i32", module);
+
+  auto *callerType = llvm::FunctionType::get(llvm::Type::getInt64Ty(context),
+                                             {llvm::Type::getInt64Ty(context)},
+                                             false);
+  llvm::Function *function = llvm::Function::Create(
+      callerType, llvm::GlobalValue::ExternalLinkage, "userop_caller", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateRet(builder.CreateCall(
+      used, {function->getArg(0),
+             llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0x56)},
+      "crc"));
+
+  // 关掉 GlobalDCE，确保是 helper 声明清理在做这件事（真实 pipeline 里
+  // GlobalDCE 可能先把没人用的声明一起带走）。
+  notdec::bin2llvm::NativeRegisterFinalCleanupOptions options;
+  options.RunGlobalDCE = false;
+  auto cleanup =
+      notdec::bin2llvm::runNativeRegisterFinalCleanup(module, options);
+
+  return expect(module.getFunction("notdec.register.userop.crc32.i64.i64.i8") !=
+                    nullptr,
+                "used userop placeholder was removed") &&
+         expect(module.getFunction("notdec.register.userop.cpuid.i64.i32") ==
+                    nullptr,
+                "unused userop placeholder declaration was kept") &&
+         expect(cleanup.HelperDeclarationsRemoved == 1,
+                "unused userop declaration removal was not counted") &&
+         verifyOk(module,
+                  "module failed verifier after userop declaration cleanup");
+}
+
 bool testFinalCleanupLowersValueRangeHelpers() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-value-range", context);
@@ -12259,6 +12309,7 @@ int main() {
   ok &= testConstantDivisionUnknownMagicIsLeftAlone();
   ok &= testFinalCleanupRunsGlobalDCEForUnusedIntrinsicDeclarations();
   ok &= testFinalCleanupDropsDeadUnknownValueCalls();
+  ok &= testFinalCleanupDropsUnusedUserOpPlaceholders();
   ok &= testFinalCleanupLowersValueRangeHelpers();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

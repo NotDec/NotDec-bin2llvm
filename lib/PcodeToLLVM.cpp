@@ -3,6 +3,7 @@
 #include "notdec-bin2llvm/RegisterStorage.h"
 
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -396,6 +397,7 @@ public:
     }
 
     CurrentProgramOps = &program.Ops;
+    CurrentProgram = &program;
     prepareX86CallReturnStackSuppression(program);
     prepareX86PcThunkSuppression(program);
     prepareSseFloatWriteMarkers(program);
@@ -3922,9 +3924,101 @@ private:
     return true;
   }
 
+  // Sleigh userop 的号就是 .sla 里 userop 表的下标（Ghidra 的
+  // SleighBase::getUserOpNames 按号返回名字），名字表由 SleighLift 填进
+  // PcodeProgram。有名字时按名字分派（不依赖 .sla 的编号顺序），没有名字
+  // （手工构造的 program 或旧输入）时退回编号。
+  std::string userOpName(uint64_t index) const {
+    if (CurrentProgram == nullptr ||
+        index >= CurrentProgram->UserOpNames.size()) {
+      return {};
+    }
+    return CurrentProgram->UserOpNames[index];
+  }
+
+  bool isUserOp(const PcodeOpView &op, llvm::StringRef name,
+                uint64_t index) const {
+    if (op.Inputs.empty() || op.Inputs[0].Space != "const") {
+      return false;
+    }
+    std::string resolved = userOpName(op.Inputs[0].Offset);
+    return resolved.empty() ? op.Inputs[0].Offset == index : resolved == name;
+  }
+
+  // 没建模的 Sleigh userop：生成"每个 userop 一个"的专用占位函数，而不是笼统的
+  // notdec_pcode_CALLOTHER_i64。名字用 notdec.register. 前缀——summary 把这个
+  // 命名空间当内置 intrinsic：不做 ABI 签名重写，实参因此不会在后半程被丢掉
+  // （旧的 variadic CALLOTHER 就丢过所有实参），也不会按未知外部调用生成
+  // clobber。名字带 userop 名和返回/参数类型，例如
+  // notdec.register.userop.crc32.i64.i64.i8。
+  //
+  // 每个 userop 打一条 warning，提示后来者在这里补语义，或者在 lowerCallOther
+  // 里加专门的分支（rdtsc/LOCK/MOVMSKPD 就是先例）。
+  bool lowerUnknownUserOp(const PcodeOpView &op, std::string &errorMessage) {
+    uint64_t index = op.Inputs.empty() ? 0 : op.Inputs[0].Offset;
+    std::string name = userOpName(index);
+    std::string safeName =
+        name.empty() ? "unknown_" + std::to_string(index) : name;
+    for (char &c : safeName) {
+      if (!llvm::isAlnum(c) && c != '_' && c != '.') {
+        c = '_';
+      }
+    }
+    std::string helperName = "notdec.register.userop." + safeName;
+
+    llvm::Type *returnType = llvm::Type::getVoidTy(Context);
+    if (op.Output) {
+      returnType = intType(op.Output->Size);
+      helperName += ".i" + std::to_string(bitWidth(op.Output->Size));
+    }
+
+    std::vector<llvm::Value *> args;
+    std::vector<llvm::Type *> argTypes;
+    for (size_t i = 1; i < op.Inputs.size(); ++i) {
+      const VarnodeView &input = op.Inputs[i];
+      args.push_back(input.Space == "ram"
+                         ? llvm::ConstantInt::get(intType(input.Size),
+                                                  input.Offset)
+                         : read(input));
+      argTypes.push_back(args.back()->getType());
+      helperName += ".i" + std::to_string(bitWidth(input.Size));
+    }
+
+    auto *helperType = llvm::FunctionType::get(returnType, argTypes, false);
+    llvm::FunctionCallee helper =
+        Module.getOrInsertFunction(helperName, helperType);
+    warnUnsupportedUserOp(index, name, op.Address, helperName);
+    llvm::CallInst *call = Builder.CreateCall(helper, args);
+    if (!op.Output) {
+      return true;
+    }
+    write(*op.Output, call);
+    return true;
+  }
+
+  void warnUnsupportedUserOp(uint64_t index, const std::string &name,
+                             uint64_t address, const std::string &helperName) {
+    // 同一条指令在一个二进制里会出现很多次，每个 userop 只提示一次。
+    static std::set<std::string> warned;
+    std::string key = std::to_string(index) + ":" + name;
+    if (!warned.insert(key).second) {
+      return;
+    }
+    llvm::errs() << "warning: unsupported Sleigh userop " << index;
+    if (!name.empty()) {
+      llvm::errs() << " (" << name << ")";
+    }
+    llvm::errs() << " at 0x";
+    llvm::errs().write_hex(address);
+    llvm::errs() << "; emitted " << helperName
+                 << " placeholder - add semantic support in "
+                    "PcodeToLLVM.cpp lowerCallOther\n";
+  }
+
   bool lowerCallOther(const PcodeOpView &op, std::string &errorMessage) {
+    // rdtsc 有现成的 LLVM intrinsic 对应，直接映射。
     if (op.Output && requireInputCount(op, 1, errorMessage) &&
-        op.Inputs[0].Space == "const" && op.Inputs[0].Offset == 77) {
+        isUserOp(op, "rdtsc", 77)) {
       llvm::Function *intrinsic = llvm::Intrinsic::getOrInsertDeclaration(
           &Module, llvm::Intrinsic::readcyclecounter);
       write(*op.Output, resize(Builder.CreateCall(intrinsic, {}), op.Output->Size));
@@ -3934,18 +4028,18 @@ private:
     // x86 LOCK/UNLOCK are Sleigh userops around normal memory P-Code.  The
     // read/write ops still carry the value semantics, so keep only that part.
     if (!op.Output && requireInputCount(op, 1, errorMessage) &&
-        op.Inputs[0].Space == "const" &&
-        (op.Inputs[0].Offset == 17 || op.Inputs[0].Offset == 18)) {
+        (isUserOp(op, "LOCK", 17) || isUserOp(op, "UNLOCK", 18))) {
       return true;
     }
 
     // Ghidra x86 emits MOVMSKPD as a userop.  The operation extracts the sign
     // bit of each packed double lane into the low bits of the integer result.
-    if (op.Output && !op.Inputs.empty() && op.Inputs[0].Space == "const" &&
-        op.Inputs[0].Offset == 128) {
+    if (op.Output && !op.Inputs.empty() && isUserOp(op, "MOVMSKPD", 128)) {
       return lowerX86Movmskpd(op, errorMessage);
     }
-    return lowerHelperCall(op, errorMessage);
+
+    // 其余 userop 还没建模：专用命名占位 + warning。
+    return lowerUnknownUserOp(op, errorMessage);
   }
 
   bool lowerOp(const PcodeOpView &op, std::string &errorMessage) {
@@ -4103,6 +4197,8 @@ private:
   std::vector<uint64_t> EmptyNativeBlockAddresses;
   std::vector<llvm::BasicBlock *> ExternalTargetBlocks;
   const std::vector<PcodeOpView> *CurrentProgramOps = nullptr;
+  // 当前 lower 的 program，用来查 Sleigh userop 名字表（见 userOpName）。
+  const PcodeProgram *CurrentProgram = nullptr;
   llvm::BasicBlock *ExitBlock = nullptr;
   llvm::GlobalVariable *Memory = nullptr;
   std::unique_ptr<RegisterStorage> Registers;

@@ -1192,6 +1192,8 @@ int main(int argc, char **argv) {
       // 这次 InstCombine 可能删掉某个 unknown 占位的最后一个使用者；unknown
       // 调用本身不会被当死代码删（call 有副作用语义），补一次清理。
       notdec::bin2llvm::eraseDeadUnknownValueCalls(*module);
+      // 同一次化简也可能才删掉死块里的 userop 占位调用，声明的清理跟着补一次。
+      notdec::bin2llvm::eraseUnusedRegisterHelperDeclarations(*module);
       if (options->PrintRegisterSSASummary) {
         reportRemainingUnknownValues(*module);
       }
@@ -1391,6 +1393,7 @@ int main(int argc, char **argv) {
     }
     // 同上：最后一次 InstCombine 之后补一次死 unknown 清理。
     notdec::bin2llvm::eraseDeadUnknownValueCalls(*module);
+    notdec::bin2llvm::eraseUnusedRegisterHelperDeclarations(*module);
     if (options->PrintRegisterSSASummary) {
       reportRemainingUnknownValues(*module);
     }

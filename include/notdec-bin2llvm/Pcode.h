@@ -126,6 +126,11 @@ struct PcodeProgram {
   std::vector<PcodeOpView> Ops;
   std::vector<RegisterInfo> Registers;
   bool IsBigEndian = false;
+  // Sleigh userop 名字表，下标就是 CALLOTHER 第一个常量操作数里的 userop 号
+  // （Ghidra 的 SleighBase::getUserOpNames 按号返回名字）。lowerCallOther 用它
+  // 给没建模的 userop 生成可读的专用占位函数名和 warning；空表（手工构造的
+  // program 或旧输入）时退回按编号分派。
+  std::vector<std::string> UserOpNames;
 };
 
 const char *pcodeOpcodeName(PcodeOpcode opcode);

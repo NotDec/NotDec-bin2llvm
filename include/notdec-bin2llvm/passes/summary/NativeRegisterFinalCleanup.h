@@ -44,6 +44,11 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
 // 删掉。
 uint64_t eraseDeadUnknownValueCalls(llvm::Module &module);
 
+// 清掉没人用的 helper 声明（notdec.register.summary_* / userop 占位 /
+// unknown / value-range / partial read-write）。tool 的最后一次
+// InstCombine+SimplifyCFG 之后补一次：那次化简可能才删掉死块里的最后调用。
+uint64_t eraseUnusedRegisterHelperDeclarations(llvm::Module &module);
+
 // 盘点最终 IR 里剩下的 notdec.unknown.* 占位，按 !notdec.unknown.source 的
 // reason/callee/register 归因（key 形如 "call_effect_mixed:FUN_17e10:R9"）。
 // 只在 tool 的最后一次 InstCombine + eraseDeadUnknownValueCalls 之后调用，

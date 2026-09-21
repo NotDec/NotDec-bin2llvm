@@ -317,6 +317,92 @@ bool testStaticMemoryWriteIsLiftedAsStore() {
                 "module failed verifier after static memory write test");
 }
 
+// 没建模的 Sleigh userop（CALLOTHER）不能退化成笼统的
+// notdec_pcode_CALLOTHER_i64：函数名要带 userop 名字和返回/参数类型，实参要
+// 原样保留。前缀 notdec.register. 让 summary 把它当内置 intrinsic，不做 ABI
+// 签名重写（旧路径就是在这里丢的实参）。
+bool testUnknownUserOpGetsNamedPlaceholder() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  program.UserOpNames.resize(216);
+  program.UserOpNames[215] = "crc32";
+
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = 0x1000;
+  op.InstructionSize = 5;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::CallOther;
+  op.OpcodeName = "CALLOTHER";
+  op.Output = uniqueVarnode(0, 8);
+  op.Inputs.push_back(constVarnode(215, 4));
+  op.Inputs.push_back(constVarnode(0x1234, 8));
+  op.Inputs.push_back(constVarnode(0x56, 1));
+  program.Ops.push_back(op);
+  program.Ops.push_back(returnOp(0x1005));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "named_userop";
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config, errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+
+  llvm::Function *placeholder =
+      module->getFunction("notdec.register.userop.crc32.i64.i64.i8");
+  unsigned callArgs = 0;
+  if (placeholder != nullptr) {
+    for (llvm::User *user : placeholder->users()) {
+      if (auto *call = llvm::dyn_cast<llvm::CallInst>(user)) {
+        callArgs = call->arg_size();
+      }
+    }
+  }
+  return expect(placeholder != nullptr,
+                "named userop placeholder was not created") &&
+         expect(callArgs == 2,
+                "userop placeholder call lost its arguments") &&
+         expect(module->getFunction("notdec_pcode_CALLOTHER_i64") == nullptr,
+                "named userop must not fall back to the generic CALLOTHER") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after named userop test");
+}
+
+// 没有 userop 名字表时（手工构造的 program / 旧输入）退回编号命名，保证仍然是
+// "一个 userop 一个占位函数"。
+bool testUnknownUserOpWithoutNamesUsesIndex() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+
+  notdec::bin2llvm::PcodeOpView op;
+  op.Address = 0x2000;
+  op.InstructionSize = 5;
+  op.Opcode = notdec::bin2llvm::PcodeOpcode::CallOther;
+  op.OpcodeName = "CALLOTHER";
+  op.Output = uniqueVarnode(0, 8);
+  op.Inputs.push_back(constVarnode(215, 4));
+  op.Inputs.push_back(constVarnode(0x1234, 8));
+  op.Inputs.push_back(constVarnode(0x56, 1));
+  program.Ops.push_back(op);
+  program.Ops.push_back(returnOp(0x2005));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "unnamed_userop";
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config, errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  return expect(module->getFunction(
+                    "notdec.register.userop.unknown_215.i64.i64.i8") != nullptr,
+                "unnamed userop did not fall back to the index-based name") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after unnamed userop test");
+}
+
 bool testUnreachablePcodeBlocksAreRemoved() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -3180,5 +3266,7 @@ int main() {
   ok &= testX87FldenvFoldsToIntrinsicCall();
   ok &= testX87FabsChsFoldsToDirectUnary();
   ok &= testStaticMemoryWriteIsLiftedAsStore();
+  ok &= testUnknownUserOpGetsNamedPlaceholder();
+  ok &= testUnknownUserOpWithoutNamesUsesIndex();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

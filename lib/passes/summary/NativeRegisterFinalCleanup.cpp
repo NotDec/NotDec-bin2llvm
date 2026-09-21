@@ -275,7 +275,7 @@ uint64_t eraseUnusedRegisterGlobals(llvm::Module &module) {
   return deadGlobals.size();
 }
 
-uint64_t eraseUnusedRegisterHelperDeclarations(llvm::Module &module) {
+uint64_t eraseUnusedRegisterHelperDeclarationsImpl(llvm::Module &module) {
   std::vector<llvm::Function *> deadHelpers;
   for (llvm::Function &function : module) {
     if (!function.isDeclaration() || !function.use_empty()) {
@@ -283,6 +283,9 @@ uint64_t eraseUnusedRegisterHelperDeclarations(llvm::Module &module) {
     }
     llvm::StringRef name = function.getName();
     if (name.starts_with("notdec.register.summary_") ||
+        // 未建模 Sleigh userop 的专用占位函数（PcodeToLLVM lowerCallOther）：
+        // 调用点可能随 GlobalDCE 一起没了，声明别再留在产物里。
+        name.starts_with("notdec.register.userop.") ||
         isVarArgUnknownHelperName(name) ||
         isOpaqueUnknownHelperName(name) ||
         isNativeRegisterValueRangeName(name) ||
@@ -393,6 +396,13 @@ void runLocalDeadCodeCleanup(llvm::Module &module) {
 
 } // namespace
 
+// 同 eraseDeadUnknownValueCalls：tool 的最后一次 InstCombine+SimplifyCFG 可能
+// 才把死块里的调用删掉，于是 helper 声明在那之后才变成没人用。导出同一个清理，
+// 让 tool 在最后再补一次。
+uint64_t eraseUnusedRegisterHelperDeclarations(llvm::Module &module) {
+  return eraseUnusedRegisterHelperDeclarationsImpl(module);
+}
+
 // notdec.unknown.* 是占位调用：重写和 DCE 之后使用者可能已经没了，但调用指令
 // 本身不会被当死代码删掉（普通 call 有副作用语义）。最终 IR 之前要再扫一次，
 // 因为 tool 在 final cleanup 之后还会跑一次 InstCombine，它可能删掉最后一个
@@ -489,7 +499,7 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   runLocalDeadCodeCleanup(module);
   summary.RegisterGlobalsRemoved += eraseUnusedRegisterGlobals(module);
   summary.HelperDeclarationsRemoved +=
-      eraseUnusedRegisterHelperDeclarations(module);
+      eraseUnusedRegisterHelperDeclarationsImpl(module);
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;
@@ -507,7 +517,7 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   }
   summary.RegisterGlobalsRemoved += eraseUnusedRegisterGlobals(module);
   summary.HelperDeclarationsRemoved +=
-      eraseUnusedRegisterHelperDeclarations(module);
+      eraseUnusedRegisterHelperDeclarationsImpl(module);
   summary.RemainingRegisterAccesses = countRemainingRegisterAccesses(module);
 
   if (options.PrintSummary) {

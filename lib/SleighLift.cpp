@@ -243,6 +243,10 @@ public:
   }
 };
 
+void collectUserOpNames(const ghidra::Sleigh &engine, PcodeProgram &program) {
+  engine.getUserOpNames(program.UserOpNames);
+}
+
 void collectRegisters(const ghidra::Sleigh &engine, PcodeProgram &program) {
   std::map<ghidra::VarnodeData, std::string> registers;
   engine.getAllRegisters(registers);
@@ -442,13 +446,16 @@ struct SleighInstructionDecoder::Impl {
     IsBigEndian = Engine.isBigEndian();
     PcodeProgram registerProgram;
     collectRegisters(Engine, registerProgram);
+    collectUserOpNames(Engine, registerProgram);
     Registers = std::move(registerProgram.Registers);
+    UserOpNames = std::move(registerProgram.UserOpNames);
   }
 
   ghidra::ContextInternal Context;
   XmlCapableSleigh Engine;
   ghidra::DocumentStorage Storage;
   std::vector<RegisterInfo> Registers;
+  std::vector<std::string> UserOpNames;
   bool IsBigEndian = false;
   bool Valid = false;
 };
@@ -473,6 +480,7 @@ PcodeProgram SleighInstructionDecoder::collectPcode(
   }
   program.IsBigEndian = Pimpl->IsBigEndian;
   program.Registers = Pimpl->Registers;
+  program.UserOpNames = Pimpl->UserOpNames;
 
   // Address order is the default for raw range lifting.  Native function
   // lifting may pass entry-first ranges so cold fragments before the hot entry
@@ -513,6 +521,7 @@ SleighInstructionDecoder::decode(uint64_t address, uint64_t maxInstructions,
 
   decode.Pcode.IsBigEndian = Pimpl->IsBigEndian;
   decode.Pcode.Registers = Pimpl->Registers;
+  decode.Pcode.UserOpNames = Pimpl->UserOpNames;
 
   AssemblyCollector collector;
   PcodeCollector pcodeCollector(Pimpl->Engine, decode.Pcode);
@@ -578,6 +587,7 @@ PcodeProgram collectSleighPcode(ghidra::LoadImage &loadImage,
   }
   program.IsBigEndian = engine.isBigEndian();
   collectRegisters(engine, program);
+  collectUserOpNames(engine, program);
 
   PcodeCollector collector(engine, program);
   AssemblyCollector asmCollector;
@@ -611,6 +621,7 @@ collectSleighPcodeRanges(ghidra::LoadImage &loadImage,
   }
   program.IsBigEndian = engine.isBigEndian();
   collectRegisters(engine, program);
+  collectUserOpNames(engine, program);
 
   // Address order is the default for raw range lifting.  Native function
   // lifting may pass entry-first ranges so cold fragments before the hot entry

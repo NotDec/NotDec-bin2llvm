@@ -1334,6 +1334,104 @@ root `%13 = lshr i32 %12, 2`；`%12 = trunc(zext(%10))`、`%10 = add i32 %3, %9`
 上一轮那两个耗时数字是外部负载下的，不可比；这轮恢复正常档，和更早的基线一致，
 说明改动没有性能影响。
 
+## Sleigh userop：名字接进来 + 每个 userop 一个专用占位函数（2026-09-21 续）
+
+用户原始 prompt：
+
+> 感觉这里应该针对对应的user op，针对性地创建intrinsic函数。那就是把遇到的这种
+> userop号都识别一下吧。在原来的这种创建notdec_pcode_CALLOTHER_i64的地方加一些
+> warning，提示后面开发的时候应该增加对这种user op号的支持。顺手把名字接进来
+> 这一步也做吧。考虑和其他的intrinsic一致，即用notdec.register.开头，如果我没记错的话
+
+### 名字接进来
+
+- `PcodeProgram` 加 `UserOpNames`（下标就是 CALLOTHER 第一个常量操作数里的
+  userop 号）；`SleighLift` 三处产 program 的地方（decoder 的 Impl、
+  `collectSleighPcode`、`collectSleighPcodeRanges`）都用
+  `SleighBase::getUserOpNames` 填。
+- `PcodeToLLVM::lowerCallOther` 改成**按名字分派**（不依赖 .sla 编译期的编号
+  顺序），只有名字表缺失（手工构造的 program）时才退回编号。
+
+### 专用占位函数 + warning
+
+- 未建模的 userop 不再落到笼统的 `notdec_pcode_CALLOTHER_i64`，而是每个 userop
+  一个 `notdec.register.userop.<name>.<返回类型>.<参数类型…>`，例如
+  `notdec.register.userop.crc32.i64.i64.i8` / `…i64.i64.i64`（同一 userop 的
+  不同操作数宽度用类型后缀区分）。
+- `notdec.register.` 前缀是关键：summary 把这个命名空间当内置 intrinsic
+  （`isUnknownExternalFunction` 和 `buildInitialSignatureShapes` 都显式排除），
+  所以**不做 ABI 签名重写**——旧路径的 variadic CALLOTHER 就是在这一步把
+  `(i32 215, i64 %acc, i64 %data)` 全丢光的；现在实参原样保留，也不会按未知
+  外部调用生成 clobber。
+- 每个 userop 打一条 warning（进程内去重，避免大二进制刷屏）：
+
+  ```text
+  warning: unsupported Sleigh userop 215 (crc32) at 0x1fa80; emitted
+  notdec.register.userop.crc32.i64.i64.i8 placeholder - add semantic support in
+  PcodeToLLVM.cpp lowerCallOther
+  ```
+
+- helper 声明清理（`eraseUnusedRegisterHelperDeclarations`）加上
+  `notdec.register.userop.` 前缀，并像 `eraseDeadUnknownValueCalls` 一样导出、
+  在 tool 的最后一次 InstCombine+SimplifyCFG 之后再补一次：那次化简可能才删掉
+  死块里的调用。没补这一步时 memcached 留下了 **17 条没人用的 cpuid 声明**。
+
+### 盘点：三个样本里遇到的 userop
+
+| 号 | 名字 | 处理 |
+|---|---|---|
+| 17/18 | LOCK / UNLOCK | 忽略（读写 p-code 已表达语义） |
+| （按名字） | rdtsc | `llvm.readcyclecounter` |
+| 128 | MOVMSKPD | 显式逐 lane 取符号位 |
+| 215 | crc32 | 占位（memcached `FUN_1fa40`，11 个调用点：8×i64 + 3×i8） |
+| 44–60 | cpuid / cpuid_* | 占位（memcached 一条 `0f a2`，Ghidra 展开成 17 个 CALLOTHER；所在函数最后被 DCE） |
+| 77 | invalidInstructionException | 占位（memcached / wrk 的 `ud2`） |
+
+顺带发现/修掉的两件事：
+
+1. **旧代码 `Offset == 77 → readcyclecounter` 是错的**：这个 .sla 里 77 =
+   `invalidInstructionException`，memcached 0xb8b3 正是 `ud2`（`0f 0b`）。
+   以前 `ud2` 被静默当成 rdtsc。改成按名字分派后，真实 rdtsc（另一个号）由名字
+   命中 `readcyclecounter`——用 `__rdtsc()` 自建二进制验证：输出里 2 条
+   readcyclecounter、没有 userop warning；`ud2` 则明确变成
+   `notdec.register.userop.invalidInstructionException.i64` 占位。
+2. 旧路径把每个 userop 都当"未知外部调用"，产生大量 clobber：memcached 的
+   `remaining_summary_clobber_value` 438 → 382、
+   `unknown_external_arity_stopped_at_call_clobber` 27 → 5。占位调用把读写放在
+   实参/返回值里（cpuid 的 17 个 leaf 各自带输出 varnode），不再无差别毒化
+   caller-saved。
+
+### 单测
+
+- `tests/pcode_to_llvm_test.cpp`：`testUnknownUserOpGetsNamedPlaceholder`
+  （命名 + 类型后缀、实参保留、不再出现笼统名）、
+  `testUnknownUserOpWithoutNamesUsesIndex`（无名字表退回 `unknown_<号>`）。
+- `tests/native_register_summary_ssa_test.cpp`：
+  `testFinalCleanupDropsUnusedUserOpPlaceholders`（关掉 GlobalDCE，
+  确认未用声明被清掉且计数 +1）。
+
+### 验证
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| 笼统 `notdec_pcode_CALLOTHER_*` | memcached 9 处 | **0**（全部命名占位） |
+| memcached userop 占位 | — | 13 个调用（crc32 11 + invalidInstructionException 4）、3 条声明；17 条未用 cpuid 声明被清掉 |
+| memcached warning 行 | 821 | **760**（clobber 类减少；新增 19 条 userop warning） |
+| memcached unknown / IR bytes / defines | 0 / 3,766,810 / 231 | 0 / 3,782,229 / 231 |
+| wrk unknown / IR bytes / defines / warning | 15 / 949,714 / 89 / 318 | 15 / 949,686 / 89 / 319 |
+| 单测（pcode_to_llvm / summary_ssa） | 过 | 过（+3 用例） |
+| `ctest --test-dir build` | 12/12 | 12/12 |
+| `llvm-as` + `opt -passes=verify` | OK | OK（memcached / wrk） |
+| 耗时 memcached / wrk | 289.6s / 34.9s | 288.0s / 34.4s |
+
+### 仍未做
+
+- **crc32 的语义（CRC-32C）还没实现**，现在只是命名占位：下一步可以按位展开
+  （每个字节 8 轮，字节序是从低字节开始），或者在 runtime 里给它一个定义；
+  cpuid 的各个 leaf 同理（样本里它落在被 DCE 的函数里，优先级低）。
+- warning 是进程内去重、打到 stderr；IR 输入路径不进 lifter，所以
+  `cli-signature-rewrite-ll` 那条"默认 stderr 必须为空"的红线不受影响。
+
 ### 顺带：乘法的盘点结论（回答"乘法还有没有类似魔数模式"）
 
 四份产物里的剩余常量乘（memcached 157 / wrk 17 / fortune-x64 9 / fortune-i386 1）
