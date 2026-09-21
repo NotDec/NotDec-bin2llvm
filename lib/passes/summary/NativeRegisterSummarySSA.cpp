@@ -4516,6 +4516,30 @@ private:
     }
   }
 
+  // 调用点的 callee 形参槽位也是对本函数寄存器的一次访问。直接调用点的 shape 在
+  // 规划之前（buildInitialSignatureShapes）就已经算好，把它们也加成边界，槽位
+  // 请求就能整段平铺，不必依赖按重叠段拼接的读兜底。拿不到 shape 的调用点
+  // （间接调用的 shape 是规划之后 addIndirectCallsiteShapes 现推的）跳过，
+  // 仍由拼接兜底。
+  void addCallParamRangeBoundaries() {
+    for (llvm::Instruction &inst : llvm::instructions(Function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr || !isAnalyzableCall(*call)) {
+        continue;
+      }
+      const SignatureShape *shape = shapeForCall(SignatureState, *call);
+      if (shape == nullptr) {
+        continue;
+      }
+      for (const NativeSignatureSlot &slot : callParamSlots(*call, *shape)) {
+        if (slot.Unit == nullptr) {
+          continue;
+        }
+        addRangeBoundary(slot.Unit->Global, slot.OffsetBits, slot.SizeBits);
+      }
+    }
+  }
+
   void planRegisterRanges() {
     RangeBoundaries.clear();
     PlannedRanges.clear();
@@ -4564,6 +4588,7 @@ private:
 
     addAbiRangeBoundaries();
     addSummaryDemandRangeBoundaries();
+    addCallParamRangeBoundaries();
 
     for (const auto &[global, boundaries] : RangeBoundaries) {
       if (boundaries.size() < 2) {

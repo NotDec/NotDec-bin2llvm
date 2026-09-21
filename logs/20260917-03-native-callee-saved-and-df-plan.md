@@ -1768,3 +1768,31 @@ RSI/R8/R9 的 range 值变成 unknown，phi 一路汇到 `call void %84(...)` �
 下一个动手目标定为 (A)，三个候选里先选 1（后向 demand）还是 2（结构性匹配）需要
 先定：1 更根本、覆盖面大但风险高；2 小、能立刻消掉这批，但只治 push/pop 这一种
 写法。
+
+### 7. 调用边界也进分区（planRegisterRanges，2026-09-21 续）
+
+用户 prompt：
+
+> 对，在 planRegisterRanges 里也考虑一下调用边界吧。应该还好
+
+做法：新增 `addCallParamRangeBoundaries`（NativeRegisterSummarySSA.cpp，紧挨
+addSummaryDemandRangeBoundaries 之后调用）。遍历本函数里 `isAnalyzableCall` 的
+调用点，对拿得到 shape 的（直接调用；间接调用的 shape 是规划之后
+addIndirectCallsiteShapes 现推的，这里拿不到）把 `callParamSlots()` 里每个带
+Unit 的槽位 [offset, size) 加成边界。这样 callee 形参槽位请求天然整段平铺，走
+assembleRangeReadIfDominating 的常规路径；按重叠段拼接（composePlannedRangeRead）
+从此只作为"规划时拿不到 shape"（间接调用、晚期精化）的兜底。
+
+效果（对比只保留拼接兜底的上一版，同机同期跑）：
+
+| 目标 | unknown | IR bytes（前 → 后） | warning | verify |
+|---|---|---|---|---|
+| libuv | 8 → 8 | 2,770,747 → 2,771,321（+0.02%） | 66 → 66 | OK |
+| vsftpd | 4 → 4 | 1,709,291 → 1,712,704（+0.20%） | 166 → 166 | OK |
+| memcached | 0 → 0 | 3,782,437 → 3,799,177（+0.44%） | 755 → 757 | OK |
+| wrk | 0 → 0 | 937,161 → 937,812（+0.07%） | 306 → 306 | OK |
+
+memcached 多的 2 条 warning 不是新缺口：同一批 clobber 占位从 R8[0:64) 变成
+R8[0:32)+R8[32:64)（更细的粒度）。单测 testCallArgSlotSpansPlannedRangeSegments 加了
+一条断言，caller 的 range_segments_planned >= 3（callee i32 槽位的边界确实进了分区），
+最终实参仍是常量 16。ctest 12/12。

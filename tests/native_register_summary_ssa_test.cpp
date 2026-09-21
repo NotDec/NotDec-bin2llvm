@@ -9560,8 +9560,11 @@ bool testPlannerSplitsRegisterForDemandMask() {
 
 // callee 的形参槽位宽度来自 callee 自己的读证据，可能和本函数对同一寄存器
 // 的分区边界不对齐：RDX 上 i16 partial read 与 i64 存取把分区切成
-// [0,16)+[16,64)，而形参槽位要的是 i32 的 [0,32)。这条用例锁住"按重叠分段
-// 拼接"的读取路径，避免调用点退化成 call_arg_rewrite_missing_binding。
+// [0,16)+[16,64)，而形参槽位要的是 i32 的 [0,32)。planRegisterRanges 现在会把
+// 直接调用点的 callee 形参槽位也加成边界（这里应切出 [0,16)+[16,32)+[32,64)
+// 三段），请求就能整段平铺；拼接路径保留给规划时还拿不到 shape 的间接调用。
+// 这条用例同时锁住"槽位边界进分区"和"最终实参是常量 16"，避免调用点退化成
+// call_arg_rewrite_missing_binding。
 bool testCallArgSlotSpansPlannedRangeSegments() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-call-arg-spanning-segments", context);
@@ -9609,6 +9612,12 @@ bool testCallArgSlotSpansPlannedRangeSegments() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  uint64_t callerSegments = 0;
+  for (const auto &function : summary.Functions) {
+    if (function.FunctionName == "spanning_segments_caller") {
+      callerSegments = function.RangeSegmentsPlanned;
+    }
+  }
   // 拼接出来的范围 helper 由 final cleanup 降级成移位/或，再折叠成常量。
   notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
   llvm::Function *rewrittenCallee =
@@ -9634,7 +9643,10 @@ bool testCallArgSlotSpansPlannedRangeSegments() {
                     ? nullptr
                     : llvm::dyn_cast<llvm::ConstantInt>(
                           rewrittenCall->getArgOperand(0));
-  return expect(rewrittenCall != nullptr && rewrittenCall->arg_size() == 1,
+  return expect(callerSegments >= 3,
+                "callee parameter slot boundary was not planned into the "
+                "caller range partition") &&
+         expect(rewrittenCall != nullptr && rewrittenCall->arg_size() == 1,
                 "spanning segment call lost its RDX argument") &&
          expect(bound != nullptr && bound->getZExtValue() == 16,
                 "spanning segment call argument was not composed from the "
