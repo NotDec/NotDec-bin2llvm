@@ -10987,6 +10987,268 @@ bool testSignedNegativeMagicAddXFormFold() {
          verifyOk(module, "module failed verifier after add-x fold");
 }
 
+// 寄存器 SSA 阶段 iW 的值常被 `trunc i(2W) (zext iW ...)` 往返包住（partial
+// write / 全宽寄存器读写的残留）。真实 peephole 输入里的 32 位除法就长这样，
+// 匹配器必须看穿它，否则整条链认不出来。
+llvm::Value *wrapRegisterWidthRoundTrip(llvm::IRBuilder<> &builder,
+                                        llvm::Value *value, unsigned width) {
+  llvm::LLVMContext &context = builder.getContext();
+  llvm::Type *valueType = llvm::IntegerType::get(context, width);
+  llvm::Type *wideType = llvm::IntegerType::get(context, 2 * width);
+  return builder.CreateTrunc(builder.CreateZExt(value, wideType), valueType);
+}
+
+// x86-64 上 `int32_t x / d`（d 取到需要修正的魔数时）：`movslq` 之后用 64 位
+// `imulq`，算术右移直接在 64 位积上做（`sarq $33,%rax`），最后截断到 32 位才加
+// 符号位：
+//   %m    = mul nsw i64 (sext i32 %x), M
+//   %q    = trunc i32 (ashr i64 %m, W+s)
+//   %sign = trunc i32 (lshr i64 %m, 2W-1)
+//   %root = add i32 %q, %sign
+// 截断后的低 W 位和 i386 形态的 `trunc(lshr(m, W))` + `ashr i32, s` 相同，闭式
+// 仍是 `floor_s(x*M / 2^(W+s)) + [x<0]`，所以共用同一套反解。
+bool testX86_64Signed32BitAshrBeforeTruncFold() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-signed-32-ashr-before-trunc", context);
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  struct Case {
+    uint64_t Divisor;
+    uint64_t Magic;
+    unsigned AshrShift;
+  };
+  // (d, M, sarq 移位量) 取自 clang -m64 -O2 的真实输出。
+  const Case cases[] = {
+      {3, 0x55555556ULL, 32},    {9, 0x38E38E39ULL, 33},
+      {11, 0x2E8BA2E9ULL, 33},   {13, 0x4EC4EC4FULL, 34},
+      {1000, 0x10624DD3ULL, 38}, {1000000000, 0x44B82FA1ULL, 60},
+  };
+  for (const Case &testCase : cases) {
+    llvm::Function *function = llvm::Function::Create(
+        llvm::FunctionType::get(i32, {i32}, false),
+        llvm::GlobalValue::ExternalLinkage,
+        "x64_s32_ashr_" + std::to_string(testCase.Divisor), module);
+    llvm::BasicBlock *entry =
+        llvm::BasicBlock::Create(context, "entry", function);
+    llvm::IRBuilder<> builder(entry);
+    llvm::Value *wide = builder.CreateSExt(function->getArg(0), i64);
+    llvm::Value *product = builder.CreateNSWMul(
+        wide, llvm::ConstantInt::get(i64, testCase.Magic));
+    llvm::Value *shifted = builder.CreateAShr(
+        product, llvm::ConstantInt::get(i64, testCase.AshrShift));
+    llvm::Value *quotient = builder.CreateTrunc(shifted, i32);
+    llvm::Value *sign = builder.CreateTrunc(
+        builder.CreateLShr(product, llvm::ConstantInt::get(i64, 63)), i32);
+    builder.CreateRet(builder.CreateAdd(quotient, sign));
+  }
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool allFolded = true;
+  for (const Case &testCase : cases) {
+    llvm::Function *function = module.getFunction(
+        "x64_s32_ashr_" + std::to_string(testCase.Divisor));
+    allFolded &=
+        expect(function != nullptr, "x64 i32 ashr-form function is missing") &&
+        expect(functionHasSdivBy(*function, testCase.Divisor),
+               "x64 i32 ashr-form chain was not folded back to sdiv") &&
+        expect(!functionHasMul(*function),
+               "x64 i32 ashr-form chain survived the sdiv fold");
+  }
+
+  return expect(peephole.SignedConstantDivisionsRecognized == std::size(cases),
+                "unexpected number of recognized x64 i32 ashr divisions") &&
+         expect(peephole.ConstantDivisionsRecognized == 0,
+                "x64 i32 ashr fold counted as unsigned") &&
+         allFolded &&
+         verifyOk(module, "module failed verifier after x64 i32 ashr fold");
+}
+
+// x86-64 上 `int32_t x / d` 的负魔数 `+x` 形态，并带上寄存器 SSA 留下的
+// `trunc(zext)` 宽度往返（真实 peephole 输入里 `%t`、符号位、ashr 结果外面都
+// 套了一层）：
+//   %h    = trunc i32 (lshr i64 (mul nsw (sext i32 %x), M_neg), W)
+//   %t    = add i32 (trunc i32 (sext i32 %x)), %h
+//   %root = add i32 (ashr i32 wrap(%t), s), (lshr i32 wrap(%t), W-1)
+// M_neg 的低 W 位是正魔数 M_u，验证和改写都用 M_u。
+bool testX86_64Signed32BitNegativeMagicAddXWithRoundTrips() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-signed-32-addx-round-trips", context);
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  struct Case {
+    uint64_t Divisor;
+    uint64_t Magic32;
+    unsigned PostShift;
+  };
+  // (d, 32 位负魔数的低 W 位, ashr 移位量) 取自 clang -m64 -O2 的真实输出。
+  const Case cases[] = {
+      {7, 0x92492493ULL, 2},
+      {60, 0x88888889ULL, 5},
+      {65535, 0x80008001ULL, 15},
+  };
+  for (const Case &testCase : cases) {
+    llvm::Function *function = llvm::Function::Create(
+        llvm::FunctionType::get(i32, {i32}, false),
+        llvm::GlobalValue::ExternalLinkage,
+        "x64_s32_addx_" + std::to_string(testCase.Divisor), module);
+    llvm::BasicBlock *entry =
+        llvm::BasicBlock::Create(context, "entry", function);
+    llvm::IRBuilder<> builder(entry);
+    llvm::Value *x = function->getArg(0);
+    llvm::Value *wide = builder.CreateSExt(x, i64);
+    llvm::Value *product = builder.CreateNSWMul(
+        wide, llvm::ConstantInt::get(
+                  i64, llvm::APInt(32, testCase.Magic32).sext(64)));
+    llvm::Value *high = builder.CreateTrunc(
+        builder.CreateLShr(product, llvm::ConstantInt::get(i64, 32)), i32);
+    llvm::Value *wrappedX = builder.CreateTrunc(wide, i32);
+    llvm::Value *sum = builder.CreateAdd(wrappedX, high);
+    llvm::Value *wrappedSum = wrapRegisterWidthRoundTrip(builder, sum, 32);
+    llvm::Value *shifted = builder.CreateAShr(
+        wrappedSum, llvm::ConstantInt::get(i32, testCase.PostShift));
+    llvm::Value *sign = builder.CreateLShr(
+        wrappedSum, llvm::ConstantInt::get(i32, 31));
+    builder.CreateRet(builder.CreateAdd(
+        wrapRegisterWidthRoundTrip(builder, shifted, 32),
+        wrapRegisterWidthRoundTrip(builder, sign, 32), "quotient"));
+  }
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool allFolded = true;
+  for (const Case &testCase : cases) {
+    llvm::Function *function = module.getFunction(
+        "x64_s32_addx_" + std::to_string(testCase.Divisor));
+    allFolded &=
+        expect(function != nullptr, "x64 i32 add-x function is missing") &&
+        expect(functionHasSdivBy(*function, testCase.Divisor),
+               "x64 i32 add-x chain was not folded back to sdiv") &&
+        expect(!functionHasMul(*function),
+               "x64 i32 add-x chain survived the sdiv fold");
+  }
+
+  return expect(peephole.SignedConstantDivisionsRecognized == std::size(cases),
+                "unexpected number of recognized x64 i32 add-x divisions") &&
+         allFolded &&
+         verifyOk(module, "module failed verifier after x64 i32 add-x fold");
+}
+
+// 32 位无符号 add 修正形态（x86-64 的 `uint32_t x/d`）同样会被宽度往返包住：
+//   %h    = trunc i32 (lshr i64 (mul nuw (zext i32 %x), M), W)
+//   %root = lshr i32 wrap(add i32 %h, lshr i32 wrap(sub i32 %x, %h), 1)), s
+bool testUnsigned32BitAddCorrectionWithRoundTrips() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-unsigned-32-add-round-trips", context);
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  struct Case {
+    uint64_t Divisor;
+    uint64_t Magic;
+    unsigned PostShift;
+  };
+  // (d, M, 最后的 shrl 移位量) 取自 clang -m64 -O2 对 uint32_t x/7、x/4095 的输出。
+  const Case cases[] = {
+      {7, 613566757ULL, 2},
+      {4095, 1048833ULL, 11},
+  };
+  for (const Case &testCase : cases) {
+    llvm::Function *function = llvm::Function::Create(
+        llvm::FunctionType::get(i32, {i32}, false),
+        llvm::GlobalValue::ExternalLinkage,
+        "x64_u32_add_" + std::to_string(testCase.Divisor), module);
+    llvm::BasicBlock *entry =
+        llvm::BasicBlock::Create(context, "entry", function);
+    llvm::IRBuilder<> builder(entry);
+    llvm::Value *x = function->getArg(0);
+    llvm::Value *wide = builder.CreateZExt(x, i64);
+    llvm::Value *product = builder.CreateNUWMul(
+        wide, llvm::ConstantInt::get(i64, testCase.Magic));
+    llvm::Value *high = builder.CreateTrunc(
+        builder.CreateLShr(product, llvm::ConstantInt::get(i64, 32)), i32);
+    llvm::Value *difference = builder.CreateSub(x, high);
+    llvm::Value *halved = builder.CreateLShr(
+        wrapRegisterWidthRoundTrip(builder, difference, 32),
+        llvm::ConstantInt::get(i32, 1));
+    llvm::Value *sum = builder.CreateAdd(
+        high, wrapRegisterWidthRoundTrip(builder, halved, 32));
+    builder.CreateRet(builder.CreateLShr(
+        wrapRegisterWidthRoundTrip(builder, sum, 32),
+        llvm::ConstantInt::get(i32, testCase.PostShift), "quotient"));
+  }
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool allFolded = true;
+  for (const Case &testCase : cases) {
+    llvm::Function *function = module.getFunction(
+        "x64_u32_add_" + std::to_string(testCase.Divisor));
+    allFolded &=
+        expect(function != nullptr, "x64 u32 add-form function is missing") &&
+        expect(functionHasUdivBy(*function, testCase.Divisor),
+               "x64 u32 add-form chain was not folded back to udiv") &&
+        expect(!functionHasMul(*function),
+               "x64 u32 add-form chain survived the udiv fold");
+  }
+
+  return expect(peephole.ConstantDivisionsRecognized == std::size(cases),
+                "unexpected number of recognized x64 u32 add-form divisions") &&
+         expect(peephole.SignedConstantDivisionsRecognized == 0,
+                "x64 u32 add-form fold counted as signed") &&
+         allFolded &&
+         verifyOk(module, "module failed verifier after x64 u32 add-form fold");
+}
+
+// 反例：同样的宽度往返形态配一个不对应任何除数的魔数，必须整体跳过（看穿往返
+// 不能变成"看着像就折"）。
+bool testWrappedRoundTripUnknownMagicIsLeftAlone() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-wrapped-unknown-magic", context);
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  llvm::Function *function = llvm::Function::Create(
+      llvm::FunctionType::get(i32, {i32}, false),
+      llvm::GlobalValue::ExternalLinkage, "wrapped_junk", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *x = function->getArg(0);
+  llvm::Value *wide = builder.CreateSExt(x, i64);
+  llvm::Value *product = builder.CreateNSWMul(
+      wide, llvm::ConstantInt::get(
+                i64, llvm::APInt(32, 0x12345678ULL).sext(64)));
+  llvm::Value *high = builder.CreateTrunc(
+      builder.CreateLShr(product, llvm::ConstantInt::get(i64, 32)), i32);
+  llvm::Value *sum =
+      builder.CreateAdd(builder.CreateTrunc(wide, i32), high);
+  llvm::Value *wrappedSum = wrapRegisterWidthRoundTrip(builder, sum, 32);
+  llvm::Value *shifted = builder.CreateAShr(
+      wrappedSum, llvm::ConstantInt::get(i32, 2));
+  llvm::Value *sign = builder.CreateLShr(
+      wrappedSum, llvm::ConstantInt::get(i32, 31));
+  builder.CreateRet(builder.CreateAdd(
+      wrapRegisterWidthRoundTrip(builder, shifted, 32),
+      wrapRegisterWidthRoundTrip(builder, sign, 32), "quotient"));
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool sawSdiv = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    sawSdiv |= inst.getOpcode() == llvm::Instruction::SDiv;
+  }
+
+  return expect(peephole.SignedConstantDivisionsRecognized == 0,
+                "wrapped non-division magic must not be recognized") &&
+         expect(functionHasMul(*function),
+                "wrapped non-division magic lost its multiply") &&
+         expect(!sawSdiv, "wrapped non-division magic was folded to an sdiv") &&
+         verifyOk(module, "module failed verifier after wrapped junk skip");
+}
+
 
 // 窄乘积形态：16 位除法被提升到 32 位，乘积就在 32 位内算完。
 //   unsigned: %v = zext i16 %x to i32; %p = mul i32 %v, 43691; %q = lshr i32 %p, 17
@@ -11931,6 +12193,10 @@ int main() {
   ok &= testSignedConstantDivisionMagicFoldX86_64();
   ok &= testUnsignedAddCorrectionMagicFold();
   ok &= testSignedNegativeMagicAddXFormFold();
+  ok &= testX86_64Signed32BitAshrBeforeTruncFold();
+  ok &= testX86_64Signed32BitNegativeMagicAddXWithRoundTrips();
+  ok &= testUnsigned32BitAddCorrectionWithRoundTrips();
+  ok &= testWrappedRoundTripUnknownMagicIsLeftAlone();
   ok &= testNarrowProductMagicFold16Bit();
   ok &= testNarrowSourceWideningFold();
   ok &= testConstantDivisionUnknownMagicIsLeftAlone();

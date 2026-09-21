@@ -248,8 +248,34 @@ struct LowBitsView {
   unsigned Width = 0;
 };
 
-LowBitsView lowBitsView(llvm::Value *value) {
+// peephole 阶段 iW 的值经常被 zext 到 i(2W) 再 trunc 回来（寄存器读写留下的
+// 宽度往返，例如 `%3 = trunc i64 (sext i32 %x)`）。`trunc (zext|sext %v)` 的位
+// 模式就是 %v，是同一个值；比较两个操作数时先看穿它，否则整个除法匹配不上。
+llvm::Value *stripWidthRoundTrip(llvm::Value *value) {
   for (int depth = 0; depth < 4 && value != nullptr; ++depth) {
+    auto *trunc = llvm::dyn_cast<llvm::TruncInst>(value);
+    if (trunc == nullptr) {
+      break;
+    }
+    auto *extend = llvm::dyn_cast<llvm::CastInst>(trunc->getOperand(0));
+    if (extend == nullptr ||
+        (!llvm::isa<llvm::ZExtInst>(extend) &&
+         !llvm::isa<llvm::SExtInst>(extend)) ||
+        extend->getOperand(0)->getType() != trunc->getType()) {
+      break;
+    }
+    value = extend->getOperand(0);
+  }
+  return value;
+}
+
+LowBitsView lowBitsView(llvm::Value *value) {
+  for (int depth = 0; depth < 6 && value != nullptr; ++depth) {
+    llvm::Value *stripped = stripWidthRoundTrip(value);
+    if (stripped != value) {
+      value = stripped;
+      continue;
+    }
     if (auto *trunc = llvm::dyn_cast<llvm::TruncInst>(value)) {
       value = trunc->getOperand(0);
       continue;
@@ -631,7 +657,8 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
   llvm::Value *shifted = nullptr;
   llvm::Instruction *sign = nullptr;
   for (llvm::Value *operand : root.operands()) {
-    auto *inst = llvm::dyn_cast<llvm::Instruction>(operand);
+    llvm::Value *view = stripWidthRoundTrip(operand);
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(view);
     if (inst == nullptr) {
       return std::nullopt;
     }
@@ -665,14 +692,14 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
       if (shifted != nullptr) {
         return std::nullopt;
       }
-      shifted = operand;
+      shifted = view;
       continue;
     }
     if (inst->getOpcode() == llvm::Instruction::AShr) {
       if (shifted != nullptr) {
         return std::nullopt;
       }
-      shifted = operand;
+      shifted = view;
       continue;
     }
     return std::nullopt;
@@ -694,21 +721,48 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
     }
     shiftedBase = ashr->getOperand(0);
   }
+  // ashr 的操作数也可能还套着一层宽度往返（`ashr i32 (trunc(zext(%t)))`）。
+  shiftedBase = stripWidthRoundTrip(shiftedBase);
   llvm::APInt magicValue;
   llvm::Value *scaled = nullptr;
   unsigned inputBits = width - 1; // 有符号默认 |x| < 2^(W-1)。
   if (auto *trunc = llvm::dyn_cast<llvm::TruncInst>(shiftedBase)) {
-    // 简单形态：%shifted 直接来自 `trunc(lshr(mul, W))`。
+    // 简单形态：`%shifted` 来自 2W 位乘积的高半段。两种等价写法：
+    //   i386：`trunc(lshr(m, W))`，再在 iW 上 `ashr s`（即上面的 extraShift）；
+    //   x86-64 的 32 位除法：`trunc(ashr(m, W+s))`，ashr 直接在 2W 位上做。
+    // 截断后的低 W 位相同，所以都归到 `floor_s(x*M / 2^(W+s))` 这个闭式。
     if (trunc->getType() != rootType) {
       return std::nullopt;
     }
-    std::optional<std::pair<llvm::Instruction *, unsigned>> highHalf =
-        parseHighHalf(*trunc, width);
-    if (!highHalf || highHalf->second != width) {
-      return std::nullopt; // 只认 `>> W` 取高半段。
+    llvm::Instruction *mul = nullptr;
+    auto *truncSource =
+        llvm::dyn_cast<llvm::Instruction>(trunc->getOperand(0));
+    if (truncSource != nullptr &&
+        truncSource->getOpcode() == llvm::Instruction::AShr) {
+      auto *amount =
+          llvm::dyn_cast<llvm::ConstantInt>(truncSource->getOperand(1));
+      if (amount == nullptr) {
+        return std::nullopt;
+      }
+      unsigned ashrShift =
+          (unsigned)amount->getValue().getLimitedValue(2 * width);
+      if (ashrShift < width || ashrShift > 2 * width) {
+        return std::nullopt;
+      }
+      mul = llvm::dyn_cast<llvm::Instruction>(truncSource->getOperand(0));
+      extraShift = ashrShift - width;
+    } else {
+      std::optional<std::pair<llvm::Instruction *, unsigned>> highHalf =
+          parseHighHalf(*trunc, width);
+      if (!highHalf || highHalf->second != width) {
+        return std::nullopt; // 只认 `>> W` 取高半段。
+      }
+      mul = highHalf->first;
     }
-    std::optional<MagicProduct> product =
-        parseMagicProduct(*highHalf->first, width);
+    if (mul == nullptr) {
+      return std::nullopt;
+    }
+    std::optional<MagicProduct> product = parseMagicProduct(*mul, width);
     if (!product || !product->Signed ||
         product->Magic->getValue().isNegative()) {
       return std::nullopt; // 负魔数走下面的 `+x` 形态。
@@ -720,7 +774,7 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
     if (llvm::isa<llvm::TruncInst>(sign)) {
       auto *inner = llvm::dyn_cast<llvm::Instruction>(signSource);
       if (inner == nullptr || inner->getOpcode() != llvm::Instruction::LShr ||
-          !sameLowBits(inner->getOperand(0), highHalf->first)) {
+          !sameLowBits(inner->getOperand(0), mul)) {
         return std::nullopt;
       }
       signSource = scaled;
@@ -750,13 +804,14 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
     // 所以取常量的低 W 位当 M_u，照原来的有符号条件验证。
     auto *sum = llvm::dyn_cast<llvm::Instruction>(shiftedBase);
     if (sum == nullptr || sum->getOpcode() != llvm::Instruction::Add ||
-        sign->getOperand(0) != sum) {
+        !sameLowBits(sign->getOperand(0), sum)) {
       return std::nullopt;
     }
     llvm::Instruction *highValue = nullptr;
     llvm::Value *dividend = nullptr;
     for (llvm::Value *operand : sum->operands()) {
-      auto *inst = llvm::dyn_cast<llvm::Instruction>(operand);
+      llvm::Value *view = stripWidthRoundTrip(operand);
+      auto *inst = llvm::dyn_cast<llvm::Instruction>(view);
       if (inst != nullptr && llvm::isa<llvm::TruncInst>(inst)) {
         if (highValue != nullptr) {
           return std::nullopt;
@@ -767,7 +822,7 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
       if (dividend != nullptr) {
         return std::nullopt;
       }
-      dividend = operand;
+      dividend = view;
     }
     if (highValue == nullptr || dividend == nullptr) {
       return std::nullopt;
@@ -779,7 +834,8 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
     }
     std::optional<MagicProduct> product =
         parseMagicProduct(*highHalf->first, width);
-    if (!product || !product->Signed || product->Scaled != dividend ||
+    if (!product || !product->Signed ||
+        !sameLowBits(product->Scaled, dividend) ||
         !product->Magic->getValue().isNegative()) {
       return std::nullopt;
     }
@@ -822,14 +878,16 @@ matchUnsignedAddMagicMulChain(llvm::Instruction &root) {
   if (finalShift == 0 || finalShift >= width) {
     return std::nullopt;
   }
-  auto *sum = llvm::dyn_cast<llvm::BinaryOperator>(root.getOperand(0));
+  auto *sum = llvm::dyn_cast<llvm::BinaryOperator>(
+      stripWidthRoundTrip(root.getOperand(0)));
   if (sum == nullptr || sum->getOpcode() != llvm::Instruction::Add) {
     return std::nullopt;
   }
   llvm::Instruction *highValue = nullptr;
   llvm::Instruction *halved = nullptr;
   for (llvm::Value *operand : sum->operands()) {
-    auto *inst = llvm::dyn_cast<llvm::Instruction>(operand);
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(
+        stripWidthRoundTrip(operand));
     if (inst == nullptr) {
       return std::nullopt;
     }
@@ -850,8 +908,8 @@ matchUnsignedAddMagicMulChain(llvm::Instruction &root) {
   if (halvedAmount == nullptr || !halvedAmount->getValue().isOne()) {
     return std::nullopt; // 只认 `>> 1` 那一步。
   }
-  auto *difference =
-      llvm::dyn_cast<llvm::BinaryOperator>(halved->getOperand(0));
+  auto *difference = llvm::dyn_cast<llvm::BinaryOperator>(
+      stripWidthRoundTrip(halved->getOperand(0)));
   if (difference == nullptr ||
       difference->getOpcode() != llvm::Instruction::Sub) {
     return std::nullopt;

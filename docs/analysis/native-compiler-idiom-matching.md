@@ -80,7 +80,7 @@ if (const char *want = std::getenv("NOTDEC_DEBUG_PEEPHOLE")) {
 | 噪声 | 样子 | 处理 |
 |---|---|---|
 | 位段读取调用 | `call i32 @notdec.reg.extract.i64.i32(i64 %v, i64 0)` 而不是 `trunc` | 在目标 pass 开头把它降成 `lshr`+`trunc`（final cleanup 反正要做） |
-| 宽度往返 | `trunc i64 (zext i32 %v)`、`trunc i64 (sext i32 %v)` | 匹配时看穿，或在 pass 开头折掉 |
+| 宽度往返 | `trunc i64 (zext i32 %v)`、`trunc i64 (sext i32 %v)` | 匹配时看穿（`stripWidthRoundTrip`，见 §4）；同类噪声出现第二次就别再逐处打补丁 |
 | 拼位调用 | `notdec.reg.insert.iFULL.iW(...)` | 看穿（它表达"保留高位"） |
 | 寄存器 store/load 还没消 | `store i64 %v, ptr @RAX` 后面又 `load i64, ptr @RAX` | 说明目标 pass 位置太早；要么后移，要么在识别时按值而不是按 SSA 指针比较 |
 | 值被 poison | `zext i64 poison to i128` + `!notdec.register.summary_ssa.zero_demand_operand` | 这是 partial-demand 有意的诊断信号，先查 demand 分析是不是漏了 observer（见 logs/20260920 的"同宽 mul"一节） |
@@ -156,19 +156,24 @@ L 要按被除数**自己的值上界**取：`lshr x, k` 的 L 可以收窄到 W
   `APInt(32, 31)` 比较会 abort（wrk 被这个搞崩过一次）。**移位量一律按值比较。**
 - 加了临时 dump/打印后要 `git grep getenv` 复核，确认没带进提交。
 
-## 4. 现状清单（2026-09-20）
+## 4. 现状清单（2026-09-21）
 
 - **已实现**（`NativeRegisterPeephole.cpp` 的 `runNativeRegisterPostRewritePeephole`）：
   无符号/有符号 × 简单/add 修正 四类，覆盖 W=64（mulq）、W=32（i386 mull 与
   x86-64 的 32 位除法）、窄乘积（16 位提升到 32 位）、窄源加宽。
+- **x86-64 的 32 位除法两种形态**（同一套闭式，只是**形态**不同）：i386 风格是
+  `trunc(lshr i64 %m, 32)` 再在 i32 上 `ashr s`；x86-64 是
+  `trunc(ashr i64 %m, 32+s)`（`sarq` 直接在 64 位积上做）。后者只是把
+  `extraShift` 从"trunc 之后的 ashr 量"改成"2W 位 ashr 量 - W"。
+  两类都要求被除数是 `sext` 进 2W 位的源。
 - **乘法不用做**：`x*3 → lea` 这类强度削减在 lift 出来的 IR 里本来就是 `mul`
   （代数扫描器在三份产物上是 0 处），没有"移位加法汤"要还原。
 - **取模**：先折出 `sdiv/udiv`，InstCombine 会把 `x - d*(x/d)` 认成 `srem/urem`，
   不用单独写 matcher。
 - **未做**：16 位 add 修正（sub/lshr 在 i16、add/lshr 在 i32，混宽度）、
-  有符号 2 的幂、8 位形态；以及 x86-64 上 32 位除法的两个边角
-  （`u32_1` 与 `s32_1..s32_8`，已确认它们**不需要新的数学**，是 peephole 阶段
-  宽度往返噪声没看穿，见 `logs/20260917-03-…md` 最后一节）。
+  有符号 2 的幂、8 位形态。x86-64 上 32 位除法的边角（`u32_1` 与 `s32_1..s32_8`）
+  已在 2026-09-21 补齐：它们**不需要新的数学**，是 peephole 阶段的宽度往返噪声
+  （`trunc(zext/sext)`）没看穿，见 `logs/20260917-03-…md` 最后一节。
 
 ## 5. 相关文档
 

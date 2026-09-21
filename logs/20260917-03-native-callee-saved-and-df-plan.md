@@ -1063,3 +1063,200 @@ value-range 化简。匹配器另外放宽了两处：符号位接受
 （这一轮的定位经验：以后"最终 IR 该折没折"先怀疑 **peephole 阶段的值图形态**，
 dump 一眼比猜快得多；`notdec.reg.*` helper 是这一层最常见的噪声。）
 
+## x86-64 32 位除法边角：宽度往返 + ashr-before-trunc（2026-09-21 续）
+
+用户原始 prompt：
+
+> 阅读 docs/analysis/native-compiler-idiom-matching.md，
+>
+> 下一步（很具体，不用再推导数学）：在 runNativeRegisterPostRewritePeephole 里重新加上
+> NOTDEC_DEBUG_PEEPHOLE 开关（我这两轮用的那几行），dump s32_1 在往返剥离之后的形态；
+> 对着形态修 matchSignedMagicMulChain 的 +x 分支（大概率是剥离只做了一半，或
+> sign->getOperand(0) != sum / product->Scaled != dividend 这两处比较）；u32_1（32 位
+> add 修正）同样 dump 一次，多半也是同一类包装；覆盖率 fixture 从 29/40 打到 37/40
+> （剩下 3 个是 x/10^12 的假缺口），补单测、跑 memcached/wrk/ctest、记录提交。
+> 这个 fixture（40 个除法点）和 dump 开关的用法我都写在
+> logs/20260917-03-native-callee-saved-and-df-plan.md 里了，下一轮可以直接接着做。
+
+### 覆盖率 fixture 与结果
+
+fixture 源码（`/tmp/cov.c`，重建时直接抄回）：
+
+```c
+#include <stdint.h>
+__attribute__((noinline)) uint32_t u32_0(uint32_t x){return x/3;}
+__attribute__((noinline)) uint32_t u32_1(uint32_t x){return x/7;}
+__attribute__((noinline)) uint32_t u32_2(uint32_t x){return x/9;}
+__attribute__((noinline)) uint32_t u32_3(uint32_t x){return x/11;}
+__attribute__((noinline)) uint32_t u32_4(uint32_t x){return x/13;}
+__attribute__((noinline)) uint32_t u32_5(uint32_t x){return x/60;}
+__attribute__((noinline)) uint32_t u32_6(uint32_t x){return x/1000;}
+__attribute__((noinline)) uint32_t u32_7(uint32_t x){return x/65535;}
+__attribute__((noinline)) uint32_t u32_8(uint32_t x){return x/1000000000;}
+__attribute__((noinline)) uint32_t u32_9(uint32_t x){return x/1000000000000;}
+__attribute__((noinline)) int32_t s32_0(int32_t x){return x/3;}
+__attribute__((noinline)) int32_t s32_1(int32_t x){return x/7;}
+__attribute__((noinline)) int32_t s32_2(int32_t x){return x/9;}
+__attribute__((noinline)) int32_t s32_3(int32_t x){return x/11;}
+__attribute__((noinline)) int32_t s32_4(int32_t x){return x/13;}
+__attribute__((noinline)) int32_t s32_5(int32_t x){return x/60;}
+__attribute__((noinline)) int32_t s32_6(int32_t x){return x/1000;}
+__attribute__((noinline)) int32_t s32_7(int32_t x){return x/65535;}
+__attribute__((noinline)) int32_t s32_8(int32_t x){return x/1000000000;}
+__attribute__((noinline)) int32_t s32_9(int32_t x){return x/1000000000000;}
+__attribute__((noinline)) uint64_t u64_0(uint64_t x){return x/3;}
+__attribute__((noinline)) uint64_t u64_1(uint64_t x){return x/7;}
+__attribute__((noinline)) uint64_t u64_2(uint64_t x){return x/9;}
+__attribute__((noinline)) uint64_t u64_3(uint64_t x){return x/11;}
+__attribute__((noinline)) uint64_t u64_4(uint64_t x){return x/13;}
+__attribute__((noinline)) uint64_t u64_5(uint64_t x){return x/60;}
+__attribute__((noinline)) uint64_t u64_6(uint64_t x){return x/1000;}
+__attribute__((noinline)) uint64_t u64_7(uint64_t x){return x/65535;}
+__attribute__((noinline)) uint64_t u64_8(uint64_t x){return x/1000000000;}
+__attribute__((noinline)) uint64_t u64_9(uint64_t x){return x/1000000000000;}
+__attribute__((noinline)) int64_t s64_0(int64_t x){return x/3;}
+__attribute__((noinline)) int64_t s64_1(int64_t x){return x/7;}
+__attribute__((noinline)) int64_t s64_2(int64_t x){return x/9;}
+__attribute__((noinline)) int64_t s64_3(int64_t x){return x/11;}
+__attribute__((noinline)) int64_t s64_4(int64_t x){return x/13;}
+__attribute__((noinline)) int64_t s64_5(int64_t x){return x/60;}
+__attribute__((noinline)) int64_t s64_6(int64_t x){return x/1000;}
+__attribute__((noinline)) int64_t s64_7(int64_t x){return x/65535;}
+__attribute__((noinline)) int64_t s64_8(int64_t x){return x/1000000000;}
+__attribute__((noinline)) int64_t s64_9(int64_t x){return x/1000000000000;}
+int main(void){ return (int)(u32_0(3)+u32_1(3)+u32_2(3)+u32_3(3)+u32_4(3)+u32_5(3)+u32_6(3)+u32_7(3)+u32_8(3)+u32_9(3)+
+  s32_0(3)+s32_1(3)+s32_2(3)+s32_3(3)+s32_4(3)+s32_5(3)+s32_6(3)+s32_7(3)+s32_8(3)+s32_9(3)+
+  u64_0(3)+u64_1(3)+u64_2(3)+u64_3(3)+u64_4(3)+u64_5(3)+u64_6(3)+u64_7(3)+u64_8(3)+u64_9(3)+
+  s64_0(3)+s64_1(3)+s64_2(3)+s64_3(3)+s64_4(3)+s64_5(3)+s64_6(3)+s64_7(3)+s64_8(3)+s64_9(3)); }
+```
+
+fixture 在 `/tmp/cov.c`（40 个除法点：u32/s32/u64/s64 × 10 个除数，全部 noinline，
+main 里逐个调用），`/tmp/cov64`、`/tmp/cov32` 是 clang -m64/-m32 -O2 的产物；
+逐点检查就是把产物按函数名切开数 `udiv/sdiv`（脚本 `/tmp/cov_check.py`）：
+
+```bash
+build/bin/notdec-native-llvm /tmp/cov64 --all-confirmed --skip-runtime \
+  --register-ssa-summary -o /tmp/cov64.ll
+python3 /tmp/cov_check.py /tmp/cov64.ll   # 打印 recognized: N/38 + missing
+```
+
+- x86-64：**29/40 → 38/40**。缺的 11 个里，`s32_1..s32_8`、`u32_1` 是真缺口
+  （本轮修掉）；`u32_9`/`s32_9`（除以 10^12）在产物里根本不存在——`objdump -d`
+  是 `xor %eax,%eax; ret`，clang 已经折成常量 0，是假缺口。
+  **用户预估的"3 个假缺口"实际是 2 个**（u64_9/s64_9 是真实 64 位除法，一直能折），
+  所以 38/40 就是全部真实点。
+- i386（/tmp/cov32）：18/18 个真实 32 位点都折了；u64/s64 在 i386 上是
+  `__udivdi3`/`__divdi3` 库调用，没有魔数，属预期，无回归。
+
+### dump：peephole 输入的真实形态（开关已按惯例删除）
+
+在 `runNativeRegisterPostRewritePeephole` 的 extract 降级之后加回
+`NOTDEC_DEBUG_PEEPHOLE`（docs §1.3 的那几行），`NOTDEC_DEBUG_PEEPHOLE=s32_` 跑一次
+fixture 就能看到。三类形态：
+
+**s32_1（负魔数 `+x`，x86-64 i32）**——`+x` 分支的每个环节都被 `trunc(zext(...))`
+包住，指针比较全部落空：
+
+```llvm
+%0 = sext i32 %RDI.arg to i64
+%1 = mul nsw i64 %0, -1840700269
+%2 = lshr i64 %1, 32
+%3 = trunc i64 %0 to i32          ; trunc(sext %RDI.arg) = %RDI.arg
+%4 = trunc i64 %2 to i32
+%5 = add i32 %3, %4               ; sum
+%6 = zext i32 %5 to i64
+%7 = trunc i64 %6 to i32          ; trunc(zext %5) = %5
+%8 = zext i32 %7 to i64
+%9 = trunc i64 %8 to i32          ; 又一层
+%10 = lshr i32 %9, 31             ; 符号位：操作数是 %9，不是 %5
+%11 = zext nneg i32 %10 to i64
+%12 = ashr i32 %7, 2              ; shifted：操作数也是 %7，不是 %5
+%13 = zext i32 %12 to i64
+%14 = trunc i64 %13 to i32
+%15 = trunc i64 %11 to i32
+%16 = add i32 %14, %15            ; root
+```
+
+**s32_2（正魔数，ashr 作用在 2W 位积上）**：
+
+```llvm
+%1 = mul nsw i64 %0, 954437177
+%2 = lshr i64 %1, 63              ; 乘积符号位
+%3 = ashr i64 %1, 33              ; sarq $0x21,%rax：移位在 64 位积上做
+%4 = trunc i64 %3 to i32          ; 截断在 ashr 之后
+%5 = trunc i64 %2 to i32
+%6 = add i32 %4, %5
+```
+
+**u32_1（无符号 add 修正）**——同一类包装：
+root `%13 = lshr i32 %12, 2`；`%12 = trunc(zext(%10))`、`%10 = add i32 %3, %9`
+（`%9 = trunc(zext(%7))`）、`%7 = lshr i32 %6, 1`（`%6 = trunc(zext(%4))`）、
+`%4 = sub i32 %RDI.arg, %3`。
+
+### 根因（三处，都不是数学）
+
+1. **宽度往返没看穿**：`trunc(zext(x))`/`trunc(sext(x))` 和 `x` 是同一个值，但
+   `sign->getOperand(0) != sum`、`product->Scaled != dividend` 以及 root 操作数的
+   分类都按 `Value*` 直接比，`+x` 分支和 add 修正分支的每个环节都断链。
+2. **ashr 的位置**：i386 是 `trunc(lshr(m, W))` 之后在 iW 上 `ashr s`；x86-64 的
+   32 位除法是 `trunc(ashr i64 %m, W+s)`（`sarq` 直接作用在 64 位积上）。
+   匹配器只认前者，后者的 trunc 操作数是 `ashr` 不是 `lshr`，`parseHighHalf`
+   直接拒绝。
+3. **`lowBitsView` 的盲区**：原来的 trunc 处理会跳到更宽的操作数上，于是
+   `%RDI.arg`（i32）和 `trunc(sext %RDI.arg)`（i32）仍被当成两个值。
+
+### 改动（`lib/passes/summary/NativeRegisterPeephole.cpp`）
+
+- `:254` 新增 `stripWidthRoundTrip`：把 `trunc (zext|sext %v)`（结果类型 == %v
+  类型）折成 `%v`，最多 4 层。`lowBitsView`（`:272`）每轮先过它，`sameLowBits`
+  因此也能看穿。
+- `matchSignedMagicMulChain`（`:644`）：root 操作数、ashr 的操作数、`+x` 分支 sum
+  的两个操作数都先过 `stripWidthRoundTrip`；`sign->getOperand(0) != sum` 和
+  `product->Scaled != dividend` 改成 `sameLowBits`。
+- 同函数 simple 分支接受 `trunc(ashr i(2W) %m, K)`（W ≤ K ≤ 2W）：
+  `extraShift = K - W`，其余（正魔数、`parseMagicProduct`、符号位来源）不动。
+  等价性：截断后低 W 位和"先取高半段再 ashr"相同，闭式仍是
+  `floor_s(x*M/2^K) + [x<0]`。
+- `matchUnsignedAddMagicMulChain`（`:864`）：root 的 add、sum 的操作数、`sub`
+  同样过 `stripWidthRoundTrip`。
+
+数学一行没改：新形态复用同一个 `solveMagicDivisor`/`solveUnsignedAddMagicDivisor`
+证明。dump 开关按惯例在提交前删除（`git grep getenv` 复核过）。
+
+### 单测（`tests/native_register_summary_ssa_test.cpp`）
+
+- `:11010` `testX86_64Signed32BitAshrBeforeTruncFold`：d = 3/9/11/13/1000/10^9，
+  (M, sarq 移位量) 抄自 clang -m64 真实输出；断言折成 sdiv、乘法链收干净。
+- `:11075` `testX86_64Signed32BitNegativeMagicAddXWithRoundTrips`：d = 7/60/65535
+  的负魔数 `+x` 形态，按 peephole 输入原样构造 `trunc(zext)` 往返。
+- `:11142` `testUnsigned32BitAddCorrectionWithRoundTrips`：u32 x/7、x/4095。
+- `:11207` `testWrappedRoundTripUnknownMagicIsLeftAlone`：同样的往返形态配未知
+  魔数（0x12345678）必须原样保留。
+- A/B：把 pass 改动 stash 掉重建后跑，前三条分别报
+  "chain was not folded back to sdiv/udiv" 和计数不符；恢复后全过。
+
+### 验证
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| 覆盖率 fixture x86-64 | 29/40 | **38/40**（余下 2 个是假缺口） |
+| 覆盖率 fixture i386 | 18/18 真实点 | 18/18 |
+| memcached unknown | 0 | **0** |
+| memcached 识别（无符号/有符号） | 19 / 0 | **20 / 0** |
+| memcached IR bytes / warning / defines | — | 3,767,398 / 823 / 231 |
+| wrk unknown | 15（ST0=7, ST1=8） | **15**（同左） |
+| wrk 识别（无/有）/ value_range | 1 / 6 / 53 | 1 / 6 / 53 |
+| wrk IR bytes / defines / warning | — | 949,730 / 89 / 318 |
+| `llvm-as` + `opt -passes=verify`（memcached/wrk） | OK | OK |
+| `ctest --test-dir build` | 12/12 | **12/12** |
+
+耗时：memcached 586s、wrk 61s。**这两个数不可比**——跑的时候机器上有别的项目在
+跑（一批 `microsub2.exe` worker），16 核 load average 23~29，是改前
+4m50s/35s 的 ~1.8~2 倍；但和改动无关（同负载下 fixture 还是 2.6s，改动是每个候选
+根 O(1) 的 dyn_cast，没有新增循环）。要复现耗时对比得等机器空下来重跑。
+
+### 剩余
+
+- `u32_9`/`s32_9` 是假缺口（clang 折成常量 0），不再计。
+- 16 位 add 修正、有符号 2 的幂、8 位形态仍不做（样本里没有）。
+
