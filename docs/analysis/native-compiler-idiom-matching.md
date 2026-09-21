@@ -84,6 +84,7 @@ if (const char *want = std::getenv("NOTDEC_DEBUG_PEEPHOLE")) {
 | 拼位调用 | `notdec.reg.insert.iFULL.iW(...)` | 看穿（它表达"保留高位"） |
 | 寄存器 store/load 还没消 | `store i64 %v, ptr @RAX` 后面又 `load i64, ptr @RAX` | 说明目标 pass 位置太早；要么后移，要么在识别时按值而不是按 SSA 指针比较 |
 | 值被 poison | `zext i64 poison to i128` + `!notdec.register.summary_ssa.zero_demand_operand` | 这是 partial-demand 有意的诊断信号，先查 demand 分析是不是漏了 observer（见 logs/20260920 的"同宽 mul"一节） |
+| demand 折叠 | 最终 IR 把 `ashr` 写成 `lshr`、把 `-d*q` 写成 `+(2^N-d)*q`（只保留低 N 位时的等价改写） | 形态要在 peephole 阶段认；按最终 IR 写 matcher 会一处都折不了（见 §4 的 `sub` 商形态） |
 
 **判据**：如果"最终 IR 该匹配却没匹配"，九成是这一层的问题，而不是数学。
 
@@ -166,6 +167,13 @@ L 要按被除数**自己的值上界**取：`lshr x, k` 的 L 可以收窄到 W
   `trunc(ashr i64 %m, 32+s)`（`sarq` 直接在 64 位积上做）。后者只是把
   `extraShift` 从"trunc 之后的 ashr 量"改成"2W 位 ashr 量 - W"。
   两类都要求被除数是 `sext` 进 2W 位的源。
+- **有符号商的两种符号修正写法**：`add shifted, (x >>_logical W-1)`（加 0/1）和
+  `sub shifted, (x >>_arith W-1)`（减 0/-1）。clang 在"只要余数"的取模路径上用
+  后者（fortune x86-64 的 `(c - 52) % 26`）；折出 `sdiv` 之后 `x - d*(x/d)`
+  由 InstCombine 认成 `srem`，不需要单独的取模 matcher。**注意**：peephole
+  **之后**最后一次 InstCombine 会按 demanded bits 把它改写成 `lshr` +
+  `+ (2^N - d)*q`（只保留低 N 位时的等价改写），所以这个形态只有 peephole
+  阶段能认，盯着最终 IR 会看错。
 - **乘法不用做**：`x*3 → lea` 这类强度削减在 lift 出来的 IR 里本来就是 `mul`
   （代数扫描器在三份产物上是 0 处），没有"移位加法汤"要还原。
 - **取模**：先折出 `sdiv/udiv`，InstCombine 会把 `x - d*(x/d)` 认成 `srem/urem`，

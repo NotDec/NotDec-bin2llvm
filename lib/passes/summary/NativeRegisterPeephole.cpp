@@ -636,13 +636,20 @@ std::optional<MagicMulChain> matchMagicMulChain(llvm::Instruction &root) {
   return chain;
 }
 
-// `%root = add iW %shifted, %sign`（顺序任意）：
-//   %shifted = ashr iW %truncated, s（s >= 1）或直接就是 %truncated（s == 0）
-//   %sign    = lshr iW <同一个 trunc 或被除数>, W-1
+// 有符号商的两种等价写法（closed form 都是 floor_s(x*M/2^K) + [x<0]）：
+//   `%root = add iW %shifted, %sign`（顺序任意）：
+//     %shifted = ashr iW %truncated, s（s >= 1）或直接就是 %truncated（s == 0）
+//     %sign    = lshr iW <同一个 trunc 或被除数>, W-1      —— 加 0/1 的符号位
+//   `%root = sub iW %shifted, %sign`：
+//     同上，但 %sign = ashr iW <同一个 trun 或被除数>, W-1 —— 减 0/-1 的符号掩码
 //   %truncated = trunc i(2W) (lshr i(2W) %m, W) to iW
 //   %m = mul i(2W) (sext iW %x), M
+// clang 在"只要余数"的取模路径上生成 Sub 写法（`sar $31` 之后 `sub`，见
+// fortune 的 `(c - 52) % 26`）；余数的 `x - d*q` 照旧由 InstCombine 认成
+// srem，和 i386 的路径一致，不需要单独的取模 matcher。
 std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
-  if (root.getOpcode() != llvm::Instruction::Add) {
+  bool subtractForm = root.getOpcode() == llvm::Instruction::Sub;
+  if (!subtractForm && root.getOpcode() != llvm::Instruction::Add) {
     return std::nullopt;
   }
   auto *rootType = llvm::dyn_cast<llvm::IntegerType>(root.getType());
@@ -662,15 +669,26 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
     if (inst == nullptr) {
       return std::nullopt;
     }
-    if (inst->getOpcode() == llvm::Instruction::LShr) {
+    if (inst->getOpcode() == llvm::Instruction::LShr ||
+        inst->getOpcode() == llvm::Instruction::AShr) {
+      bool maskForm = inst->getOpcode() == llvm::Instruction::AShr;
       auto *amount = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1));
-      if (!shiftAmountIs(amount, width - 1)) {
-        return std::nullopt; // 符号位必须是 >> (W-1)。
+      // 符号项必须是 `>> (W-1)`，而且写法要和根配对：Add 配 lshr（0/1），
+      // Sub 配 ashr（0/-1）。其余 AShr 是 i386 形态里的 `ashr iW (trunc), s`。
+      if (maskForm == subtractForm && shiftAmountIs(amount, width - 1)) {
+        if (sign != nullptr) {
+          return std::nullopt;
+        }
+        sign = inst;
+        continue;
       }
-      if (sign != nullptr) {
+      if (!maskForm) {
+        return std::nullopt; // lshr 既不是符号位也没法当 shifted。
+      }
+      if (shifted != nullptr) {
         return std::nullopt;
       }
-      sign = inst;
+      shifted = view;
       continue;
     }
     if (llvm::isa<llvm::TruncInst>(inst)) {
@@ -689,13 +707,6 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
         sign = inst;
         continue;
       }
-      if (shifted != nullptr) {
-        return std::nullopt;
-      }
-      shifted = view;
-      continue;
-    }
-    if (inst->getOpcode() == llvm::Instruction::AShr) {
       if (shifted != nullptr) {
         return std::nullopt;
       }
@@ -803,7 +814,8 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
     // （M_u = M_neg + 2^W），外面再 `+ x` 正好把它还原成 M_u 的简单形态，
     // 所以取常量的低 W 位当 M_u，照原来的有符号条件验证。
     auto *sum = llvm::dyn_cast<llvm::Instruction>(shiftedBase);
-    if (sum == nullptr || sum->getOpcode() != llvm::Instruction::Add ||
+    if (subtractForm || sum == nullptr ||
+        sum->getOpcode() != llvm::Instruction::Add ||
         !sameLowBits(sign->getOperand(0), sum)) {
       return std::nullopt;
     }
@@ -1231,12 +1243,13 @@ runNativeRegisterPostRewritePeephole(llvm::Module &module) {
     }
     for (llvm::Instruction &inst : llvm::instructions(function)) {
       // W = 32（i386 的 mull）和 W = 64（x86-64 的 mulq）都要扫；有符号除法的
-      // 根是最后那个 `add iW %q, %sign`，无符号是 trunc 或修正用的 lshr。
+      // 根是最后那个 `add/sub iW %q, %sign`，无符号是 trunc 或修正用的 lshr。
       if ((inst.getType()->isIntegerTy(32) ||
            inst.getType()->isIntegerTy(64)) &&
           (llvm::isa<llvm::TruncInst>(inst) ||
            inst.getOpcode() == llvm::Instruction::LShr ||
-           inst.getOpcode() == llvm::Instruction::Add)) {
+           inst.getOpcode() == llvm::Instruction::Add ||
+           inst.getOpcode() == llvm::Instruction::Sub)) {
         divisionRoots.emplace_back(&inst);
       }
     }

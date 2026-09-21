@@ -1260,3 +1260,90 @@ root `%13 = lshr i32 %12, 2`；`%12 = trunc(zext(%10))`、`%10 = add i32 %3, %9`
 - `u32_9`/`s32_9` 是假缺口（clang 折成常量 0），不再计。
 - 16 位 add 修正、有符号 2 的幂、8 位形态仍不做（样本里没有）。
 
+## 取模残形：`sub` 写法的有符号商（2026-09-21 续）
+
+用户原始 prompt：
+
+> 这个"取模残形"可以补一下，补完再详细分析一下那个 CALLOTHER 问题具体是什么，
+> 用容易懂的方式介绍一下
+
+### 先纠一个自己的误判：peephole 看到的不是折叠后的形态
+
+上一轮扫描在**最终 IR** 里看到 fortune-x86_64 的 4 处 `(c - 52) % 26` 是
+`lshr i64 %m, 35` + `mul i32 %q, 230`（230 ≡ -26 (mod 256)），据此写了一版认
+"demand 折叠后的 add + 230"的 matcher，结果一处也没折。把 peephole 输入 dump 出来
+才看清（`NOTDEC_DEBUG_PEEPHOLE=4db0`）：
+
+- peephole 阶段是**原始形态**：
+  `%102 = sub i32 (trunc i64 (ashr i64 %m, 35)), (ashr i32 %x, 31)`，
+  余数是 `%107 = sub i32 %x, mul i32 %q, 26`；
+- 最终 IR 里的 `lshr` + `230` 是 peephole **之后**最后一次 InstCombine 的
+  demanded-bits 化简：只有低 8 位被用到，`ashr` 与 `lshr` 在 bit[0,8) 上相同，
+  负的 `-26*q` 也就换成了 `+230*q`。
+
+第一版 matcher 整个撤掉（没进提交），改在**商的写法**上补：现有
+`matchSignedMagicMulChain` 只认 `add iW %shifted, %sign`（sign = `lshr x, W-1`，
+0/1），而 clang 在"只要余数"的路径上用 `sub iW %shifted, %sign`（sign =
+`ashr x, W-1`，0/-1）。两者都等于 `floor_s(x*M/2^K) + [x<0]`，closed form 和
+`solveMagicDivisor` 的验证条件完全相同。
+
+**教训**：`docs §1.3` 说"dump 目标 pass 那一刻的 IR"，这次指的是**两种方向**——
+最终 IR 既可能比 peephole 脏（helper 还没降级），也可能比 peephole **干净**
+（InstCombine 事后做了等价的 demand 改写）。按最终 IR 反推 matcher 会写错形态。
+
+### 改动（`lib/passes/summary/NativeRegisterPeephole.cpp`）
+
+- `matchSignedMagicMulChain`：根接受 `Sub`；符号项和根**配对**——Add 配
+  `lshr x, W-1`（0/1），Sub 配 `ashr x, W-1`（0/-1）；其余 AShr 仍按 i386 的
+  `ashr iW (trunc(lshr(m, W))), s` 处理。`+x` 负魔数分支保持只认 Add。
+- 候选根扫描加上 `Sub`（原来只扫 trunc/lshr/add）。
+- 取模本身**不写 matcher**：折出 `sdiv` 之后 `x - d*(x/d)` 由 InstCombine 认成
+  `srem`（文档 §2.3 的既定路线）。i386 的 fortune 一直这么折，这次只是让 x86-64
+  的 `sub` 写法也能走到这一步。
+
+### 验证
+
+- fortune-x86_64：4 处全部变成 `srem i32`，产物里 `1321528399` 从 4 → **0**：
+
+  ```llvm
+  %48 = add nsw i32 %notdec.reg.insert.lower.wide158, -52
+  %49 = srem i32 %48, 26
+  %50 = trunc nsw i32 %49 to i8
+  %51 = add i8 %50, 65
+  ```
+
+- 单测 `testSignedDivisionSubFormFold`（按真实形态构造，含 `trunc(zext)` 往返）：
+  断言折成 sdiv 26、magic 的 i64 mul 收干净；把 pass 改动 stash 掉重建后报
+  "sub-form signed quotient was not recognized"，恢复后通过。
+- `ctest --test-dir build`：12/12（含 fortune x86_64/i386）。
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| fortune-x86_64 `(c - 52) % 26` ×4 | magic `mul lshr/ashr` + `-26*q` 链 | **`srem i32, 26`**，`1321528399` 归零 |
+| 单测 + A/B | 新用例失败 | 通过 |
+| ctest | 12/12 | 12/12 |
+| memcached unknown | 0 | **0** |
+| memcached 识别（无符号/有符号） | 20 / 0 | 20 / **1**（`FUN_f920` 的 d=1392，`e*2^31=1.7e11 <= 2^40` 验证过） |
+| memcached IR bytes / warning / defines | 3,767,398 / 823 / 231 | 3,766,810 / 821 / 231 |
+| wrk unknown | 15（ST0=7, ST1=8） | **15**（同左） |
+| wrk 识别（无/有）/ value_range | 1 / 6 / 53 | 1 / 6 / 53 |
+| wrk IR bytes / defines / warning | 949,730 / 89 / 318 | 949,714 / 89 / 318 |
+| `llvm-as` + `opt -passes=verify` | OK | OK |
+| 耗时 memcached / wrk | 586s / 61s（外部 load 23~29） | **289.6s / 34.9s**（机器空下来，回到 4m50s/35s 基线档） |
+
+上一轮那两个耗时数字是外部负载下的，不可比；这轮恢复正常档，和更早的基线一致，
+说明改动没有性能影响。
+
+### 顺带：乘法的盘点结论（回答"乘法还有没有类似魔数模式"）
+
+四份产物里的剩余常量乘（memcached 157 / wrk 17 / fortune-x64 9 / fortune-i386 1）
+按形态分：
+
+- **哈希/定点常数**（真乘法，什么都不用做）：memcached `FUN_13a60` 的 xxHash
+  （`0x165667B19E3779F9`、`0x85EBCA6B` 等 14 条 `mul + lshr + xor`）、wrk 的
+  时间换算（`*1000`/`*1000000`）、`*40/*120/*536` 的结构体步长；
+- **取模残形** 4 处（本轮修掉）；
+- **除法型 `mulhi + 修正` 链**：其余产物 0 处。
+
+所以乘法本身没有新的 matcher 可加；剩下的都在除法/取模的"写法变体"里。
+

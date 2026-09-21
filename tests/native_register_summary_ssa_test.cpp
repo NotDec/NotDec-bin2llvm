@@ -10998,6 +10998,62 @@ llvm::Value *wrapRegisterWidthRoundTrip(llvm::IRBuilder<> &builder,
   return builder.CreateTrunc(builder.CreateZExt(value, wideType), valueType);
 }
 
+// clang 在"只要余数"的取模路径上用 `sub` 写符号项（机器码 `sar $31,%esi;
+// sub %esi,%ecx`），fortune x86-64 的 `(c - 52) % 26` 就是这个形态：
+//   %q = sub i32 (trunc i64 (ashr i64 (mul nsw (sext i32 wrap(x)), M), K)),
+//                wrap(ashr i32 wrap(x), 31)
+//   %r = sub i32 %x, mul i32 %q, d
+// `sub shifted, 0/-1` 和 `add shifted, 0/1` 等价，折成 sdiv 之后余数的
+// `x - d*q` 由 InstCombine 认成 srem。
+bool testSignedDivisionSubFormFold() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-signed-sub-form", context);
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  // (d, M, sarq 移位量) 取自 fortune 的实际机器码。
+  const uint64_t divisor = 26;
+  const uint64_t magic = 1321528399ULL;
+  const unsigned shift = 35;
+  llvm::Function *function = llvm::Function::Create(
+      llvm::FunctionType::get(i32, {i32}, false),
+      llvm::GlobalValue::ExternalLinkage, "sub_form_sdiv_26", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *x = function->getArg(0);
+  llvm::Value *wrapped = wrapRegisterWidthRoundTrip(builder, x, 32);
+  llvm::Value *wide = builder.CreateSExt(wrapped, i64);
+  llvm::Value *product = builder.CreateNSWMul(
+      wide, llvm::ConstantInt::get(i64, magic));
+  llvm::Value *shifted = builder.CreateTrunc(
+      builder.CreateAShr(product, llvm::ConstantInt::get(i64, shift)), i32);
+  llvm::Value *sign = builder.CreateAShr(
+      wrapped, llvm::ConstantInt::get(i32, 31));
+  llvm::Value *quotient = builder.CreateSub(
+      shifted, wrapRegisterWidthRoundTrip(builder, sign, 32), "quotient");
+  builder.CreateRet(builder.CreateSub(
+      x, builder.CreateMul(quotient, llvm::ConstantInt::get(i32, divisor)),
+      "remainder"));
+
+  auto peephole =
+      notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
+
+  bool hasI64Mul = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (inst.getOpcode() == llvm::Instruction::Mul &&
+        inst.getType()->isIntegerTy(64)) {
+      hasI64Mul = true;
+    }
+  }
+  return expect(peephole.SignedConstantDivisionsRecognized == 1,
+                "sub-form signed quotient was not recognized") &&
+         expect(functionHasSdivBy(*function, divisor),
+                "sub-form signed quotient did not fold to sdiv 26") &&
+         expect(!hasI64Mul,
+                "sub-form magic multiply survived the sdiv fold") &&
+         verifyOk(module, "module failed verifier after sub-form fold");
+}
+
 // x86-64 上 `int32_t x / d`（d 取到需要修正的魔数时）：`movslq` 之后用 64 位
 // `imulq`，算术右移直接在 64 位积上做（`sarq $33,%rax`），最后截断到 32 位才加
 // 符号位：
@@ -12193,6 +12249,7 @@ int main() {
   ok &= testSignedConstantDivisionMagicFoldX86_64();
   ok &= testUnsignedAddCorrectionMagicFold();
   ok &= testSignedNegativeMagicAddXFormFold();
+  ok &= testSignedDivisionSubFormFold();
   ok &= testX86_64Signed32BitAshrBeforeTruncFold();
   ok &= testX86_64Signed32BitNegativeMagicAddXWithRoundTrips();
   ok &= testUnsigned32BitAddCorrectionWithRoundTrips();
