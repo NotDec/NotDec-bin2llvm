@@ -999,3 +999,67 @@ wrk 那处：
 16 位以下的 8 位形态同理。有符号 2 的幂除法（clang 用 `cmov`/`and` 修正序列）
 在三个样本里一处都没有，也先不做。
 
+
+
+## 常量乘法盘点 + peephole 阶段的 extract 噪声（2026-09-20 续）
+
+用户原始 prompt：
+
+> 类似的乘法是不是还没做，如果是的话，也做一下匹配吧？
+
+### 先回答"乘法还有没有没做的"：没有
+
+写了代数扫描器，把产物里的 `shl/add/sub` 链按 `C*x` 还原（递归到同一个基值），
+只统计系数不是 0/1/2 的幂、也不是已有 `mul` 的：
+memcached / wrk / fortune-i386 **三份产物全是 0 处**。原因是这类强度削减
+（`x*3` → `lea`）在 lift 出来的 IR 里本来就已经是 `mul`，InstCombine 也会折回去，
+没有"移位加法汤"要还原。所以这一轮没有乘法 matcher 可加。
+
+顺手做的覆盖率检查反而发现了**除法的真缺口**：编了个 40 个除法点（u32/s32/u64/s64 ×
+10 个除数）的 x86-64/i386 二进制对拍，x86-64 只折了 27/40：
+
+- `s32_*`（`int32_t x/d`）**全部没折**；
+- `u32_1`（`uint32_t x/7` 的 add 修正形态）没折；
+- `u32_9`/`s32_9`（除以 10^12，源码直接是常量 0）是假缺口，忽略。
+
+### 根因：peephole 阶段还在用 `notdec.reg.extract` 表示位段
+
+把 peephole 输入的 IR dump 出来（临时 getenv 开关，看完已删）才看清：
+`s32_0` 在这个阶段是
+
+```llvm
+%1 = mul nsw i64 %0, 1431655766
+%2 = lshr i64 %1, 63
+%3 = lshr i64 %1, 32
+%a = call i32 @notdec.reg.extract.i64.i32(i64 %3, i64 0)   ; 不是 trunc
+%b = call i32 @notdec.reg.extract.i64.i32(i64 %2, i64 0)
+%4 = add i32 %a, %b
+```
+
+识别器只认 `trunc`，于是整条链匹配不上；而 final cleanup 之后它才变成 `trunc`，
+所以"最终 IR 看着完全该折"却折不了。
+
+### 本轮改动
+
+在 `runNativeRegisterPostRewritePeephole` 开头先把 `notdec.reg.extract.iFULL.iW(v, off)`
+降成显式 `lshr`+`trunc`（final cleanup 本来就会做同样的事），再跑识别和原有的
+value-range 化简。匹配器另外放宽了两处：符号位接受
+`trunc iW (lshr i(2W) %m, 2W-1)`（乘积符号位），以及"是不是同一个值"改成按
+(基值, 位偏移, 位宽) 归一化比较，不再被一层 `trunc`/extract 包装挡住。
+
+### 结果与仍缺的部分
+
+- 覆盖率对拍：x86-64 27/40 → **29/40**（`s32_0` 折了；peephole 的 value-range 化简
+  在同一份 IR 上从 0 处变成 19 处）。
+- 仍缺：`u32_1`（32 位 add 修正）和 `s32_1..s32_8`（d=7 起的 32 位有符号除法）。
+  这些在 peephole 阶段是**另一类形态**（还没逐个 dump 确认），需要单独一轮：
+  先 dump 它们的 peephole 输入、按同一套流程推导、再实现。
+- 回归：memcached unknown 0、wrk unknown 15（不变）、`ctest --test-dir build` 12/12、
+  单测全过；wrk 的 value-range 化简从 0 处涨到 53 处（同一份 IR 上识别和化简都变好）。
+- 中途踩到一个自己引入的崩溃：移位量用 `APInt(width, ...)` 按类型比较，遇到
+  "移位量比被除数宽"（`lshr i64` 用在 i32 形态里）会触发宽度断言，wrk 直接 abort；
+  改成按值比较（`shiftAmountIs`）后消失。这类形态在 lowering 之后才被暴露出来。
+
+（这一轮的定位经验：以后"最终 IR 该折没折"先怀疑 **peephole 阶段的值图形态**，
+dump 一眼比猜快得多；`notdec.reg.*` helper 是这一层最常见的噪声。）
+

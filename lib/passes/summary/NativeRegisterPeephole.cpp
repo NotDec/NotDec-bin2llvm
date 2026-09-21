@@ -238,6 +238,56 @@ llvm::Value *simplifyInsertedValueExtract(llvm::TruncInst &trunc) {
                                 readType, seen);
 }
 
+// peephole 阶段同一个寄存器值可能一处是 `%arg`、另一处是 `trunc` 或
+// `notdec.reg.extract.iFULL.iW(%arg, 0)` 这种低位视图。它们是同一个值，所以比较
+// "被除数是不是同一个"时要先归一化成 (基值, 位偏移, 位宽)，否则会因为一层无关
+// 包装漏掉整个除法。
+struct LowBitsView {
+  llvm::Value *Base = nullptr;
+  uint64_t Offset = 0;
+  unsigned Width = 0;
+};
+
+LowBitsView lowBitsView(llvm::Value *value) {
+  for (int depth = 0; depth < 4 && value != nullptr; ++depth) {
+    if (auto *trunc = llvm::dyn_cast<llvm::TruncInst>(value)) {
+      value = trunc->getOperand(0);
+      continue;
+    }
+    auto *call = llvm::dyn_cast<llvm::CallBase>(value);
+    std::optional<NativeRegisterValueExtractInfo> extract =
+        call == nullptr ? std::nullopt : parseNativeRegisterValueExtract(*call);
+    if (extract && extract->BitOffset == 0) {
+      value = extract->FullValue;
+      continue;
+    }
+    break;
+  }
+  auto *type = llvm::dyn_cast<llvm::IntegerType>(value->getType());
+  LowBitsView view;
+  view.Base = value;
+  view.Offset = 0;
+  view.Width = type == nullptr ? 0 : type->getBitWidth();
+  return view;
+}
+
+bool sameLowBits(llvm::Value *lhs, llvm::Value *rhs) {
+  if (lhs == rhs) {
+    return true;
+  }
+  LowBitsView left = lowBitsView(lhs);
+  LowBitsView right = lowBitsView(rhs);
+  return left.Base == right.Base && left.Offset == right.Offset &&
+         left.Width == right.Width;
+}
+
+// 移位量按"值"比较：shift 的操作数类型可能比被除数宽（lshr i64 用在 i32 的形态里），
+// 直接用 APInt(宽度不同) 比较会触发断言。
+bool shiftAmountIs(llvm::ConstantInt *amount, uint64_t value) {
+  return amount != nullptr && amount->getValue().getActiveBits() <= 64 &&
+         amount->getValue().getZExtValue() == value;
+}
+
 // 编译器把无符号除以常数 d 生成成 `(x * M) >> (W + s)`（W 是被除数位宽，
 // M 是 W 位魔数，s 由编译器按 d 选定）。lift 出来的形态是
 // `mul i(2W) (zext x), M` + `lshr i(2W), K` + `trunc`（x86-64 的 mulq 是
@@ -587,15 +637,38 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
     }
     if (inst->getOpcode() == llvm::Instruction::LShr) {
       auto *amount = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(1));
-      if (amount == nullptr ||
-          amount->getValue() != llvm::APInt(width, width - 1)) {
+      if (!shiftAmountIs(amount, width - 1)) {
         return std::nullopt; // 符号位必须是 >> (W-1)。
+      }
+      if (sign != nullptr) {
+        return std::nullopt;
       }
       sign = inst;
       continue;
     }
-    if (inst->getOpcode() == llvm::Instruction::AShr ||
-        llvm::isa<llvm::TruncInst>(inst)) {
+    if (llvm::isa<llvm::TruncInst>(inst)) {
+      // `trunc iW (lshr i(2W) %m, 2W-1)` 是乘积的符号位，也当 sign；
+      // 其余 trunc 是 `>> W` 之后的高半段，当 shifted。
+      auto *inner = llvm::dyn_cast<llvm::Instruction>(inst->getOperand(0));
+      auto *amount =
+          inner == nullptr || inner->getOpcode() != llvm::Instruction::LShr
+              ? nullptr
+              : llvm::dyn_cast<llvm::ConstantInt>(inner->getOperand(1));
+      if (amount != nullptr &&
+          shiftAmountIs(amount, 2 * width - 1)) {
+        if (sign != nullptr) {
+          return std::nullopt;
+        }
+        sign = inst;
+        continue;
+      }
+      if (shifted != nullptr) {
+        return std::nullopt;
+      }
+      shifted = operand;
+      continue;
+    }
+    if (inst->getOpcode() == llvm::Instruction::AShr) {
       if (shifted != nullptr) {
         return std::nullopt;
       }
@@ -643,9 +716,18 @@ std::optional<MagicMulChain> matchSignedMagicMulChain(llvm::Instruction &root) {
     scaled = product->Scaled;
     magicValue = product->Magic->getValue();
     llvm::Value *signSource = sign->getOperand(0);
+    // 符号位也可能是 `trunc(lshr i(2W) %m, 2W-1)`（乘积的符号位，等价）。
+    if (llvm::isa<llvm::TruncInst>(sign)) {
+      auto *inner = llvm::dyn_cast<llvm::Instruction>(signSource);
+      if (inner == nullptr || inner->getOpcode() != llvm::Instruction::LShr ||
+          !sameLowBits(inner->getOperand(0), highHalf->first)) {
+        return std::nullopt;
+      }
+      signSource = scaled;
+    }
     if (product->SourceBits == width) {
       // 符号位来自高半段（同一个 trunc）或被除数本身，两者都等于 [x < 0]。
-      if (signSource != trunc && signSource != scaled) {
+      if (!sameLowBits(signSource, trunc) && !sameLowBits(signSource, scaled)) {
         return std::nullopt;
       }
     } else {
@@ -797,7 +879,7 @@ matchUnsignedAddMagicMulChain(llvm::Instruction &root) {
   }
   std::optional<MagicProduct> product =
       parseMagicProduct(*highHalf->first, width);
-  if (!product || product->Signed || product->Scaled != dividend) {
+  if (!product || product->Signed || !sameLowBits(product->Scaled, dividend)) {
     return std::nullopt;
   }
 
@@ -849,7 +931,7 @@ matchNarrowProductMagicChain(llvm::Instruction &root) {
       if (amount == nullptr) {
         return std::nullopt;
       }
-      if (amount->getValue() == llvm::APInt(width, width - 1)) {
+      if (shiftAmountIs(amount, width - 1)) {
         sign = inst;
       } else {
         shifted = inst;
@@ -1041,6 +1123,49 @@ runNativeRegisterPostRewritePeephole(llvm::Module &module) {
   NativeRegisterPostRewritePeepholeSummary summary;
   // 常数除法识别先做：命中会删掉链上的 trunc/lshr，所以这里用 WeakVH 收集
   // 候选根，后面的 value-range 化简再重新收集一次 trunc。
+  // 这个阶段寄存器 SSA 还在用 notdec.reg.extract.iFULL.iW(v, off) 表示位段读取，
+  // 而下面的识别器只认 trunc/lshr。final cleanup 反正要把它们降成显式位运算，
+  // 这里先降一遍，让匹配看到真实的值图（先降，再扫候选根）。
+  {
+    llvm::SmallVector<llvm::CallInst *, 64> extracts;
+    for (llvm::Function &fn : module) {
+      if (fn.isDeclaration()) {
+        continue;
+      }
+      for (llvm::Instruction &inst : llvm::instructions(fn)) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+        if (call != nullptr && parseNativeRegisterValueExtract(*call)) {
+          extracts.push_back(call);
+        }
+      }
+    }
+    for (llvm::CallInst *call : extracts) {
+      if (call->getParent() == nullptr) {
+        continue;
+      }
+      std::optional<NativeRegisterValueExtractInfo> extract =
+          parseNativeRegisterValueExtract(*call);
+      auto *resultType = llvm::dyn_cast<llvm::IntegerType>(call->getType());
+      auto *fullType =
+          extract.has_value()
+              ? llvm::dyn_cast<llvm::IntegerType>(extract->FullValue->getType())
+              : nullptr;
+      if (!extract || resultType == nullptr || fullType == nullptr ||
+          fullType->getBitWidth() <= resultType->getBitWidth()) {
+        continue;
+      }
+      llvm::IRBuilder<> builder(call);
+      llvm::Value *value = extract->FullValue;
+      if (extract->BitOffset != 0) {
+        value = builder.CreateLShr(
+            value, llvm::ConstantInt::get(fullType, extract->BitOffset));
+      }
+      value = builder.CreateTrunc(value, resultType);
+      call->replaceAllUsesWith(value);
+      call->eraseFromParent();
+    }
+  }
+
   llvm::SmallVector<llvm::WeakVH, 64> divisionRoots;
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
