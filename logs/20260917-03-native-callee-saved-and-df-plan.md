@@ -1424,11 +1424,27 @@ root `%13 = lshr i32 %12, 2`；`%12 = trunc(zext(%10))`、`%10 = add i32 %3, %9`
 | `llvm-as` + `opt -passes=verify` | OK | OK（memcached / wrk） |
 | 耗时 memcached / wrk | 289.6s / 34.9s | 288.0s / 34.4s |
 
-### 仍未做
+### 占位的定位：够类型推理用就行，不做语义展开
 
-- **crc32 的语义（CRC-32C）还没实现**，现在只是命名占位：下一步可以按位展开
-  （每个字节 8 轮，字节序是从低字节开始），或者在 runtime 里给它一个定义；
-  cpuid 的各个 leaf 同理（样本里它落在被 DCE 的函数里，优先级低）。
+这条链路的产物是喂类型推理（htype / microsub2）的，占位函数不需要"算出真值"，
+只要满足：
+
+1. **宽度正确**：返回类型 = p-code 输出 varnode 的位宽，实参类型 = 各输入位宽；
+   同一 userop 的不同宽度用类型后缀区分（crc32 的 `i8`/`i64` 两个签名）。
+2. **访存还在**：内存操作数在 p-code 里本来就是独立的 LOAD，占位调用拿到的是
+   已加载的值，类型推理仍能看到那次访存和它的宽度。例（memcached crc32q）：
+
+   ```llvm
+   %unique_df00_8 = load i64, ptr %notdec_ram_ptr29, align 1
+   %35 = call i64 @notdec.register.userop.crc32.i64.i64.i64(
+             i64 %notdec.reg.insert.lower116, i64 %unique_df00_8)
+   ```
+
+3. **有具体原型**：不再是 `i64 (...)` variadic，消费者按普通函数签名处理即可；
+   `notdec.register.userop.` 前缀就是"这是未建模指令"的可机器识别标记。
+4. 需要真语义（比如以后要重编译执行）时再展开；现在没有这个消费方，不做。
+   cpuid 的各 leaf 同理。
+
 - warning 是进程内去重、打到 stderr；IR 输入路径不进 lifter，所以
   `cli-signature-rewrite-ll` 那条"默认 stderr 必须为空"的红线不受影响。
 

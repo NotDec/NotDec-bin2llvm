@@ -85,7 +85,7 @@ if (const char *want = std::getenv("NOTDEC_DEBUG_PEEPHOLE")) {
 | 寄存器 store/load 还没消 | `store i64 %v, ptr @RAX` 后面又 `load i64, ptr @RAX` | 说明目标 pass 位置太早；要么后移，要么在识别时按值而不是按 SSA 指针比较 |
 | 值被 poison | `zext i64 poison to i128` + `!notdec.register.summary_ssa.zero_demand_operand` | 这是 partial-demand 有意的诊断信号，先查 demand 分析是不是漏了 observer（见 logs/20260920 的"同宽 mul"一节） |
 | demand 折叠 | 最终 IR 把 `ashr` 写成 `lshr`、把 `-d*q` 写成 `+(2^N-d)*q`（只保留低 N 位时的等价改写） | 形态要在 peephole 阶段认；按最终 IR 写 matcher 会一处都折不了（见 §4 的 `sub` 商形态） |
-| 未建模 userop 占位 | `call i64 @notdec.register.userop.crc32.i64.i64.i8(...)` | 不是噪声，是 Sleigh userop（crc32 等）还没实现语义。lift 时每个 userop 打一条 warning；看到占位调用就去 `PcodeToLLVM.cpp` 的 `lowerCallOther` 补分支 |
+| 未建模 userop 占位 | `call i64 @notdec.register.userop.crc32.i64.i64.i8(...)` | 不是噪声：Sleigh userop（crc32、cpuid、ud2…）没有独立语义实现，占位函数只为类型推理保留宽度/实参/访存信息（真值不展开）。lift 时每个 userop 打一条 warning；要补语义就去 `PcodeToLLVM.cpp` 的 `lowerCallOther` 加分支 |
 
 **判据**：如果"最终 IR 该匹配却没匹配"，九成是这一层的问题，而不是数学。
 
