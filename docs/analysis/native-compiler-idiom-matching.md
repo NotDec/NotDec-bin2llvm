@@ -52,6 +52,11 @@ build/bin/notdec-native-llvm cov64 --all-confirmed --skip-runtime \
 - 当 lift 出来的东西"看着不对"时，回头用
   `objdump -d --start-address=... --stop-address=...` 看真实机器码，
   对照 p-code/lift 的语义，别在 IR 上瞎猜。
+- **x87 助记符坑**：objdump 的 AT&T 输出对无操作数形式的 `fdivp`/`fdivrp` 和
+  `fsubp`/`fsubrp` 是**互换**的（`DE F1` 在 objdump 里显示 `fdivp`，Intel/Ghidra
+  语义是 `FDIVRP`：`ST1 = ST0 / ST1`）。核对 x87 语义以 `ia.sinc` 的宏为准
+  （`:FDIVP` 是 `DE F9`、`:FDIVRP` 是 `DE F1`），别拿 objdump 的助记符直接判
+  "操作数反了"。
 
 ### 1.3 关键一步：dump **目标 pass 执行那一刻**的 IR
 

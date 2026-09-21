@@ -1448,6 +1448,61 @@ root `%13 = lshr i32 %12, 2`；`%12 = trunc(zext(%10))`、`%10 = add i32 %3, %9`
 - warning 是进程内去重、打到 stderr；IR 输入路径不进 lifter，所以
   `cli-signature-rewrite-ll` 那条"默认 stderr 必须为空"的红线不受影响。
 
+## wrk IR 盘点：没有新 bug，但记两条结论（2026-09-21 续）
+
+用户要求"看看哪里还有明显的问题值得修的，比如说 WRK 的 IR"。盘了一遍，结论：
+
+### 1. 间接调用/函数指针提升的低命中率是**设计使然**，不是漏提升
+
+数字：wrk `seen=50 promoted=2 slots=15`，memcached `seen=54 promoted=0 slots=45`。
+单看像 bug，在 promotion pass 里临时打印槽状态（已撤）后实测：
+
+- 目标是**未定义外部声明**的槽（wrk 的 `ssl_read/ssl_write/ssl_close/ssl_connect`、
+  `sock_*`）→ `target->isDeclaration()`，本来就不提升；
+- `0x142c0 sock_connect`、`0x142d0 sock_read`、`0x14100`（zmalloc 的 OOM handler，
+  重定位初值 `FUN_7b30`）在 IR 里有真实 store：`main` 里
+  `store ... inttoptr(82624)`、`zmalloc_set_oom_handler` 里
+  `store i64 %RDI.arg, ptr inttoptr(82176)`——运行时可写，拒绝提升是对的；
+- `0x142e0` 有 2 个目标（sock_readable），也拒绝；
+- 其余 `FPCALL unresolved` 都是运行时算出来的指针（`inttoptr %unique_...`），
+  静态提不了。
+
+结论：这条路没有"明显 bug"，别再去追低提升率。
+
+### 2. wrk 的 15 条 unknown 全是 x87 入口 ST0/ST1，是**可修的死值**
+
+分布在 6 个函数（`format_time_us/s`、`stats_mean/stdev/percentile/within_stdev`、
+`FUN_81d0`）。形态是窗口模型在入口读 ST0/ST1，作为"被挤出窗口的旧值"传给
+`notdec.x87.push`：
+
+```llvm
+%ST0entry_range_rejected = call i80 @notdec.unknown.i80()
+%ST1entry_range_rejected = call i80 @notdec.unknown.i80()
+call void @notdec.x87.push(... %ST1 ...)
+call void @notdec.x87.push(... %ST0 ...)
+```
+
+逐函数检查过：这些入口值只被压进库、或被没人用的 pop 返回；被使用的 pop 返回的
+都是之后压入的真实值（入口值沉在库底）。按 SysV ABI，函数入口 x87 栈为空，
+这两次读本来就是死值。
+
+可修方向：窗口模型补"入口深度 = 0"——前两次 push 不读 ST0/ST1（或读成 poison）。
+预期 wrk unknown 15 → 0。风险点是跨分支深度和尾部跳转，动手前先 dump 几个函数的
+push/pop 平衡。
+
+### 3. 方法论坑：objdump 的 x87 `fdivp/fdivrp` 助记符是互换的
+
+差点据此误报"format_time_us 的除法反了"：`DE F1` 在 objdump（AT&T）里显示
+`fdivp %st,%st(1)`，而 Ghidra spec（`ia.sinc`）里 `DE F1` 是 **FDIVRP**
+（`ST1 = ST0 / ST1`，`:FDIVRP is ... byte=0xF1`），`DE F9` 才是 FDIVP。
+按 spec 核对后 IR 的 `x / C` 是对的。已写进 `docs §1.2`。
+
+### 其他扫描结果（都不是问题）
+
+- 无 `poison`/`undef` 返回；60 处 `unreachable` 是 `ud2`/abort 路径；
+- 75 个 `summary_clobber` 都是"调用后读 caller-saved"的诚实结果；
+- 最大的函数 `http_parser_execute`（6670 行）是大 switch，无结构异常。
+
 ### 顺带：乘法的盘点结论（回答"乘法还有没有类似魔数模式"）
 
 四份产物里的剩余常量乘（memcached 157 / wrk 17 / fortune-x64 9 / fortune-i386 1）
