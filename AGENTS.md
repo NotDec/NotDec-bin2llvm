@@ -31,6 +31,12 @@ x87 窗口等）都遵循：
 
 native 计划必须说明已有 native 状态，列出 Ghidra 源码文件和关键函数，区分需要复刻的策略与保守暂缓的部分，再写阶段、判断标准、风险和不做什么。本格式只用于 native bin2llvm。
 
+**动手做底层二进制操作的识别/还原（常量除法、取模、强度削减、变参、canary 等）之前，
+先看 `docs/analysis/native-compiler-idiom-matching.md`**：它写了定位手法（覆盖率 fixture、
+dump 目标 pass 那一刻的 IR、这一层常见的 helper/宽度往返噪声）、等价性证明的固定套路
+（闭式 → 代入 x = d*q + r → 两次 APInt 检查）、落地与验证清单，以及现状/未做清单。
+"最终 IR 看着该匹配却没匹配"几乎都是那一层的值图噪声，先 dump 再猜。
+
 ## 寄存器消除路线
 
 当前默认且后续重点是 `summary`：
