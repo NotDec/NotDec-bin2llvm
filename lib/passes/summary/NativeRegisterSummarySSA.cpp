@@ -2561,6 +2561,16 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
   std::map<std::string, std::vector<unsigned>> aritiesByCallee;
   std::map<std::string, std::vector<std::pair<unsigned, unsigned>>>
       intFloatAritiesByCallee;
+  // 未知外部（没有原型）各调用点的证据槽位。元数不一致时要按"固定 min + 每点
+  // 自己的尾巴"建模，必须保留每个点自己的前缀。
+  struct UnknownExternalSite {
+    const llvm::CallBase *Call = nullptr;
+    unsigned IntegerCount = 0;
+    unsigned FloatCount = 0;
+    std::vector<NativeRegisterCallsiteSlotEvidence> IntegerSlots;
+    std::vector<NativeRegisterCallsiteSlotEvidence> FloatSlots;
+  };
+  std::map<std::string, std::vector<UnknownExternalSite>> unknownSitesByCallee;
   for (const NativeRegisterExternalCallsite &callsite :
        baseSummary.ExternalCallsites) {
     if (callsite.Kind == NativeRegisterExternalCallsiteKind::UnknownExternal) {
@@ -2589,6 +2599,15 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
           warnIfStoppedAtCallClobber(
               warnings, callsite, floatSlots, floatCount,
               "float_unknown_external_arity_stopped_at_call_clobber");
+        }
+        if (callsite.Call != nullptr) {
+          UnknownExternalSite site;
+          site.Call = callsite.Call;
+          site.IntegerCount = integerCount;
+          site.FloatCount = floatCount;
+          site.IntegerSlots = std::move(integerSlots);
+          site.FloatSlots = std::move(floatSlots);
+          unknownSitesByCallee[callsite.CalleeName].push_back(std::move(site));
         }
       }
       continue;
@@ -2706,7 +2725,10 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
     unsigned maxArity = *std::max_element(arities.begin(), arities.end());
     std::string detail = "arity=" + std::to_string(minArity) + ".." +
                          std::to_string(maxArity) +
-                         "/final=" + std::to_string(maxArity);
+                         (minArity != maxArity
+                              ? "/final=(fixed=" + std::to_string(minArity) +
+                                    ",...)"
+                              : "/final=" + std::to_string(maxArity));
     if (minArity != maxArity) {
       warnings.push_back(externalInferenceWarning(
           callee, detail, "inconsistent_unknown_external_arity",
@@ -2718,8 +2740,17 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
           arities.size()));
       continue;
     }
+    // 各调用点证据推出来的元数不一致时，真实函数几乎只能是变参：非变参函数在
+    // 所有调用点元数相同。按"固定 min + 每点自己的尾巴"建模（声明成
+    // (fixed, ...)），避免把 max 强加给所有调用点 —— 那会让只传 3 个参数的
+    // av_log(NULL, level, "msg") 也去凑 11 个没人传的实参，每个都变成 unknown。
+    // 单点元数可以小于 min 的只有推理噪声；min 作为固定前缀是这里最保守的
+    // 公共部分，剩下的按点传。
+    bool inferredVarArg = minArity != maxArity;
     NativeExternalPrototype prototype;
-    prototype.FixedArgs = maxArity;
+    prototype.FixedArgs = inferredVarArg ? minArity : maxArity;
+    prototype.VarArg = inferredVarArg;
+    prototype.MaxArgs = inferredVarArg ? maxArity : 0;
     // The first pass only infers input arity.  Do not cap unknown external
     // returns to the built-in one-register default; later demand decides them.
     prototype.MaxReturnRegisters = std::numeric_limits<unsigned>::max();
@@ -2728,6 +2759,7 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
     // of overflowing into integer/stack slots.  Integer arguments are assumed
     // to come first (the common C shape is a handle/pointer followed by
     // floating data); interleaved float-in-the-middle shapes stay untyped.
+    // 变参原型只给固定前缀定型，尾巴由每个调用点自己的证据决定。
     unsigned bestIntegerCount = 0;
     unsigned bestFloatCount = 0;
     for (const auto &[integerCount, floatCount] :
@@ -2738,7 +2770,7 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
         bestFloatCount = floatCount;
       }
     }
-    if (bestFloatCount > 0) {
+    if (!inferredVarArg && bestFloatCount > 0) {
       prototype.TypedParams.reserve(maxArity);
       for (unsigned index = 0; index < bestIntegerCount; ++index) {
         prototype.TypedParams.push_back(
@@ -2750,8 +2782,36 @@ NativeExternalCallsiteShapeMap inferExternalCallShapes(
       }
     }
     prototypes[callee] = std::move(prototype);
+    if (inferredVarArg) {
+      auto sitesIt = unknownSitesByCallee.find(callee);
+      if (sitesIt != unknownSitesByCallee.end()) {
+        for (const UnknownExternalSite &site : sitesIt->second) {
+          if (site.Call == nullptr) {
+            continue;
+          }
+          // Inputs 的前 shape.Params.size() 项对应固定前缀（callParamSlots
+          // 只取后面的尾巴），所以顺序按证据的整数序列在前、浮点序列在后，
+          // 与上面 TypedParams 的"整数参数在前"约定一致。
+          NativeExternalCallShape shape;
+          shape.VarArg = true;
+          shape.FixedArgs = minArity;
+          shape.MaxArgs = maxArity;
+          shape.FixedInputsComplete = true;
+          for (unsigned index = 0; index < site.IntegerCount; ++index) {
+            shape.Inputs.push_back(callInputSlot(site.IntegerSlots[index]));
+          }
+          for (unsigned index = 0; index < site.FloatCount; ++index) {
+            shape.Inputs.push_back(callInputSlot(site.FloatSlots[index]));
+          }
+          callsiteShapes.emplace(site.Call, std::move(shape));
+        }
+      }
+    }
     warnings.push_back(externalInferenceWarning(
-        callee, detail, "inferred_unknown_external_arity", arities.size()));
+        callee, detail,
+        inferredVarArg ? "inferred_unknown_external_vararg"
+                       : "inferred_unknown_external_arity",
+        arities.size()));
   }
   return callsiteShapes;
 }
@@ -4521,6 +4581,10 @@ private:
   // 请求就能整段平铺，不必依赖按重叠段拼接的读兜底。拿不到 shape 的调用点
   // （间接调用的 shape 是规划之后 addIndirectCallsiteShapes 现推的）跳过，
   // 仍由拼接兜底。
+  //
+  // 试过"只收本块内自己写过的槽位"（认为没写过就不是这次传的实参）：lighttpd 上
+  // 省 0.46% IR，但 4 个 call_arg_rewrite_type_mismatch 会回来（调用点没在本块写
+  // 寄存器、却要靠细分区才能取出类型正确的值），所以保持全收。
   void addCallParamRangeBoundaries() {
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
       auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);

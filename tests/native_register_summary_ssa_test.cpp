@@ -5906,7 +5906,9 @@ bool testClobberReturnPhiPreservesMixedPath() {
                   "module failed verifier after mixed clobber return phi test");
 }
 
-bool testUnknownExternalArityUsesMaxCallsitePrefix() {
+// 各调用点元数不一致的未知外部按变参建模：固定前缀取 min，每个调用点只传
+// 自己证据推出来的尾巴（旧行为是把 max 强加给所有点）。
+bool testUnknownExternalArityUsesVarArgTail() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-unknown-external-max-arity", context);
   attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX"});
@@ -5920,8 +5922,11 @@ bool testUnknownExternalArityUsesMaxCallsitePrefix() {
   llvm::Function *callee =
       llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
                              "unknown_external_arity", module);
+  // 条件用函数参数：常量真分支会被后面的 SimplifyCFG 折掉，长调用点就看不到了。
+  auto *callerType = llvm::FunctionType::get(
+      llvm::Type::getVoidTy(context), {llvm::Type::getInt1Ty(context)}, false);
   llvm::Function *function =
-      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+      llvm::Function::Create(callerType, llvm::GlobalValue::ExternalLinkage,
                              "unknown_external_arity_callers", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
@@ -5932,8 +5937,7 @@ bool testUnknownExternalArityUsesMaxCallsitePrefix() {
   llvm::BasicBlock *done = llvm::BasicBlock::Create(context, "done", function);
 
   llvm::IRBuilder<> builder(entry);
-  builder.CreateCondBr(llvm::ConstantInt::getTrue(context), shortCall,
-                       longCall);
+  builder.CreateCondBr(function->getArg(0), shortCall, longCall);
 
   builder.SetInsertPoint(shortCall);
   storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
@@ -5964,12 +5968,44 @@ bool testUnknownExternalArityUsesMaxCallsitePrefix() {
         warning.Reason == "inconsistent_unknown_external_arity";
   }
 
+  llvm::Function *rewrittenCaller =
+      module.getFunction("unknown_external_arity_callers");
+  std::vector<unsigned> callArities;
+  if (rewrittenCaller != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() == rewritten) {
+        callArities.push_back(call->arg_size());
+      }
+    }
+  }
+  std::sort(callArities.begin(), callArities.end());
+  bool hasVarArgWarning = false;
+  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+       summary.Warnings) {
+    hasVarArgWarning |= warning.CalleeName == "unknown_external_arity" &&
+                        warning.Reason == "inferred_unknown_external_vararg";
+  }
+  std::string arityMessage =
+      "unknown external call sites did not keep their own arity (got";
+  for (unsigned arity : callArities) {
+    arityMessage += " " + std::to_string(arity);
+  }
+  arityMessage += ")";
+
   return expect(rewritten != nullptr,
                 "unknown external arity callee missing") &&
-         expect(rewritten->arg_size() == 3,
-                "unknown external arity did not use max callsite prefix") &&
+         expect(rewritten->isVarArg(),
+                "inconsistent unknown external arity was not modeled as "
+                "vararg") &&
+         expect(rewritten->arg_size() == 1,
+                "unknown external fixed prefix did not use the min arity") &&
+         expect(callArities == std::vector<unsigned>({1, 3}),
+                arityMessage.c_str()) &&
          expect(hasInconsistentArityWarning,
                 "unknown external arity mismatch warning missing") &&
+         expect(hasVarArgWarning,
+                "unknown external vararg inference warning missing") &&
          verifyOk(module,
                   "module failed verifier after unknown external arity test");
 }
@@ -12296,7 +12332,7 @@ int main() {
   ok &= testUnknownExternalClobberArgBecomesUnknown();
   ok &= testInternalReturnDoesNotExposeExternalClobber();
   ok &= testClobberReturnPhiPreservesMixedPath();
-  ok &= testUnknownExternalArityUsesMaxCallsitePrefix();
+  ok &= testUnknownExternalArityUsesVarArgTail();
   ok &= testConsumedScratchRegisterIsNotAnExternalArgument();
   ok &= testConsumedRegisterBeforeLaterArgumentKeepsArity();
   ok &= testExternalPrototypeJsonOverridesInferredArity();

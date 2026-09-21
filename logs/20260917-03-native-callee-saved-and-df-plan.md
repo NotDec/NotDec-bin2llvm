@@ -1796,3 +1796,62 @@ memcached 多的 2 条 warning 不是新缺口：同一批 clobber 占位从 R8[
 R8[0:32)+R8[32:64)（更细的粒度）。单测 testCallArgSlotSpansPlannedRangeSegments 加了
 一条断言，caller 的 range_segments_planned >= 3（callee i32 槽位的边界确实进了分区），
 最终实参仍是常量 16。ctest 12/12。
+
+## 未知外部元数：不一致时按变参建模（2026-09-21 续）
+
+用户 prompt：
+
+> 两个都试试吧
+
+### 1. 先确认证据来源（临时打印，已删）
+
+给 inferExternalCallShapes 的 UnknownExternal 分支加 `NOTDEC_DEBUG_EXTARITY=<callee>`
+的临时打印，跑 ffmpeg `-n main` 看 av_log 各调用点的证据：每点候选是 6 个整型寄存器
++ 6 个浮点 + 16 个栈槽，栈槽只有真写过才是 LocalDefinition（origin=0），否则
+Unknown。也就是**每个点自己推出来的元数是可信的**（3/4/7…各不相同），问题在聚合：
+aritiesByCallee 取 min..max，然后把 max 当成整个 callee 的固定元数。
+
+ffmpeg 里元数不一致的未知外部有 282 个：av_log 3..14、av_bprintf 2..9、
+av_add_q 1..2、av_buffer_unref 0..1…… 结果 `declare double @av_log(i64 ×14)`，
+573 个调用点全部传 14 个参数；只传 3 个参数的点也去凑 8 个栈槽，于是 4563 个
+missing_binding unknown（占 ffmpeg 全部 unknown 的 93%）。
+
+### 2. 修法：固定 min 前缀 + 每点自己的尾巴
+
+inferExternalCallShapes 在 `minArity != maxArity` 时：
+
+- 原型改成 `VarArg=true, FixedArgs=minArity, MaxArgs=maxArity`，声明变成
+  `(i64, i64, i64, ...)`；元数一致时保持原来的固定元数模型（非变参函数在所有
+  调用点元数相同，不一致基本只能是变参）；
+- 同时给每个调用点发一个 NativeExternalCallShape：Inputs = 该点自己的证据前缀
+  （整数序列在前、浮点序列在后），callParamSlots 只取 Params.size() 之后的尾巴，
+  于是每个点只传自己证据支持的实参；
+- 尾巴上取不到值的槽位走已有的 shouldPoisonUnprovenVarArg → poison，不再算 unknown。
+
+单测：testUnknownExternalArityUsesMaxCallsitePrefix 改名
+testUnknownExternalArityUsesVarArgTail，断言声明是变参、固定前缀 1、两个调用点分别
+传 1/3 个实参（顺带把测试里的常量真分支改成函数参数，否则 SimplifyCFG 会把长调用点
+折掉）。
+
+### 3. 效果（对比只加边界的上一版）
+
+| 目标 | unknown 前 → 后 | IR bytes 前 → 后 | warning 前 → 后 |
+|---|---|---|---|
+| ffmpeg | 4920 → **8** | 7,373,354 → 4,689,227（−36%） | 11,942 → 2,073 |
+| lighttpd | 787 → 754 | 5,305,599 → 5,257,857 | 2,648 → 2,553 |
+| redis-cli | 129 → 128 | 4,044,258 → 4,087,405 | 1,530 → 1,523 |
+| wrk | 0 → 0 | 937,812 → 927,133 | 306 → 275 |
+| memcached | 0 → 0 | 3,799,177 | 757 |
+| libuv / vsftpd | 8 / 4 | 不变 | 不变 |
+
+ffmpeg 剩下 8 个：call_effect_mixed（FUN_38200:ZMM0 ×3、FUN_3e3b0:R9 ×4）+ 1 个
+clobber 返回。av_log 调用点现在按点给参数（main：3×7、4×12、5×1、6×3、7×4），
+与源码一致；llvm-as + verify 全 OK。
+
+### 4. 顺带：调用边界"只收本块写过的槽位"收窄实验（不采用）
+
+试过在 addCallParamRangeBoundaries 里只给"本块内调用点之前写过该寄存器"的槽位加
+边界（理由：编译器会在调用前 materialize 实参，没写过就不是这次传的实参）。lighttpd
+上省了 0.46% IR，但 4 个 call_arg_rewrite_type_mismatch 全部回来了（有些调用点没在
+本块写寄存器，却要靠细分区才能取出类型正确的值），unknown 754 → 755。结论：保持
+全收，代码里留了注释记录这次实验。
