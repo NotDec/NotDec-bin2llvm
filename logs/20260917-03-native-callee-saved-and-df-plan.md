@@ -1611,3 +1611,160 @@ entryRangeInput 里加一条和 DF 的 isAbiBoundaryZeroRegister 并列的规则
 
 所以乘法本身没有新的 matcher 可加；剩下的都在除法/取模的"写法变体"里。
 
+
+## 调用点形参槽位跨分区段：按重叠段拼接（2026-09-21 续）
+
+用户原始 prompt：
+
+> 当前的问题是都完全修好了吗。是的话可以找下一个值得修的地方
+
+### 1. 先把"还有没有别的问题"变成数据：Bench2 light sweep
+
+上一轮之后 memcached / wrk / fortune-x86_64 的 unknown 都是 0，fortune-i386 剩 1 个
+（死函数、无调用者）。为回答"下一个值得修的地方"，跑了一轮
+`/tmp/sweep/run.sh`（`--all-confirmed --skip-runtime --register-ssa-summary`，
+单目标 1500s 上限）：
+
+| 目标 | unknown | 主要 reason（修复前） |
+|---|---|---|
+| lighttpd-angel | 0 | - |
+| vsftpd | 5 | call_arg_rewrite_missing_binding ×5 |
+| libuv | 16 | call_arg_rewrite_missing_binding ×8 + return_binding_uses_clobber_value ×8 |
+| lighttpd | 783 | call_effect_mixed ×663 + call_arg_rewrite_missing_binding ×89 + type_mismatch ×4 |
+| ffmpeg | 4920 | call_arg_rewrite_missing_binding 为主 |
+
+### 2. 根因：callee 形参槽位宽度不一定落在 caller 的分区边界上
+
+libuv `uv_udp_set_membership` → `FUN_26a50` 的 RDX/RCX 槽位是 i32，而 caller 对
+@RDX 的计划分区是 [0,16)+[16,64)：i16 partial read 贡献 16 这个边界，i64 存取贡献
+0/64。于是对 [0,32) 的请求：
+
+- `plannedRangesCovering(0,32)` 因为最后一段 [16,64) 越过请求右端而返回空；
+- 原来的兜底只找"单个包含段"，[0,16) 与 [16,64) 都不包含 [0,32) → nullptr；
+- `callArgStoreBindings` 在第一个失败槽位就 break，同一个调用点的 RDX、RCX 一起
+  报 `call_arg_rewrite_missing_binding`。
+
+raw lift（`--no-register-ssa-pass --no-instcombine-pass`）里
+`store i64 16, ptr @RDX` / `store i64 4, ptr @RCX` 都在，值并没有丢，只是读不出来。
+
+### 3. 修法：composePlannedRangeRead（NativeRegisterSummarySSA.cpp）
+
+`readSlotRangeBefore` 的 `ranges.empty()` 兜底从"找单个包含段"改成按**重叠分段**
+拼接：
+
+- 按顺序取与请求相交的计划分段，要求从请求左端开始无空洞地覆盖到右端，否则放弃；
+- 每段用 `readRangeBefore` 读出整段值（要求类型匹配 + 支配调用点），
+  `extractBitsFromIntegerValue` 截出相交位，`insertBitsIntoInteger` 插回请求宽度；
+- 单段就能覆盖整个请求时直接返回该段（保持旧行为）；
+- 任一段缺失/未知就整体返回 nullptr，仍然保守。
+
+旧兜底是它的子集（单包含段 = 一个覆盖全请求的段），所以是补全而不是新开一条路。
+
+### 4. 验证
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| libuv unknown | 16 | **8**（8 个 missing_binding 全部消失，剩 8 个纯 clobber 返回） |
+| libuv IR bytes / warning | 2,772,152 / 74 | 2,770,747 / 66 |
+| vsftpd unknown | 5 | **4**（FUN_18120 的 i16 RSI 槽修掉，剩 FUN_17f60 RCX ×4） |
+| vsftpd IR bytes / warning | 1,709,556 / 167 | 1,709,291 / 166 |
+| memcached unknown / bytes / warning | 0 / 3,782,229 / 760 | 0 / 3,782,437 / 755 |
+| wrk unknown / bytes / warning | 0 / 937,141 / 306 | 0 / 937,161 / 306 |
+| 单测 native_register_summary_ssa_test | 过 | 过（+testCallArgSlotSpansPlannedRangeSegments） |
+| ctest | 12/12 | **12/12** |
+| fortune x86_64 / i386 regression | 过 | 过（EXIT=0） |
+| llvm-as + opt -passes=verify | OK | OK（libuv/vsftpd/memcached/wrk） |
+
+libuv 修完后的调用点（原先两个 `arg_unknown`）：
+
+    call i64 @FUN_26a50(i64 %RDI.arg, i64 %notdec_stack.native.int531, i32 16, i32 4)
+
+单测用 RDX 的 i16 partial read + i64 存取造出 [0,16)+[16,64) 分区，callee 只要
+i32 RDX，断言最终调用参数是常量 16 且没有 missing_binding 告警。
+
+lighttpd 用修复后的二进制重跑仍是 783、reason 分布一模一样（missing_binding 还是
+89（去重后 77 组）、call_effect_mixed 还是 663）：这类与"分区拼接"无关，正是下面
+(A) 的伪形参问题。
+
+
+### 5. 顺带盘出来的下一批目标（按证据强度）
+
+修完后剩下的 unknown 分三类，只有第一类是真 bug。
+
+**(A) 伪形参：`push %rcx` 栈对齐（vsftpd 4 个；也是 lighttpd 89 个里的一部分）**
+
+vsftpd FUN_17f60（内部函数，真实签名 2 个参数）的实测汇编：
+
+    17f60: endbr64
+    17f64: cmp    %esi,%edi
+    17f66: je     17f8c
+    17f68: push   %rbp
+    17f69: mov    %rsp,%rbp
+    17f6c: push   %rbx
+    17f6d: mov    %esi,%ebx
+    17f6f: push   %rcx        <-- 只为把栈对齐到 16 字节
+    17f70: call   6190        (dup2)
+    ...
+    17f79: pop    %rax        <-- 弹出的值没人用
+    17f7a: pop    %rbx
+    17f7b: pop    %rbp
+    17f7c: ret
+
+lighttpd array_insert_unique（真实签名也是 2 个参数）是同一种写法：
+
+    20383: push   %rbp
+    20384: mov    %rsp,%rbp
+    20387: push   %rbx
+    20388: mov    %rsi,%rbx
+    2038b: push   %rcx        <-- 对齐
+    2038c: call   FUN_202c2
+    ...
+    203db: pop    %rax        <-- 丢弃
+    203dc: pop    %rbx
+    203dd: pop    %rbp
+    203de: ret
+
+lift 之后 push 变成"读入口 @RCX + 写 native frame 槽"，pop 变成"读该槽 + 写 @RAX"。
+summary 的入口读判定是前向的：只要入口 @RCX 被读到就记 read_entry，于是 RCX 变成
+形参。真实调用点（如 lighttpd 1a4d9 调 array_insert_unique）根本不设 RCX，于是
+call_arg_rewrite_missing_binding；更麻烦的是为了让这个不存在的形参有值，调用点会
+跨调用去读 RCX，产生 call_effect_mixed 的 unknown —— lighttpd 这 663 个里很大
+一部分是它的下游。
+
+量化（脚本扫 lighttpd 最终 IR）：模块里有 **104** 个函数的某个 `.arg` 只被
+native frame store 使用；77 个 missing_binding 告警里 **19** 个属于这种函数。
+
+修法候选（要先定一个再动手）：
+
+1. **后向 demand / 活跃性**：void 函数里 @RAX 没有 exit demand → `store @RAX` 死
+   → pop load 死 → frame 槽没有活 load → push store 死 → RCX 入口读消失。
+   最根本，等于给 summary 补一条"寄存器 store 看 exit demand、frame store 看槽的
+   活 load"的后向活跃性；改动最大，但一次能扫掉一大片。
+2. **frame 层结构性匹配**：push 的源寄存器与 pop 的目标寄存器不同（`push %rcx` /
+   `pop %rax`），且弹出值在块内没有被读 → 判为对齐填充，删掉这一对。
+   代码小；"没被读"可以先做块内近似（到本块下一次写该寄存器之间没有 load）。
+3. **shape 精化**：对内部函数，若**所有**调用点都没有给出该寄存器形参的非 clobber
+   绑定，就把它从形参里去掉（类似已有的 refineInternalStackParamShapes）。
+   调用点侧立刻干净；callee body 里那次入口读要替换成 poison/unknown。
+
+**(B) 纯 clobber 返回（libuv 8 个）——保守正确，不建议为好看而改**
+
+uv_free_cpu_info / uv_os_free_environ / uv_free_interface_addresses 这类：函数尾是
+间接调用（free），@RAX 的出口值只能来自 clobber，于是签名给了 RAX 返回槽、值降级
+成 notdec.unknown。C ABI 下 void 函数的 RAX 本就是未定义值，调用点拿到"有值但
+不知道"比强行改成 void 更准确。除非有别的证据（比如外部原型表确实知道它返回
+void），这一类别算预期内的保守占位。
+
+**(C) call_effect_mixed（lighttpd 663 个、ffmpeg 更多）——多数是 (A) 的下游**
+
+已追过一条链：lighttpd configparser 里 `call @array_get_element_klen` 之后
+RSI/R8/R9 的 range 值变成 unknown，phi 一路汇到 `call void %84(...)` 的实参。
+这些寄存器在该调用点并不是真实参数（compiler 只把 SIL 等低位当 scratch 用），
+所以按 (A) 把伪形参去掉后，这一层会跟着大幅下降；剩下真正路径不敏感的部分再单独
+评估（需要 per-path demand，属于大改）。
+
+### 6. 下一步
+
+下一个动手目标定为 (A)，三个候选里先选 1（后向 demand）还是 2（结构性匹配）需要
+先定：1 更根本、覆盖面大但风险高；2 小、能立刻消掉这批，但只治 push/pop 这一种
+写法。

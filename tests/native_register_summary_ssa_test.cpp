@@ -9558,6 +9558,92 @@ bool testPlannerSplitsRegisterForDemandMask() {
          verifyOk(module, "module failed verifier after demand planner test");
 }
 
+// callee 的形参槽位宽度来自 callee 自己的读证据，可能和本函数对同一寄存器
+// 的分区边界不对齐：RDX 上 i16 partial read 与 i64 存取把分区切成
+// [0,16)+[16,64)，而形参槽位要的是 i32 的 [0,32)。这条用例锁住"按重叠分段
+// 拼接"的读取路径，避免调用点退化成 call_arg_rewrite_missing_binding。
+bool testCallArgSlotSpansPlannedRangeSegments() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-call-arg-spanning-segments", context);
+  attachTestAbiWithInputs(module, {"RDI", "RDX"});
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  auto *i16 = llvm::Type::getInt16Ty(context);
+  auto *i32 = llvm::Type::getInt32Ty(context);
+  auto *i64 = llvm::Type::getInt64Ty(context);
+  auto *sink = new llvm::GlobalVariable(
+      module, i16, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "spanning_segments_sink");
+
+  llvm::Function *partialRead32 =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rdx->getType(), i32, 64, 32);
+  llvm::Function *partialRead16 =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, rdx->getType(), i16, 64, 16);
+
+  // callee 只读 RDX 低 32 位，所以它的形参槽位是 i32。
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "spanning_segments_callee",
+      module);
+  llvm::BasicBlock *calleeEntry =
+      llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(calleeEntry);
+  llvm::Value *calleeLow = builder.CreateCall(
+      partialRead32, {rdx, llvm::ConstantInt::get(i64, 0)}, "callee.rdx");
+  builder.CreateStore(calleeLow, sink);
+  builder.CreateRetVoid();
+
+  llvm::Function *caller = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "spanning_segments_caller",
+      module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 16),
+                "RDX");
+  llvm::Value *low16 = builder.CreateCall(
+      partialRead16, {rdx, llvm::ConstantInt::get(i64, 0)}, "caller.low16");
+  builder.CreateStore(low16, sink);
+  builder.CreateCall(voidType, callee);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  // 拼接出来的范围 helper 由 final cleanup 降级成移位/或，再折叠成常量。
+  notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+  llvm::Function *rewrittenCallee =
+      module.getFunction("spanning_segments_callee");
+  llvm::CallInst *rewrittenCall = nullptr;
+  if (llvm::Function *rewrittenCaller =
+          module.getFunction("spanning_segments_caller")) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() == rewrittenCallee) {
+        rewrittenCall = call;
+      }
+    }
+  }
+  bool missingBinding = std::any_of(
+      summary.Warnings.begin(), summary.Warnings.end(),
+      [](const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning) {
+        return warning.CalleeName == "spanning_segments_callee" &&
+               llvm::StringRef(warning.Reason) ==
+                   "call_arg_rewrite_missing_binding";
+      });
+  auto *bound = rewrittenCall == nullptr || rewrittenCall->arg_size() != 1
+                    ? nullptr
+                    : llvm::dyn_cast<llvm::ConstantInt>(
+                          rewrittenCall->getArgOperand(0));
+  return expect(rewrittenCall != nullptr && rewrittenCall->arg_size() == 1,
+                "spanning segment call lost its RDX argument") &&
+         expect(bound != nullptr && bound->getZExtValue() == 16,
+                "spanning segment call argument was not composed from the "
+                "planned range segments") &&
+         expect(!missingBinding,
+                "spanning segment call argument reported a missing binding") &&
+         verifyOk(module, "module failed verifier after spanning segment test");
+}
+
 bool testPartialWriteHelperNameSurvivesSignatureRewrite() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-write-name", context);
@@ -12274,6 +12360,7 @@ int main() {
   ok &= testFloatCallEffectUsesRangeLiveness();
   ok &= testPlannerSplitsZmmForFloatAbiSlot();
   ok &= testPlannerSplitsRegisterForDemandMask();
+  ok &= testCallArgSlotSpansPlannedRangeSegments();
   ok &= testPartialWriteHelperNameSurvivesSignatureRewrite();
   ok &= testPartialReadHelperNameSurvivesSignatureRewrite();
   ok &= testRecordedReturnValueSurvivesPartialDemandRewrite();

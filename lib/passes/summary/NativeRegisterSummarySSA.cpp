@@ -6802,6 +6802,72 @@ private:
     return nullptr;
   }
 
+  // 请求的槽位可能既不是某个计划分段的子区间，也不与分段边界对齐：例如
+  // RDX 的分区是 [0,16)+[16,64)（i16 partial read 与 i64 存取各贡献一组
+  // 边界），而 callee 形参槽位要的是 i32 的 [0,32)。这种请求既过不了
+  // plannedRangesCovering 的"整段平铺"检查，也找不到单个包含它的段。这里
+  // 按重叠分段拼接：每段读出整段值，截出与请求相交的位，再插回请求宽度的
+  // 整数。任一段缺失（未知或没有支配值）就整体放弃，保持保守。
+  llvm::Value *composePlannedRangeRead(llvm::GlobalVariable *global,
+                                       uint64_t readOffset,
+                                       uint32_t readWidth,
+                                       llvm::Instruction *before,
+                                       llvm::Twine name,
+                                       llvm::DominatorTree &domTree) {
+    if (global == nullptr || before == nullptr || before->getParent() == nullptr ||
+        readWidth == 0) {
+      return nullptr;
+    }
+    auto plannedIt = PlannedRanges.find(global);
+    if (plannedIt == PlannedRanges.end()) {
+      return nullptr;
+    }
+    uint64_t readEnd = readOffset + readWidth;
+    auto *resultType =
+        llvm::IntegerType::get(Function.getContext(), readWidth);
+    llvm::Value *result = llvm::ConstantInt::get(resultType, 0);
+    uint64_t cursor = readOffset;
+    for (const RegisterRangeKey &range : plannedIt->second) {
+      uint64_t rangeEnd = range.BitOffset + range.BitWidth;
+      if (rangeEnd <= cursor) {
+        continue;
+      }
+      if (range.BitOffset > cursor) {
+        // 分区在请求范围内出现空洞，无法完整覆盖。
+        return nullptr;
+      }
+      uint64_t pieceEnd = std::min(rangeEnd, readEnd);
+      if (pieceEnd <= cursor) {
+        continue;
+      }
+      llvm::Value *full = resolve(
+          readRangeBefore(*before->getParent(), range, before, domTree));
+      if (full == nullptr || full->getType() != rangeType(range) ||
+          !valueDominatesUse(full, before, domTree)) {
+        return nullptr;
+      }
+      auto pieceWidth = static_cast<unsigned>(pieceEnd - cursor);
+      llvm::Value *piece = extractBitsFromIntegerValue(
+          full, pieceWidth, cursor - range.BitOffset, before, name);
+      if (piece == nullptr) {
+        return nullptr;
+      }
+      if (cursor == readOffset && pieceEnd == readEnd) {
+        return piece;
+      }
+      result = insertBitsIntoInteger(result, piece, pieceWidth,
+                                     cursor - readOffset, before, name);
+      if (result == nullptr) {
+        return nullptr;
+      }
+      cursor = pieceEnd;
+      if (cursor == readEnd) {
+        return result;
+      }
+    }
+    return nullptr;
+  }
+
   llvm::Value *readSlotRangeBefore(llvm::Instruction &before,
                                    const NativeSignatureSlot &slot,
                                    llvm::Twine name,
@@ -6815,28 +6881,12 @@ private:
     llvm::DominatorTree domTree(Function);
     llvm::Value *bits = nullptr;
     if (ranges.empty()) {
-      // The requested slot may be narrower than the only planned range (for
-      // example a 32-bit ESI read of a 64-bit RSI store).  Read the containing
-      // range and extract the requested bits instead of failing the cover
-      // check.
-      auto plannedIt = PlannedRanges.find(slot.Unit->Global);
-      if (plannedIt != PlannedRanges.end()) {
-        for (const RegisterRangeKey &range : plannedIt->second) {
-          uint64_t rangeEnd = range.BitOffset + range.BitWidth;
-          uint64_t slotEnd = slot.OffsetBits + slot.SizeBits;
-          if (range.BitOffset <= slot.OffsetBits && rangeEnd >= slotEnd) {
-            llvm::Value *full =
-                resolve(readRangeBefore(*before.getParent(), range, &before,
-                                        domTree));
-            if (full != nullptr && full->getType() == rangeType(range)) {
-              bits = extractBitsFromIntegerValue(
-                  full, slot.SizeBits, slot.OffsetBits - range.BitOffset,
-                  &before, name);
-            }
-            break;
-          }
-        }
-      }
+      // 槽位比唯一的分段窄（例如 32 位 ESI 读一个 64 位 RSI 存）时只找包含
+      // 段是不够的：分区可能把槽位切成多段（RDX = [0,16)+[16,64) 而槽位是
+      // i32 [0,32)）。按重叠分段拼接。
+      bits = composePlannedRangeRead(slot.Unit->Global, slot.OffsetBits,
+                                     slot.SizeBits, &before, name, domTree);
+      bits = resolve(bits);
     } else {
       bits = assembleRangeReadIfDominating(
           ranges, slot.OffsetBits, slot.SizeBits, &before, name, domTree,
