@@ -1469,26 +1469,55 @@ root `%13 = lshr i32 %12, 2`；`%12 = trunc(zext(%10))`、`%10 = add i32 %3, %9`
 
 结论：这条路没有"明显 bug"，别再去追低提升率。
 
-### 2. wrk 的 15 条 unknown 全是 x87 入口 ST0/ST1，是**可修的死值**
+### 2. wrk 的 15 条 unknown 全是 x87 入口 ST0/ST1（已细化，更正上一版"死值"的粗话）
 
-分布在 6 个函数（`format_time_us/s`、`stats_mean/stdev/percentile/within_stdev`、
-`FUN_81d0`）。形态是窗口模型在入口读 ST0/ST1，作为"被挤出窗口的旧值"传给
-`notdec.x87.push`：
+6 个函数全是 internal：`format_time_us/s`、`stats_mean/stdev/percentile/within_stdev`、
+`FUN_81d0`。形态：窗口模型在入口读 `@ST0`/`@ST1`（load 上带
+`!notdec.x87.window.shift`），当作"被挤出窗口的旧值"传给 `notdec.x87.push`；
+range 侧 `rangeMayComeFromEntry` 用**函数出口级**的 MayEntry=0 拒绝入口值
+（`NativeRegisterSummarySSA.cpp:6435`，和当初 main 的 RDI 是同一类"口径按整函数
+而不是按读取点"的问题），于是 phi 兜底物化成 `notdec.unknown.i80`。
 
-```llvm
-%ST0entry_range_rejected = call i80 @notdec.unknown.i80()
-%ST1entry_range_rejected = call i80 @notdec.unknown.i80()
-call void @notdec.x87.push(... %ST1 ...)
-call void @notdec.x87.push(... %ST0 ...)
-```
+**这些值到底有没有被用**（对 CFG 做 LIFO 栈内容模拟，再按使用点分类；不是只看
+min-depth，也不是只看"有没有 use"）：
 
-逐函数检查过：这些入口值只被压进库、或被没人用的 pop 返回；被使用的 pop 返回的
-都是之后压入的真实值（入口值沉在库底）。按 SysV ABI，函数入口 x87 栈为空，
-这两次读本来就是死值。
+| 函数 | 入口值经 pop 回到的值 | 结论 |
+|---|---|---|
+| format_time_us / stats_mean / stats_percentile / FUN_81d0 | pop 结果没人用，或只喂 `push` | 死 |
+| stats_stdev | `%23/%29/%30` 只喂 `push`，`%34` 没人用 | 死 |
+| stats_within_stdev | `%25/%37` 进 ST1 的 phi，但该 phi **只喂 push**；`%26/%38` 只喂 `push` | 死 |
 
-可修方向：窗口模型补"入口深度 = 0"——前两次 push 不读 ST0/ST1（或读成 poison）。
-预期 wrk unknown 15 → 0。风险点是跨分支深度和尾部跳转，动手前先 dump 几个函数的
-push/pop 平衡。
+- 真正被算术/比较消费的 `peek(i)`（stats_stdev 的 peek(3)、stats_within_stdev 的
+  4 个 peek(2)）都发生在 **depth > i** 的位置（模拟深度 3/4），读的是真实槽位，
+  不可能读到入口值；`poke` 同理。
+- **更正**：不能说"没人用"。准确说法是：只参与 x87 窗口记账（push/poke），不进入
+  任何算术/比较/存储/调用/返回；LLVM 意义上不是死值（消费者是对外不可见的
+  `notdec.x87.*`），所以不能靠 DCE 掉。
+
+**修法候选**：
+
+- (A) 最小：在 `entryRangeInput` 里给空槽一条规则，和 DF 的
+  `isAbiBoundaryZeroRegister` 并列——x87 窗口搬移读（`!notdec.x87.window.shift`）
+  在本路径上没有定义时返回 **poison**，不要退化成 unknown。前提是"函数入口 x87
+  栈为空"。改动局部、不影响真实数据流：poison 只会流进记账调用。
+- (B) 彻底：给窗口模型加**深度跟踪**（入口深度 0）。push 在 depth<2 时不读旧槽、
+  也不往库里 spill；pop 在 depth≤2 时新 ST1 就是空（poison），不调 `pop()`。
+  这样入口寄存器根本不会被读，`format_time_us` 这种深度从不超过 2 的函数的
+  push/pop 记账会全部消失。代价是跨分支/循环的深度需要数据流，无法证明时回退到
+  今天的形态（保留 unknown）。
+
+**ABI / linkage 的边界**：
+
+- 需要的假设只有一条：**函数入口 x87 栈逻辑为空**。SysV ABI 把它写进调用约定，
+  对 public/导出函数是硬保证；对 internal 函数，编译器理论上能自定义约定，但
+  clang/GCC 不会拿 x87 栈跨调用传值（x87 不参与参数传递，唯一接口是 long double
+  返回值、调用方立刻消费；LLVM/GCC 也没有跨函数的 x87 深度优化）。
+- 本项目已经在 internal 函数上依赖同类 ABI 假设：callee-saved 保留、DF 边界为 0、
+  栈参数布局（见 2026-09-17/18 的记录）。把"入口 x87 深度 0"并入同一类假设是一致的，
+  但要在代码注释和文档里写明。
+- 不想靠假设也行：`--all-confirmed` 已经 lift 了整个二进制，可以用同一个深度数据流
+  算出**每个调用点上 x87 深度是否为 0**；"所有调用点都可验证为 0"的 internal 函数
+  直接成立，没有内部调用者的导出函数用 ABI 兜底。这是 (B) 的副产品。
 
 ### 3. 方法论坑：objdump 的 x87 `fdivp/fdivrp` 助记符是互换的
 
