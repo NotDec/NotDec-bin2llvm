@@ -2139,3 +2139,49 @@ ctest 12/12，fortune x86_64 / i386 回归 EXIT=0，7 个目标 llvm-as + opt -p
 testVarArgPrologueWithSpillAndAlNoiseIsDetected：在真保存区旁边同时放
 (a) 同寄存器的普通 spill（base 不一致）和 (b) 把 AL 当数据存到内存的无关用途，
 断言仍然 detected/rewritten 且插入 llvm.va_start。旧实现分别在 (a)(b) 两处放弃。
+
+## 间接调用无证据时的"6 个 ABI 入参"兜底：去掉（2026-09-22 续）
+
+用户 prompt：
+
+> 对继续查一下吧
+
+### 1. 下一批：entry_range_rejected（lighttpd 19 个）
+
+分布：plugins_call_init 9（RSI/RDX/R8/R9 的 i32 range）、FUN_263db 3、FUN_f8e6 2、
+FUN_3acd0 2、FUN_e78d / FUN_23c64 / buffer_copy_string_len_lc 各 1。
+
+查最大的 `plugins_call_init`（形参只有 RDI）：
+
+- 入口块里出现 9 个 unknown，唯一消费者是 `%13 = call i64 %12(6 个实参)`（一个
+  间接调用）；
+- 它的汇编（0x2403b）就是 `call *%rax`，调用点前**没有任何实参寄存器设置**；
+  同一个函数里另一个间接调用点 0x240d2 设了 `mov (%r12),%rsi; mov %rbx,%rdi`，
+  有 LocalDefinition 证据，于是没走兜底、也没出 unknown；
+- 无证据时 addIndirectCallsiteShapes 走 addAbiInputParamSlots 兜底：把 6 个 SysV
+  整型入参寄存器全当形参 → 调用点凭空要 5 个值 → range SSA 沿循环回边把需求拉回
+  函数入口 → 这些寄存器在 summary 里 MayEntry=0（被调用 clobber 过），
+  entryRangeInput 拒绝 → `notdec.unknown`。
+
+### 2. 修法
+
+证据机制的前提是：真实参要么是调用点前显式写进实参寄存器（LocalDefinition），要么
+是入口透传（ForwardedEntry）。两者都没有时，寄存器里只是 caller-saved 的残留，兜底
+成 6 个实参只会凭空造需求。改成**无证据就不加形参**，并删掉随之无用的
+addAbiInputParamSlots。
+
+### 3. 效果（7 个目标全量对比）
+
+| 目标 | unknown 前 → 后 | IR bytes 前 → 后 | warning 前 → 后 |
+|---|---|---|---|
+| lighttpd | 115 → **106** | 4,648,828 → 4,628,926 | 1,066 → 1,039 |
+| vsftpd | 0 → 0 | 1,710,770 → 1,708,034 | 158 |
+| libuv | 8 → 8 | 2,771,361 | 66 |
+| memcached | 0 → 0 | 3,797,987 → 3,797,881 | 755 |
+| wrk | 0 → 0 | 930,436 → 930,349 | 276 |
+| redis-cli | 7 → 7 | 4,019,841 → 4,019,295 | 1,437 → 1,332 |
+| ffmpeg | 8 → 8 | 4,693,934 → 4,693,908 | 2,082 |
+
+所有目标 llvm-as + opt -passes=verify OK，ctest 12/12，fortune x86_64 / i386 回归
+EXIT=0。单测 testIndirectCallWithoutEvidenceHasNoArguments：没写任何实参寄存器的
+间接调用，断言改写后 0 个实参。

@@ -2950,21 +2950,6 @@ void addConservativeUnknownReturnSlots(
   }
 }
 
-void addAbiInputParamSlots(
-    SignatureShape &shape,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
-    const AbiFacts &abi) {
-  if (!shape.Params.empty()) {
-    return;
-  }
-  for (const std::string &name : abi.InputsInOrder) {
-    const RegisterUnit *unit = unitByName(units, name);
-    if (unit != nullptr) {
-      shape.Params.push_back(integerSignatureSlot(*unit));
-    }
-  }
-}
-
 void addIndirectCallsiteShapes(
     SignatureRewriteState &state,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -2976,7 +2961,11 @@ void addIndirectCallsiteShapes(
     }
     auto inputIt = state.IndirectCallInputs.find(call);
     if (inputIt == state.IndirectCallInputs.end()) {
-      addAbiInputParamSlots(shape, units, abi);
+      // 证据机制成立的前提：真实参要么是调用点前显式写进实参寄存器
+      // （LocalDefinition），要么是入口透传（ForwardedEntry）。两者都没有时，
+      // 寄存器里只是调用者对 caller-saved 寄存器的残留，把 6 个 ABI 入参寄存器
+      // 全当实参只会在调用点凭空造出 5 个 unknown（lighttpd plugins_call_init
+      // 的 entry_range_rejected 就是这么来的）。所以无证据就不加形参。
       return;
     }
     for (const NativeRegisterCallInputSlot &input : inputIt->second) {

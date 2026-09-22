@@ -6104,6 +6104,50 @@ bool testFlagOnlyRegisterReadKeepsArgumentArity() {
          verifyOk(module, "module failed verifier after flag-only arity test");
 }
 
+// 间接调用完全没有任何实参证据（调用点前没写过 ABI 实参寄存器、也不是入口透传）
+// 时，不能兜底把 6 个 ABI 入参寄存器全当实参：那会在调用点凭空多出 5 个 unknown，
+// 还会一路把 range 需求拉回函数入口（lighttpd plugins_call_init 的
+// entry_range_rejected 就是这么来的）。
+bool testIndirectCallWithoutEvidenceHasNoArguments() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-indirect-no-evidence", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  (void)createRegisterGlobal(module, "RDI");
+  (void)createRegisterGlobal(module, "RSI");
+
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "indirect_no_evidence",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  // 只取函数指针，不写任何实参寄存器。
+  llvm::LoadInst *target = loadRegister(builder, rax, "RAX", "target");
+  llvm::Value *targetPointer =
+      builder.CreateIntToPtr(target, llvm::PointerType::get(context, 0));
+  builder.CreateCall(voidType, targetPointer);
+  builder.CreateRetVoid();
+
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::CallInst *rewrittenCall = nullptr;
+  if (llvm::Function *rewritten = module.getFunction("indirect_no_evidence")) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call != nullptr && call->getCalledFunction() == nullptr) {
+        rewrittenCall = call;
+      }
+    }
+  }
+  return expect(rewrittenCall != nullptr, "indirect call disappeared") &&
+         expect(rewrittenCall->arg_empty(),
+                "indirect call without argument evidence kept ABI-input "
+                "arguments") &&
+         verifyOk(module,
+                  "module failed verifier after indirect no-evidence test");
+}
+
 // The same pattern the other way around: the compiler fills a later argument
 // register first (suffix in R8) and copies it down into an earlier one (prefix
 // in RDX).  Both registers are real arguments, so the consumed copy must not
@@ -12496,6 +12540,7 @@ int main() {
   ok &= testUnknownExternalArityUsesVarArgTail();
   ok &= testConsumedScratchRegisterIsNotAnExternalArgument();
   ok &= testFlagOnlyRegisterReadKeepsArgumentArity();
+  ok &= testIndirectCallWithoutEvidenceHasNoArguments();
   ok &= testConsumedRegisterBeforeLaterArgumentKeepsArity();
   ok &= testExternalPrototypeJsonOverridesInferredArity();
   ok &= testExternalPrototypeJsonAcceptsLongDouble();
