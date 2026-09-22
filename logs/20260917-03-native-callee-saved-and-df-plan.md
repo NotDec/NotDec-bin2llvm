@@ -1946,3 +1946,75 @@ ctest 12/12，fortune x86_64 / i386 回归 EXIT=0，所有目标 llvm-as + opt -
 lighttpd 剩下的 274 个：call_effect_mixed 238（其中 `FUN_26313` 的 R8/R9/RSI
 各 40，占 120）、entry_range_rejected 19、clobber 返回 10、missing_binding 7。
 redis-cli 的 128 没动（`FUN_1e950` / `hi_sdscat*` 家族不是这个 idiom）。
+
+## 间接调用元数被"判空/寻址读"误清零：只有"搬到别处"的读才算消费（2026-09-22 续）
+
+用户 prompt：
+
+> 对，详细查一下下一批这一块，然后用容易懂的方式介绍一下
+
+### 1. lighttpd `FUN_26313` 那 120 个 unknown 的完整链条
+
+- `FUN_26313` 是按 kind 分派的小函数：有的路径直接 `ret`（R8/R9/RSI 保持调用
+  方原值），有的路径尾跳 `jmp buffer_free` / `jmp *0x8(%rax)`（控制权交给别的
+  函数，寄存器被改写）。所以 summary 判它对这三个寄存器 Mixed 是**对的**。
+- configparser（yacc 主循环）把这些寄存器当循环携带值用；循环里有一条路径经过
+  FUN_26313，汇合点 SSA 把 range 值变成 unknown（20 个 FUN_26313 调用点 × 3 寄存器
+  × 2 个 range = 120）。
+- 这些 unknown 唯一的消费者是 configparser 里 5 个 vtable 间接调用的第 2~6 个实参。
+  5 个调用点的汇编都只设了 RDI（对象指针），实际就是 1 个参数。
+- 为什么被推成 6 个参数：debug 打出的证据是
+  `idx=0 unit=RDI origin=LocalDefinition consumed=1`，其余 origin=Mixed。
+  RDI 明明是实参，但同块内它被读过，ConsumedLocal 规则把它从连续证据尾部扣掉 →
+  参数个数 0；0 证据时 addIndirectCallsiteShapes 走兜底 addAbiInputParamSlots，
+  把 6 个 SysV 整型入参寄存器全当参数，其中 5 个是循环携带的残留 → unknown 顺着
+  它们流进实参。
+
+### 2. 第一次修法（不够）：只豁免"只置标志位"的读
+
+先加了 loadFeedsOnlyFlags（load 的值只喂 icmp/fcmp 不算消费），build 后全量重跑，
+lighttpd 仍是 274。加临时打印看 registerValuePendingAtCall 从调用点往回扫到的
+load：`users=1 [add]` —— 紧挨着调用的那条 `mov 0x10(%rdi),%rax`（把 RDI 当地址
+基址用）先被扫到，它喂的是 add，不是 icmp，于是规则没触发。
+
+### 3. 最终修法：只有"原样搬到别处"的读才算消费
+
+把判据改成 loadValueIsMovedAway：读出来的值直接存进另一个寄存器/内存（或只经过一层
+cast 再存）才算"值已被物化到别处、寄存器可能只是残留"（对应
+`lea name,%rcx; mov %rcx,%rdx; call f` 那种）；比较（判空）、算术/寻址都说明这个值
+仍然要用，寄存器还要带着它进调用。
+
+效果：RDI 的 ConsumedLocal 变 0 → 证据 int=1 → 间接调用形状 1 个参数 → 后 5 个假实参
+连需求都不存在，120 个 unknown 一起消失。
+
+### 4. 单测
+
+- testFlagOnlyRegisterReadKeepsArgumentArity：四个寄存器本地定义，RCX 只被 icmp 读，
+  断言未知外部被改写成 4 个参数（旧行为算 3）；
+- 已有的 testConsumedScratchRegisterIsNotAnExternalArgument（RCX 被存进内存）继续
+  通过，保证"真消费"没被放宽。
+
+### 5. 效果
+
+| 目标 | unknown 前 → 后 | IR bytes 前 → 后 |
+|---|---|---|
+| vsftpd | 0 → 0 | 持平 |
+| libuv | 8 → 8 | 持平 |
+| lighttpd | 274 → **?** | ? |
+| redis-cli | 128 → ? | ? |
+| memcached / wrk / ffmpeg | 0 / 0 / 8 | 持平 |
+
+### 5. 效果（相对上一版）
+
+| 目标 | unknown 前 → 后 | IR bytes 前 → 后 | warning 前 → 后 |
+|---|---|---|---|
+| lighttpd | 274 → **115**（−58%） | 4,721,632 → 4,647,952 | 1,179 → 1,064 |
+| redis-cli | 128 → **110** | 4,086,172 → 4,070,497 | 1,523 → 1,490 |
+| vsftpd | 0 → 0 | 1,710,770 → 1,710,774 | 158 |
+| libuv | 8 → 8 | 2,771,338 → 2,771,819 | 66 → 68（clobber 占位粒度变细） |
+| memcached / wrk / ffmpeg | 0 / 0 / 8 | 基本持平 | 不变 |
+
+ctest 12/12，fortune x86_64 / i386 回归 EXIT=0，7 个目标 llvm-as + opt -passes=verify 全 OK。
+
+lighttpd 剩下的 115：call_effect_mixed 约 90（FUN_26313 那 120 已经清零）、
+entry_range_rejected 十几、clobber 返回 10、missing_binding 7。

@@ -1704,11 +1704,39 @@ private:
     return &shapeIt->second;
   }
 
+  // 读出来的值是否被"原样搬到别处"（直接存进另一个寄存器或内存，或只经过一层
+  // cast 再存）。只有这种读才说明寄存器里的值已经被物化到别处、本身可能只是残留
+  // （例如 lea name,%rcx; mov %rcx,%rdx; call f 里的 RCX）。
+  // 比较（判空 test %rdi,%rdi）、算术/寻址（mov 0x10(%rdi),%rax）都是"还需要
+  // 这个值"，寄存器仍要带着它进调用，不能算消费。
+  bool loadValueIsMovedAway(const llvm::LoadInst &load) const {
+    llvm::SmallVector<const llvm::Value *, 8> worklist{&load};
+    llvm::SmallPtrSet<const llvm::Value *, 8> seen;
+    unsigned budget = 16;
+    while (!worklist.empty() && budget-- != 0) {
+      const llvm::Value *value = worklist.pop_back_val();
+      if (!seen.insert(value).second) {
+        continue;
+      }
+      for (const llvm::User *user : value->users()) {
+        if (llvm::isa<llvm::StoreInst>(user)) {
+          return true;
+        }
+        if (auto *cast = llvm::dyn_cast<llvm::CastInst>(user)) {
+          worklist.push_back(cast);
+        }
+      }
+    }
+    return false;
+  }
+
   // An argument register holds a value that is still waiting for the call.  A
   // local value that was read between its last write and the call was consumed
   // by that read, so it may only be a scratch copy.  Only the current block is
   // scanned: a value written in an earlier block has nothing in between here
-  // that could have consumed it.
+  // that could have consumed it.  A read that only sets flags (compare/test)
+  // does not consume the value; the register still has to carry it into the
+  // call.
   bool registerValuePendingAtCall(const llvm::GlobalVariable &global,
                                   const llvm::CallBase &call) const {
     const llvm::BasicBlock *block = call.getParent();
@@ -1720,6 +1748,9 @@ private:
       const llvm::Instruction &instruction = *it;
       if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
         if (load->getPointerOperand()->stripPointerCasts() == &global) {
+          if (!loadValueIsMovedAway(*load)) {
+            continue;
+          }
           return false;
         }
         continue;

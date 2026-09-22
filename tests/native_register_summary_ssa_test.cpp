@@ -6059,6 +6059,51 @@ bool testConsumedScratchRegisterIsNotAnExternalArgument() {
                   "module failed verifier after scratch register arity test");
 }
 
+// 调用前只拿实参去比较（判空/条件检查，最终只置标志位）不消费该值：编译器
+// 经常 test %rcx,%rcx 之后再 call，RCX 仍然是实参。旧行为把这种读也算"消费"，
+// 于是唯一一个证据槽被扣掉、元数退化到 0，间接调用兜底又补出一串假实参。
+bool testFlagOnlyRegisterReadKeepsArgumentArity() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-flag-only-read-arity", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX"});
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+
+  auto *calleeType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "flag_only_arity", module);
+  llvm::Function *function = llvm::Function::Create(
+      calleeType, llvm::GlobalValue::ExternalLinkage, "flag_only_arity_callers",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  storeRegister(builder, rsi, llvm::ConstantInt::get(rsi->getValueType(), 2),
+                "RSI");
+  storeRegister(builder, rdx, llvm::ConstantInt::get(rdx->getValueType(), 4),
+                "RDX");
+  storeRegister(builder, rcx, llvm::ConstantInt::get(rcx->getValueType(), 3),
+                "RCX");
+  llvm::LoadInst *checked = loadRegister(builder, rcx, "RCX", "checked");
+  builder.CreateICmpEQ(checked,
+                       llvm::ConstantInt::get(rcx->getValueType(), 0));
+  builder.CreateCall(calleeType, callee);
+  builder.CreateRetVoid();
+
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("flag_only_arity");
+  return expect(rewritten != nullptr, "flag-only arity callee missing") &&
+         expect(rewritten->arg_size() == 4,
+                "flag-only (test/cmp) read consumed the argument register") &&
+         verifyOk(module, "module failed verifier after flag-only arity test");
+}
+
 // The same pattern the other way around: the compiler fills a later argument
 // register first (suffix in R8) and copies it down into an earlier one (prefix
 // in RDX).  Both registers are real arguments, so the consumed copy must not
@@ -12334,6 +12379,7 @@ int main() {
   ok &= testClobberReturnPhiPreservesMixedPath();
   ok &= testUnknownExternalArityUsesVarArgTail();
   ok &= testConsumedScratchRegisterIsNotAnExternalArgument();
+  ok &= testFlagOnlyRegisterReadKeepsArgumentArity();
   ok &= testConsumedRegisterBeforeLaterArgumentKeepsArity();
   ok &= testExternalPrototypeJsonOverridesInferredArity();
   ok &= testExternalPrototypeJsonAcceptsLongDouble();
