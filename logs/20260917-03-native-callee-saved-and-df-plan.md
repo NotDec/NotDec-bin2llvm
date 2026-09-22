@@ -2018,3 +2018,73 @@ ctest 12/12，fortune x86_64 / i386 回归 EXIT=0，7 个目标 llvm-as + opt -p
 
 lighttpd 剩下的 115：call_effect_mixed 约 90（FUN_26313 那 120 已经清零）、
 entry_range_rejected 十几、clobber 返回 10、missing_binding 7。
+
+## 变参保存区识别：混入同寄存器普通 spill 时不再整函数放弃（2026-09-22 续）
+
+用户 prompt：
+
+> 再看下一个明显的问题吧
+
+### 1. 下一批的分布
+
+lighttpd 115（mixed 79 + entry_range_rejected 19 + clobber 返回 10 + missing 7）；
+redis-cli 110（mixed 83 + missing 20 + clobber 7），其中 mixed 有 **69 个**来自
+`hi_sdscatfmt` / `hi_sdscatlen`，missing 20 个来自 `FUN_1e950` —— 都是 hiredis
+的变参函数（`sdscatfmt(sds, fmt, ...)` 那一族）。
+
+### 2. 现象：变参函数没被 va_start 恢复识别
+
+- 这些函数 lift 后 summary 把 6 个 GP 寄存器 + AL 都算成形参，调用点要传 7 个实参；
+- 变参重写（NativeVarArgRewrite）本该把它们改写成`(固定参数, ...)` + llvm.va_start，
+  redis-cli 一共识别出 7 个（redisAppendCommand / FUN_15510 / FUN_20df0 /
+  hi_sdscatprintf / redisCommand / redisFormatCommand / redisAsyncCommand），
+  但 `hi_sdscatfmt` / `FUN_1e950` 漏了。
+
+### 3. 原因 (a)：保存区里混入同寄存器普通 spill → 整函数放弃（本次修）
+
+识别第 1 步把"load @REG + store 到帧槽（load 只有一个使用者）"都当保存区候选，
+并要求**所有**候选共用一个 base = offset - 8*regIndex，否则 return nullopt。
+hi_sdscatfmt 有 8 个候选：
+
+    idx=2 off=112  idx=3 off=120  idx=4 off=128  idx=5 off=136   ← 真保存区 base=96
+    idx=2 off=8    idx=4 off=16   idx=4 off=24   idx=3 off=24    ← 局部变量 spill
+
+后 4 个是编译器把同几个入口值再存到局部变量，base 各不相同（-8/-16/0），旧逻辑直接
+整函数放弃。
+
+改成按 base 分组、取**最大的一致子集**（组内寄存器下标不重复、≥2 个）作为保存区。
+注意只按 base 分组、不额外要求同一 alloca：先试过按 (帧, base) 分组，结果误伤了
+redisAppendCommand / redisFormatCommand / redisAsyncCommand（它们的保存槽跨帧比较
+offset），detected 从 7 掉到 5。
+
+效果：`FUN_1e950` 现在识别成 `(i64, i64, i8, ...)`，调用点的 20 个
+missing_binding 消失；redis-cli unknown 110 → **87**。
+
+### 4. 原因 (b)：AL 链闭包被格式解析的 cmp 污染（留作下一刀）
+
+第 3 步把**所有** `partial_read.i64.i8(@RAX)`（test al,al 的 lift 形态）当 AL 测试
+根，沿使用者做闭包，遇到"存进非标志寄存器"的用途就整函数放弃。hi_sdscatfmt 的格式
+解析循环里有 **92** 个 `cmp al,k`，闭包把它们全卷进来，最后撞到非标志用途 → 放弃
+（临时用 __LINE__ 探针定位到第 3 步的这条检查）。
+
+正确做法是只把"守着 XMM 保存区的那个 AL 测试"算作 va_start 的 AL 链（例如要求该链
+到达的分支支配 XMM 保存 store），其余 AL 链不参与闭包、也不因其放弃。这需要给识别加
+一条支配关系检查，比 (a) 大，留作下一刀。
+
+### 5. 效果
+
+| 目标 | unknown 前 → 后 | IR bytes 前 → 后 | warning 前 → 后 |
+|---|---|---|---|
+| redis-cli | 110 → **87** | 4,070,497 → 4,064,293 | 1,490 → 1,473 |
+| vsftpd | 0 → 0 | 1,710,774 → 1,710,777 | 158 |
+| libuv | 8 → 8 | 2,771,819 → 2,771,361 | 68 → 66 |
+| memcached / wrk | 0 / 0 | 基本持平 | 755 / 276 |
+| lighttpd | 115 → 115 | 4,647,952 → 4,647,536 | 1,064 |
+| ffmpeg | 8 → 8 | 4,693,934 → 4,693,940 | 2,082 |
+
+ctest 12/12，fortune x86_64 / i386 回归 EXIT=0，所有目标 verify OK。
+
+补充单测：testVarArgPrologueWithOrdinarySpillIsDetected —— 在真保存区旁边加一份同
+寄存器的普通 spill（base 不一致、槽位避开 FP 保存区和 va_list 窗口），断言仍然
+detected/rewritten 且插入 llvm.va_start。旧的"所有候选共用一个 base"实现在这条用例
+上会失败。

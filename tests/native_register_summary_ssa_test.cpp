@@ -12054,6 +12054,111 @@ bool testMixedCallBoundaryAttributesUnknownToCallee() {
 }
 
 
+// 真保存区旁边常有"同一个变参寄存器再存到别的帧槽"的普通 spill（hi_sdscatfmt 就
+// 是：RDX/R8/RCX 各有一份存到局部变量）。旧实现要求所有候选共用一个 base，混进
+// 这种 spill 就整函数放弃；这里锁住"取最大一致子集"的行为。
+bool testVarArgPrologueWithOrdinarySpillIsDetected() {
+  llvm::LLVMContext context;
+  llvm::Module module("vararg-rewrite-spill", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  auto *i64Type = llvm::Type::getInt64Ty(context);
+  auto *i128Type = llvm::Type::getInt128Ty(context);
+  auto *i512Type = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+  llvm::GlobalVariable *r9 = createRegisterGlobal(module, "R9");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", i512Type, 0, 64);
+  auto *sink = new llvm::GlobalVariable(
+      module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "spill_sink");
+  llvm::Function *useVaList = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                              {llvm::PointerType::get(context, 0)}, false),
+      llvm::GlobalValue::ExternalLinkage, "spill_use_va_list", module);
+
+  llvm::Function *function = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {i64Type}, false),
+      llvm::GlobalValue::InternalLinkage, "native_vararg_wrapper_spill", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *xmmSave =
+      llvm::BasicBlock::Create(context, "xmm_save", function);
+  llvm::BasicBlock *done = llvm::BasicBlock::Create(context, "done", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::AllocaInst *frame = builder.CreateAlloca(
+      llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 400), nullptr,
+      "frame");
+  auto framePointer = [&](uint64_t offset) {
+    return builder.CreateGEP(llvm::Type::getInt8Ty(context), frame,
+                             llvm::ConstantInt::get(i64Type, offset));
+  };
+  llvm::Value *fixed = loadRegister(builder, rdi, "RDI", "fixed");
+  builder.CreateStore(fixed, sink);
+  // 真保存区：R8/R9 落在 base=208 的 +32/+40。
+  llvm::Value *savedR8 = loadRegister(builder, r8, "R8", "saved_r8");
+  builder.CreateStore(savedR8, framePointer(240));
+  llvm::Value *savedR9 = loadRegister(builder, r9, "R9", "saved_r9");
+  builder.CreateStore(savedR9, framePointer(248));
+  // 普通 spill：同一个 R8 再存到别的帧槽（base=160 ≠ 208），旧逻辑会因此放弃。
+  // 槽位要避开 FP 保存区窗口（fpBase=256 起 128 字节）和 va_list 窗口（0..24）。
+  llvm::Value *spilledR8 = loadRegister(builder, r8, "R8", "spilled_r8");
+  builder.CreateStore(spilledR8, framePointer(192));
+  // 手写 va_list（+0 gp_offset、+4 fp_offset、+8 overflow、+16 reg_save_area）。
+  llvm::GlobalVariable *overflow = new llvm::GlobalVariable(
+      module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "spill_overflow_area");
+  llvm::Value *overflowValue = loadRegister(builder, overflow, "overflow");
+  builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 8),
+                      framePointer(0));
+  builder.CreateStore(
+      llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 48),
+      framePointer(4));
+  builder.CreateStore(overflowValue, framePointer(8));
+  builder.CreateStore(
+      builder.CreatePtrToInt(framePointer(208), i64Type), framePointer(16));
+  llvm::Value *al = builder.CreateCall(
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0),
+          llvm::Type::getInt8Ty(context), 64, 8),
+      {rax, llvm::ConstantInt::get(i64Type, 0)}, "al");
+  llvm::Value *alZero = builder.CreateICmpEQ(
+      al, llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0));
+  builder.CreateCondBr(alZero, done, xmmSave);
+  builder.SetInsertPoint(xmmSave);
+  llvm::Value *savedZmm = builder.CreateCall(
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0), i128Type, 512, 128),
+      {zmm0, llvm::ConstantInt::get(i64Type, 0)}, "saved_zmm0");
+  builder.CreateStore(savedZmm, framePointer(256));
+  builder.CreateBr(done);
+  builder.SetInsertPoint(done);
+  builder.CreateCall(useVaList, {framePointer(0)});
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeVarArgRewriteOptions options;
+  notdec::bin2llvm::NativeVarArgRewriteSummary summary =
+      notdec::bin2llvm::runNativeVarArgRewrite(module, options);
+  std::optional<notdec::bin2llvm::NativeVarArgInfo> info =
+      notdec::bin2llvm::nativeVarArgInfo(*function);
+  unsigned vaStarts = 0;
+  for (llvm::Instruction &inst : llvm::instructions(*function)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName().starts_with("llvm.va_start")) {
+      ++vaStarts;
+    }
+  }
+  return expect(summary.FunctionsDetected == 1,
+                "vararg prologue with an ordinary spill was not detected") &&
+         expect(summary.FunctionsRewritten == 1,
+                "vararg prologue with an ordinary spill was not rewritten") &&
+         expect(info.has_value() && info->FixedGp == 1,
+                "spill case did not recover fixed_gp") &&
+         expect(vaStarts == 1, "spill case did not insert llvm.va_start");
+}
+
 // 变参识别：lift 里编译器生成的寄存器保存区 + 手写 va_list 初始化，要能被识别成
 // llvm.va_start + 变参签名（固定参数 = 仍然被直接读的参数寄存器），而不是把变参
 // 寄存器当固定参数。模式依据见 logs/20260919-01-native-vararg-recovery-plan.md。
@@ -12315,6 +12420,7 @@ int main() {
   ok &= testTwoFramePointerSettersAreNotFolded();
   ok &= testEraseDeadUnknownValueCalls();
   ok &= testMixedCallBoundaryAttributesUnknownToCallee();
+  ok &= testVarArgPrologueWithOrdinarySpillIsDetected();
   ok &= testVarArgPrologueBecomesVaStart();
   ok &= testManualVaArgDiamondBecomesVaArgInstruction();
   ok &= testCalleeSavedRegisterSurvivesInternalCall();

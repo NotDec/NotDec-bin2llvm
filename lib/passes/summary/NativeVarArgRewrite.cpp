@@ -191,27 +191,44 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
         SaveStore{index, slot->first, slot->second, store, load});
   }
   {
-    std::set<int> savedRegisters;
-    for (const SaveStore &save : plan.GpSaves) {
-      savedRegisters.insert(save.Index);
-    }
-    if (savedRegisters.size() < 2) {
-      return std::nullopt;
-    }
-    // 保存槽必须落在同一个基址上：offset = base + 8*regIndex。
-    int64_t base = -1;
+    // 函数里往往还有同寄存器的普通 spill（把入口值再存到自己的局部变量），它们
+    // 不满足 base + 8*index。旧实现要求所有 save 共用一个 base，混进这种 spill 就整
+    // 函数放弃（hi_sdscatfmt 就是这样漏掉的）。改成按 (帧, base) 分组，取最大的
+    // 一致子集作为 va_start 保存区；组内下标重复说明不是保存区。
+    // 只按 base 分组（不额外要求同一 alloca）：旧实现就是跨帧比较 offset 的，
+    // 收紧到单帧会让一部分本来能识别的函数退化。
+    std::map<int64_t, std::vector<SaveStore>> groups;
     for (const SaveStore &save : plan.GpSaves) {
       int64_t candidate =
           static_cast<int64_t>(save.Offset) - 8 * save.Index;
-      if (base < 0) {
-        base = candidate;
-      } else if (base != candidate) {
-        return std::nullopt;
+      groups[candidate].push_back(save);
+    }
+    const std::vector<SaveStore> *best = nullptr;
+    for (const auto &[key, saves] : groups) {
+      if (key < 0) {
+        continue;
+      }
+      std::set<int> indices;
+      bool unique = true;
+      for (const SaveStore &save : saves) {
+        if (!indices.insert(save.Index).second) {
+          unique = false;
+          break;
+        }
+      }
+      if (!unique) {
+        continue;
+      }
+      if (best == nullptr || saves.size() > best->size()) {
+        best = &saves;
       }
     }
-    if (base < 0) {
+    if (best == nullptr || best->size() < 2) {
       return std::nullopt;
     }
+    plan.GpSaves = *best;
+    int64_t base = static_cast<int64_t>(plan.GpSaves.front().Offset) -
+                   8 * plan.GpSaves.front().Index;
     plan.Info.SaveAreaOffset = static_cast<uint64_t>(base);
     plan.Frame = plan.GpSaves.front().Frame;
     std::string saved;
