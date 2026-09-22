@@ -12055,9 +12055,11 @@ bool testMixedCallBoundaryAttributesUnknownToCallee() {
 
 
 // 真保存区旁边常有"同一个变参寄存器再存到别的帧槽"的普通 spill（hi_sdscatfmt 就
-// 是：RDX/R8/RCX 各有一份存到局部变量）。旧实现要求所有候选共用一个 base，混进
-// 这种 spill 就整函数放弃；这里锁住"取最大一致子集"的行为。
-bool testVarArgPrologueWithOrdinarySpillIsDetected() {
+// 是：RDX/R8/RCX 各有一份存到局部变量），而且函数里还有大量无关的 AL 用途
+// （格式解析的 cmp al,k、把 AL 当数据搬走）。旧实现分别在"所有候选共用一个 base"
+// 和"AL 闭包只能有标志用途"两处整函数放弃；这条用例把两种噪声都放进去，锁住
+// "取最大一致子集 + 只认守着 XMM 保存区的 AL 链"的行为。
+bool testVarArgPrologueWithSpillAndAlNoiseIsDetected() {
   llvm::LLVMContext context;
   llvm::Module module("vararg-rewrite-spill", context);
   attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
@@ -12105,6 +12107,14 @@ bool testVarArgPrologueWithOrdinarySpillIsDetected() {
   // 槽位要避开 FP 保存区窗口（fpBase=256 起 128 字节）和 va_list 窗口（0..24）。
   llvm::Value *spilledR8 = loadRegister(builder, r8, "R8", "spilled_r8");
   builder.CreateStore(spilledR8, framePointer(192));
+  // 无关的 AL 用途：把 AL 当数据存到内存（格式解析里的常见形态），旧逻辑的 AL
+  // 闭包会因"非标志用途"整函数放弃。
+  llvm::Value *unrelatedAl = builder.CreateCall(
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0),
+          llvm::Type::getInt8Ty(context), 64, 8),
+      {rax, llvm::ConstantInt::get(i64Type, 0)}, "unrelated_al");
+  builder.CreateStore(unrelatedAl, sink);
   // 手写 va_list（+0 gp_offset、+4 fp_offset、+8 overflow、+16 reg_save_area）。
   llvm::GlobalVariable *overflow = new llvm::GlobalVariable(
       module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
@@ -12420,7 +12430,7 @@ int main() {
   ok &= testTwoFramePointerSettersAreNotFolded();
   ok &= testEraseDeadUnknownValueCalls();
   ok &= testMixedCallBoundaryAttributesUnknownToCallee();
-  ok &= testVarArgPrologueWithOrdinarySpillIsDetected();
+  ok &= testVarArgPrologueWithSpillAndAlNoiseIsDetected();
   ok &= testVarArgPrologueBecomesVaStart();
   ok &= testManualVaArgDiamondBecomesVaArgInstruction();
   ok &= testCalleeSavedRegisterSurvivesInternalCall();

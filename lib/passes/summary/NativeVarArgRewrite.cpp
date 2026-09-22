@@ -295,63 +295,8 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
     }
   }
 
-  // 3) AL 测试（编译器 test al,al，决定是否保存 XMM）：从 partial_read.i64.i8(@RAX)
-  //    出发算传递闭包。闭包内的使用者只能是标志寄存器 store、进一步的标志运算，
-  //    或依赖它的分支；出现别的使用者就放弃改写（保守）。
-  std::vector<llvm::Instruction *> alRoots;
-  for (llvm::Instruction &inst : llvm::instructions(function)) {
-    if (isAlTestRoot(inst)) {
-      alRoots.push_back(&inst);
-    }
-  }
-  if (alRoots.empty()) {
-    return std::nullopt;
-  }
-  std::set<llvm::Instruction *> alTest;
-  llvm::SmallVector<llvm::Instruction *, 16> worklist(alRoots.begin(),
-                                                     alRoots.end());
-  while (!worklist.empty()) {
-    llvm::Instruction *current = worklist.pop_back_val();
-    if (!alTest.insert(current).second) {
-      continue;
-    }
-    for (llvm::User *user : current->users()) {
-      auto *userInst = llvm::dyn_cast<llvm::Instruction>(user);
-      if (userInst == nullptr) {
-        return std::nullopt;
-      }
-      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(userInst)) {
-        if (!isFlagRegisterGlobal(store->getPointerOperand())) {
-          return std::nullopt;
-        }
-        continue;
-      }
-      if (llvm::isa<llvm::BinaryOperator>(userInst) ||
-          llvm::isa<llvm::ICmpInst>(userInst) ||
-          llvm::isa<llvm::CastInst>(userInst)) {
-        worklist.push_back(userInst);
-        continue;
-      }
-      if (auto *call = llvm::dyn_cast<llvm::CallBase>(userInst)) {
-        // 标志位计算里还会用 llvm.ctpop（PF）这类纯 intrinsic：它们也是 AL 测试
-        // 链的一部分，跟着一起当死代码清理。
-        llvm::Function *callee = call->getCalledFunction();
-        if (callee != nullptr && callee->isIntrinsic() &&
-            !call->mayHaveSideEffects()) {
-          worklist.push_back(userInst);
-          continue;
-        }
-      }
-      if (llvm::isa<llvm::BranchInst>(userInst)) {
-        continue;
-      }
-      return std::nullopt;
-    }
-  }
-  plan.AlTestInstructions.assign(alTest.begin(), alTest.end());
-
   // 4) FP 保存区：区间内每个 store 都必须是可删的 XMM 保存（否则放弃改写，
-  //    避免留下读 ZMM 的入口值）。
+  //    避免留下读 ZMM 的入口值）。先算它：AL 测试的判定要用"XMM 保存块"。
   uint64_t fpBase = plan.Info.SaveAreaOffset + GpSaveAreaSize;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
@@ -382,6 +327,100 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
     plan.XmmSaves.push_back(
         SaveStore{index, slot->first, slot->second, store, read});
   }
+  std::set<llvm::BasicBlock *> xmmSaveBlocks;
+  for (const SaveStore &save : plan.XmmSaves) {
+    if (save.Store != nullptr && save.Store->getParent() != nullptr) {
+      xmmSaveBlocks.insert(save.Store->getParent());
+    }
+  }
+
+  // 3) AL 测试（编译器 test al,al，决定是否保存 XMM）。函数里往往还有很多别的 AL
+  //    用途 —— 格式解析的 cmp al,k、把 AL 当数据搬进别的寄存器……旧实现把这些
+  //    都当 AL 测试根，一旦闭包碰到非标志用途就整函数放弃（hi_sdscatfmt 有 92 个
+  //    cmp al,k，整个变参函数因此漏掉）。
+  //    只挑"守着 XMM 保存区"的那条链：从 partial_read.i64.i8(@RAX) 出发做**标志
+  //    用途**的传递闭包（碰到别的用途只停在那条边上，不影响这条链），链经过的块
+  //    里若有一个条件分支直接跳到含 XMM 保存 store 的块，这条链才算数。一条都
+  //    没有才放弃改写。
+  std::vector<llvm::Instruction *> alRoots;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (isAlTestRoot(inst)) {
+      alRoots.push_back(&inst);
+    }
+  }
+  if (alRoots.empty()) {
+    return std::nullopt;
+  }
+  std::set<llvm::Instruction *> alTest;
+  for (llvm::Instruction *root : alRoots) {
+    std::set<llvm::Instruction *> closure;
+    std::set<llvm::BasicBlock *> touchedBlocks;
+    llvm::SmallVector<llvm::Instruction *, 16> worklist{root};
+    while (!worklist.empty()) {
+      llvm::Instruction *current = worklist.pop_back_val();
+      if (!closure.insert(current).second) {
+        continue;
+      }
+      if (current->getParent() != nullptr) {
+        touchedBlocks.insert(current->getParent());
+      }
+      for (llvm::User *user : current->users()) {
+        auto *userInst = llvm::dyn_cast<llvm::Instruction>(user);
+        if (userInst == nullptr) {
+          continue;
+        }
+        if (auto *store = llvm::dyn_cast<llvm::StoreInst>(userInst)) {
+          if (isFlagRegisterGlobal(store->getPointerOperand())) {
+            closure.insert(store);
+            if (store->getParent() != nullptr) {
+              touchedBlocks.insert(store->getParent());
+            }
+          }
+          continue;
+        }
+        if (llvm::isa<llvm::BinaryOperator>(userInst) ||
+            llvm::isa<llvm::ICmpInst>(userInst) ||
+            llvm::isa<llvm::CastInst>(userInst)) {
+          worklist.push_back(userInst);
+          continue;
+        }
+        if (auto *call = llvm::dyn_cast<llvm::CallBase>(userInst)) {
+          // 标志位计算里还会用 llvm.ctpop（PF）这类纯 intrinsic：它们也是 AL 测试
+          // 链的一部分，跟着一起当死代码清理。
+          llvm::Function *callee = call->getCalledFunction();
+          if (callee != nullptr && callee->isIntrinsic() &&
+              !call->mayHaveSideEffects()) {
+            worklist.push_back(userInst);
+          }
+          continue;
+        }
+        if (llvm::isa<llvm::BranchInst>(userInst) &&
+            userInst->getParent() != nullptr) {
+          touchedBlocks.insert(userInst->getParent());
+        }
+      }
+    }
+    bool guardsXmmSaves = false;
+    for (llvm::BasicBlock *block : touchedBlocks) {
+      auto *branch = llvm::dyn_cast_or_null<llvm::BranchInst>(
+          block == nullptr ? nullptr : block->getTerminator());
+      if (branch == nullptr || !branch->isConditional()) {
+        continue;
+      }
+      for (llvm::BasicBlock *successor : branch->successors()) {
+        if (xmmSaveBlocks.count(successor) != 0) {
+          guardsXmmSaves = true;
+        }
+      }
+    }
+    if (guardsXmmSaves) {
+      alTest.insert(closure.begin(), closure.end());
+    }
+  }
+  if (alTest.empty()) {
+    return std::nullopt;
+  }
+  plan.AlTestInstructions.assign(alTest.begin(), alTest.end());
 
   // 5) va_list 的 4 个字段 store（指针字段允许缺失，值可能经过寄存器中转）。
   for (llvm::Instruction &inst : llvm::instructions(function)) {

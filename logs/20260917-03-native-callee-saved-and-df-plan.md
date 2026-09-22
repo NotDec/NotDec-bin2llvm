@@ -2088,3 +2088,54 @@ ctest 12/12，fortune x86_64 / i386 回归 EXIT=0，所有目标 verify OK。
 寄存器的普通 spill（base 不一致、槽位避开 FP 保存区和 va_list 窗口），断言仍然
 detected/rewritten 且插入 llvm.va_start。旧的"所有候选共用一个 base"实现在这条用例
 上会失败。
+
+## 变参 AL 测试识别：只认"守着 XMM 保存区"的那条链（2026-09-22 续）
+
+用户 prompt：
+
+> 对，按这个继续推进试试吧
+
+### 1. 现象
+
+上一轮修掉保存区 spill 之后，`hi_sdscatfmt` 还是没被识别。用 __LINE__ 探针定位到
+识别第 3 步（AL 测试闭包）：某条 AL 链的使用者里出现"存进非标志寄存器"就 return
+nullopt。hi_sdscatfmt 的格式解析循环里有 **92** 个 `cmp al,k`，全都是
+`partial_read.i64.i8(@RAX)`，全被当作 AL 测试根卷进闭包，最后撞到一个非标志用途
+（把 AL 当数据搬走），整个变参函数被放弃。
+
+### 2. 修法（NativeVarArgRewrite.cpp）
+
+- 先把第 4 步（FP/XMM 保存区）挪到 AL 判定之前，收集 `xmmSaveBlocks`（含 XMM 保存
+  store 的块）；
+- AL 判定改成逐根独立：对每个 `partial_read.i64.i8(@RAX)` 做**标志用途**的传递闭包
+  （碰到别的用途只停在那条边上，不再整函数放弃），只有当这条链经过的块里存在一个
+  **条件分支直接跳到 XMM 保存块**时，这条链才算数；一条都没有才放弃。
+- 无关的 AL 用途（cmp 链、把 AL 当数据搬走）既不进闭包，也不会导致放弃。
+
+注：`plan.AlTestInstructions` 只用于记录/校验（applyPlan 不删它，清理交给后续
+SSA 死代码消除），所以这次改动只影响"识别/放弃"的判定。
+
+### 3. 效果（相对上一版）
+
+| 目标 | unknown 前 → 后 | IR bytes 前 → 后 | warning 前 → 后 |
+|---|---|---|---|
+| redis-cli | 87 → **7** | 4,064,293 → 4,019,841 | 1,473 → 1,437 |
+| vsftpd | 0 → 0 | 1,710,777 → 1,710,770 | 158 |
+| libuv | 8 → 8 | 2,771,361 | 66 |
+| memcached | 0 → 0 | 3,797,987 | 755 |
+| wrk | 0 → 0 | 930,419 → 930,436 | 276 |
+| lighttpd | 115 → 115 | 4,647,536 → 4,648,828 | 1,064 → 1,066 |
+| ffmpeg | 8 → 8 | 4,693,940 → 4,693,934 | 2,082 |
+
+redis-cli 只剩 7 个 `return_binding_uses_clobber_value:RAX`（纯 clobber 返回，保守
+占位）。`hi_sdscatfmt` 现在识别成变参（`(i64, i64, i8, ...)`），它和
+`hi_sdscatlen` 的 69 个 call_effect_mixed、以及 7 个 missing_binding 一起消失。
+
+ctest 12/12，fortune x86_64 / i386 回归 EXIT=0，7 个目标 llvm-as + opt -passes=verify
+全 OK。
+
+### 4. 单测
+
+testVarArgPrologueWithSpillAndAlNoiseIsDetected：在真保存区旁边同时放
+(a) 同寄存器的普通 spill（base 不一致）和 (b) 把 AL 当数据存到内存的无关用途，
+断言仍然 detected/rewritten 且插入 llvm.va_start。旧实现分别在 (a)(b) 两处放弃。
