@@ -1725,6 +1725,16 @@ SignatureShape shapeForInternalFunction(
     if (paramMask.getBitWidth() == 0) {
       paramMask = regIt->second.EntryDemandMask;
     }
+    // 入口读只覆盖寄存器中段时（例如 R8 的 bit 8..32：低字节在另一条路径上先被
+    // 写过），这不是真正的参数 —— ABI 参数永远从 bit 0 开始，这种读是"部分重读
+    // 局部写过的值 + 死 scratch 位"的组合。给它建窄形参（i24 R8.arg）会逼所有
+    // 调用点去凑那几位，而调用点的值多半来自 Mixed 调用 → 一连串 unknown。
+    // 不建形参：调用点不再要这几位，函数体内那一次入口读退化成 entry_range_rejected
+    // 占位（1 个），通常比每个调用点各一个 unknown 划算。
+    if (paramMask.getBitWidth() != 0 && !paramMask.isZero() &&
+        paramMask.countr_zero() != 0) {
+      return;
+    }
     if (floatSlot != nullptr) {
       if (paramMask.getBitWidth() != 0 && !paramMask.isZero()) {
         if (std::optional<NativeSignatureSlot> slot =

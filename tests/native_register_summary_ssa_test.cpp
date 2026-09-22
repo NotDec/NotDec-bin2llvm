@@ -6148,6 +6148,59 @@ bool testIndirectCallWithoutEvidenceHasNoArguments() {
                   "module failed verifier after indirect no-evidence test");
 }
 
+// 入口读只覆盖寄存器中段（低字节在另一条路径上先被写过）时不能建窄形参：
+// ABI 参数从 bit 0 开始，这种读是"部分重读局部值 + 死 scratch 位"的组合。
+// lighttpd 的 config_plugin_values_init / network_init 就因此挂了 i24 R8.arg，
+// 逼所有调用点去凑那 24 位。
+bool testPartialEntryMaskDoesNotCreateNarrowParam() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-entry-param", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  auto *i8Type = llvm::Type::getInt8Ty(context);
+  auto *i32Type = llvm::Type::getInt32Ty(context);
+  auto *i64Type = llvm::Type::getInt64Ty(context);
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+  (void)createRegisterGlobal(module, "RDI");
+  auto *sink = new llvm::GlobalVariable(
+      module, i32Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "partial_entry_sink");
+  llvm::Function *partialWrite =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+          module, r8->getType(), i8Type, 64, 8);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, r8->getType(), i32Type, 64, 32);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                                       {llvm::Type::getInt1Ty(context)}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "partial_entry_param", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  // 先无条件写低字节，再读 32 位：入口值只剩 bit 8..32 可能还活着，
+  // ReadEntryMask = 0xFFFFFF00（真正的"部分入口读"）。
+  builder.CreateCall(partialWrite, {r8, llvm::ConstantInt::get(i8Type, 7),
+                                    llvm::ConstantInt::get(i64Type, 0)});
+  llvm::Value *value =
+      builder.CreateCall(partialRead, {r8, llvm::ConstantInt::get(i64Type, 0)});
+  builder.CreateStore(value, sink);
+  builder.CreateRetVoid();
+
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("partial_entry_param");
+  bool hasR8Param = false;
+  if (rewritten != nullptr) {
+    for (const llvm::Argument &arg : rewritten->args()) {
+      hasR8Param |= arg.getName().starts_with("R8");
+    }
+  }
+  return expect(rewritten != nullptr, "partial entry param function missing") &&
+         expect(!hasR8Param,
+                "partial-entry R8 read created a narrow parameter") &&
+         verifyOk(module,
+                  "module failed verifier after partial entry param test");
+}
+
 // The same pattern the other way around: the compiler fills a later argument
 // register first (suffix in R8) and copies it down into an earlier one (prefix
 // in RDX).  Both registers are real arguments, so the consumed copy must not
@@ -12541,6 +12594,7 @@ int main() {
   ok &= testConsumedScratchRegisterIsNotAnExternalArgument();
   ok &= testFlagOnlyRegisterReadKeepsArgumentArity();
   ok &= testIndirectCallWithoutEvidenceHasNoArguments();
+  ok &= testPartialEntryMaskDoesNotCreateNarrowParam();
   ok &= testConsumedRegisterBeforeLaterArgumentKeepsArity();
   ok &= testExternalPrototypeJsonOverridesInferredArity();
   ok &= testExternalPrototypeJsonAcceptsLongDouble();

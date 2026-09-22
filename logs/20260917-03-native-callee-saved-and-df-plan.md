@@ -2185,3 +2185,43 @@ addAbiInputParamSlots。
 所有目标 llvm-as + opt -passes=verify OK，ctest 12/12，fortune x86_64 / i386 回归
 EXIT=0。单测 testIndirectCallWithoutEvidenceHasNoArguments：没写任何实参寄存器的
 间接调用，断言改写后 0 个实参。
+
+## 部分入口读不再建窄形参（2026-09-22 续）
+
+用户 prompt：
+
+> 按这个感觉可以试一试
+
+### 1. 剩余 mixed 里的一个具体子机制
+
+lighttpd 的 config_plugin_values_init / network_init 签名里挂着 `i24 %R8.arg`
+（第 5 个参数 R8 的 bit 8..32）。facts 里 `read_entry_mask=0xFFFFFF00`：
+
+- 函数在某处读了 R8 的 32 位（`partial_read.i64.i32(@R8, 0)`）；
+- 但低字节在那之前被**无条件**写过（`partial_write.i64.i8(@R8, ..., 0)`）→
+  MayEntry 只剩 bit 8..32；readRegister 记 `ReadEntry = MayEntry & readMask =
+  0xFFFFFF00`；
+- buildInitialSignatureShapes 把这个连续段变成 i24 形参槽 [8:32) → 所有调用点都要给
+  R8 补这 24 位；调用点那边 R8 又来自别的 Mixed 调用 → unknown。
+
+ABI 参数永远从 bit 0 开始；这种"入口读只覆盖寄存器中段"是"部分重读局部写过的值 +
+死 scratch 位"的组合，不是真参数。
+
+### 2. 修法
+
+addParamForUnit 里：paramMask 非零且 `countr_zero() != 0`（不从 bit 0 开始）就不建
+形参、直接 return。调用点不再需要这几位；函数体内那一次入口读退化成
+entry_range_rejected 占位（1 个，比每个调用点各一个 unknown 划算）。
+
+### 3. 效果
+
+| 目标 | unknown 前 → 后 | IR bytes 前 → 后 |
+|---|---|---|
+| lighttpd | 106 → **97** | 4,628,926 → 4,607,985 |
+| vsftpd / memcached / wrk | 0 / 0 / 0 | 持平 |
+| libuv | 8 | 2,771,361 → 2,765,013 |
+| redis-cli / ffmpeg | 7 / 8 | 持平 |
+
+ctest 12/12，所有目标 llvm-as + opt -passes=verify OK。单测
+testPartialEntryMaskDoesNotCreateNarrowParam：先无条件写 R8 低字节再读 32 位，
+断言改写后没有 R8 形参（旧行为会生成 i24 R8.arg）。
