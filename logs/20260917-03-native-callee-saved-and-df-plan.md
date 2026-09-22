@@ -1855,3 +1855,94 @@ clobber 返回。av_log 调用点现在按点给参数（main：3×7、4×12、5
 上省了 0.46% IR，但 4 个 call_arg_rewrite_type_mismatch 全部回来了（有些调用点没在
 本块写寄存器，却要靠细分区才能取出类型正确的值），unknown 754 → 755。结论：保持
 全收，代码里留了注释记录这次实验。
+
+## 栈对齐 push/pop 被当成保存：和 callee-saved save/restore 一起认（2026-09-21 续）
+
+用户 prompt：
+
+> 对，按这个推进试试吧
+
+### 1. 先看编译器源码：push 的值是 undef、pop 的是死寄存器
+
+llvm/lib/Target/X86/X86FrameLowering.cpp 的 BuildStackAdjustment（while (Offset) 循环）：
+
+    if (Offset == SlotSize) {
+      // Use push / pop for slot sized adjustments as a size optimization. We
+      // need to find a dead register when using pop.
+      unsigned Reg = isSub ? (unsigned)(Is64Bit ? X86::RAX : X86::EAX)
+                           : TRI->findDeadCallerSavedReg(MBB, MBBI);
+      ...
+        BuildMI(MBB, MBBI, DL, TII.get(Opc))
+            .addReg(Reg, getDefRegState(!isSub) | getUndefRegState(isSub))
+
+调整量正好一个槽（x86-64 的 8 字节）时 LLVM 用 push/pop 代替 sub/add：push 的
+寄存器带 getUndefRegState（值不存在，固定 RAX），pop 用 findDeadCallerSavedReg 挑
+一个死寄存器。GCC 的 `push %rcx` + `pop %rax` 是同一手法（vsftpd FUN_17f60、
+lighttpd array_insert_unique 实测）。也就是编译器自己认为这次 push 的值是 undef、
+pop 的结果是死的，而我们的 lift 只看到普通 load/store。
+
+### 2. 位置：就是 callee-saved save/restore 那套代码
+
+NativeRegisterSummary.cpp 里早就有保存/恢复建模：
+
+- push 侧（store 进固定栈槽）：存的若是寄存器 R 的入口值且
+  canTrackSavedEntryRegister(R)，就记 StackSlots[slot] = R、**不计入口读**；
+  否则 markEntryValueRead → R 变 read_entry。
+- canTrackSavedEntryRegister（:2125 附近）**只认 Abi.Unaffected（callee-saved）**，
+  所以 `push %rcx` 直接落进"读"分支，把 scratch 变成形参。
+
+按"和 callee-saved 一起识别、且发生在寄存器消除之前"的思路，在这里加第三种分类。
+
+### 3. 实现（NativeRegisterSummary.cpp）
+
+新增 stackAdjustmentSlots / collectStackAdjustmentSlots：
+
+1. 候选：store 进固定栈槽、值是该寄存器的**直接入口 load**、寄存器是 caller-saved
+   （非 Abi.Unaffected、非 RSP、非 ignored）；
+2. 该槽的每个 load 都只被搬进别的寄存器（写回同一个寄存器 = 真 save/restore，排除）；
+3. 每个搬进去的寄存器"搬完就死"：registerValueDiesAfter 从那条 store 往后走
+   （块内 + 后继块，最多 64 块），期间没有显式读、也没被会消费它的调用读掉。
+
+命中后：push 侧不计入口读、不登记保存槽；load 侧也不挂"保存值来源"。
+
+调试中踩的两个坑（都会把真实 spill 误判成对齐填充）：
+
+- 一开始把**任何**显式读/写当判据、忽略调用：lift 的 IR 里实参是"store 进实参
+  寄存器 + call"，调用隐式消费寄存器，于是 vsftpd FUN_13d70 的 RSI spill、
+  FUN_14880/FUN_13ee0 的 RDX spill 被误判，新增 5 个 entry_range_rejected。
+- 改成"一切调用都算读"又太粗：FUN_17f60 错误分支的 pop 走
+  `pop %rdx; jmp die`，被当成活，修复失效。
+- 最终按**逐寄存器**判断：callMayReadRegister 对外部调用看 shape 的输入槽、对内部
+  调用看 bottom-up effect 的 ReadEntry，未知外部/间接/effect 未算出才保守当读；
+  callee 不碰这个寄存器就继续往后走。这样 FUN_17f60 的两条 pop 路径都判死，
+  真实 spill 又保住。
+
+### 4. 单测（native_register_summary_test.cpp）
+
+- testStackAdjustmentPushIsNotEntryRead：`push RCX（入口值）→ call → pop 进
+  RAX → ret`，断言 RCX.ReadEntry == false；
+- testCallerSavedSaveRestoreIsEntryRead：同样 push，但 pop 写回 RCX，断言
+  ReadEntry == true（真 save/restore 不能被吃掉）；
+- testStackAdjustmentPopUseKeepsEntryRead：pop 进 RAX 后又有 `load @RAX`，
+  断言 ReadEntry == true（保守不放行）。
+
+### 5. 效果
+
+vsftpd：4 个 `call_arg_rewrite_missing_binding:FUN_17f60:RCX` → **0**。
+其余目标见 summary（libuv / memcached / wrk / lighttpd / redis-cli / ffmpeg）。
+
+### 5. 效果（相对只做了 vararg 元数修复的上一版）
+
+| 目标 | unknown 前 → 后 | IR bytes 前 → 后 | warning 前 → 后 |
+|---|---|---|---|
+| vsftpd | 4 → **0** | 1,712,854 → 1,710,770 | 166 → 158 |
+| lighttpd | 754 → **274**（−64%） | 5,257,857 → 4,721,632（−10%） | 2,553 → 1,179 |
+| libuv | 8 → 8 | 2,771,321 → 2,771,338 | 66 → 66 |
+| redis-cli | 128 → 128 | 4,087,405 → 4,086,172 | 1,523 |
+| memcached / wrk / ffmpeg | 0 / 0 / 8 | 基本不变 | 不变 |
+
+ctest 12/12，fortune x86_64 / i386 回归 EXIT=0，所有目标 llvm-as + opt -passes=verify OK。
+
+lighttpd 剩下的 274 个：call_effect_mixed 238（其中 `FUN_26313` 的 R8/R9/RSI
+各 40，占 120）、entry_range_rejected 19、clobber 返回 10、missing_binding 7。
+redis-cli 的 128 没动（`FUN_1e950` / `hi_sdscat*` 家族不是这个 idiom）。

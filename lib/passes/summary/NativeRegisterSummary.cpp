@@ -9,6 +9,8 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackAddress.h"
 
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
@@ -1452,6 +1454,8 @@ private:
   mutable std::map<llvm::Function *,
                    std::unique_ptr<NativeStackAddressAnalysis>>
       StackAddressAnalyses;
+  // 栈对齐 push 的槽位集合，按函数缓存（见 stackAdjustmentSlots 的注释）。
+  mutable std::map<llvm::Function *, std::set<StackSlotKey>> StackAdjustmentSlots;
 
   void buildCallGraph() {
     std::set<llvm::Function *> defined(Functions.begin(), Functions.end());
@@ -1953,7 +1957,8 @@ private:
       if (std::optional<StackSlotKey> slot =
               fixedStackSlot(load->getPointerOperand(), *load)) {
         auto saved = state.StackSlots.find(*slot);
-        if (saved != state.StackSlots.end()) {
+        if (saved != state.StackSlots.end() &&
+            stackAdjustmentSlots(*load->getFunction()).count(*slot) == 0) {
           state.ValueOrigins[load] =
               ValueOrigin{saved->second, 0, fullRegisterMask(saved->second)};
         } else {
@@ -2022,8 +2027,14 @@ private:
         }
         std::optional<ValueOrigin> origin =
             entryValueOrigin(store->getValueOperand(), state);
-        if (origin && origin->Offset == 0 &&
-            canTrackSavedEntryRegister(origin->Base)) {
+        if (stackAdjustmentSlots(*store->getFunction()).count(*slot) != 0) {
+          // 栈对齐 push：push 的值是 undef（LLVM 源码里就是 getUndefRegState），
+          // 不是"保存入口值"，所以不计入口读；也不登记保存槽，load 侧自然不挂
+          // 保存值来源。
+          state.StackSlots.erase(*slot);
+          state.StackSlotOrigins.erase(*slot);
+        } else if (origin && origin->Offset == 0 &&
+                   canTrackSavedEntryRegister(origin->Base)) {
           state.StackSlots[*slot] = origin->Base;
           state.StackSlotOrigins[*slot] =
               NativeRegisterCallsiteValueOrigin::ForwardedEntry;
@@ -2130,6 +2141,235 @@ private:
     const RegisterUnit &unit = unitIt->second;
     return unit.Name != Abi.StackPointer &&
            Abi.Unaffected.count(unit.Name) != 0;
+  }
+
+  bool instructionReadsRegister(const llvm::Instruction &inst,
+                                const llvm::GlobalVariable &global) const {
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      return load->getPointerOperand()->stripPointerCasts() == &global;
+    }
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call == nullptr) {
+      return false;
+    }
+    std::optional<NativeRegisterPartialReadInfo> partial =
+        parseNativeRegisterPartialRead(*call);
+    return partial && partial->Global == &global;
+  }
+
+  bool instructionWritesRegister(const llvm::Instruction &inst,
+                                 const llvm::GlobalVariable &global) const {
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+      return store->getPointerOperand()->stripPointerCasts() == &global;
+    }
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call == nullptr) {
+      return false;
+    }
+    std::optional<NativeRegisterPartialWriteInfo> partial =
+        parseNativeRegisterPartialWrite(*call);
+    return partial && partial->Global == &global;
+  }
+
+  // 该调用会不会消费 @global 的值。外部调用看 shape 的输入槽；内部调用看
+  // bottom-up effect 的 ReadEntry；未知外部、间接调用、effect 还没算出的 callee
+  // 一律保守当成会读。
+  bool callMayReadRegister(const llvm::CallBase &call,
+                           const llvm::GlobalVariable &global) const {
+    auto unitIt = Units.find(const_cast<llvm::GlobalVariable *>(&global));
+    if (unitIt == Units.end()) {
+      return true;
+    }
+    llvm::StringRef name = unitIt->second.Name;
+    auto mentions = [&](llvm::ArrayRef<NativeRegisterCallInputSlot> slots) {
+      for (const NativeRegisterCallInputSlot &input : slots) {
+        if (input.Kind == NativeRegisterCallInputSlotKind::Register &&
+            input.UnitName == name) {
+          return true;
+        }
+      }
+      return false;
+    };
+    if (const NativeExternalCallShape *shape = externalCallShape(call)) {
+      return mentions(shape->Inputs) || mentions(shape->VarArgInputs);
+    }
+    llvm::Function *callee = call.getCalledFunction();
+    if (callee == nullptr || callee->isDeclaration()) {
+      return true;
+    }
+    auto effectIt = Effects.find(callee);
+    if (effectIt == Effects.end()) {
+      return true;
+    }
+    auto regIt = effectIt->second.Registers.find(
+        const_cast<llvm::GlobalVariable *>(&global));
+    if (regIt == effectIt->second.Registers.end()) {
+      return false;
+    }
+    const llvm::APInt &readEntry = regIt->second.ReadEntry;
+    return readEntry.getBitWidth() != 0 && !readEntry.isZero();
+  }
+
+  // store 写进 @global 的值，在被下一次写覆盖之前有没有被显式读过。块内先看，
+  // 没被覆盖就沿后继块看（上限 64 个块，超了按"活"处理，保守）。遇到会消费该
+  // 寄存器的调用按"读"处理（lift 的 IR 里实参是显式 store 进寄存器 + call）；
+  // callee 不碰这个寄存器就继续往后看。
+  bool registerValueDiesAfter(llvm::StoreInst &store,
+                              const llvm::GlobalVariable &global) const {
+    llvm::BasicBlock *block = store.getParent();
+    if (block == nullptr) {
+      return false;
+    }
+    constexpr unsigned maxBlocks = 64;
+    llvm::SmallVector<llvm::BasicBlock *, 8> worklist;
+    llvm::SmallPtrSet<llvm::BasicBlock *, 32> visited;
+    visited.insert(block);
+    for (llvm::BasicBlock *successor : llvm::successors(block)) {
+      worklist.push_back(successor);
+    }
+    for (auto it = std::next(store.getIterator()); it != block->end(); ++it) {
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&*it);
+          call != nullptr && isAnalyzableCall(*call) &&
+          callMayReadRegister(*call, global)) {
+        return false;
+      }
+      if (instructionReadsRegister(*it, global)) {
+        return false;
+      }
+      if (instructionWritesRegister(*it, global)) {
+        return true;
+      }
+    }
+    while (!worklist.empty()) {
+      if (visited.size() >= maxBlocks) {
+        return false;
+      }
+      llvm::BasicBlock *current = worklist.pop_back_val();
+      if (!visited.insert(current).second) {
+        continue;
+      }
+      bool killed = false;
+      for (const llvm::Instruction &inst : *current) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+        if ((call != nullptr && isAnalyzableCall(*call) &&
+             callMayReadRegister(*call, global)) ||
+            instructionReadsRegister(inst, global)) {
+          return false;
+        }
+        if (instructionWritesRegister(inst, global)) {
+          killed = true;
+          break;
+        }
+      }
+      if (killed) {
+        continue;
+      }
+      for (llvm::BasicBlock *successor : llvm::successors(current)) {
+        worklist.push_back(successor);
+      }
+    }
+    return true;
+  }
+
+  // 栈对齐 push（GCC 的 push %rcx + pop %rax；LLVM 的 pushq %rax + pop 死寄存器）
+  // 在 lift 之后只是"存入口值 → 取出来写进另一个寄存器"，前向 summary 会把入口读
+  // 记成真实使用，把 scratch 寄存器变成形参。编译器源码里这两种 push/pop 的语义
+  // 是明确的：LLVM X86FrameLowering::BuildStackAdjustment 用
+  // getUndefRegState(isSub) 标 push（值不存在），pop 用 findDeadCallerSavedReg 挑
+  // 一个死寄存器。
+  //
+  // 识别判据（只对非 callee-saved 寄存器，尽量保守）：
+  //   1. store 进固定栈槽的值是某个 caller-saved 寄存器的入口 load；
+  //   2. 该槽的 load 没有写回同一个寄存器（真 save/restore 对不走这里）；
+  //   3. 每个这样的 load 都只被搬进"搬完就死"的寄存器（下一次写之前没有显式读）。
+  // 三条都成立才认定为对齐填充：push 侧不计入口读，load 侧不挂保存值来源。
+  const std::set<StackSlotKey> &
+  stackAdjustmentSlots(llvm::Function &function) const {
+    auto cached = StackAdjustmentSlots.find(&function);
+    if (cached != StackAdjustmentSlots.end()) {
+      return cached->second;
+    }
+    std::set<StackSlotKey> slots;
+    collectStackAdjustmentSlots(function, slots);
+    return StackAdjustmentSlots.emplace(&function, std::move(slots))
+        .first->second;
+  }
+
+  void collectStackAdjustmentSlots(llvm::Function &function,
+                                   std::set<StackSlotKey> &result) const {
+    struct Candidate {
+      StackSlotKey Slot;
+      llvm::GlobalVariable *Register = nullptr;
+    };
+    std::vector<Candidate> candidates;
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &inst : block) {
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+        if (store == nullptr) {
+          continue;
+        }
+        auto *loaded = llvm::dyn_cast<llvm::LoadInst>(store->getValueOperand());
+        if (loaded == nullptr) {
+          continue;
+        }
+        RegisterAccess access = registerLoad(*loaded, Units);
+        if (access.Unit == nullptr || isIgnored(*access.Unit, Options) ||
+            access.Unit->Name == Abi.StackPointer ||
+            Abi.Unaffected.count(access.Unit->Name) != 0) {
+          continue;
+        }
+        std::optional<StackSlotKey> slot =
+            fixedStackSlot(store->getPointerOperand(), *store);
+        if (!slot) {
+          continue;
+        }
+        candidates.push_back({*slot, access.Unit->Global});
+      }
+    }
+    for (const Candidate &candidate : candidates) {
+      if (result.count(candidate.Slot) != 0) {
+        continue;
+      }
+      bool padding = true;
+      bool sawLoad = false;
+      for (llvm::BasicBlock &block : function) {
+        for (llvm::Instruction &inst : block) {
+          auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst);
+          if (load == nullptr) {
+            continue;
+          }
+          std::optional<StackSlotKey> slot =
+              fixedStackSlot(load->getPointerOperand(), *load);
+          if (!slot || !(*slot == candidate.Slot)) {
+            continue;
+          }
+          sawLoad = true;
+          for (llvm::User *user : load->users()) {
+            auto *store = llvm::dyn_cast<llvm::StoreInst>(user);
+            if (store == nullptr) {
+              padding = false;
+              break;
+            }
+            RegisterAccess access = registerStore(*store, Units);
+            if (access.Unit == nullptr ||
+                access.Unit->Global == candidate.Register ||
+                !registerValueDiesAfter(*store, *access.Unit->Global)) {
+              padding = false;
+              break;
+            }
+          }
+          if (!padding) {
+            break;
+          }
+        }
+        if (!padding) {
+          break;
+        }
+      }
+      if (padding && sawLoad) {
+        result.insert(candidate.Slot);
+      }
+    }
   }
 
   std::optional<ValueOrigin> entryValueOrigin(llvm::Value *value,

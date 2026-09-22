@@ -1100,6 +1100,139 @@ bool testOverwrittenSavedRegisterSlotIsNotPreserved() {
                 "overwritten saved RBX slot was incorrectly preserved");
 }
 
+// 造一个"push 只用于栈对齐"的函数：把入口 RCX 存进 rsp-8，调用一次，再把槽
+// 里的值 pop 进另一个寄存器（RAX）。LLVM 源码里这种 push 的寄存器是 undef、
+// pop 目标是 findDeadCallerSavedReg 挑的死寄存器；GCC 的 push %rcx + pop %rax
+// 同理。入口 RCX 不该被当成真实使用。
+struct StackAdjustFixture {
+  llvm::GlobalVariable *Rsp = nullptr;
+  llvm::GlobalVariable *Rcx = nullptr;
+  llvm::GlobalVariable *Rax = nullptr;
+  llvm::Value *Slot = nullptr;
+  llvm::LoadInst *RcxEntry = nullptr;
+  llvm::LoadInst *RspEntry = nullptr;
+};
+
+StackAdjustFixture buildStackAdjustPrologue(llvm::Module &module,
+                                            llvm::LLVMContext &context,
+                                            llvm::IRBuilder<> &builder,
+                                            llvm::Function *function) {
+  StackAdjustFixture fixture;
+  fixture.Rsp = createRegisterGlobal(module, "RSP");
+  fixture.Rcx = createRegisterGlobal(module, "RCX");
+  fixture.Rax = createRegisterGlobal(module, "RAX");
+  fixture.RspEntry =
+      loadRegister(builder, fixture.Rsp, "RSP", "rsp.entry");
+  llvm::Value *slotAddress = builder.CreateAdd(
+      fixture.RspEntry,
+      llvm::ConstantInt::get(fixture.Rsp->getValueType(), -8, true));
+  fixture.Slot = builder.CreateIntToPtr(
+      slotAddress, llvm::PointerType::get(context, 0));
+  fixture.RcxEntry =
+      loadRegister(builder, fixture.Rcx, "RCX", "rcx.entry");
+  builder.CreateStore(fixture.RcxEntry, fixture.Slot);
+  return fixture;
+}
+
+bool testStackAdjustmentPushIsNotEntryRead() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-stack-adjust-push", context);
+  attachTestAbi(module);
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "stack_adjust_ext", module);
+  llvm::Function *function = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "stack_adjust_push_rcx",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  StackAdjustFixture fixture =
+      buildStackAdjustPrologue(module, context, builder, function);
+  builder.CreateCall(voidType, external);
+  llvm::LoadInst *saved =
+      builder.CreateLoad(fixture.Rcx->getValueType(), fixture.Slot);
+  storeRegisterValue(builder, fixture.Rax, saved, "RAX");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "stack_adjust_push_rcx");
+  const auto *rcxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RCX");
+  const auto *raxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RAX");
+  return expect(rcxSummary != nullptr, "missing RCX summary") &&
+         expect(!rcxSummary->ReadEntry,
+                "stack alignment push made the scratch register an input") &&
+         expect(raxSummary != nullptr && raxSummary->MayNonEntry,
+                "dead pop target was not recorded as a write");
+}
+
+bool testCallerSavedSaveRestoreIsEntryRead() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-caller-saved-restore", context);
+  attachTestAbi(module);
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "caller_saved_ext", module);
+  llvm::Function *function = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "caller_saved_save_rcx",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  StackAdjustFixture fixture =
+      buildStackAdjustPrologue(module, context, builder, function);
+  builder.CreateCall(voidType, external);
+  llvm::LoadInst *saved =
+      builder.CreateLoad(fixture.Rcx->getValueType(), fixture.Slot);
+  storeRegisterValue(builder, fixture.Rcx, saved, "RCX");
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "caller_saved_save_rcx");
+  const auto *rcxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RCX");
+  return expect(rcxSummary != nullptr, "missing RCX summary after restore") &&
+         expect(rcxSummary->ReadEntry,
+                "real caller-saved save/restore lost the entry read");
+}
+
+bool testStackAdjustmentPopUseKeepsEntryRead() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-stack-adjust-pop-used", context);
+  attachTestAbi(module);
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *external = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "pop_used_ext", module);
+  llvm::Function *function = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "stack_adjust_pop_used",
+      module);
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "stack_adjust_sink");
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  StackAdjustFixture fixture =
+      buildStackAdjustPrologue(module, context, builder, function);
+  builder.CreateCall(voidType, external);
+  llvm::LoadInst *saved =
+      builder.CreateLoad(fixture.Rcx->getValueType(), fixture.Slot);
+  storeRegisterValue(builder, fixture.Rax, saved, "RAX");
+  llvm::LoadInst *use = loadRegister(builder, fixture.Rax, "RAX", "rax.use");
+  builder.CreateStore(use, sink);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterSummary(module);
+  const auto *fn = functionSummary(summary, "stack_adjust_pop_used");
+  const auto *rcxSummary =
+      fn == nullptr ? nullptr : registerSummary(*fn, "RCX");
+  return expect(rcxSummary != nullptr, "missing RCX summary after used pop") &&
+         expect(rcxSummary->ReadEntry,
+                "pop value that is read afterwards was treated as padding");
+}
+
 bool testImplicitCalleeSavedRestoreIsPreserved() {
   llvm::LLVMContext context;
   llvm::Module module("summary-implicit-callee-saved-restore", context);
@@ -1156,6 +1289,9 @@ int main() {
   ok &= testRootDemandSkipsFloatOnlyAbiOutput();
   ok &= testSavedRegisterRestoreIsPreserved();
   ok &= testOverwrittenSavedRegisterSlotIsNotPreserved();
+  ok &= testStackAdjustmentPushIsNotEntryRead();
+  ok &= testCallerSavedSaveRestoreIsEntryRead();
+  ok &= testStackAdjustmentPopUseKeepsEntryRead();
   ok &= testImplicitCalleeSavedRestoreIsPreserved();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
