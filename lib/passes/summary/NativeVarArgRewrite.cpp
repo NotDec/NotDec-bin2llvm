@@ -30,7 +30,12 @@
 //      编译器不会生成的形态；
 //   3) 每个模式要么完整命中并整体改写，要么整体放弃（保守跳过，绝不半改）；
 //   4) 识别结果挂 metadata（这里是 !notdec.vararg），签名/调用点推断只读
-//      metadata，匹配逻辑和消费方解耦。
+//      metadata，匹配逻辑和消费方解耦；
+//   5) "一次 va_start ↔ 一段以 ap 为 base 的 4 字段 store 序列"在编译器模型里是
+//      1:1 的：clang 对每个 __builtin_va_start 都发一个 llvm.va_start、不做去重
+//      （CGBuiltin.cpp EmitVAStartEnd），标准也允许同一 va_list 重新 va_start
+//      （C11 7.16.1.3）。所以识别和改写都按"初始化点"计数：见到几段就还原几个
+//      llvm.va_start，绝不合并（见 VaListWindow 的注释）。
 namespace notdec::bin2llvm {
 namespace {
 
@@ -148,14 +153,31 @@ struct I32Store {
   llvm::Instruction *Store = nullptr;
 };
 
+// 一个"被初始化的 va_list"（窗口）= 同一基本块里同一段 24 字节 va_list 槽上的
+// 字段 store 集合。为什么这样划：编译器把每个 va_start 展开成"以 ap 为 base 的
+// 固定 4 个字段 store"（后端 LowerVASTART，X86ISelLowering.cpp:26203-26258），
+// 所以"同块 + [gp_offset, gp_offset+24)"就是这次 va_start 写的那个 va_list；
+// 别的块写同一段槽是栈槽复用出去的其它变量，不算。
+struct VaListWindow {
+  llvm::BasicBlock *Block = nullptr;
+  uint64_t GpOffset = 0;
+  // 这个窗口上的初始化点，一个 gp_offset store 一次 va_start。为什么不按
+  // (块, 槽) 去重成一个点：clang 对每个 __builtin_va_start 都发一个
+  // llvm.va_start、不做去重（clang/lib/CodeGen/CGBuiltin.cpp EmitVAStartEnd），
+  // 标准也允许 va_end 之后重新 va_start（C11 7.16.1.3），两个 va_list 复用同一个
+  // 栈槽时它们的字段 store 会落进同一个窗口；这时必须各自还原成一个
+  // llvm.va_start，否则中间那次重新初始化会被删掉（就是"半改写"）。
+  std::vector<llvm::Instruction *> GpStores;
+  std::vector<llvm::Instruction *> FieldStores;
+};
+
 struct FunctionPlan {
   llvm::Function *Function = nullptr;
   NativeVarArgInfo Info;
   llvm::AllocaInst *Frame = nullptr;
   std::vector<SaveStore> GpSaves;
   std::vector<SaveStore> XmmSaves;
-  std::vector<llvm::Instruction *> VaListFieldStores;
-  llvm::BasicBlock *VaListInitBlock = nullptr;
+  std::vector<VaListWindow> VaListWindows;
   std::vector<llvm::Instruction *> AlTestInstructions;
 };
 
@@ -262,8 +284,7 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
                                  constant->getZExtValue(), store});
   }
   std::optional<uint64_t> fixedGp;
-  uint64_t vaListOffset = 0;
-  llvm::BasicBlock *vaListInitBlock = nullptr;
+  std::vector<VaListWindow> vaListWindows;
   for (const I32Store &fp : i32Stores) {
     if (fp.Value != FpOffsetBase) {
       continue;
@@ -275,18 +296,46 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
       }
       uint64_t candidate = gp.Value / 8;
       if (fixedGp.has_value() && *fixedGp != candidate) {
-        return std::nullopt;  // 多个互相矛盾的 va_list，保守跳过
+        // gp_offset/fp_offset 是函数级常量：后端按签名里的固定参数个数算
+        // （X86ISelLoweringCall.cpp:1561-1562），同一个函数的每个真 va_start 写的
+        // 都一样。对不上说明其中一对常量不是 va_start 序列，保守跳过。
+        return std::nullopt;
       }
       fixedGp = candidate;
-      vaListOffset = gp.Offset;
-      vaListInitBlock = gp.Store->getParent();
+      VaListWindow *window = nullptr;
+      for (VaListWindow &existing : vaListWindows) {
+        if (existing.Block == gp.Store->getParent() &&
+            existing.GpOffset == gp.Offset) {
+          window = &existing;
+          break;
+        }
+      }
+      if (window == nullptr) {
+        vaListWindows.push_back(
+            VaListWindow{gp.Store->getParent(), gp.Offset, {}, {}});
+        window = &vaListWindows.back();
+      }
+      // 外层 fp、内层 gp 是笛卡尔积，同一个 gp store 会被同槽的多个 fp store
+      // 重复匹配（同块两次初始化时），按指令去重，保证一个站点点数一次。
+      bool knownStore = false;
+      for (llvm::Instruction *existingStore : window->GpStores) {
+        if (existingStore == gp.Store) {
+          knownStore = true;
+          break;
+        }
+      }
+      if (!knownStore) {
+        window->GpStores.push_back(gp.Store);
+      }
     }
   }
   if (!fixedGp.has_value()) {
     return std::nullopt;
   }
   plan.Info.FixedGp = *fixedGp;
-  plan.Info.VaListOffset = vaListOffset;
+  // metadata / 诊断只记第一个初始化点的槽（va_list= 目前没有别的消费者）。
+  plan.Info.VaListOffset = vaListWindows.front().GpOffset;
+  plan.VaListWindows = std::move(vaListWindows);
   // 只保存了 1 个 GP 槽：只有"变参 GP 寄存器只剩 R9 一个"（fixed_gp=5）时才
   // 成立 —— 此时保存区本来就只有一个槽，编译器生成的序言就是这么写的
   // （lighttpd 的 log_pri(errh,msg,pri,int,fmt,...) 变参全在 R9）。旧实现要求
@@ -437,7 +486,10 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
   }
   plan.AlTestInstructions.assign(alTest.begin(), alTest.end());
 
-  // 5) va_list 的 4 个字段 store（指针字段允许缺失，值可能经过寄存器中转）。
+  // 5) 每个窗口的字段 store。窗口 = (块, va_list 槽)：编译器 LowerVASTART 的 4 个
+  //    字段 store（gp_offset+0、fp_offset+4、overflow_arg_area+8、
+  //    reg_save_area+16）全部以同一个 ap 为 base，所以同一段 24 字节槽就是这次
+  //    va_start 写的那个 va_list；指针字段允许缺失（值可能经过寄存器中转）。
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
     if (store == nullptr) {
@@ -449,18 +501,51 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
       continue;
     }
     uint64_t offset = slot->second;
-    if (offset < vaListOffset || offset >= vaListOffset + VaListSize) {
-      continue;
+    for (VaListWindow &window : plan.VaListWindows) {
+      if (store->getParent() != window.Block || offset < window.GpOffset ||
+          offset >= window.GpOffset + VaListSize) {
+        continue;
+      }
+      window.FieldStores.push_back(store);
+      break;
     }
-    // 只认和 gp_offset/fp_offset 同一个块里的 store：那一段 24 字节槽就是
-    // va_list 本身；别的块写同一段槽是栈槽复用出去的其它变量，跳过。
-    if (store->getParent() != vaListInitBlock) {
-      continue;
-    }
-    plan.VaListFieldStores.push_back(store);
   }
-  if (plan.VaListFieldStores.size() < 2) {
-    return std::nullopt;
+
+  // 每个窗口至少要凑出 gp_offset 和 fp_offset 两个字段，否则这个窗口只匹配到
+  // 一半（例如两个字段被 lift 分到了不同块）——整函数放弃，不半改。
+  for (const VaListWindow &window : plan.VaListWindows) {
+    if (window.FieldStores.size() < 2) {
+      return std::nullopt;
+    }
+  }
+  // 第 2 个及以后的窗口要有独立证据：编译器 LowerVASTART 的四个字段里，gp+16 是
+  // reg_save_area 指针（函数级保存区地址，X86ISelLoweringCall.cpp:1563），任何
+  // 用到变参的函数都必须写它。为什么只认形态、不比对它等于哪个保存区：这个阶段
+  // lift 的指针值还可能经过寄存器中转（store 的值是 load i64, ptr @RAX 这种），
+  // 比对就要追寄存器数据流 —— 本 pass 不做通用数据流推断。所以门槛是"gp+16 处有
+  // 一个 64 位、非常量的 store"（普通结构体那种 {8k, 48} 常量对挡在这里）。
+  // 第一个窗口沿用整函数证据（保存区 + AL 测试 + gp/fp 相邻），不额外收紧，
+  // 避免把现在能识别的单点函数挡掉。
+  for (size_t index = 1; index < plan.VaListWindows.size(); ++index) {
+    const VaListWindow &window = plan.VaListWindows[index];
+    bool hasSaveAreaStore = false;
+    for (llvm::Instruction *store : window.FieldStores) {
+      auto *storeInst = llvm::dyn_cast<llvm::StoreInst>(store);
+      std::optional<std::pair<llvm::AllocaInst *, uint64_t>> slot =
+          frameSlot(storeInst->getPointerOperand());
+      if (!slot || slot->second != window.GpOffset + 16) {
+        continue;
+      }
+      llvm::Value *value = storeInst->getValueOperand();
+      if (!llvm::isa<llvm::Constant>(value) &&
+          value->getType()->isIntegerTy(64)) {
+        hasSaveAreaStore = true;
+        break;
+      }
+    }
+    if (!hasSaveAreaStore) {
+      return std::nullopt;
+    }
   }
 
   return plan;
@@ -531,43 +616,33 @@ void applyPlan(FunctionPlan &plan, NativeVarArgRewriteSummary &summary) {
     }
   }
 
-  // 3) 手写 va_list 初始化 → llvm.va_start。
-  llvm::Value *vaListPointer = nullptr;
-  for (llvm::Instruction *store : plan.VaListFieldStores) {
-    if (auto *storeInst = llvm::dyn_cast<llvm::StoreInst>(store)) {
-      std::optional<std::pair<llvm::AllocaInst *, uint64_t>> slot =
-          frameSlot(storeInst->getPointerOperand());
-      if (slot && slot->first == plan.Frame &&
-          slot->second == plan.Info.VaListOffset) {
-        vaListPointer = storeInst->getPointerOperand();
-        break;
-      }
+  // 3) 手写 va_list 初始化 → llvm.va_start：每个初始化点一个。同窗口有多个点时
+  //    各自插在自己的 gp_offset store 前 —— 都插在窗口开头会把中间那次重新
+  //    初始化挪到前面的调用之前，语义就不对了。
+  //    llvm.va_start 是 llvm_anyptr_ty 重载 intrinsic：必须给出指针类型，否则
+  //    getOrInsertDeclaration 解不出重载会崩。ap 指针直接取 gp_offset store 的
+  //    pointer operand（编译器 4 个字段 store 共用同一个 ap）。
+  llvm::Function *vaStart = llvm::Intrinsic::getOrInsertDeclaration(
+      function.getParent(), llvm::Intrinsic::vastart,
+      {llvm::PointerType::get(function.getContext(), 0)});
+  for (const VaListWindow &window : plan.VaListWindows) {
+    for (size_t index = 0; index < window.GpStores.size(); ++index) {
+      llvm::Instruction *gpStore = window.GpStores[index];
+      // 窗口的第一个点保持旧行为：插在该窗口最早的字段 store 前。
+      llvm::Instruction *insertBefore =
+          index == 0 ? window.FieldStores.front() : gpStore;
+      llvm::IRBuilder<> builder(insertBefore);
+      builder.CreateCall(
+          vaStart, {llvm::cast<llvm::StoreInst>(gpStore)->getPointerOperand()});
+      ++summary.VaStartCallsInserted;
     }
   }
-  llvm::Instruction *insertBefore = plan.VaListFieldStores.front();
-  if (vaListPointer == nullptr) {
-    llvm::IRBuilder<> entryBuilder(
-        &*function.getEntryBlock().getFirstInsertionPt());
-    vaListPointer = entryBuilder.CreateGEP(
-        llvm::Type::getInt8Ty(function.getContext()), plan.Frame,
-        llvm::ConstantInt::get(llvm::Type::getInt64Ty(function.getContext()),
-                              plan.Info.VaListOffset),
-        "notdec.vararg.ap");
-  }
-  {
-    llvm::IRBuilder<> builder(insertBefore);
-    // llvm.va_start 是 llvm_anyptr_ty 重载 intrinsic：必须给出指针类型，
-    // 否则 getOrInsertDeclaration 解不出重载会崩。
-    llvm::Function *vaStart = llvm::Intrinsic::getOrInsertDeclaration(
-        function.getParent(), llvm::Intrinsic::vastart,
-        {llvm::PointerType::get(function.getContext(), 0)});
-    builder.CreateCall(vaStart, {vaListPointer});
-    ++summary.VaStartCallsInserted;
-  }
-  for (llvm::Instruction *store : plan.VaListFieldStores) {
-    if (store->getParent() != nullptr) {
-      store->eraseFromParent();
-      ++summary.VaListFieldStoresRemoved;
+  for (const VaListWindow &window : plan.VaListWindows) {
+    for (llvm::Instruction *store : window.FieldStores) {
+      if (store->getParent() != nullptr) {
+        store->eraseFromParent();
+        ++summary.VaListFieldStoresRemoved;
+      }
     }
   }
 

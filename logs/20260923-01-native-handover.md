@@ -120,6 +120,11 @@ grep -o 'notdec.unknown remaining: total=[0-9]*.*' x.log
   va_list 的语义，代价是这些函数退回"变参寄存器当固定参数"，可能带回 unknown）。
 - 判据：`va_scan4.py` 的 half-rewritten 为空；wrk/redis-cli unknown 不回升；
   7 目标 verify OK；ctest 12/12；单测覆盖两处初始化的形态。
+- **2026-09-23 已修**：识别改成窗口（块+槽）+ 站点（每个 gp_offset store 一次 va_start）
+  两级，每个初始化点各还原一个 `llvm.va_start`；第 2 个及以后的窗口要求 gp+16 有
+  reg_save_area 的指针 store。`va_scan6.py` 指向 `/tmp/fix14` 时 half-rewritten 全空，
+  unknown 48/7/8/8/0/0/0 持平，ctest 12/12。设计依据和量测见
+  `logs/20260919-01-native-vararg-recovery-plan.md` 末节。
 
 ### P2 `fixed_gp=6`（GP 全固定、变参只在 XMM/栈）
 

@@ -235,3 +235,115 @@ call void (i64, i64, i64, i8, ...) @FUN_293a0(i64 207008, i64 %RDI.arg, i64 2051
 unknown 仍 **3**、**0 处 va_arg 折叠**（样本里确实没有"自己取"的函数）——说明新增折叠对
 现有样本无副作用，能力由单测覆盖。
 
+## 多处 va_list 初始化：每个初始化点各还原一个 llvm.va_start（2026-09-23 续）
+
+起因是交接文档 `logs/20260923-01-native-handover.md` 的 P1：同一个 va_list 在多条
+路径上各初始化一次时，plan 只记最后一个 (gp,fp) 对，step 5 只删那个块的字段 store，
+applyPlan 只插一个 `llvm.va_start` —— 另一条路径的手工 va_list 还在，但它指向的寄存器
+保存区已经被删掉，是半改写（语义 bug）。实例：`wrk aprintf`（entry 里手工 va_list 之后
+立刻 `__vsnprintf_chk(0,0,2,-1,fmt,ap)` 做长度探测）、`redis-cli FUN_20df0`
+（`clusterManagerLog.lto_priv.0`，同形，用 `__vfprintf_chk`）。
+用户要求："把背后的设计考虑写到注释和文档里"。
+
+### 先确定"编译器会生成什么"（不猜，查源码）
+
+- **标准**：C11 §7.16.1 要求每次 va_start/va_copy 在同函数里配一个 va_end；va_end 的
+  规定里明确 va_list 之后可以 "reinitialized by the va_start or va_copy macro"。标准
+  没有"一个函数只能 va_start 一次"或"一个函数只有一个 va_list"的限制。
+- **clang**：对每个 `__builtin_va_start` 都发一个 `llvm.va_start`，没有去重、没有
+  状态跟踪（`clang/lib/CodeGen/CGBuiltin.cpp` `EmitVAStartEnd`，调用点在 3179-3188）。
+  `va_end` 同样发 intrinsic（x86-64 后端展开成 no-op）；`va_copy` 发 `llvm.va_copy`，
+  后端在 LP64 上是 24 字节 memcpy（`LowerVACOPY`，`X86ISelLowering.cpp:26319-26342`）
+  ——所以 va_copy 在 lift 里是一段结构体拷贝，不会被常量对 matcher 当成初始化点。
+- **LLVM X86 后端**：每个 `llvm.va_start` 独立展开成"以 ap 为 base 的固定 4 个字段
+  store"：`i32 gp_offset@+0`、`i32 fp_offset@+4`、`overflow_arg_area@+8`、
+  `reg_save_area@+16`（`LowerVASTART`，`X86ISelLowering.cpp:26203-26258`，
+  注释里就写着 `__va_list_tag` 的布局）。多个 va_start 不合并。
+- gp_offset/fp_offset 是**函数级**常量：`setVarArgsGPOffset(NumIntRegs*8)`、
+  `setVarArgsFPOffset(48 + NumXMMRegs*16)`，reg save frame index 也是函数级
+  （`X86ISelLoweringCall.cpp:1561-1563`）——同一函数里每个真 va_start 写的 gp/fp
+  常量必然相同。
+- verifier 对 `llvm.va_start` 只查"所在函数是 vararg"
+  （`llvm/lib/IR/Verifier.cpp:6396`），没有"只能在 entry 块 / 只能一个"的限制
+  （现有实现本来就插在非 entry 块）。
+
+⇒ **一个 gp_offset store = 一次源 va_start**，是机器码↔IR 的 1:1 映射；多处初始化不是
+编译器重复生成，而是多次合法 va_start，必须逐一还原。
+
+### 实现（`lib/passes/summary/NativeVarArgRewrite.cpp`）
+
+- **数据结构**：`FunctionPlan` 里的 `VaListFieldStores`/`VaListInitBlock` 换成
+  `std::vector<VaListWindow>`。窗口 = (基本块, va_list 槽)，装该槽的字段 store；窗口里
+  再记 `GpStores` = 这个槽上的初始化点（一个 gp_offset store 一个）。两级分开的原因：
+  同一个栈槽可能被两个 va_list 复用（标准允许，编译器照发两段完整序列），此时槽只该删
+  一次、`llvm.va_start` 却要插两次，且第二次必须插在中间那次调用之后。
+- **step 2**（~282-333）：每个匹配的 gp store 收进所在窗口的 `GpStores`，按指令去重
+  （外层 fp、内层 gp 是笛卡尔积）；站点间 `fixed_gp` 一致性检查保留——gp_offset 是
+  函数级常量，对不上说明其中一对是普通常量、不是 va_start 序列。
+- **step 5**（~486-541）：按窗口收集字段 store（同块 + `[GpOffset, GpOffset+24)`；指针
+  字段允许缺失，值可能经过寄存器中转）；每个窗口 <2 个字段 store → 整函数放弃；第 2 个
+  及以后的窗口额外要求 gp+16（reg_save_area）处有一个 64 位、非常量的 store，普通结构体
+  那种 {8k, 48} 常量对挡在这里。**为什么不比对它等于哪个保存区**：这个阶段 lift 的指针值
+  还可能经过寄存器中转（实测 store 的值是 `load i64, ptr @RAX`），比对就要追寄存器
+  数据流——本 pass 不做通用数据流推断，所以只认形态。第一个窗口沿用整函数证据（保存区 +
+  AL 测试 + gp/fp 相邻），不额外收紧，避免把现在能识别的单点函数挡掉。
+- **applyPlan step 3**（~616-645）：每个初始化点插一个 `llvm.va_start`，ap 指针取该点
+  gp_offset store 的 pointer operand（编译器 4 个字段 store 共用同一个 ap）；窗口第一个
+  点仍插在该窗口最早的字段 store 前（保持旧行为），同窗口后续点插在自己的 gp store 前。
+  metadata `va_list=` 记第一个点（全仓库只有 `nativeVarArgInfo()` 读它，测试只看
+  FixedGp）。
+- 删掉了 `vaListPointer == nullptr` 时的 entry-GEP 兜底：每个站点必然有 gp store，
+  它是死代码。
+
+### 单测（`tests/native_register_summary_ssa_test.cpp`）
+
+三个 helper（`emitManualVaListInit` / `emitVarArgAlTestAndXmmSave` /
+`buildVarArgTestFixture`）+ 四条用例：
+
+1. `testVarArgPrologueWithTwoInitsInDifferentBlocksIsRewritten`：两个块各一次
+   （wrk/redis 的真实形态）→ 2 个 va_start、字段 store 全删、
+   `VaListFieldStoresRemoved == 6`。
+2. `testVarArgPrologueWithTwoInitsInOneBlockIsRewritten`：同一块里隔着一次调用两次
+   初始化（两个 va_list 复用一个栈槽）→ 2 个 va_start，且断言第二个在第一次调用之后。
+3. `testVarArgPrologueWithTwoVaListObjectsIsRewritten`：一个函数两个 va_list 对象
+   （不同槽）→ 2 个 va_start，参数分别是对应的 ap 指针。
+4. `testVarArgPrologueWithConflictingInitsIsRejected`：两个点 gp_offset 不同 →
+   整函数放弃，手工 va_list 一个 store 都不动。
+
+（顺带修了测试计数器的一个坑：`stripPointerCasts()` 会把全零 GEP 折成 alloca，偏移 0
+的 gp_offset store 要按"alloca = offset 0"处理，否则 `== 0` 的断言会空过。）
+
+
+### 验证
+
+- 单测全绿（4 条新用例）。把 pass 改动 stash 掉重跑做对照：前 3 条按预期失败
+  （"did not insert two llvm.va_start" / "did not keep two va_start"），第 4 条
+  （冲突拒绝）本来就该绿。
+- ctest **12/12**（含 fortune x86_64/i386）。
+- 7 目标同条件重跑（`/tmp/fix14` vs `/tmp/fix13`，命令同 `/tmp/fix13b_run.sh`
+  换成 fix14；lighttpd 单独一次 506s）：
+  - `notdec.unknown` 全部持平 **48 / 7 / 8 / 8 / 0 / 0 / 0**
+    （lighttpd / redis-cli / libuv / ffmpeg / vsftpd / memcached / wrk）；
+  - 7 个 IR 全部 `llvm-as` + `opt -passes=verify` **OK**；
+  - vararg 统计只有两处变化，正好是这次修的两个函数：redis-cli
+    `va_list_fields_removed 36→40`、`va_start_inserted 9→10`（FUN_20df0）；
+    wrk `3→7`、`1→2`（aprintf）；其余目标逐项相同；
+  - `aprintf` / `FUN_20df0` 最终 IR：各 **2 个 `llvm.va_start`**、va_list
+    窗口里 0 个手工常量 store、`!notdec.vararg` 在。
+- va_list 半改写扫描（`/tmp/va_scan6.py` 指向 fix14）：7 个目标 **half-rewritten 全空**；
+  `undetected` 仍是已知三条：lighttpd `log_pri_multiline`（P2，fixed_gp=6）、
+  vsftpd `FUN_1c630` / ffmpeg `FUN_3c030`（交接文档里 objdump 确认过的误报）。
+- 度量注意：这套 pipeline 本身有 run-to-run 非确定性（同一个二进制连跑两遍 vsftpd，
+  IR 大小 1708019 vs 1708028 字节，diff 是 metadata 编号/SSA 重命名级别；在 vsftpd
+  这种 0 个变参改写、pass 完全不改写的目标上也出现）。所以跨 run 比较只看
+  unknown/warn/verify/vararg 计数和定点 IR 检查，不要拿 IR 字节数当判据。
+
+### 留给后面的（本次不做）
+
+- `fixed_gp=6`（lighttpd `log_pri_multiline`）：GP 全固定、变参只在 XMM/栈，
+  序言没有 GP 保存槽，保存区 base 要从 va_list 的 reg_save_area 字段反推——P2。
+- 同一个初始化点的字段 store 被 lift 分到不同基本块：现在仍按"gp store 所在块"收集，
+  另一个块的字段 store 不会删（matcher 的跨块接受行为没动，收紧怕回归）。
+- gp_offset 不是常量（走寄存器中转）的初始化点：本来就识别不到，不上数据流。
+
+
