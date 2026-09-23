@@ -2225,3 +2225,89 @@ entry_range_rejected 占位（1 个，比每个调用点各一个 unknown 划算
 ctest 12/12，所有目标 llvm-as + opt -passes=verify OK。单测
 testPartialEntryMaskDoesNotCreateNarrowParam：先无条件写 R8 低字节再读 32 位，
 断言改写后没有 R8 形参（旧行为会生成 i24 R8.arg）。
+
+## 变参序言只保存一个 GP 槽的形态（fixed_gp=5）（2026-09-23 续）
+
+用户 prompt：
+
+> 再看下一个有问题的地方吧
+
+### 1. 症状：lighttpd 剩余的 R9 mixed 占位
+
+`c21dce3` 之后 lighttpd 还剩 97 个 unknown，其中约 50 个是
+`call_effect_mixed:<callee>:R9`（30 个不同 callee，每个 1–6 个；network_init、
+config_plugin_values_init、config_read、main 都在其中）。
+
+临时调试（`readRegister` 记录"谁把入口读记到 R9 上" + `transferCall` 打印
+callee effect 的 ReadEntry）指向一个源头：
+
+- `log_pri` 的 body 里 R9 被当成**固定形参** R9。它的 DWARF 原型是
+  `void log_pri(log_error_st*, const char*, unsigned, int, const char*, ...)`，
+  5 个固定 GP 参数，变参只剩 R9；
+- 于是所有调过 `log_pri` 的函数都被记成"读过自己的入口 R9"
+  （`applyFunctionEffect` 把 callee 的 ReadEntry 按 caller 的 MayEntry 传播回来）；
+- 这些函数（`network_init` = FUN_10e2f 等）的签名多出一个 `i64 %R9.arg`，
+  它们自己的调用点没有 R9 值，只能退化成 `call_effect_mixed` 占位，级联。
+
+机器码证据：`log_pri` 序言是 `mov %r9,-0x88(%rbp)` + `test %al,%al` +
+`movaps %xmm0..7`，reg_save_area=rbp-0xb0、gp_offset=0x28=40=8*5；保存区里
+只有 R9 一个 GP 槽 —— 变参从 R9 开始，本来就只有这一个槽。
+
+### 2. 匹配器的漏洞
+
+`NativeVarArgRewrite` step 1 选 GP 保存区时要求"最大一致子集至少 2 个槽"
+（当初是为了防止把普通 spill 当成保存区）。`fixed_gp=5` 的序言只有一个槽，
+整类形态被漏掉。
+
+### 3. 修法
+
+- step 1 允许单个槽的候选组；
+- 单个槽时要求 `fixed_gp == 5`（变参 GP 寄存器只剩 R9，保存区本来就完整）；
+- 单个槽时再要求 FP 区至少 2 个 XMM 保存槽；
+- 其余印证不变：va_list 的 gp_offset=8*fixed_gp、fp_offset=48、FP 区
+  `base+48+16*idx` 的 16 字节对齐窗口、守 XMM 保存块的 AL 测试。
+
+单测 `testVarArgPrologueWithSingleGpSaveIsDetected`：去掉改动会失败
+（"single GP save vararg prologue was not detected"）。
+
+### 4. 效果
+
+| 目标 | unknown 前 → 后 | detected 前 → 后 | IR bytes 前 → 后 | verify |
+|---|---|---|---|---|
+| lighttpd | 97 → **48** | 3 → 4 | 4,607,985 → 4,576,404 | OK |
+| redis-cli | 7 → 7 | 9 → 9 | 4,019,295 → 4,019,299 | OK |
+| ffmpeg | 8 → 8 | 1 → 1 | 4,693,908 → 4,693,979 | OK |
+| libuv | 8 → 8 | 1 → 1 | 2,765,013 | OK |
+| vsftpd | 0 → 0 | 0 → 0 | 1,708,034 | OK |
+| memcached | 0 → 0 | 4 → 4 | 3,797,881 | OK |
+| wrk | 0 → 0 | 1 → 1 | 930,349 → 930,437 | OK |
+
+lighttpd 的 48 个 = `call_effect_mixed` 19（R9 全部消失，只剩 RCX/R8：
+configparser:RCX 6、array_get_element_klen:RCX 3 等）+ `entry_range_rejected` 16
+（新增 6 个都在 FUN_f108 / FUN_f147：它们是 log_pri 的小 wrapper，原来 R9 参数
+逼调用点凑值，现在转发值在本地退化成 3 个 range 占位）+ 
+`return_binding_uses_clobber_value` 10 + `call_arg_rewrite_missing_binding` 3。
+
+`log_pri` 的签名现在和 DWARF 一致：
+`(i64 %RDI.arg, i64 %RSI.arg, i32 %RDX.arg, i32 %RCX.arg, i64 %R8.arg, i8 %RAX.arg, ...)`。
+
+ctest 12/12；fortune x86_64 / i386 回归通过；7 个目标 llvm-as + opt -passes=verify OK。
+
+### 5. 顺带发现（本轮未改）
+
+扫了 7 个目标的最终 IR，找"还留着 gp_offset/fp_offset 手工 va_list 初始化"的函数：
+
+1. **一个函数里有多处 va_list 初始化时只改写了一处**（wrk `aprintf`、
+   redis-cli `clusterManagerLog.lto_priv.0`）：plan 只记最后一个 (gp,fp) 对，
+   step 5 只删该块里的字段 store；另外那条路径的手工 va_list 仍在，而它指向的
+   寄存器保存区已经被删掉。aprintf 的 entry 块里
+   `__vsnprintf_chk(0,0,2,-1,fmt,ap)` 就是拿这个手工 va_list 做长度探测，会读到
+   未初始化的保存区 → 属于"半改写"，按项目约定应整体改写或整体放弃。
+2. **6 个 GP 全是固定参数、变参只在 XMM/栈**（lighttpd `log_pri_multiline`，
+   gp_offset=48）：保存区没有 GP 槽，base 只能从 `reg_save_area` 指针字段反推，
+   当前直接跳过。
+3. 另有扫描器误报两处（vsftpd FUN_1c630、ffmpeg FUN_3c030，经 objdump 确认不是
+   变参序言，只是普通函数里正好有 0/48 常量）。
+
+另一个未决问题：tmux/ssh 的 summary 阶段像是超线性（tmux 跑了 1 小时仍未产出
+IR，它的 IR 只有 lighttpd 的 3–4 倍；同一时段 lighttpd 9 分钟跑完），根因还没定位。

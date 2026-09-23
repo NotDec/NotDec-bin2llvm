@@ -12266,6 +12266,121 @@ bool testVarArgPrologueWithSpillAndAlNoiseIsDetected() {
          expect(vaStarts == 1, "spill case did not insert llvm.va_start");
 }
 
+// 变参识别：固定参数占满 RDI..R8、变参只剩 R9 一个 GP 寄存器（fixed_gp=5）
+// 的形态，编译器只保存 R9 一个 GP 槽（lighttpd 的
+// log_pri(errh,msg,pri,int,fmt,...) 就是这样）。旧实现要求保存区至少 2 个槽，
+// 把它漏成 6 个固定参数：保存区里对 R9 的读被当成固定形参 R9，于是所有调用点
+// 都要凑一个 R9，凑不出就退化成一串 call_effect_mixed 占位。
+bool testVarArgPrologueWithSingleGpSaveIsDetected() {
+  llvm::LLVMContext context;
+  llvm::Module module("vararg-rewrite-single-gp", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  auto *i64Type = llvm::Type::getInt64Ty(context);
+  auto *i32Type = llvm::Type::getInt32Ty(context);
+  auto *i128Type = llvm::Type::getInt128Ty(context);
+  auto *i512Type = llvm::IntegerType::get(context, 512);
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+  llvm::GlobalVariable *r9 = createRegisterGlobal(module, "R9");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *zmm0 =
+      createRegisterGlobal(module, "ZMM0", i512Type, 0, 64);
+  llvm::GlobalVariable *zmm1 =
+      createRegisterGlobal(module, "ZMM1", i512Type, 0, 64);
+  auto *sink = new llvm::GlobalVariable(
+      module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "single_gp_sink");
+  llvm::Function *useVaList = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                              {llvm::PointerType::get(context, 0)}, false),
+      llvm::GlobalValue::ExternalLinkage, "single_gp_use_va_list", module);
+
+  llvm::Function *function = llvm::Function::Create(
+      llvm::FunctionType::get(
+          llvm::Type::getVoidTy(context),
+          {i64Type, i64Type, i64Type, i64Type, i64Type}, false),
+      llvm::GlobalValue::InternalLinkage, "native_vararg_single_gp", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *xmmSave =
+      llvm::BasicBlock::Create(context, "xmm_save", function);
+  llvm::BasicBlock *done = llvm::BasicBlock::Create(context, "done", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::AllocaInst *frame = builder.CreateAlloca(
+      llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 400), nullptr,
+      "frame");
+  auto framePointer = [&](uint64_t offset) {
+    return builder.CreateGEP(llvm::Type::getInt8Ty(context), frame,
+                             llvm::ConstantInt::get(i64Type, offset));
+  };
+  // 5 个固定参数：RDI..R8 在入口被读。
+  for (llvm::GlobalVariable *reg : {rdi, rsi, rdx, rcx, r8}) {
+    builder.CreateStore(
+        loadRegister(builder, reg, reg->getName().str(), "fixed"), sink);
+  }
+  // 保存区 base=208：变参从 R9 开始，所以只有 +40 一个槽。
+  llvm::Value *savedR9 = loadRegister(builder, r9, "R9", "saved_r9");
+  builder.CreateStore(savedR9, framePointer(248));
+  // 手写 va_list：gp_offset=40（5 个固定 GP 参数）、fp_offset=48。
+  llvm::GlobalVariable *overflow = new llvm::GlobalVariable(
+      module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "single_gp_overflow_area");
+  llvm::Value *overflowValue = loadRegister(builder, overflow, "overflow");
+  builder.CreateStore(llvm::ConstantInt::get(i32Type, 40), framePointer(0));
+  builder.CreateStore(llvm::ConstantInt::get(i32Type, 48), framePointer(4));
+  builder.CreateStore(overflowValue, framePointer(8));
+  builder.CreateStore(
+      builder.CreatePtrToInt(framePointer(208), i64Type), framePointer(16));
+  llvm::Value *al = builder.CreateCall(
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0),
+          llvm::Type::getInt8Ty(context), 64, 8),
+      {rax, llvm::ConstantInt::get(i64Type, 0)}, "al");
+  llvm::Value *alZero = builder.CreateICmpEQ(
+      al, llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0));
+  builder.CreateCondBr(alZero, done, xmmSave);
+  builder.SetInsertPoint(xmmSave);
+  llvm::Value *savedZmm0 = builder.CreateCall(
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0), i128Type, 512, 128),
+      {zmm0, llvm::ConstantInt::get(i64Type, 0)}, "saved_zmm0");
+  builder.CreateStore(savedZmm0, framePointer(256));
+  llvm::Value *savedZmm1 = builder.CreateCall(
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0), i128Type, 512, 128),
+      {zmm1, llvm::ConstantInt::get(i64Type, 0)}, "saved_zmm1");
+  builder.CreateStore(savedZmm1, framePointer(272));
+  builder.CreateBr(done);
+  builder.SetInsertPoint(done);
+  builder.CreateCall(useVaList, {framePointer(0)});
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeVarArgRewriteOptions options;
+  notdec::bin2llvm::NativeVarArgRewriteSummary summary =
+      notdec::bin2llvm::runNativeVarArgRewrite(module, options);
+  std::optional<notdec::bin2llvm::NativeVarArgInfo> info =
+      notdec::bin2llvm::nativeVarArgInfo(*function);
+  unsigned vaStarts = 0;
+  for (llvm::Instruction &inst : llvm::instructions(*function)) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName().starts_with("llvm.va_start")) {
+      ++vaStarts;
+    }
+  }
+  return expect(summary.FunctionsDetected == 1,
+                "single GP save vararg prologue was not detected") &&
+         expect(summary.FunctionsRewritten == 1,
+                "single GP save vararg prologue was not rewritten") &&
+         expect(info.has_value() && info->FixedGp == 5,
+                "single GP save case did not recover fixed_gp=5") &&
+         expect(vaStarts == 1,
+                "single GP save case did not insert llvm.va_start");
+}
+
 // 变参识别：lift 里编译器生成的寄存器保存区 + 手写 va_list 初始化，要能被识别成
 // llvm.va_start + 变参签名（固定参数 = 仍然被直接读的参数寄存器），而不是把变参
 // 寄存器当固定参数。模式依据见 logs/20260919-01-native-vararg-recovery-plan.md。
@@ -12528,6 +12643,7 @@ int main() {
   ok &= testEraseDeadUnknownValueCalls();
   ok &= testMixedCallBoundaryAttributesUnknownToCallee();
   ok &= testVarArgPrologueWithSpillAndAlNoiseIsDetected();
+  ok &= testVarArgPrologueWithSingleGpSaveIsDetected();
   ok &= testVarArgPrologueBecomesVaStart();
   ok &= testManualVaArgDiamondBecomesVaArgInstruction();
   ok &= testCalleeSavedRegisterSurvivesInternalCall();

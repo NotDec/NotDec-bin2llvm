@@ -223,7 +223,7 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
         best = &saves;
       }
     }
-    if (best == nullptr || best->size() < 2) {
+    if (best == nullptr || best->empty()) {
       return std::nullopt;
     }
     plan.GpSaves = *best;
@@ -287,6 +287,16 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
   }
   plan.Info.FixedGp = *fixedGp;
   plan.Info.VaListOffset = vaListOffset;
+  // 只保存了 1 个 GP 槽：只有"变参 GP 寄存器只剩 R9 一个"（fixed_gp=5）时才
+  // 成立 —— 此时保存区本来就只有一个槽，编译器生成的序言就是这么写的
+  // （lighttpd 的 log_pri(errh,msg,pri,int,fmt,...) 变参全在 R9）。旧实现要求
+  // 保存区至少 2 个槽，把这类函数漏成"6 个固定参数"：它保存区里对 R9 的读被
+  // 当成固定形参 R9，于是所有调用点都要凑一个 R9（凑不出就退化成一串
+  // call_effect_mixed 占位）。保存区布局仍然由 va_list 的 gp_offset、FP 区的
+  // 16 字节对齐窗口和守 XMM 保存的 AL 测试共同印证，见下方步骤。
+  if (plan.GpSaves.size() == 1 && plan.Info.FixedGp != 5) {
+    return std::nullopt;
+  }
   // 保存的寄存器必须都是变参寄存器（固定参数的槽不该出现在保存区里；
   // -O0 那种保存全部 6 个的形态本轮保守跳过）。
   for (const SaveStore &save : plan.GpSaves) {
@@ -326,6 +336,11 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
     }
     plan.XmmSaves.push_back(
         SaveStore{index, slot->first, slot->second, store, read});
+  }
+  // 单个 GP 保存槽的证据偏薄：再要求 FP 区至少 2 个 XMM 保存槽。真实序言里
+  // clang 一次保存 8 个 XMM，2 个的下限不会漏掉正常形态。
+  if (plan.GpSaves.size() == 1 && plan.XmmSaves.size() < 2) {
+    return std::nullopt;
   }
   std::set<llvm::BasicBlock *> xmmSaveBlocks;
   for (const SaveStore &save : plan.XmmSaves) {
