@@ -6798,6 +6798,61 @@ private:
     }
   }
 
+  // 内部变参 callee 的**栈上变参**：ABI 把没进寄存器的实参依次放到调用者的
+  // outgoing stack 区（cspec：stack+8 起，maxsize 500）。shape 的固定栈参数只覆盖
+  // 前几个槽，这里从它们后面继续补：槽类型取该位置最近一次 store 的值类型
+  // （浮点 → FloatStack，其余按 8 字节 IntegerStack），找不到 store 就停 ——
+  // 每个调用点真正传了几个栈变参由调用者的 store 决定。寄存器尾和栈尾分别在两趟
+  // collection 里收集（callArgStoreBindings 的 stackSlotsOnly），第二趟只看栈槽，
+  // 所以寄存器槽读不到值不会挡住这里的栈槽。
+  void appendAbiStackVarArgSlots(llvm::CallBase &call,
+                                 std::vector<NativeSignatureSlot> &slots) {
+    if (Abi.StackInputsInOrder.empty()) {
+      return;
+    }
+    const AbiFacts::StackSlot &abiSlot = Abi.StackInputsInOrder.front();
+    uint64_t step = stackGridStep(abiSlot.Align);
+    if (step == 0) {
+      return;
+    }
+    uint64_t nextOffset = abiSlot.Offset;
+    for (const NativeSignatureSlot &slot : slots) {
+      if (!isStackSignatureSlot(slot) || slot.StackSpace != abiSlot.Space) {
+        continue;
+      }
+      nextOffset = std::max(nextOffset, slot.StackOffset + slot.StackSize);
+    }
+    if (nextOffset < abiSlot.Offset) {
+      return;
+    }
+    uint64_t relative = nextOffset - abiSlot.Offset;
+    if (relative % step != 0) {
+      relative += step - relative % step;
+    }
+    auto *i64Type = llvm::Type::getInt64Ty(call.getContext());
+    for (uint64_t index = relative / step;; ++index) {
+      std::optional<NativeSignatureSlot> probe = signatureStackSlotFromAbi(
+          abiSlot, index, i64Type, NativeSignatureSlotKind::IntegerStack);
+      if (!probe.has_value()) {
+        return;
+      }
+      llvm::StoreInst *store = findNearestStackStoreBeforeCall(call, *probe);
+      if (store == nullptr) {
+        return;
+      }
+      llvm::Type *valueType = store->getValueOperand()->getType();
+      bool isFloat = valueType->isFloatingPointTy();
+      std::optional<NativeSignatureSlot> slot = signatureStackSlotFromAbi(
+          abiSlot, index, isFloat ? valueType : static_cast<llvm::Type *>(i64Type),
+          isFloat ? NativeSignatureSlotKind::FloatStack
+                  : NativeSignatureSlotKind::IntegerStack);
+      if (!slot.has_value()) {
+        return;
+      }
+      slots.push_back(*slot);
+    }
+  }
+
   std::vector<NativeSignatureSlot> callParamSlots(llvm::CallBase &call,
                                                   const SignatureShape &shape) {
     std::vector<NativeSignatureSlot> slots = shape.Params;
@@ -6812,6 +6867,7 @@ private:
       if (callee != nullptr && !callee->isDeclaration() &&
           isNativeVarArgFunction(*callee)) {
         appendAbiVarArgSlots(slots);
+        appendAbiStackVarArgSlots(call, slots);
       }
       return slots;
     }

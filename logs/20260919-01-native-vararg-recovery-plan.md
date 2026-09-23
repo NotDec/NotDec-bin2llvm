@@ -405,4 +405,33 @@ applyPlan 只插一个 `llvm.va_start` —— 另一条路径的手工 va_list �
 - 度量补充：warning 计数也会 run-to-run 抖动（libuv 在 fix14 那次是 68，用 P1/P2 两个
   二进制各重跑两次都是 66），跨 run 只比 unknown/verify/vararg 计数。
 
+### 追加：调用点的栈上变参（P2 的配套，2026-09-23 续）
+
+P2 认出 `log_pri_multiline` 之后做 A/B 发现：它的 3 个调用点仍然只传 7 个固定参数
++ AL，而汇编里这几个调用点明明在 push 变参实参（`0x254cd: push %rdx` 等）。原因不在
+callee：`callParamSlots` 对内部变参 callee 只补"剩下的 ABI 输入寄存器槽"
+（`appendAbiVarArgSlots`），**没有栈槽**；fixed_gp=6 时变参只能走栈，于是没有槽可以
+绑，调用点的 outgoing store 被当死值删掉。
+
+**实现**（`NativeRegisterSummarySSA.cpp`，`callParamSlots` 的 vararg 分支）：
+新增 `appendAbiStackVarArgSlots(call, slots)`。从 shape 固定栈参数覆盖到的最后一个
+偏移往后，按 ABI 的 stack 输入槽（cspec：`stack+8` 起、maxsize 500、align 8）逐个
+补槽：每个候选先用 i64 探针定位该位置的最近一次 outgoing store，找不到就停；找到就按 store
+的值类型建槽（浮点 → FloatStack，否则 8 字节 IntegerStack）。寄存器尾和栈尾分别在两趟
+collection（`stackSlotsOnly`）里收集，第二趟只看栈槽，所以寄存器槽读不到值不会挡住
+栈槽。
+
+**验证**：
+- lighttpd 的 3 个 `log_pri_multiline` 调用点都多出了那个变参 operand
+  （`i64 %2` / `i64 %9` / `i64 poison`——第三个的值在上游已经不可证，走
+  既有的 vararg_unknown→poison 路径）。
+- 7 目标 `/tmp/fix16` vs `/tmp/fix15`：unknown 全持平 **48/7/8/8/0/0/0**、
+  `llvm-as`+`opt -passes=verify` 全 OK；内部变参 callee 的调用点 operand 总数
+  lighttpd 1898→1946、redis-cli 1645→1718、memcached 1301→1331，其余目标不变（即找回了
+  151 个之前被丢掉的栈上变参 operand）；poison 只多 4 个（lighttpd）。
+- 半改写扫描（fix16）仍全空、undetected 只剩两个已知误报。
+- **没有单测**：手写 IR 里 `NativeStackAddressAnalysis` 不把 outgoing/incoming 栈槽判成
+  lift 形态的 EntryStackPointer/相对组（push 形态和 reload 形态都试过，固定栈参数也绑不上），
+  所以这条路径现在只由真实二进制的调用点验收。要补单测得用一段真实 lift 片段做 fixture。
+
 
