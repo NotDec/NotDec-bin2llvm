@@ -128,6 +128,11 @@ grep -o 'notdec.unknown remaining: total=[0-9]*.*' x.log
 
 ### P2 `fixed_gp=6`（GP 全固定、变参只在 XMM/栈）
 
+- **2026-09-23 已修**：GP 分组为空时用"XMMk 存在 base+48+16k"反推保存区 base（要求 ≥2 个
+  候选、同一帧、base 一致、GP 区无 store），零 GP 槽必须 `fixed_gp==6`。lighttpd
+  detected 4→5，unknown 48 持平，签名与 DWARF 的 7 个固定参数一致。见
+  `logs/20260919-01-native-vararg-recovery-plan.md` 的 P2 一节；那里还记了一个没解决的
+  缺口：3 个调用点没把变参实参传进来（识别之前证据就被丢了）。
 - 实例：lighttpd `log_pri_multiline`（`gp_offset=48`，序言只有 `test %al` + 8 个
   `movaps`，没有 GP 保存槽）。
 - 方案：允许零 GP 保存槽，但 base 必须从 va_list 第 4 个字段（`reg_save_area`

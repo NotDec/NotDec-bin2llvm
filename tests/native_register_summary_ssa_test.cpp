@@ -12235,15 +12235,18 @@ struct VarArgTestFixture {
   llvm::AllocaInst *Frame = nullptr;
   llvm::GlobalVariable *Rax = nullptr;
   llvm::GlobalVariable *Zmm0 = nullptr;
+  llvm::GlobalVariable *Zmm1 = nullptr;
   llvm::Function *UseVaList = nullptr;
 };
 
-// 建一个能通过变参识别的函数骨架：固定参数 RDI 直接读，保存区 base=208 上存
-// R8/R9（gp_offset=8 → 1 个固定 GP 参数），帧里留 XMM 保存槽 +256。初始化点由
-// 调用方自己写，最后用 emitVarArgAlTestAndXmmSave 收尾。
+// 建一个能通过变参识别的函数骨架：固定参数 RDI 直接读，保存区 base=208（GP 槽
+// +240/+248 存 R8/R9，XMM 槽 +256/+272）；withGpSaves=false 时一个 GP 槽都不存
+// （fixed_gp=6 的形态）。初始化点由调用方自己写，最后用
+// emitVarArgAlTestAndXmmSave 收尾。
 VarArgTestFixture buildVarArgTestFixture(llvm::Module &module,
                                          const llvm::Twine &name,
-                                         llvm::IRBuilder<> &builder) {
+                                         llvm::IRBuilder<> &builder,
+                                         bool withGpSaves = true) {
   llvm::LLVMContext &context = module.getContext();
   auto *i64Type = llvm::Type::getInt64Ty(context);
   auto *i512Type = llvm::IntegerType::get(context, 512);
@@ -12257,6 +12260,7 @@ VarArgTestFixture buildVarArgTestFixture(llvm::Module &module,
   VarArgTestFixture fixture;
   fixture.Rax = createRegisterGlobal(module, "RAX");
   fixture.Zmm0 = createRegisterGlobal(module, "ZMM0", i512Type, 0, 64);
+  fixture.Zmm1 = createRegisterGlobal(module, "ZMM1", i512Type, 0, 64);
   fixture.UseVaList = llvm::Function::Create(
       llvm::FunctionType::get(llvm::Type::getVoidTy(context),
                               {llvm::PointerType::get(context, 0)}, false),
@@ -12271,20 +12275,23 @@ VarArgTestFixture buildVarArgTestFixture(llvm::Module &module,
       llvm::ArrayType::get(llvm::Type::getInt8Ty(context), 400), nullptr,
       "frame");
   builder.CreateStore(loadRegister(builder, rdi, "RDI", "fixed"), sink);
-  builder.CreateStore(loadRegister(builder, r8, "R8", "saved_r8"),
-                      emitFramePointer(builder, fixture.Frame, 240));
-  builder.CreateStore(loadRegister(builder, r9, "R9", "saved_r9"),
-                      emitFramePointer(builder, fixture.Frame, 248));
+  if (withGpSaves) {
+    builder.CreateStore(loadRegister(builder, r8, "R8", "saved_r8"),
+                        emitFramePointer(builder, fixture.Frame, 240));
+    builder.CreateStore(loadRegister(builder, r9, "R9", "saved_r9"),
+                        emitFramePointer(builder, fixture.Frame, 248));
+  }
   return fixture;
 }
 
-// 收尾：AL 测试（test al,al）→ 条件保存一个 XMM → done 块。返回 done，
-// builder 的插入点也落到 done。
+// 收尾：AL 测试（test al,al）→ 条件保存两个 XMM → done 块。返回 done，
+// builder 的插入点也落到 done。两个槽是 base=208 的 +256/+272。
 llvm::BasicBlock *emitVarArgAlTestAndXmmSave(llvm::IRBuilder<> &builder,
                                              llvm::Module &module,
                                              llvm::AllocaInst *frame,
                                              llvm::GlobalVariable *rax,
                                              llvm::GlobalVariable *zmm0,
+                                             llvm::GlobalVariable *zmm1,
                                              const llvm::Twine &doneName) {
   llvm::LLVMContext &context = module.getContext();
   auto *i64Type = llvm::Type::getInt64Ty(context);
@@ -12308,6 +12315,11 @@ llvm::BasicBlock *emitVarArgAlTestAndXmmSave(llvm::IRBuilder<> &builder,
           module, llvm::PointerType::get(context, 0), i128Type, 512, 128),
       {zmm0, llvm::ConstantInt::get(i64Type, 0)}, "saved_zmm0");
   builder.CreateStore(savedZmm, emitFramePointer(builder, frame, 256));
+  llvm::Value *savedZmm1 = builder.CreateCall(
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, llvm::PointerType::get(context, 0), i128Type, 512, 128),
+      {zmm1, llvm::ConstantInt::get(i64Type, 0)}, "saved_zmm1");
+  builder.CreateStore(savedZmm1, emitFramePointer(builder, frame, 272));
   builder.CreateBr(done);
   builder.SetInsertPoint(done);
   return done;
@@ -12323,7 +12335,7 @@ bool testVarArgPrologueWithTwoInitsInDifferentBlocksIsRewritten() {
   llvm::Value *vaList =
       emitManualVaListInit(builder, fixture.Frame, 0, 8, 208);
   emitVarArgAlTestAndXmmSave(builder, module, fixture.Frame, fixture.Rax,
-                             fixture.Zmm0, "done");
+                             fixture.Zmm0, fixture.Zmm1, "done");
   emitManualVaListInit(builder, fixture.Frame, 0, 8, 208);
   builder.CreateCall(fixture.UseVaList, {vaList});
   builder.CreateRetVoid();
@@ -12361,7 +12373,7 @@ bool testVarArgPrologueWithTwoInitsInOneBlockIsRewritten() {
   builder.CreateCall(fixture.UseVaList, {vaList});
   emitManualVaListInit(builder, fixture.Frame, 0, 8, 208);
   emitVarArgAlTestAndXmmSave(builder, module, fixture.Frame, fixture.Rax,
-                             fixture.Zmm0, "done");
+                             fixture.Zmm0, fixture.Zmm1, "done");
   builder.CreateCall(fixture.UseVaList, {vaList});
   builder.CreateRetVoid();
 
@@ -12412,7 +12424,7 @@ bool testVarArgPrologueWithTwoVaListObjectsIsRewritten() {
   llvm::Value *second =
       emitManualVaListInit(builder, fixture.Frame, 64, 8, 208);
   emitVarArgAlTestAndXmmSave(builder, module, fixture.Frame, fixture.Rax,
-                             fixture.Zmm0, "done");
+                             fixture.Zmm0, fixture.Zmm1, "done");
   builder.CreateCall(fixture.UseVaList, {first});
   builder.CreateCall(fixture.UseVaList, {second});
   builder.CreateRetVoid();
@@ -12452,7 +12464,7 @@ bool testVarArgPrologueWithConflictingInitsIsRejected() {
   llvm::Value *first = emitManualVaListInit(builder, fixture.Frame, 0, 8, 208);
   emitManualVaListInit(builder, fixture.Frame, 64, 16, 208);
   emitVarArgAlTestAndXmmSave(builder, module, fixture.Frame, fixture.Rax,
-                             fixture.Zmm0, "done");
+                             fixture.Zmm0, fixture.Zmm1, "done");
   builder.CreateCall(fixture.UseVaList, {first});
   builder.CreateRetVoid();
 
@@ -12468,6 +12480,42 @@ bool testVarArgPrologueWithConflictingInitsIsRejected() {
                     countManualVaListConstantStores(*fixture.Function, 64) == 2,
                 "conflicting va_list inits were partially rewritten");
 }
+
+// 零 GP 保存槽：6 个 GP 参数寄存器全是固定参数（fixed_gp=6），序言只保存 XMM
+// （lighttpd log_pri_multiline 的形态）。保存区 base 由 XMM 保存组反推：每个
+// XMMk 都存在 base+48+16k，所以 256/272 两个槽能独立算出同一个 base=208。
+bool testVarArgPrologueWithNoGpSavesIsRewritten() {
+  llvm::LLVMContext context;
+  llvm::Module module("vararg-rewrite-no-gp", context);
+  llvm::IRBuilder<> builder(context);
+  VarArgTestFixture fixture = buildVarArgTestFixture(
+      module, "vararg_no_gp", builder, /*withGpSaves=*/false);
+  llvm::Value *vaList =
+      emitManualVaListInit(builder, fixture.Frame, 0, 48, 208);
+  emitVarArgAlTestAndXmmSave(builder, module, fixture.Frame, fixture.Rax,
+                             fixture.Zmm0, fixture.Zmm1, "done");
+  builder.CreateCall(fixture.UseVaList, {vaList});
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeVarArgRewriteSummary summary =
+      notdec::bin2llvm::runNativeVarArgRewrite(module);
+  std::optional<notdec::bin2llvm::NativeVarArgInfo> info =
+      notdec::bin2llvm::nativeVarArgInfo(*fixture.Function);
+  return expect(summary.FunctionsDetected == 1,
+                "no-GP-save vararg prologue was not detected") &&
+         expect(summary.FunctionsRewritten == 1,
+                "no-GP-save vararg prologue was not rewritten") &&
+         expect(info.has_value() && info->FixedGp == 6,
+                "no-GP-save case did not recover fixed_gp=6") &&
+         expect(summary.VaStartCallsInserted == 1 &&
+                    countVaStartCalls(*fixture.Function) == 1,
+                "no-GP-save case did not insert one llvm.va_start") &&
+         expect(summary.RegisterSavesRemoved == 2,
+                "no-GP-save case did not remove the XMM saves") &&
+         expect(countManualVaListConstantStores(*fixture.Function, 0) == 0,
+                "hand-written va_list fields survived the rewrite");
+}
+
 
 
 // 真保存区旁边常有"同一个变参寄存器再存到别的帧槽"的普通 spill（hi_sdscatfmt 就
@@ -12968,6 +13016,7 @@ int main() {
   ok &= testVarArgPrologueWithTwoInitsInOneBlockIsRewritten();
   ok &= testVarArgPrologueWithTwoVaListObjectsIsRewritten();
   ok &= testVarArgPrologueWithConflictingInitsIsRejected();
+  ok &= testVarArgPrologueWithNoGpSavesIsRewritten();
   ok &= testManualVaArgDiamondBecomesVaArgInstruction();
   ok &= testCalleeSavedRegisterSurvivesInternalCall();
   ok &= testDirectionFlagIsZeroAtBoundaries();

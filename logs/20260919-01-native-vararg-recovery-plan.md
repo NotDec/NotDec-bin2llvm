@@ -340,10 +340,69 @@ applyPlan 只插一个 `llvm.va_start` —— 另一条路径的手工 va_list �
 
 ### 留给后面的（本次不做）
 
-- `fixed_gp=6`（lighttpd `log_pri_multiline`）：GP 全固定、变参只在 XMM/栈，
-  序言没有 GP 保存槽，保存区 base 要从 va_list 的 reg_save_area 字段反推——P2。
+- `fixed_gp=6`（lighttpd `log_pri_multiline`）：已在下面的 P2 一节修掉；base 从 XMM
+  保存组反推，而不是从 reg_save_area 字段（那个值可能经过寄存器中转）。
 - 同一个初始化点的字段 store 被 lift 分到不同基本块：现在仍按"gp store 所在块"收集，
   另一个块的字段 store 不会删（matcher 的跨块接受行为没动，收紧怕回归）。
 - gp_offset 不是常量（走寄存器中转）的初始化点：本来就识别不到，不上数据流。
+
+## P2：零 GP 保存槽（fixed_gp=6，lighttpd log_pri_multiline）（2026-09-23 续）
+
+### 目标与 pass-time 证据
+
+- DWARF：`void log_pri_multiline(log_error_st*, const char* restrict, unsigned, int,
+  const char* restrict, size_t, const char* restrict, ...)` —— 7 个固定参数（前 6 个
+  在 GP 寄存器、第 7 个在栈上），变参只在 XMM/栈。
+- 汇编：`test %al,%al; je; movaps %xmm0..7 → -0xb0..-0x40(%rbp)`，没有任何 GP 保存。
+- 临时 dump pass-time IR（getenv 钩子，查完已删）：AL 测试在 entry；8 个 XMM 保存落在
+  frame+112..224；va_list 窗口在 frame+32（+32 gp=48、+36 fp=48、+40 overflow、
+  +48 reg_save=`ptrtoint(frame+64)`）；XMM 组自洽推出 base=64，GP 区 [64,112) 无 store。
+- 旧实现 step 1 要求至少一个 GP 保存槽，这类函数直接放弃（这正是它漏掉的原因）。
+
+### 实现（`lib/passes/summary/NativeVarArgRewrite.cpp`）
+
+- 新增 `deriveSaveAreaFromXmmSaves()`：GP 分组为空时，用"XMMk 存在 base+48+16k"
+  反推 base——每个候选独立算一个 base，要求 ≥2 个候选、同一帧、base 全部一致，并且 GP 区
+  `[base, base+48)` 一个 store 都没有。保存区本身仍由 step 4 的 FP 区间检查兜底
+  （区间内每个 store 必须是对应槽位的 XMM 保存），推导只负责给出 base 假设。
+  **为什么不用 va_list 的 reg_save_area 字段**：那个值在这个阶段可能还是
+  `load i64, ptr @RAX` 这种寄存器中转形态（aprintf 就是），比对它要追寄存器数据流。
+- 新守卫：零 GP 槽时必须 `fixed_gp == 6`，和已有的"单 GP 槽必须 fixed_gp == 5"
+  对称——只有 6 个 GP 参数寄存器全是固定参数，编译器才会一个 GP 变参寄存器都不保存。
+- 误报挡板已核：两个已知误报（vsftpd `FUN_1c630`、ffmpeg `FUN_3c030`）
+  pass-time 一个 ZMM 保存都没有（dump 过），进不了这条路。
+
+### 单测（`tests/native_register_summary_ssa_test.cpp`）
+
+`testVarArgPrologueWithNoGpSavesIsRewritten`：fixture 加 `withGpSaves=false`
+（一个 GP 槽都不存），尾部的 XMM 保存块固定存两个（+256/+272），va_list 写 gp_offset=48。
+断言 detected/rewritten=1、`fixed_gp=6`、1 个 `llvm.va_start`、
+`RegisterSavesRemoved==2`、窗口常量 store 清空。去掉 pass 改动这条会失败。
+
+### 验证
+
+- 单测绿；ctest **12/12**。
+- 7 目标 `/tmp/fix15` vs `/tmp/fix14`：unknown 全持平 **48/7/8/8/0/0/0**；
+  7 个 IR `llvm-as` + `opt -passes=verify` 全 OK；vararg 统计只有 lighttpd
+  变化（detected 4→5、`register_saves_removed` 39→47、
+  `va_list_fields_removed` 16→20、`va_start_inserted` 4→5），其余逐项相同。
+- `log_pri_multiline` 最终 IR：1 个 `llvm.va_start`、无手工窗口 store、签名
+  `(i64 %RDI.arg, ..., i64 %R9.arg, i8 %RAX.arg, i64 %"stack+8.arg", ...)`
+  ——和 DWARF 的 7 个固定参数一致。
+- 扫描器（fix15）：half-rewritten 全空；undetected 只剩 vsftpd/ffmpeg 两个已知误报
+  （`log_pri_multiline` 已从 undetected 消失）。
+
+### 已知缺口（这次没解决，单独记）
+
+- 3 个调用点（`h1_send_headers` / `h1_recv_headers` /
+  `http_request_headers_process`）**没有把变参实参传进来**：二进制里
+  `0x254cd` 有 `push %rdx`（第 8 个参数，也就是第一个变参），但 IR 调用只传
+  7 个固定参数 + AL；fix14/fix15 的调用点逐行相同，不是这次引入的。
+  机制：调用点的变参实参证据在识别之前就没了——callee 的 XMM 保存读被
+  `partialReadFeedsOnlyDeadFrameSlots`（NativeRegisterSummary.cpp:98）判成"只喂没人
+  本地读的帧槽"而不产生寄存器需求；栈上的变参则通过逃逸的 va_list 被外面读，同样看不见。
+  要补上得让这条规则考虑"帧地址被拿出去用"（发现 2 的 demand 侧），见下一节。
+- 度量补充：warning 计数也会 run-to-run 抖动（libuv 在 fix14 那次是 68，用 P1/P2 两个
+  二进制各重跑两次都是 66），跨 run 只比 unknown/verify/vararg 计数。
 
 

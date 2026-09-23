@@ -181,6 +181,76 @@ struct FunctionPlan {
   std::vector<llvm::Instruction *> AlTestInstructions;
 };
 
+
+// 一个 GP 变参寄存器都没保存（fixed_gp=6：6 个 GP 参数寄存器全是固定参数）时的
+// 保存区 base 反推。编译器把 XMMk 存在 base+48+16k（LowerVASTART 的布局），所以
+// 每个 XMM 保存候选都能独立算出一个 base，全部一致、且落在同一个帧上才认。
+// 这里只负责"候选自洽"；保存区本身的校验仍交给后面的 FP 区间检查（区间内每个
+// store 都必须是对应槽位的 XMM 保存）。
+// 另外要求 GP 区 [base, base+48) 一个 store 都没有：既然一个 GP 变参寄存器都没
+// 保存，编译器不会写那 48 字节；有写操作说明这段自洽的 XMM 组不是变参保存区。
+bool deriveSaveAreaFromXmmSaves(llvm::Function &function, FunctionPlan &plan) {
+  std::optional<uint64_t> base;
+  llvm::AllocaInst *frame = nullptr;
+  uint64_t candidates = 0;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store == nullptr) {
+      continue;
+    }
+    auto *read = llvm::dyn_cast<llvm::CallBase>(
+        stripValueCasts(store->getValueOperand()));
+    std::optional<NativeRegisterPartialReadInfo> partial =
+        read == nullptr ? std::nullopt : parseNativeRegisterPartialRead(*read);
+    if (!partial || partial->Global == nullptr || partial->ReadWidth != 128) {
+      continue;
+    }
+    int index = floatArgIndex(partial->Global->getName());
+    if (index < 0) {
+      continue;
+    }
+    std::optional<std::pair<llvm::AllocaInst *, uint64_t>> slot =
+        frameSlot(store->getPointerOperand());
+    if (!slot) {
+      continue;
+    }
+    uint64_t fieldOffset = GpSaveAreaSize + 16 * static_cast<uint64_t>(index);
+    if (slot->second < fieldOffset) {
+      continue;
+    }
+    uint64_t candidate = slot->second - fieldOffset;
+    if (base.has_value()) {
+      if (*base != candidate || frame != slot->first) {
+        return false;
+      }
+    } else {
+      base = candidate;
+      frame = slot->first;
+    }
+    ++candidates;
+  }
+  if (!base.has_value() || candidates < 2) {
+    return false;
+  }
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store == nullptr) {
+      continue;
+    }
+    std::optional<std::pair<llvm::AllocaInst *, uint64_t>> slot =
+        frameSlot(store->getPointerOperand());
+    if (!slot || slot->first != frame || slot->second < *base ||
+        slot->second >= *base + GpSaveAreaSize) {
+      continue;
+    }
+    return false;
+  }
+  plan.Frame = frame;
+  plan.Info.SaveAreaOffset = *base;
+  plan.Info.SavedRegisters.clear();
+  return true;
+}
+
 std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
   FunctionPlan plan;
   plan.Function = &function;
@@ -246,21 +316,26 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
       }
     }
     if (best == nullptr || best->empty()) {
-      return std::nullopt;
-    }
-    plan.GpSaves = *best;
-    int64_t base = static_cast<int64_t>(plan.GpSaves.front().Offset) -
-                   8 * plan.GpSaves.front().Index;
-    plan.Info.SaveAreaOffset = static_cast<uint64_t>(base);
-    plan.Frame = plan.GpSaves.front().Frame;
-    std::string saved;
-    for (const SaveStore &save : plan.GpSaves) {
-      if (!saved.empty()) {
-        saved += ",";
+      // 一个 GP 变参寄存器都没保存：fixed_gp=6 的形态（6 个 GP 参数寄存器全是
+      // 固定参数），序言只保存 XMM。base 从 XMM 保存组反推，见 helper。
+      if (!deriveSaveAreaFromXmmSaves(function, plan)) {
+        return std::nullopt;
       }
-      saved += GpArgOrder[save.Index].str();
+    } else {
+      plan.GpSaves = *best;
+      int64_t base = static_cast<int64_t>(plan.GpSaves.front().Offset) -
+                     8 * plan.GpSaves.front().Index;
+      plan.Info.SaveAreaOffset = static_cast<uint64_t>(base);
+      plan.Frame = plan.GpSaves.front().Frame;
+      std::string saved;
+      for (const SaveStore &save : plan.GpSaves) {
+        if (!saved.empty()) {
+          saved += ",";
+        }
+        saved += GpArgOrder[save.Index].str();
+      }
+      plan.Info.SavedRegisters = saved;
     }
-    plan.Info.SavedRegisters = saved;
   }
 
   // 2) va_list 初始化：同一帧上相邻 4 字节的 i32 对（gp_offset=8k, fp_offset=48）。
@@ -344,6 +419,12 @@ std::optional<FunctionPlan> analyzeFunction(llvm::Function &function) {
   // call_effect_mixed 占位）。保存区布局仍然由 va_list 的 gp_offset、FP 区的
   // 16 字节对齐窗口和守 XMM 保存的 AL 测试共同印证，见下方步骤。
   if (plan.GpSaves.size() == 1 && plan.Info.FixedGp != 5) {
+    return std::nullopt;
+  }
+  // 零 GP 槽同理：只有"6 个 GP 参数寄存器全是固定参数"（fixed_gp=6）时，编译器
+  // 才会一个 GP 变参寄存器都不保存。gp_offset 对不上说明前面那段自洽的 XMM 组
+  // 不是变参保存区。
+  if (plan.GpSaves.empty() && plan.Info.FixedGp != 6) {
     return std::nullopt;
   }
   // 保存的寄存器必须都是变参寄存器（固定参数的槽不该出现在保存区里；
