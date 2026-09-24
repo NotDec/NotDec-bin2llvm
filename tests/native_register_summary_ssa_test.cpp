@@ -11907,6 +11907,64 @@ bool testFramePointerLoadFoldsAcrossLoop() {
                   "module failed verifier after frame pointer loop fold");
 }
 
+// GCC 的栈对齐 push（push %rcx + pop %rdx）在 lift 之后是"入口值 → 栈顶槽 → 另一个
+// 寄存器"。pop 的目的寄存器由编译器挑成死寄存器，但后面跟着间接调用时，"未知 callee
+// 一律算读"会让它看起来还活着，旧判据于是把 RCX 记成入口读、建成形参。判据 4
+// （store 写在当前栈顶 + 每个 load 也从栈顶读）认下这个 push/pop 对后不应再建形参。
+bool testStackAdjustmentPushDoesNotCreateEntryParam() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-stack-adjustment-push", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX", "R8", "R9"});
+  auto *i64Type = llvm::Type::getInt64Ty(context);
+  auto *pointerType = llvm::PointerType::get(context, 0);
+  llvm::GlobalVariable *rsp = createRegisterGlobal(module, "RSP");
+  llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *voidType =
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *function = llvm::Function::Create(
+      voidType, llvm::GlobalValue::ExternalLinkage, "stack_adjustment_push",
+      module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  // push %rcx：SP 先减 8，再把 RCX 写进新的栈顶。
+  llvm::Value *stackPointer = loadRegister(builder, rsp, "RSP", "sp");
+  llvm::Value *pushed =
+      builder.CreateSub(stackPointer, llvm::ConstantInt::get(i64Type, 8));
+  storeRegister(builder, rsp, pushed, "RSP");
+  llvm::Value *pushedValue = loadRegister(builder, rcx, "RCX", "pushed");
+  builder.CreateStore(pushedValue, builder.CreateIntToPtr(pushed, pointerType));
+  // pop %rdx：从栈顶读出来写进另一个寄存器，然后 SP 加回 8。
+  llvm::Value *popped = builder.CreateLoad(
+      i64Type, builder.CreateIntToPtr(pushed, pointerType), "popped");
+  storeRegister(builder, rdx, popped, "RDX");
+  storeRegister(builder, rsp,
+                builder.CreateAdd(pushed, llvm::ConstantInt::get(i64Type, 8)),
+                "RSP");
+  // 收尾处的间接调用（真机器码里是尾跳）：未知 callee 对目的寄存器（这里是 RDX）
+  // 的消费只能保守当成读，这正是旧判据拒绝这个 push/pop 对的原因。
+  llvm::Value *target = loadRegister(builder, rax, "RAX", "target");
+  builder.CreateCall(voidType, builder.CreateIntToPtr(target, pointerType));
+  builder.CreateRetVoid();
+
+  (void)notdec::bin2llvm::runNativeStackFrameRewrite(module);
+  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  llvm::Function *rewritten = module.getFunction("stack_adjustment_push");
+  bool hasRcxParam = false;
+  if (rewritten != nullptr) {
+    for (const llvm::Argument &arg : rewritten->args()) {
+      hasRcxParam |= arg.getName().starts_with("RCX");
+    }
+  }
+  return expect(rewritten != nullptr, "stack adjustment function missing") &&
+         expect(!hasRcxParam,
+                "stack adjustment push created an entry parameter") &&
+         verifyOk(module,
+                  "module failed verifier after stack adjustment push test");
+}
+
 bool testFramePointerLoadAfterRestoreIsKept() {
   llvm::LLVMContext context;
   llvm::Module module("frame-pointer-restore", context);
@@ -13005,6 +13063,7 @@ int main() {
   ok &= testDeadFrameSpillPartialReadCreatesNoEntryParam();
   ok &= testLiveFrameSpillPartialReadKeepsValue();
   ok &= testFramePointerLoadFoldsAcrossLoop();
+  ok &= testStackAdjustmentPushDoesNotCreateEntryParam();
   ok &= testFramePointerLoadAfterRestoreIsKept();
   ok &= testTwoFramePointerSettersAreNotFolded();
   ok &= testEraseDeadUnknownValueCalls();

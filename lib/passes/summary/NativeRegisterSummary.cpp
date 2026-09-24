@@ -2244,9 +2244,12 @@ private:
   // store 写进 @global 的值，在被下一次写覆盖之前有没有被显式读过。块内先看，
   // 没被覆盖就沿后继块看（上限 64 个块，超了按"活"处理，保守）。遇到会消费该
   // 寄存器的调用按"读"处理（lift 的 IR 里实参是显式 store 进寄存器 + call）；
-  // callee 不碰这个寄存器就继续往后看。
+  // callee 不碰这个寄存器就继续往后看。ignoreCallReads 只给确认过的栈对齐
+  // push/pop 对用（见 collectStackAdjustmentSlots 判据 4）：那种槽的目的寄存器
+  // 由编译器挑成死的，调用对它的消费不算真实使用。
   bool registerValueDiesAfter(llvm::StoreInst &store,
-                              const llvm::GlobalVariable &global) const {
+                              const llvm::GlobalVariable &global,
+                              bool ignoreCallReads = false) const {
     llvm::BasicBlock *block = store.getParent();
     if (block == nullptr) {
       return false;
@@ -2260,7 +2263,7 @@ private:
     }
     for (auto it = std::next(store.getIterator()); it != block->end(); ++it) {
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&*it);
-          call != nullptr && isAnalyzableCall(*call) &&
+          call != nullptr && !ignoreCallReads && isAnalyzableCall(*call) &&
           callMayReadRegister(*call, global)) {
         return false;
       }
@@ -2282,7 +2285,7 @@ private:
       bool killed = false;
       for (const llvm::Instruction &inst : *current) {
         auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
-        if ((call != nullptr && isAnalyzableCall(*call) &&
+        if ((call != nullptr && !ignoreCallReads && isAnalyzableCall(*call) &&
              callMayReadRegister(*call, global)) ||
             instructionReadsRegister(inst, global)) {
           return false;
@@ -2312,8 +2315,16 @@ private:
   // 识别判据（只对非 callee-saved 寄存器，尽量保守）：
   //   1. store 进固定栈槽的值是某个 caller-saved 寄存器的入口 load；
   //   2. 该槽的 load 没有写回同一个寄存器（真 save/restore 对不走这里）；
-  //   3. 每个这样的 load 都只被搬进"搬完就死"的寄存器（下一次写之前没有显式读）。
-  // 三条都成立才认定为对齐填充：push 侧不计入口读，load 侧不挂保存值来源。
+  //   3. 每个这样的 load 都只被搬进"搬完就死"的寄存器（下一次写之前没有显式读）；
+  //   4. 或者这是一条栈调整访问（push 写在栈顶、pop 读栈顶，且 SP 调整量正好是
+  //      访问宽度，见 isStackAdjustmentAccess）。编译器挑 pop 目的寄存器时已经保证它是死的
+  //      （LLVM findDeadCallerSavedReg；GCC 同形），所以判据 4 里调用对目的寄存器
+  //      的消费不算读——间接/未知调用算不出实参寄存器，判据 3 会因此拒绝真 push。
+  // 成立才认定为对齐填充：push 侧不计入口读，load 侧不挂保存值来源。
+  // 判据 4 的边界：`push %rcx` 与 `sub $8,%rsp; mov %rcx,(%rsp)` 的 p-code 相同，
+  // 无帧指针函数里后者那种 8 字节临时槽也会命中；这种槽若真把值传给未知调用就会
+  // 被误判。实测 7 个目标只有 lighttpd 的两个函数命中（机器码都是真 push），
+  // 见 logs/20260924-01-native-stack-align-push-plan.md。
   const std::set<StackSlotKey> &
   stackAdjustmentSlots(llvm::Function &function) const {
     auto cached = StackAdjustmentSlots.find(&function);
@@ -2326,11 +2337,112 @@ private:
         .first->second;
   }
 
+  // 把地址换算到可以互相比较的坐标：NativeFrame / RelativeStackPointer 原样
+  // 返回；入口 SP 坐标在有重写帧的函数里换算成帧 alloca 坐标（换算不了就原样，
+  // 那种情况两边都换算不了，仍可比）。
+  std::optional<StackSlotKey>
+  comparableSlotKey(llvm::Function &function,
+                    const NativeStackAddress &address) const {
+    std::optional<StackSlotKey> key = stackSlotKey(address);
+    if (!key) {
+      return std::nullopt;
+    }
+    if (address.Kind != NativeStackAddressKind::EntryStackPointer) {
+      return key;
+    }
+    if (std::optional<StackSlotKey> converted =
+            entrySlotToNativeFrameKey(function, *key)) {
+      return converted;
+    }
+    return key;
+  }
+
+  // 这条访问是不是栈调整本身（push 写进去 / pop 读出来的那个栈顶槽）。
+  // 三个条件：
+  //   1. 访问地址等于该指令处的栈指针（正好落在栈顶）；
+  //   2. 另一侧的栈指针与它相差恰好一个访问宽度（push 看调整前，pop 看调整后）：
+  //      `push %reg` 是 SP-=8 后立刻写 [SP]，而"在预留区里做临时溢出"是
+  //      `sub $N,%rsp` 之后写 [rsp]，N 是整块预留大小，不等于单次访问宽度；
+  //   3. 两边的地址换算到同一坐标后再比（栈帧重写把帧访问换成 notdec_stack.native
+  //      的 GEP，而 @RSP 的值仍是入口 SP 坐标，见 entrySlotToNativeFrameKey）。
+  bool isStackAdjustmentAccess(llvm::Instruction &inst, llvm::Value *pointer,
+                               uint64_t sizeBytes, bool push) const {
+    llvm::Function *function = inst.getFunction();
+    llvm::BasicBlock *block = inst.getParent();
+    llvm::GlobalVariable *stackPointer = stackPointerGlobal();
+    if (function == nullptr || block == nullptr || stackPointer == nullptr ||
+        sizeBytes == 0) {
+      return false;
+    }
+    auto isStackPointerStore = [stackPointer](llvm::Instruction &candidate) {
+      auto *store = llvm::dyn_cast<llvm::StoreInst>(&candidate);
+      return store != nullptr &&
+             store->getPointerOperand()->stripPointerCasts() == stackPointer;
+    };
+    NativeStackAddressAnalysis &analysis = stackAddressAnalysis(*function);
+    std::optional<NativeStackAddress> slot =
+        analysis.addressForPointer(pointer);
+    std::optional<NativeStackAddress> current =
+        analysis.stackPointerBefore(inst);
+    if (!slot || !current) {
+      return false;
+    }
+    std::optional<StackSlotKey> slotKey = comparableSlotKey(*function, *slot);
+    std::optional<StackSlotKey> currentKey =
+        comparableSlotKey(*function, *current);
+    if (!slotKey || !currentKey || !(*slotKey == *currentKey)) {
+      return false;
+    }
+    std::optional<NativeStackAddress> other;
+    if (push) {
+      for (auto it = inst.getIterator(); it != block->begin();) {
+        --it;
+        if (isStackPointerStore(*it)) {
+          other = analysis.stackPointerBefore(*it);
+          break;
+        }
+      }
+    } else {
+      for (auto it = std::next(inst.getIterator()); it != block->end(); ++it) {
+        if (isStackPointerStore(*it)) {
+          other = analysis.addressForIntegerValue(
+              llvm::cast<llvm::StoreInst>(&*it)->getValueOperand());
+          break;
+        }
+      }
+    }
+    if (!other) {
+      return false;
+    }
+    std::optional<NativeStackAddress> expected = nativeStackAddressWithOffset(
+        *slot, static_cast<int64_t>(sizeBytes));
+    if (!expected) {
+      return false;
+    }
+    std::optional<StackSlotKey> otherKey = comparableSlotKey(*function, *other);
+    std::optional<StackSlotKey> expectedKey =
+        comparableSlotKey(*function, *expected);
+    return otherKey && expectedKey && *otherKey == *expectedKey;
+  }
+
+  // llvm::Value 的字节宽度，取不到（不可计算/非整数）时返回 0（判据直接不成立）。
+  static uint64_t valueSizeInBytes(llvm::Value *value) {
+    llvm::Type *type = value != nullptr ? value->getType() : nullptr;
+    if (type == nullptr || !type->isSized() ||
+        !(type->isIntegerTy() || type->isFloatingPointTy() ||
+          type->isPointerTy())) {
+      return 0;
+    }
+    return type->getPrimitiveSizeInBits() / 8;
+  }
+
   void collectStackAdjustmentSlots(llvm::Function &function,
                                    std::set<StackSlotKey> &result) const {
     struct Candidate {
       StackSlotKey Slot;
       llvm::GlobalVariable *Register = nullptr;
+      // store 正好写在当前栈顶（push 那一侧，判据 4）。
+      bool StackTop = false;
     };
     std::vector<Candidate> candidates;
     for (llvm::BasicBlock &block : function) {
@@ -2354,7 +2466,10 @@ private:
         if (!slot) {
           continue;
         }
-        candidates.push_back({*slot, access.Unit->Global});
+        const bool stackTop = isStackAdjustmentAccess(
+            inst, store->getPointerOperand(),
+            valueSizeInBytes(store->getValueOperand()), /*push=*/true);
+        candidates.push_back({*slot, access.Unit->Global, stackTop});
       }
     }
     for (const Candidate &candidate : candidates) {
@@ -2375,6 +2490,9 @@ private:
             continue;
           }
           sawLoad = true;
+          const bool stackTopLoad = isStackAdjustmentAccess(
+              *load, load->getPointerOperand(), valueSizeInBytes(load),
+              /*push=*/false);
           for (llvm::User *user : load->users()) {
             auto *store = llvm::dyn_cast<llvm::StoreInst>(user);
             if (store == nullptr) {
@@ -2383,11 +2501,24 @@ private:
             }
             RegisterAccess access = registerStore(*store, Units);
             if (access.Unit == nullptr ||
-                access.Unit->Global == candidate.Register ||
-                !registerValueDiesAfter(*store, *access.Unit->Global)) {
+                access.Unit->Global == candidate.Register) {
               padding = false;
               break;
             }
+            // 判据 3：普通保存槽，目的寄存器在下次写之前不能被显式读、也不能被
+            // 调用消费。
+            if (registerValueDiesAfter(*store, *access.Unit->Global)) {
+              continue;
+            }
+            // 判据 4：push/pop 对（store 写在栈顶、load 也从栈顶读）里目的寄存器
+            // 由编译器保证是死的，调用对它的消费不算真实使用。
+            if (candidate.StackTop && stackTopLoad &&
+                registerValueDiesAfter(*store, *access.Unit->Global,
+                                       /*ignoreCallReads=*/true)) {
+              continue;
+            }
+            padding = false;
+            break;
           }
           if (!padding) {
             break;

@@ -161,9 +161,18 @@ grep -o 'notdec.unknown remaining: total=[0-9]*.*' x.log
 
 ### P4 lighttpd 余下 48
 
+- **2026-09-24 已修**：这 19 个 `call_effect_mixed`（外加 3 个
+  `call_arg_rewrite_missing_binding`）的根因不是 Mixed 判错，而是 GCC 的栈对齐
+  `push %rcx` / `push %r8`（lighttpd `array_insert_unique`、`configparserFree`、
+  `gw_proc_init_portpath` 三处真 push）被 summary 记成入口读，级联出 6 个伪形参
+  （另 3 个是 configparser_push / gw_proc_spawn / gw_host_get 的传播值）。
+  `NativeRegisterSummary.cpp` 的 `stackAdjustmentSlots` 加了判据 4（push 写在栈顶、
+  pop 读栈顶、且 SP 调整量正好是访问宽度）后，lighttpd unknown **48 → 26**，其余目标持平。
+  见 `logs/20260924-01-native-stack-align-push-plan.md`。
 - 19 `call_effect_mixed`（RCX/R8 为主：configparser:RCX 6、array_get_element_klen:RCX 3、
   config_remoteip_normalize:RCX 3…）——机制是 callee 出口 provenance 真 Mixed 且调用点
   随后读该寄存器，之前判过大多是保守正确，需要按 callee 逐个看是否有假 Mixed。
+  （以上为 2026-09-24 修复前的记录，保留备查。）
 - 16 `entry_range_rejected`（RAX 10，其中 6 个是 FUN_f108/FUN_f147 这两个 `log_pri`
   wrapper 的转发值占位，属于可接受交换）。
 - 10 `return_binding_uses_clobber_value`（RDX 8 / RAX 2）、3
