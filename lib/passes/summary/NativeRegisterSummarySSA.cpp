@@ -6010,17 +6010,26 @@ private:
           ++Summary.UnknownCallEffects;
           countedUnknownCall = true;
         }
-        std::vector<RegisterRangeKey> ranges =
-            plannedRangesCovering(global, 0, registerBitWidth(unit));
-        if (ranges.empty()) {
-          clearBlockRangeDefs(block, global);
+        // Mixed（出口既可能保留入口值、也可能是新值）。按"第一遍统一生成
+        // 调用后状态占位、是不是返回由签名决定"的原则，这不该直接判丢：只要签名
+        // 说这个寄存器在 callee 的返回槽里，就照 Clobber 一样生成可替换占位，
+        // 重写 / 清理遍再按签名解析成真实返回值（就是调用后寄存器真实持有的值，
+        // 包含"原样保留入口值"的路径）。注意这里只动分派、不动 callEffect 的
+        // 分类：活跃性里"入口值可能活过这次调用"那条仍然保留。
+        // 不在返回槽里才保持原来的"判丢 + 归因"路径，省掉一次无意义的占位。
+        if (!signatureReturnUsesUnit(*call, unit)) {
+          std::vector<RegisterRangeKey> ranges =
+              plannedRangesCovering(global, 0, registerBitWidth(unit));
+          if (ranges.empty()) {
+            clearBlockRangeDefs(block, global);
+            continue;
+          }
+          RangeLossCause cause = unknownCallEffectCause(*call);
+          for (const RegisterRangeKey &range : ranges) {
+            markBlockRangeUnknown(block, range, cause);
+          }
           continue;
         }
-        RangeLossCause cause = unknownCallEffectCause(*call);
-        for (const RegisterRangeKey &range : ranges) {
-          markBlockRangeUnknown(block, range, cause);
-        }
-        continue;
       }
 
       std::vector<RegisterRangeKey> ranges =

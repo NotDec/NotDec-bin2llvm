@@ -456,4 +456,38 @@ unknown（reason=`call_effect_mixed`），于是变成 poison。
 另：那三个 callee 的"第二个返回值"是过推断（源码/DWARF 都是 int 单返回），如果哪天要收
 `call_effect_mixed`，可以从这里入手评估。
 
+### 追加 2：Mixed effect 也走统一占位（2026-09-23 续）
+
+**问题**：第三个调用点压进栈的 RDX，来源是前面三个 parse 调用（`FUN_23a73` /
+`FUN_428d0` / `FUN_23a0d`）出口的 RDX。这些 callee 把 RDX 当第 3 个参数读、又只在
+部分路径写它 → summary 的出口 provenance 是 Mixed（`MayEntry && MayNonEntry`）。按位 SSA 的
+调用点分派里只有 `Clobber`/`ReturnValue` 才生成"调用后状态"占位（`callRangeValue`），
+Mixed 走的是 `markBlockRangeUnknown`：直接判丢，后面物化成不可替换的
+`notdec.unknown`（`NativeRegisterSummarySSA.cpp` 的 6007 起）。于是签名里明明有 RDX
+返回槽，调用点却拿不到 `extractvalue`，变参规则再把它换成 poison。
+
+**背景**：`logs/20260805-12-native-unify-call-return-plan.md` 已经把"第一遍不再区分
+return/clobber、统一生成占位、是不是返回由签名决定"落地了，但那次只把占位给了 Clobber，
+Mixed 仍是旧路——这一条是把那次统一补完整。
+
+**实现**（只动分派，不动 `callEffect` 的分类）：effect 是 Mixed 且
+`signatureReturnUsesUnit(call, unit)` 为真（签名说这个寄存器在 callee 的返回槽里）时，
+也走 `callRangeValue` 占位通道；不在返回槽里才保持原来的"判丢 + `call_effect_mixed`
+归因"路径，省掉一次无意义的占位。
+不动分类的原因：`callEffect` 还被区间事件统计（4721-4728）和调用点活跃性（5503-5506）
+消费——Clobber 会擦掉"入口值可能活过这次调用"那条活跃性，Mixed 语义上不该擦。
+
+**验证**（同一二进制，`/tmp/fix17` vs `/tmp/fix16`）：
+- lighttpd 第三个调用点的变参 operand 从 `i64 poison` 变成真实值
+  （`%notdec.reg.insert.lower339`，叶子是那三个 callee 的 `extractvalue …, 1`）。
+- unknown 计数：lighttpd 48→48、redis-cli 7→7、libuv 8→8、**ffmpeg 8→5**
+  （`call_effect_mixed:FUN_38200:ZMM0=3` 消失）、vsftpd/memcached/wrk 0→0；
+  7 目标 `llvm-as`+verify 全 OK；ctest 12/12；半改写扫描仍全空。
+- warning：lighttpd `vararg_arg_uses_unknown_value` 51→48、`return_binding_missing` 1→0；
+  redis-cli 同项 1→0；libuv 2→0；没有新增 warning 类型。
+- **没有单测**：手写小 fixture 里改前改后结果一样——清理遍会把调用后的读重新按签名解析，
+  小 fixture 因此没有牙（实测：把 pass 改动 stash 掉重跑，那条用例照样绿）。差异只在"值在
+  重写过程中就被抓走"的场合（变参 operand 绑定）出现，要复现得同时搭内部变参 callee + 栈参数，
+  而手写 IR 触发不了栈参数的 lift 形态识别（见上一节）。
+
 
