@@ -434,15 +434,26 @@ collection（`stackSlotsOnly`）里收集，第二趟只看栈槽，所以寄存
   lift 形态的 EntryStackPointer/相对组（push 形态和 reload 形态都试过，固定栈参数也绑不上），
   所以这条路径现在只由真实二进制的调用点验收。要补单测得用一段真实 lift 片段做 fixture。
 
-**那次 poison 的根因（2026-09-23 追查）**：第三个调用点（`http_request_headers_process`）
-压的是当时的 RDX。追下去发现它是前面几个调用（`FUN_23a73` / `FUN_428d0` /
-`FUN_23a0d`）的**第二个返回值**——cspec 默认返回值寄存器是 XMM0/XMM1/RAX/RDX，这三个
-callee 的签名都是 `{..., i64}`，第二个元素就放在 RDX 里。但调用者从来没消费过这个半值
-（唯一的消费者就是那个一直没传下去的变参），于是寄存器重建阶段把它记成 unknown
-（`!notdec.unknown.source` 的 reason=`call_effect_mixed`，callee 就是这三个），
-变参规则"未证明的值不当真值传"又把它降级成 poison。所以这不是栈尾方案的副作用，而是
-"没有消费者 → 值没被重建 → 后来的消费者只看到 unknown"的顺序问题。真正要修得让"callee
-声明了返回槽的寄存器"在调用点无条件绑到该调用的返回值（可能顺带消掉一批
-`call_effect_mixed`），改动面更大，待评估。
+**那次 poison 的根因（2026-09-23 追查，已更正）**：第三个调用点
+（`http_request_headers_process`）在机器码里除了压格式串，还多压了一个 RDX——但它
+**不是变参实参，是栈对齐的填充**。对照 lighttpd **1.4.74** 源码（DWARF 记的行号 1366 与源码
+逐行对得上；注意本地 `source-ir/src/lighttpd-1.4.82-new` 是另一个版本，行号差 47）：
+
+    log_debug_multiline(r->conf.errh, __FILE__, __LINE__,
+                        hdrs, r->rqst_header_len, "rqst: ");
+
+后面没有实参；编译器为了 16 字节对齐多压了一个已经死掉的寄存器（同一个源码里别处用的是
+`sub $8,%rsp`，那种不会被 lift 成 store，所以只有 push 形态的填充会多出一个槽）。lift 把
+这个 push 建模成"往 outgoing 区写值"，栈尾规则就把它当成了一个变参槽；绑上去的值是前面几个
+parse 调用的出口 RDX——工具把这三个 callee（`FUN_23a73`/`FUN_428d0`/`FUN_23a0d`，
+DWARF 里都是 `int` 单返回值）的出口 RDX 过推断成了第二个返回值，调用点侧这个值又已经是
+unknown（reason=`call_effect_mixed`），于是变成 poison。
+对比：`h1.c:248` / `h1.c:497` 两处**确实是真变参**（`r->con->fd` / `con->fd`），
+栈尾规则把它们正常恢复了（这也是 fix16 里 lighttpd +48 的主要来源）。
+结论：栈尾规则目前分不出"真变参"和"对齐填充"，填充会在调用点多出一个（无害的）幽灵 operand
+——callee 只按格式串取它需要的个数，永远不会读到填充槽。可选收紧：栈尾只传"值能证明"的槽，
+遇到第一个不可证明的槽就停（真实例 147 个能保住，lighttpd 那 4 个 poison 会掉）。
+另：那三个 callee 的"第二个返回值"是过推断（源码/DWARF 都是 int 单返回），如果哪天要收
+`call_effect_mixed`，可以从这里入手评估。
 
 
