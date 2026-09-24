@@ -434,4 +434,15 @@ collection（`stackSlotsOnly`）里收集，第二趟只看栈槽，所以寄存
   lift 形态的 EntryStackPointer/相对组（push 形态和 reload 形态都试过，固定栈参数也绑不上），
   所以这条路径现在只由真实二进制的调用点验收。要补单测得用一段真实 lift 片段做 fixture。
 
+**那次 poison 的根因（2026-09-23 追查）**：第三个调用点（`http_request_headers_process`）
+压的是当时的 RDX。追下去发现它是前面几个调用（`FUN_23a73` / `FUN_428d0` /
+`FUN_23a0d`）的**第二个返回值**——cspec 默认返回值寄存器是 XMM0/XMM1/RAX/RDX，这三个
+callee 的签名都是 `{..., i64}`，第二个元素就放在 RDX 里。但调用者从来没消费过这个半值
+（唯一的消费者就是那个一直没传下去的变参），于是寄存器重建阶段把它记成 unknown
+（`!notdec.unknown.source` 的 reason=`call_effect_mixed`，callee 就是这三个），
+变参规则"未证明的值不当真值传"又把它降级成 poison。所以这不是栈尾方案的副作用，而是
+"没有消费者 → 值没被重建 → 后来的消费者只看到 unknown"的顺序问题。真正要修得让"callee
+声明了返回槽的寄存器"在调用点无条件绑到该调用的返回值（可能顺带消掉一批
+`call_effect_mixed`），改动面更大，待评估。
+
 
