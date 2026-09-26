@@ -256,7 +256,45 @@ tmux/ssh 都在 sweep 的 `timeout 1500` 内产出 IR 并通过验证，P3 的�
 tmux/ssh 都在 sweep 的 timeout 1500 内产出 IR 并通过验证，P3 的主要目标达成。
 wolfssl（3964 个函数、IR 37MB）现在能跑完并验证通过，但 1782s 仍略高于 sweep 的
 1500s 上限——它体量是 tmux 的 3 倍，按同一量级外推仍差 ~20%。如果还要继续压，
-下一层热点要看 base summary（3964 个函数的 SCC/定点）和 removeDeadStoresByLiveness。
+下一层热点看 base summary（3964 个函数的 SCC/定点）和 removeDeadStoresByLiveness。
+
+## 9. wolfssl 为什么还要 ~1350s（2026-09-24 追加测量）
+
+先把探针加回来（`NOTDEC_DEBUG_SUMMARY_TIMING` / `NOTDEC_DEBUG_SSA_TIMING`，测完已回退），
+量的是改动后的代码（HEAD `2878c06`）。wolfssl：3964 个函数、485k loads / 667k stores、
+IR 37MB（lighttpd 是 505 函数 / 69k loads / 102k stores / 4.6MB）。
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| pre-SSA（stack-frame-rewrite 11s + 其他） | ~15s | |
+| base-summary-1（self-bottom-up） | **102s** | 537k transferBlock 调用 |
+| base-summary-2（demand） | **238s** | 其中 solveFunction 只占 ~88s，其余在 demand 机制本身 |
+| SSA function-loop（3964 个函数） | **449s** | 111ms/函数；最慢 FUN_5b610 12.5s、FUN_931d0 8.9s |
+| shape-refine + rewrite-signature-shapes | ~19s | |
+| cleanup-iteration 0（删 18238 条死 store） | **212s** | 含一次全模块 InstCombine+SimplifyCFG + 每函数完整清理管线 |
+| cleanup-iteration 1（删 0 条，收敛） | **54s** | 明知删不到东西也要跑完整轮 |
+| 未计时的余量（最终 cleanup/输出等） | ~260s | 按 lighttpd 的余量（~24s）× IR 体量（8×）外推一致 |
+
+合计 ~1350s（本次插桩运行；非插桩的 /tmp/fix21 是 1782s，机器/指针序有波动）。
+
+结论：不存在单一热点，是四块各占 7-33%：
+1. **SSA function-loop 449s**：修完 A/B 之后每函数成本已经和函数指令数近似线性，
+   要继续只能压常数（当前 ~111ms/函数，其中最大头是 `rewritePartialWrites` 的
+   per-store 处理、`removeDeadStoresByLiveness` 的每函数反向定点）。
+2. **demand pass 238s**：`runTopDownDemand` 是「每轮遍历全部函数 ⇒ `analyzeCallerDemand`」，
+   而 `analyzeCallerDemand(F)` 只依赖 F 自己的 IR 和 F 自己的 ExitDemand（callee 需求是
+   它的输出），所以「本轮 F 的 ExitDemand 没变就跳过 F」可以严格保语义地把
+   轮数 × 全部函数 降到 只算有变化的函数（同一处还能把 `computeValueDemands(F)` 跨轮缓存）。
+3. **cleanup 两轮 266s**：第 0 轮里全模块 InstCombine 与每函数清理管线各占一半左右（未细分）；
+   第 1 轮删 0 条却仍要跑完整轮（54s）。可做的是「用 InstCombine 是否改动过来决定要不要
+   再跑一轮」——注意这只能省掉死指令的清理（语义无害），要确认收益再改。
+4. **base-summary-1 102s**：`transferBlock(State state)` 按值拷贝整个 State
+   （Cells/Origins/StackSlots/StackSlotStores/ValueOrigins 六张 map，大的函数上千条），
+   每块每轮拷一次；sp_mul 实测 1.5ms/transfer（lighttpd 平均 0.14ms）。可以改成
+   传引用 + 只在需要保留输入状态时拷一次，或换 worklist 减少 transfer 次数。
+
+如果要让 wolfssl 也进 1500s：优先做 2（改动小、语义等价、预计省 100-150s）和 3 的
+InstCombine 短路（预计省 ~54s+），就能压到 ~1150s；再要快就得动 1 或 4。
 
 ### 8.6 残留与后续
 
