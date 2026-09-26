@@ -251,7 +251,12 @@ bool isRecordedCallArgValue(llvm::Value *value) const {
 | **ssh** | **378s（timeout 1500s 无 IR）** | 65 | OK，IR 12.1MB |
 
 tmux/ssh 都在 sweep 的 `timeout 1500` 内产出 IR 并通过验证，P3 的目标达成。
-wolfssl（3964 个函数）本轮还在跑，结果补充到本节。
+| **wolfssl** | **1782s（timeout 1500s 无 IR）** | 556 | OK，IR 37.4MB |
+
+tmux/ssh 都在 sweep 的 timeout 1500 内产出 IR 并通过验证，P3 的主要目标达成。
+wolfssl（3964 个函数、IR 37MB）现在能跑完并验证通过，但 1782s 仍略高于 sweep 的
+1500s 上限——它体量是 tmux 的 3 倍，按同一量级外推仍差 ~20%。如果还要继续压，
+下一层热点要看 base summary（3964 个函数的 SCC/定点）和 removeDeadStoresByLiveness。
 
 ### 8.6 残留与后续
 
