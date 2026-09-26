@@ -2960,14 +2960,8 @@ private:
       for (const NativeBasicBlock &block : function.Blocks) {
         blockStarts.insert(block.Start);
       }
-      auto functionContains = [&](uint64_t address) {
-        for (const NativeBasicBlock &block : function.Blocks) {
-          if (block.Start <= address && address < block.End) {
-            return true;
-          }
-        }
-        return false;
-      };
+      // 原来的 functionContains 是线性扫本函数所有块；下面把它换成"按各块覆盖的
+      // 地址区间查 code block"（见 GTIRB 补边那段），这里不再需要。
       auto addFlowXref = [&](uint64_t source, uint64_t target) {
         NativeXref xref;
         xref.From = source;
@@ -3032,10 +3026,32 @@ private:
       // GTIRB CFG can contain code-block boundaries that FunctionBlocks did not
       // list for this function.  Keep those edges as flow xrefs so the normalizer
       // can split the containing NativeBasicBlock before lowering.
-      for (const auto &[address, gtirbBlock] : codeBlocksByAddress) {
-        if (blockStarts.count(address) != 0 || !functionContains(address)) {
-          continue;
+      //
+      // 只查本函数各块覆盖的地址区间，而不是"对每个函数扫全模块 code block 再线性
+      // 判断是否落在函数里"：后者是 函数数 × 模块块数（wolfssl 上 importCfgEdges
+      // 占到全程序 14.6% 采样、其中 std::set<uint64_t>::count 一项就 12%）。
+      // 判定集合不变（落在某个块内、且不是块的起点），顺序仍按地址。
+      std::vector<std::pair<uint64_t, const gtirb::CodeBlock *>> strayBlocks;
+      for (const NativeBasicBlock &block : function.Blocks) {
+        auto it = codeBlocksByAddress.lower_bound(block.Start);
+        for (; it != codeBlocksByAddress.end() && it->first < block.End; ++it) {
+          if (blockStarts.count(it->first) != 0) {
+            continue;
+          }
+          strayBlocks.emplace_back(it->first, it->second);
         }
+      }
+      std::sort(strayBlocks.begin(), strayBlocks.end(),
+                [](const auto &lhs, const auto &rhs) {
+                  return lhs.first < rhs.first;
+                });
+      strayBlocks.erase(
+          std::unique(strayBlocks.begin(), strayBlocks.end(),
+                      [](const auto &lhs, const auto &rhs) {
+                        return lhs.first == rhs.first;
+                      }),
+          strayBlocks.end());
+      for (const auto &[address, gtirbBlock] : strayBlocks) {
         importBlockEdges(address, *gtirbBlock, /*attachSuccessors=*/false);
       }
     }

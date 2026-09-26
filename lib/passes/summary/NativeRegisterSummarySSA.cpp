@@ -3620,6 +3620,11 @@ private:
   // previous transfer point instead of rebuilding the block state each time.
   std::map<llvm::BasicBlock *, llvm::Instruction *> CurrentDefPosition;
   std::map<llvm::Value *, llvm::Value *> Replacement;
+  // Replacement 的反向索引（target -> 指向它的 key）。原来 forgetReplacementValue
+  // 每次擦除都全表扫一遍 Replacement 找 key/target 等于被删值的那两项，而擦除发生在
+  // 每次删死指令时（大函数上千次 × 上千条项），perf 里 forgetReplacementValue +
+  // eraseInstructionFromParent 合计约 18% 采样。索引只在 recordReplacement 里维护。
+  std::map<llvm::Value *, std::vector<llvm::Value *>> ReplacementSources;
   // rewriteUndemandedRegisterStoreOperands 在一个函数里被每个寄存器 store 各调一次，
   // 而它走的那张值图是共享的：逐 store 重走是 O(store 数 × 图大小)（实测 8ms/store）。
   // demands 在一次 rewritePartialWrites 内是常量、"把 undemanded 操作数换成 poison"
@@ -5039,13 +5044,47 @@ private:
     return inst.getMetadata("notdec.register.summary_ssa.replaced") != nullptr;
   }
 
-  void forgetReplacementValue(llvm::Value *value) {
-    for (auto it = Replacement.begin(); it != Replacement.end();) {
-      if (it->first == value || it->second == value) {
-        it = Replacement.erase(it);
-      } else {
-        ++it;
+  void removeReplacementSource(llvm::Value *target, llvm::Value *key) {
+    auto sourcesIt = ReplacementSources.find(target);
+    if (sourcesIt == ReplacementSources.end()) {
+      return;
+    }
+    auto &keys = sourcesIt->second;
+    keys.erase(std::remove(keys.begin(), keys.end(), key), keys.end());
+    if (keys.empty()) {
+      ReplacementSources.erase(sourcesIt);
+    }
+  }
+
+  void recordReplacement(llvm::Value *key, llvm::Value *target) {
+    auto it = Replacement.find(key);
+    if (it != Replacement.end()) {
+      if (it->second == target) {
+        return;
       }
+      removeReplacementSource(it->second, key);
+      it->second = target;
+    } else {
+      Replacement.emplace(key, target);
+    }
+    ReplacementSources[target].push_back(key);
+  }
+
+  // 擦除被删指令相关的 Replacement 项：key == value 的那项，以及所有 target == value
+  // 的项（解析不再经过被删的值）。用反向索引，代价只和受影响项数有关。
+  void forgetReplacementValue(llvm::Value *value) {
+    if (auto it = Replacement.find(value); it != Replacement.end()) {
+      removeReplacementSource(it->second, value);
+      Replacement.erase(it);
+    }
+    auto sourcesIt = ReplacementSources.find(value);
+    if (sourcesIt == ReplacementSources.end()) {
+      return;
+    }
+    std::vector<llvm::Value *> keys = std::move(sourcesIt->second);
+    ReplacementSources.erase(sourcesIt);
+    for (llvm::Value *key : keys) {
+      Replacement.erase(key);
     }
   }
 
@@ -5081,7 +5120,7 @@ private:
       if (value == nullptr || value->getType() != call->getType()) {
         continue;
       }
-      Replacement[call] = value;
+      recordReplacement(call, value);
       call->replaceAllUsesWith(value);
       call->setMetadata("notdec.register.summary_ssa.replaced",
                         markerNode("true"));
@@ -5115,7 +5154,7 @@ private:
           value->getType() != load->getType()) {
         continue;
       }
-      Replacement[load] = value;
+      recordReplacement(load, value);
       load->replaceAllUsesWith(value);
       load->setMetadata("notdec.register.summary_ssa.replaced",
                         markerNode("true"));
@@ -5230,7 +5269,7 @@ private:
         continue;
       }
       auto *zero = llvm::ConstantInt::get(op->getType(), 0);
-      Replacement[op] = zero;
+      recordReplacement(op, zero);
       op->replaceAllUsesWith(zero);
       FoldedZeroXors.push_back(op);
       ++Summary.LoadsReplaced;
@@ -6307,7 +6346,7 @@ private:
         return &phi;
       }
     }
-    Replacement[&phi] = same;
+    recordReplacement(&phi, same);
     phi.replaceAllUsesWith(same);
     DeadPhis.insert(&phi);
     ++Summary.PhisSimplified;
