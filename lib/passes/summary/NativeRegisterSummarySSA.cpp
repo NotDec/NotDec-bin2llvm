@@ -14,6 +14,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeVarArgRewrite.h"
 
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -3601,6 +3602,20 @@ private:
   // previous transfer point instead of rebuilding the block state each time.
   std::map<llvm::BasicBlock *, llvm::Instruction *> CurrentDefPosition;
   std::map<llvm::Value *, llvm::Value *> Replacement;
+  // rewriteUndemandedRegisterStoreOperands 在一个函数里被每个寄存器 store 各调一次，
+  // 而它走的那张值图是共享的：逐 store 重走是 O(store 数 × 图大小)（实测 8ms/store）。
+  // demands 在一次 rewritePartialWrites 内是常量、"把 undemanded 操作数换成 poison"
+  // 是幂等的，所以整棵子树已经处理完的值再遇到时可以直接跳过——那时重走一遍也不会
+  // 再有改动，返回 false 与原行为一致。每次 rewritePartialWrites 开始时清空。
+  llvm::DenseSet<llvm::Value *> UndemandedWalkClean;
+  // SignatureState.CallArgs / FunctionReturns 是模块级的，"这个值/这条 store 是不是
+  // 被记录过"原来要逐候选线性扫全表（实测 lighttpd 一个函数扫 3000 万行、全模块 7.8
+  // 亿行，perf 里占 37.9%）。这里按当前 Replacement 状态 resolve 一次放进集合，
+  // 查询变 O(1)。CallArgs / FunctionReturns / Replacement 变化时置脏，下次查询重建。
+  mutable bool RecordedValueCacheDirty = true;
+  mutable llvm::DenseSet<llvm::Value *> RecordedCallArgValues;
+  mutable llvm::DenseSet<llvm::StoreInst *> RecordedCallArgStores;
+  mutable llvm::DenseSet<llvm::Value *> RecordedFunctionReturnValues;
   std::set<llvm::PHINode *> DeadPhis;
   std::map<RegisterRangeKey, llvm::Value *> EntryRangeInputs;
   std::map<llvm::Value *, RegisterRangeKey> EntryInputRanges;
@@ -3872,7 +3887,13 @@ private:
     if (inst == nullptr || !visiting.insert(inst).second) {
       return false;
     }
+    // 这棵子树在本次 rewritePartialWrites 里已经处理完：demands 不变、poison 替换
+    // 幂等，重走一遍不会再有任何改动（见 UndemandedWalkClean 的注释）。
+    if (UndemandedWalkClean.count(inst) != 0) {
+      return false;
+    }
     if (llvm::isa<llvm::CallBase>(inst) || inst->mayHaveSideEffects()) {
+      UndemandedWalkClean.insert(inst);
       return false;
     }
 
@@ -3911,6 +3932,7 @@ private:
       }
       changed = true;
     }
+    UndemandedWalkClean.insert(inst);
     return changed;
   }
 
@@ -4341,6 +4363,7 @@ private:
   }
 
   void rewritePartialWrites() {
+    UndemandedWalkClean.clear();
     std::map<llvm::Value *, llvm::APInt> demands = computePartialDemands();
     std::vector<llvm::StoreInst *> stores;
     std::vector<llvm::CallBase *> partialWrites;
@@ -5000,6 +5023,9 @@ private:
   }
 
   void forgetReplacementValue(llvm::Value *value) {
+    // 这里不失效 Recorded 缓存：集合里存的是每个记录值的整条 Replacement 链，
+    // 擦掉链上任意一段后该值只会解析到链上更早的成员（仍在集合里），不会漏判；
+    // 只有"新写 Replacement"才可能把值解析到集合外的目标，所以只在写入点失效。
     for (auto it = Replacement.begin(); it != Replacement.end();) {
       if (it->first == value || it->second == value) {
         it = Replacement.erase(it);
@@ -5042,6 +5068,7 @@ private:
         continue;
       }
       Replacement[call] = value;
+      invalidateRecordedValueCache();
       call->replaceAllUsesWith(value);
       call->setMetadata("notdec.register.summary_ssa.replaced",
                         markerNode("true"));
@@ -5076,6 +5103,7 @@ private:
         continue;
       }
       Replacement[load] = value;
+      invalidateRecordedValueCache();
       load->replaceAllUsesWith(value);
       load->setMetadata("notdec.register.summary_ssa.replaced",
                         markerNode("true"));
@@ -5191,6 +5219,7 @@ private:
       }
       auto *zero = llvm::ConstantInt::get(op->getType(), 0);
       Replacement[op] = zero;
+      invalidateRecordedValueCache();
       op->replaceAllUsesWith(zero);
       FoldedZeroXors.push_back(op);
       ++Summary.LoadsReplaced;
@@ -5271,33 +5300,64 @@ private:
     }
   }
 
+  void invalidateRecordedValueCache() const { RecordedValueCacheDirty = true; }
+
+  // 把模块级 SignatureState 里的"记录值"按当前 Replacement 状态 resolve 一次放进
+  // 集合；三个 isRecorded* 之后只查哈希表。见成员声明处的注释。
+  void ensureRecordedValueCache() const {
+    if (!RecordedValueCacheDirty) {
+      return;
+    }
+    RecordedValueCacheDirty = false;
+    RecordedCallArgValues.clear();
+    RecordedCallArgStores.clear();
+    RecordedFunctionReturnValues.clear();
+    // 每个记录值把整条 Replacement 链都放进去：链被擦短后只会解析到链上更早的
+    // 成员，仍在集合里；链被加长则由写入点的失效负责重建。
+    auto insertChain = [this](llvm::DenseSet<llvm::Value *> &set,
+                              llvm::Value *value) {
+      llvm::SmallPtrSet<llvm::Value *, 8> seen;
+      while (value != nullptr && seen.insert(value).second) {
+        set.insert(value);
+        auto it = Replacement.find(value);
+        if (it == Replacement.end() || it->second == value) {
+          break;
+        }
+        value = it->second;
+      }
+    };
+    for (const auto &[call, bindings] : SignatureState.CallArgs) {
+      (void)call;
+      for (const CallArgStoreBinding &binding : bindings) {
+        if (binding.Store != nullptr) {
+          RecordedCallArgStores.insert(binding.Store);
+        }
+        insertChain(RecordedCallArgValues, binding.Value);
+        insertChain(RecordedCallArgValues, binding.RegisterValue);
+      }
+    }
+    auto returnsIt = SignatureState.FunctionReturns.find(&Function);
+    if (returnsIt != SignatureState.FunctionReturns.end()) {
+      for (const auto &[ret, values] : returnsIt->second) {
+        (void)ret;
+        for (llvm::Value *retValue : values) {
+          insertChain(RecordedFunctionReturnValues, retValue);
+        }
+      }
+    }
+  }
+
   bool isRecordedCallArgStore(llvm::StoreInst *store) const {
     if (SignatureState.StoresToErase.count(store) != 0) {
       return true;
     }
-    for (const auto &[call, bindings] : SignatureState.CallArgs) {
-      (void)call;
-      for (const CallArgStoreBinding &binding : bindings) {
-        if (binding.Store == store) {
-          return true;
-        }
-      }
-    }
-    return false;
+    ensureRecordedValueCache();
+    return RecordedCallArgStores.count(store) != 0;
   }
 
   bool isRecordedCallArgValue(llvm::Value *value) const {
-    value = resolve(value);
-    for (const auto &[call, bindings] : SignatureState.CallArgs) {
-      (void)call;
-      for (const CallArgStoreBinding &binding : bindings) {
-        if (resolve(binding.Value) == value ||
-            resolve(binding.RegisterValue) == value) {
-          return true;
-        }
-      }
-    }
-    return false;
+    ensureRecordedValueCache();
+    return RecordedCallArgValues.count(resolve(value)) != 0;
   }
 
   bool isRecordedFunctionReturnValue(llvm::Value *value) const {
@@ -5308,21 +5368,8 @@ private:
             functionTypeForShape(Function.getContext(), shapeIt->second)) {
       return false;
     }
-    auto returnsIt = SignatureState.FunctionReturns.find(&Function);
-    if (returnsIt == SignatureState.FunctionReturns.end()) {
-      return false;
-    }
-
-    value = resolve(value);
-    for (const auto &[ret, values] : returnsIt->second) {
-      (void)ret;
-      for (llvm::Value *retValue : values) {
-        if (resolve(retValue) == value) {
-          return true;
-        }
-      }
-    }
-    return false;
+    ensureRecordedValueCache();
+    return RecordedFunctionReturnValues.count(resolve(value)) != 0;
   }
 
   void removeDeadStoresByLiveness() {
@@ -6245,6 +6292,7 @@ private:
       }
     }
     Replacement[&phi] = same;
+    invalidateRecordedValueCache();
     phi.replaceAllUsesWith(same);
     DeadPhis.insert(&phi);
     ++Summary.PhisSimplified;
@@ -6754,6 +6802,7 @@ private:
         }
       }
     }
+    invalidateRecordedValueCache();
   }
 
   const RegisterUnit *unitByName(llvm::StringRef name) const {
@@ -7655,6 +7704,7 @@ private:
       }
       if (recordBinding) {
         SignatureState.FunctionReturns[&Function][ret] = std::move(values);
+        invalidateRecordedValueCache();
       }
     }
   }
