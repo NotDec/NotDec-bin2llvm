@@ -2843,20 +2843,36 @@ private:
   }
 
   void runTopDownDemand() {
+    // analyzeCallerDemand(F) 只读 F 自己的 IR 和 F 自己的 ExitDemand（callee 的需求是
+    // 它的输出，见 liveBeforeBlock 里唯一的 Demands[&function] 读），所以只有"F 自己的
+    // ExitDemand 变过"时才需要重算 F。原来每轮对全部函数重算（重复 computeValueDemands
+    // 加一次块级定点），大模块上是 轮数 × 全部函数；这里用版本号跳过没变的函数。
+    std::map<llvm::Function *, uint64_t> exitDemandVersion;
+    std::map<llvm::Function *, uint64_t> analyzedVersion;
+    uint64_t nextVersion = 1;
     for (llvm::Function *function : Functions) {
       if (Callers[function].empty()) {
         seedAbiReturns(Demands[function]);
       }
+      // 每个函数至少要分析一次，所以初始版本各不相同。
+      exitDemandVersion[function] = nextVersion++;
     }
 
     bool changed = true;
     while (changed) {
       changed = false;
       for (llvm::Function *function : Functions) {
+        if (exitDemandVersion[function] == analyzedVersion[function]) {
+          continue;
+        }
+        analyzedVersion[function] = exitDemandVersion[function];
         std::map<llvm::Function *, RegisterDemand> additions =
             analyzeCallerDemand(*function);
         for (auto &[callee, demand] : additions) {
-          changed |= mergeDemand(Demands[callee].ExitDemand, demand);
+          if (mergeDemand(Demands[callee].ExitDemand, demand)) {
+            exitDemandVersion[callee] = nextVersion++;
+            changed = true;
+          }
         }
       }
     }

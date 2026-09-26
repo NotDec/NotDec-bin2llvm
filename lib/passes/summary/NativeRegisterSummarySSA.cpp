@@ -3450,7 +3450,10 @@ llvm::Value *buildReturnValue(llvm::IRBuilder<> &builder,
 // cleanup.  It is intentionally kept at the SummarySSA top level: the per
 // function builder caches instruction pointers while rewriting, and running
 // LLVM cleanup inside that phase would make those caches unsafe.
-void runPostRewriteInstCombine(llvm::Module &module) {
+// 返回模块 IR 是否被这两个 pass 改动过（无改动时它们返回
+// PreservedAnalyses::all()）。cleanup 循环用它决定还要不要再跑一轮：两个 pass 都没
+// 动过 IR 时，上一轮的清理结果已经是同一个 IR 上的定点。
+bool runPostRewriteInstCombine(llvm::Module &module) {
   llvm::LoopAnalysisManager loopAnalysis;
   llvm::FunctionAnalysisManager functionAnalysis;
   llvm::CGSCCAnalysisManager cgsccAnalysis;
@@ -3467,11 +3470,15 @@ void runPostRewriteInstCombine(llvm::Module &module) {
   llvm::FunctionPassManager functionPasses;
   functionPasses.addPass(llvm::InstCombinePass());
   functionPasses.addPass(llvm::SimplifyCFGPass());
+  bool changed = false;
   for (llvm::Function &function : module) {
     if (!function.isDeclaration()) {
-      functionPasses.run(function, functionAnalysis);
+      llvm::PreservedAnalyses preserved =
+          functionPasses.run(function, functionAnalysis);
+      changed |= !preserved.areAllPreserved();
     }
   }
+  return changed;
 }
 
 class FunctionBuilder {
@@ -9272,8 +9279,15 @@ runNativeRegisterSummarySSA(llvm::Module &module,
       constexpr unsigned maxPostRewriteCleanupIterations = 10;
       for (unsigned iteration = 0; iteration < maxPostRewriteCleanupIterations;
            ++iteration) {
+        bool instCombineChanged = false;
         if (effectiveOptions.EnablePostRewriteInstCombine) {
-          runPostRewriteInstCombine(module);
+          instCombineChanged = runPostRewriteInstCombine(module);
+          // 第一轮之后 InstCombine/SimplifyCFG 一点没改 IR：这一轮清理面对的 IR 和
+          // 上一轮结束时完全相同，上一轮的"改写完再删死值"已经是同一个 IR 上的定点，
+          // 再跑一轮只是重复劳动。剩在 IR 里的死 store 不影响语义。
+          if (iteration > 0 && !instCombineChanged) {
+            break;
+          }
         }
 
         uint64_t deadStoresRemovedThisIteration = 0;
