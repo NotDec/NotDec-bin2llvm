@@ -338,6 +338,17 @@ struct SignatureRewriteState {
   std::map<const llvm::CallBase *, std::vector<NativeRegisterCallInputSlot>>
       IndirectCallInputs;
   std::map<llvm::CallBase *, std::vector<CallArgStoreBinding>> CallArgs;
+  // "这个值/这条 store 是不是被调用点记录过"的模块级集合，在记录绑定时增量插入
+  // （见 collectSignatureCallArgs）。原来每个函数重建一次要扫全模块 CallArgs，
+  // wolfssl 上占 33% 采样；这里查询 O(1) 且不用重建。存的是原始值：本函数自己的
+  // 值可能被 Replacement 改写，由 FunctionBuilder 用 LocalRecordedValues 再解析一次。
+  llvm::DenseSet<llvm::Value *> CallArgRecordedValues;
+  llvm::DenseSet<llvm::StoreInst *> CallArgRecordedStores;
+  // 按函数名分组的绑定值：解析（resolve）用的是"当前正在构建的函数"的 Replacement 表，
+  // 所以查询时要单独按解析结果比一次。用函数名分组而不是 Function*，是因为签名重写会
+  // 换成新的 Function 对象（名字保持不变），清理遍按名字仍能找到同一批记录值。
+  std::map<std::string, std::vector<llvm::Value *>>
+      CallArgRecordedValuesByFunction;
   std::map<llvm::CallBase *, std::map<std::string, llvm::CallInst *>>
       ReturnHelpers;
   std::map<llvm::CallBase *, std::vector<RangeReturnHelper>> RangeReturnHelpers;
@@ -3615,13 +3626,12 @@ private:
   // 是幂等的，所以整棵子树已经处理完的值再遇到时可以直接跳过——那时重走一遍也不会
   // 再有改动，返回 false 与原行为一致。每次 rewritePartialWrites 开始时清空。
   llvm::DenseSet<llvm::Value *> UndemandedWalkClean;
-  // SignatureState.CallArgs / FunctionReturns 是模块级的，"这个值/这条 store 是不是
-  // 被记录过"原来要逐候选线性扫全表（实测 lighttpd 一个函数扫 3000 万行、全模块 7.8
-  // 亿行，perf 里占 37.9%）。这里按当前 Replacement 状态 resolve 一次放进集合，
-  // 查询变 O(1)。CallArgs / FunctionReturns / Replacement 变化时置脏，下次查询重建。
-  mutable bool RecordedValueCacheDirty = true;
-  mutable llvm::DenseSet<llvm::Value *> RecordedCallArgValues;
-  mutable llvm::DenseSet<llvm::StoreInst *> RecordedCallArgStores;
+  // 本函数调用点记录过的绑定值（按函数名从 SignatureState 取，构造时懒解析一次）。
+  // 数量是该函数自己的调用点实参，很少；清理遍按名字仍能取到主循环记录的那批。
+  mutable const std::vector<llvm::Value *> *LocalRecordedValues = nullptr;
+  mutable bool LocalRecordedValuesLooked = false;
+  // 本函数的返回值集合（含 Replacement 链）。FunctionReturns 变化时置脏。
+  mutable bool FunctionReturnCacheDirty = true;
   mutable llvm::DenseSet<llvm::Value *> RecordedFunctionReturnValues;
   std::set<llvm::PHINode *> DeadPhis;
   std::map<RegisterRangeKey, llvm::Value *> EntryRangeInputs;
@@ -5030,9 +5040,6 @@ private:
   }
 
   void forgetReplacementValue(llvm::Value *value) {
-    // 这里不失效 Recorded 缓存：集合里存的是每个记录值的整条 Replacement 链，
-    // 擦掉链上任意一段后该值只会解析到链上更早的成员（仍在集合里），不会漏判；
-    // 只有"新写 Replacement"才可能把值解析到集合外的目标，所以只在写入点失效。
     for (auto it = Replacement.begin(); it != Replacement.end();) {
       if (it->first == value || it->second == value) {
         it = Replacement.erase(it);
@@ -5075,7 +5082,6 @@ private:
         continue;
       }
       Replacement[call] = value;
-      invalidateRecordedValueCache();
       call->replaceAllUsesWith(value);
       call->setMetadata("notdec.register.summary_ssa.replaced",
                         markerNode("true"));
@@ -5110,7 +5116,6 @@ private:
         continue;
       }
       Replacement[load] = value;
-      invalidateRecordedValueCache();
       load->replaceAllUsesWith(value);
       load->setMetadata("notdec.register.summary_ssa.replaced",
                         markerNode("true"));
@@ -5226,7 +5231,6 @@ private:
       }
       auto *zero = llvm::ConstantInt::get(op->getType(), 0);
       Replacement[op] = zero;
-      invalidateRecordedValueCache();
       op->replaceAllUsesWith(zero);
       FoldedZeroXors.push_back(op);
       ++Summary.LoadsReplaced;
@@ -5307,48 +5311,33 @@ private:
     }
   }
 
-  void invalidateRecordedValueCache() const { RecordedValueCacheDirty = true; }
+  void invalidateRecordedValueCache() const { FunctionReturnCacheDirty = true; }
 
-  // 把模块级 SignatureState 里的"记录值"按当前 Replacement 状态 resolve 一次放进
-  // 集合；三个 isRecorded* 之后只查哈希表。见成员声明处的注释。
-  void ensureRecordedValueCache() const {
-    if (!RecordedValueCacheDirty) {
+  // 本函数返回值集合：把每条记录值的整条 Replacement 链都放进去（链被擦短后只会
+  // 解析到链上更早的成员，仍在集合里；链被加长由 collectFunctionReturnValues 的
+  // 失效负责重建）。
+  void ensureFunctionReturnValueCache() const {
+    if (!FunctionReturnCacheDirty) {
       return;
     }
-    RecordedValueCacheDirty = false;
-    RecordedCallArgValues.clear();
-    RecordedCallArgStores.clear();
+    FunctionReturnCacheDirty = false;
     RecordedFunctionReturnValues.clear();
-    // 每个记录值把整条 Replacement 链都放进去：链被擦短后只会解析到链上更早的
-    // 成员，仍在集合里；链被加长则由写入点的失效负责重建。
-    auto insertChain = [this](llvm::DenseSet<llvm::Value *> &set,
-                              llvm::Value *value) {
-      llvm::SmallPtrSet<llvm::Value *, 8> seen;
-      while (value != nullptr && seen.insert(value).second) {
-        set.insert(value);
-        auto it = Replacement.find(value);
-        if (it == Replacement.end() || it->second == value) {
-          break;
-        }
-        value = it->second;
-      }
-    };
-    for (const auto &[call, bindings] : SignatureState.CallArgs) {
-      (void)call;
-      for (const CallArgStoreBinding &binding : bindings) {
-        if (binding.Store != nullptr) {
-          RecordedCallArgStores.insert(binding.Store);
-        }
-        insertChain(RecordedCallArgValues, binding.Value);
-        insertChain(RecordedCallArgValues, binding.RegisterValue);
-      }
-    }
     auto returnsIt = SignatureState.FunctionReturns.find(&Function);
-    if (returnsIt != SignatureState.FunctionReturns.end()) {
-      for (const auto &[ret, values] : returnsIt->second) {
-        (void)ret;
-        for (llvm::Value *retValue : values) {
-          insertChain(RecordedFunctionReturnValues, retValue);
+    if (returnsIt == SignatureState.FunctionReturns.end()) {
+      return;
+    }
+    for (const auto &[ret, values] : returnsIt->second) {
+      (void)ret;
+      for (llvm::Value *retValue : values) {
+        llvm::Value *value = retValue;
+        llvm::SmallPtrSet<llvm::Value *, 8> seen;
+        while (value != nullptr && seen.insert(value).second) {
+          RecordedFunctionReturnValues.insert(value);
+          auto it = Replacement.find(value);
+          if (it == Replacement.end() || it->second == value) {
+            break;
+          }
+          value = it->second;
         }
       }
     }
@@ -5358,13 +5347,33 @@ private:
     if (SignatureState.StoresToErase.count(store) != 0) {
       return true;
     }
-    ensureRecordedValueCache();
-    return RecordedCallArgStores.count(store) != 0;
+    return SignatureState.CallArgRecordedStores.count(store) != 0;
   }
 
   bool isRecordedCallArgValue(llvm::Value *value) const {
-    ensureRecordedValueCache();
-    return RecordedCallArgValues.count(resolve(value)) != 0;
+    llvm::Value *resolved = resolve(value);
+    // 模块级集合存的是原始值。resolve 的终点一定不再被改写，所以"跨函数的记录值
+    // （resolve 恒等）"和"本函数自己记录、没被改写的值"都能直接命中。
+    if (SignatureState.CallArgRecordedValues.count(resolved) != 0) {
+      return true;
+    }
+    // 本函数记录、且被 Replacement 改写过的值：按解析结果再比一次。
+    if (!LocalRecordedValuesLooked) {
+      LocalRecordedValuesLooked = true;
+      auto it = SignatureState.CallArgRecordedValuesByFunction.find(
+          Function.getName().str());
+      if (it != SignatureState.CallArgRecordedValuesByFunction.end()) {
+        LocalRecordedValues = &it->second;
+      }
+    }
+    if (LocalRecordedValues != nullptr) {
+      for (llvm::Value *recorded : *LocalRecordedValues) {
+        if (recorded != nullptr && resolve(recorded) == resolved) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   bool isRecordedFunctionReturnValue(llvm::Value *value) const {
@@ -5375,7 +5384,7 @@ private:
             functionTypeForShape(Function.getContext(), shapeIt->second)) {
       return false;
     }
-    ensureRecordedValueCache();
+    ensureFunctionReturnValueCache();
     return RecordedFunctionReturnValues.count(resolve(value)) != 0;
   }
 
@@ -6299,7 +6308,6 @@ private:
       }
     }
     Replacement[&phi] = same;
-    invalidateRecordedValueCache();
     phi.replaceAllUsesWith(same);
     DeadPhis.insert(&phi);
     ++Summary.PhisSimplified;
@@ -6798,6 +6806,28 @@ private:
           }
         }
       }
+      std::vector<llvm::Value *> *localRecorded = nullptr;
+      if (llvm::Function *caller = call->getFunction()) {
+        localRecorded = &SignatureState.CallArgRecordedValuesByFunction
+                             [caller->getName().str()];
+      }
+      for (const CallArgStoreBinding &binding : bindings) {
+        if (binding.Store != nullptr) {
+          SignatureState.CallArgRecordedStores.insert(binding.Store);
+        }
+        if (binding.Value != nullptr) {
+          SignatureState.CallArgRecordedValues.insert(binding.Value);
+          if (localRecorded != nullptr) {
+            localRecorded->push_back(binding.Value);
+          }
+        }
+        if (binding.RegisterValue != nullptr) {
+          SignatureState.CallArgRecordedValues.insert(binding.RegisterValue);
+          if (localRecorded != nullptr) {
+            localRecorded->push_back(binding.RegisterValue);
+          }
+        }
+      }
       if (callee == nullptr ||
           !isUnknownExternalFunction(
               *callee, externalPrototypesForState(SignatureState))) {
@@ -6809,7 +6839,6 @@ private:
         }
       }
     }
-    invalidateRecordedValueCache();
   }
 
   const RegisterUnit *unitByName(llvm::StringRef name) const {

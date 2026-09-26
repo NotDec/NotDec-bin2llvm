@@ -28,6 +28,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <map>
@@ -1597,34 +1598,41 @@ private:
     FunctionFlow flow;
     flow.In[&function.getEntryBlock()].Reachable = true;
 
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (llvm::BasicBlock &block : function) {
-        if (&block != &function.getEntryBlock()) {
-          State joined;
-          for (llvm::BasicBlock *pred : llvm::predecessors(&block)) {
-            joinState(joined, flow.Out[pred]);
-          }
-          bool inputChanged = Options.CollectExternalCallsiteEvidence
-                                  ? !(flow.In[&block] == joined)
-                                  : !flow.In[&block].sameSummaryLattice(joined);
-          if (inputChanged) {
-            flow.In[&block] = std::move(joined);
-            changed = true;
-          } else {
-            flow.In[&block] = std::move(joined);
-          }
+    // 工作队列：只重算"前驱出口变了"的块。原来是 while(changed){for each block}，
+    // 每轮把所有块从头转移一遍，对长链/大 CFG 是 轮数 × 块数（实测 wolfssl sp_mul
+    // 5 轮 × 98 块；每块拷贝一次 State，大函数 1.5ms/次，lighttpd 平均 0.14ms/次）。
+    // 转移函数对各 Cell 位是单调的 gen/kill，工作队列在同一个格上做混沌迭代，收敛到
+    // 同一个不动点；顺序用 FIFO，和原来的函数序更接近。
+    std::deque<llvm::BasicBlock *> worklist;
+    llvm::SmallPtrSet<llvm::BasicBlock *, 32> queued;
+    auto enqueue = [&](llvm::BasicBlock *block) {
+      if (queued.insert(block).second) {
+        worklist.push_back(block);
+      }
+    };
+    for (llvm::BasicBlock &block : function) {
+      enqueue(&block);
+    }
+
+    while (!worklist.empty()) {
+      llvm::BasicBlock &block = *worklist.front();
+      worklist.pop_front();
+      queued.erase(&block);
+      if (&block != &function.getEntryBlock()) {
+        State joined;
+        for (llvm::BasicBlock *pred : llvm::predecessors(&block)) {
+          joinState(joined, flow.Out[pred]);
         }
-        State next = transferBlock(block, flow.In[&block]);
-        bool outputChanged = Options.CollectExternalCallsiteEvidence
-                                 ? !(flow.Out[&block] == next)
-                                 : !flow.Out[&block].sameSummaryLattice(next);
-        if (outputChanged) {
-          flow.Out[&block] = std::move(next);
-          changed = true;
-        } else {
-          flow.Out[&block] = std::move(next);
+        flow.In[&block] = std::move(joined);
+      }
+      State next = transferBlock(block, flow.In[&block]);
+      bool outputChanged = Options.CollectExternalCallsiteEvidence
+                               ? !(flow.Out[&block] == next)
+                               : !flow.Out[&block].sameSummaryLattice(next);
+      flow.Out[&block] = std::move(next);
+      if (outputChanged) {
+        for (llvm::BasicBlock *succ : llvm::successors(&block)) {
+          enqueue(succ);
         }
       }
     }
