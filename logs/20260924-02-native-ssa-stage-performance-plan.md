@@ -342,3 +342,60 @@ InstCombine 短路（预计省 ~54s+），就能压到 ~1150s；再要快就得�
   （lighttpd 32/50、tmux 77/139、ssh 332/543、wolfssl 190/225）。
 - 全部 `llvm-as` + `opt -passes=verify` OK；`ctest` 12/12；单测通过。
 
+## 11. 第三轮优化：工作队列 + 记录值集合改成模块级增量（2026-09-24，commit `2b1de93`）
+
+### 11.1 怎么找到这两处的
+
+对整次 wolfssl 运行做了一次低频 perf 采样（`-F 199`，22 分钟），发现**上一轮加的**
+`FunctionBuilder::ensureRecordedValueCache` 自己占了全程序 **33.5%** 采样（其中
+`insertChain` 22.8%、`DenseSet` 12.7%）：它按设计是「每个 FunctionBuilder 重建一次」，
+而每次重建要扫**全模块**的 `SignatureState.CallArgs`；wolfssl 有 3964 个函数、每个函数
+还要跑 run + 两轮清理，于是变成 函数数 × 全模块行数 × 3。lighttpd 上只有 3720 条所以
+看不出来，大模块上就成了最大头。
+
+### 11.2 改动
+
+1. `Analyzer::solveFunction`（`NativeRegisterSummary.cpp`）：`while(changed){for each block}`
+   改成工作队列（FIFO），只有前驱出口变了的块才重新 `transferBlock`。转移函数对各 Cell 位
+   是单调 gen/kill，工作队列在同一个格上做混沌迭代，收敛到同一不动点。
+2. 记录值集合（`NativeRegisterSummarySSA.cpp`）：`SignatureState` 增加
+   `CallArgRecordedValues` / `CallArgRecordedStores`（记录绑定时增量插入）和
+   `CallArgRecordedValuesByFunction`（按函数名分组的绑定值）。查询 = 模块级集合一次哈希
+   （跨函数记录值的 `resolve` 恒等，直接命中）+ 本函数自己那几个记录值按解析结果再比一次。
+   用函数名分组而不是 `Function*`：签名重写会 `takeName` 换新对象，清理遍按名字仍能取到
+   主循环记录的那批值。`isRecordedFunctionReturnValue` 保留每函数小集合（返回值很少）。
+
+### 11.3 量测（/tmp/fix24 vs /tmp/fix23 vs /tmp/fix21，同命令，10 个目标）
+
+| 目标 | fix21 | fix23 | fix24 | unknown | verify |
+|---|---|---|---|---|---|
+| lighttpd | 173s | 140s | **90s** | 26 | OK |
+| redis-cli | 146s | 143s | **87s** | 7 | OK |
+| libuv | 69s | 74s | **40s** | 8 | OK |
+| vsftpd | 47s | 42s | **32s** | 0 | OK |
+| memcached | 116s | 95s | **73s** | 0 | OK |
+| wrk | 29s | 22s | **19s** | 0 | OK |
+| ffmpeg | 159s | 157s | **100s** | 5 | OK |
+| tmux | 591s | 474s | **310s** | 25 | OK |
+| ssh | 378s | 330s | **273s** | 65 | OK |
+| wolfssl | 1782s | 1385s | **809s** | 556 | OK |
+
+相对本轮动工前（fix19/fix21）：lighttpd 504→90s、tmux 591→310s、ssh 378→273s、
+wolfssl 1782→809s（wolfssl 之前还会被 1500s 超时杀掉）。
+
+### 11.4 等价性
+
+- `/tmp/sig_diff3.py`（fix23 vs fix24）：10 个目标函数签名零变化。
+- unknown 计数逐目标不变；SSA 计数 `dead_loads_removed`/`dead_stores_removed` 完全一致
+  （lighttpd 32/50、tmux 77/139、ssh 332/543、wolfssl 190/225）。
+- 10 个目标 `llvm-as` + `opt -passes=verify` 全 OK；`ctest` 12/12；单测通过。
+
+### 11.5 残留
+
+- 记录值集合是「只增不减」的，签名重写后里面可能留着已删除 Value 的指针；查询只用活值，
+  与改动前的行为一致（原来也是拿 `CallArgs` 里的值比）。
+- 工作队列假定转移函数单调（原实现的不动点也依赖同一假设）；如果将来出现非单调规则，
+  这里要一起看。
+- 现在最大的剩余成本已经不是单点：wolfssl 809s 里 base summary 两遍 + demand、SSA 逐函数
+  循环、清理轮各占一块，需要重新量一遍才知道下一刀切哪里。
+
