@@ -399,3 +399,62 @@ wolfssl 1782→809s（wolfssl 之前还会被 1500s 超时杀掉）。
 - 现在最大的剩余成本已经不是单点：wolfssl 809s 里 base summary 两遍 + demand、SSA 逐函数
   循环、清理轮各占一块，需要重新量一遍才知道下一刀切哪里。
 
+## 12. 第四轮优化：discovery 补边 + Replacement 反向索引（2026-09-24，commit `69663ff`）
+
+### 12.1 先补上工具主流程的阶段计时
+
+给 `tools/notdec-native-llvm.cpp` 的 pass 序列加了探针（`NOTDEC_DEBUG_TOOL_TIMING`，用完已回退），
+wolfssl 的完整分解变成：
+
+| 阶段 | wolf4（fix23 之后） | wolf5/wolf7（本轮两刀之后） |
+|---|---|---|
+| discovery + lift | **433.9s** | **224.5s** |
+| instcombine-1 | 9.9s | 7.7s |
+| register-ssa-pass | 582.5s | 386.8s |
+| instcombine-2 / promotion / peephole / final-cleanup / instcombine-3 | 1.7 / 0.5 / 1.7 / 2.3 / 2.4s | 1.4 / 0.4 / 1.4 / 2.0 / 2.2s |
+| dead-unknown 清理 + 报告 / 写 IR | 0.2 / 0.5s | 0.2 / 0.4s |
+
+两点结论：SSA pass **之后**的所有 pass 一共只有 ~9s（之前猜"tail 很大"是错的，那部分其实在
+discovery/lift 和 SSA pass 自己的收尾里）；SSA pass 内部是 base-summary-1 66s、demand 92s、
+function-loop 228s、cleanup 35s、收尾 ~20s。
+
+### 12.2 两个平方级扫描
+
+perf（整跑采样）显示：
+
+- `GtirbFunctionFactsAnalyzer::importCfgEdges` **14.6%**（其中 `std::set<uint64_t>::count`
+  一项 12%）：它给每个函数遍历**全模块** code block，再用线性 `functionContains` 判断归属，
+  规模是 函数数 × 模块块数。改成对函数每个块用 `map::lower_bound` 只查该块覆盖的地址区间，
+  找到的块按地址排序去重后处理——判定集合和顺序都不变。
+- `FunctionBuilder::forgetReplacementValue` 8.9% + `eraseInstructionFromParent` 9.3%：每次删
+  死指令都全表扫 `Replacement` 找 key/target 等于被删值的项，规模是 擦除数 × 项数。加
+  反向索引 `ReplacementSources`（target → keys），四个写入点统一走 `recordReplacement()`。
+
+### 12.3 最终量测（/tmp/fix26，10 个目标，全部 verify OK）
+
+| 目标 | 动工前 | fix24 | **fix26（当前）** | unknown |
+|---|---|---|---|---|
+| lighttpd | 504s | 90s | **83s** | 26 |
+| redis-cli | 351s | 87s | **82s** | 7 |
+| libuv | 100s | 40s | **38s** | 8 |
+| vsftpd | 87s | 32s | **31s** | 0 |
+| memcached | 264s | 73s | **69s** | 0 |
+| wrk | 35s | 19s | **17s** | 0 |
+| ffmpeg | 367s | 100s | **91s** | 5 |
+| tmux | timeout 1500s 无 IR | 310s | **271s** | 25 |
+| ssh | timeout 1500s 无 IR | 273s | **250s** | 65 |
+| wolfssl | timeout 1500s 无 IR | 809s | **626s** | 556 |
+
+### 12.4 等价性
+
+- `/tmp/sig_diff3.py`（fix24 vs fix26）：10 个目标函数签名零变化。
+- unknown 计数逐目标不变；SSA 计数 `dead_loads_removed`/`dead_stores_removed` 完全一致。
+- 10 个目标 `llvm-as` + `opt -passes=verify` 全 OK；`ctest` 12/12；单测通过。
+
+### 12.5 如果还要继续
+
+按 perf 剩余分布，下一批候选是：base summary（`Analyzer::solveFunction`/`transferInstruction`
+合计 ~20%，其中每块按值拷贝 State、`pruneBlockLocalValueFacts` 全量扫 ValueOrigins）、
+`removeDeadStoresByLiveness`（~10%，同样是每块每轮的定点，可换工作队列）、lift
+（`appendPcodeFunction`/`PcodeLowerer::lower` ~12%，每指令挂 metadata 的开销）。
+
