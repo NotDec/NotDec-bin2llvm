@@ -258,6 +258,14 @@ wolfssl（3964 个函数、IR 37MB）现在能跑完并验证通过，但 1782s 
 1500s 上限——它体量是 tmux 的 3 倍，按同一量级外推仍差 ~20%。如果还要继续压，
 下一层热点看 base summary（3964 个函数的 SCC/定点）和 removeDeadStoresByLiveness。
 
+### 8.6 残留与后续
+
+- 缓存是"链成员"语义，理论上可能多返回 true（保守），实测无差异；如果将来发现
+  `dead_loads_removed` 异常下降，先查这里。
+- 临时插桩（`NOTDEC_DEBUG_SSA_TIMING` 那套）已删除，代码里没有 getenv。
+- 下一步可选：`removeDeadStoresByLiveness`（改后占比上升）、base summary 的
+  demand 定点（tmux 44s / ssh 105s，波动大）都不再是瓶颈，但可以作为后续优化。
+
 ## 9. wolfssl 为什么还要 ~1350s（2026-09-24 追加测量）
 
 先把探针加回来（`NOTDEC_DEBUG_SUMMARY_TIMING` / `NOTDEC_DEBUG_SSA_TIMING`，测完已回退），
@@ -296,10 +304,41 @@ IR 37MB（lighttpd 是 505 函数 / 69k loads / 102k stores / 4.6MB）。
 如果要让 wolfssl 也进 1500s：优先做 2（改动小、语义等价、预计省 100-150s）和 3 的
 InstCombine 短路（预计省 ~54s+），就能压到 ~1150s；再要快就得动 1 或 4。
 
-### 8.6 残留与后续
+## 10. 第二轮优化：demand 跳过 + cleanup 短路（2026-09-24，commit `2577874`）
 
-- 缓存是"链成员"语义，理论上可能多返回 true（保守），实测无差异；如果将来发现
-  `dead_loads_removed` 异常下降，先查这里。
-- 临时插桩（`NOTDEC_DEBUG_SSA_TIMING` 那套）已删除，代码里没有 getenv。
-- 下一步可选：`removeDeadStoresByLiveness`（改后占比上升）、base summary 的
-  demand 定点（tmux 44s / ssh 105s，波动大）都不再是瓶颈，但可以作为后续优化。
+### 10.1 改动
+
+1. `runTopDownDemand`（`NativeRegisterSummary.cpp`）：给每个函数的 ExitDemand 记版本号，
+   只有它自己变过才重算 `analyzeCallerDemand`。依据：该函数只读 F 自己的 IR 和 F 自己的
+   `Demands[&function].ExitDemand`（`liveBeforeBlock` 里唯一的 `Demands[...]` 读），
+   callee 的需求是它的**输出**。原来每轮遍历全部函数，等于重复 `computeValueDemands`
+   加一次块级定点，规模是 轮数 × 全部函数。
+2. `runPostRewriteInstCombine`（`NativeRegisterSummarySSA.cpp`）返回「IR 是否被改动」
+   （InstCombine/SimplifyCFG 无改动时返回 `PreservedAnalyses::all()`）；cleanup 循环在
+   `iteration > 0` 且两个 pass 都没改过 IR 时直接结束。这一轮面对的 IR 与上一轮结束时相同，
+   上一轮「改写完再删死值」已经是同一个 IR 上的定点；剩下的死 store 不影响语义。
+
+### 10.2 量测（/tmp/fix23 vs /tmp/fix21，同命令，10 个目标）
+
+| 目标 | fix21 | fix23 | unknown | verify |
+|---|---|---|---|---|
+| lighttpd | 173s | **140s** | 26 | OK |
+| redis-cli | 146s | 143s | 7 | OK |
+| libuv | 69s | 74s | 8 | OK |
+| vsftpd | 47s | 42s | 0 | OK |
+| memcached | 116s | 95s | 0 | OK |
+| wrk | 29s | 22s | 0 | OK |
+| ffmpeg | 159s | 157s | 5 | OK |
+| tmux | 591s | **474s** | 25 | OK |
+| ssh | 378s | **330s** | 65 | OK |
+| wolfssl | 1782s | **1385s** | 556 | OK |
+
+10 个目标现在全部在 sweep 的 1500s 以内（libuv 的 69→74s 是噪声）。
+
+### 10.3 等价性
+
+- `/tmp/sig_diff2.py`（fix21 vs fix23）：9 个目标函数签名零变化（tmux/ssh 也纳入对比）。
+- unknown 计数逐目标不变；SSA 计数 `dead_loads_removed` / `dead_stores_removed` 完全一致
+  （lighttpd 32/50、tmux 77/139、ssh 332/543、wolfssl 190/225）。
+- 全部 `llvm-as` + `opt -passes=verify` OK；`ctest` 12/12；单测通过。
+
