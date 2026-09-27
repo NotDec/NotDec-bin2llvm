@@ -8,6 +8,7 @@
 namespace llvm {
 class IRBuilderBase;
 class LLVMContext;
+class MDNode;
 class Module;
 class Value;
 class GlobalVariable;
@@ -51,6 +52,9 @@ private:
     uint32_t Size = 0;
     std::string Name;
     llvm::GlobalVariable *Global = nullptr;
+    // 访问元数据只依赖这个 unit（名字/空间/偏移/大小），但 lift 对每条 load/store
+    // 都会重建 5 个字符串 + MDString/MDNode。这里按 unit 缓存同一个（uniqued）节点。
+    llvm::MDNode *AccessMetadata = nullptr;
   };
 
   RegisterUnit *unitFor(const RegisterAccess &access);
@@ -58,12 +62,13 @@ private:
   llvm::GlobalVariable *globalFor(RegisterUnit &unit);
   uint64_t bitOffset(const RegisterUnit &unit,
                      const RegisterAccess &access) const;
-  void addAccessMetadata(llvm::Value *instruction, const RegisterUnit &unit,
+  void addAccessMetadata(llvm::Value *instruction, RegisterUnit &unit,
                          const RegisterAccess &access, bool isFloatWrite);
 
   llvm::LLVMContext &Context;
   llvm::Module &Module;
   std::vector<RegisterUnit> Units;
+  llvm::MDNode *FloatWriteMetadata = nullptr;
   bool IsBigEndian = false;
 };
 

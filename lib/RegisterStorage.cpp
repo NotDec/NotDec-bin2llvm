@@ -178,7 +178,7 @@ uint64_t RegisterStorage::bitOffset(const RegisterUnit &unit,
 }
 
 void RegisterStorage::addAccessMetadata(llvm::Value *instruction,
-                                        const RegisterUnit &unit,
+                                        RegisterUnit &unit,
                                         const RegisterAccess &access,
                                         bool isFloatWrite) {
   auto *inst = llvm::dyn_cast<llvm::Instruction>(instruction);
@@ -186,19 +186,25 @@ void RegisterStorage::addAccessMetadata(llvm::Value *instruction,
     return;
   }
   (void)access;
-  llvm::Metadata *metadata[] = {
-      llvm::MDString::get(Context, "base=" + unit.Name),
-      llvm::MDString::get(Context, "space=" + unit.Space),
-      llvm::MDString::get(Context, "offset=" + std::to_string(unit.Offset)),
-      llvm::MDString::get(Context, "size=" + std::to_string(unit.Size)),
-      llvm::MDString::get(Context, "name=" + unit.Name),
-  };
-  inst->setMetadata("notdec.register.access",
-                    llvm::MDNode::get(Context, metadata));
+  // 节点内容只由 unit 决定（access 不参与；MDNode 本身是 uniqued 的），所以同一个
+  // unit 只构造一次，之后直接复用。
+  if (unit.AccessMetadata == nullptr) {
+    llvm::Metadata *metadata[] = {
+        llvm::MDString::get(Context, "base=" + unit.Name),
+        llvm::MDString::get(Context, "space=" + unit.Space),
+        llvm::MDString::get(Context, "offset=" + std::to_string(unit.Offset)),
+        llvm::MDString::get(Context, "size=" + std::to_string(unit.Size)),
+        llvm::MDString::get(Context, "name=" + unit.Name),
+    };
+    unit.AccessMetadata = llvm::MDNode::get(Context, metadata);
+  }
+  inst->setMetadata("notdec.register.access", unit.AccessMetadata);
   if (isFloatWrite) {
-    inst->setMetadata(
-        "notdec.register.float_write",
-        llvm::MDNode::get(Context, llvm::MDString::get(Context, "1")));
+    if (FloatWriteMetadata == nullptr) {
+      FloatWriteMetadata =
+          llvm::MDNode::get(Context, llvm::MDString::get(Context, "1"));
+    }
+    inst->setMetadata("notdec.register.float_write", FloatWriteMetadata);
   }
 }
 

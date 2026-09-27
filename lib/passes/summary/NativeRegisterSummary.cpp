@@ -1951,17 +1951,23 @@ private:
       }
       transferInstruction(inst, state);
     }
-    pruneBlockLocalValueFacts(state);
+    pruneBlockLocalValueFacts(block, state);
     return state;
   }
 
-  void pruneBlockLocalValueFacts(State &state) const {
-    for (auto it = state.ValueOrigins.begin();
-         it != state.ValueOrigins.end();) {
-      if (CrossBlockValues.count(it->first) == 0) {
-        it = state.ValueOrigins.erase(it);
-      } else {
-        ++it;
+  // 转移只会给**本块**的指令新增 ValueOrigins 项（load / 调用点，见
+  // transferInstruction）；入口状态里的项在上一块已经剪过，留下的都是跨块值，原实现
+  // 每次转移全量扫一遍 ValueOrigins（大函数上千项 × 每块），这里只查本块指令，
+  // 结果与原来一致。
+  void pruneBlockLocalValueFacts(llvm::BasicBlock &block, State &state) const {
+    if (state.ValueOrigins.empty()) {
+      return;
+    }
+    for (llvm::Instruction &inst : block) {
+      auto it = state.ValueOrigins.find(&inst);
+      if (it != state.ValueOrigins.end() &&
+          CrossBlockValues.count(&inst) == 0) {
+        state.ValueOrigins.erase(it);
       }
     }
   }

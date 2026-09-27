@@ -6293,9 +6293,20 @@ private:
       ++existingIncoming[phi->getIncomingBlock(index)];
     }
     std::map<llvm::BasicBlock *, unsigned> requiredIncoming;
+    // 同一个前驱在 CFG 里可能出现多次（重复边：switch 多个 case 指向同一块、
+    // 条件分支两边同目标等）。LLVM 要求同一前驱的多个 incoming **值相同**，所以本轮
+    // 为同一个 pred 补的多个槽必须复用同一个值——否则每条边各造一个 unknown 会得到
+    // 非法 phi（实测 tmux 上偶发 verifier 报 "multiple entries for the same basic
+    // block with different incoming values"，是随堆布局变化的偶发失败）。
+    std::map<llvm::BasicBlock *, llvm::Value *> appendedIncoming;
     for (llvm::BasicBlock *pred : llvm::predecessors(&block)) {
       unsigned requiredCount = ++requiredIncoming[pred];
       if (existingIncoming[pred] >= requiredCount) {
+        continue;
+      }
+      if (auto cached = appendedIncoming.find(pred);
+          cached != appendedIncoming.end()) {
+        phi->addIncoming(cached->second, pred);
         continue;
       }
       llvm::Instruction *terminator = pred->getTerminator();
@@ -6312,6 +6323,7 @@ private:
                 ? attributedRangeUnknown(*terminator, range, ".range_unknown")
                 : llvm::UndefValue::get(rangeType(range));
       }
+      appendedIncoming.emplace(pred, incoming);
       phi->addIncoming(incoming, pred);
     }
     return simplifyRangePhi(*phi, range);
