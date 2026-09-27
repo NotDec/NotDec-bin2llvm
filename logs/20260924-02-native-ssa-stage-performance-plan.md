@@ -458,3 +458,59 @@ perf（整跑采样）显示：
 `removeDeadStoresByLiveness`（~10%，同样是每块每轮的定点，可换工作队列）、lift
 （`appendPcodeFunction`/`PcodeLowerer::lower` ~12%，每指令挂 metadata 的开销）。
 
+## 13. 第五轮：base summary / liveness / lift 三处 + 重复前驱边 phi 的偶发非法 IR（2026-09-24，commit `8e54cdb`）
+
+### 13.1 做了什么
+
+1. `Analyzer::pruneBlockLocalValueFacts`（`NativeRegisterSummary.cpp`）：转移只会给**本块**
+   指令新增 ValueOrigins 项（load / 调用点，见 `transferInstruction`），原来每次转移全量
+   扫一遍 map；改成只查本块指令。入口状态里的项在上一块已经剪过，结果一致。
+2. liveness 的工作队列（`removeDeadStoresByLiveness`）：实现了、量测没有收益，**已回退**
+   ——它改的是定点遍历顺序，收益不明确时不值得引入风险。
+3. `RegisterStorage::addAccessMetadata`（`lib/RegisterStorage.cpp` + 头文件）：访问元数据
+   只依赖 unit（名字/空间/偏移/大小，access 不参与），原来每条 load/store 都重建 5 个
+   字符串 + MDString + MDNode；改成按 unit 缓存节点，浮点写节点也只建一次。
+4. **顺带修了一个偶发非法 IR 的 bug**：`completeRangePhi` 在 CFG 有重复前驱边（switch 多个
+   case 指向同一块）时，给同一前驱的多个 incoming 槽各造一个 unknown（`attributedRangeUnknown`
+   每次返回新的 `notdec.unknown.*()` 调用），verifier 报 “multiple entries for the same basic
+   block with different incoming values”。tmux 在 fix27 那次就是这样 exit=1、没有 IR；重跑
+   两次又通过（随堆布局偶发，2/3 通过）。改成同一 pred 本轮补的多个槽复用同一个 incoming 值
+   （LLVM 要求同一前驱的各项值相同）。
+
+### 13.2 量测（/tmp/fix29，10 个目标 + tmux 连跑 3 次，全部 verify OK、phi=0）
+
+| 目标 | fix26 | fix29 | unknown |
+|---|---|---|---|
+| lighttpd | 83s | 92s | 26 |
+| redis-cli | 82s | 84s | 7 |
+| libuv | 38s | 38s | 8 |
+| vsftpd | 31s | 30s | 0 |
+| memcached | 69s | 68s | 0 |
+| wrk | 17s | 17s | 0 |
+| ffmpeg | 91s | 91s | 5 |
+| tmux | 271s | 274 / 276 / 276s | 25 |
+| ssh | 250s | 253s | 65 |
+| wolfssl | 626s | 636s | 556 |
+
+### 13.3 结论
+
+- 第 1、3 两项在总时间上是噪声（wolfssl 626 → 638 → 636s、lighttpd 83 → 92s 这一档都在
+  机器波动范围内），说明 wolfssl/lighttpd 剩余时间已经不在“每块扫一次 map / 每条指令建
+  metadata”这两个点上。保留它们是因为改动小、语义等价、确实少做无用功；没有把它们当成
+  提速项。
+- 第 4 项是这一轮的主要价值：修掉一个会偶发产出非法 IR 的 bug，tmux 连跑 3 次均通过。
+
+### 13.4 等价性
+
+- `/tmp/sig_diff3.py`（fix26 vs fix29）：10 个目标函数签名零变化。
+- unknown 计数逐目标不变；SSA 计数 `dead_loads_removed`/`dead_stores_removed` 完全一致。
+- 10 个目标 `llvm-as` + `opt -passes=verify` 全 OK；`ctest` 12/12；单测通过。
+
+### 13.5 如果还要继续压
+
+需要重新量一次当前热点（这一轮之后没有重新 profile）：预期剩余大头是 base summary 的
+每块 State 拷贝 + `joinState`、SSA 逐函数循环里的 `rewritePartialWrites`/`rewriteLoads`、
+以及 lift 的 `PcodeLowerer::lower`。重复前驱边那个 bug 也提示：这类“同一前驱/同一块出现
+多次”的路径值得再搜一遍（phi 之外，`addIncoming` 的另一个调用点是从现有 phi 镜像出来的，
+如果上游 phi 合法它就不会出问题）。
+
