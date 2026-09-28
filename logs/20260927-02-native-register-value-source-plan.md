@@ -276,6 +276,39 @@ unknown"的 `else` 分支删掉，让占位留给重写/清理遍按签名解析
    `integerSlotForSingleDemandRange` 决定，若 mask 落在非连续区间会退回整寄存器，而调用点
    需要的 range 可能仍不在覆盖范围内。
 
-- 阶段 1 收尾判据（按 §10/§11/§12 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
+
+## 13. "禁止裸读→没载体就给 unknown" 试改失败：入口读是**真来源**
+
+**试改**：在 `entryRangeInput` 末尾，对"接口可改"的函数（本地链接且地址没被取）直接删掉
+裸读兜底，改成 `entry_value_without_carrier` 的 unknown（边界函数保留裸读）。
+
+**结果**：单测两处失败 ——
+
+- `dead frame spill created an unknown vector value`
+- `callee-saved register after an internal call became unknown`
+
+**含义（关键）**：入口读（`load @REG` / `partial_read(@REG,…)`）**不是假值**，它承载的是
+"这个函数自己的入口值"——一个**真实来源**（被调用者/机器状态确实在入口放了值）。把它换成
+unknown 等于**把已经知道的值扔掉**，比裸读更糟。所以：
+
+- 出口 4（裸读）的正解是**出口 3：形参**，不是 unknown；
+- "全化"必须**两边一起做**，否则只会把问题从一个地方挪到另一个地方：
+  - **callee 侧**：入口需要的 range 全部由形参承载（现在的判据只覆盖"返回槽需要的那部分位"）；
+  - **caller 侧**：调用点要能给出这个形参的值（先取调用者自己的按位 SSA 值；现在只认 store 绑定）。
+  只做 callee 侧就是 §9.1 量到的现象：callee 的裸读少了，调用点冒出一堆 unknown。
+
+已回退（测试恢复通过，工作区干净）。
+
+**修正后的下一步（一个组合改动）**：
+
+1. callee 侧：入口形参判据从 `ReadEntryMask | returnEntryMask` 扩到"按位 SSA 在入口要过的
+   所有 range"（出口 3 成为默认载体）；
+2. caller 侧：`call_arg_rewrite_missing_binding` 与调用点分派改成"先取调用者自己的按位
+   SSA 值"，确实没有才落到 unknown / 边界读；
+3. 两边一起量：`local_register_reads` 应显著下降，且 unknown **不净增**（原来由裸读承载的
+   值改由形参承载）；
+4. 之后才是策略：出口 1（剪掉调用者并不需要的返回槽）vs 出口 2/3。
+
+- 阶段 1 收尾判据（按 §10–§13 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
   逐条能说出“为什么是边界 / 为什么是 junk”。
 
