@@ -331,6 +331,38 @@ unknown 等于**把已经知道的值扔掉**，比裸读更糟。所以：
 
 填充槽（`read_entry=false` 那类）不受这两步影响，继续按 §10 保持 unknown + 后续专门 Pass 消除。
 
-- 阶段 1 收尾判据（按 §10–§14 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
+
+## 15. 结论（用户确认）：签名改写要能查"值表"，不能只认 store 绑定
+
+诊断已确认：问题在**改写签名阶段只能看 store 绑定**，而机器传寄存器参数根本不需要 store。
+修法就是让改写阶段能查到构建期那张"某调用点某寄存器 range 的值"表。
+
+**实现规格（下一轮照此执行）**
+
+1. **记录（构建期）**：在 `SignatureRewriteState`（`NativeRegisterSummarySSA.cpp:345-351` 一带，
+   现有 `CallArgRecordedValues / …ByFunction` 旁边）新增
+   ```
+   // 调用点每个参数槽在"调用前那一刻"的按位 SSA 值：改写阶段缺 store 绑定时用它，
+   // 而不是造 unknown。键 = (call, param index)；值 = range SSA 值。
+   std::map<llvm::CallBase *, std::map<unsigned, llvm::Value *>> CallArgRangeValues;
+   ```
+   填充点：FunctionBuilder 处理调用（`transferRangeBlockUntil` 的 call 分支，`:6167-6216`
+   一带）时，对 callee shape 的每个 `NativeSignatureSlot`（含 `slot.Unit`/`OffsetBits`/`SizeBits`），
+   用当前 `CurrentDef` 查该寄存器 range 的值（若跨 range 需按 `extractRangeValue` 拼装，
+   和 `entryRangeArgument` 的做法一致），存进 `CallArgRangeValues[call][index]`。
+2. **消费（改写期）**：`rewriteSignatureShapes` 的实参循环（`:8943` 前后，
+   `bindingForIndex` 返回 nullptr 时）改为
+   ①取 `CallArgRangeValues[call][index]` → `remapValue` + `localizeCallArgument` 后使用；
+   ②再取调用者自己的 ABI 形参（若该槽寄存器就是调用者的入参寄存器）；
+   ③都没有才落到现在的位置（裸读 / unknown）。
+3. **验收**：审计里 `call_arg_rewrite_missing_binding` 显著下降；新增形参时 unknown **不净增**；
+   10 目标 verify OK、ctest 12/12。
+4. **然后**才做 §14 的第 2 步（扩 callee 入口形参）；填充槽维持 §10 的决定。
+
+风险：跨 range 拼装（`extractRangeValue`）与 `localizeCallArgument` 的语义要保持和
+`entryRangeArgument` 一致；`CurrentDef` 在调用点可能只有部分 range 的值，缺的部分要放弃
+（不要临时造值）。
+
+- 阶段 1 收尾判据（按 §10–§15 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
   逐条能说出“为什么是边界 / 为什么是 junk”。
 
