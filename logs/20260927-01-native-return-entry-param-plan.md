@@ -1,5 +1,8 @@
 # 返回槽里“可能还是入口值”的位没有形参承载（读寄存器 global / partial_read 占位）
 
+> **后续**：本文的“入口形参”改动已并入 `logs/20260927-02-native-register-value-source-plan.md`
+> 的**阶段 1**（入口侧闭合）；本轮实验未落地，patch 在 `/tmp/fix-entry-param.patch`。
+
 ## 0. 用户原始 prompt
 
 > 继续修复IR里面明显的问题吧。性能目前看还行。
