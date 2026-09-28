@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -117,6 +118,23 @@ struct NativeRegisterSummarySSASummary {
   std::vector<NativeRegisterSummarySSAFunctionSummary> Functions;
   std::vector<NativeRegisterSummarySSAWarning> Warnings;
 };
+
+// 产物审计：把“寄存器值的来源”变成可数的量（见
+// logs/20260927-02-native-register-value-source-plan.md）。
+// “接口可改”指本地链接且函数地址没被取——这类函数的调用点全部由本 pass 改写，
+// 所以它不该再读寄存器 global（不变量 I1）；其余函数是边界，读寄存器是允许的
+// （I3），但要单独计数。UnknownValuesByReason 按 !notdec.unknown.source 的 reason
+// 分类，用来盯“建模缺口型 unknown”（I2）。
+struct NativeRegisterValueSourceAudit {
+  uint64_t LocalRegisterReads = 0;
+  uint64_t BoundaryRegisterReads = 0;
+  uint64_t PartialWriteHelpers = 0;
+  uint64_t ClobberPlaceholders = 0;
+  std::map<std::string, uint64_t> UnknownValuesByReason;
+};
+
+NativeRegisterValueSourceAudit
+auditNativeRegisterValueSources(llvm::Module &module);
 
 NativeRegisterSummarySSASummary runNativeRegisterSummarySSA(
     llvm::Module &module, const NativeRegisterSummarySSAOptions &options = {});

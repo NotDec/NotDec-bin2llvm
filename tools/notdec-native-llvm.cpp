@@ -577,6 +577,27 @@ void reportRemainingUnknownValues(llvm::Module &module) {
     first = false;
   }
   std::cerr << (first ? "" : "]") << '\n';
+  // 产物审计：寄存器值的来源不变量（logs/20260927-02-native-register-value-source-plan.md）。
+  // local_register_reads 是“接口可改的内部函数里还残留的寄存器 global 读”，不变量 I1
+  // 要求它为 0；boundary_register_reads 是边界函数（外部可见/地址被取）里的读，允许
+  // 但单独计数（I3）。unknowns 按 reason 分类，I2 要求其中不再有“建模缺口”类。
+  notdec::bin2llvm::NativeRegisterValueSourceAudit audit =
+      notdec::bin2llvm::auditNativeRegisterValueSources(module);
+  uint64_t auditUnknowns = 0;
+  for (const auto &[reason, count] : audit.UnknownValuesByReason) {
+    (void)reason;
+    auditUnknowns += count;
+  }
+  std::cerr << "Native register value sources: local_register_reads="
+            << audit.LocalRegisterReads
+            << " boundary_register_reads=" << audit.BoundaryRegisterReads
+            << " partial_write_helpers=" << audit.PartialWriteHelpers
+            << " clobber_placeholders=" << audit.ClobberPlaceholders
+            << " unknowns=" << auditUnknowns;
+  for (const auto &[reason, count] : audit.UnknownValuesByReason) {
+    std::cerr << " " << reason << "=" << count;
+  }
+  std::cerr << '\n';
 }
 
 bool resolveFunctionRange(const notdec::bin2llvm::NativeProgramState &state,

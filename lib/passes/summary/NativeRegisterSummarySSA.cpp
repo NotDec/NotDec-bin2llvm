@@ -711,6 +711,70 @@ std::optional<std::string> mdField(const llvm::MDNode *node,
   return std::nullopt;
 }
 
+// 产物审计：见头文件里的说明。这里只按“本地链接 + 地址没被取”判断接口是否可改：
+// 满足时函数的所有调用点都由本 pass 改写，寄存器读必须有形参/返回值承载。
+bool registerValueSourceIsControlled(const llvm::Function &function) {
+  return function.hasLocalLinkage() && !function.hasAddressTaken();
+}
+
+bool pointerIsRegisterGlobal(const llvm::Value *value) {
+  const llvm::Value *stripped = value->stripPointerCasts();
+  const auto *global = llvm::dyn_cast<llvm::GlobalVariable>(stripped);
+  return global != nullptr && global->getMetadata("notdec.register") != nullptr;
+}
+
+NativeRegisterValueSourceAudit
+auditRegisterValueSourcesImpl(llvm::Module &module) {
+  NativeRegisterValueSourceAudit audit;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    const bool controlled = registerValueSourceIsControlled(function);
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+          if (pointerIsRegisterGlobal(load->getPointerOperand())) {
+            if (controlled) {
+              ++audit.LocalRegisterReads;
+            } else {
+              ++audit.BoundaryRegisterReads;
+            }
+          }
+          continue;
+        }
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr) {
+          continue;
+        }
+        llvm::StringRef name = callee->getName();
+        if (isNativeRegisterPartialReadName(name) && call->arg_size() >= 1 &&
+            pointerIsRegisterGlobal(call->getArgOperand(0))) {
+          if (controlled) {
+            ++audit.LocalRegisterReads;
+          } else {
+            ++audit.BoundaryRegisterReads;
+          }
+        } else if (isNativeRegisterPartialWriteName(name)) {
+          ++audit.PartialWriteHelpers;
+        } else if (name.starts_with("notdec.register.summary_clobber.")) {
+          ++audit.ClobberPlaceholders;
+        } else if (isNotDecOpaqueUnknownName(name)) {
+          std::string reason =
+              mdField(call->getMetadata("notdec.unknown.source"), "reason")
+                  .value_or("no_reason");
+          ++audit.UnknownValuesByReason[reason];
+        }
+      }
+    }
+  }
+  return audit;
+}
+
 std::string unitName(const llvm::GlobalVariable &global) {
   if (auto name = mdField(global.getMetadata("notdec.register"), "name")) {
     if (!name->empty()) {
@@ -9220,6 +9284,11 @@ collectRemainingCallValueWarnings(const llvm::Module &module) {
 }
 
 } // namespace
+
+NativeRegisterValueSourceAudit
+auditNativeRegisterValueSources(llvm::Module &module) {
+  return auditRegisterValueSourcesImpl(module);
+}
 
 NativeRegisterSummarySSASummary
 runNativeRegisterSummarySSA(llvm::Module &module,

@@ -119,4 +119,83 @@
 
 - `logs/20260927-01-native-return-entry-param-plan.md`（入口形参实验，未落地）是**阶段 1 的一种手段**，不是全部；它的量测数据（unknown 会先涨）正好说明为什么必须先做阶段 0 的审计、再做阶段 1。
 - 交接文档 `logs/20260923-01-native-handover.md` §6 的“不要重试”清单继续有效。
-- 本文只写规划，没有改产品代码；工作区干净（HEAD `c07aa7d` + 本文档提交）。
+- 本文档记录规划与后续实现记录（阶段 0 已落地，见 §8）。
+## 8. 阶段 0 实现记录（已落地）
+
+- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h`：新增
+  `NativeRegisterValueSourceAudit` 结构与 `auditNativeRegisterValueSources()` 声明。
+- `lib/passes/summary/NativeRegisterSummarySSA.cpp`：实现放匿名 namespace
+  （`registerValueSourceIsControlled` = 本地链接且函数地址没被取；
+  `pointerIsRegisterGlobal`；`auditRegisterValueSourcesImpl`），公开 wrapper 在匿名
+  namespace 之后。分类：`load iN, ptr @REG` 与 `notdec.partial_read.*(@REG, …)` 按
+  “接口可改 / 边界”分别计数；`notdec.partial_write.*`、`notdec.register.summary_clobber.*`、
+  `notdec.unknown.*`（按 `!notdec.unknown.source` 的 `reason`）各一列。
+- `tools/notdec-native-llvm.cpp`：`reportRemainingUnknownValues` 里在
+  `notdec.unknown remaining` 之后打印 `Native register value sources: …`（只在
+  `--register-ssa-summary` 下打印，默认路径 stderr 仍为空）。
+- `tests/native_register_summary_ssa_test.cpp`：
+  `testRegisterValueSourceAuditClassifiesReads`（内部读→local、外部可见读→boundary、
+  unknown 按 reason 归类）。
+
+命令：
+
+```bash
+make -C build -j16 notdec-native-llvm native_register_summary_ssa_test
+./build/bin/native_register_summary_ssa_test            # exit 0
+build/bin/notdec-native-llvm <target> --all-confirmed --skip-runtime --register-ssa-summary -o out.ll
+```
+
+基线（**最终产物**、审计口径）：
+
+| 目标 | local_register_reads | boundary_register_reads | clobber_placeholders | unknowns |
+|---|---|---|---|---|
+| vsftpd | 7 | 6 | 23 | 0 |
+| lighttpd | 120 | 6 | 519 | 26（`entry_range_rejected` 16、`return_binding_uses_clobber_value` 10） |
+| tmux | 308 | 473 | 6856 | 25（`call_arg_rewrite_missing_binding` 14、`entry_range_rejected` 6、`call_effect_mixed` 4、`return_binding` 1） |
+
+注意：§1 表里用脚本数的 `partial_read` 把 helper 的 `declare` 也算进去了，实际以本表为准
+（lighttpd 旧口径 76 里有 9 条是声明）。
+
+## 9. 阶段 1：现状、修正后的工作项
+
+### 9.1 入口形参（原 1c）已实现并量测：单独落地不达标
+
+patch：`/tmp/fix-entry-param.patch`（收窄版：跳过浮点返回寄存器与变参函数）。
+
+| 目标 | local_register_reads | unknowns |
+|---|---|---|
+| vsftpd | 7 → 9 | 0 → 0 |
+| lighttpd | 120 → **78** | 26 → **84**（`call_effect_mixed` +47、`entry_range_rejected` +6、`call_arg_rewrite_missing_binding` +5） |
+| tmux | 308 → 291 | 25 → 30 |
+
+1c 只覆盖“返回槽需要的入口位”，裸读主体（填充槽、边界、跳过的那几类）还在；
+涨的 unknown 全部落在阶段 2/3 负责的类里。按 §5 判据**先不落地**，只留 patch。
+
+### 9.2 `entry_range_rejected` 的成因分类（本轮查清）
+
+抽查 lighttpd 16 个（FUN_f108 RAX×3、FUN_f147 RAX×3、FUN_f8e6 RCX×2、FUN_263db RDX×2、
+FUN_3acd0 RAX×2、FUN_e78d RCX、FUN_23a73 RAX、FUN_23c64 R10、buffer_copy_string_len_lc RAX）
+与 wolfssl/tmux 的同名项，分两类：
+
+1. **编译器填充/保存区（junk）**。例 `FUN_f108`（0xf108）：汇编是
+   `push rax`（对齐 8 字节）→ `call` → `pop r9`（R9 是后随变参调用的寄存器保存槽），
+   源码对应 connections.c 的 `log_pri(...)`。summary 的 `collectStackAdjustmentSlots`
+   已判定它是“栈对齐 push，值 undef”（`NativeRegisterSummary.cpp:2076`），所以
+   `read_entry` 里没有 RAX；但按位 SSA 仍把 `push` 的**值**（入口 RAX）物化出来，
+   出口级 `MayEntryMask` 闸门再拒掉 → 3 个 unknown。同型：FUN_f147、FUN_f8e6、
+   FUN_e78d（`push rcx … pop rdx`）、FUN_23c64（`push r10`）。
+   **修法**：在“已判定为填充/保存区”的槽位 store 处直接写 poison（IR 侧的
+   `getUndefRegState`），不给它找值 —— 裸读和 unknown 一起消失。
+2. **真入口值**：请求发生在函数入口、这些位确实还没被写过，只是出口级 `MayEntryMask`
+   为 0（函数在别的路径上覆盖过）。点查询用了出口级 mask。
+   **修法**：按位 SSA 走到函数入口就说明来源就是入口值，闸门只留诊断（warning 类），
+   值走形参 / 边界读。
+
+### 9.3 修正后的阶段 1 工作项
+
+- **1a**：填充/保存区槽位 poison 化（覆盖第 1 类，预计消掉 lighttpd 16 里的大半）。
+- **1b**：入口闸门改点敏感（只告警不拒），第 2 类走形参/边界读。
+- **1c**：入口形参补齐（patch 已有，等 1a/1b 一起量）。
+- 阶段 1 收尾判据：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
+  逐条能说出“为什么是边界 / 为什么是 junk”。
+
