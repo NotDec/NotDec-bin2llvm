@@ -224,6 +224,31 @@ FUN_3acd0 RAX×2、FUN_e78d RCX、FUN_23a73 RAX、FUN_23c64 R10、buffer_copy_st
 局部、可单测），再 `call_effect_mixed` 的 (ii)+(i)，最后 `call_arg_rewrite_missing_binding`；
 每步按 §5 判据量测（审计行 + unknown 直方图 + verify + ctest）。
 
-- 阶段 1 收尾判据（按 §10 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
+
+## 11. 返回侧试改记录：折叠是**有意的**，得从 demand 侧修
+
+按 §10 的顺序先动返回侧：把 `collectFunctionReturnValues`（`NativeRegisterSummarySSA.cpp`
+`:7812` 一带）里"出口值全是 clobber 占位 → 折叠成 `return_binding_uses_clobber_value`
+unknown"的 `else` 分支删掉，让占位留给重写/清理遍按签名解析。
+
+结果：单测三处失败 ——
+
+- `unknown external RDX value was not materialized as unknown`
+- `internal return exposed external clobber helper`
+- `sqrtl left a register SSA warning`
+
+说明这个折叠是**有意的设计**：内部函数的出口值里不允许暴露 clobber helper 占位，出口处宁可
+给显式 unknown。已回退（工作区干净，单测恢复通过）。
+
+结论（修正 §10 的顺序）：**返回侧的 52 个 unknown 不能就地修**，得先修 demand 侧 ——
+只要 callee 的返回槽覆盖了调用者需要的寄存器，clobber 图在到达 `ret` 之前就已经被解析成
+真实返回值，折叠根本不会触发。所以顺序改为：
+
+1. `call_effect_mixed` 的 (i) demand 侧：让 `analyzeCallerDemand` / `ExitDemand` 把
+   "调用点之后仍被读"的 Mixed 寄存器算进去（callee 的 `shape.Returns` 因此覆盖它）；
+2. 再看 (ii) 分派侧是否还需要"第一遍可替换占位"；
+3. 返回侧与 `call_arg_rewrite_missing_binding` 顺带消失或大幅下降。
+
+- 阶段 1 收尾判据（按 §10/§11 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
   逐条能说出“为什么是边界 / 为什么是 junk”。
 
