@@ -196,6 +196,34 @@ FUN_3acd0 RAX×2、FUN_e78d RCX、FUN_23a73 RAX、FUN_23c64 R10、buffer_copy_st
 - **1a**：填充/保存区槽位 poison 化（覆盖第 1 类，预计消掉 lighttpd 16 里的大半）。
 - **1b**：入口闸门改点敏感（只告警不拒），第 2 类走形参/边界读。
 - **1c**：入口形参补齐（patch 已有，等 1a/1b 一起量）。
-- 阶段 1 收尾判据：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
+
+## 10. 决策与阶段 2/3 的切入点
+
+**用户决策（填充槽 / 栈对齐 push 的值）**：不要用 poison —— 后续优化对 poison 的行为可能超出
+预期；这类"编译器自己都当 undef 用"的槽位，值用 `notdec.unknown` 是对的；如果消不掉，后面
+再设计**专门的优化 Pass** 来消除（例如只喂给死槽/变参保存槽的 unknown）。
+
+对本规划的修改：
+
+- 阶段 1a 从"poison 化"改为"**保持 unknown + 归因到填充槽**"：现状（lighttpd 16 个）已经是
+  unknown，但 reason 是 `entry_range_rejected`；应改成 `padding_slot_value` 这类一眼能看出
+  "这是编译器填充值"的 reason，并把"消除"拆成后续独立 Pass。
+- 阶段 1b（入口闸门点敏感）只对**真入口值**那一类生效；填充槽那类继续走 unknown。
+
+**阶段 2/3 代码切入点（本轮已定位）**：
+
+| 目标 reason | 位置 | 现状与修法 |
+|---|---|---|
+| `call_effect_mixed`（534） | 分派 `NativeRegisterSummarySSA.cpp:6167-6216`；返回槽条件 `:1806` 一带 | Mixed 时若 `signatureReturnUsesUnit` 为真已走 `callRangeValue`（正确）；为假才 `markBlockRangeUnknown`。根因是 **callee 的返回槽没覆盖该寄存器**（`ExitDemand` 没算上这个调用点的需求）。修法：(i) demand 侧让 callers 的需求进 `ExitDemand`；(ii) 分派侧第一遍对 Mixed 生成可替换占位，交给 cleanup 按签名解析（cleanup 的 `callEffect` 已经分 ReturnValue/Preserve/Clobber）。两条都做才闭合：只做 (ii) 会退化成 clobber 占位（ABI 上不算错，但不是真值） |
+| `call_arg_rewrite_missing_binding`（61） | `:8943` 一带 | 绑定缺失时先试若干 fallback，最后造 unknown；要补"取调用点该寄存器按位 SSA 值" |
+| `return_binding_uses_clobber_value`（52） | `:7825` 一带 | 返回绑定直接用 clobber 占位；改成优先取按位 SSA 值 / 形参链 |
+| `range_return_rewrite_missing_value`（5） | `:7693` | 返回重写找不到值，靠上面的闭合修 |
+| `foreign_call_argument_replacement`（1） | `:8200` 一带 | 传参取调用者 SSA 值 / I3 外部来源 |
+
+**建议顺序**：先返回侧（`return_binding_uses_clobber_value` + `range_return_rewrite_missing_value`，
+局部、可单测），再 `call_effect_mixed` 的 (ii)+(i)，最后 `call_arg_rewrite_missing_binding`；
+每步按 §5 判据量测（审计行 + unknown 直方图 + verify + ctest）。
+
+- 阶段 1 收尾判据（按 §10 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
   逐条能说出“为什么是边界 / 为什么是 junk”。
 
