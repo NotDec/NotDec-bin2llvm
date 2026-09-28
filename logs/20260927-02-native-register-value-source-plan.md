@@ -309,6 +309,28 @@ unknown 等于**把已经知道的值扔掉**，比裸读更糟。所以：
    值改由形参承载）；
 4. 之后才是策略：出口 1（剪掉调用者并不需要的返回槽）vs 出口 2/3。
 
-- 阶段 1 收尾判据（按 §10–§13 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
+
+## 14. 优先级确认（用户）：形参 > 裸读 > unknown；两边一起改的依赖顺序
+
+用户决策：**裸寄存器读仍然比 unknown 更优先**（已知来源 > 未知）。所以优先级是
+
+`形参（出口③） > 裸读（出口④，机器状态/入口值） > unknown（出口⑤）`
+
+这条直接决定了"两边一起改"的**依赖顺序**（否则会先制造 unknown）：
+
+1. **先做 caller 侧（使能半边）**：调用点必须能给出形参值。现在 `call_arg_rewrite_missing_binding`
+   只认 store 绑定，而改写阶段（`rewriteSignatureShapes`）已经拿不到按位 SSA 状态，所以做法是
+   **在 FunctionBuilder 构建期把"该调用点每个寄存器 range 的 SSA 值"记录下来**（沿用已有的
+   recorded-value 机制：`CallArgRecordedValues/…ByFunction`），改写阶段缺绑定时直接取它；
+   取不到（确实无定义）才允许落到裸读/边界读，最后才是 unknown。
+2. **再做 callee 侧（扩容半边）**：入口形参判据从 `ReadEntryMask | returnEntryMask` 扩到
+   "按位 SSA 在入口要过的 range"（候选：`ReadEntryMask | returnEntryMask | (EntryDemandMask & MayEntryMask)`；
+   注意 `EntryDemandMask` 含写保留位，注释里明确说会撑大参数，所以必须量测）。
+3. **顺序反了会先涨 unknown**：只扩 callee 侧（§9.1 已量到 lighttpd 26 → 84），因为调用点还不知道
+   该给什么。caller 侧先做好，扩容才不会引入新 unknown。
+
+填充槽（`read_entry=false` 那类）不受这两步影响，继续按 §10 保持 unknown + 后续专门 Pass 消除。
+
+- 阶段 1 收尾判据（按 §10–§14 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
   逐条能说出“为什么是边界 / 为什么是 junk”。
 
