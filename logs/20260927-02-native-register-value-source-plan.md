@@ -249,6 +249,33 @@ unknown"的 `else` 分支删掉，让占位留给重写/清理遍按签名解析
 2. 再看 (ii) 分派侧是否还需要"第一遍可替换占位"；
 3. 返回侧与 `call_arg_rewrite_missing_binding` 顺带消失或大幅下降。
 
-- 阶段 1 收尾判据（按 §10/§11 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
+
+## 12. 阶段 2 (i) 第一步：partial_read 的 demand 位偏移（已修，量测中性）
+
+**改动**：`NativeRegisterSummary.cpp` 的 `liveBeforeBlock` 里，partial_read 分支原来把
+`valueDemand(call, valueDemands)`（读结果坐标，从 bit 0 起）直接 `addDemand` 到寄存器上，
+没有按 `partial->BitOffset` 移位。改成先 `zext+shl(BitOffset)` 再 add。理由：读 `DH`
+（offset=8）的需求会记到 DL 上，调用点之后真正被读的位进不了 callee 的 ExitDemand。
+
+**量测**（lighttpd 97s、libuv 49s，与基线逐项对比）：
+
+| 目标 | local | boundary | clobber | unknowns |
+|---|---|---|---|---|
+| lighttpd | 120（不变） | 6（不变） | 519（不变） | 26（不变：entry_range_rejected 16、return_binding 10） |
+| libuv | 4 | 18 | 8 | 8（不变） |
+
+单测 `native_register_summary_ssa_test` / `native_register_summary_test` 通过。
+
+**结论**：这个移位是**对的**（坐标语义），但**不是** 534 个 `call_effect_mixed` 的成因
+（很多消费方按 mask 非零判断，位偏移不影响"有没有需求"）。下一步要查的是需求链上的另外两处：
+
+1. `applyBackwardCallDemand` 只在 `Effects.count(callee) != 0` 时把 `MayNonEntry & mask`
+   加进 callee 的 ExitDemand；effect 没算出来的 callee 会走到"不透明调用"分支，需求被擦掉
+   而不是传下去（`NativeRegisterSummary.cpp:3025/3053`）。
+2. 返回槽/`signatureReturnUsesUnit` 的**range 覆盖**：slot 类型由 `ExitDemandMask` 经
+   `integerSlotForSingleDemandRange` 决定，若 mask 落在非连续区间会退回整寄存器，而调用点
+   需要的 range 可能仍不在覆盖范围内。
+
+- 阶段 1 收尾判据（按 §10/§11/§12 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
   逐条能说出“为什么是边界 / 为什么是 junk”。
 

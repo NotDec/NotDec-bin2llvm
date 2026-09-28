@@ -2971,7 +2971,16 @@ private:
                 parseNativeRegisterPartialRead(*call)) {
           // 只喂给"没人读"的帧槽的死读不产生需求（见 helper 注释）。
           if (!partialReadFeedsOnlyDeadFrameSlots(*call)) {
-            addDemand(live, partial->Global, valueDemand(call, valueDemands));
+            // valueDemand 是"读结果"的按位需求（结果坐标，从 bit 0 起）；寄存器
+            // 需求要放到 partial->BitOffset 处。少了这个移位，读 DH（offset=8）
+            // 会把需求记到 DL 上，调用点之后真正被读的位永远进不了 callee 的
+            // ExitDemand，签名就不给返回槽 → call_effect_mixed unknown。
+            llvm::APInt mask = valueDemand(call, valueDemands);
+            if (partial->BitOffset != 0 && mask.getBitWidth() != 0) {
+              mask = mask.zext(mask.getBitWidth() + partial->BitOffset)
+                         .shl(partial->BitOffset);
+            }
+            addDemand(live, partial->Global, mask);
           }
           continue;
         }
