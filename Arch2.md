@@ -488,3 +488,90 @@ ELF 机器码
   结构体返回押后。
 - 栈参数绑定（调用前压栈的参数恢复成 call 参数）从 2026-07-25 起持续推进，尚未完全收口。
 - 旧 heritage 对照链路已从活跃代码、构建配置和工具入口中删除；历史实现只保留在 logs 和 git 历史中。
+
+## 13. 寄存器值的表示准则（2026-09-28）
+
+第 8 代把"返回信息唯一来源是签名"定下来之后，剩下的问题从"值从哪来"变成了"值丢了的时候怎么表示"。
+这一步只有三条准则，但它决定了后面还能不能把值修回来。
+
+**1. 优先级：载体 > 裸读 > unknown。**
+
+- **载体** = 入口形参 / 返回槽 / 调用点实参，值的真正来源；
+- **裸读** = `load @REG` / `notdec.partial_read.*(@REG, off)`：保留了"哪个寄存器、哪几位、
+  在哪个位置"；后面的阶段还能靠它把值提成形参/实参（第 12 节"栈参数绑定"就是这类工作）；
+- `notdec.unknown.*` 只说明"这里缺一个值"，寄存器和位的身份全丢了，只能靠人重新分析
+  （所以它要带 `!notdec.unknown.source` 归因）。
+
+所以同一个"未知的寄存器值"，宁可先落成裸读，也不要直接落成 unknown。**终态是两者都不出现**：
+裸读只允许出现在接口不可改的边界函数（导出函数、地址被取的函数）和不透明 callee 的出口。
+
+**2. 不用 poison 表示未知。**
+
+LLVM 允许把 poison 细化成任意具体值（`freeze(poison)` 会被 InstCombine 折成 0），占位会静默
+变成具体值，同时丢掉 `!notdec.unknown.source` 的归因。要表示"值未知"就用 `notdec.unknown.*`
++ `!notdec.unknown.source`（`unknownValueAt` 的注释里已经写了这条）。目前仍在用 poison 的几处
+（x87 空槽入口读、`vararg_unknown` 占位的降级、zero-demand 操作数）是旧决定的残留，逐个评估后换。
+
+**3. 边界两侧的位必须闭合。**
+
+现在两侧的判据是分着的：
+
+| 侧 | 判据 | 位置 |
+| --- | --- | --- |
+| 入口形参 | `ReadEntry` + `ReadEntryMask`（"入口值在被覆盖前被读过"的位） | `shapeForInternalFunction` 的 `addParamForUnit` |
+| 返回槽 | `MayNonEntry && ExitDemand` + `ExitDemandMask` | 同函数的返回槽循环 |
+
+缝隙是 `ExitDemandMask & MayNonEntryMask & MayEntryMask`——"返回槽里可能还是入口值的位"。
+构造出口寄存器值需要这些位的入口值，而入口没有形参承载它们，按位 SSA 就只能去裸读寄存器 global。
+补法是把这段 mask 并进入口 `paramMask`（见 `logs/20260927-02` §9.1 的 1c patch）。
+
+**例子：lighttpd `fdevent_fdnode_event_set`（0x38e10）**
+
+汇编上 EDX 是第 3 个源码参数 `int events`：两条提前返回的路径上 RDX 完全没被动过，间接调用
+`ev->event_set` 之后 RDX 被 clobber（caller-saved）。于是 summary 里：
+
+```text
+RDX: read_entry_mask=0xFFFFFFFF          （低 32 位真被读过：mov r12d,edx / cmp edx,[rsi+0x14]）
+     may_entry_mask=0xFFFFFFFFFFFFFFFF    （出口时高半可能还是入口值）
+     may_non_entry_mask=0xFFFFFFFFFFFFFFFF
+     exit_demand_mask=0xFFFFFFFFFFFFFFFF  （调用者把返回的 RDX 当 8 字节切片继续用）
+```
+
+当前产物是**混合态**——既不是"只当参数"，也不是"当返回值就同时把入口整个当参数"：
+
+```llvm
+define internal i64 @fdevent_fdnode_event_set(i64 %RDI.arg, i64 %RSI.arg, i32 %RDX.arg) {
+  %RDX.range_entry68 = call i32 @notdec.partial_read.i64.i32(ptr @RDX, i64 32)  ; ← 高半裸读
+  ...
+  ; 低半 = %RDX.arg / clobber / 重试路径返回值
+  ; 高半 = 上面这条裸读 / clobber / 重试路径返回值
+  ; 两半 zext 后拼成 i64 返回
+}
+```
+
+闭合之后（入口 `paramMask` 并上 `returnEntryMask`）应该长这样，裸读消失、也没有 unknown：
+
+```llvm
+define internal i64 @fdevent_fdnode_event_set(i64 %RDI.arg, i64 %RSI.arg, i64 %RDX.arg) {
+  ; 高半就是形参的高半；返回槽仍是 i64
+}
+```
+
+这就是"先让逻辑只在这三种情况之间切换、完全消掉裸读，再调策略"：闭合做完之后，"RDX 要不要当
+返回值 / 要不要整条当形参"才是纯粹的策略选择，而不是由两个判据的缝隙决定。
+
+**2026-09-28 实测（详见 `logs/20260927-02` §17）**：
+
+- 已经落地：返回槽收窄到 `ExitDemand ∩ MayNonEntry`；`calleeNeverWritesRange` 逐 range 保留
+  调用者前值；caller 侧三档（range 值表 → 调用者形参 → 入口裸读）；`return_entry_mask` 标记。
+  结果是 unknown 不净增（tmux 25→22、wolfssl 556→535），`call_arg_rewrite_missing_binding`
+  合计 57→33，local 裸读基本不变。
+- **入口形参侧的消费（`paramMask |= ReturnEntryMask`）单独打开是回归**：lighttpd unknown
+  26→83、wolfssl 556→650，虽然裸读同时下降（lighttpd local 120→78）。原因是调用点侧的值同样
+  被更早的 Mixed 调用丢掉了——新增的载体把需求推到调用点，调用点答不出来。
+  所以这一步要等 demand 侧闭合（把"调用点之后/作为实参被读"的需求算进前一个 callee 的
+  ExitDemand）之后再打开；patch 停在 `/tmp/fix-return-entry-param.patch`。
+- 另一处修正：返回槽本来还有 `MayNonEntry` 布尔闸门，"从不写但被需要"的位不会建出返回槽；
+  收窄真正生效的是"部分写过"的寄存器（例如 wolfSSL 里只写过低字节的 RAX）。
+
+

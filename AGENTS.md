@@ -46,6 +46,24 @@ dump 目标 pass 那一刻的 IR、这一层常见的 helper/宽度往返噪声�
 - `notdec-native-llvm` 默认且唯一使用该路；`--summary-register-ssa-pass` 仅保留为兼容别名。
 - 新的寄存器消除、call/internal signature rewrite 都基于 summary 结果，不依赖 Ghidra `notdec.prototype.*` metadata。相关 plan/记录在 `logs/20260616-01-native-prototype-recovery-stage2/`。
 
+**寄存器值的表示准则（硬性，2026-09-28 定）**
+
+寄存器消除的产物里，"裸的寄存器读"（`load @REG` / `notdec.partial_read.*(@REG, off)`）和
+`notdec.unknown.*` 都要尽量少；两者的取舍和表示方式固定为：
+
+- **值的优先级：载体（入口形参 / 返回槽 / 调用点实参） > 裸寄存器读 > `notdec.unknown`。**
+  寄存器相关的未知值宁可先落成裸读，也不要直接落成 unknown：裸读保留了"哪个寄存器、哪几位、
+  在哪个位置"，后续阶段还能把它提成形参/实参；unknown 把这些信息全丢掉，只能靠人重新分析。
+- **不要用 poison / undef / `freeze(poison)` 表示"寄存器值未知"**：LLVM 可以把 poison 细化成
+  任意具体值（`freeze(poison)` 会被 InstCombine 折成 0），占位会静默变成具体值并丢掉
+  `!notdec.unknown.source` 归因。占位统一用 `notdec.unknown.*` + `!notdec.unknown.source`。
+- **边界两侧的位要闭合**：callee 返回槽里"可能还是入口值"的位，必须由该 callee 的入口形参承载；
+  callee 形参要的位，必须在每个调用点答得出来（调用点 range SSA 值 / 调用者自己的形参 / 裸读）。
+  只做单边（例如只扩入口形参）会把裸读换成调用点的 unknown。
+
+背景、例子和演进见 `Arch2.md` 第 13 节；收口计划见
+`logs/20260927-02-native-register-value-source-plan.md`。
+
 旧 heritage pass、prototype recovery、Ghidra JSON schema、工具和 exporter 已删除；相关历史只保留在 logs 和 git 历史中。不要重新引入旧路，SummarySSA 新功能直接落在 `passes/summary/`。
 
 ## EVM PHI 约束
