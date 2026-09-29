@@ -155,6 +155,10 @@ struct NativeRegisterSummaryRegister {
   // Empty masks mean the old whole-register boolean is the only known fact.
   std::string EntryDemandMaskHex;
   std::string ExitDemandMaskHex;
+  // 返回槽里"可能还是入口值"的位（ExitDemand ∩ MayEntry ∩ MayNonEntry）。出口要
+  // 把这些位交回调用者，入口就必须有形参承载它们，否则按位 SSA 只能裸读寄存器
+  // global。见 Arch2.md 第 13 节的"双向位"。
+  std::string ReturnEntryMaskHex;
 };
 
 // Function-level public summary. The counters are derived from Registers and

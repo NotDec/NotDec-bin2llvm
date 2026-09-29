@@ -82,6 +82,9 @@ struct SummaryRegisterFact {
   llvm::APInt MayNonEntryMask;
   llvm::APInt EntryDemandMask;
   llvm::APInt ExitDemandMask;
+  // 返回槽里"可能还是入口值"的位（ExitDemand ∩ MayEntry ∩ MayNonEntry）。出口
+  // 要交回这些位，入口就必须有形参承载（Arch2.md 第 13 节的"双向位"）。
+  llvm::APInt ReturnEntryMask;
 };
 
 struct FunctionSummaryFacts {
@@ -349,6 +352,12 @@ struct SignatureRewriteState {
   // 换成新的 Function 对象（名字保持不变），清理遍按名字仍能找到同一批记录值。
   std::map<std::string, std::vector<llvm::Value *>>
       CallArgRecordedValuesByFunction;
+  // 调用点每个参数槽在"调用前那一刻"的按位 SSA 值：改写阶段 bindingForIndex
+  // 找不到绑定时按 (call, index) 查它，而不是造 unknown。绑定收集为了保持
+  // "前缀"语义，遇到第一个读不出值的槽就停；这张表逐槽记录、不因前一个槽失败
+  // 而放弃后面的槽，所以能补上断档处的值。栈槽在第二遍（栈地址稳定后）记录。
+  std::map<llvm::CallBase *, std::map<unsigned, llvm::Value *>>
+      CallArgRangeValues;
   std::map<llvm::CallBase *, std::map<std::string, llvm::CallInst *>>
       ReturnHelpers;
   std::map<llvm::CallBase *, std::vector<RangeReturnHelper>> RangeReturnHelpers;
@@ -1314,6 +1323,22 @@ collectAbiFacts(const llvm::Module &module,
   return facts;
 }
 
+// 多张按位掩码求交，宽度按最宽的一张对齐（宽度 0 = 无信息）。
+llvm::APInt intersectBitMasks(std::initializer_list<llvm::APInt> masks) {
+  unsigned width = 0;
+  for (const llvm::APInt &mask : masks) {
+    width = std::max(width, mask.getBitWidth());
+  }
+  if (width == 0) {
+    return llvm::APInt();
+  }
+  llvm::APInt result = llvm::APInt::getAllOnes(width);
+  for (const llvm::APInt &mask : masks) {
+    result &= mask.zextOrTrunc(width);
+  }
+  return result;
+}
+
 std::map<llvm::Function *, FunctionSummaryFacts>
 summaryFactsByFunction(const NativeRegisterSummary &summary,
                        llvm::Module &module) {
@@ -1346,6 +1371,12 @@ summaryFactsByFunction(const NativeRegisterSummary &summary,
       fact.MayNonEntryMask = parseMask(reg.MayNonEntryMaskHex);
       fact.EntryDemandMask = parseMask(reg.EntryDemandMaskHex);
       fact.ExitDemandMask = parseMask(reg.ExitDemandMaskHex);
+      fact.ReturnEntryMask = parseMask(reg.ReturnEntryMaskHex);
+      if (fact.ReturnEntryMask.getBitWidth() == 0) {
+        // 旧 summary 没有这个字段：按定义补算一次（Arch2.md 第 13 节）。
+        fact.ReturnEntryMask = intersectBitMasks(
+            {fact.ExitDemandMask, fact.MayEntryMask, fact.MayNonEntryMask});
+      }
       facts.Registers.emplace(reg.Name, std::move(fact));
     }
     result.emplace(function, std::move(facts));
@@ -1792,6 +1823,12 @@ SignatureShape shapeForInternalFunction(
         abi.InternalReturnRegisters.count(unit.Name) == 0) {
       return;
     }
+    // 待办（plan §16 第 3 步 / Arch2.md 第 13 节）：返回槽里"可能还是入口值"的
+    // 位（ReturnEntryMask = ExitDemand ∩ MayEntry ∩ MayNonEntry）也应该并进
+    // paramMask，让出口透传的位从入口形参来，而不是裸读寄存器 global。实测单独
+    // 打开会把裸读换成调用点的 unknown（lighttpd 26→83、wolfssl 556→650）：这些
+    // 位在调用点的值同样被更早的 Mixed 调用丢掉了，得先闭合 demand 侧（§10 (i)），
+    // 所以这一步先不开，ReturnEntryMask 目前只作为 metadata 标记 + 审计用。
     // 参数宽度以 ReadEntryMask 为准："入口值在被覆盖前被读过"的位才是
     // 函数真正需要的参数位。不用 EntryDemandMask：它是反向 liveness 的
     // "入口处有有效值"，包含写保留（partial write 读改写）这类没被语义
@@ -1869,18 +1906,24 @@ SignatureShape shapeForInternalFunction(
     auto regIt = factsIt->second.Registers.find(unit->Name);
     if (regIt != factsIt->second.Registers.end() && regIt->second.MayNonEntry &&
         regIt->second.ExitDemand) {
+      // 返回槽只覆盖"真被写过 且 被需要"的位：从不写的位出口值就等于入口值，
+      // 调用者自己的调用前值就是答案，塞进返回槽只会逼入口给它找载体
+      // （Arch2.md 第 13 节）。
+      llvm::APInt returnMask = intersectBitMasks(
+          {regIt->second.ExitDemandMask, regIt->second.MayNonEntryMask});
+      if (returnMask.getBitWidth() != 0 && returnMask.isZero()) {
+        continue;
+      }
       if (const AbiFacts::RegisterSlot *slot =
               floatAbiOutputSlotForUnit(abi, unit->Name)) {
         if (std::optional<NativeSignatureSlot> floatSlot =
                 floatSlotForDemand(function.getContext(), *slot, units,
-                                   regIt->second.ExitDemandMask)) {
+                                   returnMask)) {
           shape.Returns.push_back(*floatSlot);
         } else if (function.getReturnType()->isVoidTy() &&
-                   regIt->second.ExitDemandMask.getBitWidth() != 0 &&
-                   !regIt->second.ExitDemandMask.isZero()) {
+                   returnMask.getBitWidth() != 0 && !returnMask.isZero()) {
           if (std::optional<NativeSignatureSlot> rangeSlot =
-                  integerSlotForSingleDemandRange(
-                      *unit, regIt->second.ExitDemandMask)) {
+                  integerSlotForSingleDemandRange(*unit, returnMask)) {
             shape.Returns.push_back(*rangeSlot);
           } else {
             shape.Returns.push_back(integerSignatureSlot(*unit));
@@ -1889,8 +1932,7 @@ SignatureShape shapeForInternalFunction(
         continue;
       }
       if (std::optional<NativeSignatureSlot> rangeSlot =
-              integerSlotForSingleDemandRange(*unit,
-                                              regIt->second.ExitDemandMask)) {
+              integerSlotForSingleDemandRange(*unit, returnMask)) {
         shape.Returns.push_back(*rangeSlot);
       } else {
         shape.Returns.push_back(integerSignatureSlot(*unit));
@@ -5020,7 +5062,8 @@ private:
   llvm::Value *assembleRangeReadIfDominating(
       const std::vector<RegisterRangeKey> &ranges, uint64_t readOffset,
       uint32_t readWidth, llvm::Instruction *before, llvm::Twine name,
-      llvm::DominatorTree &domTree, bool allowUnknownSegments = false) {
+      llvm::DominatorTree &domTree, bool allowUnknownSegments = false,
+      bool entryFallback = false) {
     if (ranges.empty() || before == nullptr || readWidth == 0) {
       return nullptr;
     }
@@ -5029,6 +5072,13 @@ private:
     for (const RegisterRangeKey &range : ranges) {
       llvm::Value *segment = resolve(
           readRangeBefore(*before->getParent(), range, before, domTree));
+      if (entryFallback &&
+          (segment == nullptr || segment->getType() != rangeType(range) ||
+           !valueDominatesUse(segment, before, domTree))) {
+        // 新准则（Arch2.md §13）：range 状态答不上来时退到函数入口值（裸读），
+        // 不要直接落 unknown。入口闸门仍然生效（判为填充/junk 的位拿不到值）。
+        segment = resolve(entryRangeInput(*before->getParent(), range));
+      }
       if (segment == nullptr || segment->getType() != rangeType(range) ||
           !valueDominatesUse(segment, before, domTree)) {
         if (!allowUnknownSegments ||
@@ -6170,41 +6220,39 @@ private:
       if (effect == CallRegisterEffect::Preserve) {
         continue;
       }
-      if (effect != CallRegisterEffect::ReturnValue &&
-          effect != CallRegisterEffect::Clobber) {
-        if (!countedUnknownCall) {
-          ++Summary.UnknownCallEffects;
-          countedUnknownCall = true;
-        }
-        // Mixed（出口既可能保留入口值、也可能是新值）。按"第一遍统一生成
-        // 调用后状态占位、是不是返回由签名决定"的原则，这不该直接判丢：只要签名
-        // 说这个寄存器在 callee 的返回槽里，就照 Clobber 一样生成可替换占位，
-        // 重写 / 清理遍再按签名解析成真实返回值（就是调用后寄存器真实持有的值，
-        // 包含"原样保留入口值"的路径）。注意这里只动分派、不动 callEffect 的
-        // 分类：活跃性里"入口值可能活过这次调用"那条仍然保留。
-        // 不在返回槽里才保持原来的"判丢 + 归因"路径，省掉一次无意义的占位。
-        if (!signatureReturnUsesUnit(*call, unit)) {
-          std::vector<RegisterRangeKey> ranges =
-              plannedRangesCovering(global, 0, registerBitWidth(unit));
-          if (ranges.empty()) {
-            clearBlockRangeDefs(block, global);
-            continue;
-          }
-          RangeLossCause cause = unknownCallEffectCause(*call);
-          for (const RegisterRangeKey &range : ranges) {
-            markBlockRangeUnknown(block, range, cause);
-          }
-          continue;
-        }
+      bool mixed = effect != CallRegisterEffect::ReturnValue &&
+                   effect != CallRegisterEffect::Clobber;
+      if (mixed && !countedUnknownCall) {
+        ++Summary.UnknownCallEffects;
+        countedUnknownCall = true;
       }
-
       std::vector<RegisterRangeKey> ranges =
           plannedRangesCovering(global, 0, registerBitWidth(unit));
       if (ranges.empty()) {
         clearBlockRangeDefs(block, global);
         continue;
       }
+      // Mixed（出口既可能保留入口值、也可能是新值）。按"第一遍统一生成
+      // 调用后状态占位、是不是返回由签名决定"的原则，这不该直接判丢：只要签名
+      // 说这个寄存器在 callee 的返回槽里，就照 Clobber 一样生成可替换占位，
+      // 重写 / 清理遍再按签名解析成真实返回值（就是调用后寄存器真实持有的值，
+      // 包含"原样保留入口值"的路径）。注意这里只动分派、不动 callEffect 的
+      // 分类：活跃性里"入口值可能活过这次调用"那条仍然保留。
+      // 不在返回槽里才保持原来的"判丢 + 归因"路径，省掉一次无意义的占位。
+      bool carried = signatureReturnUsesUnit(*call, unit);
+      RangeLossCause cause =
+          mixed ? unknownCallEffectCause(*call) : RangeLossCause();
       for (const RegisterRangeKey &range : ranges) {
+        // 按位细化：callee 从不写这些位，出口值就等于入口值，调用者自己的调用
+        // 前值就是答案（Arch2.md 第 13 节第二/三行）。整寄存器的 Mixed 布尔在
+        // 这里被拆到每一位，这是"返回槽只覆盖真写过的位"能成立的前提。
+        if (calleeNeverWritesRange(*call, range)) {
+          continue;
+        }
+        if (mixed && !carried) {
+          markBlockRangeUnknown(block, range, cause);
+          continue;
+        }
         llvm::Value *value = callRangeValue(*call, range);
         value = resolve(value);
         if (value != nullptr && value->getType() == rangeType(range)) {
@@ -6926,6 +6974,46 @@ private:
         localRecorded = &SignatureState.CallArgRecordedValuesByFunction
                              [caller->getName().str()];
       }
+      // 逐槽记录"调用前那一刻"的 range 值（见 SignatureRewriteState::
+      // CallArgRangeValues）。绑定收集遇到第一个读不出值的槽就停，这里不因
+      // 前一个槽失败而放弃后面的槽；已由绑定覆盖的槽不再重复读（readSlotValueBefore
+      // 每次都要重建 DominatorTree，成本不能翻倍）。栈槽沿用绑定收集的两遍结构：
+      // 栈地址要等循环携带的 RSP/RBP phi 定型，所以只在第二遍记录。
+      {
+        std::map<unsigned, llvm::Value *> &rangeValues =
+            SignatureState.CallArgRangeValues[call];
+        for (auto [index, slot] :
+             llvm::enumerate(callParamSlots(*call, *shape))) {
+          bool isStackSlot =
+              slot.Kind == NativeSignatureSlotKind::IntegerStack ||
+              slot.Kind == NativeSignatureSlotKind::FloatStack;
+          if (isStackSlot != stackSlotsOnly) {
+            continue;
+          }
+          if (bindingForIndex(bindings, index) != nullptr) {
+            continue;
+          }
+          if (slot.Unit == nullptr && slot.LlvmType == nullptr) {
+            continue;
+          }
+          llvm::Value *value = resolve(readSlotValueBefore(*call, slot));
+          if (value == nullptr || value->getType() != slotType(slot)) {
+            // 新准则（Arch2.md 第 13 节）：range 状态答不上来时退到函数入口值
+            // （裸读），不要直接落 unknown。裸读保留了"哪个寄存器、哪几位"，
+            // 后续还能提成形参/实参；入口闸门仍生效（填充/junk 位不在此列）。
+            value =
+                resolve(readSlotValueBefore(*call, slot, /*entryFallback=*/true));
+          }
+          if (value == nullptr || value->getType() != slotType(slot)) {
+            continue;
+          }
+          rangeValues[index] = value;
+          SignatureState.CallArgRecordedValues.insert(value);
+          if (localRecorded != nullptr) {
+            localRecorded->push_back(value);
+          }
+        }
+      }
       for (const CallArgStoreBinding &binding : bindings) {
         if (binding.Store != nullptr) {
           SignatureState.CallArgRecordedStores.insert(binding.Store);
@@ -7128,17 +7216,20 @@ private:
   }
 
   llvm::Value *readSlotValueBefore(llvm::CallBase &call,
-                                   const NativeSignatureSlot &slot) {
+                                   const NativeSignatureSlot &slot,
+                                   bool entryFallback = false) {
     return readSlotValueBefore(
         static_cast<llvm::Instruction &>(call), slot,
         slot.Unit == nullptr ? llvm::Twine("stack.arg")
-                             : llvm::Twine(slot.Unit->Name) + ".arg_range");
+                             : llvm::Twine(slot.Unit->Name) + ".arg_range",
+        /*allowUnknownSegments=*/false, entryFallback);
   }
 
   llvm::Value *readSlotValueBefore(llvm::Instruction &before,
                                    const NativeSignatureSlot &slot,
                                    llvm::Twine rangeName,
-                                   bool allowUnknownSegments = false) {
+                                   bool allowUnknownSegments = false,
+                                   bool entryFallback = false) {
     if (slot.Kind == NativeSignatureSlotKind::IntegerStack ||
         slot.Kind == NativeSignatureSlotKind::FloatStack) {
       auto *call = llvm::dyn_cast<llvm::CallBase>(&before);
@@ -7147,8 +7238,8 @@ private:
     if (slot.Unit == nullptr || before.getParent() == nullptr) {
       return nullptr;
     }
-    llvm::Value *rangeValue =
-        readSlotRangeBefore(before, slot, rangeName, allowUnknownSegments);
+    llvm::Value *rangeValue = readSlotRangeBefore(
+        before, slot, rangeName, allowUnknownSegments, entryFallback);
     if (rangeValue != nullptr && rangeValue->getType() == slotType(slot)) {
       return rangeValue;
     }
@@ -7166,7 +7257,8 @@ private:
                                        uint32_t readWidth,
                                        llvm::Instruction *before,
                                        llvm::Twine name,
-                                       llvm::DominatorTree &domTree) {
+                                       llvm::DominatorTree &domTree,
+                                       bool entryFallback = false) {
     if (global == nullptr || before == nullptr || before->getParent() == nullptr ||
         readWidth == 0) {
       return nullptr;
@@ -7195,6 +7287,11 @@ private:
       }
       llvm::Value *full = resolve(
           readRangeBefore(*before->getParent(), range, before, domTree));
+      if (entryFallback &&
+          (full == nullptr || full->getType() != rangeType(range) ||
+           !valueDominatesUse(full, before, domTree))) {
+        full = resolve(entryRangeInput(*before->getParent(), range));
+      }
       if (full == nullptr || full->getType() != rangeType(range) ||
           !valueDominatesUse(full, before, domTree)) {
         return nullptr;
@@ -7224,7 +7321,8 @@ private:
   llvm::Value *readSlotRangeBefore(llvm::Instruction &before,
                                    const NativeSignatureSlot &slot,
                                    llvm::Twine name,
-                                   bool allowUnknownSegments = false) {
+                                   bool allowUnknownSegments = false,
+                                   bool entryFallback = false) {
     if (slot.Unit == nullptr || before.getParent() == nullptr ||
         slot.SizeBits == 0) {
       return nullptr;
@@ -7238,12 +7336,13 @@ private:
       // 段是不够的：分区可能把槽位切成多段（RDX = [0,16)+[16,64) 而槽位是
       // i32 [0,32)）。按重叠分段拼接。
       bits = composePlannedRangeRead(slot.Unit->Global, slot.OffsetBits,
-                                     slot.SizeBits, &before, name, domTree);
+                                     slot.SizeBits, &before, name, domTree,
+                                     entryFallback);
       bits = resolve(bits);
     } else {
       bits = assembleRangeReadIfDominating(
           ranges, slot.OffsetBits, slot.SizeBits, &before, name, domTree,
-          allowUnknownSegments);
+          allowUnknownSegments, entryFallback);
       bits = resolve(bits);
     }
     if (bits == nullptr) {
@@ -7740,6 +7839,35 @@ private:
       }
     }
     return false;
+  }
+
+  // callee 对这段 range 的位"从不写"（MayNonEntryMask 全 0）：所有路径上出口值
+  // 都等于入口值，调用者自己的调用前值就是答案，不需要返回槽也不需要形参。
+  // 没有按位信息（旧 summary / 未知外部）时不猜，返回 false 走原路径。
+  bool calleeNeverWritesRange(const llvm::CallBase &call,
+                              const RegisterRangeKey &range) const {
+    llvm::Function *callee = call.getCalledFunction();
+    if (callee == nullptr || callee->isDeclaration()) {
+      return false;
+    }
+    auto fnIt = SummaryFacts.find(callee);
+    if (fnIt == SummaryFacts.end()) {
+      return false;
+    }
+    const RegisterUnit *unit = unitForRange(range);
+    if (unit == nullptr) {
+      return false;
+    }
+    auto regIt = fnIt->second.Registers.find(unit->Name);
+    if (regIt == fnIt->second.Registers.end()) {
+      return false;
+    }
+    const llvm::APInt &mask = regIt->second.MayNonEntryMask;
+    if (mask.getBitWidth() == 0 ||
+        range.BitOffset + range.BitWidth > mask.getBitWidth()) {
+      return false;
+    }
+    return mask.extractBits(range.BitWidth, range.BitOffset).isZero();
   }
 
   llvm::FunctionCallee callRangeValueHelper(const RegisterRangeKey &range) {
@@ -8794,6 +8922,50 @@ void redirectAddressTakenUses(llvm::Function &oldFunction,
   }
 }
 
+// §15 ②：绑定和构建期值表都答不上来时，如果这个槽就是调用者自己的入参寄存器，
+// 直接把调用者的形参传下去——机器上该寄存器此刻的值就是调用者入口拿到的那个值
+// （优先级：形参 > 裸读 > unknown，见日志 §14）。只在位段对齐的常见形态上做
+// zext/trunc/bitcast，不做跨分段拼装（那属于构建期 range 值表的事）。
+llvm::Value *callerEntryArgumentForSlot(
+    llvm::Function &caller, const SignatureShape &callerShape,
+    const NativeSignatureSlot &slot, llvm::IRBuilder<> &builder) {
+  if (slot.Unit == nullptr || slot.Unit->Global == nullptr) {
+    return nullptr;
+  }
+  for (unsigned index = 0;
+       index < callerShape.Params.size() && index < caller.arg_size();
+       ++index) {
+    const NativeSignatureSlot &callerSlot = callerShape.Params[index];
+    if (callerSlot.Unit == nullptr ||
+        callerSlot.Unit->Global != slot.Unit->Global) {
+      continue;
+    }
+    if (callerSlot.OffsetBits != 0 || slot.OffsetBits != 0) {
+      continue;
+    }
+    llvm::Value *argument = caller.getArg(index);
+    llvm::Type *targetType = slotType(slot);
+    if (argument->getType() == targetType) {
+      return argument;
+    }
+    if (argument->getType()->isIntegerTy() && targetType->isIntegerTy()) {
+      return builder.CreateZExtOrTrunc(argument, targetType,
+                                       slot.Unit->Name + ".entry_arg");
+    }
+    if (argument->getType()->getScalarSizeInBits() ==
+            targetType->getScalarSizeInBits() &&
+        ((argument->getType()->isFloatingPointTy() &&
+          targetType->isIntegerTy()) ||
+         (argument->getType()->isIntegerTy() &&
+          targetType->isFloatingPointTy()))) {
+      return builder.CreateBitCast(argument, targetType,
+                                   slot.Unit->Name + ".entry_arg_bits");
+    }
+    return nullptr;
+  }
+  return nullptr;
+}
+
 void rewriteSignatureShapes(
     llvm::Module &module, SignatureRewriteState &state,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -8933,6 +9105,28 @@ void rewriteSignatureShapes(
       llvm::Value *value = binding == nullptr ? nullptr : binding->Value;
       if (value == nullptr) {
         value = tailCallStackValue(slot);
+      }
+      if (value == nullptr) {
+        // 绑定收集停在第一个读不出值的槽上，后面的槽也可能没绑定。构建期
+        // 已经逐槽记下"调用前那一刻"的 range 值，这里按 index 取回来，比
+        // 直接造 notdec.unknown 更接近真实来源（日志 §15）。
+        auto callIt = state.CallArgRangeValues.find(oldCall);
+        if (callIt != state.CallArgRangeValues.end()) {
+          auto valueIt = callIt->second.find(index);
+          if (valueIt != callIt->second.end() &&
+              valueIt->second->getType() == slotType(slot)) {
+            value = valueIt->second;
+          }
+        }
+      }
+      if (value == nullptr && oldCall->getFunction() != nullptr) {
+        // §15 ②：这个槽就是调用者自己的入参寄存器时，直接传调用者的形参。
+        llvm::Function *newCaller = oldCall->getFunction();
+        auto callerShapeIt = rewrittenFunctionShapes.find(newCaller);
+        if (callerShapeIt != rewrittenFunctionShapes.end()) {
+          value = callerEntryArgumentForSlot(*newCaller, *callerShapeIt->second,
+                                             slot, oldCallBuilder);
+        }
       }
       if (value != nullptr) {
         value = remapValue(value);

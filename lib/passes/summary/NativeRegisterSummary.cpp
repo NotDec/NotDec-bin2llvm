@@ -496,6 +496,22 @@ bool maskNonZero(const llvm::APInt &mask) {
   return mask.getBitWidth() != 0 && !mask.isZero();
 }
 
+// 三张按位掩码求交，宽度按最宽的一张对齐（宽度 0 = 无信息 → 结果为空）。
+llvm::APInt intersectBitMasks(std::initializer_list<llvm::APInt> masks) {
+  unsigned width = 0;
+  for (const llvm::APInt &mask : masks) {
+    width = std::max(width, mask.getBitWidth());
+  }
+  if (width == 0) {
+    return llvm::APInt();
+  }
+  llvm::APInt result = llvm::APInt::getAllOnes(width);
+  for (const llvm::APInt &mask : masks) {
+    result &= mask.zextOrTrunc(width);
+  }
+  return result;
+}
+
 unsigned globalBitWidth(llvm::GlobalVariable *global) {
   if (global == nullptr) {
     return 0;
@@ -3164,6 +3180,14 @@ private:
       fields.push_back(llvm::MDString::get(context, "exit_demand_mask=0x" +
                                                         maskToHex(exitMask)));
     }
+    // 双向位：返回槽要交回、但有些路径上还是入口值的位。出口靠返回槽，入口必须
+    // 靠形参，否则按位 SSA 只能裸读寄存器 global（Arch2.md 第 13 节）。
+    llvm::APInt returnEntryMask =
+        intersectBitMasks({exitMask, cell.MayEntry, cell.MayNonEntry});
+    if (returnEntryMask.getBitWidth() != 0 && !returnEntryMask.isZero()) {
+      fields.push_back(llvm::MDString::get(context, "return_entry_mask=0x" +
+                                                        maskToHex(returnEntryMask)));
+    }
     return llvm::MDNode::get(context, fields);
   }
 
@@ -3265,6 +3289,9 @@ private:
         reg.EntryDemandMaskHex =
             maskToHex(demandFor(demand.EntryDemand, global));
         reg.ExitDemandMaskHex = maskToHex(demandFor(demand.ExitDemand, global));
+        reg.ReturnEntryMaskHex = maskToHex(intersectBitMasks(
+            {demandFor(demand.ExitDemand, global), cell.MayEntry,
+             cell.MayNonEntry}));
         fn.Registers.push_back(reg);
         if (reg.ReadEntry) {
           ++fn.ReadEntryRegisters;

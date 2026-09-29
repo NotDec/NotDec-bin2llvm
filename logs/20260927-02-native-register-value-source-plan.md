@@ -366,3 +366,91 @@ unknown 等于**把已经知道的值扔掉**，比裸读更糟。所以：
 - 阶段 1 收尾判据（按 §10–§15 修订）：`entry_range_rejected` = 0；`local_register_reads` 明显下降，且剩余项
   逐条能说出“为什么是边界 / 为什么是 junk”。
 
+## 16. 表示准则固定后的收口顺序（2026-09-28）
+
+用户定了硬性准则，已写进 `AGENTS.md`（"寄存器消除路线"）和 `Arch2.md` 第 13 节：
+
+- 优先级 **载体（形参/返回槽/实参） > 裸读 > unknown**；寄存器相关的未知值宁可保留裸读（信息量大）；
+- 不用 poison/undef/freeze 当占位，一律 `notdec.unknown.*` + `!notdec.unknown.source`；
+- 边界两侧的位要闭合。
+
+按这个准则，§15 的"两处小改动"要重新排序并补全：
+
+1. **caller 侧（已落地并量测，提交前保留）**
+   - 改动 1：`SignatureRewriteState::CallArgRangeValues` 逐槽记录调用点 range 值，改写期缺绑定时按
+     index 查（用户要求保留，不按收益衡量）；
+   - 改动 2：`callerEntryArgumentForSlot`——槽就是调用者自己的入参寄存器时直接传调用者形参；
+   - 量测：`call_arg_rewrite_missing_binding` 57 → 50（wolfssl 43→38、tmux 14→12）；
+     `local_register_reads`/`boundary_register_reads` 不变；5 目标 `llvm-as`+`opt -passes=verify` OK、
+     `ctest` 12/12。唯一未归因项：wolfssl `clobber_placeholders` 2900 → 2684。
+2. **caller 侧补第三档（按新准则）**：绑定、值表、调用者形参都答不上时**保留裸读**
+   （`load @REG` / `notdec.partial_read.*`），不再直接造 unknown。落地后
+   `call_arg_rewrite_missing_binding` 应归零，代价是 local 裸读上升——这是准则允许的中间状态。
+3. **callee 侧闭合**：重放 §9.1 的 1c patch（入口 `paramMask` 并上
+   `returnEntryMask = ExitDemandMask & MayNonEntryMask & MayEntryMask`，保留"跳过浮点返回寄存器与
+   变参函数"的取舍）。验收：新增形参的位能在调用点答出来（missing_binding 不净增）、返回槽相关的
+   裸读下降、`entry_range_rejected` 不涨。
+4. **策略**：闭合之后才调"某个寄存器/某些位要不要进返回槽、要不要整条进形参"（§14 的三档变成逐位旋钮）。
+5. **poison 清理**：x87 空槽入口读、`vararg_unknown` 占位降级、zero-demand 操作数三处逐个评估换 unknown。
+
+例子（lighttpd `fdevent_fdnode_event_set` 的 RDX）见 `Arch2.md` 第 13 节：现状是"低半形参 + 整条返回 +
+高半裸读"的混合态，闭合后是 `i64 %RDX.arg` + `i64` 返回、无裸读、无 unknown。
+
+## 17. 按位闭合第一轮实现记录（2026-09-28）
+
+按 §13/Arch2.md 第 13 节的判据落地并量测（命令：`notdec-native-llvm <target> --all-confirmed
+--skip-runtime --register-ssa-summary`，5 目标 `llvm-as` + `opt -passes=verify` OK、`ctest` 12/12）。
+
+**落地的东西**
+
+1. **返回槽只覆盖"真写过 且 被需要"的位**：`shapeForInternalFunction` 返回槽循环改用
+   `returnMask = ExitDemandMask & MayNonEntryMask`；交集为空就不建返回槽。
+2. **逐 range 的"callee 从不写就保留调用者前值"**：新增 `calleeNeverWritesRange()`，
+   调用分派按 range 判断（`MayNonEntryMask` 全 0 的位出口值就是入口值）。这是 (1) 的前提；
+   整寄存器的 Mixed 布尔在这里被细化到每一位。
+3. **caller 侧第三档**：`assembleRangeReadIfDominating / readSlotRangeBefore / readSlotValueBefore`
+   增加 `entryFallback`，绑定收集在 range 状态答不上时退到入口读（裸读），不再直接落 unknown；
+   入口闸门 `rangeMayComeFromEntry` 仍然生效（填充/junk 位不在此列）。
+4. **`ReturnEntryMask` 显式标记**：summary 写 `return_entry_mask=0x…`
+   （`ExitDemand ∩ MayEntry ∩ MayNonEntry`），SSA 侧解析进 `SummaryRegisterFact::ReturnEntryMask`。
+5. **入口形参侧的消费（`paramMask |= ReturnEntryMask`）试过后回退**，patch 停在
+   `/tmp/fix-return-entry-param.patch`（回退理由见下）。
+
+**量测（基线 → 现在）**
+
+| 目标 | local | boundary | clobber | unknowns | missing_binding |
+|---|---|---|---|---|---|
+| vsftpd | 7 → 7 | 6 → 6 | 23 → 23 | 0 → 0 | 0 → 0 |
+| libuv | 4 → 4 | 18 → 18 | 8 → 8 | 8 → 8 | 0 → 0 |
+| lighttpd | 120 → 120 | 6 → 6 | 519 → 519 | 26 → 26 | 0 → 0 |
+| tmux | 308 → 310 | 473 → 473 | 6830 → 6867 | 25 → **22** | 14 → **11** |
+| wolfssl | 648 → 648 | 903 → 906 | 2900 → 2849 | 556 → **535** | 43 → **22** |
+
+missing_binding 合计 57 → 33；unknown 不净增（tmux −3、wolfssl −21），local 裸读基本不变
+（tmux +2 来自第三档）。
+
+**入口形参闭合单独打开的实测（回退理由）**：lighttpd 26 → **83**、libuv 8 → **11**、
+tmux 25 → **27**、wolfssl 556 → **650**；同时裸读明显下降（lighttpd 120 → **78**、
+tmux 308 → 293、libuv 4 → 1）。机制：新增形参/返回槽把"某个寄存器的值"变成调用点的需求，
+而这个值在调用点被更早的一次 Mixed 调用丢掉了（那个 callee 的返回槽没覆盖它）→ 调用点冒
+unknown。实例：lighttpd `h1_reqbody_read` 在 `chunkqueue_mark_written` 之后新增 4 条 RAX phi，
+入边是 `call_effect_mixed` unknown；起因是 `chunkqueue_remove_empty_chunks` 等 4 个 callee 因
+`ReturnEntryMask` 新增了 `%RAX.arg`，调用点必须提供 RAX。
+
+**结论**：按位闭合方向正确（`fdevent_fdnode_event_set` 的 RDX 已从"半形参 + 整条返回 + 高半
+裸读"变成 `i64 %RDX.arg` + i64 返回、无裸读），但**必须先闭合 demand 侧**
+（§10 (i)：把"调用点之后 / 作为实参被读"的需求算进前一个 callee 的 ExitDemand），否则只是把
+裸读换成调用点的 unknown。
+
+**一处修正**：早先以为"从不写但被需要"的位（A 类）会建出多余返回槽——实际不会，返回槽还有
+`MayNonEntry` 布尔闸门挡着（如 lighttpd `sys_setjmp_sigbus` 在基线和现在都是 `void`）。
+返回槽收窄真正生效的是"部分写过"的寄存器（如 wolfssl 的 RAX 只有低字节写过）。
+
+**下一步（按依赖顺序）**
+
+1. demand 侧闭合（§10 (i)）：让"实参/调用后被读"的需求进前一个 callee 的 ExitDemand；
+2. 再重放 `/tmp/fix-return-entry-param.patch`，验收"unknown 不净增 + 返回槽裸读下降"；
+3. 栈槽跨块（tmux 7 + wolfssl 12）单独一条线。
+
+
+
