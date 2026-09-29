@@ -569,8 +569,11 @@ define internal i64 @fdevent_fdnode_event_set(i64 %RDI.arg, i64 %RSI.arg, i64 %R
 - **入口形参侧的消费（`paramMask |= ReturnEntryMask`）单独打开是回归**：lighttpd unknown
   26→83、wolfssl 556→650，虽然裸读同时下降（lighttpd local 120→78）。原因是调用点侧的值同样
   被更早的 Mixed 调用丢掉了——新增的载体把需求推到调用点，调用点答不出来。
-  所以这一步要等 demand 侧闭合（把"调用点之后/作为实参被读"的需求算进前一个 callee 的
-  ExitDemand）之后再打开；patch 停在 `/tmp/fix-return-entry-param.patch`。
+- **补上 demand 的入口需求之后就成立了**：`applyBackwardCallDemand` 里给内部 callee 补上
+  "callee 入口需要的位要在调用点活着"（`ReadEntry | MayEntry ∩ live`），再打开入口形参闭合，
+  unknown 直方图逐键不变（lighttpd 26、tmux 22、wolfssl 535），裸读还少了几条
+  （lighttpd 120→117、wolfssl 648→646）。`fdevent_fdnode_event_set` 现在是
+  `i64 %RDX.arg` + i64 返回、没有 `partial_read`，调用点传的是真值。见 `logs/20260927-02` §18。
 - 另一处修正：返回槽本来还有 `MayNonEntry` 布尔闸门，"从不写但被需要"的位不会建出返回槽；
   收窄真正生效的是"部分写过"的寄存器（例如 wolfSSL 里只写过低字节的 RAX）。
 

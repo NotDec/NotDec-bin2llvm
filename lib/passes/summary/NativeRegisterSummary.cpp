@@ -3072,6 +3072,34 @@ private:
           eraseDemand(live, global, killedBits);
         }
       }
+      // callee 在入口需要的位，调用点必须已经有值：
+      //  - ReadEntry：callee 真会读入口值；
+      //  - MayEntry ∩ live：调用点之后还需要这一位，而 callee 可能原样把它交回，
+      //    所以它的值必须从调用前就在（callee 一定会写的位不用）。
+      // 实参准备 store 会在更早的位置把这条需求擦掉（值由 value 链提供），所以真正
+      // 受影响的是"没有 store、靠寄存器透传"的位：需求继续往上游传，直到真正的
+      // 生产者（某次调用的返回槽）。已知外部 callee 的 addInputDemand 是同一件事，
+      // 这里只是把内部 callee 补齐。
+      for (const auto &[global, unit] : Units) {
+        if (isIgnored(unit, Options)) {
+          continue;
+        }
+        Cell calleeCell = cellIn(effect, global);
+        llvm::APInt entryNeeds = calleeCell.ReadEntry;
+        llvm::APInt liveMask = demandFor(live, global);
+        if (liveMask.getBitWidth() != 0 &&
+            calleeCell.MayEntry.getBitWidth() == liveMask.getBitWidth()) {
+          llvm::APInt passthrough = calleeCell.MayEntry & liveMask;
+          if (entryNeeds.getBitWidth() == 0) {
+            entryNeeds = passthrough;
+          } else if (entryNeeds.getBitWidth() == passthrough.getBitWidth()) {
+            entryNeeds |= passthrough;
+          }
+        }
+        if (maskNonZero(entryNeeds)) {
+          addDemand(live, global, entryNeeds);
+        }
+      }
       return;
     }
 

@@ -1823,20 +1823,38 @@ SignatureShape shapeForInternalFunction(
         abi.InternalReturnRegisters.count(unit.Name) == 0) {
       return;
     }
-    // 待办（plan §16 第 3 步 / Arch2.md 第 13 节）：返回槽里"可能还是入口值"的
-    // 位（ReturnEntryMask = ExitDemand ∩ MayEntry ∩ MayNonEntry）也应该并进
-    // paramMask，让出口透传的位从入口形参来，而不是裸读寄存器 global。实测单独
-    // 打开会把裸读换成调用点的 unknown（lighttpd 26→83、wolfssl 556→650）：这些
-    // 位在调用点的值同样被更早的 Mixed 调用丢掉了，得先闭合 demand 侧（§10 (i)），
-    // 所以这一步先不开，ReturnEntryMask 目前只作为 metadata 标记 + 审计用。
+    // 返回槽里"可能还是入口值"的位（ReturnEntryMask = ExitDemand ∩ MayEntry ∩
+    // MayNonEntry）也必须由形参承载：出口要交回它们，而"没写过的路径"上它们的值
+    // 只能从入口来（Arch2.md 第 13 节）。调用点侧靠 demand 把"callee 入口需要的
+    // 位"算成调用点的 live 需求，值才能从更早的返回槽接上（见
+    // NativeRegisterSummary.cpp 的 applyBackwardCallDemand）。
+    // 两类先不做（沿用 1c 的实验取舍）：浮点返回寄存器、变参函数——调用点侧还答
+    // 不出整条向量/被变参占用的槽。
     // 参数宽度以 ReadEntryMask 为准："入口值在被覆盖前被读过"的位才是
     // 函数真正需要的参数位。不用 EntryDemandMask：它是反向 liveness 的
     // "入口处有有效值"，包含写保留（partial write 读改写）这类没被语义
     // 读过的位，会把参数宽度撑大。旧产物没有 ReadEntryMask 时退回
-    // EntryDemandMask，再退到整寄存器。
+    // EntryDemandMask，再退到整寄存器；返回槽透传的位并进 paramMask。
+    llvm::APInt returnEntryMask;
+    if (abi.InternalReturnRegisters.count(unit.Name) != 0 && !shape.VarArg &&
+        !isFloatAbiOutputUnit(abi, unit.Name)) {
+      returnEntryMask = regIt->second.ReturnEntryMask;
+    }
+    if (!regIt->second.ReadEntry &&
+        (returnEntryMask.getBitWidth() == 0 || returnEntryMask.isZero())) {
+      return;
+    }
     llvm::APInt paramMask = regIt->second.ReadEntryMask;
     if (paramMask.getBitWidth() == 0) {
       paramMask = regIt->second.EntryDemandMask;
+    }
+    if (returnEntryMask.getBitWidth() != 0 && !returnEntryMask.isZero()) {
+      unsigned width =
+          std::max(paramMask.getBitWidth(), returnEntryMask.getBitWidth());
+      paramMask = paramMask.getBitWidth() == 0
+                      ? returnEntryMask.zextOrTrunc(width)
+                      : paramMask.zextOrTrunc(width) |
+                            returnEntryMask.zextOrTrunc(width);
     }
     // 入口读只覆盖寄存器中段时（例如 R8 的 bit 8..32：低字节在另一条路径上先被
     // 写过），这不是真正的参数 —— ABI 参数永远从 bit 0 开始，这种读是"部分重读

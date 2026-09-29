@@ -452,5 +452,65 @@ unknown。实例：lighttpd `h1_reqbody_read` 在 `chunkqueue_mark_written` 之�
 2. 再重放 `/tmp/fix-return-entry-param.patch`，验收"unknown 不净增 + 返回槽裸读下降"；
 3. 栈槽跨块（tmux 7 + wolfssl 12）单独一条线。
 
+## 18. demand 入口需求 + 入口形参闭合（2026-09-28 第二轮）
+
+第一轮实测（§17）：单独打开入口形参闭合 → 裸读换成调用点 unknown。根因是 demand 没有把
+"callee 入口需要的位"算成调用点的需求，调用点拿不到值。本轮先补 demand 输入，再打开闭合。
+
+**改动**
+
+1. `NativeRegisterSummary.cpp` 的 `applyBackwardCallDemand`（**已有机制**，不是新加的）在内部
+   callee 分支补一段：callee 入口需要的位也要在调用点活着——
+   `entryNeeds = callee.ReadEntry | (callee.MayEntry & live)`。
+   - `ReadEntry`：callee 真会读入口值；
+   - `MayEntry ∩ live`：调用点之后还需要这位，而 callee 可能原样交回，所以它必须从调用前就在。
+   实参准备 store 会在更早的位置把这条需求擦掉（值走 value 链），所以真正受影响的是
+   "没有 store、靠寄存器透传"的位：需求继续往上游传，直到真正的生产者（某次调用的返回槽）。
+   已知外部 callee 的 `addInputDemand` 本来就在做同一件事，这里只是把内部 callee 补齐。
+2. 重放 §17 停下的入口形参闭合 patch（`paramMask |= ReturnEntryMask`），
+   `/tmp/fix-return-entry-param.patch`。
+
+**量测（基线 → §17 的 after4 → 本轮 after5）**
+
+| 目标 | local | boundary | clobber | unknowns | missing_binding |
+|---|---|---|---|---|---|
+| vsftpd | 7 | 6 | 23 | 0 → 0 → 0 | 0 |
+| libuv | 4 | 18 | 8 | 8 → 8 → 8 | 0 |
+| lighttpd | 120 → 120 → **117** | 6 | 519 → 519 → 523 | 26 → 26 → 26 | 0 |
+| tmux | 308 → 310 → 312 | 473 | 6830 → 6867 → 6884 | 25 → 22 → 22 | 14 → 11 → 11 |
+| wolfssl | 648 → 648 → **646** | 903 → 906 → 905 | 2900 → 2849 → **2632** | 556 → 535 → 535 | 43 → 22 → 22 |
+
+- **unknown 直方图逐键相同**（wolfssl 94 个 key、lighttpd/tmux 各 6/9 个 key，值与 §17 完全一致），
+  也就是说闭合没有再制造任何新的 unknown；裸读反而少了几条。
+- 例子：`fdevent_fdnode_event_set` 现在是
+  `define internal i64 @fdevent_fdnode_event_set(i64 %RDI.arg, i64 %RSI.arg, i64 %RDX.arg)`，
+  函数体内的 `partial_read(@RDX, 32)` **消失**——就是 Arch2.md 第 13 节里的选项 3（前后一致）。
+  调用点是真值：例如 `FUN_ea58` 传 `%0 = zext i32 %RSI.arg to i64`（机器上 EDX 写 32 位、
+  高半按 x86-64 规则为 0），`connection_state_machine` 传 `%16` 并把返回的 RDX 高低半接着用。
+- 验证：5 目标 `llvm-as` + `opt -passes=verify` OK、`ctest` 12/12、两个 summary 单测通过。
+
+**demand 侧待办（下一轮，先量化后改）**
+
+"非全位需求最后变成整寄存器需求"的候选点（都已定位，未量测）：
+
+1. `valueDemand()`（`NativeRegisterSummary.cpp:2931`）：值不在 `valueDemands` 表里就返回
+   **全位**需求——"没有信息"被当成"全都要"。
+2. `computeValueDemands()` 的种子集合（`:678-725`）：只 seed ret 值、call 实参、**非寄存器**
+   store 操作数、分支/switch/icmp 操作数、partial write 值；**load 结果不 seed，写寄存器 global
+   的 store 操作数也不 seed**。于是 `load @R; store %v, @RDX; call f` 这条实参搬运链里，
+   `%v` 不在表里 → `load @R` 的需求是全位，而 callee 真正需要的可能只有几位。
+3. `liveBeforeBlock` 的 register store 分支（`:3029-3034`）：一条 store 擦掉**整个寄存器**的
+   live 需求。窄写（非 x86-64 低 32 位那种零扩展写）本应只擦被写的位，否则上游返回槽会缺位
+   （镜像问题：需求被低估）。
+4. `seedAbiReturns`（`:2911`）：根函数按 ABI 输出整寄存器 seed——有意为之，不算 bug。
+5. 不透明 callee 分支（`:3078-3087`）：`clobberMask = fullMask(unit)` 把整条 live 需求擦掉；
+   已知外部靠 `addInputDemand` 按位补回，未知外部只能整条丢——边界取舍。
+
+第 1、2 条正好解释 §17 里发现的"死 phi 网仍然产生整条 RDX 需求"：一个只用于寄存器间搬运、
+最终没有真实消费者的 load 也会产生全位需求。修法方向：给"只喂给寄存器 store 的 load"按
+callee 的入口宽度（`ReadEntryMask` / 输入槽）给需求，而不是全位；以及把"没有信息"从
+"全位"改成"只保留调用点确实需要的位"。
+
+
 
 
