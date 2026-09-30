@@ -6842,6 +6842,135 @@ bool testInternalSignatureRewriteUsesNonAbiReturn() {
                   "module failed verifier after non-ABI return rewrite");
 }
 
+
+// 接口可改（本地链接 + 地址没被取）的内部函数可以用自定义约定：callee 在有些路径上
+// 改写 caller-saved 的 RCX、有些路径不改（Mixed），调用者在调用后仍要读 RCX。遵守 ABI
+// 时 RCX 既不是输出寄存器、也没人保证它活着，只能判丢成 unknown；内部约定允许把 RCX
+// 当额外返回通道。开关 AbiForAllFunctions 打开时回到 ABI 行为，用来对照。
+bool testInternalCalleeReturnsCallerSavedRegister() {
+  auto build = [](llvm::LLVMContext &context, llvm::Module &module) {
+    attachTestAbi(module);
+    llvm::GlobalVariable *rcx = createRegisterGlobal(module, "RCX");
+    auto *i64Type = llvm::Type::getInt64Ty(context);
+    auto *sink = new llvm::GlobalVariable(
+        module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+        "sink");
+    auto *flag = new llvm::GlobalVariable(
+        module, llvm::Type::getInt1Ty(context), false,
+        llvm::GlobalValue::ExternalLinkage, nullptr, "flag");
+
+    auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+    llvm::Function *callee = llvm::Function::Create(
+        voidType, llvm::GlobalValue::InternalLinkage, "rcx_mixed_callee",
+        module);
+    llvm::BasicBlock *calleeEntry =
+        llvm::BasicBlock::Create(context, "entry", callee);
+    llvm::BasicBlock *calleeWrite =
+        llvm::BasicBlock::Create(context, "write", callee);
+    llvm::BasicBlock *calleeDone =
+        llvm::BasicBlock::Create(context, "done", callee);
+    llvm::IRBuilder<> calleeBuilder(calleeEntry);
+    llvm::Value *calleeCond =
+        calleeBuilder.CreateLoad(llvm::Type::getInt1Ty(context), flag, "cond");
+    calleeBuilder.CreateCondBr(calleeCond, calleeWrite, calleeDone);
+    calleeBuilder.SetInsertPoint(calleeWrite);
+    storeRegister(calleeBuilder, rcx, llvm::ConstantInt::get(i64Type, 7), "RCX");
+    calleeBuilder.CreateBr(calleeDone);
+    calleeBuilder.SetInsertPoint(calleeDone);
+    calleeBuilder.CreateRetVoid();
+
+    llvm::Function *caller = llvm::Function::Create(
+        voidType, llvm::GlobalValue::InternalLinkage, "rcx_mixed_caller",
+        module);
+    llvm::BasicBlock *callerEntry =
+        llvm::BasicBlock::Create(context, "entry", caller);
+    llvm::IRBuilder<> builder(callerEntry);
+    builder.CreateCall(voidType, callee);
+    llvm::Value *after = loadRegister(builder, rcx, "RCX", "after");
+    builder.CreateStore(after, sink);
+    builder.CreateRetVoid();
+    return rcx;
+  };
+
+  // 默认：接口可改 ⇒ callee 的签名带 RCX 返回槽，调用点不再产生 RCX 的 unknown。
+  {
+    llvm::LLVMContext context;
+    llvm::Module module("summary-ssa-internal-caller-saved-return", context);
+    llvm::GlobalVariable *rcx = build(context, module);
+    auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+    llvm::Function *rewritten = module.getFunction("rcx_mixed_callee");
+    bool callReturnsRCX = false;
+    if (llvm::Function *rewrittenCaller =
+            module.getFunction("rcx_mixed_caller")) {
+      for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+        if (call != nullptr && call->getCalledFunction() == rewritten &&
+            call->getType() == rcx->getValueType()) {
+          callReturnsRCX = true;
+        }
+      }
+    }
+    std::map<std::string, uint64_t> counts =
+        notdec::bin2llvm::countRemainingUnknownValues(module);
+    bool internalMarker = false;
+    if (rewritten != nullptr) {
+      if (llvm::MDNode *node = rewritten->getMetadata("notdec.abi")) {
+        for (const llvm::MDOperand &operand : node->operands()) {
+          if (auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get())) {
+            internalMarker |= text->getString() == "conventions=internal";
+          }
+        }
+      }
+    }
+    if (!expect(rewritten != nullptr, "caller-saved return callee missing") ||
+        !expect(rewritten->getReturnType() == rcx->getValueType(),
+                "internal caller-saved return was not added to signature") ||
+        !expect(callReturnsRCX,
+                "internal caller-saved return callsite was not rewritten") ||
+        !expect(internalMarker,
+                "internal function was not marked as internal convention") ||
+        !expect(counts.count("call_effect_mixed:rcx_mixed_callee:RCX") == 0,
+                "internal caller-saved return still produced a mixed unknown") ||
+        !expect(summary.CallsRewritten >= 1,
+                "caller-saved return call rewrite was not counted") ||
+        !verifyOk(module, "module failed verifier after caller-saved return")) {
+      return false;
+    }
+  }
+
+  // 开关打开：所有函数都遵守 ABI ⇒ 不出现 RCX 返回槽，回到"值丢了"的路径。
+  {
+    llvm::LLVMContext context;
+    llvm::Module module("summary-ssa-abi-for-all-caller-saved", context);
+    llvm::GlobalVariable *rcx = build(context, module);
+    notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+    options.AbiForAllFunctions = true;
+    (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+    llvm::Function *rewritten = module.getFunction("rcx_mixed_callee");
+    bool externalMarker = false;
+    if (rewritten != nullptr) {
+      if (llvm::MDNode *node = rewritten->getMetadata("notdec.abi")) {
+        for (const llvm::MDOperand &operand : node->operands()) {
+          if (auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get())) {
+            externalMarker |= text->getString() == "conventions=external";
+          }
+        }
+      }
+    }
+    if (!expect(rewritten != nullptr, "abi-for-all callee missing") ||
+        !expect(rewritten->getReturnType() ==
+                    llvm::Type::getVoidTy(context),
+                "abi-for-all must not add caller-saved return slot") ||
+        !expect(externalMarker,
+                "abi-for-all function was not marked as external convention") ||
+        !expect(rcx != nullptr, "register global missing") ||
+        !verifyOk(module, "module failed verifier after abi-for-all test")) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool testInternalSignatureRewriteUsesReadEntryReturnRegisterArg() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-entry-return-register-arg", context);
@@ -6849,8 +6978,9 @@ bool testInternalSignatureRewriteUsesReadEntryReturnRegisterArg() {
   llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
 
   auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  // 接口可改（本地链接 + 地址没被取）的内部函数才能用自定义约定，把入口 RAX 变成形参。
   llvm::Function *function =
-      llvm::Function::Create(voidType, llvm::GlobalValue::ExternalLinkage,
+      llvm::Function::Create(voidType, llvm::GlobalValue::InternalLinkage,
                              "notdec_native_read_entry_rax", module);
   llvm::BasicBlock *entry =
       llvm::BasicBlock::Create(context, "entry", function);
@@ -12169,8 +12299,11 @@ bool testMixedCallBoundaryAttributesUnknownToCallee() {
   auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
   // callee：true 路径把 RDI 写成常量（非入口值），false 路径不动 RDI
   // ⇒ RDI 的出口 provenance 是 Mixed，调用点只能用占位值。
+  // 这里故意用外部链接：遵守 ABI 的函数不能把 RDI 当返回通道，调用点才会落到
+  // "值丢了"的归因路径上（内部函数现在可以给 RDI 加返回槽，见
+  // testInternalCalleeReturnsCallerSavedRegister）。
   llvm::Function *callee = llvm::Function::Create(
-      voidType, llvm::GlobalValue::InternalLinkage, "mixed_rdi_callee", module);
+      voidType, llvm::GlobalValue::ExternalLinkage, "mixed_rdi_callee", module);
   llvm::BasicBlock *calleeEntry =
       llvm::BasicBlock::Create(context, "entry", callee);
   llvm::BasicBlock *calleeWrite =
@@ -13200,6 +13333,7 @@ int main() {
   ok &= testInternalSignatureRewriteUsesArgsAndReturn();
   ok &= testAddressTakenInternalFunctionUseFollowsRewrite();
   ok &= testInternalSignatureRewriteUsesNonAbiReturn();
+  ok &= testInternalCalleeReturnsCallerSavedRegister();
   ok &= testInternalSignatureRewriteUsesReadEntryReturnRegisterArg();
   ok &= testInternalSignatureRewriteUsesNarrowEntryRangeArg();
   ok &= testInternalSignatureShapeParamKeepsOverwrittenEntryRange();

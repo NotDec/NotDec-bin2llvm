@@ -726,6 +726,28 @@ bool registerValueSourceIsControlled(const llvm::Function &function) {
   return function.hasLocalLinkage() && !function.hasAddressTaken();
 }
 
+// 函数遵循哪一套调用约定：
+//   External —— 必须遵守外部 ABI：声明（外部实现）、导出/地址被取的函数，或者用户
+//               打开了“所有函数都遵守 ABI”的开关。参数只能用 ABI 输入寄存器，
+//               返回只能用 ABI 输出寄存器，其余寄存器读留作边界读。
+//   Internal —— 接口可改（本地链接 + 地址没被取，所有调用点都由本 pass 重写）：
+//               参数和返回都可以用自定义约定，例如把 caller-saved 的 RCX/R8 也当
+//               返回值通道。
+// 参数侧和返回侧必须用同一个判定，否则会出现“一半按 ABI、一半自定义”的混合签名。
+enum class AbiConvention { External, Internal };
+
+AbiConvention abiConventionFor(const llvm::Function &function,
+                               bool abiForAllFunctions) {
+  if (function.isDeclaration()) {
+    return AbiConvention::External;
+  }
+  if (abiForAllFunctions) {
+    return AbiConvention::External;
+  }
+  return registerValueSourceIsControlled(function) ? AbiConvention::Internal
+                                                   : AbiConvention::External;
+}
+
 bool pointerIsRegisterGlobal(const llvm::Value *value) {
   const llvm::Value *stripped = value->stripPointerCasts();
   const auto *global = llvm::dyn_cast<llvm::GlobalVariable>(stripped);
@@ -733,13 +755,16 @@ bool pointerIsRegisterGlobal(const llvm::Value *value) {
 }
 
 NativeRegisterValueSourceAudit
-auditRegisterValueSourcesImpl(llvm::Module &module) {
+auditRegisterValueSourcesImpl(llvm::Module &module, bool abiForAllFunctions) {
   NativeRegisterValueSourceAudit audit;
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
       continue;
     }
-    const bool controlled = registerValueSourceIsControlled(function);
+    // 和签名构建用同一个判定：只有“接口可改”的函数的残留寄存器读才算 local，
+    // 遵守 ABI 的函数（导出/地址被取，或开关强制）算边界读。
+    const bool controlled = abiConventionFor(function, abiForAllFunctions) ==
+                            AbiConvention::Internal;
     for (llvm::BasicBlock &block : function) {
       for (llvm::Instruction &instruction : block) {
         if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
@@ -1155,6 +1180,16 @@ bool isAbiBoundaryZeroRegister(llvm::StringRef name) {
 bool isX87StackRegisterName(llvm::StringRef name) {
   return name.size() == 3 && name.starts_with("ST") && name[2] >= '0' &&
          name[2] <= '7';
+}
+
+// x86-64 通用寄存器（承载整数/指针值）。接口可改的内部函数允许把 caller-saved 的
+// 通用寄存器当额外返回通道；标志位（OF/SF/ZF/…）、段基址（FS_OFFSET/GS_OFFSET）、
+// x87 窗口（ST0..ST7）、浮点向量寄存器都不承载 C 语义的值，不在此列。
+bool isValueCarryingRegisterName(llvm::StringRef name) {
+  return name == "RAX" || name == "RBX" || name == "RCX" || name == "RDX" ||
+         name == "RSI" || name == "RDI" || name == "RBP" || name == "RSP" ||
+         name == "R8" || name == "R9" || name == "R10" || name == "R11" ||
+         name == "R12" || name == "R13" || name == "R14" || name == "R15";
 }
 
 std::string
@@ -1772,7 +1807,7 @@ SignatureShape shapeForInternalFunction(
     llvm::Function &function,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     const std::map<llvm::Function *, FunctionSummaryFacts> &summaryFacts,
-    const AbiFacts &abi) {
+    const AbiFacts &abi, AbiConvention own) {
   SignatureShape shape;
   auto factsIt = summaryFacts.find(&function);
   if (factsIt == summaryFacts.end()) {
@@ -1819,8 +1854,16 @@ SignatureShape shapeForInternalFunction(
     if (regIt == facts.Registers.end() || !regIt->second.ReadEntry) {
       return;
     }
-    if (abi.InternalParamRegisters.count(unit.Name) == 0 &&
-        abi.InternalReturnRegisters.count(unit.Name) == 0) {
+    // 遵守 ABI 的函数：形参只能是 ABI 输入寄存器（facts.Inputs 就是 cspec 标注的
+    // 寄存器输入）。接口可改的函数沿用旧集合（ABI 输入 ∪ 返回/unaffected 寄存器），
+    // 那本身就是本 pass 自定义的内部约定。
+    if (own == AbiConvention::External) {
+      if (abi.Inputs.count(unit.Name) == 0) {
+        return;
+      }
+    } else if (abi.InternalParamRegisters.count(unit.Name) == 0 &&
+               abi.InternalReturnRegisters.count(unit.Name) == 0 &&
+               !isValueCarryingRegisterName(unit.Name)) {
       return;
     }
     // 返回槽里"可能还是入口值"的位（ReturnEntryMask = ExitDemand ∩ MayEntry ∩
@@ -1835,9 +1878,15 @@ SignatureShape shapeForInternalFunction(
     // "入口处有有效值"，包含写保留（partial write 读改写）这类没被语义
     // 读过的位，会把参数宽度撑大。旧产物没有 ReadEntryMask 时退回
     // EntryDemandMask，再退到整寄存器；返回槽透传的位并进 paramMask。
+    // "返回槽里可能还是入口值"的位要形参承载，这属于自定义约定的一部分：遵守 ABI
+    // 的函数不能凭空多出形参，所以只在接口可改的函数上做。
+    // 参数侧和返回侧必须用同一个集合：能在返回侧承载值的通用寄存器，也要能从形参
+    // 把入口值接进来（否则返回值里"没写过的那条路径"只能裸读寄存器 global）。
     llvm::APInt returnEntryMask;
-    if (abi.InternalReturnRegisters.count(unit.Name) != 0 && !shape.VarArg &&
-        !isFloatAbiOutputUnit(abi, unit.Name)) {
+    if (own == AbiConvention::Internal &&
+        (abi.InternalReturnRegisters.count(unit.Name) != 0 ||
+         isValueCarryingRegisterName(unit.Name)) &&
+        !shape.VarArg && !isFloatAbiOutputUnit(abi, unit.Name)) {
       returnEntryMask = regIt->second.ReturnEntryMask;
     }
     if (!regIt->second.ReadEntry &&
@@ -1911,8 +1960,19 @@ SignatureShape shapeForInternalFunction(
   appendInternalStackParams(shape, function, units, abi);
 
   for (const RegisterUnit *unit : orderedUnits) {
-    if (abi.InternalReturnRegisters.count(unit->Name) == 0) {
+    const bool abiReturn = abi.InternalReturnRegisters.count(unit->Name) != 0;
+    if (own == AbiConvention::External && !abiReturn) {
+      // 遵守 ABI：只有 ABI 输出寄存器能做返回槽。
       continue;
+    }
+    if (!abiReturn) {
+      // 接口可改：caller-saved 的通用寄存器（RCX/R8/R9/…）也能承载返回值——返回值就是
+      // 它在调用后真实持有的值，caller-saved 的语义本来就不保证它被保留，所以把它当
+      // 额外返回通道是安全的。只放通用寄存器：标志位/段基址/x87 窗口/浮点向量不承载
+      // C 语义的值（early 版本把 OF 也当成了返回寄存器）。
+      if (!isValueCarryingRegisterName(unit->Name)) {
+        continue;
+      }
     }
     // Whole-ZMM returns are only safe for lifted void helpers.  If a function
     // already has an LLVM return value, widening it to i512 would overwrite the
@@ -3466,7 +3526,8 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
     llvm::Module &module,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     const std::map<llvm::Function *, FunctionSummaryFacts> &summaryFacts,
-    const AbiFacts &abi, const NativeExternalPrototypeMap &prototypes) {
+    const AbiFacts &abi, const NativeExternalPrototypeMap &prototypes,
+    bool abiForAllFunctions) {
   std::map<llvm::Function *, SignatureShape> shapes;
   for (llvm::Function &function : module) {
     // 内置 intrinsic（notdec.register.* 命名空间 + 历史前缀）不参与签名重写，
@@ -3486,7 +3547,9 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
     SignatureShape shape =
         function.isDeclaration() || (known != nullptr && known->VarArg)
             ? shapeForKnownExternal(function, units, abi, prototypes)
-            : shapeForInternalFunction(function, units, summaryFacts, abi);
+            : shapeForInternalFunction(
+                  function, units, summaryFacts, abi,
+                  abiConventionFor(function, abiForAllFunctions));
     if (!shape.Params.empty() || !shape.Returns.empty() || shape.VarArg) {
       shapes.emplace(&function, std::move(shape));
     }
@@ -9498,8 +9561,9 @@ collectRemainingCallValueWarnings(const llvm::Module &module) {
 } // namespace
 
 NativeRegisterValueSourceAudit
-auditNativeRegisterValueSources(llvm::Module &module) {
-  return auditRegisterValueSourcesImpl(module);
+auditNativeRegisterValueSources(llvm::Module &module,
+                                bool abiForAllFunctions) {
+  return auditRegisterValueSourcesImpl(module, abiForAllFunctions);
 }
 
 NativeRegisterSummarySSASummary
@@ -9599,8 +9663,26 @@ runNativeRegisterSummarySSA(llvm::Module &module,
   signatureState.Warnings = std::move(inferenceWarnings);
   if (options.EnableRewrite) {
     signatureState.Shapes = buildInitialSignatureShapes(
-        module, units, facts, abi, externalPrototypes);
+        module, units, facts, abi, externalPrototypes,
+        options.AbiForAllFunctions);
     propagateTailCallStackParams(module, signatureState);
+    // 每个函数的调用约定标记（Arch2.md 第 13 节）：external = 参数/返回都按外部 ABI；
+    // internal = 接口可改，可以用自定义约定。审计和后续 pass 只读这个标记，不再重算。
+    if (options.AttachMetadata) {
+      for (llvm::Function &function : module) {
+        if (function.isIntrinsic()) {
+          continue;
+        }
+        AbiConvention convention =
+            abiConventionFor(function, options.AbiForAllFunctions);
+        llvm::Metadata *fields[] = {llvm::MDString::get(
+            module.getContext(),
+            convention == AbiConvention::External ? "conventions=external"
+                                                  : "conventions=internal")};
+        function.setMetadata("notdec.abi",
+                             llvm::MDNode::get(module.getContext(), fields));
+      }
+    }
   }
 
   NativeRegisterSummarySSASummary summary;

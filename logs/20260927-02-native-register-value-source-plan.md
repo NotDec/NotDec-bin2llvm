@@ -617,6 +617,82 @@ fallback、种子集合漏寄存器 store 操作数，见 §18）收窄。
 也就是说当前剩余入口读主要是"变参寄存器保存区"和"callee-saved 寄存器"两类；真正属于
 "普通参数寄存器、只转发"的很少，所以这一步的收益本来也不在数量上，而在结构闭合。
 
+## 21. "非 ABI 返回槽（受控函数）"实现记录（2026-09-28 第五轮）
+
+用户要求：统一一个"是否遵守 ABI"的判定，参数和返回保持一致；给一个开关（有些编译配置
+所有函数都遵守 ABI）；直接完全实现，效果不好也不要急着回退，先讨论原因。
+
+**实现（都在工作区）**
+
+1. `NativeRegisterSummarySSAOptions::AbiForAllFunctions`（默认 false）+ CLI
+   `--abi-for-all-functions`。
+2. 判定 `abiConventionFor(function, abiForAllFunctions)`：
+   - 声明 / 导出 / 地址被取 / 开关打开 → `External`（遵守 ABI）；
+   - 本地链接 + 地址没被取 → `Internal`（接口可改，自定义约定）。
+   参数侧和返回侧共用这一个判定。
+3. 每个函数挂 `!notdec.abi !{!"conventions=external|internal"}` 标记。
+4. 形状：
+   - `External`：形参只允许 ABI 输入寄存器（`abi.Inputs`）；返回只允许
+     `InternalReturnRegisters`；不做 `ReturnEntryMask` 闭包。
+   - `Internal`：形参 = ABI 输入 ∪ 返回/unaffected ∪ 通用寄存器；返回 = ABI 输出 ∪
+     unaffected ∪ **通用寄存器（caller-saved 也能当返回通道）**。参数和返回用同一个集合。
+   - 只放"承载值"的通用寄存器（新增 `isValueCarryingRegisterName`）：标志位（OF 一度被
+     当成返回寄存器）、段基址、x87 窗口、浮点向量都排除。
+5. 审计 `auditNativeRegisterValueSources(module, abiForAllFunctions)` 用同一个判定分
+   local/boundary。
+6. 单测：`testInternalCalleeReturnsCallerSavedRegister`（内部函数 RCX Mixed + 调用后读
+   → 签名带 RCX 返回槽、调用点拿到值、无 unknown；开关打开后不出现返回槽、
+   标记变成 external）；两个原有单测改用外部/内部链接以匹配新语义。
+
+**量测（基线 after8 → 默认模式 after11）**
+
+| 目标 | local | boundary | clobber | unknowns |
+|---|---|---|---|---|
+| vsftpd | 7 → 7 | 6 → 6 | 23 → 23 | 0 → 0 |
+| libuv | 4 → 4 | 18 → 18 | 8 → 8 | 8 → 8 |
+| lighttpd | 117 → **215** | 6 → 19 | 523 → **876** | 26 → **54** |
+| tmux | 312 → 343 | 473 → 473 | 6854 → 7543 | 22 → **27** |
+| wolfssl | 646 → **1650** | 905 → 897 | 2690 → **11370** | 535 → **643** |
+
+**对照：`--abi-for-all-functions`（所有函数都遵守 ABI）**
+
+| 目标 | local | boundary | unknowns |
+|---|---|---|---|
+| lighttpd | 0 | 146 | **23** |
+| tmux | 0 | 781 | 25 |
+
+（打开开关时没有函数属于"接口可改"，所以 local 按定义是 0，寄存器读全部计 boundary。）
+
+**结论与诊断（为什么变差）**
+
+1. 调用点那一侧确实修好了：tmux 的 `call_effect_mixed` 4 → 0、
+   `call_arg_rewrite_missing_binding` 11 → 7。
+2. 但那些 unknown 只是**换了地方**：新的返回槽在 callee 的 `ret` 处组装出口值时，
+   来源是"不透明调用的 clobber"，于是走 §11 的折叠 →
+   `return_binding_uses_clobber_value` 从 10/1/14 涨到 38/14/182（lighttpd/tmux/wolfssl）。
+   实例：lighttpd `fdevent_waitpid`（R8 的 `may_entry_mask=0`，出口 R8 只来自
+   `call @waitpid`）→ `%R8.return_unknown69`。
+3. 代价很大：callee 为了组装这些出口值，clobber 占位与局部读暴涨
+   （wolfssl clobber 2690 → 11370、local 646 → 1650；返回结构体也变大）。
+4. 底层动机仍然是假需求：partial write 造出来的位最早把 RCX/R8 卷进来，现在它们同时走
+   形参和返回两条通道，等于给垃圾位修了两条路。
+
+**待讨论的选项**
+
+- **A（推荐先做）**：返回槽判据加一条"出口值必须有真实来源"：summary 侧区分"本函数自己
+  写过"与"只被调用 clobber 过"（现在只有 MayNonEntry 一个 bool/mask，两者混在一起），
+  只有 `需求 ∩ (本地写过 ∪ 可能还是入口值)` 非空才建返回槽。这样 §2 那类"出口只来自
+  `waitpid`"的寄存器不会再被当成返回通道。
+- **B**：按新准则重新设计 §11 的折叠——clobber 是"不透明 callee 的出口"（I3 里的已知来源），
+  不该算建模缺口 unknown。上次删折叠挂了 3 个单测，需要连同"内部函数出口不暴露 clobber
+  helper"这条一起设计（例如给返回槽的 clobber 占位挂 `!notdec.register.opaque_clobber`
+  并按 I3 单独计数）。
+- **C**：等假需求收窄（partial write 那两条）之后重新量同一组数字——现在 RCX/R8 被卷进来
+  的动机大半是假的，修完可能默认模式自然变好。
+- **D**：临时把 `AbiForAllFunctions` 默认打开（等价于"不做自定义约定"），把机制留着备用。
+  对照数据里打开开关的 unknown 反而比基线低（lighttpd 23 vs 26）。
+
+
 
 
 

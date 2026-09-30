@@ -23,6 +23,11 @@ struct NativeRegisterSummarySSAOptions {
   bool AttachMetadata = true;
   // 识别编译器生成的变参序言并恢复成 llvm.va_start + 变参签名（默认开）。
   bool EnableVarArgRecovery = true;
+  // 是否要求所有函数都遵守外部 ABI（参数和返回都用 ABI 寄存器）。
+  // 默认 false：本地链接、地址没被取的函数属于"接口可改"，参数和返回都可以用自定义
+  // 约定（例如把 caller-saved 的 RCX/R8 也当返回通道）。某些编译配置下所有函数都遵守
+  // ABI，这时打开该开关，产物形状与打开前一致。
+  bool AbiForAllFunctions = false;
   bool PrintSummary = false;
   std::string ExternalPrototypeJsonPath;
   std::set<std::string> IgnoredRegisters;
@@ -134,7 +139,8 @@ struct NativeRegisterValueSourceAudit {
 };
 
 NativeRegisterValueSourceAudit
-auditNativeRegisterValueSources(llvm::Module &module);
+auditNativeRegisterValueSources(llvm::Module &module,
+                                bool abiForAllFunctions = false);
 
 NativeRegisterSummarySSASummary runNativeRegisterSummarySSA(
     llvm::Module &module, const NativeRegisterSummarySSAOptions &options = {});

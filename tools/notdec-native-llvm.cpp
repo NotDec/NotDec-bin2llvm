@@ -75,6 +75,9 @@ struct CliOptions {
   bool DisableRegisterSSAPass = false;
   bool DisableSummaryRegisterResidueRemoval = false;
   bool DisableVarArgRecovery = false;
+  // 要求所有函数都遵守外部 ABI（参数/返回都用 ABI 寄存器）。默认只对导出/地址被取的
+  // 函数强制，本地链接且地址没被取的函数允许本 pass 自定义约定。
+  bool AbiForAllFunctions = false;
   bool PrintRegisterSSASummary = false;
   bool DisableInstCombinePass = false;
   bool SkipRuntimeFunctions = false;
@@ -110,7 +113,7 @@ void printUsage(const char *argv0) {
                "[--no-register-ssa-pass] "
                "[--summary-register-ssa-pass] "
                "[--no-summary-register-residue-removal] "
-               "[--no-vararg-recovery] "
+               "[--no-vararg-recovery] [--abi-for-all-functions] "
                "[--register-ssa-summary] "
                "[--skip-runtime] "
                "[--native-decode-mode gtirb|internal] [--gtirb <path>] "
@@ -179,6 +182,10 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
     if (flag == "--no-summary-register-residue-removal") {
       options.DisableSummaryRegisterResidueRemoval = true;
+      continue;
+    }
+    if (flag == "--abi-for-all-functions") {
+      options.AbiForAllFunctions = true;
       continue;
     }
     if (flag == "--no-vararg-recovery") {
@@ -562,7 +569,8 @@ bool writeRegisterSSAWarnings(
 // "剩下的 unknown 到底是什么"（调用边界丢的 / 入口闸门拒绝的 / 真有缺口）。
 // 只在 --register-ssa-summary 下打印：默认路径的 stderr 必须保持干净
 // （cli-signature-rewrite smoke 用 require_empty 检查）。
-void reportRemainingUnknownValues(llvm::Module &module) {
+void reportRemainingUnknownValues(llvm::Module &module,
+                                  bool abiForAllFunctions) {
   std::map<std::string, uint64_t> counts =
       notdec::bin2llvm::countRemainingUnknownValues(module);
   uint64_t total = 0;
@@ -582,7 +590,8 @@ void reportRemainingUnknownValues(llvm::Module &module) {
   // 要求它为 0；boundary_register_reads 是边界函数（外部可见/地址被取）里的读，允许
   // 但单独计数（I3）。unknowns 按 reason 分类，I2 要求其中不再有“建模缺口”类。
   notdec::bin2llvm::NativeRegisterValueSourceAudit audit =
-      notdec::bin2llvm::auditNativeRegisterValueSources(module);
+      notdec::bin2llvm::auditNativeRegisterValueSources(
+          module, abiForAllFunctions);
   uint64_t auditUnknowns = 0;
   for (const auto &[reason, count] : audit.UnknownValuesByReason) {
     (void)reason;
@@ -1037,6 +1046,7 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
       !options.DisableSummaryRegisterResidueRemoval;
   passOptions.EnablePostRewriteInstCombine = !options.DisableInstCombinePass;
   passOptions.EnableVarArgRecovery = !options.DisableVarArgRecovery;
+  passOptions.AbiForAllFunctions = options.AbiForAllFunctions;
   passOptions.PrintSummary = options.PrintRegisterSSASummary;
   passOptions.ExternalPrototypeJsonPath = options.ExternalPrototypeJsonPath;
   notdec::bin2llvm::NativeRegisterSummarySSASummary summary =
@@ -1216,7 +1226,7 @@ int main(int argc, char **argv) {
       // 同一次化简也可能才删掉死块里的 userop 占位调用，声明的清理跟着补一次。
       notdec::bin2llvm::eraseUnusedRegisterHelperDeclarations(*module);
       if (options->PrintRegisterSSASummary) {
-        reportRemainingUnknownValues(*module);
+        reportRemainingUnknownValues(*module, options->AbiForAllFunctions);
       }
       return writeModule(*module, options->OutputPath);
     }
@@ -1416,7 +1426,7 @@ int main(int argc, char **argv) {
     notdec::bin2llvm::eraseDeadUnknownValueCalls(*module);
     notdec::bin2llvm::eraseUnusedRegisterHelperDeclarations(*module);
     if (options->PrintRegisterSSASummary) {
-      reportRemainingUnknownValues(*module);
+      reportRemainingUnknownValues(*module, options->AbiForAllFunctions);
     }
 
     return writeModule(*module, options->OutputPath);
