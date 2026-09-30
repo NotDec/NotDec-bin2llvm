@@ -511,6 +511,57 @@ unknown。实例：lighttpd `h1_reqbody_read` 在 `chunkqueue_mark_written` 之�
 callee 的入口宽度（`ReadEntryMask` / 输入槽）给需求，而不是全位；以及把"没有信息"从
 "全位"改成"只保留调用点确实需要的位"。
 
+## 19. demand 改成双向 worklist（2026-09-28 第三轮）
+
+用户结论：这种结构问题是理论完整性问题，不做收益量化，直接实现——需求有两个方向，
+不该硬套"自顶向下"，用单调 worklist 定点。
+
+**改动（`lib/passes/summary/NativeRegisterSummary.cpp`）**
+
+1. `runTopDownDemand`：版本号循环 → **worklist**。
+   - caller → callee：调用点的 `additions[callee]` 进 callee 的 ExitDemand，变化则入队 callee；
+   - callee → caller：callee 的 **ExitDemand** 变化 → 入队它的所有 caller（因为调用点规则要读
+     它的 ExitDemand 取透传需求）——这就是那条反向需求边；
+   - `inQueue` 去重；所有量只置位（`mergeDemand`/`addDemand` 只 OR），有限格 → 收敛；
+     递归/互递归同样终止。
+2. `applyBackwardCallDemand` 的入口需求改成**镜像签名判据**：
+   `entryNeeds = ReadEntryMask | (MayEntryMask ∩ MayNonEntryMask ∩ callee.ExitDemandMask ∩ live)`，
+   浮点返回寄存器和变参函数沿用 `shapeForInternalFunction` 的取舍。
+   即"调用点必须提供的位" = callee 真读的入口位 + callee 出口透传、而调用点之后还要用的位。
+
+**走过的一段弯路（记录备查）**：第一版直接用 callee 的 `EntryDemand` 当入口需求，实测是回归——
+
+| 目标 | EntryDemand 版 | 镜像判据版（最终） |
+|---|---|---|
+| lighttpd unknowns / local | 35 / 163 | **26 / 117** |
+| tmux unknowns / local | 76 / 815 | **22 / 312** |
+| wolfssl unknowns / local / boundary | 552 / 1040 / 1859 | **535 / 646 / 905** |
+
+原因：`EntryDemand` 是"入口 live-in"，含 partial write 的写保留位等垃圾位（
+`shapeForInternalFunction` 的注释里解释过为什么不用它定形参宽度），而且它被假需求放大后
+会沿整条调用链继续传播。镜像判据才是"调用点确实必须提供的位"。
+
+**最终量测（基线 → 现在）**
+
+| 目标 | local | boundary | clobber | unknowns | missing_binding |
+|---|---|---|---|---|---|
+| vsftpd | 7 | 6 | 23 | 0 | 0 |
+| libuv | 4 | 18 | 8 | 8 | 0 |
+| lighttpd | 120 → **117** | 6 | 519 → 523 | 26 | 0 |
+| tmux | 308 → 312 | 473 | 6830 → 6854 | 25 → **22** | 14 → **11** |
+| wolfssl | 648 → **646** | 903 → 905 | 2900 → **2690** | 556 → **535** | 43 → **22** |
+
+数字与第二轮（§18）持平或略好，但结构上是完整的双向定点：callee 的 ExitDemand 变化会重算
+caller，需求可以沿调用链一路往上传。`fdevent_fdnode_event_set` 仍是
+`i64 %RDX.arg` + i64 返回、无 `partial_read`。5 目标 verify OK、`ctest` 12/12、两个 summary
+单测通过。
+
+**仍然存在的边界**：形参判据还是 `ReadEntry`（不含 ReturnEntryMask 之外传播上来的入口需求），
+所以"只透传、自己从不读"的函数仍以入口裸读收尾（准则允许：裸读 > unknown）。要把它也变成
+形参，需要让形参判据吃"传播上来的入口需求"，并且先把假需求（`valueDemand` 的 all-ones
+fallback、种子集合漏寄存器 store 操作数，见 §18）收窄。
+
+
 
 
 

@@ -7,6 +7,7 @@
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackAddress.h"
+#include "notdec-bin2llvm/passes/summary/NativeVarArgRewrite.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -2873,35 +2874,45 @@ private:
   }
 
   void runTopDownDemand() {
-    // analyzeCallerDemand(F) 只读 F 自己的 IR 和 F 自己的 ExitDemand（callee 的需求是
-    // 它的输出，见 liveBeforeBlock 里唯一的 Demands[&function] 读），所以只有"F 自己的
-    // ExitDemand 变过"时才需要重算 F。原来每轮对全部函数重算（重复 computeValueDemands
-    // 加一次块级定点），大模块上是 轮数 × 全部函数；这里用版本号跳过没变的函数。
-    std::map<llvm::Function *, uint64_t> exitDemandVersion;
-    std::map<llvm::Function *, uint64_t> analyzedVersion;
-    uint64_t nextVersion = 1;
+    // 需求是双向的，所以这里是一个普通的单调 worklist 定点，而不是"自顶向下扫描"：
+    //   caller -> callee：调用点用到的位进 callee 的 ExitDemand（callee 要返回它）；
+    //   callee -> caller：调用点规则读 callee 的 ExitDemand（透传需求 = ExitDemand ∩
+    //                     MayEntry ∩ MayNonEntry ∩ 调用点的 live），所以 callee 的
+    //                     ExitDemand 变了要重算它的所有 caller。
+    // 两个方向都只置位（mergeDemand / addDemand 只 OR），有限格 → 一定收敛；递归、
+    // 互递归也一样，每轮只会多置几位。用 inQueue 去重，避免同一函数被反复入队。
+    std::set<llvm::Function *> inQueue;
+    std::deque<llvm::Function *> worklist;
+    auto enqueue = [&](llvm::Function *function) {
+      if (function != nullptr && inQueue.insert(function).second) {
+        worklist.push_back(function);
+      }
+    };
     for (llvm::Function *function : Functions) {
       if (Callers[function].empty()) {
         seedAbiReturns(Demands[function]);
       }
-      // 每个函数至少要分析一次，所以初始版本各不相同。
-      exitDemandVersion[function] = nextVersion++;
+      // 每个函数至少要分析一次：EntryDemand 是 caller 侧需求的输入。
+      enqueue(function);
     }
 
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (llvm::Function *function : Functions) {
-        if (exitDemandVersion[function] == analyzedVersion[function]) {
-          continue;
-        }
-        analyzedVersion[function] = exitDemandVersion[function];
-        std::map<llvm::Function *, RegisterDemand> additions =
-            analyzeCallerDemand(*function);
-        for (auto &[callee, demand] : additions) {
-          if (mergeDemand(Demands[callee].ExitDemand, demand)) {
-            exitDemandVersion[callee] = nextVersion++;
-            changed = true;
+    while (!worklist.empty()) {
+      llvm::Function *function = worklist.front();
+      worklist.pop_front();
+      inQueue.erase(function);
+      std::map<llvm::Function *, RegisterDemand> additions =
+          analyzeCallerDemand(*function);
+      for (auto &[callee, demand] : additions) {
+        if (mergeDemand(Demands[callee].ExitDemand, demand)) {
+          enqueue(callee);
+          // 调用点规则也读 callee 的 ExitDemand（取它和 MayEntry ∩ MayNonEntry 的
+          // 交集当透传需求），所以 callee 的 ExitDemand 变了，它的所有 caller 也要
+          // 重算：这正是 callee → caller 那条反向需求边。
+          auto callersIt = Callers.find(callee);
+          if (callersIt != Callers.end()) {
+            for (llvm::Function *caller : callersIt->second) {
+              enqueue(caller);
+            }
           }
         }
       }
@@ -3072,28 +3083,47 @@ private:
           eraseDemand(live, global, killedBits);
         }
       }
-      // callee 在入口需要的位，调用点必须已经有值：
-      //  - ReadEntry：callee 真会读入口值；
-      //  - MayEntry ∩ live：调用点之后还需要这一位，而 callee 可能原样把它交回，
-      //    所以它的值必须从调用前就在（callee 一定会写的位不用）。
-      // 实参准备 store 会在更早的位置把这条需求擦掉（值由 value 链提供），所以真正
-      // 受影响的是"没有 store、靠寄存器透传"的位：需求继续往上游传，直到真正的
-      // 生产者（某次调用的返回槽）。已知外部 callee 的 addInputDemand 是同一件事，
-      // 这里只是把内部 callee 补齐。
+      // callee 在入口需要的位，调用点必须已经有值——但只要求"签名确实会带进来的位"，
+      // 也就是镜像 shapeForInternalFunction 的入口形参判据：
+      //   ReadEntryMask                —— callee 真读的入口位；
+      //   ReturnEntryMask ∩ live        —— callee 出口透传、而调用点之后还要用的位
+      //                                    （不被需要的透传位是 don't-care，调用点用
+      //                                    入口读兜底即可，不必为它造载体）。
+      // 不用 EntryDemandMask：它含 partial write 的写保留位等垃圾位（见
+      // shapeForInternalFunction 的注释），拿它传播会把假需求放大到整条调用链。
+      // 已知外部 callee 的 addInputDemand 做的是同一件事（那边用静态 shape）。
+      // ReturnEntryMask 依赖 callee 的 ExitDemand，所以这个函数不再是"只读自己的
+      // ExitDemand"；ExitDemand 变化由 runTopDownDemand 的 worklist 重新入队 caller。
+      auto calleeDemandIt = Demands.find(callee);
       for (const auto &[global, unit] : Units) {
         if (isIgnored(unit, Options)) {
           continue;
         }
         Cell calleeCell = cellIn(effect, global);
         llvm::APInt entryNeeds = calleeCell.ReadEntry;
+        // 浮点返回寄存器（XMM/ZMM/ST0）不做入口侧闭合（和
+        // shapeForInternalFunction 的取舍一致）：调用点还答不出整条向量。
+        bool floatReturnUnit =
+            Abi.Outputs.count(unit.Name) != 0 &&
+            std::find(Abi.IntegerOutputOrder.begin(),
+                      Abi.IntegerOutputOrder.end(),
+                      unit.Name) == Abi.IntegerOutputOrder.end();
         llvm::APInt liveMask = demandFor(live, global);
-        if (liveMask.getBitWidth() != 0 &&
-            calleeCell.MayEntry.getBitWidth() == liveMask.getBitWidth()) {
-          llvm::APInt passthrough = calleeCell.MayEntry & liveMask;
-          if (entryNeeds.getBitWidth() == 0) {
-            entryNeeds = passthrough;
-          } else if (entryNeeds.getBitWidth() == passthrough.getBitWidth()) {
-            entryNeeds |= passthrough;
+        llvm::APInt exitDemand =
+            calleeDemandIt == Demands.end()
+                ? llvm::APInt()
+                : demandFor(calleeDemandIt->second.ExitDemand, global);
+        if (!floatReturnUnit && !isNativeVarArgFunction(*callee) &&
+            exitDemand.getBitWidth() != 0 && liveMask.getBitWidth() != 0 &&
+            exitDemand.getBitWidth() == liveMask.getBitWidth() &&
+            calleeCell.MayEntry.getBitWidth() == exitDemand.getBitWidth()) {
+          // callee 出口透传（MayEntry ∩ MayNonEntry）∩ 调用点之后还需要（live）
+          llvm::APInt returnEntry =
+              calleeCell.MayEntry & calleeCell.MayNonEntry & exitDemand & liveMask;
+          if (maskNonZero(returnEntry)) {
+            entryNeeds = entryNeeds.getBitWidth() == 0
+                             ? returnEntry
+                             : entryNeeds | returnEntry;
           }
         }
         if (maskNonZero(entryNeeds)) {

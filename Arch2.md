@@ -570,10 +570,17 @@ define internal i64 @fdevent_fdnode_event_set(i64 %RDI.arg, i64 %RSI.arg, i64 %R
   26→83、wolfssl 556→650，虽然裸读同时下降（lighttpd local 120→78）。原因是调用点侧的值同样
   被更早的 Mixed 调用丢掉了——新增的载体把需求推到调用点，调用点答不出来。
 - **补上 demand 的入口需求之后就成立了**：`applyBackwardCallDemand` 里给内部 callee 补上
-  "callee 入口需要的位要在调用点活着"（`ReadEntry | MayEntry ∩ live`），再打开入口形参闭合，
-  unknown 直方图逐键不变（lighttpd 26、tmux 22、wolfssl 535），裸读还少了几条
-  （lighttpd 120→117、wolfssl 648→646）。`fdevent_fdnode_event_set` 现在是
-  `i64 %RDX.arg` + i64 返回、没有 `partial_read`，调用点传的是真值。见 `logs/20260927-02` §18。
+  "callee 入口需要的位要在调用点活着"（镜像签名判据：`ReadEntry | (MayEntry ∩ MayNonEntry ∩
+  callee.ExitDemand ∩ live)`），再打开入口形参闭合，unknown 直方图逐键不变
+  （lighttpd 26、tmux 22、wolfssl 535），裸读还少了几条（lighttpd 120→117、wolfssl 648→646）。
+  `fdevent_fdnode_event_set` 现在是 `i64 %RDX.arg` + i64 返回、没有 `partial_read`，调用点传
+  的是真值。见 `logs/20260927-02` §18。
+- **demand 分析本身改成了双向 worklist**（§19）：需求有两个方向（caller → callee 的 ExitDemand、
+  callee → caller 的透传需求），所以 `runTopDownDemand` 不再是"自顶向下扫描"，而是普通的单调
+  worklist 定点：caller 的 `additions` 变化入队 callee，callee 的 ExitDemand 变化入队它的所有
+  caller。所有量只置位、有限格，一定收敛（递归也一样）。实测与版本号循环持平或略好。
+  直接用 callee 的 `EntryDemand` 当调用点需求是回归（lighttpd 26→35、tmux 22→76），因为它是
+  入口 live-in，含 partial write 写保留位等垃圾位。
 - 另一处修正：返回槽本来还有 `MayNonEntry` 布尔闸门，"从不写但被需要"的位不会建出返回槽；
   收窄真正生效的是"部分写过"的寄存器（例如 wolfSSL 里只写过低字节的 RAX）。
 
