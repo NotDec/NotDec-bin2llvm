@@ -561,6 +561,63 @@ caller，需求可以沿调用链一路往上传。`fdevent_fdnode_event_set` �
 形参，需要让形参判据吃"传播上来的入口需求"，并且先把假需求（`valueDemand` 的 all-ones
 fallback、种子集合漏寄存器 store 操作数，见 §18）收窄。
 
+## 20. 试改记录："转交需求"进形参判据（2026-09-28 第四轮，已回退）
+
+目标（§19 结尾留下的边界）：函数自己既不读也不返回某个寄存器、只是把入口值交给下一个
+调用（转发/包装函数）时，也让这个寄存器成为它的入口形参，这样调用点不用裸读寄存器 global。
+
+**实现**（已回退，工作区干净）
+
+1. `FunctionDemand` 新增 `CallInputNeeds`：`liveBeforeBlock` 在每个调用点算出的入口需求
+   （callee 的 ReadEntry + 出口透传位 + callee 自己的转交位）并集，最后和 `EntryDemand` 求交
+   （函数自己定义过的位被滤掉）。
+2. 调用点规则把 callee 的 `CallInputNeeds` 也算进调用点的 live（继续往上游传）。
+3. worklist 增加一条失效源：callee 的 `CallInputNeeds` 变化 → 重算它的 caller。
+4. 导出成 metadata `call_input_mask`，SSA 侧 `addParamForUnit` 并进 `paramMask`
+   （`paramMask = ReadEntryMask | ReturnEntryMask | CallInputMask`，并放宽 `!ReadEntry` 早退）。
+
+**量测（after8 → 本轮）**
+
+| 目标 | local | boundary | clobber | unknowns | 其中 call_effect_mixed |
+|---|---|---|---|---|---|
+| vsftpd | 7 → 14 | 6 → 2 | 23 | 0 → 0 | 0 → 0 |
+| libuv | 4 → 1 | 18 → 13 | 8 → 15 | 8 → 11 | — |
+| lighttpd | 117 → **55** | 6 → 8 | 523 → 2239 | 26 → **1124** | 0 → **1036** |
+| tmux | 312 → 398 | 473 → 437 | 6854 → 8296 | 22 → **74** | 4 → 36 |
+| wolfssl | （未跑完，趋势同 lighttpd） | | | | |
+
+裸读确实降了（lighttpd 117 → 55），但 unknown 爆炸，全部集中在 `call_effect_mixed`。
+
+**原因（已定位）**：`CallInputNeeds` 的 "callee 真读的入口位" 用的是 `ReadEntryMask`，而它里面
+含**只为了重建 partial write 才被读的位**。例：lighttpd `array_get_element_klen` 从
+`(RDI, RSI, i32 RDX)` 变成 `(RDI, RSI, i64 RDX, RCX, R8)`，`buffer_extend` 多了 `RCX/R8`。
+这些位并不是源码语义上的参数（多数来自 `mov cl, …` / `mov r8b, …` 这类半寄存器写之后的
+读改写）。形参一加，所有调用点都得给这些位找值；需求再沿调用链继续往上传，于是整条链上
+每个函数都多出 RCX/R8 形参、每个调用点都要值 → `call_effect_mixed` 泛滥。
+
+**结论**：这一步本身是对的（它就是把 §13 的"载体 > 裸读"再往前推一格），但**必须先修需求
+源头**——§18 列的第 1、2 条：
+
+1. `valueDemand()` 对不在需求表里的值返回全位需求；
+2. `computeValueDemands()` 不 seed 写寄存器 global 的 store 操作数，而 partial write 的
+   `Value` 又被 `fullMaskForValue` 整条 seed。
+
+把 partial write 造成的"读改写"需求从 `ReadEntryMask` / `EntryDemand` 里摘掉之后，
+`CallInputMask` 才只剩真正的转发位，这一步再打开就不会级联。回退后状态仍是 §19 的
+`bd3c54e`（unknown 不净增、fdevent 干净）。
+
+**顺带记下这轮查到的边界分布**（after8 产物，按调用点统计"实参是入口读"的调用）：
+
+| 目标 | 总数 | 变参调用 | 非变参 |
+|---|---|---|---|
+| tmux | 154 | 147（FUN_69630 / FUN_51790 / FUN_69fd0 这类内部变参函数） | 7 |
+| lighttpd | 13 | 10（log_error / log_debug / log_pri） | 3（R13/R15/RBP 这类 callee-saved） |
+| wolfssl | 2 | 0 | 2（callee-saved） |
+
+也就是说当前剩余入口读主要是"变参寄存器保存区"和"callee-saved 寄存器"两类；真正属于
+"普通参数寄存器、只转发"的很少，所以这一步的收益本来也不在数量上，而在结构闭合。
+
+
 
 
 
