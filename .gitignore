@@ -2,3 +2,4 @@ build
 Prompt.md
 tests/fixtures/native/downloads/
 __pycache__/
+paper/
