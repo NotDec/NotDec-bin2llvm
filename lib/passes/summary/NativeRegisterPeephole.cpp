@@ -1,10 +1,12 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
 
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
+#include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -1163,11 +1165,376 @@ bool rewriteConstantDivision(llvm::Instruction &root,
   return true;
 }
 
+// ===== GCC"字节值放进 32 位寄存器算"：把只被低字节观察的宽读收窄成 8 位 =====
+//
+// GCC 对字节值（char/unsigned char）经常用 32 位指令算，只观察低字节：
+//   - switch 跳转表下标：`leal -lo(%rdx), %ecx; cmpb $range, %cl; movzbl %cl, %ecx`
+//     （gcc/expr.cc 的 try_tablejump / do_tablejump；clang 不生成这个形状）；
+//   - 字节自增自减：`movb X, %dl; ...; decl %edx; ...; movb %dl, Y`（高位是垃圾，
+//     结果只写回低字节）。
+// 两种形态提升后都是同一套固定寄存器舞步：
+//   %wide = partial_read.<full>.i32(@R, 0)     ; leal 的源（32 位读）
+//   %idx  = add|sub i32 %wide, C               ; c - lo
+//   partial_write.i64.i32(@R2, %idx, 0)
+//   %rb   = partial_read.i64.i32(@R2, 0)       ; 写回读
+//   %zx   = zext i32 %rb to i64
+//   store i64 %zx, ptr @R2                     ; x86-64 低 32 位写零扩展的物化
+// 这个 32 位读的高位"读了没人看"，但会被记成入口依赖并沿调用图放大。下面在证明
+// "到 @R2 下一次 >=32 位写之前只有 8 位读、且低字节确实被读过"之后，把 %wide
+// 换成 8 位读 + zext。标志位物化那种真读 32 位（icmp eq 0 之类）不在匹配范围内，
+// 死标志位由前面的 dead flag value 一段先删掉。
+//
+// 低 k 位等价：zext8(b) +/- C 的低字节与 c +/- C 的低字节相同（加法的低位不依赖
+// 高位），后续只观察低字节；高位的差异按上面的证明没有观察者。
+
+bool isRegisterGlobalPointer(llvm::Value *value, llvm::GlobalVariable *global) {
+  return value != nullptr && value->stripPointerCasts() == global;
+}
+
+
+// 从 start 起沿 CFG 检查 @global 的每一次读：必须都是 8 位读。遇到 >=32 位写
+// （或整寄存器 store）该路径结束；出现更宽的读、真实 call、或值随 ret 逃逸就
+// 返回 false。sawByteRead 记录这条路径上低字节确实被读过（不是只写不读）。
+bool byteReadsOnlyUntilNextWrite(llvm::Instruction *start,
+                                 llvm::GlobalVariable *global,
+                                 bool &sawByteRead) {
+  llvm::SmallPtrSet<llvm::BasicBlock *, 16> visited;
+  llvm::SmallVector<std::pair<llvm::BasicBlock *, llvm::Instruction *>, 16>
+      worklist;
+  worklist.push_back({start->getParent(), start});
+  while (!worklist.empty()) {
+    llvm::BasicBlock *block = worklist.back().first;
+    llvm::Instruction *inst = worklist.back().second;
+    worklist.pop_back();
+    if (!visited.insert(block).second) {
+      continue;
+    }
+    while (inst != nullptr) {
+      llvm::Instruction *next = inst->getNextNode();
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(inst)) {
+        if (std::optional<NativeRegisterPartialReadInfo> read =
+                parseNativeRegisterPartialRead(*call)) {
+          if (read->Global == global) {
+            if (read->ReadWidth != 8) {
+              return false;
+            }
+            sawByteRead = true;  // 低字节确实被用了
+          }
+          inst = next;
+          continue;
+        }
+        if (std::optional<NativeRegisterPartialWriteInfo> write =
+                parseNativeRegisterPartialWrite(*call)) {
+          if (write->Global == global && write->BitOffset == 0 &&
+              write->WriteWidth >= 32) {
+            break;  // 该路径上值被覆盖，结束
+          }
+          inst = next;
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        bool harmless =
+            callee != nullptr &&
+            (callee->isIntrinsic() ||
+             callee->getName().starts_with("notdec."));
+        if (!harmless) {
+          return false;  // 未知调用可能把该寄存器当参数读走
+        }
+        inst = next;
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(inst)) {
+        if (isRegisterGlobalPointer(store->getPointerOperand(), global)) {
+          break;  // 整寄存器写
+        }
+        inst = next;
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(inst)) {
+        if (isRegisterGlobalPointer(load->getPointerOperand(), global)) {
+          return false;  // 整寄存器读
+        }
+        inst = next;
+        continue;
+      }
+      if (inst->isTerminator()) {
+        if (llvm::isa<llvm::ReturnInst>(inst) ||
+            llvm::isa<llvm::UnreachableInst>(inst) ||
+            llvm::isa<llvm::ResumeInst>(inst)) {
+          return false;  // 值还活着就离开函数，算逃逸
+        }
+        for (llvm::BasicBlock *successor : llvm::successors(block)) {
+          worklist.push_back({successor, &successor->front()});
+        }
+        break;
+      }
+      for (llvm::Use &operand : inst->operands()) {
+        if (isRegisterGlobalPointer(operand.get(), global)) {
+          return false;  // 该寄存器以别的形式参与运算
+        }
+      }
+      inst = next;
+    }
+  }
+  return true;
+}
+
+// 命中 GCC 字节 switch 跳转表就收窄那次 32 位读；任一条件不成立整体跳过。
+bool narrowByteObservedWideRead(
+    llvm::CallBase &indexWrite,
+    NativeRegisterPreSummaryPeepholeSummary &summary) {
+  std::optional<NativeRegisterPartialWriteInfo> write =
+      parseNativeRegisterPartialWrite(indexWrite);
+  if (!write || write->BitOffset != 0 || write->WriteWidth != 32) {
+    return false;
+  }
+  llvm::GlobalVariable *destination = write->Global;
+  auto *index = llvm::dyn_cast<llvm::BinaryOperator>(write->Value);
+  if (index == nullptr || !index->getType()->isIntegerTy(32)) {
+    return false;
+  }
+  if (index->getOpcode() != llvm::Instruction::Add &&
+      index->getOpcode() != llvm::Instruction::Sub) {
+    return false;
+  }
+  llvm::Value *wide = nullptr;
+  if (llvm::isa<llvm::ConstantInt>(index->getOperand(1)) &&
+      !llvm::isa<llvm::ConstantInt>(index->getOperand(0))) {
+    wide = index->getOperand(0);
+  } else if (llvm::isa<llvm::ConstantInt>(index->getOperand(0)) &&
+             !llvm::isa<llvm::ConstantInt>(index->getOperand(1))) {
+    wide = index->getOperand(1);
+  }
+  if (wide == nullptr || !wide->hasOneUse() || !index->hasOneUse()) {
+    return false;
+  }
+  auto *wideRead = llvm::dyn_cast<llvm::CallInst>(wide);
+  if (wideRead == nullptr) {
+    return false;
+  }
+  std::optional<NativeRegisterPartialReadInfo> read =
+      parseNativeRegisterPartialRead(*wideRead);
+  if (!read || read->BitOffset != 0 || read->ReadWidth != 32) {
+    return false;
+  }
+  // 写回读 -> zext -> 整存：x86-64 低 32 位写零扩展的固定物化。
+  auto *backRead =
+      llvm::dyn_cast_or_null<llvm::CallInst>(indexWrite.getNextNode());
+  auto *extend = llvm::dyn_cast_or_null<llvm::ZExtInst>(
+      backRead != nullptr ? backRead->getNextNode() : nullptr);
+  auto *materialize = llvm::dyn_cast_or_null<llvm::StoreInst>(
+      extend != nullptr ? extend->getNextNode() : nullptr);
+  if (backRead == nullptr || extend == nullptr || materialize == nullptr) {
+    return false;
+  }
+  std::optional<NativeRegisterPartialReadInfo> back =
+      parseNativeRegisterPartialRead(*backRead);
+  if (!back || back->Global != destination || back->BitOffset != 0 ||
+      back->ReadWidth != 32) {
+    return false;
+  }
+  if (extend->getOperand(0) != backRead ||
+      materialize->getValueOperand() != extend ||
+      !isRegisterGlobalPointer(materialize->getPointerOperand(), destination) ||
+      !backRead->hasOneUse() || !extend->hasOneUse()) {
+    return false;
+  }
+  llvm::Instruction *afterMaterialize = materialize->getNextNode();
+  if (afterMaterialize == nullptr) {
+    return false;
+  }
+  bool sawByteRead = false;
+  if (!byteReadsOnlyUntilNextWrite(afterMaterialize, destination,
+                                   sawByteRead)) {
+    return false;
+  }
+  if (!sawByteRead) {
+    return false;
+  }
+  // 收窄：%wide = partial_read.i32 -> partial_read.i8 + zext i8->i32。
+  llvm::Module *module = indexWrite.getModule();
+  llvm::Function *narrowRead = getOrInsertNativeRegisterPartialRead(
+      *module, read->Global->getType(),
+      llvm::Type::getInt8Ty(module->getContext()), read->FullWidth, 8);
+  llvm::IRBuilder<> builder(wideRead);
+  llvm::CallInst *narrow = builder.CreateCall(
+      narrowRead,
+      {read->Global, llvm::ConstantInt::get(
+                         llvm::Type::getInt64Ty(module->getContext()), 0)});
+  if (llvm::MDNode *metadata = wideRead->getMetadata("notdec.register.access")) {
+    narrow->setMetadata("notdec.register.access", metadata);
+  }
+  llvm::Value *extended = builder.CreateZExt(narrow, wideRead->getType());
+  std::string name = wideRead->getName().str();
+  wideRead->replaceAllUsesWith(extended);
+  wideRead->eraseFromParent();
+  if (!name.empty()) {
+    extended->setName(name);
+  }
+  ++summary.ByteIndexRewrites;
+  return true;
+}
+
+// ===== 死标志位物化消除（lifter 自己发的标志位，不是编译器模式） =====
+//
+// 提升器给每条算术操作都发 CF/OF/SF/ZF/PF 物化（p-code 的 flag 输出），但机器码里
+// 很多标志位根本没被读过（GCC 不会为死标志位生成 setcc/分支）。这些计算会连带读
+// 寄存器，把"读了但没人看"的位记进入口依赖。这里只认这一条逻辑：
+//   flag store 到下一次同 flag 的写、调用或函数出口之间没有任何读 → 死，
+//   连同它现在没人用的计算链（含链底读寄存器的那次 partial_read）一起删掉。
+// 活的标志位（后面有分支读它）原样保留。
+
+bool isArithmeticFlagGlobal(llvm::GlobalVariable *global) {
+  if (global == nullptr) {
+    return false;
+  }
+  llvm::StringRef name = global->getName();
+  return name == "CF" || name == "OF" || name == "SF" || name == "ZF" ||
+         name == "PF";
+}
+
+// 这个 flag store 之后有没有人读（有读就是活的）。
+bool flagValueIsRead(llvm::StoreInst &store, llvm::GlobalVariable *global) {
+  llvm::SmallPtrSet<llvm::BasicBlock *, 16> visited;
+  llvm::SmallVector<std::pair<llvm::BasicBlock *, llvm::Instruction *>, 16>
+      worklist;
+  worklist.push_back({store.getParent(), store.getNextNode()});
+  while (!worklist.empty()) {
+    llvm::BasicBlock *block = worklist.back().first;
+    llvm::Instruction *inst = worklist.back().second;
+    worklist.pop_back();
+    if (!visited.insert(block).second) {
+      continue;
+    }
+    while (inst != nullptr) {
+      llvm::Instruction *next = inst->getNextNode();
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(inst)) {
+        if (isRegisterGlobalPointer(load->getPointerOperand(), global)) {
+          return true;  // 有人读这个标志位
+        }
+      } else if (auto *other = llvm::dyn_cast<llvm::StoreInst>(inst)) {
+        if (isRegisterGlobalPointer(other->getPointerOperand(), global)) {
+          break;  // 被重新定义，这条路径结束
+        }
+      } else if (auto *call = llvm::dyn_cast<llvm::CallBase>(inst)) {
+        llvm::Function *callee = call->getCalledFunction();
+        bool keepsFlag =
+            callee != nullptr &&
+            (callee->isIntrinsic() || callee->getName().starts_with("notdec."));
+        if (!keepsFlag) {
+          break;  // 真实调用按 ABI 清标志位，之后与本 store 无关
+        }
+      }
+      if (inst->isTerminator()) {
+        if (llvm::isa<llvm::ReturnInst>(inst) ||
+            llvm::isa<llvm::UnreachableInst>(inst) ||
+            llvm::isa<llvm::ResumeInst>(inst)) {
+          break;  // 走到函数出口还没有读，这条路径结束
+        }
+        for (llvm::BasicBlock *successor : llvm::successors(block)) {
+          worklist.push_back({successor, &successor->front()});
+        }
+        break;
+      }
+      inst = next;
+    }
+  }
+  return false;
+}
+
+// 链路节点能不能跟着删：读写寄存器的 helper、纯运算和 intrinsic 可以；
+// store / 真实调用 / partial_write / 终结指令不行。
+bool isRemovableFlagChainNode(llvm::Instruction &inst) {
+  if (inst.isTerminator() || llvm::isa<llvm::StoreInst>(inst)) {
+    return false;
+  }
+  auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+  if (call == nullptr) {
+    return true;
+  }
+  llvm::Function *callee = call->getCalledFunction();
+  if (callee == nullptr) {
+    return false;
+  }
+  if (callee->isIntrinsic()) {
+    return true;
+  }
+  llvm::StringRef name = callee->getName();
+  if (!name.starts_with("notdec.")) {
+    return false;
+  }
+  return !name.starts_with("notdec.partial_write.");
+}
+
+// 删掉死 store 和它现在没人用的计算链；链上还有别的使用者的节点保留。
+void eraseDeadFlagValue(llvm::Instruction *root,
+                        NativeRegisterPreSummaryPeepholeSummary &summary) {
+  llvm::SmallVector<llvm::Instruction *, 16> pending;
+  pending.push_back(root);
+  while (!pending.empty()) {
+    llvm::Instruction *inst = pending.pop_back_val();
+    if (inst->getParent() == nullptr || !inst->use_empty()) {
+      continue;
+    }
+    for (llvm::Use &operand : inst->operands()) {
+      auto *operandInst = llvm::dyn_cast<llvm::Instruction>(operand.get());
+      if (operandInst != nullptr && isRemovableFlagChainNode(*operandInst)) {
+        pending.push_back(operandInst);
+      }
+    }
+    inst->eraseFromParent();
+    ++summary.DeadFlagValuesRemoved;
+  }
+}
+
 } // namespace
 
 NativeRegisterPreSummaryPeepholeSummary
 runNativeRegisterPreSummaryPeephole(llvm::Module &module) {
   NativeRegisterPreSummaryPeepholeSummary summary;
+
+  // 死标志位物化先做：后面下标收窄的区间检查才看得到干净的值图。反复扫到不动为止——
+  // 删掉一条链后，前面那条 flag store 可能也变成死的。
+  for (unsigned iteration = 0; iteration < 4; ++iteration) {
+    llvm::SmallVector<llvm::WeakVH, 64> flagStores;
+    for (llvm::Function &function : module) {
+      if (function.isDeclaration()) {
+        continue;
+      }
+      for (llvm::Instruction &inst : llvm::instructions(function)) {
+        auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+        if (store == nullptr) {
+          continue;
+        }
+        auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+            store->getPointerOperand()->stripPointerCasts());
+        if (isArithmeticFlagGlobal(global)) {
+          flagStores.emplace_back(store);
+        }
+      }
+    }
+    if (iteration == 0) {
+      summary.FlagStoresSeen = flagStores.size();
+    }
+    unsigned removedThisRound = 0;
+    for (llvm::WeakVH &handle : flagStores) {
+      auto *store = llvm::dyn_cast_or_null<llvm::StoreInst>(handle);
+      if (store == nullptr || store->getParent() == nullptr) {
+        continue;
+      }
+      auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+          store->getPointerOperand()->stripPointerCasts());
+      if (global == nullptr || flagValueIsRead(*store, global)) {
+        continue;
+      }
+      eraseDeadFlagValue(store, summary);
+      ++summary.DeadFlagStoresRemoved;
+      ++removedThisRound;
+    }
+    if (removedThisRound == 0) {
+      break;
+    }
+  }
   llvm::SmallVector<llvm::LoadInst *, 64> loads;
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
@@ -1183,6 +1550,36 @@ runNativeRegisterPreSummaryPeephole(llvm::Module &module) {
   for (llvm::LoadInst *load : loads) {
     if (load->getParent() != nullptr) {
       (void)rewriteLoad(*load, summary);
+    }
+  }
+
+  // 字节值宽读收窄（见 narrowByteObservedWideRead 的注释）：switch 下标和字节自增自减。
+  // 放在 rewriteLoad 之后：整寄存器 load + trunc 这时已经变成 partial_read。
+  llvm::SmallVector<llvm::WeakVH, 64> indexWrites;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      std::optional<NativeRegisterPartialWriteInfo> write =
+          parseNativeRegisterPartialWrite(*call);
+      if (write && write->BitOffset == 0 && write->WriteWidth == 32) {
+        indexWrites.emplace_back(call);
+      }
+    }
+  }
+  for (llvm::WeakVH &handle : indexWrites) {
+    auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(handle);
+    if (call == nullptr || call->getParent() == nullptr) {
+      continue;
+    }
+    ++summary.ByteIndexCandidates;
+    if (!narrowByteObservedWideRead(*call, summary)) {
+      ++summary.ByteIndexSkipped;
     }
   }
   return summary;
@@ -1300,7 +1697,13 @@ void printNativeRegisterPreSummaryPeepholeSummary(
      << summary.FullRegisterLoadsSeen << " rewrites=" << summary.Rewrites
      << " direct_trunc=" << summary.DirectTruncRewrites
      << " shift_trunc=" << summary.ShiftTruncRewrites
-     << " multi_use_skipped=" << summary.MultiUseLoadsSkipped << '\n';
+     << " multi_use_skipped=" << summary.MultiUseLoadsSkipped
+     << " byte_index_candidates=" << summary.ByteIndexCandidates
+     << " byte_index_rewrites=" << summary.ByteIndexRewrites
+     << " byte_index_skipped=" << summary.ByteIndexSkipped
+     << " flag_stores=" << summary.FlagStoresSeen
+     << " dead_flag_stores=" << summary.DeadFlagStoresRemoved
+     << " dead_flag_values=" << summary.DeadFlagValuesRemoved << '\n';
 }
 
 void printNativeRegisterPostRewritePeepholeSummary(

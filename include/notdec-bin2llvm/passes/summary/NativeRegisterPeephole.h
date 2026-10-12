@@ -18,6 +18,18 @@ struct NativeRegisterPreSummaryPeepholeSummary {
   uint64_t DirectTruncRewrites = 0;
   uint64_t ShiftTruncRewrites = 0;
   uint64_t MultiUseLoadsSkipped = 0;
+  // GCC 的字节 switch 跳转表：下标 c - lo 在 32 位里算、只有低字节被比较和
+  // 重扩展（见 .cpp 的 narrowByteSwitchIndexRead）。这类 32 位读的高位没有
+  // 观察者，收窄成 8 位读后 SummarySSA 才不会把它记成入口依赖。
+  uint64_t ByteIndexCandidates = 0;
+  uint64_t ByteIndexRewrites = 0;
+  uint64_t ByteIndexSkipped = 0;
+  // 提升器自己发的标志位物化（OF/SF/ZF/PF/CF）：一个 flag store 到下一次同 flag
+  // 的写/调用/函数出口之前没有任何读，就是死的，连同它的计算链一起删掉
+  // （见 .cpp 的 dead flag value 一段）。标志位不是编译器模式，只认这一条逻辑。
+  uint64_t FlagStoresSeen = 0;
+  uint64_t DeadFlagStoresRemoved = 0;
+  uint64_t DeadFlagValuesRemoved = 0;
 };
 
 // Runs after register rewrite/signature rewrite and before final cleanup.  It

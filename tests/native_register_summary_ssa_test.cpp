@@ -488,6 +488,19 @@ unsigned countPartialReadCalls(const llvm::Function &function,
   return count;
 }
 
+unsigned countStoresTo(const llvm::Function &function,
+                       llvm::GlobalVariable *global) {
+  unsigned count = 0;
+  for (const llvm::Instruction &inst : llvm::instructions(function)) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+    if (store != nullptr &&
+        store->getPointerOperand()->stripPointerCasts() == global) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 bool hasRegisterLoad(const llvm::Function &function, llvm::StringRef name) {
   std::string wanted = ("name=" + name).str();
   for (const llvm::Instruction &inst : llvm::instructions(function)) {
@@ -4231,7 +4244,11 @@ bool testDeadFlagStoreBeforeCallIsRemoved() {
   builder.CreateRetVoid();
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  return expect(summary.DeadStoresRemoved == 1,
+  (void)summary;
+  // 现在这条 store 在 summary 之前的 peephole 就判死删掉了（见
+  // NativeRegisterPeephole.cpp 的 dead flag value 一段）；这里只断言最终没有留下
+  // 这条死 store。
+  return expect(countStoresTo(*function, of) == 0,
                 "dead flag store before call was not removed") &&
          verifyOk(module, "module failed verifier after dead flag store test");
 }
@@ -4263,7 +4280,7 @@ bool testFlagStoreBeforeVolatileCallIsRemoved() {
   builder.CreateRet(loaded);
 
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  return expect(summary.DeadStoresRemoved == 1,
+  return expect(countStoresTo(*function, of) == 0,
                 "clobbered flag store before call was not removed") &&
          expect(summary.CallClobberValues >= 1,
                 "flag read after call did not materialize clobber value") &&
@@ -4311,9 +4328,9 @@ bool testPostRewriteInstCombineExposesDeadFlagStore() {
     }
   }
 
-  return expect(summary.DeadStoresRemoved == 1,
-                "post-rewrite instcombine did not expose dead flag store") &&
-         expect(ofStores == 0, "dead OF store remained after cleanup loop") &&
+  (void)summary;
+  // 这条 store 现在在 summary 之前的 peephole 就被判死删掉了；只断言最终没留下。
+  return expect(ofStores == 0, "dead OF store remained after cleanup loop") &&
          verifyOk(module,
                   "module failed verifier after post-rewrite cleanup test");
 }
@@ -10672,6 +10689,252 @@ bool testLowBitPeepholeSkipsMultiUseFullLoad() {
                   "module failed verifier after low-bit multi-use test");
 }
 
+// GCC 字节 switch 跳转表的提升形态（见 NativeRegisterPeephole.cpp 的
+// narrowByteSwitchIndexRead）：下标在 32 位里算，只有低字节被比较/重扩展。
+enum class ByteIndexShape {
+  // 正例：区间内只有 8 位读。
+  ByteOnly,
+  // 反例：区间内还有一次 32 位读（标志位物化那种真用途）。
+  WideReadInRegion,
+  // 反例：区间内有真实 call（callee 可能把该寄存器当参数读走）。
+  RealCallInRegion,
+  // 反例：区间里只有写、没有任何 8 位读（低字节没被用）。
+  NoByteRead,
+  // 反例：宽读有别的 user。
+  WideMultipleUses,
+};
+
+llvm::Function *buildByteIndexFunction(llvm::Module &module,
+                                       llvm::StringRef name,
+                                       ByteIndexShape shape) {
+  llvm::LLVMContext &context = module.getContext();
+  llvm::GlobalVariable *source = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *destination = createRegisterGlobal(module, "RDX");
+  llvm::Function *read32 = notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+      module, source->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *read8 = notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+      module, source->getType(), llvm::Type::getInt8Ty(context), 64, 8);
+  llvm::Function *write32 = notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+      module, source->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *external = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false),
+      llvm::GlobalValue::ExternalLinkage, "byte_index_external", module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, name, module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *hit = llvm::BasicBlock::Create(context, "hit", function);
+  llvm::BasicBlock *miss = llvm::BasicBlock::Create(context, "miss", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+  llvm::Value *wide = builder.CreateCall(read32, {source, zero}, "wide");
+  llvm::Value *index = builder.CreateAdd(
+      wide, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), -9), "index");
+  if (shape == ByteIndexShape::WideMultipleUses) {
+    builder.CreateCall(write32,
+                       {destination, index, zero});  // 宽读/下标多一个 user
+  }
+  builder.CreateCall(write32, {destination, index, zero});
+  llvm::Value *back = builder.CreateCall(read32, {destination, zero}, "back");
+  llvm::Value *extended = builder.CreateZExt(back, llvm::Type::getInt64Ty(context));
+  builder.CreateStore(extended, destination);
+  llvm::Value *compare = nullptr;
+  if (shape == ByteIndexShape::NoByteRead) {
+    llvm::Value *other = builder.CreateCall(read8, {source, zero}, "other");
+    compare = builder.CreateICmpEQ(
+        other, llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0));
+  } else {
+    llvm::Value *byte = builder.CreateCall(read8, {destination, zero}, "byte");
+    compare = builder.CreateICmpULT(
+        byte, llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 35));
+  }
+  builder.CreateCondBr(compare, hit, miss);
+
+  builder.SetInsertPoint(hit);
+  if (shape == ByteIndexShape::WideReadInRegion) {
+    llvm::Value *flag = builder.CreateCall(read32, {destination, zero}, "flag");
+    llvm::Value *isZero = builder.CreateICmpEQ(
+        flag, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
+    builder.CreateStore(
+        builder.CreateZExt(isZero, llvm::Type::getInt8Ty(context)),
+        new llvm::GlobalVariable(module, llvm::Type::getInt8Ty(context), false,
+                                 llvm::GlobalValue::ExternalLinkage, nullptr,
+                                 name.str() + "_zf"));
+  }
+  if (shape == ByteIndexShape::RealCallInRegion) {
+    builder.CreateCall(external, {});
+  }
+  if (shape != ByteIndexShape::NoByteRead) {
+    llvm::Value *byte2 = builder.CreateCall(read8, {destination, zero}, "byte2");
+    llvm::Value *extended2 =
+        builder.CreateZExt(byte2, llvm::Type::getInt32Ty(context));
+    builder.CreateCall(write32, {destination, extended2, zero});
+  } else {
+    builder.CreateCall(write32, {destination,
+                                 llvm::ConstantInt::get(
+                                     llvm::Type::getInt32Ty(context), 0),
+                                 zero});
+  }
+  builder.CreateRetVoid();
+
+  builder.SetInsertPoint(miss);
+  builder.CreateCall(write32, {destination,
+                               llvm::ConstantInt::get(
+                                   llvm::Type::getInt32Ty(context), 0),
+                               zero});
+  builder.CreateRetVoid();
+  return function;
+}
+
+bool testByteIndexPeepholeNarrowsByteOnlyWideRead() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-byte-index-narrow", context);
+  llvm::Function *function =
+      buildByteIndexFunction(module, "byte_index_narrow", ByteIndexShape::ByteOnly);
+  llvm::GlobalVariable *source = module.getGlobalVariable("RSI");
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.ByteIndexCandidates >= 1,
+                "byte index peephole did not see the index write") &&
+         expect(summary.ByteIndexRewrites == 1,
+                "byte index peephole did not narrow the wide read") &&
+         expect(countPartialReadCalls(*function, source, 0, 32) == 0,
+                "byte index peephole left the 32-bit source read") &&
+         expect(countPartialReadCalls(*function, source, 0, 8) == 1,
+                "byte index peephole did not create the 8-bit source read") &&
+         verifyOk(module, "module failed verifier after byte index narrowing");
+}
+
+bool testByteIndexPeepholeSkipsWideReadInRegion() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-byte-index-wide-read", context);
+  llvm::Function *function = buildByteIndexFunction(
+      module, "byte_index_wide_read", ByteIndexShape::WideReadInRegion);
+  llvm::GlobalVariable *source = module.getGlobalVariable("RSI");
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.ByteIndexRewrites == 0,
+                "byte index peephole narrowed across a 32-bit read") &&
+         expect(countPartialReadCalls(*function, source, 0, 32) == 1,
+                "byte index peephole changed the source read on skip") &&
+         verifyOk(module, "module failed verifier after byte index skip");
+}
+
+bool testByteIndexPeepholeSkipsRealCallInRegion() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-byte-index-call", context);
+  llvm::Function *function = buildByteIndexFunction(
+      module, "byte_index_call", ByteIndexShape::RealCallInRegion);
+  llvm::GlobalVariable *source = module.getGlobalVariable("RSI");
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.ByteIndexRewrites == 0,
+                "byte index peephole narrowed across a real call") &&
+         expect(countPartialReadCalls(*function, source, 0, 32) == 1,
+                "byte index peephole changed the source read on skip") &&
+         verifyOk(module, "module failed verifier after byte index skip");
+}
+
+bool testByteIndexPeepholeSkipsWithoutByteRead() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-byte-index-no-read", context);
+  llvm::Function *function = buildByteIndexFunction(
+      module, "byte_index_no_read", ByteIndexShape::NoByteRead);
+  llvm::GlobalVariable *source = module.getGlobalVariable("RSI");
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.ByteIndexRewrites == 0,
+                "byte index peephole matched without any byte read") &&
+         expect(countPartialReadCalls(*function, source, 0, 32) == 1,
+                "byte index peephole changed the source read on skip") &&
+         verifyOk(module, "module failed verifier after byte index skip");
+}
+
+bool testByteIndexPeepholeSkipsMultiUseWideRead() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-byte-index-multi-use", context);
+  llvm::Function *function = buildByteIndexFunction(
+      module, "byte_index_multi_use", ByteIndexShape::WideMultipleUses);
+  llvm::GlobalVariable *source = module.getGlobalVariable("RSI");
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.ByteIndexRewrites == 0,
+                "byte index peephole narrowed a multi-use wide read") &&
+         expect(countPartialReadCalls(*function, source, 0, 32) == 1,
+                "byte index peephole changed the source read on skip") &&
+         verifyOk(module, "module failed verifier after byte index skip");
+}
+// 死标志位物化：flag store 到下一次同 flag 的写/调用/函数出口之前没有读，就是死的，
+// 连同计算链（含链底读寄存器那次 partial_read）一起删掉。
+bool testDeadFlagStorePeepholeRemovesDeadChain() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-dead-flag-store", context);
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  auto *zf = new llvm::GlobalVariable(
+      module, llvm::Type::getInt8Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "ZF");
+  llvm::Function *read32 = notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+      module, rsi->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "dead_flag_store", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *value = builder.CreateCall(
+      read32, {rsi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "value");
+  llvm::Value *isZero = builder.CreateICmpEQ(
+      value, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
+  builder.CreateStore(builder.CreateZExt(isZero, llvm::Type::getInt8Ty(context)),
+                      zf);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.DeadFlagStoresRemoved == 1,
+                "dead flag store was not removed") &&
+         expect(summary.DeadFlagValuesRemoved >= 4,
+                "dead flag chain was not erased") &&
+         expect(countPartialReadCalls(*function, rsi, 0, 32) == 0,
+                "dead flag chain kept the register read") &&
+         verifyOk(module, "module failed verifier after dead flag elimination");
+}
+
+// 活的标志位（后面有分支读它）原样保留。
+bool testDeadFlagStorePeepholeKeepsReadFlag() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-live-flag-store", context);
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  auto *zf = new llvm::GlobalVariable(
+      module, llvm::Type::getInt8Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "ZF");
+  llvm::Function *read32 = notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+      module, rsi->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "live_flag_store", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *taken = llvm::BasicBlock::Create(context, "taken", function);
+  llvm::BasicBlock *other = llvm::BasicBlock::Create(context, "other", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *value = builder.CreateCall(
+      read32, {rsi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)},
+      "value");
+  llvm::Value *isZero = builder.CreateICmpEQ(
+      value, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
+  builder.CreateStore(builder.CreateZExt(isZero, llvm::Type::getInt8Ty(context)),
+                      zf);
+  llvm::Value *flag = builder.CreateLoad(llvm::Type::getInt8Ty(context), zf);
+  llvm::Value *flagIsZero = builder.CreateICmpEQ(
+      flag, llvm::ConstantInt::get(llvm::Type::getInt8Ty(context), 0));
+  builder.CreateCondBr(flagIsZero, taken, other);
+  builder.SetInsertPoint(taken);
+  builder.CreateRetVoid();
+  builder.SetInsertPoint(other);
+  builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.DeadFlagStoresRemoved == 0,
+                "live flag store was removed") &&
+         expect(countPartialReadCalls(*function, rsi, 0, 32) == 1,
+                "live flag chain was erased") &&
+         verifyOk(module, "module failed verifier after live flag check");
+}
 bool testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-clean", context);
@@ -13410,6 +13673,13 @@ int main() {
   ok &= testLowBitPeepholeRewritesFullLoadTrunc();
   ok &= testLowBitPeepholeRewritesShiftTrunc();
   ok &= testLowBitPeepholeSkipsMultiUseFullLoad();
+  ok &= testByteIndexPeepholeNarrowsByteOnlyWideRead();
+  ok &= testByteIndexPeepholeSkipsWideReadInRegion();
+  ok &= testByteIndexPeepholeSkipsRealCallInRegion();
+  ok &= testByteIndexPeepholeSkipsWithoutByteRead();
+  ok &= testDeadFlagStorePeepholeRemovesDeadChain();
+  ok &= testDeadFlagStorePeepholeKeepsReadFlag();
+  ok &= testByteIndexPeepholeSkipsMultiUseWideRead();
   ok &= testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata();
   ok &= testFinalCleanupKeepsMetadataWhenRegisterAccessRemains();
   ok &= testFinalCleanupCountsPartialWriteResidue();
