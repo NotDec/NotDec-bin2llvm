@@ -1917,18 +1917,14 @@ bool testX87WindowShiftLoadFollowsRangeState() {
     }
   }
 
-  bool pushReadsST1 = false;
-  for (llvm::Value *argument : pushArgs) {
-    pushReadsST1 |= isLoadFromValue(argument, st1);
-  }
   uint32_t st1Loads = countLoadsFromGlobal(*rewritten, st1);
 
   return expect(pushArgs.size() == 3,
                 "x87 window shift pushes were not preserved") &&
-         expect(!pushReadsST1,
-                "x87 window shift read still re-reads the @ST1 global") &&
-         expect(st1Loads == 0,
-                "x87 window shift read left a stale @ST1 load behind") &&
+         // 继承下来的窗口槽没有 SSA 定义时，按寄存器值表示准则保留成入口裸读
+         // （一次），不再落成 notdec.unknown；窗口模型自身不应该反复重读 @ST1。
+         expect(st1Loads <= 1,
+                "x87 window shift read re-reads the @ST1 global more than once") &&
          verifyOk(module,
                   "module failed verifier after x87 window shift load test");
 }
@@ -9169,7 +9165,11 @@ bool testPartialReadHelperIsConsumedBySummarySSA() {
   llvm::Function *rewritten = module.getFunction("partial_write_then_read");
   return expect(summary.LoadsReplaced == 1,
                 "partial read helper was not replaced") &&
-         expect(rewritten == nullptr || !hasPartialReadCall(*rewritten),
+         // 原来那次读（offset 0）必须被折成常量；返回槽里从没被写过的上半部分
+         // （offset 32）现在保留成入口裸读——裸读优先于 notdec.unknown
+         // （见寄存器值表示准则）。
+         expect(rewritten == nullptr ||
+                    countPartialReadCalls(*rewritten, rax, 0, 32) == 0,
                 "partial read helper call remained after summary SSA") &&
          expect(rewritten == nullptr || !hasRegisterLoad(*rewritten, "RAX"),
                 "raw RAX load remained after partial read rewrite") &&
@@ -9540,7 +9540,9 @@ bool testBranchPartialReadUsesNarrowRangePhi() {
 
   return expect(summary.LoadsReplaced >= 1,
                 "branch partial read was not replaced") &&
-         expect(rewritten == nullptr || !hasPartialReadCall(*rewritten),
+         // 原读（offset 0）必须被折进 range phi；没被写过的位保留成入口裸读。
+         expect(rewritten == nullptr ||
+                    countPartialReadCalls(*rewritten, rax, 0, 32) == 0,
                 "branch partial read helper call remained") &&
          expect(summary.PhisCreated >= 1,
                 "branch partial read did not create a range phi") &&
@@ -9715,7 +9717,8 @@ bool testLoopPartialWriteUsesNarrowRangePhi() {
 
   return expect(summary.LoadsReplaced >= 2,
                 "loop partial reads were not replaced") &&
-         expect(!hasPartialReadCall(*function),
+         // 原读（offset 0）必须被折进 range phi；没被写过的位保留成入口裸读。
+         expect(countPartialReadCalls(*function, rax, 0, 32) == 0,
                 "loop partial read helper call remained") &&
          expect(!hasPartialWriteCall(*function),
                 "loop partial write helper call remained") &&
@@ -9769,8 +9772,11 @@ bool testDeadPartialWriteUsesRangeLiveness() {
                 "dead low partial write was not removed") &&
          expect(rewritten == nullptr || !hasPartialWriteCall(*rewritten),
                 "dead low partial write helper remained") &&
-         expect(rewritten == nullptr || !hasPartialReadCall(*rewritten),
-                "high partial read helper remained") &&
+         // 高半部分从没被写过，它的值就是入口值：保留成入口裸读，不是 unknown。
+         // （可能有两份重复读：两遍改写各建了一次，后续可以再合并。）
+         expect(rewritten == nullptr ||
+                    countPartialReadCalls(*rewritten, rax, 32, 32) >= 1,
+                "high partial read is missing after entry raw read fallback") &&
          verifyOk(module,
                   "module failed verifier after partial write liveness test");
 }

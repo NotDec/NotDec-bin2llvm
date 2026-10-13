@@ -1909,8 +1909,9 @@ SignatureShape shapeForInternalFunction(
     // 写过），这不是真正的参数 —— ABI 参数永远从 bit 0 开始，这种读是"部分重读
     // 局部写过的值 + 死 scratch 位"的组合。给它建窄形参（i24 R8.arg）会逼所有
     // 调用点去凑那几位，而调用点的值多半来自 Mixed 调用 → 一连串 unknown。
-    // 不建形参：调用点不再要这几位，函数体内那一次入口读退化成 entry_range_rejected
-    // 占位（1 个），通常比每个调用点各一个 unknown 划算。
+    // 不建形参：调用点不再要这几位；函数体内那一次入口读退化成裸读（partial_read，
+    // 保留寄存器/位/位置），不再落成 notdec.unknown —— 一个裸读通常比每个调用点
+    // 各一个 unknown 划算，而且后续还能把它提成形参/实参。
     if (paramMask.getBitWidth() != 0 && !paramMask.isZero() &&
         paramMask.countr_zero() != 0) {
       return;
@@ -3171,7 +3172,7 @@ void addIndirectCallsiteShapes(
       // （LocalDefinition），要么是入口透传（ForwardedEntry）。两者都没有时，
       // 寄存器里只是调用者对 caller-saved 寄存器的残留，把 6 个 ABI 入参寄存器
       // 全当实参只会在调用点凭空造出 5 个 unknown（lighttpd plugins_call_init
-      // 的 entry_range_rejected 就是这么来的）。所以无证据就不加形参。
+      // 那类，最后以裸读形式保留，见 entryRangeInput 的闸门）。所以无证据就不加形参。
       return;
     }
     for (const NativeRegisterCallInputSlot &input : inputIt->second) {
@@ -6858,13 +6859,12 @@ private:
       return empty;
     }
     if (!rangeMayComeFromEntry(range)) {
-      // 入口值存在但闸门拒绝（summary 说这些位不可能还来自入口）。记成因，
-      // 让 phi 兜底物化的 unknown 带上 entry_range_rejected，而不是只有
-      // range_unknown：这一类是"事实不允许"，不是"调用边界丢掉"。
-      RangeLossCause cause;
-      cause.Reason = "entry_range_rejected";
-      RangeLossCauses[{&block, range}] = cause;
-      return nullptr;
+      // 闸门拒绝：summary 说这些位不可能还来自入口（例如编译器为对齐压栈的
+      // 那个值，汇总侧特意没把它记成入口读）。拒绝只表示"不向调用点要这几位、
+      // 不建形参"，值本身仍然要给出——退回裸读（partial_read/load），保留
+      // 寄存器/位/位置，比 notdec.unknown 好（寄存器值表示准则：载体 > 裸读 >
+      // unknown）。所以这里只记数，不返回 nullptr。
+      ++Summary.EntryRangeRejectedReads;
     }
     llvm::Instruction *insertBefore =
         &*Function.getEntryBlock().getFirstInsertionPt();
@@ -8120,6 +8120,7 @@ void addFunctionSummary(NativeRegisterSummarySSASummary &total,
   total.PhisCreated += fn.PhisCreated;
   total.PhisSimplified += fn.PhisSimplified;
   total.RangeEntryInputs += fn.RangeEntryInputs;
+  total.EntryRangeRejectedReads += fn.EntryRangeRejectedReads;
   total.CallReturnValues += fn.CallReturnValues;
   total.CallClobberValues += fn.CallClobberValues;
   total.CallArgStoresMarked += fn.CallArgStoresMarked;
@@ -9809,6 +9810,7 @@ void printNativeRegisterSummarySSASummary(
      << " phis_created=" << summary.PhisCreated
      << " phis_simplified=" << summary.PhisSimplified
      << " range_entry_inputs=" << summary.RangeEntryInputs
+     << " entry_range_rejected_reads=" << summary.EntryRangeRejectedReads
      << " call_returns=" << summary.CallReturnValues
      << " call_clobbers=" << summary.CallClobberValues
      << " call_arg_stores_marked=" << summary.CallArgStoresMarked
@@ -9867,6 +9869,7 @@ void printNativeRegisterSummarySSASummary(
        << " phis_created=" << function.PhisCreated
        << " phis_simplified=" << function.PhisSimplified
        << " range_entry_inputs=" << function.RangeEntryInputs
+       << " entry_range_rejected_reads=" << function.EntryRangeRejectedReads
        << " call_returns=" << function.CallReturnValues
        << " call_clobbers=" << function.CallClobberValues
        << " call_arg_stores_marked=" << function.CallArgStoresMarked

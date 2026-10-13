@@ -261,3 +261,55 @@ lighttpd（`--all-confirmed --skip-runtime --register-ssa-summary`，1m17s）：
 
 到这里 §1 的目标（`buffer_free` 不该有额外返回值）达成：RDX（§5 死标志位）、RSI（§6 观察宽度）、
 RCX（§7 掩码）三路都清掉了。
+
+## 8. `entry_range_rejected` 的 unknown 退回裸读（commit 4）
+
+### 8.1 一个具体的 unknown
+
+`FUN_e78d`（lighttpd `fdevent_impl.c:854` 的 `fdevent_poll_free`，源码返回 void）：
+
+```llvm
+%RCXentry_range_rejected = call i64 @notdec.unknown.i64(), !notdec.unknown.source !158
+store i64 %RCXentry_range_rejected, ptr %notdec_stack.native   ; pushq %rcx
+...
+%unique_51280_835 = load i64, ptr %notdec_stack.native         ; popq %rax
+ret i64 %RAX.range_summary_ssa                                 ; 这个 unknown 成了返回值
+!158 = !{!"reason=entry_range_rejected", !"register=RCX", !"detail=offset=0,width=64"}
+```
+
+机器码 0xe799 `pushq %rcx` 只是把栈凑成 16 字节对齐（值本身没人看），收尾 0xe7b4
+`popq %rax` 把它弹进返回值寄存器。汇总侧有专门的"对齐 push"判据
+（`collectStackAdjustmentSlots`），命中就故意什么都不记（注释：push 的值是 undef，
+不计入口读、不登记保存槽）。而 SSA 侧要给 RAX 一个值（函数被取地址放进函数指针表，
+ABI 返回值必须保守产生）→ 找到 push 进去的值 = 入口 RCX → 问闸门
+`rangeMayComeFromEntry` → 账上没这笔 → 拒绝 → unknown。
+
+也就是两个判断打架：一边说"这是编译器随手压的垃圾，不算读"，另一边说"这个垃圾顺着
+返回值流出去了，得给它一个值"。事实层面它就是入口的 RCX，按表示准则
+（载体 > 裸读 > unknown）应该给裸读，而不是 unknown。
+
+### 8.2 改动
+
+`NativeRegisterSummarySSA.cpp` 的 `entryRangeInput`：闸门拒绝时不再返回 nullptr
+（那会让 phi 兜底物化成 unknown），而是继续走下面的裸读路径（`entryRegisterLoad` /
+`entryPartialRead`），只记一个新计数 `EntryRangeRejectedReads`。"不向调用点要这几位、
+不建形参"这个需求侧决定保持不变。两处相关注释同步（1912、3173 附近）。
+
+### 8.3 效果与验证
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| `notdec.unknown` 调用 | 51 | **35**（16 个 `entry_range_rejected` 全消失） |
+| local_register_reads | 205 | 224 |
+| boundary_register_reads | 19 | 20 |
+| entry 裸读 | 101 | 104 |
+| range_entry 裸读 | 123 | 140 |
+
+剩下的 35 个 unknown 全是 `return_binding_uses_clobber_value`（返回值绑到了"调用破坏
+占位"上），属于另一类，下一步再看。
+
+`ctest` 12/12；lighttpd 产物 `llvm-as` + `opt -passes=verify` OK。
+
+单测更新了 5 个断言：它们原本用"不残留 partial_read"当作"值已经被载体收掉"的代理，
+现在改成断言真正关心的结果——原读（特定 offset）被折算掉、没被写过的位保留成入口裸读
+（x87 那条改成"最多一次 @ST1 读"）。

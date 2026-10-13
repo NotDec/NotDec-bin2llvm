@@ -43,6 +43,7 @@ struct NativeRegisterSummarySSAFunctionSummary {
   uint64_t PhisCreated = 0;
   uint64_t PhisSimplified = 0;
   uint64_t RangeEntryInputs = 0;
+  uint64_t EntryRangeRejectedReads = 0;
   uint64_t CallReturnValues = 0;
   uint64_t CallClobberValues = 0;
   uint64_t CallArgStoresMarked = 0;
@@ -91,6 +92,7 @@ struct NativeRegisterSummarySSASummary {
   uint64_t PhisCreated = 0;
   uint64_t PhisSimplified = 0;
   uint64_t RangeEntryInputs = 0;
+  uint64_t EntryRangeRejectedReads = 0;
   uint64_t CallReturnValues = 0;
   uint64_t CallClobberValues = 0;
   uint64_t CallArgStoresMarked = 0;
