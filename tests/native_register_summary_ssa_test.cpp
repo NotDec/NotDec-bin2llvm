@@ -10862,6 +10862,128 @@ bool testByteIndexPeepholeSkipsMultiUseWideRead() {
 }
 // 死标志位物化：flag store 到下一次同 flag 的写/调用/函数出口之前没有读，就是死的，
 // 连同计算链（含链底读寄存器那次 partial_read）一起删掉。
+// 按观察宽度收窄：寄存器搬移 / 16 位观察 / 常量右移 / 除法边界。
+enum class WidthNarrowShape { MoveByte, MoveHalf, ShiftRight, Division };
+
+llvm::Function *buildWidthNarrowFunction(llvm::Module &module,
+                                         llvm::StringRef name,
+                                         WidthNarrowShape shape) {
+  llvm::LLVMContext &context = module.getContext();
+  llvm::GlobalVariable *source = createRegisterGlobal(module, "RSI");
+  llvm::GlobalVariable *destination = createRegisterGlobal(module, "RDX");
+  llvm::Function *read8 = notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+      module, source->getType(), llvm::Type::getInt8Ty(context), 64, 8);
+  llvm::Function *read16 = notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+      module, source->getType(), llvm::Type::getInt16Ty(context), 64, 16);
+  llvm::Function *read32 = notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+      module, source->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::Function *write32 = notdec::bin2llvm::getOrInsertNativeRegisterPartialWrite(
+      module, source->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, name, module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *hit = llvm::BasicBlock::Create(context, "hit", function);
+  llvm::BasicBlock *miss = llvm::BasicBlock::Create(context, "miss", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+  llvm::Value *value = builder.CreateCall(read32, {source, zero}, "value");
+  llvm::Value *written = value;
+  if (shape == WidthNarrowShape::ShiftRight) {
+    written = builder.CreateLShr(
+        value, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 8),
+        "shifted");
+  } else if (shape == WidthNarrowShape::Division) {
+    written = builder.CreateUDiv(
+        value, llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 10),
+        "quotient");
+  }
+  builder.CreateCall(write32, {destination, written, zero});
+  llvm::Value *back = builder.CreateCall(read32, {destination, zero}, "back");
+  llvm::Value *extended =
+      builder.CreateZExt(back, llvm::Type::getInt64Ty(context));
+  builder.CreateStore(extended, destination);
+  llvm::Value *observed =
+      shape == WidthNarrowShape::MoveHalf
+          ? builder.CreateCall(read16, {destination, zero}, "half")
+          : builder.CreateCall(read8, {destination, zero}, "byte");
+  llvm::Value *compare = builder.CreateICmpULT(
+      observed, llvm::ConstantInt::get(observed->getType(), 35));
+  builder.CreateCondBr(compare, hit, miss);
+  for (llvm::BasicBlock *block : {hit, miss}) {
+    builder.SetInsertPoint(block);
+    builder.CreateStore(
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0),
+        destination);
+    builder.CreateRetVoid();
+  }
+  return function;
+}
+
+// 寄存器搬移：mov ebx, esi 之后只有低字节被读，ESI 的 32 位读收窄成 8 位。
+bool testWidthNarrowNarrowsRegisterMove() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-width-narrow-move-byte", context);
+  llvm::Function *function = buildWidthNarrowFunction(
+      module, "width_narrow_move_byte", WidthNarrowShape::MoveByte);
+  llvm::GlobalVariable *source = module.getGlobalVariable("RSI");
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.ByteIndexRewrites == 1,
+                "register move was not narrowed to the observed byte") &&
+         expect(countPartialReadCalls(*function, source, 0, 32) == 0,
+                "wide read of the moved register remained") &&
+         expect(countPartialReadCalls(*function, source, 0, 8) == 1,
+                "narrow byte read of the moved register missing") &&
+         verifyOk(module, "module failed verifier after register move narrowing");
+}
+
+// 观察宽度是 16 位时收窄成 16 位。
+bool testWidthNarrowNarrowsToHalfWordObservation() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-width-narrow-half", context);
+  llvm::Function *function = buildWidthNarrowFunction(
+      module, "width_narrow_move_half", WidthNarrowShape::MoveHalf);
+  llvm::GlobalVariable *source = module.getGlobalVariable("RSI");
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.ByteIndexRewrites == 1,
+                "half word observation did not narrow the source read") &&
+         expect(countPartialReadCalls(*function, source, 0, 32) == 0,
+                "wide read remained after half word narrowing") &&
+         expect(countPartialReadCalls(*function, source, 0, 16) == 1,
+                "narrow half word read missing") &&
+         verifyOk(module, "module failed verifier after half word narrowing");
+}
+
+// 常量右移 8 位后只观察低 8 位：需要的宽度是 8+8=16。
+bool testWidthNarrowHandlesConstantShift() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-width-narrow-shift", context);
+  llvm::Function *function = buildWidthNarrowFunction(
+      module, "width_narrow_shift_right", WidthNarrowShape::ShiftRight);
+  llvm::GlobalVariable *source = module.getGlobalVariable("RSI");
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.ByteIndexRewrites == 1,
+                "constant right shift did not narrow the source read") &&
+         expect(countPartialReadCalls(*function, source, 0, 16) == 1,
+                "right shift narrowing produced the wrong read width") &&
+         verifyOk(module, "module failed verifier after shift narrowing");
+}
+
+// 除法不是低位封闭的：链上有 udiv 就整体跳过。
+bool testWidthNarrowSkipsDivision() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-width-narrow-division", context);
+  llvm::Function *function = buildWidthNarrowFunction(
+      module, "width_narrow_division", WidthNarrowShape::Division);
+  llvm::GlobalVariable *source = module.getGlobalVariable("RSI");
+  auto summary = notdec::bin2llvm::runNativeRegisterPreSummaryPeephole(module);
+  return expect(summary.ByteIndexRewrites == 0,
+                "division chain was narrowed although it is not low bit closed") &&
+         expect(countPartialReadCalls(*function, source, 0, 32) == 1,
+                "wide source read disappeared on a division chain") &&
+         verifyOk(module, "module failed verifier after division skip");
+}
+
 bool testDeadFlagStorePeepholeRemovesDeadChain() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-dead-flag-store", context);
@@ -13677,6 +13799,10 @@ int main() {
   ok &= testByteIndexPeepholeSkipsWideReadInRegion();
   ok &= testByteIndexPeepholeSkipsRealCallInRegion();
   ok &= testByteIndexPeepholeSkipsWithoutByteRead();
+  ok &= testWidthNarrowNarrowsRegisterMove();
+  ok &= testWidthNarrowNarrowsToHalfWordObservation();
+  ok &= testWidthNarrowHandlesConstantShift();
+  ok &= testWidthNarrowSkipsDivision();
   ok &= testDeadFlagStorePeepholeRemovesDeadChain();
   ok &= testDeadFlagStorePeepholeKeepsReadFlag();
   ok &= testByteIndexPeepholeSkipsMultiUseWideRead();

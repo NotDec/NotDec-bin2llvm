@@ -1165,39 +1165,40 @@ bool rewriteConstantDivision(llvm::Instruction &root,
   return true;
 }
 
-// ===== GCC"字节值放进 32 位寄存器算"：把只被低字节观察的宽读收窄成 8 位 =====
+// ===== 按"观察宽度"收窄寄存器读：GCC 常拿宽指令算窄值 =====
 //
-// GCC 对字节值（char/unsigned char）经常用 32 位指令算，只观察低字节：
+// GCC 对窄值（char、16 位值）经常用 32 位指令算、只观察低位，常见三种形态：
 //   - switch 跳转表下标：`leal -lo(%rdx), %ecx; cmpb $range, %cl; movzbl %cl, %ecx`
 //     （gcc/expr.cc 的 try_tablejump / do_tablejump；clang 不生成这个形状）；
-//   - 字节自增自减：`movb X, %dl; ...; decl %edx; ...; movb %dl, Y`（高位是垃圾，
-//     结果只写回低字节）。
-// 两种形态提升后都是同一套固定寄存器舞步：
-//   %wide = partial_read.<full>.i32(@R, 0)     ; leal 的源（32 位读）
-//   %idx  = add|sub i32 %wide, C               ; c - lo
-//   partial_write.i64.i32(@R2, %idx, 0)
-//   %rb   = partial_read.i64.i32(@R2, 0)       ; 写回读
-//   %zx   = zext i32 %rb to i64
-//   store i64 %zx, ptr @R2                     ; x86-64 低 32 位写零扩展的物化
-// 这个 32 位读的高位"读了没人看"，但会被记成入口依赖并沿调用图放大。下面在证明
-// "到 @R2 下一次 >=32 位写之前只有 8 位读、且低字节确实被读过"之后，把 %wide
-// 换成 8 位读 + zext。标志位物化那种真读 32 位（icmp eq 0 之类）不在匹配范围内，
-// 死标志位由前面的 dead flag value 一段先删掉。
+//   - 字节自增自减：`movb X, %dl; ...; decl %edx; ...; movb %dl, Y`；
+//   - 寄存器搬移：`movzbl X, %esi; ...; mov ebx, esi; ...; movb %bl, Y`。
+// 共同点：写进寄存器的值最后只被低 K 位观察。提升后每次读都是 partial_read，
+// 宽的那次"高位没有人看"，却会被记成入口依赖并沿调用图放大。
 //
-// 低 k 位等价：zext8(b) +/- C 的低字节与 c +/- C 的低字节相同（加法的低位不依赖
-// 高位），后续只观察低字节；高位的差异按上面的证明没有观察者。
+// 规则（要么整条链都成立、要么整体跳过）：
+//   1. 锚点：一次寄存器写 partial_write.i{writeWidth}(@R2, %v, 0) + 写回读 / zext / 整存；
+//   2. 观察宽度：从这个写走到 @R2 下一次写，收集每次读覆盖到的最高位，取最大值 K；
+//      这段里出现比本次写更宽的观察、整寄存器 load、真实 call、ret 逃逸就跳过；
+//   3. 反向 use-def：从 %v 出发，只走低位封闭的运算（加/减/乘/与/或/异或宽度不变，
+//      常量左移减 c、常量右移加 c），遇到 partial_read.iW 且 K < W 就记成收窄目标；
+//      load 结果、调用结果、参数、除法、比较、变量移位都是边界，不再往回走；
+//   4. 使用者闭包：被改动过的值，使用者必须都还在这条链上（或就是那次写）。
+// 只收窄读：运算和写都保持原类型——收窄写会让寄存器高位不再被覆盖，在按位 may
+// 记账里反而制造更多入口读。
+//
+// 低位等价：加/减/乘/与/或/异或的结果低 K 位只取决于操作数的低 K 位（进位只往上走）；
+// 左移 c 位的结果低 K 位只取决于低 K-c 位；右移 c 位取决于低 K+c 位。所以把读收窄到
+// K 位再 zext 回去，低 K 位逐位不变，高位按第 2、4 条没有观察者。
 
 bool isRegisterGlobalPointer(llvm::Value *value, llvm::GlobalVariable *global) {
   return value != nullptr && value->stripPointerCasts() == global;
 }
 
-
-// 从 start 起沿 CFG 检查 @global 的每一次读：必须都是 8 位读。遇到 >=32 位写
-// （或整寄存器 store）该路径结束；出现更宽的读、真实 call、或值随 ret 逃逸就
-// 返回 false。sawByteRead 记录这条路径上低字节确实被读过（不是只写不读）。
-bool byteReadsOnlyUntilNextWrite(llvm::Instruction *start,
+// 从 start 走到 @global 下一次写为止，返回这段里被观察到的最高位 K。
+// 返回 false 表示这个写入值不能安全收窄。
+bool observedWidthUntilNextWrite(llvm::Instruction *start,
                                  llvm::GlobalVariable *global,
-                                 bool &sawByteRead) {
+                                 unsigned writeWidth, unsigned &observedWidth) {
   llvm::SmallPtrSet<llvm::BasicBlock *, 16> visited;
   llvm::SmallVector<std::pair<llvm::BasicBlock *, llvm::Instruction *>, 16>
       worklist;
@@ -1215,19 +1216,20 @@ bool byteReadsOnlyUntilNextWrite(llvm::Instruction *start,
         if (std::optional<NativeRegisterPartialReadInfo> read =
                 parseNativeRegisterPartialRead(*call)) {
           if (read->Global == global) {
-            if (read->ReadWidth != 8) {
-              return false;
+            unsigned upper = static_cast<unsigned>(read->BitOffset) +
+                             static_cast<unsigned>(read->ReadWidth);
+            if (upper > writeWidth) {
+              return false; // 观察到了本次写之外的位（整寄存器读一类）
             }
-            sawByteRead = true;  // 低字节确实被用了
+            observedWidth = std::max(observedWidth, upper);
           }
           inst = next;
           continue;
         }
         if (std::optional<NativeRegisterPartialWriteInfo> write =
                 parseNativeRegisterPartialWrite(*call)) {
-          if (write->Global == global && write->BitOffset == 0 &&
-              write->WriteWidth >= 32) {
-            break;  // 该路径上值被覆盖，结束
+          if (write->Global == global) {
+            break; // 值被下一次写覆盖，观察区间结束
           }
           inst = next;
           continue;
@@ -1238,21 +1240,21 @@ bool byteReadsOnlyUntilNextWrite(llvm::Instruction *start,
             (callee->isIntrinsic() ||
              callee->getName().starts_with("notdec."));
         if (!harmless) {
-          return false;  // 未知调用可能把该寄存器当参数读走
+          return false; // 未知调用可能把该寄存器当参数读走
         }
         inst = next;
         continue;
       }
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(inst)) {
         if (isRegisterGlobalPointer(store->getPointerOperand(), global)) {
-          break;  // 整寄存器写
+          break; // 整寄存器写，观察区间结束
         }
         inst = next;
         continue;
       }
       if (auto *load = llvm::dyn_cast<llvm::LoadInst>(inst)) {
         if (isRegisterGlobalPointer(load->getPointerOperand(), global)) {
-          return false;  // 整寄存器读
+          return false; // 整寄存器 load
         }
         inst = next;
         continue;
@@ -1261,7 +1263,7 @@ bool byteReadsOnlyUntilNextWrite(llvm::Instruction *start,
         if (llvm::isa<llvm::ReturnInst>(inst) ||
             llvm::isa<llvm::UnreachableInst>(inst) ||
             llvm::isa<llvm::ResumeInst>(inst)) {
-          return false;  // 值还活着就离开函数，算逃逸
+          return false; // 值还活着就离开函数，算逃逸
         }
         for (llvm::BasicBlock *successor : llvm::successors(block)) {
           worklist.push_back({successor, &successor->front()});
@@ -1270,7 +1272,7 @@ bool byteReadsOnlyUntilNextWrite(llvm::Instruction *start,
       }
       for (llvm::Use &operand : inst->operands()) {
         if (isRegisterGlobalPointer(operand.get(), global)) {
-          return false;  // 该寄存器以别的形式参与运算
+          return false; // 该寄存器以别的形式参与运算
         }
       }
       inst = next;
@@ -1279,47 +1281,119 @@ bool byteReadsOnlyUntilNextWrite(llvm::Instruction *start,
   return true;
 }
 
-// 命中 GCC 字节 switch 跳转表就收窄那次 32 位读；任一条件不成立整体跳过。
-bool narrowByteObservedWideRead(
-    llvm::CallBase &indexWrite,
-    NativeRegisterPreSummaryPeepholeSummary &summary) {
+// 支持的收窄宽度：只认 8/16/32，别的宽度交给更靠后的分析，这里不发明新读法。
+bool isSupportedReadWidth(unsigned width) {
+  return width == 8 || width == 16 || width == 32;
+}
+
+// 反向 use-def：needed 表示"这个值的低 needed 位必须正确"。
+// traversed 收集走过的所有指令（含边界），targets 收集要收窄的寄存器读。
+bool collectNarrowableReads(
+    llvm::Value *root, unsigned neededWidth, llvm::Instruction *anchorWrite,
+    llvm::SmallPtrSetImpl<llvm::Instruction *> &traversed,
+    llvm::SmallVectorImpl<std::pair<llvm::CallInst *, unsigned>> &targets) {
+  llvm::SmallVector<std::pair<llvm::Value *, unsigned>, 16> worklist;
+  worklist.push_back({root, neededWidth});
+  while (!worklist.empty()) {
+    llvm::Value *value = worklist.back().first;
+    unsigned needed = worklist.back().second;
+    worklist.pop_back();
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
+    if (inst == nullptr || needed == 0) {
+      continue; // 常量、参数，或者不需要任何位
+    }
+    if (!traversed.insert(inst).second) {
+      continue; // 已经走过：第一次的宽度更保守，够用
+    }
+    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(inst);
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(inst)) {
+      std::optional<NativeRegisterPartialReadInfo> read =
+          parseNativeRegisterPartialRead(*call);
+      if (read) {
+        if (needed < read->ReadWidth) {
+          targets.push_back({call, needed});
+        }
+        continue; // 链底就是它，继续往回只是寄存器历史，这里不做
+      }
+      continue; // 调用结果：边界
+    }
+    if (binary == nullptr) {
+      continue; // load、比较、select、类型转换以外的指令：边界
+    }
+    unsigned resultWidth = binary->getType()->isIntegerTy()
+                               ? binary->getType()->getIntegerBitWidth()
+                               : 0;
+    if (resultWidth == 0) {
+      continue;
+    }
+    needed = std::min(needed, resultWidth);
+    auto pushOperand = [&](llvm::Value *operand, unsigned operandNeeded) {
+      unsigned operandWidth =
+          operand->getType()->isIntegerTy()
+              ? operand->getType()->getIntegerBitWidth()
+              : 0;
+      if (operandWidth == 0) {
+        return;
+      }
+      worklist.push_back({operand, std::min(operandNeeded, operandWidth)});
+    };
+    switch (binary->getOpcode()) {
+    case llvm::Instruction::Add:
+    case llvm::Instruction::Sub:
+    case llvm::Instruction::Mul:
+    case llvm::Instruction::And:
+    case llvm::Instruction::Or:
+    case llvm::Instruction::Xor:
+      for (llvm::Value *operand : binary->operands()) {
+        pushOperand(operand, needed);
+      }
+      break;
+    case llvm::Instruction::Shl: {
+      auto *amount = llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(1));
+      if (amount == nullptr || amount->getValue().uge(64)) {
+        break; // 变量移位：边界
+      }
+      unsigned shift = static_cast<unsigned>(amount->getZExtValue());
+      pushOperand(binary->getOperand(0), shift < needed ? needed - shift : 0);
+      break;
+    }
+    case llvm::Instruction::LShr:
+    case llvm::Instruction::AShr: {
+      auto *amount = llvm::dyn_cast<llvm::ConstantInt>(binary->getOperand(1));
+      if (amount == nullptr || amount->getValue().uge(64)) {
+        break; // 变量移位：边界
+      }
+      unsigned shift = static_cast<unsigned>(amount->getZExtValue());
+      pushOperand(binary->getOperand(0), needed + shift);
+      break;
+    }
+    case llvm::Instruction::ZExt:
+    case llvm::Instruction::SExt:
+    case llvm::Instruction::Trunc:
+      pushOperand(binary->getOperand(0), needed);
+      break;
+    default:
+      break; // 除法、取模等：低 K 位不封闭，边界
+    }
+  }
+  (void)anchorWrite;
+  return true;
+}
+
+// 命中就按观察宽度收窄链上的寄存器读；任一条件不成立整体跳过。
+bool narrowObservedReads(llvm::CallBase &valueWrite,
+                         NativeRegisterPreSummaryPeepholeSummary &summary) {
   std::optional<NativeRegisterPartialWriteInfo> write =
-      parseNativeRegisterPartialWrite(indexWrite);
-  if (!write || write->BitOffset != 0 || write->WriteWidth != 32) {
+      parseNativeRegisterPartialWrite(valueWrite);
+  if (!write || write->BitOffset != 0 || write->WriteWidth < 8 ||
+      write->WriteWidth > 32) {
     return false;
   }
   llvm::GlobalVariable *destination = write->Global;
-  auto *index = llvm::dyn_cast<llvm::BinaryOperator>(write->Value);
-  if (index == nullptr || !index->getType()->isIntegerTy(32)) {
-    return false;
-  }
-  if (index->getOpcode() != llvm::Instruction::Add &&
-      index->getOpcode() != llvm::Instruction::Sub) {
-    return false;
-  }
-  llvm::Value *wide = nullptr;
-  if (llvm::isa<llvm::ConstantInt>(index->getOperand(1)) &&
-      !llvm::isa<llvm::ConstantInt>(index->getOperand(0))) {
-    wide = index->getOperand(0);
-  } else if (llvm::isa<llvm::ConstantInt>(index->getOperand(0)) &&
-             !llvm::isa<llvm::ConstantInt>(index->getOperand(1))) {
-    wide = index->getOperand(1);
-  }
-  if (wide == nullptr || !wide->hasOneUse() || !index->hasOneUse()) {
-    return false;
-  }
-  auto *wideRead = llvm::dyn_cast<llvm::CallInst>(wide);
-  if (wideRead == nullptr) {
-    return false;
-  }
-  std::optional<NativeRegisterPartialReadInfo> read =
-      parseNativeRegisterPartialRead(*wideRead);
-  if (!read || read->BitOffset != 0 || read->ReadWidth != 32) {
-    return false;
-  }
-  // 写回读 -> zext -> 整存：x86-64 低 32 位写零扩展的固定物化。
+  unsigned writeWidth = static_cast<unsigned>(write->WriteWidth);
+  // 写回读 -> zext -> 整存：低位写零扩展的固定物化。
   auto *backRead =
-      llvm::dyn_cast_or_null<llvm::CallInst>(indexWrite.getNextNode());
+      llvm::dyn_cast_or_null<llvm::CallInst>(valueWrite.getNextNode());
   auto *extend = llvm::dyn_cast_or_null<llvm::ZExtInst>(
       backRead != nullptr ? backRead->getNextNode() : nullptr);
   auto *materialize = llvm::dyn_cast_or_null<llvm::StoreInst>(
@@ -1330,7 +1404,7 @@ bool narrowByteObservedWideRead(
   std::optional<NativeRegisterPartialReadInfo> back =
       parseNativeRegisterPartialRead(*backRead);
   if (!back || back->Global != destination || back->BitOffset != 0 ||
-      back->ReadWidth != 32) {
+      back->ReadWidth != writeWidth) {
     return false;
   }
   if (extend->getOperand(0) != backRead ||
@@ -1343,35 +1417,85 @@ bool narrowByteObservedWideRead(
   if (afterMaterialize == nullptr) {
     return false;
   }
-  bool sawByteRead = false;
-  if (!byteReadsOnlyUntilNextWrite(afterMaterialize, destination,
-                                   sawByteRead)) {
+  unsigned observedWidth = 0;
+  if (!observedWidthUntilNextWrite(afterMaterialize, destination, writeWidth,
+                                   observedWidth)) {
     return false;
   }
-  if (!sawByteRead) {
+  if (observedWidth == 0 || observedWidth >= writeWidth) {
+    return false; // 没人读，或者整个宽度都被观察，没什么可收窄
+  }
+  llvm::SmallPtrSet<llvm::Instruction *, 16> traversed;
+  llvm::SmallVector<std::pair<llvm::CallInst *, unsigned>, 4> targets;
+  if (!collectNarrowableReads(write->Value, observedWidth, &valueWrite,
+                              traversed, targets)) {
     return false;
   }
-  // 收窄：%wide = partial_read.i32 -> partial_read.i8 + zext i8->i32。
-  llvm::Module *module = indexWrite.getModule();
-  llvm::Function *narrowRead = getOrInsertNativeRegisterPartialRead(
-      *module, read->Global->getType(),
-      llvm::Type::getInt8Ty(module->getContext()), read->FullWidth, 8);
-  llvm::IRBuilder<> builder(wideRead);
-  llvm::CallInst *narrow = builder.CreateCall(
-      narrowRead,
-      {read->Global, llvm::ConstantInt::get(
-                         llvm::Type::getInt64Ty(module->getContext()), 0)});
-  if (llvm::MDNode *metadata = wideRead->getMetadata("notdec.register.access")) {
-    narrow->setMetadata("notdec.register.access", metadata);
+  llvm::SmallVector<std::pair<llvm::CallInst *, unsigned>, 4> usable;
+  for (auto &target : targets) {
+    if (isSupportedReadWidth(target.second)) {
+      usable.push_back(target);
+    }
   }
-  llvm::Value *extended = builder.CreateZExt(narrow, wideRead->getType());
-  std::string name = wideRead->getName().str();
-  wideRead->replaceAllUsesWith(extended);
-  wideRead->eraseFromParent();
-  if (!name.empty()) {
-    extended->setName(name);
+  if (usable.empty()) {
+    return false;
   }
-  ++summary.ByteIndexRewrites;
+  // 使用者闭包：被改动的值不能有链外的使用者。
+  llvm::SmallPtrSet<llvm::Instruction *, 16> changed;
+  llvm::SmallVector<llvm::Instruction *, 8> queue;
+  for (auto &target : usable) {
+    queue.push_back(target.first);
+  }
+  while (!queue.empty()) {
+    llvm::Instruction *inst = queue.pop_back_val();
+    if (!changed.insert(inst).second) {
+      continue;
+    }
+    for (llvm::User *user : inst->users()) {
+      if (user == &valueWrite) {
+        continue;
+      }
+      auto *userInst = llvm::dyn_cast<llvm::Instruction>(user);
+      if (userInst == nullptr || !traversed.contains(userInst)) {
+        return false; // 链外还有人看这些值的高位
+      }
+      queue.push_back(userInst);
+    }
+  }
+  // 改写：partial_read.iW -> partial_read.i{needed} + zext i{needed}->iW。
+  llvm::Module *module = valueWrite.getModule();
+  for (auto &target : usable) {
+    llvm::CallInst *read = target.first;
+    if (read->getParent() == nullptr) {
+      continue;
+    }
+    std::optional<NativeRegisterPartialReadInfo> info =
+        parseNativeRegisterPartialRead(*read);
+    if (!info) {
+      continue;
+    }
+    llvm::Function *narrowRead = getOrInsertNativeRegisterPartialRead(
+        *module, info->Global->getType(),
+        llvm::Type::getIntNTy(module->getContext(), target.second),
+        info->FullWidth, target.second);
+    llvm::IRBuilder<> builder(read);
+    llvm::CallInst *narrow = builder.CreateCall(
+        narrowRead,
+        {info->Global,
+         llvm::ConstantInt::get(llvm::Type::getInt64Ty(module->getContext()),
+                                info->BitOffset)});
+    if (llvm::MDNode *metadata = read->getMetadata("notdec.register.access")) {
+      narrow->setMetadata("notdec.register.access", metadata);
+    }
+    llvm::Value *extended = builder.CreateZExt(narrow, read->getType());
+    std::string name = read->getName().str();
+    read->replaceAllUsesWith(extended);
+    read->eraseFromParent();
+    if (!name.empty()) {
+      extended->setName(name);
+    }
+    ++summary.ByteIndexRewrites;
+  }
   return true;
 }
 
@@ -1553,7 +1677,7 @@ runNativeRegisterPreSummaryPeephole(llvm::Module &module) {
     }
   }
 
-  // 字节值宽读收窄（见 narrowByteObservedWideRead 的注释）：switch 下标和字节自增自减。
+  // 按观察宽度收窄寄存器读（见 narrowObservedReads 的注释）：switch 下标、字节自增自减、寄存器搬移。
   // 放在 rewriteLoad 之后：整寄存器 load + trunc 这时已经变成 partial_read。
   llvm::SmallVector<llvm::WeakVH, 64> indexWrites;
   for (llvm::Function &function : module) {
@@ -1567,7 +1691,8 @@ runNativeRegisterPreSummaryPeephole(llvm::Module &module) {
       }
       std::optional<NativeRegisterPartialWriteInfo> write =
           parseNativeRegisterPartialWrite(*call);
-      if (write && write->BitOffset == 0 && write->WriteWidth == 32) {
+      if (write && write->BitOffset == 0 && write->WriteWidth >= 8 &&
+          write->WriteWidth <= 32) {
         indexWrites.emplace_back(call);
       }
     }
@@ -1578,7 +1703,7 @@ runNativeRegisterPreSummaryPeephole(llvm::Module &module) {
       continue;
     }
     ++summary.ByteIndexCandidates;
-    if (!narrowByteObservedWideRead(*call, summary)) {
+    if (!narrowObservedReads(*call, summary)) {
       ++summary.ByteIndexSkipped;
     }
   }

@@ -176,3 +176,48 @@ GCC 出处：`gcc/tree-switch-conversion.cc` 聚跳转表 → `gcc/stmt.cc:expan
   （因为剩下的 RCX/RSI 返回槽还在）；
 - 已提交：见 commit message。下一步候选：需求侧闸门（入口读不从 bit 0 开始就不作为调用点需求）
   或按 P2 收紧返回槽判据。
+
+## 6. 一般化：按"观察宽度"收窄寄存器读（commit 2）
+
+原来的匹配只认"32 位读 + 常量加减 + 三件套 + 区间里有常量字节比较"。一般化之后：
+
+1. **锚点**不变：`partial_write.i{writeWidth}(@R2, %v, 0)` + 写回读 / zext / 整存；
+   writeWidth 放宽到 8..32。
+2. **观察宽度**（从使用出发）：从写走到 @R2 下一次写，收集每次读覆盖的最高位，取最大值 K；
+   出现比本次写更宽的观察、整寄存器 load、真实 call、ret 逃逸就整体跳过。
+3. **反向 use-def**：从 `%v` 出发，只走低位封闭的运算（加/减/乘/与/或/异或宽度不变、
+   常量左移减 c、常量右移加 c、zext/sext/trunc），遇到 `partial_read.iW` 且 K < W 就是收窄
+   目标；load 结果、调用结果、参数、除法、比较、变量移位都是边界。
+4. **使用者闭包**：被改动过的值，使用者必须都还在这条链上（或就是那次写）。
+
+只收窄读，运算和写保持原类型（收窄写会让寄存器高位不再被覆盖，按位 may 记账里反而
+制造更多入口读）。
+
+低位等价的依据：加/减/乘/与/或/异或的结果低 K 位只取决于操作数的低 K 位（进位只往上走）；
+左移 c 位取决于低 K-c 位；右移 c 位取决于低 K+c 位。
+
+### 6.1 落地与量测
+
+| 位置 | 内容 |
+|---|---|
+| `NativeRegisterPeephole.cpp:1168-1250` | 段注释 + `isRegisterGlobalPointer` + `observedWidthUntilNextWrite` |
+| 同上 1252-1400 | `isSupportedReadWidth` / `collectNarrowableReads`（反向 use-def，宽度传播） |
+| 同上 1402-1530 | `narrowObservedReads`（锚点、观察宽度、闭包检查、改写） |
+| `tests/native_register_summary_ssa_test.cpp` | 新增 4 个用例：寄存器搬移收窄 8 位 / 16 位观察 /
+  常量右移（8+8=16）/ 除法边界跳过 |
+
+lighttpd（`--all-confirmed --skip-runtime --register-ssa-summary`，1m17s）：
+
+| 指标 | 第 5 节（只做字节 switch） | 本节（一般化） |
+|---|---|---|
+| 收窄次数 | 12 | **112** |
+| local / boundary / clobber / unknown | 211/19/869/54 | **209/19/828/52** |
+| `buffer_free` 签名 | `{ i56, i24 }` | **`i56`（RSI 那路消失）** |
+
+`buffer_free` 只剩 RCX 那一路（掩码 `[8,64)`，整寄存器/指针宽度的读），它跟"只观察低位"
+无关，属于"按位 may 认为高位可能还是入口值"的问题。
+
+### 6.2 验证
+
+- 单测：新增 4 例 + 原有 5 例字节 index 用例全过；`ctest` 12/12；
+- lighttpd 产物 `llvm-as` + `opt -passes=verify` OK。
