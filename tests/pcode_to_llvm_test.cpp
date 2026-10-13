@@ -258,6 +258,187 @@ notdec::bin2llvm::PcodeOpView branchIndOp(uint64_t address) {
   return op;
 }
 
+// 寄存器读只被常量掩码使用时，按掩码需要的字节读（BT 的位号 rcx & 63 只要一个字节）。
+bool testMaskedRegisterReadNarrowsToNeededBytes() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+
+  notdec::bin2llvm::PcodeOpView mask;
+  mask.Address = 0x1000;
+  mask.InstructionSize = 3;
+  mask.Opcode = notdec::bin2llvm::PcodeOpcode::IntAnd;
+  mask.OpcodeName = "INT_AND";
+  mask.Output = uniqueVarnode(0x300, 8);
+  mask.Inputs.push_back(registerVarnode(0x20, 8, "RSP"));
+  mask.Inputs.push_back(constVarnode(0x3f, 8));
+  program.Ops.push_back(mask);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "masked_register_read";
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config, errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr, "lowered function is missing")) {
+    return false;
+  }
+
+  bool narrowRead = false;
+  bool wholeRegisterRead = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee != nullptr && callee->getName() == "notdec.partial_read.i64.i8") {
+        narrowRead = true;
+      }
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      if (auto *global =
+              llvm::dyn_cast<llvm::GlobalVariable>(load->getPointerOperand())) {
+        if (global->getName() == "RSP") {
+          wholeRegisterRead = true;
+        }
+      }
+    }
+  }
+  if (!narrowRead || wholeRegisterRead) {
+    module->print(llvm::errs(), nullptr);
+  }
+  return expect(narrowRead, "masked register read was not narrowed to one byte") &&
+         expect(!wholeRegisterRead,
+                "whole register load remained for a masked read");
+}
+
+// 掩码用和宽用是两个独立的读：掩码那次读收窄，宽用那次保持整寄存器读。
+bool testMaskedRegisterReadKeepsWideUseOnItsOwnRead() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+
+  notdec::bin2llvm::PcodeOpView mask;
+  mask.Address = 0x1000;
+  mask.InstructionSize = 3;
+  mask.Opcode = notdec::bin2llvm::PcodeOpcode::IntAnd;
+  mask.OpcodeName = "INT_AND";
+  mask.Output = uniqueVarnode(0x300, 8);
+  mask.Inputs.push_back(registerVarnode(0x20, 8, "RSP"));
+  mask.Inputs.push_back(constVarnode(0x3f, 8));
+  program.Ops.push_back(mask);
+
+  notdec::bin2llvm::PcodeOpView add;
+  add.Address = 0x1003;
+  add.InstructionSize = 3;
+  add.Opcode = notdec::bin2llvm::PcodeOpcode::IntAdd;
+  add.OpcodeName = "INT_ADD";
+  add.Output = uniqueVarnode(0x308, 8);
+  add.Inputs.push_back(registerVarnode(0x20, 8, "RSP"));
+  add.Inputs.push_back(constVarnode(0x10, 8));
+  program.Ops.push_back(add);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "masked_and_wide_register_read";
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config, errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr, "lowered function is missing")) {
+    return false;
+  }
+
+  bool narrowRead = false;
+  llvm::LoadInst *wholeRegisterRead = nullptr;
+  llvm::BinaryOperator *wideAdd = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee != nullptr && callee->getName() == "notdec.partial_read.i64.i8") {
+        narrowRead = true;
+      }
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      if (auto *global =
+              llvm::dyn_cast<llvm::GlobalVariable>(load->getPointerOperand())) {
+        if (global->getName() == "RSP") {
+          wholeRegisterRead = load;
+        }
+      }
+    }
+    if (auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(&inst)) {
+      if (binary->getOpcode() == llvm::Instruction::Add) {
+        wideAdd = binary;
+      }
+    }
+  }
+  if (!narrowRead || wholeRegisterRead == nullptr || wideAdd == nullptr ||
+      wideAdd->getOperand(0) != wholeRegisterRead) {
+    module->print(llvm::errs(), nullptr);
+  }
+  return expect(narrowRead, "masked use was not narrowed") &&
+         expect(wholeRegisterRead != nullptr,
+                "wide use lost its whole register read") &&
+         expect(wideAdd != nullptr &&
+                    wideAdd->getOperand(0) == wholeRegisterRead,
+                "wide use no longer reads the whole register");
+}
+
+// 没有掩码用途的整寄存器读保持原样。
+bool testWideOnlyRegisterReadStaysWholeRegister() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+
+  notdec::bin2llvm::PcodeOpView add;
+  add.Address = 0x1000;
+  add.InstructionSize = 3;
+  add.Opcode = notdec::bin2llvm::PcodeOpcode::IntAdd;
+  add.OpcodeName = "INT_ADD";
+  add.Output = uniqueVarnode(0x300, 8);
+  add.Inputs.push_back(registerVarnode(0x20, 8, "RSP"));
+  add.Inputs.push_back(constVarnode(0x10, 8));
+  program.Ops.push_back(add);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "wide_only_register_read";
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config, errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr, "lowered function is missing")) {
+    return false;
+  }
+
+  bool narrowRead = false;
+  bool wholeRegisterRead = false;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee != nullptr && callee->getName() == "notdec.partial_read.i64.i8") {
+        narrowRead = true;
+      }
+    }
+    if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+      if (auto *global =
+              llvm::dyn_cast<llvm::GlobalVariable>(load->getPointerOperand())) {
+        if (global->getName() == "RSP") {
+          wholeRegisterRead = true;
+        }
+      }
+    }
+  }
+  return expect(!narrowRead, "register read was narrowed without a mask use") &&
+         expect(wholeRegisterRead, "whole register read disappeared");
+}
+
 // sleigh 对静态地址的内存写不是 CPUI_STORE，而是 "ram 空间 varnode = 值" 的
 // COPY/算术赋值。这里断言这种赋值会落成真实 store，而不是只进 SSA 缓存。
 bool testStaticMemoryWriteIsLiftedAsStore() {
@@ -3361,6 +3542,9 @@ int main() {
   ok &= testX87FstenvFoldsToIntrinsicCall();
   ok &= testX87FldenvFoldsToIntrinsicCall();
   ok &= testX87FabsChsFoldsToDirectUnary();
+  ok &= testMaskedRegisterReadNarrowsToNeededBytes();
+  ok &= testMaskedRegisterReadKeepsWideUseOnItsOwnRead();
+  ok &= testWideOnlyRegisterReadStaysWholeRegister();
   ok &= testStaticMemoryWriteIsLiftedAsStore();
   ok &= testUnknownUserOpGetsNamedPlaceholder();
   ok &= testUnknownUserOpWithoutNamesUsesIndex();

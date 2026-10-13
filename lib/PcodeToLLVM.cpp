@@ -512,11 +512,87 @@ public:
       Builder.CreateRetVoid();
     }
 
+    narrowMaskedRegisterReads();
     llvm::EliminateUnreachableBlocks(Function);
     return true;
   }
 
 private:
+  // 只读掩码需要的字节：p-code 里这条指令把读出来的值和常量做 AND 时（例如 BT 的
+  // 位号 `rcx & 63`、只取低几位的 `and $0xff`），高位本来就被掩码吃掉。
+  //   %v = load i64, ptr @RCX            ; 整寄存器读
+  //   %m = and i64 %v, 63
+  // 改成
+  //   %b = partial_read.i64.i8(@RCX, 0)  ; 只读需要的字节
+  //   %v = zext i8 %b to i64
+  // 低位逐位不变，掩码结果不变。要求这次读的所有使用者都是同宽度的常量 AND，
+  // 只要有一个使用者不是（比如又拿去做别的运算），整体跳过。
+  void narrowMaskedRegisterReads() {
+    for (const RegisterRead &entry : RegisterReads) {
+      auto *readInst = llvm::dyn_cast<llvm::Instruction>(entry.Value);
+      if (readInst == nullptr || readInst->getParent() == nullptr) {
+        continue;
+      }
+      llvm::Value *value = entry.Value;
+      auto *readType = llvm::dyn_cast<llvm::IntegerType>(value->getType());
+      if (readType == nullptr || value->use_empty()) {
+        continue;
+      }
+      unsigned width = readType->getBitWidth();
+      if (width <= 8) {
+        continue; // 已经是一个字节，没什么可收窄
+      }
+      llvm::APInt demanded = llvm::APInt::getZero(width);
+      bool allConstantMasks = true;
+      for (llvm::User *user : value->users()) {
+        auto *mask = llvm::dyn_cast<llvm::BinaryOperator>(user);
+        if (mask == nullptr || mask->getOpcode() != llvm::Instruction::And) {
+          allConstantMasks = false;
+          break;
+        }
+        auto *lhs = llvm::dyn_cast<llvm::ConstantInt>(mask->getOperand(0));
+        auto *rhs = llvm::dyn_cast<llvm::ConstantInt>(mask->getOperand(1));
+        llvm::ConstantInt *constant = lhs != nullptr ? lhs : rhs;
+        if (constant == nullptr || constant->getType() != readType) {
+          allConstantMasks = false;
+          break;
+        }
+        demanded |= constant->getValue();
+      }
+      if (!allConstantMasks) {
+        continue;
+      }
+      unsigned needed = demanded.getActiveBits();
+      if (needed == 0 || needed >= width) {
+        continue; // 掩码要全部位（或掩码为 0），收窄没有意义
+      }
+      unsigned narrowBits =
+          needed <= 8 ? 8 : (needed <= 16 ? 16 : (needed <= 32 ? 32 : 64));
+      uint32_t narrowSize = narrowBits / 8;
+      if (narrowBits >= width || narrowSize >= entry.Access.Size) {
+        continue;
+      }
+      RegisterAccess access = entry.Access;
+      access.Size = narrowSize;
+      llvm::IRBuilder<> builder(readInst);
+      llvm::Value *narrow = Registers->read(builder, access);
+      if (narrow == nullptr ||
+          narrow->getType() != llvm::IntegerType::get(Context, narrowBits)) {
+        continue;
+      }
+      llvm::Value *extended = builder.CreateZExt(narrow, value->getType());
+      value->replaceAllUsesWith(extended);
+      for (auto &pair : Values) {
+        if (pair.second == value) {
+          pair.second = extended; // 缓存里指向旧读的条目换成新值，避免悬空
+        }
+      }
+      readInst->eraseFromParent();
+      ++MaskedRegisterReadsNarrowed;
+    }
+    RegisterReads.clear();
+  }
+
   bool usesNativeCfg() const {
     return !Config.BlockRanges.empty() || !Config.BlockSuccessors.empty();
   }
@@ -3323,6 +3399,9 @@ private:
       RegisterAccess access{varnode.Space, varnode.Offset, varnode.Size,
                             varnode.RegisterName};
       if (llvm::Value *value = Registers->read(Builder, access)) {
+        if (access.Size > 1) {
+          RegisterReads.push_back({value, access});
+        }
         return value;
       }
     }
@@ -4450,6 +4529,15 @@ private:
   llvm::BasicBlock *ExitBlock = nullptr;
   llvm::GlobalVariable *Memory = nullptr;
   std::unique_ptr<RegisterStorage> Registers;
+
+  // 翻译过程中创建的寄存器读。函数翻完时统一检查：如果某次读的所有使用者都是
+  // 同宽度的常量 AND，就只读掩码需要的那些字节（见 narrowMaskedRegisterReads）。
+  struct RegisterRead {
+    llvm::Value *Value = nullptr;
+    RegisterAccess Access;
+  };
+  std::vector<RegisterRead> RegisterReads;
+  uint64_t MaskedRegisterReadsNarrowed = 0;
 };
 
 } // namespace

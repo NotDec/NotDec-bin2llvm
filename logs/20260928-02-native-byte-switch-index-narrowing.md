@@ -221,3 +221,43 @@ lighttpd（`--all-confirmed --skip-runtime --register-ssa-summary`，1m17s）：
 
 - 单测：新增 4 例 + 原有 5 例字节 index 用例全过；`ctest` 12/12；
 - lighttpd 产物 `llvm-as` + `opt -passes=verify` OK。
+
+## 7. lift 时按常量掩码收窄寄存器读（commit 3）
+
+§6 剩下的 i56 追到了机器码：`config_skip_comment` 的扫描循环里，GCC 用位图测试实现两个比较：
+
+    14efc: movb 0x1(%rax), %cl     ; 只写 CL 一个字节
+    14f02: cmpb $0xd, %cl ; ja     ; c > 13 继续
+    14f07: btq  %rcx, %rsi         ; 位图测试：位号只取 rcx mod 64（低 6 位）
+
+提升器把 `btq` 翻成 `%v = load i64, ptr @RCX` + `and i64 %v, 63` + `lshr`：读是整寄存器的，
+"只用低 6 位"这个信息只在 `and` 上。这种信息在 lift 时是精确的（掩码就是这条指令 p-code
+的一部分），所以直接在 lifter 里收窄，不再留给后面的 pass 去猜。
+
+规则（`lib/PcodeToLLVM.cpp`）：
+
+1. 翻译过程中记录每次寄存器读（`RegisterReads`，只管大于 1 字节的读）；
+2. 函数翻完、`EliminateUnreachableBlocks` 之前调 `narrowMaskedRegisterReads()`：
+   如果某次读的**所有**使用者都是同宽度的常量 AND，就把掩码并起来，按需要的位数
+   （向上取 8/16/32）改成窄读 + zext；只要有一个使用者不是常量 AND 就整体跳过；
+   缓存 `Values` 里指向旧读的条目同步换成新值。
+
+低位等价：掩码只保留低位，窄读 + zext 逐位保留这些低位，掩码结果不变；高位本来就被掩码吃掉。
+
+### 7.1 效果（lighttpd，同一命令）
+
+| 指标 | §6 | §7 |
+|---|---|---|
+| `buffer_free` 签名 | `i56 @buffer_free(i64)` | **`void @buffer_free(i64)`** |
+| RCX 掩码 `[8,64)` 的函数 | 2（FUN_14eeb / FUN_16473） | **0** |
+| local / boundary / clobber / unknown | 209/19/828/52 | **205/19/821/51** |
+| pre-summary peephole 收窄次数 | 112 | 160 |
+
+### 7.2 验证
+
+- `tests/pcode_to_llvm_test.cpp` 新增 3 例：掩码读收窄成 i8 / 掩码用和宽用各读各的（宽用保持整寄存器读）/ 
+  没有掩码用途时保持整寄存器读；
+- `ctest` **12/12**；lighttpd 产物 `llvm-as` + `opt -passes=verify` OK。
+
+到这里 §1 的目标（`buffer_free` 不该有额外返回值）达成：RDX（§5 死标志位）、RSI（§6 观察宽度）、
+RCX（§7 掩码）三路都清掉了。
