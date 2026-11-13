@@ -38,7 +38,7 @@
       `NativeRegisterSummarySSASummary` → `NativeRegisterEliminationSummary`；
       `NativeAnalysis` → `NativeDiscovery`；
       include/lib 按 core/elf/abi/intrinsics/discovery/passes 分层。
-- [ ] P6 拆 13.8k 行 SSA 测试为多个可执行文件，共享 `tests/support/RegisterTestHarness`。
+- [x] P6 拆 13.8k 行 SSA 测试为多个可执行文件，共享 `tests/support/RegisterTestHarness`。
 
 ## 验证标准
 
@@ -64,6 +64,14 @@
 - `DEBUG.md` 第 5 节标注 `notdec-native-pcode` / `notdec-sleigh-pcode` /
   `notdec-sleigh-llvm` / `notdec-lief-elf` 为调试工具。
 - ctest 12/12。
+
+### P6（2026-11-14）
+
+- 13.8k 行、213 个 test 的单文件拆成 `tests/RegisterTestHarness.h`（helpers，2006 行）
+  + 5 个可执行文件：core(107) / vararg(21) / stack(54) / peephole(30) / audit(1)。
+- 每个文件自带 `main` 串联本组 test；CMake 用 foreach 注册
+  `notdec.register_elimination.<group>`。
+- 验证：ctest 16/16；fortune x86_64/i386 IR 逐字节相同。
 
 ### P5（2026-11-14）
 

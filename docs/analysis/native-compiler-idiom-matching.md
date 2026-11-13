@@ -146,7 +146,7 @@ L 要按被除数**自己的值上界**取：`lshr x, k` 的 L 可以收窄到 W
 
 ## 3. 验证
 
-1. **单测**：把 §1.2 的 ground truth 表抄进 `tests/native_register_summary_ssa_test.cpp`，
+1. **单测**：把 §1.2 的 ground truth 表抄进 `tests/native_register_peephole_test.cpp（常数除法/收窄读）或 tests/native_register_core_test.cpp（其余）`，
    每条断言两件事——折成了什么、链有没有收干净；再配**反例**：不在搜索范围的参数、
    不对应任何目标操作的常量必须**原样保留**（防止误折比漏折更危险）。
 2. **覆盖率 fixture**：§1.1 的全量对拍，打印 missing 列表。这是发现缺口的唯一可靠手段。

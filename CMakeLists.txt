@@ -179,20 +179,22 @@ if (BUILD_TESTING)
       native_register_summary_test
   )
 
-  add_executable(native_register_summary_ssa_test
-    tests/native_register_summary_ssa_test.cpp
-  )
+  foreach(register_test_group core vararg stack peephole audit)
+    add_executable(native_register_${register_test_group}_test
+      tests/native_register_${register_test_group}_test.cpp
+    )
 
-  target_link_libraries(native_register_summary_ssa_test
-    PRIVATE
-      notdec-bin2llvm-core
-  )
+    target_link_libraries(native_register_${register_test_group}_test
+      PRIVATE
+        notdec-bin2llvm-core
+    )
 
-  add_test(
-    NAME notdec.native_register_summary.ssa
-    COMMAND
-      native_register_summary_ssa_test
-  )
+    add_test(
+      NAME notdec.register_elimination.${register_test_group}
+      COMMAND
+        native_register_${register_test_group}_test
+    )
+  endforeach()
 
   add_executable(pcode_to_llvm_test
     tests/pcode_to_llvm_test.cpp
