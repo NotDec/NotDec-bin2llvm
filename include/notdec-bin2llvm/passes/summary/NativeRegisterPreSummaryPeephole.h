@@ -11,7 +11,9 @@ namespace notdec::bin2llvm {
 
 // Runs before register SummarySSA.  It rewrites raw full-register loads whose
 // only live use is a smaller bit range, so SummarySSA sees the real demanded
-// range instead of inventing a full-width entry value.
+// range instead of inventing a full-width entry value.  It also narrows reads
+// that are only observed through their low bits and removes dead flag
+// materialization emitted by the lifter.
 struct NativeRegisterPreSummaryPeepholeSummary {
   uint64_t FullRegisterLoadsSeen = 0;
   uint64_t Rewrites = 0;
@@ -19,8 +21,8 @@ struct NativeRegisterPreSummaryPeepholeSummary {
   uint64_t ShiftTruncRewrites = 0;
   uint64_t MultiUseLoadsSkipped = 0;
   // GCC 的字节 switch 跳转表：下标 c - lo 在 32 位里算、只有低字节被比较和
-  // 重扩展（见 .cpp 的 narrowByteSwitchIndexRead）。这类 32 位读的高位没有
-  // 观察者，收窄成 8 位读后 SummarySSA 才不会把它记成入口依赖。
+  // 重扩展（见 .cpp 的 narrowObservedReads）。这类 32 位读的高位没有观察者，
+  // 收窄成 8 位读后 SummarySSA 才不会把它记成入口依赖。
   uint64_t ByteIndexCandidates = 0;
   uint64_t ByteIndexRewrites = 0;
   uint64_t ByteIndexSkipped = 0;
@@ -32,30 +34,11 @@ struct NativeRegisterPreSummaryPeepholeSummary {
   uint64_t DeadFlagValuesRemoved = 0;
 };
 
-// Runs after register rewrite/signature rewrite and before final cleanup.  It
-// removes temporary range glue while helpers are still explicit, before final
-// cleanup lowers helpers to ordinary LLVM instructions and deletes residue.
-// It also folds the compiler's unsigned-constant-division idiom
-// `(x * magic) >> shift` back into `udiv x, d` (see the .cpp for why the
-// fold is only done when the divisor is provably recovered).
-struct NativeRegisterPostRewritePeepholeSummary {
-  uint64_t ValueRangeExtractsSimplified = 0;
-  uint64_t ConstantDivisionsRecognized = 0;
-  uint64_t SignedConstantDivisionsRecognized = 0;
-};
-
 NativeRegisterPreSummaryPeepholeSummary
 runNativeRegisterPreSummaryPeephole(llvm::Module &module);
 
-NativeRegisterPostRewritePeepholeSummary
-runNativeRegisterPostRewritePeephole(llvm::Module &module);
-
 void printNativeRegisterPreSummaryPeepholeSummary(
     const NativeRegisterPreSummaryPeepholeSummary &summary,
-    llvm::raw_ostream &os);
-
-void printNativeRegisterPostRewritePeepholeSummary(
-    const NativeRegisterPostRewritePeepholeSummary &summary,
     llvm::raw_ostream &os);
 
 } // namespace notdec::bin2llvm

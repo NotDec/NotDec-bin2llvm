@@ -26,7 +26,7 @@
 - [x] P1 抽共享底座：`RegisterModel`（RegisterUnit / 单位解析 / load-store 识别 /
       x87 窗口读）、`NotDecIntrinsics`（unknown helper）、`NotDecMetadata`（mdField）。
       不合并 `AbiFacts`（两边语义已分叉：mask vs slot）。
-- [ ] P2 拆分 `NativeRegisterPeephole` 为 pre-summary / post-rewrite 两个 pass；
+- [x] P2 拆分 `NativeRegisterPeephole` 为 pre-summary / post-rewrite 两个 pass；
       `NativeFunctionPointerPromotion` 归位到 passes。
 - [ ] P3 拆 `NativeRegisterSummarySSA` 单体：orchestrator + entry state /
       external call shapes / signature rewrite / range materialization / value source audit。
@@ -64,6 +64,17 @@
 - `DEBUG.md` 第 5 节标注 `notdec-native-pcode` / `notdec-sleigh-pcode` /
   `notdec-sleigh-llvm` / `notdec-lief-elf` 为调试工具。
 - ctest 12/12。
+
+### P2（2026-11-13）
+
+- `NativeRegisterPeephole.{h,cpp}` 拆成
+  `NativeRegisterPreSummaryPeephole.{h,cpp}`（整寄存器 load 收窄、按观察宽度收窄读、
+  死标志位）与 `NativeRegisterPostRewritePeephole.{h,cpp}`（常数除法还原、
+  value-range glue 化简）。
+- 两边共用的 `constantShiftAmount` 放进 `PeepholeUtils.h`；`LowBitsView` /
+  `stripWidthRoundTrip` / `simplifyInsertedValueExtract` 只被 post 使用，随 post 走。
+- `NativeFunctionPointerPromotion` 的目录归位推迟到 P5，避免和目录迁移重复搬动。
+- 验证：ctest 12/12；fortune x86_64/i386 IR 与 P1 基线逐字节相同。
 
 ### P1（2026-11-13）
 

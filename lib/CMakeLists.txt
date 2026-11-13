@@ -16,7 +16,8 @@ add_library(notdec-bin2llvm-core STATIC
   passes/summary/NativeVarArgRewrite.cpp
   passes/summary/NativeStackCanaryCleanup.cpp
   passes/summary/NativeRegisterSummary.cpp
-  passes/summary/NativeRegisterPeephole.cpp
+  passes/summary/NativeRegisterPreSummaryPeephole.cpp
+  passes/summary/NativeRegisterPostRewritePeephole.cpp
   passes/summary/NativeRegisterSummarySSA.cpp
   passes/summary/NativeRegisterFinalCleanup.cpp
   RegisterStorage.cpp

@@ -10,7 +10,7 @@
 #include "notdec-bin2llvm/NativeRegisterPartialRead.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterPreSummaryPeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackAddress.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"

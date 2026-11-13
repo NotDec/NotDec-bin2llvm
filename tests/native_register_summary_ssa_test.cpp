@@ -5,7 +5,8 @@
 #include "notdec-bin2llvm/NativeRegisterValueRange.h"
 #include "notdec-bin2llvm/NativeX87Intrinsic.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterPreSummaryPeephole.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterPostRewritePeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
@@ -4242,7 +4243,7 @@ bool testDeadFlagStoreBeforeCallIsRemoved() {
   auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
   (void)summary;
   // 现在这条 store 在 summary 之前的 peephole 就判死删掉了（见
-  // NativeRegisterPeephole.cpp 的 dead flag value 一段）；这里只断言最终没有留下
+  // NativeRegisterPreSummaryPeephole.cpp 的 dead flag value 一段）；这里只断言最终没有留下
   // 这条死 store。
   return expect(countStoresTo(*function, of) == 0,
                 "dead flag store before call was not removed") &&
@@ -10695,7 +10696,7 @@ bool testLowBitPeepholeSkipsMultiUseFullLoad() {
                   "module failed verifier after low-bit multi-use test");
 }
 
-// GCC 字节 switch 跳转表的提升形态（见 NativeRegisterPeephole.cpp 的
+// GCC 字节 switch 跳转表的提升形态（见 NativeRegisterPreSummaryPeephole.cpp 的
 // narrowByteSwitchIndexRead）：下标在 32 位里算，只有低字节被比较/重扩展。
 enum class ByteIndexShape {
   // 正例：区间内只有 8 位读。

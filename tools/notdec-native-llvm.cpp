@@ -7,7 +7,7 @@
 #include "notdec-bin2llvm/PcodeToLLVM.h"
 #include "notdec-bin2llvm/SleighLift.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterPeephole.h"
+#include "notdec-bin2llvm/passes/summary/NativeRegisterPostRewritePeephole.h"
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
 
 #include "llvm/IR/Constants.h"
