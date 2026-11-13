@@ -549,10 +549,14 @@ external/NotDec-bin2llvm/
     NativeRegisterPartialWrite.h    partial write intrinsic 解析/生成
 
   lib/
-    NativeAnalysis.cpp              ELF/DDISASM/GTIRB/.eh_frame/PLT/GOT discovery
-                                    （analyzer 实现目前都在这个 TU 里，按
-                                    createElfLoadAnalyzer / createEhFrameAnalyzer /
-                                    createGtirbFunctionFactsAnalyzer 等边界划分）
+    discovery/NativeAnalysis.cpp    NativeProgramState、runtime 判定、analyzer manager
+    discovery/NativeElfFacts.cpp    ELF load / relocation PLT / entry / symbol
+    discovery/NativeEhFrame.cpp     .eh_frame 解码
+    discovery/NativeGtirbFacts.cpp  GTIRB 导入
+    discovery/NativeSleighSeeds.cpp SLEIGH seed 指令解码
+    discovery/NativeX86Facts.cpp    x86 pc-thunk / jump table / flow normalizer
+    discovery/NativeReport.cpp      discovery report
+    discovery/NativeAnalysisSupport.cpp  discovery 公共 helper
     NativeExternalPrototype.cpp     默认外部原型和 JSON 加载
     SleighLift.cpp                  SLEIGH instruction / p-code 收集
     PcodeToLLVM.cpp                 p-code 到 LLVM IR lowering

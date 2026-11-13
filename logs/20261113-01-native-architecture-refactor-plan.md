@@ -31,7 +31,7 @@
 - [x] P3 拆 `NativeRegisterSummarySSA` 单体：orchestrator + entry state /
       external call shapes / signature rewrite / range materialization / value source audit。
       先搬不改，公共 API 不变。
-- [ ] P4 按 analyzer 边界拆 `NativeAnalysis`；pipeline 下沉为 `NativePipeline`，
+- [x] P4 按 analyzer 边界拆 `NativeAnalysis`；pipeline 下沉为 `NativePipeline`，
       tool 只留 CLI。
 - [x] P5 命名与目录迁移：
       `NativeRegisterSummarySSA` → `NativeRegisterElimination`；
@@ -64,6 +64,27 @@
 - `DEBUG.md` 第 5 节标注 `notdec-native-pcode` / `notdec-sleigh-pcode` /
   `notdec-sleigh-llvm` / `notdec-lief-elf` 为调试工具。
 - ctest 12/12。
+
+### P4（2026-11-14）
+
+`NativeAnalysis.cpp` 从 6.2k 行按 analyzer 边界拆成：
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `NativeAnalysis.cpp` | 817 | NativeProgramState 方法、runtime 判定、manager |
+| `NativeAnalysisInternal.h` | ~250 | x86 pattern 类型、helper 声明、factory 声明 |
+| `NativeAnalysisSupport.cpp` | 1523 | ELF/reloc/eh_frame/x86 pattern helper |
+| `NativeElfFacts.cpp` | 383 | ElfLoad / RelocationPlt / ElfEntry / ElfSymbol |
+| `NativeEhFrame.cpp` | 758 | .eh_frame 解码 |
+| `NativeGtirbFacts.cpp` | 398 | GTIRB 导入 |
+| `NativeSleighSeeds.cpp` | 1241 | SLEIGH seed 指令解码 |
+| `NativeX86Facts.cpp` | 880 | x86 pc-thunk / jump table / flow normalizer |
+| `NativeReport.cpp` | 213 | report analyzer |
+
+- 每个 analyzer 的 factory 跟着类走，声明进内部头。
+- 验证：ctest 16/16；x86_64 IR 逐字节相同；i386 只有 `%ST1.clobberNNN`
+  后缀编号不同（LLVM 同名计数器受构建布局影响），去掉数字后逐字节相同，
+  指令与 metadata 内容一致。
 
 ### P6（2026-11-14）
 
