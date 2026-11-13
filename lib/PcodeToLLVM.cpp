@@ -2,6 +2,8 @@
 #include "notdec-bin2llvm/NativeX87Intrinsic.h"
 #include "notdec-bin2llvm/RegisterStorage.h"
 
+#include "NotDecIntrinsics.h"
+
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -40,50 +42,6 @@ std::string varnodeKey(const VarnodeView &varnode) {
   os << varnode.Space << ':' << std::hex << varnode.Offset << ':' << std::dec
      << varnode.Size;
   return os.str();
-}
-
-std::string llvmTypeName(llvm::Type *type) {
-  std::string result;
-  llvm::raw_string_ostream os(result);
-  if (type != nullptr) {
-    type->print(os);
-  } else {
-    os << "<null>";
-  }
-  return os.str();
-}
-
-llvm::Function *getOrInsertUnknownValueHelper(llvm::Module &module,
-                                              llvm::Type *type) {
-  std::string name = "notdec.unknown." + llvmTypeName(type);
-  llvm::FunctionType *functionType =
-      llvm::FunctionType::get(type, {}, false);
-  if (auto *function = module.getFunction(name)) {
-    if (function->getFunctionType() == functionType) {
-      return function;
-    }
-  }
-  std::string prefix = name + ".";
-  for (llvm::Function &function : module.functions()) {
-    if (function.getName().starts_with(prefix) &&
-        function.getFunctionType() == functionType) {
-      return &function;
-    }
-  }
-  if (module.getNamedValue(name) != nullptr) {
-    name += ".typed";
-  }
-  return llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage,
-                                name, module);
-}
-
-llvm::Value *unknownValueAt(llvm::IRBuilder<> &builder, llvm::Module &module,
-                            llvm::Type *type, llvm::Twine name) {
-  // Keep the unknown as an opaque helper call: freeze(poison) would be refined
-  // to a concrete value by the optimizer (see the note in
-  // NativeRegisterSummarySSA.cpp).
-  return builder.CreateCall(getOrInsertUnknownValueHelper(module, type), {},
-                            name);
 }
 
 std::string valueName(const VarnodeView &varnode) {

@@ -1,5 +1,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
 
+#include "NotDecMetadata.h"
+
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/passes/summary/NativeStackAddress.h"
@@ -39,25 +41,6 @@ struct StackFrameAddressValue {
   llvm::Instruction *Instruction = nullptr;
   int64_t Offset = 0;
 };
-
-std::optional<std::string> mdField(const llvm::MDNode *node,
-                                   llvm::StringRef key) {
-  if (node == nullptr) {
-    return std::nullopt;
-  }
-  std::string prefix = (key + "=").str();
-  for (const llvm::MDOperand &operand : node->operands()) {
-    auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
-    if (text == nullptr) {
-      continue;
-    }
-    llvm::StringRef value = text->getString();
-    if (value.starts_with(prefix)) {
-      return value.drop_front(prefix.size()).str();
-    }
-  }
-  return std::nullopt;
-}
 
 bool accessMatchesRegister(const llvm::MDNode *access,
                            llvm::StringRef registerName) {

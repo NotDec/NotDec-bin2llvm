@@ -21,9 +21,9 @@
 
 ## 阶段
 
-- [ ] P0 删除 demo 工具/ModuleBuilder；修正 `ARCHITECTURE.md` 第 6 节文件清单；
+- [x] P0 删除 demo 工具/ModuleBuilder；修正 `ARCHITECTURE.md` 第 6 节文件清单；
       在 `DEBUG.md` 标注调试工具。
-- [ ] P1 抽共享底座：`RegisterModel`（RegisterUnit / 单位解析 / load-store 识别 /
+- [x] P1 抽共享底座：`RegisterModel`（RegisterUnit / 单位解析 / load-store 识别 /
       x87 窗口读）、`NotDecIntrinsics`（unknown helper）、`NotDecMetadata`（mdField）。
       不合并 `AbiFacts`（两边语义已分叉：mask vs slot）。
 - [ ] P2 拆分 `NativeRegisterPeephole` 为 pre-summary / post-rewrite 两个 pass；
@@ -55,4 +55,32 @@
 
 ## 进度记录
 
-（按阶段追加）
+### P0（2026-11-13，commit 7b398b6）
+
+- 删除 `tools/notdec-bin2llvm.cpp`、`include/notdec-bin2llvm/ModuleBuilder.h`、
+  `lib/ModuleBuilder.cpp`（三者只互相引用，产出 demo IR）。
+- `ARCHITECTURE.md` 第 6 节删掉已并入 `NativeAnalysis.cpp` 的
+  `GtirbNativeAnalysis.cpp` / `NativeEhFrame.cpp` / `NativeRuntime.cpp`。
+- `DEBUG.md` 第 5 节标注 `notdec-native-pcode` / `notdec-sleigh-pcode` /
+  `notdec-sleigh-llvm` / `notdec-lief-elf` 为调试工具。
+- ctest 12/12。
+
+### P1（2026-11-13）
+
+- 新增 `lib/passes/summary/RegisterModel.{h,cpp}`：RegisterUnit / 单位解析 /
+  collectRegisterUnits / storageUnitName / registerLoad / registerStore /
+  isX87WindowShiftLoad / isNotDecRegisterHelperCall / isAnalyzableCall /
+  intersectBitMasks。`registerLoad` 用 `RegisterReadOptions` 统一两边差异。
+- 新增 `lib/NotDecIntrinsics.{h,cpp}`：llvmTypeName /
+  getOrInsertUnknownValueHelper / unknownValueAt（含无 block 时的 poison 兜底），
+  PcodeToLLVM 与 SSA 共用。
+- 新增 `lib/NotDecMetadata.h`：mdField（原 4 份）。
+- summary 与 SSA 各自删除本地副本；`AbiFacts` 保持两份（mask 模型 vs slot 模型，
+  语义不同）。
+- **顺带修可复现性**：`notdec.register.summary*` 元数据原先按
+  `std::map<GlobalVariable*>` 的指针顺序输出，换一个构建产物就会重排。新增
+  `unitsInNameOrder()`，metadata 与 summary JSON 都按 (name, space, offset) 排序。
+- 验证：ctest 12/12；fortune x86_64/i386 指令流逐行相同、metadata 图规范化后
+  相同（顺序变化仅来自上面的确定性修复）；重复构建产物逐字节相同；
+  pass 时间 3.16–3.17s（基线 3.20–3.24s）。
+- 基线已按新输出刷新。

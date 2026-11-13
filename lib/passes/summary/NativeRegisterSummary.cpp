@@ -1,5 +1,8 @@
 #include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
 
+#include "NotDecMetadata.h"
+#include "passes/summary/RegisterModel.h"
+
 #include "notdec-bin2llvm/NativeAbi.h"
 #include "notdec-bin2llvm/NativeExternalPrototype.h"
 #include "notdec-bin2llvm/NativeX87Intrinsic.h"
@@ -44,21 +47,8 @@
 namespace notdec::bin2llvm {
 namespace {
 
-struct RegisterUnit {
-  llvm::GlobalVariable *Global = nullptr;
-  std::string Space;
-  std::string Name;
-  uint64_t Offset = 0;
-  uint64_t Size = 0;
-};
 
-struct RegisterAccess {
-  const RegisterUnit *Unit = nullptr;
-};
 
-RegisterAccess
-registerStore(llvm::StoreInst &store,
-              const std::map<llvm::GlobalVariable *, RegisterUnit> &units);
 
 // native frame 槽位指针：notdec_stack.native 的 alloca（或它的 GEP/bitcast）。
 bool isNativeFrameSlotPointer(llvm::Value *value) {
@@ -124,10 +114,6 @@ bool partialReadFeedsOnlyDeadFrameSlots(llvm::CallBase &call) {
   return sawStore;
 }
 
-// 识别 ST0/ST1 的窗口内部搬移读（见下方定义）。
-bool isX87WindowShiftLoad(
-    llvm::LoadInst &load,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units);
 
 struct StackSlotKey {
   llvm::Value *Base = nullptr;
@@ -353,78 +339,11 @@ struct AbiFacts {
 
 using RegisterDemand = std::map<llvm::GlobalVariable *, llvm::APInt>;
 
-std::optional<std::string> mdField(const llvm::MDNode *node,
-                                   llvm::StringRef key) {
-  if (node == nullptr) {
-    return std::nullopt;
-  }
-  std::string prefix = (key + "=").str();
-  for (const llvm::MDOperand &operand : node->operands()) {
-    auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
-    if (text == nullptr) {
-      continue;
-    }
-    llvm::StringRef value = text->getString();
-    if (value.starts_with(prefix)) {
-      return value.drop_front(prefix.size()).str();
-    }
-  }
-  return std::nullopt;
-}
 
-std::string unitName(const llvm::GlobalVariable &global) {
-  if (auto name = mdField(global.getMetadata("notdec.register"), "name")) {
-    if (!name->empty()) {
-      return *name;
-    }
-  }
-  return global.getName().str();
-}
 
-std::string unitSpace(const llvm::GlobalVariable &global) {
-  if (auto space = mdField(global.getMetadata("notdec.register"), "space")) {
-    return *space;
-  }
-  return "";
-}
 
-uint64_t unitOffset(const llvm::GlobalVariable &global) {
-  if (auto offset = mdField(global.getMetadata("notdec.register"), "offset")) {
-    uint64_t value = 0;
-    if (!llvm::StringRef(*offset).getAsInteger(10, value)) {
-      return value;
-    }
-  }
-  return 0;
-}
 
-uint64_t unitSize(const llvm::GlobalVariable &global) {
-  if (auto size = mdField(global.getMetadata("notdec.register"), "size")) {
-    uint64_t value = 0;
-    if (!llvm::StringRef(*size).getAsInteger(10, value)) {
-      return value;
-    }
-  }
-  return 0;
-}
 
-std::map<llvm::GlobalVariable *, RegisterUnit>
-collectRegisterUnits(llvm::Module &module) {
-  std::map<llvm::GlobalVariable *, RegisterUnit> units;
-  for (llvm::GlobalVariable &global : module.globals()) {
-    if (global.getMetadata("notdec.register") == nullptr) {
-      continue;
-    }
-    RegisterUnit unit;
-    unit.Global = &global;
-    unit.Space = unitSpace(global);
-    unit.Name = unitName(global);
-    unit.Offset = unitOffset(global);
-    unit.Size = unitSize(global);
-    units.emplace(&global, std::move(unit));
-  }
-  return units;
-}
 
 std::map<std::string, llvm::GlobalVariable *>
 registersByName(const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
@@ -498,20 +417,6 @@ bool maskNonZero(const llvm::APInt &mask) {
 }
 
 // 三张按位掩码求交，宽度按最宽的一张对齐（宽度 0 = 无信息 → 结果为空）。
-llvm::APInt intersectBitMasks(std::initializer_list<llvm::APInt> masks) {
-  unsigned width = 0;
-  for (const llvm::APInt &mask : masks) {
-    width = std::max(width, mask.getBitWidth());
-  }
-  if (width == 0) {
-    return llvm::APInt();
-  }
-  llvm::APInt result = llvm::APInt::getAllOnes(width);
-  for (const llvm::APInt &mask : masks) {
-    result &= mask.zextOrTrunc(width);
-  }
-  return result;
-}
 
 unsigned globalBitWidth(llvm::GlobalVariable *global) {
   if (global == nullptr) {
@@ -606,9 +511,6 @@ llvm::APInt namedMaskOrFull(const std::map<std::string, llvm::APInt> &masks,
   return fullMask(unit);
 }
 
-bool isSegmentBaseUnit(llvm::StringRef name) {
-  return name == "FS_OFFSET" || name == "GS_OFFSET";
-}
 
 unsigned valueBitWidth(llvm::Value *value) {
   if (value == nullptr || value->getType() == nullptr ||
@@ -808,48 +710,6 @@ std::map<llvm::Value *, llvm::APInt> computeValueDemands(
   return demands;
 }
 
-std::string
-storageUnitName(const NativeAbiStorage &storage,
-                const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
-  // ABI records may mention partial names such as XMM0_Qa while lifting keeps
-  // only the largest overlapping register global such as ZMM0.
-  for (const auto &[global, unit] : units) {
-    (void)global;
-    if (unit.Name == storage.Name) {
-      return unit.Name;
-    }
-  }
-  for (llvm::StringRef prefix :
-       {llvm::StringRef("XMM"), llvm::StringRef("YMM")}) {
-    llvm::StringRef name(storage.Name);
-    if (!name.starts_with(prefix)) {
-      continue;
-    }
-    llvm::StringRef rest = name.drop_front(prefix.size());
-    size_t digits = 0;
-    while (digits < rest.size() && rest[digits] >= '0' && rest[digits] <= '9') {
-      ++digits;
-    }
-    if (digits == 0) {
-      continue;
-    }
-    std::string candidate = ("ZMM" + rest.take_front(digits)).str();
-    for (const auto &[global, unit] : units) {
-      (void)global;
-      if (unit.Name == candidate) {
-        return unit.Name;
-      }
-    }
-  }
-  for (const auto &[global, unit] : units) {
-    (void)global;
-    if (unit.Space == storage.Space && unit.Offset <= storage.Offset &&
-        storage.Offset < unit.Offset + unit.Size) {
-      return unit.Name;
-    }
-  }
-  return storage.Name;
-}
 
 std::optional<std::pair<std::string, llvm::APInt>>
 storageUnitMask(const NativeAbiStorage &storage, uint64_t sizeBytes,
@@ -864,135 +724,10 @@ storageUnitMask(const NativeAbiStorage &storage, uint64_t sizeBytes,
   return std::nullopt;
 }
 
-RegisterAccess
-registerLoad(llvm::LoadInst &load,
-             const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
-  // x87 窗口移位读（push/pop/fxch 的槽位搬移）只转移窗口内部状态，不产生
-  // 对寄存器值的真实需求。跳过它们，避免把 ST0 的需求通过调用点误传成
-  // callee 的 ExitDemand（见 PcodeToLLVM 的 readX87ST windowShift）。
-  if (load.getMetadata("notdec.x87.window.shift") != nullptr ||
-      isX87WindowShiftLoad(load, units)) {
-    return {};
-  }
-  auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
-      load.getPointerOperand()->stripPointerCasts());
-  if (global == nullptr) {
-    return {};
-  }
-  auto it = units.find(global);
-  if (it == units.end()) {
-    return {};
-  }
-  if (load.getMetadata("notdec.register.access") == nullptr &&
-      global->getMetadata("notdec.register") == nullptr) {
-    return {};
-  }
-  return RegisterAccess{&it->second};
-}
 
-// x87 窗口移位读：push/pop/fxch 的槽位搬移（值经 bitcast 链后 store 到另一个
-// ST 寄存器，或传给 notdec.x87.* 库），只转移窗口内部状态，不是对寄存器值
-// 的真实消费。lifting 会给这类 load 打 notdec.x87.window.shift 标记，但
-// InstCombine 可能重写 load 丢掉标记，这里按 use 形态兜底识别，避免把 ST0
-// 的需求通过调用点误传成 callee 的 ExitDemand。
-bool isX87WindowShiftLoad(
-    llvm::LoadInst &load,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
-  auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
-      load.getPointerOperand()->stripPointerCasts());
-  if (global == nullptr) {
-    return false;
-  }
-  auto it = units.find(global);
-  if (it == units.end()) {
-    return false;
-  }
-  const RegisterUnit &unit = it->second;
-  if (unit.Name != "ST0" && unit.Name != "ST1") {
-    return false;
-  }
-  // 只有所有 use 都是窗口内部搬移（store 到寄存器全局 / 传给 x87 库）才算
-  // 纯移位读。fld %st(0) 和 fstpt 可能共享同一个 load（缓存复用）：后者
-  // 把值存到内存，是真实消费，不能按移位跳过。
-  if (load.getNumUses() == 0) {
-    return false;
-  }
-  for (llvm::User *user : load.users()) {
-    llvm::Value *value = user;
-    // 剥离 bitcast/zext/trunc 单链，找到真正的消费指令。
-    while (auto *cast = llvm::dyn_cast<llvm::CastInst>(value)) {
-      if (!cast->hasOneUse()) {
-        break;
-      }
-      value = *cast->user_begin();
-    }
-    bool internal = false;
-    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(value)) {
-      auto *target = llvm::dyn_cast<llvm::GlobalVariable>(
-          store->getPointerOperand()->stripPointerCasts());
-      if (target != nullptr && units.count(target) != 0) {
-        internal = true;
-      }
-    }
-    if (auto *call = llvm::dyn_cast<llvm::CallInst>(value)) {
-      llvm::Function *callee = call->getCalledFunction();
-      if (callee != nullptr &&
-          isNativeX87IntrinsicName(callee->getName())) {
-        internal = true;
-      }
-    }
-    if (!internal) {
-      return false;
-    }
-  }
-  return true;
-}
 
-RegisterAccess
-registerStore(llvm::StoreInst &store,
-              const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
-  auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
-      store.getPointerOperand()->stripPointerCasts());
-  if (global == nullptr) {
-    return {};
-  }
-  auto it = units.find(global);
-  if (it == units.end()) {
-    return {};
-  }
-  if (store.getMetadata("notdec.register.access") == nullptr &&
-      global->getMetadata("notdec.register") == nullptr) {
-    return {};
-  }
-  return RegisterAccess{&it->second};
-}
 
-bool isNotDecRegisterHelperCall(const llvm::CallBase &call) {
-  llvm::Function *callee = call.getCalledFunction();
-  if (callee == nullptr) {
-    return false;
-  }
-  // notdec.register.* 是寄存器模型内置 intrinsic 的命名空间：unknown 占位、
-  // frame keep-alive 等等。它们不是真实外部函数，调用点不参与外部参数推断或
-  // ABI clobber 推导；对寄存器的影响一律由它们自己的语义（指针参数、返回值）
-  // 显式表达。以后新增 intrinsic 统一用这个前缀，不需要再往名单里补。
-  // 下面几个是历史前缀，语义相同，保留兼容。
-  return callee->getName().starts_with("notdec.register.") ||
-         callee->getName().starts_with("notdec.unknown.") ||
-         isNativeX87IntrinsicName(callee->getName()) ||
-         isNativeRegisterValueRangeName(callee->getName());
-}
 
-bool isAnalyzableCall(const llvm::Instruction &inst) {
-  auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
-  if (call == nullptr || isNotDecRegisterHelperCall(*call) ||
-      parseNativeRegisterPartialRead(*call).has_value() ||
-      parseNativeRegisterPartialWrite(*call).has_value()) {
-    return false;
-  }
-  llvm::Function *callee = call->getCalledFunction();
-  return callee == nullptr || !callee->isIntrinsic();
-}
 
 AbiFacts
 collectAbiFacts(const llvm::Module &module,
@@ -3259,7 +2994,9 @@ private:
       std::vector<llvm::Metadata *> demandedReturns;
       FunctionEffect &effect = Effects[function];
       FunctionDemand &demand = Demands[function];
-      for (const auto &[global, unit] : Units) {
+      for (const RegisterUnit *unitPtr : unitsInNameOrder(Units)) {
+        llvm::GlobalVariable *global = unitPtr->Global;
+        const RegisterUnit &unit = *unitPtr;
         if (isIgnored(unit, Options)) {
           continue;
         }
@@ -3327,7 +3064,9 @@ private:
       fn.NoReturn = effect.NoReturn;
       const FunctionDemand &demand =
           Demands.count(function) == 0 ? EmptyDemand : Demands.at(function);
-      for (const auto &[global, unit] : Units) {
+      for (const RegisterUnit *unitPtr : unitsInNameOrder(Units)) {
+        llvm::GlobalVariable *global = unitPtr->Global;
+        const RegisterUnit &unit = *unitPtr;
         if (isIgnored(unit, Options)) {
           continue;
         }

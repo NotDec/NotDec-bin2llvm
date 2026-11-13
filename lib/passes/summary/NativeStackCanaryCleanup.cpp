@@ -1,5 +1,7 @@
 #include "notdec-bin2llvm/passes/summary/NativeStackCanaryCleanup.h"
 
+#include "NotDecMetadata.h"
+
 #include "notdec-bin2llvm/NativeAbi.h"
 
 #include "llvm/IR/BasicBlock.h"
@@ -51,25 +53,6 @@ struct CanaryConditionMatch {
   llvm::ICmpInst *EqualCmp = nullptr;
   llvm::StoreInst *FlagStore = nullptr;
 };
-
-std::optional<std::string> mdField(const llvm::MDNode *node,
-                                   llvm::StringRef key) {
-  if (node == nullptr) {
-    return std::nullopt;
-  }
-  std::string prefix = (key + "=").str();
-  for (const llvm::MDOperand &operand : node->operands()) {
-    auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
-    if (text == nullptr) {
-      continue;
-    }
-    llvm::StringRef value = text->getString();
-    if (value.starts_with(prefix)) {
-      return value.drop_front(prefix.size()).str();
-    }
-  }
-  return std::nullopt;
-}
 
 bool accessMatchesRegister(const llvm::MDNode *access,
                            llvm::StringRef registerName) {

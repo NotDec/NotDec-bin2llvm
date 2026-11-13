@@ -1,5 +1,6 @@
 add_library(notdec-bin2llvm-core STATIC
   NativeAbi.cpp
+  NotDecIntrinsics.cpp
   NativeRelocationMetadata.cpp
   NativeFunctionPointerPromotion.cpp
   NativeExternalPrototype.cpp
@@ -9,6 +10,7 @@ add_library(notdec-bin2llvm-core STATIC
   NativeRegisterValueRange.cpp
   Pcode.cpp
   PcodeToLLVM.cpp
+  passes/summary/RegisterModel.cpp
   passes/summary/NativeStackAddress.cpp
   passes/summary/NativeStackFrame.cpp
   passes/summary/NativeVarArgRewrite.cpp
@@ -23,6 +25,8 @@ add_library(notdec-bin2llvm-core STATIC
 target_include_directories(notdec-bin2llvm-core
   PUBLIC
     "${PROJECT_SOURCE_DIR}/include"
+  PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 target_link_libraries(notdec-bin2llvm-core
