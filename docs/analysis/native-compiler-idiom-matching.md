@@ -3,7 +3,7 @@
 这份文档回答一个问题：**想把 lift 出来的机器码形态还原成源级操作（除法、取模、乘法、
 变参、canary 之类）时，怎么找到真实形态、怎么证明改写是对的、怎么落地和验证。**
 
-设计原则见 `AGENTS.md` 的"模式匹配类 pass 的设计理念"（完整命中或整体放弃、先看编译器
+设计原则见 `docs/MatchingCompiler.md`（完整命中或整体放弃、先看编译器
 源码、结果挂 metadata）。这里只讲手法：**定位 → 证明 → 落地 → 验证**，以及这一路上
 踩过的坑。所有例子都来自 native 侧的寄存器消除链路（`passes/summary/`）。
 
@@ -195,7 +195,7 @@ L 要按被除数**自己的值上界**取：`lshr x, k` 的 L 可以收窄到 W
 
 ## 5. 相关文档
 
-- `AGENTS.md`：模式匹配类 pass 的设计理念（原则）。
+- `docs/MatchingCompiler.md`：模式匹配类 pass 的设计理念（原则、native 计划格式）。
 - `DEBUG.md`：本机命令、Bench2 产物位置。
 - `logs/20260917-03-native-callee-saved-and-df-plan.md`：常数除法识别从设计到实现的
   完整记录（含四类形态的推导、ground truth 表、覆盖率对拍结果和踩坑）。
