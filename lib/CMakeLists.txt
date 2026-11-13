@@ -1,6 +1,7 @@
 add_library(notdec-bin2llvm-core STATIC
   abi/NativeAbi.cpp
   abi/NativeExternalPrototype.cpp
+  core/NativePipeline.cpp
   core/NotDecIntrinsics.cpp
   core/Pcode.cpp
   core/PcodeToLLVM.cpp

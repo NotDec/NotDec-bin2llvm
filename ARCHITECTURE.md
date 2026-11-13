@@ -100,7 +100,7 @@ ELF
    - 给 module 附加 memory map metadata 和 ABI metadata。
 
 7. **第一次 LLVM cleanup**
-   - 入口：`runInstCombinePassIfEnabled(...)`。
+   - 入口：`runNativeInstCombineStage(...)`（`lib/core/NativePipeline.cpp`）。
    - 每个非 declaration 函数跑：
      - `InstCombine`
      - `SimplifyCFG`
@@ -291,7 +291,9 @@ load i64, ptr inttoptr (<slot address>)
 
 位置：
 
-- `tools/notdec-native-llvm.cpp::runInstCombinePassIfEnabled`
+- `include/notdec-bin2llvm/core/NativePipeline.h` / `lib/core/NativePipeline.cpp`
+  （`runNativeInstCombineStage`、`runNativeRegisterEliminationStage`、
+  `runNativePostRewritePeepholeStage`、`runNativeFinalCleanupStage`）
 
 每次运行都只对非 declaration 函数跑：
 

@@ -8,6 +8,7 @@
 #include "notdec-bin2llvm/core/SleighLift.h"
 #include "notdec-bin2llvm/passes/register/NativeRegisterFinalCleanup.h"
 #include "notdec-bin2llvm/passes/register/NativeRegisterPostRewritePeephole.h"
+#include "notdec-bin2llvm/core/NativePipeline.h"
 #include "notdec-bin2llvm/passes/register/NativeRegisterElimination.h"
 
 #include "llvm/IR/Constants.h"
@@ -1034,146 +1035,18 @@ std::unique_ptr<llvm::Module> readIRModule(const std::string &inputPath,
   return nullptr;
 }
 
-bool runRegisterSSAPassIfEnabled(llvm::Module &module,
-                                 const CliOptions &options) {
-  if (options.DisableRegisterSSAPass) {
-    return true;
-  }
 
-  notdec::bin2llvm::NativeRegisterEliminationOptions passOptions;
-  passOptions.EnableRewrite = true;
-  passOptions.EnableResidueRemoval =
-      !options.DisableSummaryRegisterResidueRemoval;
-  passOptions.EnablePostRewriteInstCombine = !options.DisableInstCombinePass;
-  passOptions.EnableVarArgRecovery = !options.DisableVarArgRecovery;
-  passOptions.AbiForAllFunctions = options.AbiForAllFunctions;
-  passOptions.PrintSummary = options.PrintRegisterSSASummary;
-  passOptions.ExternalPrototypeJsonPath = options.ExternalPrototypeJsonPath;
-  notdec::bin2llvm::NativeRegisterEliminationSummary summary =
-      notdec::bin2llvm::runNativeRegisterElimination(module, passOptions);
-  if (!options.RegisterSSAWarningPath.empty() &&
-      !writeRegisterSSAWarnings(summary, options.RegisterSSAWarningPath)) {
-    return false;
-  }
-  if (llvm::verifyModule(module, &llvm::errs())) {
-    std::cerr << "module verification failed after summary register SSA pass\n";
-    return false;
-  }
-  return true;
-}
-
-// 寄存器重写会按"每个使用点"重建同一条 lane insert/extract 链，它们在 SSA 上是
-// 不同的 Value，LLVM 看不出 `sub X, X` 是 0，于是整段链（连带 notdec.unknown
-// 调用）留在 IR 里。EarlyCSE 合并这些重复链，后面的 InstCombine 才能继续折叠。
-// 只在寄存器重写之后（以及 final cleanup 之后）跑：SSA 之前跑会改变证据分析看到
-// 的 IR，口径变化要单独实验。
-bool runInstCombinePassIfEnabled(llvm::Module &module,
-                                 const CliOptions &options,
-                                 bool runEarlyCSEFirst = false) {
-  if (options.DisableInstCombinePass) {
-    return true;
-  }
-
-  llvm::LoopAnalysisManager loopAnalysis;
-  llvm::FunctionAnalysisManager functionAnalysis;
-  llvm::CGSCCAnalysisManager cgsccAnalysis;
-  llvm::ModuleAnalysisManager moduleAnalysis;
-
-  llvm::PassBuilder builder;
-  builder.registerModuleAnalyses(moduleAnalysis);
-  builder.registerCGSCCAnalyses(cgsccAnalysis);
-  builder.registerFunctionAnalyses(functionAnalysis);
-  builder.registerLoopAnalyses(loopAnalysis);
-  builder.crossRegisterProxies(loopAnalysis, functionAnalysis, cgsccAnalysis,
-                               moduleAnalysis);
-
-  llvm::FunctionPassManager functionPasses;
-  if (runEarlyCSEFirst) {
-    functionPasses.addPass(llvm::EarlyCSEPass());
-  }
-  functionPasses.addPass(llvm::InstCombinePass());
-  functionPasses.addPass(llvm::SimplifyCFGPass());
-  for (llvm::Function &function : module) {
-    if (!function.isDeclaration()) {
-      functionPasses.run(function, functionAnalysis);
-    }
-  }
-
-  if (llvm::verifyModule(module, &llvm::errs())) {
-    std::cerr << "module verification failed after instcombine pass\n";
-    return false;
-  }
-  return true;
-}
-
-bool hasExternallyVisibleFunctionDefinition(const llvm::Module &module) {
-  for (const llvm::Function &function : module) {
-    if (!function.isDeclaration() && !function.hasLocalLinkage()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void preserveAddressTakenFunctions(
-    llvm::Module &module, const std::set<std::string> &functionNames) {
-  if (functionNames.empty()) {
-    return;
-  }
-
-  llvm::LLVMContext &context = module.getContext();
-  llvm::Type *pointerType = llvm::PointerType::get(context, 0);
-  std::vector<llvm::Constant *> functions;
-  for (const std::string &name : functionNames) {
-    llvm::Function *function = module.getFunction(name);
-    if (function == nullptr || function->isDeclaration()) {
-      continue;
-    }
-    functions.push_back(function);
-  }
-  if (functions.empty()) {
-    return;
-  }
-
-  // Keep address-taken internal bodies alive through the final GlobalDCE.
-  // Without this, only direct-call reachability is represented in the module
-  // even though the original code can enter these functions through a function
-  // pointer stored in code or relocated data.
-  auto *arrayType = llvm::ArrayType::get(pointerType, functions.size());
-  auto *initializer = llvm::ConstantArray::get(arrayType, functions);
-  auto *used = new llvm::GlobalVariable(
-      module, arrayType, /*isConstant=*/false,
-      llvm::GlobalValue::AppendingLinkage, initializer, "llvm.used");
-  used->setSection("llvm.metadata");
-}
-
-bool runFinalCleanupPass(llvm::Module &module,
-                         const std::set<std::string> &preservedFunctions = {}) {
-  preserveAddressTakenFunctions(module, preservedFunctions);
-  notdec::bin2llvm::NativeRegisterFinalCleanupOptions passOptions;
-  // If entry-point recovery has not found a public root yet, GlobalDCE would
-  // delete every internal native function and hide the actual frontend state.
-  passOptions.RunGlobalDCE = hasExternallyVisibleFunctionDefinition(module);
-  notdec::bin2llvm::runNativeRegisterFinalCleanup(module, passOptions);
-  if (llvm::verifyModule(module, &llvm::errs())) {
-    std::cerr << "module verification failed after final cleanup pass\n";
-    return false;
-  }
-  return true;
-}
-
-bool runPostRewritePeepholePass(llvm::Module &module,
-                                const CliOptions &options) {
-  auto summary = notdec::bin2llvm::runNativeRegisterPostRewritePeephole(module);
-  if (options.PrintRegisterSSASummary) {
-    notdec::bin2llvm::printNativeRegisterPostRewritePeepholeSummary(
-        summary, llvm::errs());
-  }
-  if (llvm::verifyModule(module, &llvm::errs())) {
-    std::cerr << "module verification failed after post-rewrite peephole pass\n";
-    return false;
-  }
-  return true;
+notdec::bin2llvm::NativePipelineOptions
+pipelineOptions(const CliOptions &options) {
+  notdec::bin2llvm::NativePipelineOptions pipeline;
+  pipeline.DisableRegisterElimination = options.DisableRegisterSSAPass;
+  pipeline.DisableResidueRemoval = options.DisableSummaryRegisterResidueRemoval;
+  pipeline.DisableInstCombine = options.DisableInstCombinePass;
+  pipeline.DisableVarArgRecovery = options.DisableVarArgRecovery;
+  pipeline.AbiForAllFunctions = options.AbiForAllFunctions;
+  pipeline.PrintRegisterSummary = options.PrintRegisterSSASummary;
+  pipeline.ExternalPrototypeJsonPath = options.ExternalPrototypeJsonPath;
+  return pipeline;
 }
 
 } // namespace
@@ -1198,25 +1071,33 @@ int main(int argc, char **argv) {
       if (!ensureDefaultAbiMetadata(*module, options->SpecOptions)) {
         return 1;
       }
-      if (!runInstCombinePassIfEnabled(*module, *options)) {
+      if (!notdec::bin2llvm::runNativeInstCombineStage(*module,
+                                                       pipelineOptions(*options))) {
         return 1;
       }
-      if (!runRegisterSSAPassIfEnabled(*module, *options)) {
+      auto elimination = notdec::bin2llvm::runNativeRegisterEliminationStage(
+          *module, pipelineOptions(*options));
+      if (!elimination.Ok) {
         return 1;
       }
-      if (!runInstCombinePassIfEnabled(*module, *options,
+      if (!options->RegisterSSAWarningPath.empty() &&
+          !writeRegisterSSAWarnings(elimination.Summary,
+                                    options->RegisterSSAWarningPath)) {
+        return 1;
+      }
+      if (!runNativeInstCombineStage(*module, pipelineOptions(*options),
                                        /*runEarlyCSEFirst=*/true)) {
         return 1;
       }
-      if (!runPostRewritePeepholePass(*module, *options)) {
+      if (!runNativePostRewritePeepholeStage(*module, pipelineOptions(*options))) {
         return 1;
       }
-      if (!runFinalCleanupPass(*module)) {
+      if (!notdec::bin2llvm::runNativeFinalCleanupStage(*module)) {
         return 1;
       }
       // final cleanup 把 notdec.reg.* 辅助调用降成显式 insert/extract 链，
       // 这里再收一次尾，别让重复链进入最终 IR。
-      if (!runInstCombinePassIfEnabled(*module, *options,
+      if (!runNativeInstCombineStage(*module, pipelineOptions(*options),
                                        /*runEarlyCSEFirst=*/true)) {
         return 1;
       }
@@ -1384,13 +1265,20 @@ int main(int argc, char **argv) {
       std::cerr << "module verification failed\n";
       return 1;
     }
-    if (!runInstCombinePassIfEnabled(*module, *options)) {
+    if (!runNativeInstCombineStage(*module, pipelineOptions(*options))) {
       return 1;
     }
-    if (!runRegisterSSAPassIfEnabled(*module, *options)) {
+    auto elimination = notdec::bin2llvm::runNativeRegisterEliminationStage(
+        *module, pipelineOptions(*options));
+    if (!elimination.Ok) {
       return 1;
     }
-    if (!runInstCombinePassIfEnabled(*module, *options,
+    if (!options->RegisterSSAWarningPath.empty() &&
+        !writeRegisterSSAWarnings(elimination.Summary,
+                                  options->RegisterSSAWarningPath)) {
+      return 1;
+    }
+    if (!runNativeInstCombineStage(*module, pipelineOptions(*options),
                                      /*runEarlyCSEFirst=*/true)) {
       return 1;
     }
@@ -1410,15 +1298,15 @@ int main(int argc, char **argv) {
                    << " multiple_targets="
                    << promotionSummary.SlotsWithMultipleTargets << '\n';
     }
-    if (!runPostRewritePeepholePass(*module, *options)) {
+    if (!runNativePostRewritePeepholeStage(*module, pipelineOptions(*options))) {
       return 1;
     }
-    if (!runFinalCleanupPass(*module, preservedFunctions)) {
+    if (!notdec::bin2llvm::runNativeFinalCleanupStage(*module, preservedFunctions)) {
       return 1;
     }
     // final cleanup 把 notdec.reg.* 辅助调用降成显式 insert/extract 链，
     // 这里再收一次尾，别让重复链进入最终 IR。
-    if (!runInstCombinePassIfEnabled(*module, *options,
+    if (!runNativeInstCombineStage(*module, pipelineOptions(*options),
                                      /*runEarlyCSEFirst=*/true)) {
       return 1;
     }

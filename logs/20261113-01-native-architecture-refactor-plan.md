@@ -65,6 +65,15 @@
   `notdec-sleigh-llvm` / `notdec-lief-elf` 为调试工具。
 - ctest 12/12。
 
+### P4 pipeline 下沉（2026-11-14）
+
+- 新增 `include/notdec-bin2llvm/core/NativePipeline.h` 与 `lib/core/NativePipeline.cpp`：
+  `runNativeRegisterEliminationStage` / `runNativeInstCombineStage` /
+  `runNativePostRewritePeepholeStage` / `runNativeFinalCleanupStage`。
+- `tools/notdec-native-llvm.cpp` 删掉本地 pipeline 函数，只做 CLI → options 映射、
+  调 stage、写 warning TSV、输出。
+- 验证：ctest 16/16；x86_64 IR 逐字节相同；i386 去数字后逐字节相同。
+
 ### P4（2026-11-14）
 
 `NativeAnalysis.cpp` 从 6.2k 行按 analyzer 边界拆成：
