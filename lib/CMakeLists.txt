@@ -19,6 +19,14 @@ add_library(notdec-bin2llvm-core STATIC
   passes/summary/NativeRegisterPreSummaryPeephole.cpp
   passes/summary/NativeRegisterPostRewritePeephole.cpp
   passes/summary/NativeRegisterSummarySSA.cpp
+  passes/summary/RegisterEliminationModel.cpp
+  passes/summary/RegisterSignatureSlots.cpp
+  passes/summary/RegisterExternalShapes.cpp
+  passes/summary/RegisterSignatureRewrite.cpp
+  passes/summary/FunctionBuilderCore.cpp
+  passes/summary/FunctionBuilderRanges.cpp
+  passes/summary/FunctionBuilderSsa.cpp
+  passes/summary/FunctionBuilderSignature.cpp
   passes/summary/NativeRegisterFinalCleanup.cpp
   RegisterStorage.cpp
 )

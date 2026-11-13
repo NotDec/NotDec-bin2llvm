@@ -28,7 +28,7 @@
       不合并 `AbiFacts`（两边语义已分叉：mask vs slot）。
 - [x] P2 拆分 `NativeRegisterPeephole` 为 pre-summary / post-rewrite 两个 pass；
       `NativeFunctionPointerPromotion` 归位到 passes。
-- [ ] P3 拆 `NativeRegisterSummarySSA` 单体：orchestrator + entry state /
+- [x] P3 拆 `NativeRegisterSummarySSA` 单体：orchestrator + entry state /
       external call shapes / signature rewrite / range materialization / value source audit。
       先搬不改，公共 API 不变。
 - [ ] P4 按 analyzer 边界拆 `NativeAnalysis`；pipeline 下沉为 `NativePipeline`，
@@ -64,6 +64,30 @@
 - `DEBUG.md` 第 5 节标注 `notdec-native-pcode` / `notdec-sleigh-pcode` /
   `notdec-sleigh-llvm` / `notdec-lief-elf` 为调试工具。
 - ctest 12/12。
+
+### P3（2026-11-13）
+
+`NativeRegisterSummarySSA.cpp` 从 9.6k 行拆成：
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `NativeRegisterSummarySSA.cpp` | 391 | pass 入口编排 + 公开 audit 入口 |
+| `RegisterEliminationInternal.h` | 1420 | 内部类型、free function 声明、FunctionBuilder 声明 |
+| `RegisterEliminationModel.cpp` | 719 | unknown helper / noreturn 截断 / 死 helper 清理 / audit / ABI facts |
+| `RegisterSignatureSlots.cpp` | 805 | 签名 slot 与 shape 构造 |
+| `RegisterExternalShapes.cpp` | 1434 | 外部调用形状、变参推断、间接调用证据 |
+| `RegisterSignatureRewrite.cpp` | 1446 | 函数/调用点签名重写辅助 |
+| `FunctionBuilderCore.cpp` | 944 | demand 计算、partial write、metadata |
+| `FunctionBuilderRanges.cpp` | 1150 | 区间边界、planning、liveness |
+| `FunctionBuilderSsa.cpp` | 830 | 区间 SSA、phi、range transfer |
+| `FunctionBuilderSignature.cpp` | 1351 | 调用点实参、栈槽、返回值 |
+
+- FunctionBuilder 的 157 个成员函数改为 out-of-line 定义，类声明与成员变量进内部头。
+- 嵌套类型 `RangeLossCause` 提到 namespace 作用域，out-of-line 定义可以直接使用。
+- 拆分是纯搬移：free function 与成员函数体逐字未改，只补 `FunctionBuilder::`、
+  去掉定义处的默认实参、把 `static` 成员定义前的 `static` 去掉。
+- 验证：ctest 12/12；fortune x86_64/i386 IR 与 P2 基线逐字节相同；
+  pass 时间 3.16–3.18s。
 
 ### P2（2026-11-13）
 
