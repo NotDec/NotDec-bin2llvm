@@ -550,9 +550,9 @@ external/NotDec-bin2llvm/
 
   lib/
     NativeAnalysis.cpp              ELF/DDISASM/GTIRB/.eh_frame/PLT/GOT discovery
-    GtirbNativeAnalysis.cpp         GTIRB 导入
-    NativeEhFrame.cpp               .eh_frame 解码
-    NativeRuntime.cpp               runtime 函数识别和 skip-runtime 策略
+                                    （analyzer 实现目前都在这个 TU 里，按
+                                    createElfLoadAnalyzer / createEhFrameAnalyzer /
+                                    createGtirbFunctionFactsAnalyzer 等边界划分）
     NativeExternalPrototype.cpp     默认外部原型和 JSON 加载
     SleighLift.cpp                  SLEIGH instruction / p-code 收集
     PcodeToLLVM.cpp                 p-code 到 LLVM IR lowering

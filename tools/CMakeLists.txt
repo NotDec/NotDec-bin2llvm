@@ -1,12 +1,3 @@
-add_executable(notdec-bin2llvm
-  notdec-bin2llvm.cpp
-)
-
-target_link_libraries(notdec-bin2llvm
-  PRIVATE
-    notdec-bin2llvm-core
-)
-
 if (NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
   add_library(notdec-bin2llvm-sleigh-bytes STATIC
     SleighBytes.cpp

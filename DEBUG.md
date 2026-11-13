@@ -63,3 +63,16 @@ cd /sn640/NotDec/external/NotDec-bin2llvm
   --target vim:executable \
   --target wolfssl:shared-library
 ```
+
+## 5. 调试工具
+
+除主链路 `notdec-native-discover` / `notdec-native-llvm` 外，构建还会产出几个只用于
+手工排查的工具，不接入 CTest：
+
+- `notdec-native-pcode`：只跑 discovery + SLEIGH，打印某个函数/范围的 p-code，
+  用来确认"lift 之前"的形态。
+- `notdec-sleigh-pcode`：给定原始字节直接反汇编并打印 p-code，不依赖 ELF。
+- `notdec-sleigh-llvm`：给定原始字节直接 lower 成 LLVM IR，用来隔离 lowering 问题。
+- `notdec-lief-elf`：打印 LIEF 解析出的 section/segment/relocation/symbol，核对 ELF facts。
+
+用法都是 `--help` 或直接给输入路径；这些工具的定位是"隔离一层看输入"，不要在主链路里调用。

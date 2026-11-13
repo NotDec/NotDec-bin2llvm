@@ -1,5 +1,4 @@
 add_library(notdec-bin2llvm-core STATIC
-  ModuleBuilder.cpp
   NativeAbi.cpp
   NativeRelocationMetadata.cpp
   NativeFunctionPointerPromotion.cpp
