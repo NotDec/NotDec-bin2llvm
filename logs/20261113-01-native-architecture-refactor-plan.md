@@ -53,6 +53,17 @@
 - fortune x86_64 IR：`/tmp/refactor-baseline/x86_64.ll`（3.20–3.24s）。
 - fortune i386 IR：`/tmp/refactor-baseline/i386.ll`。
 
+## 完成情况（2026-11-14）
+
+- P0–P6 全部完成，共 8 个提交。
+- 最大源文件 9.9k → 4.6k（`PcodeToLLVM.cpp`，本计划外）；寄存器消除编排入口 391 行，
+  各 stage 800–1450 行；discovery 最大文件 1523 行。
+- 测试：`ctest` 16/16；213 个 register test 拆成 5 个可执行文件 + 共享 harness。
+- 行为：fortune x86_64 IR 与重构前逐字节相同；i386 指令与 metadata 内容相同，
+  仅 `%ST1.clobberNNN` 后缀编号受 LLVM 同名计数器影响（构建布局敏感），
+  去掉数字后逐字节相同。
+- 性能：pass 时间 3.14–3.21s，基线 3.20–3.24s，未劣化。
+
 ## 进度记录
 
 ### P0（2026-11-13，commit 7b398b6）
