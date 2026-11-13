@@ -5,7 +5,7 @@
 
 设计原则见 `docs/MatchingCompiler.md`（完整命中或整体放弃、先看编译器
 源码、结果挂 metadata）。这里只讲手法：**定位 → 证明 → 落地 → 验证**，以及这一路上
-踩过的坑。所有例子都来自 native 侧的寄存器消除链路（`passes/summary/`）。
+踩过的坑。所有例子都来自 native 侧的寄存器消除链路（`passes/register/`）。
 
 ## 0. 一句话版本
 

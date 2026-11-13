@@ -1,5 +1,5 @@
 #include "SleighBytes.h"
-#include "notdec-bin2llvm/PcodeToLLVM.h"
+#include "notdec-bin2llvm/core/PcodeToLLVM.h"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"

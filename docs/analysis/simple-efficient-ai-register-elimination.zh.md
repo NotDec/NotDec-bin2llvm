@@ -27,7 +27,7 @@ CFG 合流使用 may-style union。读寄存器时，只有当前值仍可能是
 实现分成三个 pass：
 
 - `NativeRegisterSummary` 计算寄存器 effect 和 demand metadata。
-- `NativeRegisterSummarySSA` 消费 metadata，给 live register state 构建 SSA 值，重写函数签名，并移除死的 register residue。
+- `NativeRegisterElimination` 消费 metadata，给 live register state 构建 SSA 值，重写函数签名，并移除死的 register residue。
 - `NativeRegisterFinalCleanup` 在 SSA rewrite 之后运行。它调用 GlobalDCE，并且只在函数里不再有具体 register residue 时清掉 summary metadata。
 
 ## 2. 方法
@@ -48,7 +48,7 @@ CFG 合流使用 may-style union。读寄存器时，只有当前值仍可能是
 1. **Bottom-up effect summary。** 对每个有定义的函数，在它的 CFG 上做分析。结果说明每个寄存器的出口值是否可能仍然是入口值、是否可能是新值，以及入口值是否可能被读取过。递归函数通过 call graph SCC 迭代处理。
 2. **Top-down demand summary。** 从外部可见 root 和 caller observation 开始，把 demanded output register 反向传播到内部调用。这样可以过滤掉没人使用的 modified register。demand 是 bit mask，不只是 bool。
 
-得到这些 summary 后，`NativeRegisterSummarySSA` 重写 IR：
+得到这些 summary 后，`NativeRegisterElimination` 重写 IR：
 
 1. 为 register load 构建 SSA 值，在 CFG 合流点创建 PHI。
 2. 只在需要时 materialize unknown call effect。
@@ -247,7 +247,7 @@ metadata 驱动 SummarySSA，也方便 debug。它不是 cleanup 之后的新事
 
 ### 2.8 SummarySSA Construction
 
-`NativeRegisterSummarySSA` 使用 summary fact，把 register memory 替换成 SSA 值。
+`NativeRegisterElimination` 使用 summary fact，把 register memory 替换成 SSA 值。
 
 对每个函数，builder 会惰性创建值：
 

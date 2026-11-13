@@ -1,7 +1,7 @@
-#include "notdec-bin2llvm/NativeAbi.h"
-#include "notdec-bin2llvm/NativeRegisterPartialRead.h"
-#include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
+#include "notdec-bin2llvm/abi/NativeAbi.h"
+#include "notdec-bin2llvm/intrinsics/NativeRegisterPartialRead.h"
+#include "notdec-bin2llvm/intrinsics/NativeRegisterPartialWrite.h"
+#include "notdec-bin2llvm/passes/register/NativeRegisterSummary.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"

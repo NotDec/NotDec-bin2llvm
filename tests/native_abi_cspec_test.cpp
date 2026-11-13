@@ -1,4 +1,4 @@
-#include "notdec-bin2llvm/NativeAbi.h"
+#include "notdec-bin2llvm/abi/NativeAbi.h"
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"

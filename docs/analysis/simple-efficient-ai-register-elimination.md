@@ -44,7 +44,7 @@ store them in larger ZMM globals.
 The implementation is split across three passes:
 
 - `NativeRegisterSummary` computes register effects and demand metadata.
-- `NativeRegisterSummarySSA` consumes the metadata, builds SSA values for live
+- `NativeRegisterElimination` consumes the metadata, builds SSA values for live
   register state, rewrites function signatures, and removes dead register
   residue.
 - `NativeRegisterFinalCleanup` runs after SSA rewrite.  It invokes GlobalDCE and
@@ -78,7 +78,7 @@ The analysis has two main stages.
    internal calls.  This filters out modified registers that nobody uses.  The
    demand is a bit mask, not just a boolean.
 
-After these summaries, `NativeRegisterSummarySSA` rewrites the IR:
+After these summaries, `NativeRegisterElimination` rewrites the IR:
 
 1. It builds SSA values for register loads, with PHIs at CFG joins.
 2. It materializes unknown call effects only when needed.
@@ -328,7 +328,7 @@ fully disappeared according to the cleanup rules.
 
 ### 2.8 SummarySSA Construction
 
-`NativeRegisterSummarySSA` uses the summary facts to replace register memory
+`NativeRegisterElimination` uses the summary facts to replace register memory
 with SSA values.
 
 For each function, the builder lazily creates values:

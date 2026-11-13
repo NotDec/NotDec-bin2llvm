@@ -1,5 +1,5 @@
 #include "SleighBytes.h"
-#include "notdec-bin2llvm/SleighLift.h"
+#include "notdec-bin2llvm/core/SleighLift.h"
 
 #include <sleigh/libsleigh.hh>
 

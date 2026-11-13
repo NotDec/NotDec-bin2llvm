@@ -23,8 +23,8 @@
 
 当前默认且后续重点是 `summary`：
 
-- 代码在 `include/notdec-bin2llvm/passes/summary/`、`lib/passes/summary/`
-- `NativeRegisterSummary` 与 `NativeRegisterSummarySSA` 负责寄存器 SSA、寄存器消除和 native 函数签名重写。
+- 代码在 `include/notdec-bin2llvm/passes/register/`、`lib/passes/register/`
+- `NativeRegisterSummary` 与 `NativeRegisterElimination` 负责寄存器 SSA、寄存器消除和 native 函数签名重写。
 - `notdec-native-llvm` 默认且唯一使用该路；`--summary-register-ssa-pass` 仅保留为兼容别名。
 - 新的寄存器消除、call/internal signature rewrite 都基于 summary 结果，不依赖 Ghidra `notdec.prototype.*` metadata。相关 plan/记录在 `logs/20260616-01-native-prototype-recovery-stage2/`。
 

@@ -1,12 +1,12 @@
 # Range-based Register SSA
 
-本文说明 `NativeRegisterSummarySSA` 当前的 range-aware register SSA 是怎么工作的。
+本文说明 `NativeRegisterElimination` 当前的 range-aware register SSA 是怎么工作的。
 写法按 Braun SSA 的概念来对照，但重点是当前实现，不是重新介绍论文。
 
 相关文件：
 
 - `docs/analysis/braun-ssa-construction.md`
-- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
+- `lib/passes/register/NativeRegisterElimination.cpp`
 - `logs/20260704-03-bin2llvm-complete-range-aware-summary-ssa-plan.md`
 
 ## 一句话
@@ -547,7 +547,7 @@ extract 对应 range。
 
 ## 当前不应再有的路径
 
-`NativeRegisterSummarySSA` 的 old whole-register SSA 主路径已经删除。
+`NativeRegisterElimination` 的 old whole-register SSA 主路径已经删除。
 当前主实现里不应再出现独立的：
 
 - `EntryValue`

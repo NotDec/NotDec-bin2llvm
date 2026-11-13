@@ -1,14 +1,14 @@
 #include "SleighBytes.h"
-#include "notdec-bin2llvm/LiefElfLoadImage.h"
-#include "notdec-bin2llvm/NativeAbi.h"
-#include "notdec-bin2llvm/NativeAnalysis.h"
-#include "notdec-bin2llvm/NativeFunctionPointerPromotion.h"
-#include "notdec-bin2llvm/NativeRelocationMetadata.h"
-#include "notdec-bin2llvm/PcodeToLLVM.h"
-#include "notdec-bin2llvm/SleighLift.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterPostRewritePeephole.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
+#include "notdec-bin2llvm/elf/LiefElfLoadImage.h"
+#include "notdec-bin2llvm/abi/NativeAbi.h"
+#include "notdec-bin2llvm/discovery/NativeAnalysis.h"
+#include "notdec-bin2llvm/passes/function-pointer/NativeFunctionPointerPromotion.h"
+#include "notdec-bin2llvm/elf/NativeRelocationMetadata.h"
+#include "notdec-bin2llvm/core/PcodeToLLVM.h"
+#include "notdec-bin2llvm/core/SleighLift.h"
+#include "notdec-bin2llvm/passes/register/NativeRegisterFinalCleanup.h"
+#include "notdec-bin2llvm/passes/register/NativeRegisterPostRewritePeephole.h"
+#include "notdec-bin2llvm/passes/register/NativeRegisterElimination.h"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalValue.h"
@@ -543,7 +543,7 @@ std::string tsvEscape(const std::string &text) {
 }
 
 bool writeRegisterSSAWarnings(
-    const notdec::bin2llvm::NativeRegisterSummarySSASummary &summary,
+    const notdec::bin2llvm::NativeRegisterEliminationSummary &summary,
     const std::string &path) {
   std::ofstream output(path);
   if (!output) {
@@ -553,7 +553,7 @@ bool writeRegisterSSAWarnings(
 
   output << "function\tcallee\tregister\tkind\treason\tuses"
          << "\trange_offset\trange_width\n";
-  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+  for (const notdec::bin2llvm::NativeRegisterEliminationWarning &warning :
        summary.Warnings) {
     output << tsvEscape(warning.FunctionName) << '\t'
            << tsvEscape(warning.CalleeName) << '\t'
@@ -1040,7 +1040,7 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
     return true;
   }
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions passOptions;
+  notdec::bin2llvm::NativeRegisterEliminationOptions passOptions;
   passOptions.EnableRewrite = true;
   passOptions.EnableResidueRemoval =
       !options.DisableSummaryRegisterResidueRemoval;
@@ -1049,8 +1049,8 @@ bool runRegisterSSAPassIfEnabled(llvm::Module &module,
   passOptions.AbiForAllFunctions = options.AbiForAllFunctions;
   passOptions.PrintSummary = options.PrintRegisterSSASummary;
   passOptions.ExternalPrototypeJsonPath = options.ExternalPrototypeJsonPath;
-  notdec::bin2llvm::NativeRegisterSummarySSASummary summary =
-      notdec::bin2llvm::runNativeRegisterSummarySSA(module, passOptions);
+  notdec::bin2llvm::NativeRegisterEliminationSummary summary =
+      notdec::bin2llvm::runNativeRegisterElimination(module, passOptions);
   if (!options.RegisterSSAWarningPath.empty() &&
       !writeRegisterSSAWarnings(summary, options.RegisterSSAWarningPath)) {
     return false;

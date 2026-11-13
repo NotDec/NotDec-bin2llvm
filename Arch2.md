@@ -149,7 +149,7 @@ Construction》）：用到寄存器时再往前查，不用预先算复杂的�
         "可能仍是入口值" / "可能被函数改过" / "入口值被读过"
       递归函数：按调用图 SCC（互相调用的循环组）反复迭代到稳定
       自顶向下：从顶层 ABI 开始，传"调用者真会用的返回寄存器"（demand）
-  -> NativeRegisterSummarySSA              <- 新增：基于 summary 的新 SSA
+  -> NativeRegisterElimination              <- 新增：基于 summary 的新 SSA
   -> LLVM IR
 ```
 
@@ -183,7 +183,7 @@ Construction》）：用到寄存器时再往前查，不用预先算复杂的�
 ```text
 机器码 -> p-code -> PcodeToLLVM
   -> NativeRegisterSummary
-  -> NativeRegisterSummarySSA              <- 扩展：SSA + 签名重写 + 清理
+  -> NativeRegisterElimination              <- 扩展：SSA + 签名重写 + 清理
       SSA 构建
       addDemandedExternalReturns
         （"调用后被读的 ABI 输出寄存器" -> 补返回槽）
@@ -199,7 +199,7 @@ call"变成"直接传参数"，把返回寄存器变成 LLVM 返回值。这件�
 重写完旧寄存器 store 又活过来，还得额外清理。
 
 **方案**：删掉独立的 `NativeExternalCallSignatureRewrite`，把签名重写按顺序折进
-`NativeRegisterSummarySSA`：先建 SSA，再按 SSA 结果重写函数类型、call 参数、返回值，最后清理死
+`NativeRegisterElimination`：先建 SSA，再按 SSA 结果重写函数类型、call 参数、返回值，最后清理死
 store。同时引入 `addDemandedExternalReturns`：给"调用后被读的 ABI 输出寄存器"补返回槽。
 
 注意：从这一天起，返回推理就是放在 SSA 构建**之后**跑的——因为"调用后哪个寄存器被读了"这个证据是
@@ -222,7 +222,7 @@ store。同时引入 `addDemandedExternalReturns`：给"调用后被读的 ABI �
   -> NativeRegisterSummary                 <- 扩展
       跟踪"入口 RSP + 常量偏移"，识别连续 push/pop 的保存槽
       callee-saved 保存/恢复不再算"读了入口寄存器"
-  -> NativeRegisterSummarySSA
+  -> NativeRegisterElimination
   -> LLVM IR
 ```
 
@@ -251,7 +251,7 @@ store。同时引入 `addDemandedExternalReturns`：给"调用后被读的 ABI �
       部分读写先展开成 partial_read / partial_write intrinsic
   -> NativeStackFrameRewrite / CanaryCleanup
   -> NativeRegisterSummary                 <- 扩展：effect / demand 按 bit 区间算
-  -> NativeRegisterSummarySSA              <- 重写：SSA 变量 = 寄存器的某段 bit 区间
+  -> NativeRegisterElimination              <- 重写：SSA 变量 = 寄存器的某段 bit 区间
       RAX[0:32]、RAX[32:32]、ZMM0[0:64] 各自有独立 SSA 值和 PHI
   -> NativeRegisterFinalCleanup            <- 新增：删无用全局 / helper
   -> LLVM IR
@@ -297,7 +297,7 @@ lane 保留高位、读写 8/16 位。整寄存器粒度的 SSA 面对部分读�
       vararg 按调用点推断尾参
   -> 第二遍 NativeRegisterSummary          <- 变化：带最终签名重跑完整分析
       （自底向上 + 自顶向下 demand + 最终 metadata）
-  -> NativeRegisterSummarySSA
+  -> NativeRegisterElimination
   -> LLVM IR
 ```
 
@@ -333,7 +333,7 @@ lane 保留高位、读写 8/16 位。整寄存器粒度的 SSA 面对部分读�
   -> 第一遍 summary                         <- 扩展：ST0/ST1 也参与 effect 分析
   -> 外部参数推断                           <- 扩展：XMM 参数证据区分"真浮点写"和"整数打包"
   -> 第二遍 summary
-  -> NativeRegisterSummarySSA               <- 扩展
+  -> NativeRegisterElimination               <- 扩展
       调用点 DF 定值为常量 0
       ST0 -> 返回槽 x86_fp80，跟 RAX/XMM0 同一套路径
   -> LLVM IR
@@ -383,7 +383,7 @@ x87 指令的语义是 8 个浮点寄存器组成一个"栈"（`ST0`..`ST7`）�
       + "调用后 ABI 输出寄存器被读"的证据
   -> 外部参数推断
   -> 第二遍 summary
-  -> NativeRegisterSummarySSA                <- 变化
+  -> NativeRegisterElimination                <- 变化
       构建 SSA；重写函数和 call 签名
       重写时 ret 先建 unknown（返回槽由签名决定，不再由第一遍占位决定）
   -> post-rewrite cleanup                    <- 新增/移动

@@ -23,7 +23,7 @@ ELF
 位置：
 
 - `tools/notdec-native-discover.cpp`
-- `include/notdec-bin2llvm/NativeAnalysis.h`
+- `include/notdec-bin2llvm/discovery/NativeAnalysis.h`
 - `lib/NativeAnalysis.cpp`
 
 作用是只做 native 发现和审计，不生成 LLVM IR。常用输出包括：
@@ -107,7 +107,7 @@ ELF
    - 目的是先折叠 p-code lowering 产生的局部冗余，给 SummarySSA 更干净的输入。
 
 8. **register SummarySSA**
-   - 默认入口：`runNativeRegisterSummarySSA(...)`。
+   - 默认入口：`runNativeRegisterElimination(...)`。
    - 这是当前寄存器消除和函数签名重写的主 pass，详细顺序见下一节。
 
 9. **第二次 LLVM cleanup**
@@ -225,7 +225,7 @@ PcodeToLLVM
   -> attach relocation function pointer metadata
   -> verify
   -> InstCombine + SimplifyCFG
-  -> NativeRegisterSummarySSA
+  -> NativeRegisterElimination
   -> EarlyCSE + InstCombine + SimplifyCFG
   -> NativeFunctionPointerPromotion
   -> NativeRegisterPostRewritePeephole
@@ -243,7 +243,7 @@ arch-specific 特性。数据段内容建模、结构体指针传递、IPA 值�
 
 位置：
 
-- `include/notdec-bin2llvm/NativeRelocationMetadata.h`
+- `include/notdec-bin2llvm/elf/NativeRelocationMetadata.h`
 - `lib/NativeRelocationMetadata.cpp`
 
 discovery 已经算出每个 relocation slot 的 computed value，tool 把“目标是本地函数”
@@ -262,7 +262,7 @@ discovery 已经算出每个 relocation slot 的 computed value，tool 把“目
 
 位置：
 
-- `include/notdec-bin2llvm/NativeFunctionPointerPromotion.h`
+- `include/notdec-bin2llvm/passes/function-pointer/NativeFunctionPointerPromotion.h`
 - `lib/NativeFunctionPointerPromotion.cpp`
 
 在签名重写之后，这个 pass 读上面的 metadata，识别：
@@ -303,12 +303,12 @@ load i64, ptr inttoptr (<slot address>)
 这一步只做通用 LLVM 局部化简，不负责寄存器语义。EarlyCSE 是必需的：寄存器模型会
 按使用点重复生成同构的 lane 链，没有 CSE 时 InstCombine 看不到它们是同一个值。
 
-### 5.2 NativeRegisterSummarySSA
+### 5.2 NativeRegisterElimination
 
 位置：
 
-- `include/notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h`
-- `lib/passes/summary/NativeRegisterSummarySSA.cpp`
+- `include/notdec-bin2llvm/passes/register/NativeRegisterElimination.h`
+- `lib/passes/register/NativeRegisterElimination.cpp`
 
 这是当前 native register elimination 的主 pass。顶层顺序是：
 
@@ -515,8 +515,8 @@ load i64, ptr inttoptr (<slot address>)
 
 位置：
 
-- `include/notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h`
-- `lib/passes/summary/NativeRegisterFinalCleanup.cpp`
+- `include/notdec-bin2llvm/passes/register/NativeRegisterFinalCleanup.h`
+- `lib/passes/register/NativeRegisterFinalCleanup.cpp`
 
 顺序：
 
@@ -557,12 +557,30 @@ external/NotDec-bin2llvm/
     SleighLift.cpp                  SLEIGH instruction / p-code 收集
     PcodeToLLVM.cpp                 p-code 到 LLVM IR lowering
 
-  lib/passes/summary/
+  lib/passes/register/
+    NativeRegisterSummary.cpp       bottom-up / top-down register summary
+    NativeRegisterElimination.cpp   寄存器消除 pass 入口（编排）
+    RegisterEliminationInternal.h   内部类型、free function 声明、FunctionBuilder 声明
+    RegisterEliminationModel.cpp    unknown helper / noreturn / ABI facts
+    RegisterSignatureSlots.cpp      签名 slot 与 shape
+    RegisterExternalShapes.cpp      外部调用形状与变参推断
+    RegisterSignatureRewrite.cpp    函数/调用点签名重写
+    FunctionBuilderCore.cpp         demand 计算、partial write、metadata
+    FunctionBuilderRanges.cpp       区间边界、planning、liveness
+    FunctionBuilderSsa.cpp          区间 SSA、phi、range transfer
+    FunctionBuilderSignature.cpp    调用点实参、栈槽、返回值
+    RegisterModel.{h,cpp}           共享寄存器只读模型
+    NativeRegisterPreSummaryPeephole.cpp
+    NativeRegisterPostRewritePeephole.cpp
+    NativeRegisterFinalCleanup.cpp  final GlobalDCE / metadata cleanup
+  lib/passes/stack/
     NativeStackFrame.cpp            栈帧恢复和 cleanup
     NativeStackCanaryCleanup.cpp    stack canary 删除
-    NativeRegisterSummary.cpp       bottom-up / top-down register summary
-    NativeRegisterSummarySSA.cpp    range-aware SummarySSA 和签名重写
-    NativeRegisterFinalCleanup.cpp  final GlobalDCE / metadata cleanup
+    NativeStackAddress.cpp          栈地址分析
+  lib/passes/vararg/
+    NativeVarArgRewrite.cpp         变参序言 / va_list 恢复
+  lib/passes/function-pointer/
+    NativeFunctionPointerPromotion.cpp
 ```
 
 ## 7. 现在已知的设计边界

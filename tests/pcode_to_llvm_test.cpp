@@ -1,6 +1,6 @@
-#include "notdec-bin2llvm/NativeFunctionPointerPromotion.h"
-#include "notdec-bin2llvm/NativeRelocationMetadata.h"
-#include "notdec-bin2llvm/PcodeToLLVM.h"
+#include "notdec-bin2llvm/passes/function-pointer/NativeFunctionPointerPromotion.h"
+#include "notdec-bin2llvm/elf/NativeRelocationMetadata.h"
+#include "notdec-bin2llvm/core/PcodeToLLVM.h"
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"

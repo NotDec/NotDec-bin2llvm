@@ -33,7 +33,7 @@
       先搬不改，公共 API 不变。
 - [ ] P4 按 analyzer 边界拆 `NativeAnalysis`；pipeline 下沉为 `NativePipeline`，
       tool 只留 CLI。
-- [ ] P5 命名与目录迁移：
+- [x] P5 命名与目录迁移：
       `NativeRegisterSummarySSA` → `NativeRegisterElimination`；
       `NativeRegisterSummarySSASummary` → `NativeRegisterEliminationSummary`；
       `NativeAnalysis` → `NativeDiscovery`；
@@ -64,6 +64,23 @@
 - `DEBUG.md` 第 5 节标注 `notdec-native-pcode` / `notdec-sleigh-pcode` /
   `notdec-sleigh-llvm` / `notdec-lief-elf` 为调试工具。
 - ctest 12/12。
+
+### P5（2026-11-14）
+
+- 命名：`NativeRegisterSummarySSA*` → `NativeRegisterElimination*`
+  （文件、options/summary/warning 类型、`runNativeRegisterElimination`）。
+  CLI flag `--register-ssa-summary` / `--summary-register-ssa-pass` 暂保留兼容。
+- 目录分层：
+  - `include|lib/core/`：Pcode、PcodeToLLVM、SleighLift、RegisterStorage、
+    NotDecIntrinsics、NotDecMetadata
+  - `include|lib/elf/`：LiefElfLoadImage、NativeRelocationMetadata
+  - `include|lib/abi/`：NativeAbi、NativeExternalPrototype
+  - `include|lib/intrinsics/`：partial read/write、value range、x87
+  - `include|lib/discovery/`：NativeAnalysis
+  - `include|lib/passes/register|stack|vararg|function-pointer/`
+- `NativeFunctionPointerPromotion` 归位到 `passes/function-pointer/`。
+- 空目录删除，`ARCHITECTURE.md` 第 6 节与 `AGENTS.md`、docs 路径同步。
+- 验证：ctest 12/12；fortune x86_64/i386 IR 逐字节相同。
 
 ### P3（2026-11-13）
 

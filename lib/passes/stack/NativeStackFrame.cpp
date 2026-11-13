@@ -1,0 +1,1204 @@
+#include "notdec-bin2llvm/passes/stack/NativeStackFrame.h"
+
+#include "core/NotDecMetadata.h"
+
+#include "notdec-bin2llvm/abi/NativeAbi.h"
+#include "notdec-bin2llvm/intrinsics/NativeRegisterPartialWrite.h"
+#include "notdec-bin2llvm/passes/stack/NativeStackAddress.h"
+
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Local.h"
+
+#include <algorithm>
+#include <iterator>
+#include <limits>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace notdec::bin2llvm {
+namespace {
+
+struct StackFrameAddressValue {
+  llvm::Instruction *Instruction = nullptr;
+  int64_t Offset = 0;
+};
+
+bool accessMatchesRegister(const llvm::MDNode *access,
+                           llvm::StringRef registerName) {
+  if (access == nullptr) {
+    return false;
+  }
+  if (auto name = mdField(access, "name")) {
+    if (*name == registerName) {
+      return true;
+    }
+  }
+  if (auto base = mdField(access, "base")) {
+    return *base == registerName;
+  }
+  return false;
+}
+
+std::string registerName(const llvm::GlobalVariable &global) {
+  if (auto name = mdField(global.getMetadata("notdec.register"), "name")) {
+    if (!name->empty()) {
+      return *name;
+    }
+  }
+  return global.getName().str();
+}
+
+bool isRegisterAccess(const llvm::Instruction &inst,
+                      llvm::StringRef registerName) {
+  return accessMatchesRegister(inst.getMetadata("notdec.register.access"),
+                               registerName);
+}
+
+bool loadReadsRegister(const llvm::LoadInst &load,
+                       llvm::StringRef wantedRegister) {
+  if (isRegisterAccess(load, wantedRegister)) {
+    return true;
+  }
+  auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+      load.getPointerOperand()->stripPointerCasts());
+  return global != nullptr &&
+         global->getMetadata("notdec.register") != nullptr &&
+         registerName(*global) == wantedRegister;
+}
+
+bool valueUsesRegisterLoad(llvm::Value &value, llvm::StringRef registerName,
+                           unsigned depth = 0) {
+  if (depth >= 12) {
+    return false;
+  }
+  llvm::Value *stripped = value.stripPointerCasts();
+  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(stripped)) {
+    return loadReadsRegister(*load, registerName);
+  }
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(stripped)) {
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      if (valueUsesRegisterLoad(*incoming, registerName, depth + 1)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  auto *op = llvm::dyn_cast<llvm::Operator>(stripped);
+  if (op == nullptr) {
+    return false;
+  }
+  for (llvm::Value *operand : op->operands()) {
+    if (valueUsesRegisterLoad(*operand, registerName, depth + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+llvm::Value *createStackFramePointer(llvm::IRBuilder<> &builder,
+                                     llvm::AllocaInst &storage,
+                                     int64_t frameLow, int64_t offset,
+                                     llvm::StringRef name) {
+  llvm::Type *indexType =
+      storage.getModule()->getDataLayout().getIndexType(storage.getType());
+  llvm::Value *byteOffset = llvm::ConstantInt::get(
+      indexType, static_cast<uint64_t>(offset - frameLow));
+  return builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(storage.getContext()),
+                                   &storage, byteOffset, name);
+}
+
+std::optional<uint64_t> memoryAccessSize(const llvm::DataLayout &layout,
+                                         const llvm::Instruction &instruction) {
+  llvm::Type *type = nullptr;
+  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+    type = load->getType();
+  } else if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+    type = store->getValueOperand()->getType();
+  }
+  if (type == nullptr) {
+    return std::nullopt;
+  }
+  llvm::TypeSize size = layout.getTypeStoreSize(type);
+  return size.isScalable() ? std::nullopt
+                           : std::optional<uint64_t>(size.getFixedValue());
+}
+
+// Recover the native frame alloca created by an earlier stack rewrite.  Its
+// byte count is the absolute value of the lowest native offset, so later
+// cleanup passes can reuse the same allocation instead of shadowing it with a
+// second, non-aliasing alloca.  The current pipeline creates exactly one such
+// alloca per function; if the IR contains anything else, stay conservative and
+// let the caller skip this function.
+struct NativeStackFrameAllocaInfo {
+  llvm::AllocaInst *Storage = nullptr;
+  int64_t FrameLow = 0;
+  bool Ambiguous = false;
+};
+
+NativeStackFrameAllocaInfo findNativeStackFrameAlloca(llvm::Function &function) {
+  NativeStackFrameAllocaInfo result;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction);
+      if (alloca == nullptr || !alloca->hasName() ||
+          !alloca->getName().starts_with("notdec_stack.native")) {
+        continue;
+      }
+      if (result.Storage != nullptr) {
+        result.Ambiguous = true;
+        return result;
+      }
+      auto *arrayType =
+          llvm::dyn_cast<llvm::ArrayType>(alloca->getAllocatedType());
+      auto *count =
+          llvm::dyn_cast_or_null<llvm::ConstantInt>(alloca->getArraySize());
+      if (arrayType == nullptr || count == nullptr ||
+          !arrayType->getElementType()->isIntegerTy(8)) {
+        result.Ambiguous = true;
+        return result;
+      }
+      // IRBuilder makes the allocated type [N x i8] and leaves the explicit
+      // alloca array-size operand at its default of one.  Recover N from the
+      // allocated type; keep the operand multiplication for completeness.
+      const llvm::APInt &countValue = count->getValue();
+      if (countValue.getActiveBits() > 64) {
+        result.Ambiguous = true;
+        return result;
+      }
+      uint64_t elementCount = arrayType->getNumElements();
+      uint64_t allocaCount = countValue.getZExtValue();
+      if (allocaCount == 0 ||
+          elementCount >
+              std::numeric_limits<uint64_t>::max() / allocaCount) {
+        result.Ambiguous = true;
+        return result;
+      }
+      uint64_t size = elementCount * allocaCount;
+      if (size == 0 ||
+          size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        result.Ambiguous = true;
+        return result;
+      }
+      result.Storage = alloca;
+      result.FrameLow = -static_cast<int64_t>(size);
+    }
+  }
+  return result;
+}
+
+// ===== 帧指针 load 折叠：按编译器模型匹配 =====
+//
+// 编译器怎么用 RBP（llvm-source）：
+//   - X86RegisterInfo::getFrameRegister: return hasFP(MF) ? FramePtr : StackPtr;
+//     即"哪个寄存器当帧基址"是整函数属性，不存在函数中间换基址。
+//   - X86FrameLowering::hasFPImpl 全是整函数条件（可变长栈对象、取过帧地址、
+//     强制带帧指针……）。
+//   - 用帧指针时 RBP 被保留，不参与寄存器分配：
+//     X86FrameLowering.cpp: assert(MF.getRegInfo().isReserved(MachineFramePtr) &&
+//                                  "FP reserved");
+//   所以机器码里对 RBP 的写只有两种：
+//     序言: push %rbp                → store (load @RBP), [rsp-8]   （保存调用方值）
+//           mov %rbp, %rsp / lea     → store (load @RSP), @RBP     （设置帧基址）
+//     收尾: mov %rsp, %rbp; pop %rbp → @RBP = load [rbp-8]         （恢复调用方值）
+//           （或 leave）
+//   不用帧指针的函数则一次设置都没有，RBP 是一个普通 callee-saved 寄存器。
+//
+// 于是不需要逐点数据流，四条判据就够：
+//   1) 分类：值为 RSP 派生的 store 是"设置"，其余（收尾恢复、partial_write、
+//      认不出的 store）是"其它写"；
+//   2) 设置必须唯一（编译器模型保证整函数只有一个帧基址）；不唯一就整函数不折；
+//   3) "其它写"之后可达的块里不折；写所在块内按指令顺序判断；
+//   4) 其余位置只要设置支配这条 load，load 读的就是设置的值。
+// 支配 + 可达性保证：每条到该 load 的路径都经过设置，且没有别的写能到达它。
+//
+// 代码假设（每条不成立时都只是"少折"，不会折错）：
+//   - 一个函数只用一种帧基址；多个设置、或设置被别的写夹住 → 整函数不折；
+//   - 调用不会改帧指针（ABI callee-saved，项目统一假设）；
+//   - 认不出的写一律算写：partial_write 到帧指针、没有访问元数据的 store 都算，
+//     避免旧实现"看不见的写 → 拿过期值替换"；
+//   - 毒化是块级的：收尾块可达的块里，即使某条具体路径不经过恢复也不折。
+// 匹配不上就保留 raw load，交给后面的 pass。
+//
+// 对不认识的写一律当"其它写"：partial_write 到帧指针、没有访问元数据的 store
+// 都算写。这比旧实现更保守（旧实现只认带元数据的 store，可能拿过期值替换）。
+
+llvm::GlobalVariable *findFramePointerGlobal(llvm::Module &module,
+                                             llvm::StringRef name) {
+  llvm::GlobalVariable *result = nullptr;
+  for (llvm::GlobalVariable &global : module.globals()) {
+    if (registerName(global) != name) {
+      continue;
+    }
+    if (result != nullptr && result != &global) {
+      return nullptr;
+    }
+    result = &global;
+  }
+  return result;
+}
+
+// 该指令是否写帧指针寄存器。store 以指针为准，同时保留访问元数据判据（防止
+// 换过拼写的别名全局）；partial_write helper 按参数里的全局判断。
+bool isFramePointerWrite(llvm::Instruction &instruction,
+                         llvm::GlobalVariable *framePointer,
+                         llvm::StringRef frameRegisterName) {
+  if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+    return store->getPointerOperand()->stripPointerCasts() == framePointer ||
+           isRegisterAccess(*store, frameRegisterName);
+  }
+  if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+    if (std::optional<NativeRegisterPartialWriteInfo> partial =
+            parseNativeRegisterPartialWrite(*call)) {
+      return partial->Global == framePointer;
+    }
+  }
+  return false;
+}
+
+bool isFramePointerSetter(llvm::Instruction &instruction,
+                          llvm::StringRef stackRegisterName) {
+  auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+  return store != nullptr &&
+         valueUsesRegisterLoad(*store->getValueOperand(), stackRegisterName);
+}
+
+uint64_t replaceFramePointerLoads(llvm::Function &function,
+                                  llvm::StringRef frameRegisterName,
+                                  llvm::StringRef stackRegisterName) {
+  llvm::Module *module = function.getParent();
+  if (module == nullptr) {
+    return 0;
+  }
+  llvm::GlobalVariable *framePointer =
+      findFramePointerGlobal(*module, frameRegisterName);
+  if (framePointer == nullptr) {
+    return 0;
+  }
+
+  // 1) 收集写：值为 RSP 派生的 store 是"设置"，其余（收尾恢复、partial_write、
+  //    认不出的 store）是"其它写"。
+  llvm::SmallVector<llvm::Instruction *, 4> setters;
+  llvm::SmallPtrSet<llvm::BasicBlock *, 8> otherWriteBlocks;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      if (!isFramePointerWrite(instruction, framePointer, frameRegisterName)) {
+        continue;
+      }
+      if (isFramePointerSetter(instruction, stackRegisterName)) {
+        setters.push_back(&instruction);
+      } else {
+        otherWriteBlocks.insert(&block);
+      }
+    }
+  }
+  // 编译器模型保证"设置"只有一次（序言里的 mov rbp, rsp / lea）：RBP 要么整
+  // 函数是帧指针，要么完全不是。不是唯一就不折——多条路径给出不同帧基址时，
+  // 逐点判断要回到数据流，不值得。
+  if (setters.size() != 1) {
+    return 0;
+  }
+  llvm::Instruction *setter = setters.front();
+
+  // 2) "其它写"之后可达的块里帧基址已不可信。写所在块本身按块内指令顺序处理
+  //    （写之前的 load 仍可折），所以 BFS 从写所在块的后继开始。
+  llvm::SmallPtrSet<llvm::BasicBlock *, 32> poisoned;
+  llvm::SmallVector<llvm::BasicBlock *, 16> worklist;
+  auto poisonSuccessors = [&](llvm::BasicBlock *block) {
+    for (llvm::BasicBlock *successor : llvm::successors(block)) {
+      if (poisoned.insert(successor).second) {
+        worklist.push_back(successor);
+      }
+    }
+  };
+  for (llvm::BasicBlock *block : otherWriteBlocks) {
+    poisonSuccessors(block);
+  }
+  while (!worklist.empty()) {
+    poisonSuccessors(worklist.pop_back_val());
+  }
+
+  // 3) 唯一设置支配 load、且没有其它写能达到它时，load 读的就是设置的值。
+  llvm::DominatorTree dominatorTree(function);
+  llvm::Value *frameBaseValue =
+      llvm::cast<llvm::StoreInst>(setter)->getValueOperand();
+  std::vector<llvm::LoadInst *> deadLoads;
+  for (llvm::BasicBlock &block : function) {
+    bool blocked = poisoned.count(&block) != 0;
+    for (llvm::Instruction &instruction : block) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {
+        if (!blocked && loadReadsRegister(*load, frameRegisterName) &&
+            dominatorTree.dominates(setter, load)) {
+          load->replaceAllUsesWith(frameBaseValue);
+          deadLoads.push_back(load);
+        }
+        continue;
+      }
+      if (!isFramePointerWrite(instruction, framePointer, frameRegisterName)) {
+        continue;
+      }
+      // 设置之后又变回帧基址；其它写之后本块内的 load 不再折。
+      blocked = &instruction != setter;
+    }
+  }
+
+  for (llvm::LoadInst *load : deadLoads) {
+    load->eraseFromParent();
+  }
+  return deadLoads.size();
+}
+
+std::vector<std::string> framePointerRegisterNames(const NativeAbiSpec &abi) {
+  std::vector<std::string> names;
+  for (const NativeAbiEffect &effect : abi.Effects) {
+    if (effect.Kind == NativeAbiEffectKind::Unaffected &&
+        effect.Storage.Kind == NativeAbiStorageKind::Register &&
+        (effect.Storage.Name == "RBP" || effect.Storage.Name == "EBP" ||
+         effect.Storage.Name == "BP")) {
+      names.push_back(effect.Storage.Name);
+    }
+  }
+  return names;
+}
+
+bool isFramePointerRegisterName(llvm::StringRef name) {
+  return name == "RBP" || name == "EBP" || name == "BP";
+}
+
+bool valueFeedsStackPointerStore(llvm::Value &value,
+                                 llvm::GlobalVariable &stackPointer,
+                                 std::set<llvm::Value *> &seen) {
+  if (!seen.insert(&value).second) {
+    return false;
+  }
+  for (llvm::User *user : value.users()) {
+    auto *store = llvm::dyn_cast<llvm::StoreInst>(user);
+    if (store != nullptr && store->getValueOperand() == &value &&
+        store->getPointerOperand()->stripPointerCasts() == &stackPointer) {
+      return true;
+    }
+    auto *instruction = llvm::dyn_cast<llvm::Instruction>(user);
+    if (instruction != nullptr &&
+        (llvm::isa<llvm::BinaryOperator>(instruction) ||
+         llvm::isa<llvm::CastInst>(instruction) ||
+         llvm::isa<llvm::PHINode>(instruction) ||
+         llvm::isa<llvm::SelectInst>(instruction))) {
+      if (valueFeedsStackPointerStore(*instruction, stackPointer, seen)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool valueFeedsEntryStackInput(llvm::Value &value,
+                               const NativeStackAddressAnalysis &addresses,
+                               std::set<llvm::Value *> &seen) {
+  if (!seen.insert(&value).second) {
+    return false;
+  }
+  for (llvm::User *user : value.users()) {
+    auto *instruction = llvm::dyn_cast<llvm::Instruction>(user);
+    if (instruction == nullptr) {
+      continue;
+    }
+    std::optional<NativeStackAddress> address;
+    if (llvm::isa<llvm::IntToPtrInst>(instruction)) {
+      address = addresses.addressForPointer(instruction);
+    } else if (instruction->getType()->isIntegerTy()) {
+      address = addresses.addressForIntegerValue(instruction);
+    }
+    if (address && address->Kind == NativeStackAddressKind::EntryStackPointer &&
+        address->Offset >= 0) {
+      return true;
+    }
+    if (llvm::isa<llvm::BinaryOperator>(instruction) ||
+        llvm::isa<llvm::CastInst>(instruction) ||
+        llvm::isa<llvm::PHINode>(instruction) ||
+        llvm::isa<llvm::SelectInst>(instruction)) {
+      if (valueFeedsEntryStackInput(*instruction, addresses, seen)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// A frame can only be observed outside its own function through a call: a
+// callee reads it via a pointer the register model may have rebuilt as an
+// unknown clobber.  Without any call the frame provably stays local, so its
+// dead stores keep the plain liveness rule and no marker is needed.
+bool functionCanObserveFrame(llvm::Function &function) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      if (llvm::isa<llvm::CallBase>(&instruction)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// The rewrite recovers frame slots the register model lost track of, but LLVM's
+// own escape analysis only sees the IR: when the pointer that reads the frame
+// was rebuilt as an unknown clobber, the frame looks store-only and InstCombine
+// removes it together with the callback addresses stored into it.  Passing the
+// frame to a notdec.register.* intrinsic marks the object address-taken for the
+// rest of the pipeline; the register model treats notdec.register.* calls as
+// register-neutral, so the marker itself adds no register effect.
+void attachNativeFrameKeepAlive(llvm::Function &function,
+                                llvm::AllocaInst &storage) {
+  constexpr llvm::StringLiteral keepName = "notdec.register.native_frame.keep";
+  llvm::Module *module = storage.getModule();
+  if (module == nullptr || !functionCanObserveFrame(function)) {
+    return;
+  }
+  llvm::LLVMContext &context = module->getContext();
+  auto *pointerType = llvm::PointerType::get(context, 0);
+  auto *keepType = llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                                           {pointerType}, /*isVarArg=*/false);
+  for (llvm::User *user : storage.users()) {
+    auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+    if (call != nullptr && call->getCalledFunction() != nullptr &&
+        call->getCalledFunction()->getName() == keepName) {
+      return;
+    }
+  }
+  llvm::Function *keep = module->getFunction(keepName);
+  if (keep == nullptr) {
+    keep = llvm::Function::Create(keepType, llvm::GlobalValue::ExternalLinkage,
+                                  keepName, module);
+  } else if (keep->getFunctionType() != keepType) {
+    return;
+  }
+  llvm::IRBuilder<> builder(storage.getParent(),
+                            std::next(storage.getIterator()));
+  builder.CreateCall(keep, {&storage});
+}
+
+bool rewriteFunctionStackAccesses(llvm::Function &function,
+                                  llvm::StringRef stackRegisterName,
+                                  NativeStackFrameRewriteSummary &summary) {
+  llvm::Module *module = function.getParent();
+  if (module == nullptr) {
+    return false;
+  }
+  NativeStackFrameAllocaInfo existingFrame =
+      findNativeStackFrameAlloca(function);
+  if (existingFrame.Ambiguous) {
+    return false;
+  }
+  llvm::AllocaInst *storage = existingFrame.Storage;
+  int64_t frameLow = existingFrame.FrameLow;
+  llvm::GlobalVariable *stackPointer =
+      findNativeStackPointerGlobal(*module, stackRegisterName);
+  if (stackPointer == nullptr) {
+    return false;
+  }
+  NativeStackAddressAnalysis addresses(function, stackPointer,
+                                       stackRegisterName);
+  const llvm::DataLayout &layout = module->getDataLayout();
+  std::vector<StackFrameAddressValue> integerAddresses;
+  std::vector<StackFrameAddressValue> pointerAddresses;
+  std::optional<int64_t> low;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &instruction : block) {
+      auto *pointer = llvm::dyn_cast<llvm::IntToPtrInst>(&instruction);
+      if (pointer == nullptr) {
+        continue;
+      }
+      std::optional<NativeStackAddress> address =
+          addresses.addressForPointer(pointer);
+      if (!address ||
+          address->Kind != NativeStackAddressKind::EntryStackPointer ||
+          address->Offset >= 0) {
+        continue;
+      }
+
+      bool localOnly = !pointer->use_empty();
+      for (llvm::User *user : pointer->users()) {
+        auto *memory = llvm::dyn_cast<llvm::Instruction>(user);
+        bool isPointerOperand =
+            (memory != nullptr && llvm::isa<llvm::LoadInst>(memory) &&
+             llvm::cast<llvm::LoadInst>(memory)->getPointerOperand() ==
+                 pointer) ||
+            (memory != nullptr && llvm::isa<llvm::StoreInst>(memory) &&
+             llvm::cast<llvm::StoreInst>(memory)->getPointerOperand() ==
+                 pointer);
+        std::optional<uint64_t> size = memory == nullptr
+                                           ? std::nullopt
+                                           : memoryAccessSize(layout, *memory);
+        uint64_t bytesBelowEntry =
+            static_cast<uint64_t>(-(address->Offset + 1)) + 1;
+        if (!isPointerOperand || !size || *size == 0 ||
+            *size > bytesBelowEntry) {
+          localOnly = false;
+          break;
+        }
+      }
+      if (!localOnly) {
+        continue;
+      }
+      pointerAddresses.push_back({pointer, address->Offset});
+      low = low ? std::min(*low, address->Offset) : address->Offset;
+    }
+  }
+  for (llvm::Instruction &instruction : llvm::instructions(function)) {
+    if (!instruction.getType()->isIntegerTy()) {
+      continue;
+    }
+    std::optional<NativeStackAddress> address =
+        addresses.addressForIntegerValue(&instruction);
+    if (!address ||
+        address->Kind != NativeStackAddressKind::EntryStackPointer ||
+        address->Offset >= 0) {
+      continue;
+    }
+    std::set<llvm::Value *> seen;
+    if (valueFeedsStackPointerStore(instruction, *stackPointer, seen)) {
+      continue;
+    }
+    seen.clear();
+    if (valueFeedsEntryStackInput(instruction, addresses, seen)) {
+      continue;
+    }
+    integerAddresses.push_back({&instruction, address->Offset});
+    low = low ? std::min(*low, address->Offset) : address->Offset;
+  }
+  if (!low || (pointerAddresses.empty() && integerAddresses.empty())) {
+    return false;
+  }
+
+  if (storage == nullptr) {
+    uint64_t frameSize = static_cast<uint64_t>(-*low);
+    if (frameSize >
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+      return false;
+    }
+    llvm::IRBuilder<> entryBuilder(&function.getEntryBlock(),
+                                   function.getEntryBlock().begin());
+    auto *byteType = llvm::Type::getInt8Ty(function.getContext());
+    auto *arrayType = llvm::ArrayType::get(byteType, frameSize);
+    storage =
+        entryBuilder.CreateAlloca(arrayType, nullptr, "notdec_stack.native");
+    storage->setAlignment(llvm::Align(16));
+    frameLow = *low;
+  } else if (*low < frameLow) {
+    // The existing alloca does not cover the full native range.  Extending it
+    // would require rewriting every old user; stay conservative instead of
+    // creating a second, non-aliasing alloca.
+    return false;
+  }
+
+  // Every frame-derived value lives in one cluster directly after the alloca.
+  // The rewrite runs twice in one pipeline (the early rewrite and the late
+  // cleanup) and the second run reuses the slot GEPs of the first one, so a
+  // reused GEP is moved back into the cluster: the values created below are
+  // inserted there as well, and a reused pointer that stayed at its old, later
+  // position would be used before its definition by the new ptrtoint.
+  llvm::Instruction *clusterTail = storage;
+  std::map<int64_t, llvm::Value *> stackPointers;
+  std::map<std::pair<int64_t, llvm::Type *>, llvm::Value *> stackIntegers;
+  if (existingFrame.Storage != nullptr) {
+    // Reuse existing GEPs for already-localized offsets so a late cleanup pass
+    // keeps aliasing the same alloca slot instead of cloning an equivalent
+    // pointer with a different identity.
+    for (llvm::User *user : storage->users()) {
+      auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user);
+      if (gep == nullptr || gep->getPointerOperand() != storage) {
+        continue;
+      }
+      llvm::APInt byteOffset(
+          layout.getIndexSizeInBits(gep->getPointerAddressSpace()), 0);
+      if (!gep->accumulateConstantOffset(layout, byteOffset)) {
+        continue;
+      }
+      int64_t nativeOffset =
+          frameLow + static_cast<int64_t>(byteOffset.getSExtValue());
+      if (!stackPointers.emplace(nativeOffset, gep).second) {
+        continue;
+      }
+      gep->moveAfter(clusterTail);
+      clusterTail = gep;
+    }
+  }
+  llvm::IRBuilder<> stackValueBuilder(storage->getParent(),
+                                      std::next(clusterTail->getIterator()));
+  auto stackPointerForOffset = [&](int64_t offset) -> llvm::Value * {
+    auto found = stackPointers.find(offset);
+    if (found != stackPointers.end()) {
+      return found->second;
+    }
+    llvm::Value *pointer = createStackFramePointer(
+        stackValueBuilder, *storage, frameLow, offset,
+        "notdec_stack.native.ptr");
+    stackPointers[offset] = pointer;
+    return pointer;
+  };
+  auto stackIntegerForOffset = [&](int64_t offset,
+                                   llvm::Type *integerType) -> llvm::Value * {
+    auto key = std::make_pair(offset, integerType);
+    auto found = stackIntegers.find(key);
+    if (found != stackIntegers.end()) {
+      return found->second;
+    }
+    llvm::Value *integer = stackValueBuilder.CreatePtrToInt(
+        stackPointerForOffset(offset), integerType, "notdec_stack.native.int");
+    stackIntegers[key] = integer;
+    return integer;
+  };
+  uint64_t rewritten = 0;
+  for (const StackFrameAddressValue &address : pointerAddresses) {
+    if (address.Instruction->getParent() == nullptr) {
+      continue;
+    }
+    llvm::Value *localPointer = stackPointerForOffset(address.Offset);
+    address.Instruction->replaceAllUsesWith(localPointer);
+    ++rewritten;
+  }
+
+  for (const StackFrameAddressValue &address : integerAddresses) {
+    if (address.Instruction->getParent() == nullptr ||
+        address.Instruction->use_empty()) {
+      continue;
+    }
+    llvm::Value *localInteger =
+        stackIntegerForOffset(address.Offset, address.Instruction->getType());
+    address.Instruction->replaceAllUsesWith(localInteger);
+    ++rewritten;
+  }
+
+  for (const StackFrameAddressValue &address : pointerAddresses) {
+    if (address.Instruction->getParent() != nullptr &&
+        address.Instruction->use_empty()) {
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(address.Instruction);
+    }
+  }
+  for (const StackFrameAddressValue &address : integerAddresses) {
+    if (address.Instruction->getParent() != nullptr &&
+        address.Instruction->use_empty()) {
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(address.Instruction);
+    }
+  }
+  if (rewritten == 0) {
+    if (storage->use_empty()) {
+      storage->eraseFromParent();
+    }
+    return false;
+  }
+  attachNativeFrameKeepAlive(function, *storage);
+  summary.AccessesRewritten += rewritten;
+  return true;
+}
+
+void eraseInstructionOnly(llvm::Instruction &inst) { inst.eraseFromParent(); }
+
+bool stackAllocaPointer(llvm::Value *value) {
+  value = value->stripPointerCasts();
+  auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(value);
+  if (alloca != nullptr) {
+    return alloca->hasName() &&
+           alloca->getName().starts_with("notdec_stack.native");
+  }
+  auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value);
+  return gep != nullptr && stackAllocaPointer(gep->getPointerOperand());
+}
+
+llvm::AllocaInst *stackAllocaBase(llvm::Value *value) {
+  value = value->stripPointerCasts();
+  if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(value)) {
+    if (alloca->hasName() &&
+        alloca->getName().starts_with("notdec_stack.native")) {
+      return alloca;
+    }
+    return nullptr;
+  }
+  if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value)) {
+    return stackAllocaBase(gep->getPointerOperand());
+  }
+  return nullptr;
+}
+
+bool constantCarriesFunctionAddress(llvm::Constant *constant) {
+  if (constant == nullptr) {
+    return false;
+  }
+  if (auto *expression = llvm::dyn_cast<llvm::ConstantExpr>(constant)) {
+    if (expression->getOpcode() == llvm::Instruction::PtrToInt &&
+        expression->getNumOperands() == 1 &&
+        llvm::isa<llvm::Function>(expression->getOperand(0))) {
+      return true;
+    }
+    for (const llvm::Use &operand : expression->operands()) {
+      if (constantCarriesFunctionAddress(
+              llvm::dyn_cast<llvm::Constant>(operand.get()))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Register state that only lives in the register model: entry-state reads, call
+// clobbers, partial reads, and the bit manipulation that rebuilds them.  Such a
+// value is a spill when stored into the frame, not frame content, so it keeps
+// the plain "dead unless locally loaded" rule even in an escaped frame.
+// Anything else (function addresses, memory loads, arguments, real call
+// results) is observable by a callee and must be kept.
+bool valueIsRegisterSpill(llvm::Value *value, unsigned depth = 0) {
+  if (value == nullptr || depth > 8) {
+    return false;
+  }
+  if (llvm::isa<llvm::Argument>(value)) {
+    return false;
+  }
+  if (auto *constant = llvm::dyn_cast<llvm::Constant>(value)) {
+    return false;
+  }
+  if (auto *load = llvm::dyn_cast<llvm::LoadInst>(value)) {
+    auto *global = llvm::dyn_cast<llvm::GlobalVariable>(
+        load->getPointerOperand()->stripPointerCasts());
+    return global != nullptr && global->hasMetadata("notdec.register");
+  }
+  if (auto *call = llvm::dyn_cast<llvm::CallBase>(value)) {
+    llvm::Function *callee = call->getCalledFunction();
+    if (callee == nullptr) {
+      return false;
+    }
+    llvm::StringRef name = callee->getName();
+    return name.starts_with("notdec.register.") ||
+           name.starts_with("notdec.reg.") ||
+           name.starts_with("notdec.partial_read.") ||
+           name.starts_with("notdec.partial_write.") ||
+           name.starts_with("notdec.unknown.");
+  }
+  if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+    bool sawRegister = false;
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      if (llvm::isa<llvm::Constant>(incoming)) {
+        continue;
+      }
+      if (!valueIsRegisterSpill(incoming, depth + 1)) {
+        return false;
+      }
+      sawRegister = true;
+    }
+    return sawRegister;
+  }
+  auto *op = llvm::dyn_cast<llvm::Operator>(value);
+  if (op == nullptr) {
+    return false;
+  }
+  switch (op->getOpcode()) {
+  case llvm::Instruction::Add:
+  case llvm::Instruction::Sub:
+  case llvm::Instruction::And:
+  case llvm::Instruction::Or:
+  case llvm::Instruction::Xor:
+  case llvm::Instruction::Shl:
+  case llvm::Instruction::LShr:
+  case llvm::Instruction::AShr:
+  case llvm::Instruction::Select:
+  case llvm::Instruction::ZExt:
+  case llvm::Instruction::SExt:
+  case llvm::Instruction::Trunc:
+  case llvm::Instruction::BitCast:
+  case llvm::Instruction::GetElementPtr: {
+    bool sawRegister = false;
+    for (const llvm::Use &operand : op->operands()) {
+      auto *constant = llvm::dyn_cast<llvm::Constant>(operand.get());
+      if (constant != nullptr) {
+        if (constantCarriesFunctionAddress(constant)) {
+          return false;
+        }
+        continue;
+      }
+      if (!valueIsRegisterSpill(operand.get(), depth + 1)) {
+        return false;
+      }
+      sawRegister = true;
+    }
+    return sawRegister;
+  }
+  default:
+    return false;
+  }
+}
+
+// A native frame whose address is used for anything other than memory accesses
+// and pointer arithmetic can be read or written by a callee, so none of its
+// stores are provably dead.  The escape set is object (alloca) level: passing
+// one field of the frame by pointer makes the whole object address-taken.
+std::set<llvm::AllocaInst *>
+collectEscapedStackAllocas(llvm::Function &function) {
+  std::set<llvm::AllocaInst *> escaped;
+  for (llvm::Instruction &inst : llvm::instructions(function)) {
+    for (llvm::Use &operand : inst.operands()) {
+      llvm::Value *value = operand.get();
+      llvm::AllocaInst *alloca = stackAllocaBase(value);
+      if (alloca == nullptr) {
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (load->getPointerOperand() == value) {
+          continue;
+        }
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        if (store->getPointerOperand() == value) {
+          continue;
+        }
+      }
+      if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(&inst)) {
+        if (gep->getPointerOperand() == value) {
+          continue;
+        }
+      }
+      // Only pointer-preserving casts stay inside the object.  PtrToIntInst is
+      // also a CastInst, and converting the frame address to an integer is a
+      // real escape (it may be handed to a callee or stored).
+      if (auto *cast = llvm::dyn_cast<llvm::BitCastInst>(&inst)) {
+        if (cast->getOperand(0) == value) {
+          continue;
+        }
+      }
+      if (auto *cast = llvm::dyn_cast<llvm::AddrSpaceCastInst>(&inst)) {
+        if (cast->getOperand(0) == value) {
+          continue;
+        }
+      }
+      escaped.insert(alloca);
+    }
+  }
+  return escaped;
+}
+
+bool stackAllocaStoreIsLoaded(llvm::StoreInst &store,
+                              const std::vector<llvm::LoadInst *> &loads) {
+  llvm::Value *storePointer = store.getPointerOperand()->stripPointerCasts();
+  for (llvm::LoadInst *load : loads) {
+    if (load->getPointerOperand()->stripPointerCasts() == storePointer) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void cleanupStackAllocaAccesses(llvm::Function &function,
+                                NativeStackFrameCleanupSummary &summary) {
+  const std::set<llvm::AllocaInst *> escaped = collectEscapedStackAllocas(function);
+  summary.EscapedStackObjects += escaped.size();
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    std::vector<llvm::LoadInst *> stackLoads;
+    std::vector<llvm::StoreInst *> stackStores;
+    std::vector<llvm::AllocaInst *> stackAllocas;
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&inst)) {
+        if (alloca->hasName() &&
+            alloca->getName().starts_with("notdec_stack.native")) {
+          stackAllocas.push_back(alloca);
+        }
+        continue;
+      }
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (stackAllocaPointer(load->getPointerOperand())) {
+          stackLoads.push_back(load);
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        if (stackAllocaPointer(store->getPointerOperand())) {
+          stackStores.push_back(store);
+        }
+      }
+    }
+
+    for (llvm::LoadInst *load : stackLoads) {
+      if (load->getParent() != nullptr && load->use_empty() &&
+          !load->isVolatile() && !load->isAtomic()) {
+        eraseInstructionOnly(*load);
+        ++summary.StackAllocaLoadsRemoved;
+        changed = true;
+      }
+    }
+    if (changed) {
+      continue;
+    }
+
+    stackLoads.clear();
+    stackStores.clear();
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (stackAllocaPointer(load->getPointerOperand())) {
+          stackLoads.push_back(load);
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        if (stackAllocaPointer(store->getPointerOperand())) {
+          stackStores.push_back(store);
+        }
+      }
+    }
+    for (llvm::StoreInst *store : stackStores) {
+      // An escaped frame can be read by a callee, so its content stores are
+      // never dead.  Pure register spills keep the plain liveness rule: they
+      // are caller/callee register bookkeeping, not frame content.
+      llvm::AllocaInst *alloca = stackAllocaBase(store->getPointerOperand());
+      if (alloca != nullptr && escaped.count(alloca) != 0 &&
+          !valueIsRegisterSpill(store->getValueOperand())) {
+        ++summary.EscapedFrameStoresKept;
+        continue;
+      }
+      if (store->getParent() != nullptr && !store->isVolatile() &&
+          !store->isAtomic() && !stackAllocaStoreIsLoaded(*store, stackLoads)) {
+        eraseInstructionOnly(*store);
+        ++summary.StackAllocaStoresRemoved;
+        changed = true;
+      }
+    }
+
+    for (llvm::AllocaInst *alloca : stackAllocas) {
+      if (alloca->getParent() != nullptr && alloca->use_empty()) {
+        alloca->eraseFromParent();
+        ++summary.StackAllocasRemoved;
+        changed = true;
+      }
+    }
+  }
+}
+
+void cleanupRegisterBookkeeping(llvm::Function &function,
+                                const std::set<std::string> &registers,
+                                NativeStackFrameCleanupSummary &summary) {
+  std::map<llvm::BasicBlock *, std::set<std::string>> liveIn;
+  std::map<llvm::BasicBlock *, std::set<std::string>> liveOut;
+  std::vector<llvm::BasicBlock *> blocks;
+  for (llvm::BasicBlock &block : function) {
+    blocks.push_back(&block);
+  }
+
+  auto transferBlock = [&](llvm::BasicBlock &block,
+                           std::set<std::string> live) {
+    for (auto instIt = block.rbegin(); instIt != block.rend(); ++instIt) {
+      llvm::Instruction &inst = *instIt;
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (!load->use_empty()) {
+          for (const std::string &name : registers) {
+            if (loadReadsRegister(*load, name)) {
+              live.insert(name);
+              break;
+            }
+          }
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        for (const std::string &name : registers) {
+          if (isRegisterAccess(*store, name)) {
+            live.erase(name);
+            break;
+          }
+        }
+      }
+    }
+    return live;
+  };
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (auto blockIt = blocks.rbegin(); blockIt != blocks.rend(); ++blockIt) {
+      llvm::BasicBlock &block = **blockIt;
+      std::set<std::string> out;
+      for (llvm::BasicBlock *succ : llvm::successors(&block)) {
+        auto found = liveIn.find(succ);
+        if (found != liveIn.end()) {
+          out.insert(found->second.begin(), found->second.end());
+        }
+      }
+      std::set<std::string> in = transferBlock(block, out);
+      changed |= liveOut[&block] != out || liveIn[&block] != in;
+      liveOut[&block] = std::move(out);
+      liveIn[&block] = std::move(in);
+    }
+  }
+
+  std::vector<llvm::Instruction *> dead;
+  for (llvm::BasicBlock &block : function) {
+    std::set<std::string> live = liveOut[&block];
+    for (auto instIt = block.rbegin(); instIt != block.rend(); ++instIt) {
+      llvm::Instruction &inst = *instIt;
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        for (const std::string &name : registers) {
+          if (loadReadsRegister(*load, name)) {
+            if (load->use_empty()) {
+              dead.push_back(load);
+            } else {
+              live.insert(name);
+            }
+            break;
+          }
+        }
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        for (const std::string &name : registers) {
+          if (isRegisterAccess(*store, name)) {
+            if (live.count(name) == 0) {
+              dead.push_back(store);
+            } else {
+              live.erase(name);
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  for (llvm::Instruction *inst : dead) {
+    if (inst->getParent() == nullptr) {
+      continue;
+    }
+    if (llvm::isa<llvm::LoadInst>(inst)) {
+      ++summary.RegisterLoadsRemoved;
+    } else if (llvm::isa<llvm::StoreInst>(inst)) {
+      ++summary.RegisterStoresRemoved;
+    }
+    eraseInstructionOnly(*inst);
+  }
+}
+
+} // namespace
+
+NativeStackFrameRewriteSummary
+runNativeStackFrameRewrite(llvm::Module &module,
+                           const NativeStackFrameRewriteOptions &options) {
+  NativeStackFrameRewriteSummary summary;
+  std::optional<NativeAbiSpec> abi = readNativeAbiMetadata(module);
+  if (!abi || abi->StackPointerRegister.empty()) {
+    return summary;
+  }
+
+  summary.StackPointerRegister = abi->StackPointerRegister;
+  summary.IgnoredRegisters.insert(abi->StackPointerRegister);
+  std::vector<std::string> framePointers = framePointerRegisterNames(*abi);
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    ++summary.FunctionsSeen;
+    bool rewritten = false;
+    for (const std::string &framePointer : framePointers) {
+      uint64_t replaced = replaceFramePointerLoads(function, framePointer,
+                                                   abi->StackPointerRegister);
+      if (replaced != 0) {
+        summary.FramePointerLoadsReplaced += replaced;
+        // The replacement is path-sensitive: it only changes loads whose
+        // current value is proven to come from RSP.  The same register may
+        // still carry arguments or ordinary local values elsewhere in this
+        // function or another function, so it cannot be ignored module-wide.
+        rewritten = true;
+      }
+    }
+    if (rewriteFunctionStackAccesses(function, abi->StackPointerRegister,
+                                     summary)) {
+      rewritten = true;
+    }
+    if (rewritten) {
+      ++summary.FunctionsRewritten;
+    }
+  }
+
+  if (options.PrintSummary) {
+    printNativeStackFrameRewriteSummary(summary, llvm::errs());
+  }
+  return summary;
+}
+
+NativeStackFrameCleanupSummary
+runNativeStackFrameCleanup(llvm::Module &module,
+                           const NativeStackFrameCleanupOptions &options) {
+  NativeStackFrameCleanupSummary summary;
+  if (options.Registers.empty()) {
+    return summary;
+  }
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    ++summary.FunctionsSeen;
+    NativeStackFrameRewriteSummary rewriteSummary;
+    for (const std::string &name : options.Registers) {
+      if (isFramePointerRegisterName(name) &&
+          !options.StackPointerRegister.empty()) {
+        rewriteSummary.FramePointerLoadsReplaced += replaceFramePointerLoads(
+            function, name, options.StackPointerRegister);
+      }
+    }
+    if (!options.StackPointerRegister.empty() &&
+        rewriteFunctionStackAccesses(function, options.StackPointerRegister,
+                                     rewriteSummary)) {
+      summary.AccessesRewritten += rewriteSummary.AccessesRewritten;
+    }
+    summary.FramePointerLoadsReplaced +=
+        rewriteSummary.FramePointerLoadsReplaced;
+    cleanupRegisterBookkeeping(function, options.Registers, summary);
+    cleanupStackAllocaAccesses(function, summary);
+    cleanupRegisterBookkeeping(function, options.Registers, summary);
+  }
+  if (options.PrintSummary) {
+    printNativeStackFrameCleanupSummary(summary, llvm::errs());
+  }
+  return summary;
+}
+
+void printNativeStackFrameRewriteSummary(
+    const NativeStackFrameRewriteSummary &summary, llvm::raw_ostream &os) {
+  os << "Native stack frame rewrite: functions=" << summary.FunctionsSeen
+     << " rewritten=" << summary.FunctionsRewritten
+     << " accesses=" << summary.AccessesRewritten
+     << " frame_pointer_loads=" << summary.FramePointerLoadsReplaced
+     << " ignored_registers=";
+  for (const std::string &name : summary.IgnoredRegisters) {
+    os << name << ' ';
+  }
+  os << '\n';
+}
+
+void printNativeStackFrameCleanupSummary(
+    const NativeStackFrameCleanupSummary &summary, llvm::raw_ostream &os) {
+  os << "Native stack frame cleanup: functions=" << summary.FunctionsSeen
+     << " accesses=" << summary.AccessesRewritten
+     << " frame_pointer_loads=" << summary.FramePointerLoadsReplaced
+     << " register_loads=" << summary.RegisterLoadsRemoved
+     << " register_stores=" << summary.RegisterStoresRemoved
+     << " alloca_loads=" << summary.StackAllocaLoadsRemoved
+     << " alloca_stores=" << summary.StackAllocaStoresRemoved
+     << " allocas=" << summary.StackAllocasRemoved
+     << " escaped_objects=" << summary.EscapedStackObjects
+     << " escaped_stores_kept=" << summary.EscapedFrameStoresKept << '\n';
+}
+
+} // namespace notdec::bin2llvm

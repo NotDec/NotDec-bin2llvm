@@ -1,16 +1,16 @@
-#include "notdec-bin2llvm/NativeAbi.h"
-#include "notdec-bin2llvm/NativeExternalPrototype.h"
-#include "notdec-bin2llvm/NativeRegisterPartialRead.h"
-#include "notdec-bin2llvm/NativeRegisterPartialWrite.h"
-#include "notdec-bin2llvm/NativeRegisterValueRange.h"
-#include "notdec-bin2llvm/NativeX87Intrinsic.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterFinalCleanup.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterPreSummaryPeephole.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterPostRewritePeephole.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterSummary.h"
-#include "notdec-bin2llvm/passes/summary/NativeRegisterSummarySSA.h"
-#include "notdec-bin2llvm/passes/summary/NativeStackFrame.h"
-#include "notdec-bin2llvm/passes/summary/NativeVarArgRewrite.h"
+#include "notdec-bin2llvm/abi/NativeAbi.h"
+#include "notdec-bin2llvm/abi/NativeExternalPrototype.h"
+#include "notdec-bin2llvm/intrinsics/NativeRegisterPartialRead.h"
+#include "notdec-bin2llvm/intrinsics/NativeRegisterPartialWrite.h"
+#include "notdec-bin2llvm/intrinsics/NativeRegisterValueRange.h"
+#include "notdec-bin2llvm/intrinsics/NativeX87Intrinsic.h"
+#include "notdec-bin2llvm/passes/register/NativeRegisterFinalCleanup.h"
+#include "notdec-bin2llvm/passes/register/NativeRegisterPreSummaryPeephole.h"
+#include "notdec-bin2llvm/passes/register/NativeRegisterPostRewritePeephole.h"
+#include "notdec-bin2llvm/passes/register/NativeRegisterSummary.h"
+#include "notdec-bin2llvm/passes/register/NativeRegisterElimination.h"
+#include "notdec-bin2llvm/passes/stack/NativeStackFrame.h"
+#include "notdec-bin2llvm/passes/vararg/NativeVarArgRewrite.h"
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallString.h"
@@ -1523,7 +1523,7 @@ bool testPhiIncomingMatchesPredecessors() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "merged");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("branch_merge");
   return expect(summary.LoadsReplaced == 1, "branch load was not replaced") &&
          expect(summary.PhisCreated >= 1, "complete PHI was not created") &&
@@ -1565,7 +1565,7 @@ bool testDuplicatePredecessorEdgesKeepPhiComplete() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "merged");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.LoadsReplaced == 1,
                 "duplicate-edge load was not replaced") &&
          expect(summary.PhisCreated >= 1,
@@ -1655,7 +1655,7 @@ bool testPartialReadLoopPassthroughUsesDominatorTree() {
       {rsi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   builder.CreateRet(result);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   bool hasUnknown = false;
   for (llvm::Instruction &inst : llvm::instructions(*function)) {
     hasUnknown |= isUnknownValueCall(&inst);
@@ -1720,7 +1720,7 @@ bool testX87StackReturnBecomesX86Fp80ReturnSlot() {
   callerBuilder.CreateStore(st0Load, slot);
   callerBuilder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("x87_stack_return");
   bool hasSt0Param = false;
   if (rewritten != nullptr) {
@@ -1782,7 +1782,7 @@ bool testX87Fp80StoreStillFeedsRange() {
   callerBuilder.CreateStore(st0Load, slot);
   callerBuilder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("x87_fp80_store");
   return expect(rewritten != nullptr, "x87 fp80 store function missing") &&
          expect(rewritten->getReturnType()->isX86_FP80Ty(),
@@ -1901,7 +1901,7 @@ bool testX87WindowShiftLoadFollowsRangeState() {
       {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 7)});
   callerBuilder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("x87_window_shift_load");
   if (rewritten == nullptr) {
     return expect(false, "x87 window shift function was removed");
@@ -2002,7 +2002,7 @@ bool testDeadFrameSpillPartialReadCreatesNoEntryParam() {
       {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   callerBuilder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("dead_frame_spill");
   if (rewritten == nullptr) {
     return expect(false, "dead frame spill function was removed");
@@ -2069,7 +2069,7 @@ bool testLiveFrameSpillPartialReadKeepsValue() {
       {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   callerBuilder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("live_frame_spill");
   if (rewritten == nullptr) {
     return expect(false, "live frame spill function was removed");
@@ -2134,7 +2134,7 @@ bool testCalleeSavedRegisterSurvivesInternalCall() {
   callerBuilder.CreateStore(reload, sink);
   callerBuilder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("rbx_caller");
   if (rewritten == nullptr) {
     return expect(false, "callee-saved caller was removed");
@@ -2187,7 +2187,7 @@ bool testDirectionFlagIsZeroAtBoundaries() {
   callerBuilder.CreateStore(afterCall, sink);
   callerBuilder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("df_caller");
   if (rewritten == nullptr) {
     return expect(false, "direction flag caller was removed");
@@ -2233,7 +2233,7 @@ bool testRegisterPointerPhiLoadIsCanonicalized() {
                       registerAccessMetadata(context, "R12"));
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(!hasLoadFromPhiPointer(*function),
                 "register pointer PHI load remained after SummarySSA") &&
          expect(summary.LoadsReplaced >= 1,
@@ -2276,9 +2276,9 @@ bool testUnknownPhiIncomingUsesFrozenPoison() {
   llvm::LoadInst *loaded = loadRegister(builder, r10, "R10", "merged");
   builder.CreateRet(loaded);
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnableResidueRemoval = false;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
 
   bool hasClobberIncoming = false;
   bool hasUndefIncoming = false;
@@ -2342,9 +2342,9 @@ bool testSelfOnlyPhiBecomesOpaqueUnknown() {
   builder.CreateStore(selfLoaded, sinkPointer);
   builder.CreateCondBr(function->getArg(0), unreachableLoop, unreachableLoop);
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnableResidueRemoval = false;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
 
   bool hasSelfLoopUnknown = false;
   for (llvm::Instruction &inst : *unreachableLoop) {
@@ -2397,9 +2397,9 @@ bool testFsOffsetPreservedAcrossExternalCall() {
       loadRegister(builder, fsOffset, "FS_OFFSET", "fs_merged");
   builder.CreateRet(merged);
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnableResidueRemoval = false;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
 
   bool hasZeroFsPhiIncoming = false;
   bool hasFreezeFsPhiIncoming = false;
@@ -2454,7 +2454,7 @@ bool testPreservedCallKeepsPreviousValue() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "after_call");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.LoadsReplaced == 1,
                 "preserved call load not replaced") &&
          expect(summary.DeadLoadsRemoved == 1,
@@ -2488,7 +2488,7 @@ bool testRewrittenExternalCallPreservesUnaffectedRegister() {
   llvm::LoadInst *rbxValue = loadRegister(builder, rbx, "RBX", "rbx.after");
   builder.CreateRet(builder.CreateAdd(raxValue, rbxValue));
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenCaller =
       module.getFunction("rewritten_external_preserves_rbx");
   llvm::Function *rewrittenCallee = module.getFunction("__errno_location");
@@ -2534,7 +2534,7 @@ bool testDemandedReturnCreatesCallValue() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "ret_rax");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   // 第一遍统一生成 clobber 占位，返回槽由签名决定（见
   // logs/20260805-12-native-unify-call-return-plan.md）；这里断言占位
   // 证据存在、返回链把寄存器 load 换掉即可。
@@ -2569,9 +2569,9 @@ bool testExternalReturnUsesRangeCallValue() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "ret_rax");
   builder.CreateRet(loaded);
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnableResidueRemoval = false;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
 
   llvm::Function *rewritten = module.getFunction("external_return_range");
   bool typedExternalReturn = false;
@@ -2622,7 +2622,7 @@ bool testIndirectCallReturnHelperIsRewritten() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "ret_rax");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
 
   bool typedIndirectReturn = false;
   for (llvm::Instruction &inst : llvm::instructions(*caller)) {
@@ -2674,7 +2674,7 @@ bool testIndirectConservativeReturnShapeExcludesRdx() {
   llvm::Value *returnedRdx = loadRegister(builder, rdx, "RDX", "ret_rdx");
   builder.CreateRet(builder.CreateAdd(returnedRax, returnedRdx));
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
 
   bool typedIndirectReturn = false;
   for (llvm::Instruction &inst : llvm::instructions(*caller)) {
@@ -2728,7 +2728,7 @@ bool testIndirectCallInputsUseLocalDefinitionEvidence() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "ret_rax");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
 
   unsigned indirectArgCount = 0;
   bool rebuilt = false;
@@ -2770,7 +2770,7 @@ bool testIntrinsicDoesNotCreateCallValue() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "after_intrinsic");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.LoadsReplaced == 1,
                 "intrinsic-separated load was not replaced") &&
          expect(summary.CallReturnValues == 0,
@@ -2797,7 +2797,7 @@ bool testOverwrittenStoreIsRemoved() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "final_rax");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.LoadsReplaced == 1, "final load was not replaced") &&
          expect(summary.DeadLoadsRemoved == 1,
                 "final replaced load was not removed") &&
@@ -2829,7 +2829,7 @@ bool testCrossBlockDeadStoreIsRemoved() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "final_rax");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.LoadsReplaced == 1,
                 "cross-block final load was not replaced") &&
          expect(summary.DeadStoresRemoved == 2,
@@ -2860,7 +2860,7 @@ bool testAbiInputStoreBeforeCallIsKept() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   bool callRewritten = false;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
@@ -2905,7 +2905,7 @@ bool testI386KnownExternalUsesCspecStackOffset() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction = module.getFunction("i386_stack_known");
   if (!expect(rewrittenFunction != nullptr,
               "i386 stack external caller missing")) {
@@ -2963,7 +2963,7 @@ bool testI386AlignedStackPointerOutgoingArgIsBound() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction =
       module.getFunction("i386_aligned_stack_outgoing");
   llvm::CallInst *rewritten = nullptr;
@@ -3030,7 +3030,7 @@ bool testI386UnknownExternalDoesNotReusePreviousStackArgs() {
   builder.CreateCall(calleeType, second);
   builder.CreateRetVoid();
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction =
       module.getFunction("i386_stack_evidence_lifetime");
   llvm::CallInst *firstCall = nullptr;
@@ -3091,7 +3091,7 @@ bool testI386NativeFrameOutgoingStackArgIsBound() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction =
       module.getFunction("i386_native_frame_outgoing");
   if (!expect(rewrittenFunction != nullptr,
@@ -3147,7 +3147,7 @@ bool testI386NativeFrameLoadDoesNotBecomeStackInput() {
   llvm::LoadInst *localValue = builder.CreateLoad(i32, slot);
   builder.CreateRet(localValue);
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction =
       module.getFunction("i386_native_frame_load");
   return expect(rewrittenFunction != nullptr,
@@ -3197,7 +3197,7 @@ bool testI386NativeFrameOutgoingVarArgPrefixIsBound() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction =
       module.getFunction("i386_native_frame_vararg");
   if (!expect(rewrittenFunction != nullptr,
@@ -3289,7 +3289,7 @@ bool testI386NativeFrameOutgoingFloatVarArgIsWidened() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction =
       module.getFunction("i386_native_frame_float_vararg");
   if (!expect(rewrittenFunction != nullptr,
@@ -3379,7 +3379,7 @@ bool testI386StackPointerSummaryOutgoingVarArgPrefixIsBound() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction =
       module.getFunction("i386_esp_summary_vararg");
   if (!expect(rewrittenFunction != nullptr,
@@ -3453,7 +3453,7 @@ bool testX64KnownExternalUsesCspecStackOverflowOffset() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction = module.getFunction("x64_stack_known");
   if (!expect(rewrittenFunction != nullptr,
               "x64 stack external caller missing")) {
@@ -3519,7 +3519,7 @@ bool testX64AlignedStackPointerOutgoingArgIsBound() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction =
       module.getFunction("x64_aligned_stack_outgoing");
   llvm::CallInst *rewritten = nullptr;
@@ -3593,7 +3593,7 @@ bool testI386InternalStackInputIsRewritten() {
   callerBuilder.CreateStore(result, eaxSink);
   callerBuilder.CreateRetVoid();
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenCallee = module.getFunction("stack_callee");
   llvm::Function *rewrittenCaller = module.getFunction("stack_caller");
   llvm::CallInst *rewrittenCall = nullptr;
@@ -3660,7 +3660,7 @@ bool testTrimmedInternalStackInputDoesNotLeaveBindingWarning() {
   builder.CreateCall(voidType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenCallee =
       module.getFunction("trimmed_stack_input_callee");
   llvm::CallInst *rewrittenCall = nullptr;
@@ -3675,7 +3675,7 @@ bool testTrimmedInternalStackInputDoesNotLeaveBindingWarning() {
   }
   bool hasCallArgWarning = std::any_of(
       summary.Warnings.begin(), summary.Warnings.end(),
-      [](const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning) {
+      [](const notdec::bin2llvm::NativeRegisterEliminationWarning &warning) {
         return warning.CalleeName == "trimmed_stack_input_callee" &&
                warning.Kind == "call_arg";
       });
@@ -3712,10 +3712,10 @@ bool testFinalCallArgClobberWarningIsKept() {
   builder.CreateCall(voidType, freeFn);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   bool hasFinalWarning = false;
   bool hasCollectionWarning = false;
-  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+  for (const notdec::bin2llvm::NativeRegisterEliminationWarning &warning :
        summary.Warnings) {
     if (warning.CalleeName != "free" || warning.Kind != "call_arg") {
       continue;
@@ -3784,7 +3784,7 @@ bool testI386AdjustedEspStackInputIsRewritten() {
   callerBuilder.CreateCall(calleeType, callee);
   callerBuilder.CreateRetVoid();
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenCallee = module.getFunction("adjusted_stack_callee");
   llvm::Function *rewrittenCaller = module.getFunction("adjusted_stack_caller");
   llvm::CallInst *rewrittenCall = nullptr;
@@ -3842,7 +3842,7 @@ bool testI386NegativeEspLoadDoesNotBecomeStackInput() {
   llvm::LoadInst *localValue = builder.CreateLoad(i32, localPointer);
   builder.CreateRet(localValue);
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("negative_esp_local");
   return expect(rewritten != nullptr, "negative ESP local function missing") &&
          expect(rewritten->arg_empty(),
@@ -3879,7 +3879,7 @@ bool testI386AlignedEspLoadDoesNotBecomeStackInput() {
   llvm::LoadInst *localValue = builder.CreateLoad(i32, localPointer);
   builder.CreateRet(localValue);
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("aligned_esp_local");
   return expect(rewritten != nullptr, "aligned ESP local function missing") &&
          expect(rewritten->arg_empty(),
@@ -3916,7 +3916,7 @@ bool testX64AlignedRspLoadDoesNotBecomeStackInput() {
   llvm::LoadInst *localValue = builder.CreateLoad(i64, localPointer);
   builder.CreateRet(localValue);
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("aligned_rsp_local");
   return expect(rewritten != nullptr, "aligned RSP local function missing") &&
          expect(rewritten->arg_empty(),
@@ -3946,7 +3946,7 @@ bool testKnownZeroArgExternalDropsAbiInputs() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::CallInst *call = nullptr;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
@@ -3988,7 +3988,7 @@ bool testKnownZeroArgExternalTypedReturnIsMaterialized() {
   llvm::LoadInst *raxLoad = loadRegister(builder, rax, "RAX", "rax.after");
   builder.CreateRet(raxLoad);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("__ctype_b_loc");
   llvm::CallInst *call = nullptr;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
@@ -4033,7 +4033,7 @@ bool testKnownErrnoLocationReturnIsMaterialized() {
   llvm::LoadInst *raxLoad = loadRegister(builder, rax, "RAX", "rax.after");
   builder.CreateRet(raxLoad);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("__errno_location");
   llvm::CallInst *call = nullptr;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
@@ -4079,7 +4079,7 @@ bool testKnownErrnoLocationReturnUsesI386DataLayout() {
   llvm::LoadInst *eaxLoad = loadRegister(builder, eax, "EAX", "eax.after", 4);
   builder.CreateRet(eaxLoad);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("__errno_location");
   llvm::CallInst *call = nullptr;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
@@ -4131,7 +4131,7 @@ bool testKnownFixedArgExternalTruncatesAbiInputs() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::CallInst *call = nullptr;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
@@ -4180,7 +4180,7 @@ bool testCallArgUsesPartialRangeRead() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   function = module.getFunction("call_arg_partial_range");
   llvm::CallInst *call = nullptr;
   unsigned i64Phis = 0;
@@ -4240,7 +4240,7 @@ bool testDeadFlagStoreBeforeCallIsRemoved() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   (void)summary;
   // 现在这条 store 在 summary 之前的 peephole 就判死删掉了（见
   // NativeRegisterPreSummaryPeephole.cpp 的 dead flag value 一段）；这里只断言最终没有留下
@@ -4276,7 +4276,7 @@ bool testFlagStoreBeforeVolatileCallIsRemoved() {
   llvm::LoadInst *loaded = loadRegister(builder, of, "OF", "of.after");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(countStoresTo(*function, of) == 0,
                 "clobbered flag store before call was not removed") &&
          expect(summary.CallClobberValues >= 1,
@@ -4313,9 +4313,9 @@ bool testPostRewriteInstCombineExposesDeadFlagStore() {
                            llvm::ConstantInt::get(of->getValueType(), 0));
   builder.CreateRet(deadUse);
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnablePostRewriteInstCombine = true;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
   unsigned ofStores = 0;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
@@ -4368,7 +4368,7 @@ bool testKnownFiveArgExternalUsesFiveInputs() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::CallInst *call = nullptr;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
@@ -4744,7 +4744,7 @@ bool testKnownFixedExternalArities() {
     builder.CreateCall(calleeType, callee);
     builder.CreateRetVoid();
 
-    notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+    notdec::bin2llvm::runNativeRegisterElimination(module);
     llvm::CallInst *call = nullptr;
     for (llvm::Instruction &inst : llvm::instructions(function)) {
       if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
@@ -4822,7 +4822,7 @@ bool testKnownVarArgExternalInfersDefinedAbiInputs() {
     builder.CreateCall(calleeType, callee);
     builder.CreateRetVoid();
 
-    auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+    auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
     llvm::CallInst *call = nullptr;
     for (llvm::Instruction &inst : llvm::instructions(function)) {
       if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
@@ -4887,7 +4887,7 @@ bool testKnownVarArgFixedOnlyCallDoesNotReadTail() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenCaller =
       module.getFunction("vararg_fixed_only_caller");
   llvm::CallInst *rewrittenCall = nullptr;
@@ -4957,7 +4957,7 @@ bool testKnownVarArgCallsitesKeepIndependentArities() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenCaller = module.getFunction("vararg_two_calls");
   std::vector<unsigned> arities;
   if (rewrittenCaller != nullptr) {
@@ -5024,7 +5024,7 @@ bool testKnownVarArgDoesNotReuseStaleCallerSavedTail() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenCaller = module.getFunction("vararg_stale_tail");
   std::vector<unsigned> arities;
   if (rewrittenCaller != nullptr) {
@@ -5093,7 +5093,7 @@ bool testKnownVarArgUsesSseCountForFloatTail() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenCaller =
       module.getFunction("vararg_float_tail_caller");
   llvm::CallInst *rewrittenCall = nullptr;
@@ -5147,7 +5147,7 @@ bool testKnownVarArgZeroTailKeepsConstantZero() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
   llvm::Function *rewrittenCaller =
       module.getFunction("vararg_zero_tail_caller");
@@ -5238,7 +5238,7 @@ bool testKnownVarArgUnknownPhiTailUsesPoison() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
   llvm::Function *rewrittenCaller =
       module.getFunction("vararg_unknown_phi_tail_caller");
@@ -5327,7 +5327,7 @@ bool testNonX64VarArgUnknownPhiTailDoesNotUsePoisonHelper() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
   llvm::Function *rewrittenCaller =
       module.getFunction("non_x64_vararg_unknown_tail_caller");
@@ -5411,7 +5411,7 @@ bool testMismatchedDirectCallUseUsesReturnExtract() {
   sum = builder.CreateAdd(sum, rbxLoad);
   builder.CreateRet(sum);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   bool hasStructCall = false;
   bool hasExtractedDirectUse = false;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
@@ -5490,7 +5490,7 @@ bool testKnownExternalUsesSingleIntegerReturn() {
   llvm::LoadInst *rdxLoad = loadRegister(builder, rdx, "RDX", "rdx.after");
   builder.CreateRet(builder.CreateAdd(raxLoad, rdxLoad));
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::CallInst *call = nullptr;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst);
@@ -5551,9 +5551,9 @@ bool testUnknownExternalTreatsRdxAsClobberNotReturn() {
   builder.CreateCall(sinkType, sink, {rdxLoad});
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   bool hasRdxReturnWarning = false;
-  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+  for (const notdec::bin2llvm::NativeRegisterEliminationWarning &warning :
        summary.Warnings) {
     if (warning.RegisterName != "RDX") {
       continue;
@@ -5644,7 +5644,7 @@ bool testUnknownExternalFloatReturnPicksSingleXmmSlot() {
   builder.CreateStore(zmmLoad, zmmSink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenFunction =
       module.getFunction("reads_float_and_rax_after_call");
   llvm::CallInst *call = nullptr;
@@ -5727,8 +5727,8 @@ bool testUnknownExternalClobberArgBecomesUnknown() {
   builder.CreateCall(voidType, second);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  notdec::bin2llvm::runNativeRegisterElimination(module);
+  // runNativeRegisterElimination 会重写签名替换函数对象，旧指针会悬空，
   // 必须按名字重新取。
   llvm::Function *rewritten = module.getFunction("clobber_arg_caller");
   bool secondUsesClobber = false;
@@ -5788,7 +5788,7 @@ bool testInternalReturnDoesNotExposeExternalClobber() {
   builder.CreateStore(rdxResult, sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   bool helperLeft = false;
   for (llvm::Function &function : module) {
     if (function.getName().starts_with("notdec.register.summary_clobber")) {
@@ -5869,9 +5869,9 @@ bool testClobberReturnPhiPreservesMixedPath() {
     llvm::raw_fd_ostream json(jsonFd, true);
     json << R"({"free":{"return":"void","fixed_args":1}})";
   }
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.ExternalPrototypeJsonPath = jsonPath.str().str();
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
   (void)llvm::sys::fs::remove(jsonPath);
   llvm::Function *rewritten =
       module.getFunction("notdec_native_clobber_return_phi");
@@ -5901,7 +5901,7 @@ bool testClobberReturnPhiPreservesMixedPath() {
   }
   bool hasMixedWarning = std::any_of(
       summary.Warnings.begin(), summary.Warnings.end(),
-      [](const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning) {
+      [](const notdec::bin2llvm::NativeRegisterEliminationWarning &warning) {
         return warning.FunctionName == "notdec_native_clobber_return_phi" &&
                warning.RegisterName == "RAX" &&
                warning.Reason == "return_binding_preserved_mixed_clobber";
@@ -5972,10 +5972,10 @@ bool testUnknownExternalArityUsesVarArgTail() {
   builder.SetInsertPoint(done);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("unknown_external_arity");
   bool hasInconsistentArityWarning = false;
-  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+  for (const notdec::bin2llvm::NativeRegisterEliminationWarning &warning :
        summary.Warnings) {
     hasInconsistentArityWarning |=
         warning.CalleeName == "unknown_external_arity" &&
@@ -5995,7 +5995,7 @@ bool testUnknownExternalArityUsesVarArgTail() {
   }
   std::sort(callArities.begin(), callArities.end());
   bool hasVarArgWarning = false;
-  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+  for (const notdec::bin2llvm::NativeRegisterEliminationWarning &warning :
        summary.Warnings) {
     hasVarArgWarning |= warning.CalleeName == "unknown_external_arity" &&
                         warning.Reason == "inferred_unknown_external_vararg";
@@ -6064,7 +6064,7 @@ bool testConsumedScratchRegisterIsNotAnExternalArgument() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("scratch_arity");
   return expect(rewritten != nullptr, "scratch arity callee missing") &&
          expect(rewritten->arg_size() == 3,
@@ -6110,7 +6110,7 @@ bool testFlagOnlyRegisterReadKeepsArgumentArity() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("flag_only_arity");
   return expect(rewritten != nullptr, "flag-only arity callee missing") &&
          expect(rewritten->arg_size() == 4,
@@ -6144,7 +6144,7 @@ bool testIndirectCallWithoutEvidenceHasNoArguments() {
   builder.CreateCall(voidType, targetPointer);
   builder.CreateRetVoid();
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::CallInst *rewrittenCall = nullptr;
   if (llvm::Function *rewritten = module.getFunction("indirect_no_evidence")) {
     for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
@@ -6200,7 +6200,7 @@ bool testPartialEntryMaskDoesNotCreateNarrowParam() {
   builder.CreateStore(value, sink);
   builder.CreateRetVoid();
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("partial_entry_param");
   bool hasR8Param = false;
   if (rewritten != nullptr) {
@@ -6256,7 +6256,7 @@ bool testConsumedRegisterBeforeLaterArgumentKeepsArity() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("middle_arity");
   return expect(rewritten != nullptr, "middle arity callee missing") &&
          expect(rewritten->arg_size() == 6,
@@ -6303,14 +6303,14 @@ bool testExternalPrototypeJsonOverridesInferredArity() {
     json << R"({"json_known_external":{"return":"void","fixed_args":1}})";
   }
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.ExternalPrototypeJsonPath = jsonPath.str().str();
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
   (void)llvm::sys::fs::remove(jsonPath);
 
   llvm::Function *rewritten = module.getFunction("json_known_external");
   bool inferredWarning = false;
-  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+  for (const notdec::bin2llvm::NativeRegisterEliminationWarning &warning :
        summary.Warnings) {
     inferredWarning |= warning.CalleeName == "json_known_external" &&
                        warning.Reason == "inferred_unknown_external_arity";
@@ -6418,11 +6418,11 @@ bool testUnknownExternalArityStopsAtClobberArg() {
   builder.CreateCall(voidType, unknown);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten =
       module.getFunction("unknown_external_clobber_arity");
   bool hasInferredArityWarning = false;
-  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+  for (const notdec::bin2llvm::NativeRegisterEliminationWarning &warning :
        summary.Warnings) {
     hasInferredArityWarning |=
         warning.CalleeName == "unknown_external_clobber_arity" &&
@@ -6508,11 +6508,11 @@ bool testUnknownExternalArityStopsAtPhiClobberArg() {
   builder.CreateCall(voidType, unknown);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten =
       module.getFunction("unknown_external_phi_clobber_arity");
   bool hasInferredArityWarning = false;
-  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+  for (const notdec::bin2llvm::NativeRegisterEliminationWarning &warning :
        summary.Warnings) {
     hasInferredArityWarning |=
         warning.CalleeName == "unknown_external_phi_clobber_arity" &&
@@ -6588,11 +6588,11 @@ bool testUnknownExternalArityCountsExplicitBinaryArg() {
   builder.CreateCall(voidType, unknown);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten =
       module.getFunction("unknown_external_binary_clobber_arity");
   bool hasInferredArityWarning = false;
-  for (const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning :
+  for (const notdec::bin2llvm::NativeRegisterEliminationWarning &warning :
        summary.Warnings) {
     hasInferredArityWarning |=
         warning.CalleeName == "unknown_external_binary_clobber_arity" &&
@@ -6637,7 +6637,7 @@ bool testRecordedCallArgValueSurvivesDeadStoreCleanup() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::CallInst *call = nullptr;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     if (auto *candidate = llvm::dyn_cast<llvm::CallInst>(&inst)) {
@@ -6698,7 +6698,7 @@ bool testInternalSignatureRewriteUsesArgsAndReturn() {
   (void)result;
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("notdec_native_callee");
   llvm::Function *rewrittenCaller = module.getFunction("notdec_native_caller");
   bool callRewritten = false;
@@ -6765,7 +6765,7 @@ bool testAddressTakenInternalFunctionUseFollowsRewrite() {
       slot);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten =
       module.getFunction("notdec_native_address_taken_callee");
   llvm::Function *rewrittenCaller =
@@ -6823,7 +6823,7 @@ bool testInternalSignatureRewriteUsesNonAbiReturn() {
   (void)result;
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten =
       module.getFunction("notdec_native_non_abi_return");
   bool helperLeft = false;
@@ -6911,7 +6911,7 @@ bool testInternalCalleeReturnsCallerSavedRegister() {
     llvm::LLVMContext context;
     llvm::Module module("summary-ssa-internal-caller-saved-return", context);
     llvm::GlobalVariable *rcx = build(context, module);
-    auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+    auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
     llvm::Function *rewritten = module.getFunction("rcx_mixed_callee");
     bool callReturnsRCX = false;
     if (llvm::Function *rewrittenCaller =
@@ -6957,9 +6957,9 @@ bool testInternalCalleeReturnsCallerSavedRegister() {
     llvm::LLVMContext context;
     llvm::Module module("summary-ssa-abi-for-all-caller-saved", context);
     llvm::GlobalVariable *rcx = build(context, module);
-    notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+    notdec::bin2llvm::NativeRegisterEliminationOptions options;
     options.AbiForAllFunctions = true;
-    (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+    (void)notdec::bin2llvm::runNativeRegisterElimination(module, options);
     llvm::Function *rewritten = module.getFunction("rcx_mixed_callee");
     bool externalMarker = false;
     if (rewritten != nullptr) {
@@ -7004,7 +7004,7 @@ bool testInternalSignatureRewriteUsesReadEntryReturnRegisterArg() {
   builder.CreateStore(input, sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten =
       module.getFunction("notdec_native_read_entry_rax");
   unsigned raxLoads = 0;
@@ -7054,7 +7054,7 @@ bool testInternalSignatureRewriteUsesNarrowEntryRangeArg() {
   builder.CreateStore(input, sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten =
       module.getFunction("notdec_native_read_entry_rdi32");
 
@@ -7100,7 +7100,7 @@ bool testInternalSignatureShapeParamKeepsOverwrittenEntryRange() {
                 "RDI");
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten =
       module.getFunction("notdec_native_overwrites_rdi32");
   bool hasUnknownValue = false;
@@ -7152,9 +7152,9 @@ bool testNarrowEntryRangeDoesNotCreateWholeEntryLoad() {
   builder.CreateStore(input, sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
-  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
+  // runNativeRegisterElimination 会重写签名替换函数对象，旧指针会悬空，
   // 必须按名字重新取。
   llvm::Function *rewritten =
       module.getFunction("notdec_native_entry_rdi32_no_full_load");
@@ -7215,7 +7215,7 @@ bool testPostSignatureCleanupRewritesInternalEntryRawLoad() {
   builder.CreateStore(phi, sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten =
       module.getFunction("notdec_native_entry_raw_load");
   unsigned rdiLoads = 0;
@@ -7271,7 +7271,7 @@ bool testInternalSignatureRewriteUsesZmmArgAndReturn() {
   (void)loaded;
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("notdec_native_zmm_callee");
   llvm::Function *rewrittenCaller =
       module.getFunction("notdec_native_zmm_caller");
@@ -7345,7 +7345,7 @@ bool testPreservedZmmEntryIsPassedAsInternalArgument() {
   builder.CreateCall(voidType, leaf);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenLeaf = module.getFunction("notdec_native_zmm_leaf");
   llvm::Function *rewrittenPassthrough =
       module.getFunction("notdec_native_zmm_passthrough");
@@ -7429,7 +7429,7 @@ bool testInternalSignatureRewriteUsesZmmLowLaneReturn() {
   builder.CreateStore(loaded, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten =
       module.getFunction("notdec_native_zmm_low_return");
   llvm::Function *rewrittenCaller =
@@ -7478,7 +7478,7 @@ bool testForeignArgumentInMovedBodyIsReplaced() {
   storeRegister(builder, rax, callee->getArg(0), "RAX");
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("notdec_native_foreign_arg");
   bool hasForeignArgumentOperand = false;
   bool hasForeignInstructionOperand = false;
@@ -7539,7 +7539,7 @@ bool testForeignMappedCallArgumentIsLocalized() {
   builder.CreateCall(voidType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenCaller =
       module.getFunction("notdec_native_foreign_call_arg_caller");
   bool hasForeignCallOperand = false;
@@ -7609,7 +7609,7 @@ bool testInternalCallArgBindingsKeepLaterArgsAfterEntryInput() {
   builder.CreateCall(calleeType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("notdec_native_child");
   llvm::CallInst *call = nullptr;
   if (llvm::Function *rewrittenParent =
@@ -7666,7 +7666,7 @@ bool testInternalSignatureParamsUseAbiOrder() {
   builder.CreateStore(sum, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("notdec_native_param_order");
   std::vector<llvm::StringRef> expected = {"RDI.arg", "RSI.arg", "RDX.arg",
                                            "RCX.arg", "R8.arg",  "R9.arg"};
@@ -7887,7 +7887,7 @@ bool testSummarySSARemovesDeadStackFrameStore() {
   builder.CreateStore(llvm::ConstantInt::get(rsp->getValueType(), 11), slot);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   (void)summary;
   return expect(!hasStoreInstruction(*function),
                 "dead stack-frame store remained in final IR") &&
@@ -7929,7 +7929,7 @@ bool testNativeFrameContentStoreSurvivesSummarySSA() {
       callee, {llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   (void)summary;
   bool hasKeepCall = false;
   bool contentStoreKept = false;
@@ -8164,7 +8164,7 @@ bool testPostSignatureCleanupDropsAbiStoreBeforeUnrewrittenCall() {
   builder.CreateCall(callee, {arg});
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   unsigned rdiStores = 0;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
@@ -8205,7 +8205,7 @@ bool testNoReturnExternalDoesNotCreateSummaryReturn() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "unreachable_rax");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.CallReturnValues == 0,
                 "noreturn external path created a summary return helper") &&
          verifyOk(module, "module failed verifier after noreturn cleanup test");
@@ -8250,9 +8250,9 @@ bool testExternalPrototypeJsonOverlaysDefaultNoReturn() {
     json << R"({"json_known_external":{"return":"void","fixed_args":0}})";
   }
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.ExternalPrototypeJsonPath = jsonPath.str().str();
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
   (void)llvm::sys::fs::remove(jsonPath);
 
   return expect(summary.CallReturnValues == 0,
@@ -8296,7 +8296,7 @@ bool testInternalNoReturnCallFallthroughIsTruncated() {
   llvm::LoadInst *loaded = loadRegister(builder, rax, "RAX", "unreachable_rax");
   builder.CreateRet(loaded);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.CallReturnValues == 0,
                 "internal noreturn call created a summary return helper") &&
          expect(helper->hasFnAttribute(llvm::Attribute::NoReturn),
@@ -8314,7 +8314,7 @@ bool testStackCanaryCheckIsRemoved() {
   llvm::Function *function =
       createStackCanaryCheckFunction(module, 40, false, false);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "stack canary check was not counted as removed") &&
          expect(summary.StackCanaryFailBlocksRemoved == 1,
@@ -8334,7 +8334,7 @@ bool testI386GsStackCanaryCheckIsRemoved() {
   llvm::Function *function = createStackCanaryCheckFunction(
       module, 20, false, false, false, false, "GS_OFFSET", 4);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "i386 GS stack canary check was not counted as removed") &&
          expect(summary.StackCanaryFailBlocksRemoved == 1,
@@ -8380,7 +8380,7 @@ bool testDeadStackCanaryFailThunkIsRemoved() {
     return expect(false, "stack canary fail call was not rewired to thunk");
   }
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "thunk stack canary check was not removed") &&
          expect(summary.StackCanaryFailFunctionsRemoved == 1,
@@ -8400,7 +8400,7 @@ bool testStackCanaryPrologueSaveIsRemoved() {
   llvm::Function *function =
       createStackCanaryCheckFunction(module, 40, false, false, false, true);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "stack canary check with prologue save was not removed") &&
          expect(!hasCallTo(*function, "__stack_chk_fail"),
@@ -8418,7 +8418,7 @@ bool testStackCanaryZextConditionIsRemoved() {
   llvm::Function *function =
       createStackCanaryCheckFunction(module, 40, true, false);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "zext stack canary check was not counted as removed") &&
          expect(!hasCallTo(*function, "__stack_chk_fail"),
@@ -8434,7 +8434,7 @@ bool testStackCanaryMaskedSavedLoadIsRemoved() {
   llvm::Function *function =
       createStackCanaryCheckFunction(module, 40, false, false, true);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "masked saved stack canary check was not counted as removed") &&
          expect(!hasCallTo(*function, "__stack_chk_fail"),
@@ -8452,7 +8452,7 @@ bool testStackCanaryFailSideEffectIsKept() {
   llvm::Function *function =
       createStackCanaryCheckFunction(module, 40, false, true);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 0,
                 "side-effecting fail block was incorrectly removed") &&
          expect(hasCallTo(*function, "__stack_chk_fail"),
@@ -8468,7 +8468,7 @@ bool testStackCanaryWrongFsOffsetIsKept() {
   llvm::Function *function =
       createStackCanaryCheckFunction(module, 32, false, false);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 0,
                 "non-FS:0x28 canary-like check was incorrectly removed") &&
          expect(hasCallTo(*function, "__stack_chk_fail"),
@@ -8482,7 +8482,7 @@ bool testRawRspStackCanaryCheckIsRemovedAfterStackCleanup() {
   attachTestAbi(module);
   llvm::Function *function = createRawRspStackCanaryCheckFunction(module);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "raw RSP stack canary check was not removed") &&
          expect(!hasCallTo(*function, "__stack_chk_fail"),
@@ -8499,7 +8499,7 @@ bool testRawRspZfStackCanaryCheckIsRemoved() {
   attachTestAbi(module);
   llvm::Function *function = createRawRspZfStackCanaryCheckFunction(module);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "raw RSP ZF stack canary check was not removed") &&
          expect(!hasCallTo(*function, "__stack_chk_fail"),
@@ -8518,7 +8518,7 @@ bool testPhiFsBaseStackCanaryCheckIsRemoved() {
   attachTestAbi(module);
   llvm::Function *function = createPhiFsBaseStackCanaryCheckFunction(module);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "PHI FS stack canary check was not removed") &&
          expect(!hasCallTo(*function, "__stack_chk_fail"),
@@ -8535,7 +8535,7 @@ bool testZeroBaseStackCanaryCheckIsKept() {
   attachTestAbi(module);
   llvm::Function *function = createZeroBaseStackCanaryCheckFunction(module);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 0,
                 "zero-base stack canary check was incorrectly removed") &&
          expect(hasCallTo(*function, "__stack_chk_fail"),
@@ -8550,7 +8550,7 @@ bool testSharedFailStackCanaryChecksAreRemoved() {
   attachTestAbi(module);
   llvm::Function *function = createSharedFailStackCanaryCheckFunction(module);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 2,
                 "shared-fail stack canary checks were not removed") &&
          expect(!hasCallTo(*function, "__stack_chk_fail"),
@@ -8566,7 +8566,7 @@ bool testMixedFailPredecessorKeepsNonCanaryFailPath() {
   llvm::Function *function =
       createMixedFailPredecessorStackCanaryCheckFunction(module);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "mixed-fail canary predecessor was not removed") &&
          expect(summary.StackCanaryFailBlocksRemoved == 0,
@@ -8586,7 +8586,7 @@ bool testPhiFsCanaryAddressStackCanaryCheckIsRemoved() {
   llvm::Function *function =
       createPhiFsCanaryAddressStackCanaryCheckFunction(module);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "PHI FS canary address check was not removed") &&
          expect(!hasCallTo(*function, "__stack_chk_fail"),
@@ -8602,7 +8602,7 @@ bool testSelfPhiFsCanaryAddressStackCanaryCheckIsRemoved() {
   llvm::Function *function =
       createSelfPhiFsCanaryAddressStackCanaryCheckFunction(module);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "self-PHI FS canary address check was not removed") &&
          expect(!hasCallTo(*function, "__stack_chk_fail"),
@@ -8618,7 +8618,7 @@ bool testSelfPhiFsBaseStackCanaryCheckIsRemoved() {
   llvm::Function *function =
       createSelfPhiFsBaseStackCanaryCheckFunction(module);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.StackCanaryChecksRemoved == 1,
                 "self-PHI FS base canary check was not removed") &&
          expect(!hasCallTo(*function, "__stack_chk_fail"),
@@ -8671,7 +8671,7 @@ bool testXmmAbiEffectUsesZmmBackingWithoutSignatureReturn() {
   storeRegister(builder, zmm0, builder.CreateOr(keep, low), "ZMM0");
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   unsigned zmmStores = 0;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
@@ -8716,7 +8716,7 @@ bool testUnknownExternalFloatAbiClobberUsesWholeZmm() {
   builder.CreateStore(loaded, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.CallClobberValues >= 1,
                 "float ABI clobber was not modeled") &&
          expect(!moduleHasFunctionNamed(module,
@@ -8767,9 +8767,9 @@ bool testUnknownExternalIntegerClobberUsesRangeCallValue() {
   builder.CreateStore(loaded, sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnableResidueRemoval = false;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
   llvm::Function *rewritten =
       module.getFunction("reads_rdx_after_unknown_external");
 
@@ -8824,7 +8824,7 @@ bool testKnownPowUsesFloatAbiSlots() {
                           llvm::Type::getInt64Ty(context));
   builder.CreateRet(powBits);
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::CallInst *powCall = nullptr;
   unsigned zmmStores = 0;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
@@ -8886,7 +8886,7 @@ bool testKnownUnaryLibmUsesFloatAbiSlots() {
                             llvm::Type::getInt64Ty(context));
     builder.CreateRet(bits);
 
-    auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+    auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
     llvm::CallInst *rewrittenCall = nullptr;
     unsigned zmmStores = 0;
     for (llvm::Instruction &inst : llvm::instructions(function)) {
@@ -8988,7 +8988,7 @@ bool testKnownSqrtlUsesLongDoubleStackAndSt0() {
   builder.CreateStore(result, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewrittenSqrtl = module.getFunction("sqrtl");
   llvm::Function *rewrittenCaller = module.getFunction("sqrtl_caller");
   llvm::CallInst *rewrittenCall = nullptr;
@@ -9016,7 +9016,7 @@ bool testKnownSqrtlUsesLongDoubleStackAndSt0() {
   }
   bool hasSqrtlWarning = std::any_of(
       summary.Warnings.begin(), summary.Warnings.end(),
-      [](const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning) {
+      [](const notdec::bin2llvm::NativeRegisterEliminationWarning &warning) {
         return warning.CalleeName == "sqrtl";
       });
 
@@ -9061,7 +9061,7 @@ bool testPartialKeepHighStoreIsDemandRewritten() {
   storeRegister(builder, rdx, builder.CreateOr(keep, low), "RDX");
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   unsigned rdxLoads = 0;
   unsigned rdxStores = 0;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
@@ -9113,8 +9113,8 @@ bool testPartialWriteHelperIsConsumedBySummarySSA() {
   builder.CreateStore(after, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
+  // runNativeRegisterElimination 会重写签名替换函数对象，旧指针会悬空，
   // 必须按名字重新取。
   llvm::Function *rewritten = module.getFunction("partial_write_readback");
   return expect(summary.LoadsReplaced == 1,
@@ -9160,8 +9160,8 @@ bool testPartialReadHelperIsConsumedBySummarySSA() {
   builder.CreateStore(after, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
+  // runNativeRegisterElimination 会重写签名替换函数对象，旧指针会悬空，
   // 必须按名字重新取。
   llvm::Function *rewritten = module.getFunction("partial_write_then_read");
   return expect(summary.LoadsReplaced == 1,
@@ -9207,8 +9207,8 @@ bool testFullStoreFeedsPartialReadThroughRangeSSA() {
   builder.CreateStore(low, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
+  // runNativeRegisterElimination 会重写签名替换函数对象，旧指针会悬空，
   // 必须按名字重新取。
   llvm::Function *rewritten = module.getFunction("full_store_partial_read");
   return expect(summary.LoadsReplaced >= 1,
@@ -9247,7 +9247,7 @@ bool testDeadPartialReadHelperIsRemovedBySummarySSA() {
       {rdi, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.DeadLoadsRemoved >= 1,
                 "dead partial read helper was not counted") &&
          expect(!hasPartialReadCall(*function),
@@ -9287,7 +9287,7 @@ bool testDeadSummaryCallValueHelperIsRemovedBySummarySSA() {
   builder.CreateStore(live, sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
 
   unsigned helperCalls = 0;
   bool deadCallRemained = false;
@@ -9340,7 +9340,7 @@ bool testConsecutivePartialReadHelpersAreConsumedBySummarySSA() {
   builder.CreateStore(value, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.LoadsReplaced >= 2,
                 "consecutive partial reads were not both replaced") &&
          expect(!hasPartialReadCall(*function),
@@ -9379,7 +9379,7 @@ bool testConsecutivePartialReadXorIsZeroedAfterSummarySSA() {
   builder.CreateStore(value, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   bool hasNonZeroSinkStore = false;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
@@ -9440,7 +9440,7 @@ bool testDuplicatePartialReadXorAfterUnknownCallIsZeroed() {
   builder.CreateStore(value, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   bool hasNonZeroSinkStore = false;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
@@ -9521,8 +9521,8 @@ bool testBranchPartialReadUsesNarrowRangePhi() {
   builder.CreateStore(after, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
+  // runNativeRegisterElimination 会重写签名替换函数对象，旧指针会悬空，
   // 必须按名字重新取。
   llvm::Function *rewritten =
       module.getFunction("branch_partial_read_range_phi");
@@ -9606,7 +9606,7 @@ bool testBranchFullLoadAfterPartialWriteUsesNarrowRangePhi() {
   builder.CreateStore(after, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   unsigned i64Phis = 0;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
@@ -9696,7 +9696,7 @@ bool testLoopPartialWriteUsesNarrowRangePhi() {
   builder.CreateStore(after, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   function = module.getFunction("loop_partial_write_range_phi");
   if (function == nullptr) {
     return expect(false, "loop partial write function missing after rewrite");
@@ -9764,8 +9764,8 @@ bool testDeadPartialWriteUsesRangeLiveness() {
   builder.CreateStore(high, sink);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
-  // runNativeRegisterSummarySSA 会重写签名替换函数对象，旧指针会悬空，
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
+  // runNativeRegisterElimination 会重写签名替换函数对象，旧指针会悬空，
   // 必须按名字重新取。
   llvm::Function *rewritten =
       module.getFunction("dead_partial_write_range_liveness");
@@ -9806,7 +9806,7 @@ bool testFloatCallEffectUsesRangeLiveness() {
       log, {llvm::ConstantFP::get(llvm::Type::getDoubleTy(context), 1.0)});
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   return expect(summary.DeadStoresRemoved >= 1,
                 "dead full ZMM store before float return was not removed") &&
          expect(!hasRegisterStore(*function, "ZMM0"),
@@ -9830,9 +9830,9 @@ bool testPlannerSplitsZmmForFloatAbiSlot() {
   llvm::IRBuilder<> builder(entry);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnableRewrite = false;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
   return expect(summary.RangeSegmentsPlanned >= 2,
                 "float ABI slot did not split backing ZMM range") &&
          expect(summarySsaMetadataUInt(*function, "range_segments_planned") >=
@@ -9880,9 +9880,9 @@ bool testPlannerSplitsRegisterForDemandMask() {
   builder.CreateStore(low, sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnableRewrite = false;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
   return expect(summary.RangeSegmentsPlanned >= 2,
                 "demand mask did not split RAX range") &&
          expect(summarySsaMetadataUInt(*callee, "range_segments_planned") >= 2,
@@ -9943,7 +9943,7 @@ bool testCallArgSlotSpansPlannedRangeSegments() {
   builder.CreateCall(voidType, callee);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   uint64_t callerSegments = 0;
   for (const auto &function : summary.Functions) {
     if (function.FunctionName == "spanning_segments_caller") {
@@ -9966,7 +9966,7 @@ bool testCallArgSlotSpansPlannedRangeSegments() {
   }
   bool missingBinding = std::any_of(
       summary.Warnings.begin(), summary.Warnings.end(),
-      [](const notdec::bin2llvm::NativeRegisterSummarySSAWarning &warning) {
+      [](const notdec::bin2llvm::NativeRegisterEliminationWarning &warning) {
         return warning.CalleeName == "spanning_segments_callee" &&
                llvm::StringRef(warning.Reason) ==
                    "call_arg_rewrite_missing_binding";
@@ -10020,7 +10020,7 @@ bool testPartialWriteHelperNameSurvivesSignatureRewrite() {
        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0)});
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *keptPartialWrite =
       module.getFunction("notdec.partial_write.i64.i8");
 
@@ -10067,7 +10067,7 @@ bool testPartialReadHelperNameSurvivesSignatureRewrite() {
   builder.CreateStore(value, sinkPointer);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *keptPartialRead =
       module.getFunction("notdec.partial_read.i64.i8");
 
@@ -10124,9 +10124,9 @@ bool testRecordedReturnValueSurvivesPartialDemandRewrite() {
   builder.CreateStore(returned, sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnablePostRewriteInstCombine = false;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
   llvm::Function *rewrittenCallee =
       module.getFunction("return_entry_or_partial");
   return expect(summary.FunctionsRewritten >= 1,
@@ -10164,9 +10164,9 @@ bool testPartialDemandPoisonReplacementIsMarked() {
   storeRegister(builder, rdx, builder.CreateOr(keep, low, "merged"), "RDX");
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnablePostRewriteInstCombine = false;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
 
   return expect(summary.PartialDemandMatched >= 1,
                 "partial poison replacement was not applied") &&
@@ -10225,7 +10225,7 @@ bool testPartialDemandKeepsDynamicShiftAmount() {
   builder.SetInsertPoint(fallthrough);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   // 签名重写会换掉 Function 对象，按名字重新取。
   function = module.getFunction("partial_dynamic_shift");
   unsigned shiftCount = 0;
@@ -10320,9 +10320,9 @@ bool testPartialDemandKeepsSameWidthMulOperand() {
   builder.CreateStore(loadRegister(builder, rax, "RAX", "returned"), sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::NativeRegisterSummarySSAOptions options;
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
   options.EnablePostRewriteInstCombine = false;
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module, options);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
   // 签名重写会换掉 Function 对象，按名字重新取。
   llvm::Function *rewritten = module.getFunction("same_width_mul_helper");
   bool sawMul = false;
@@ -10374,7 +10374,7 @@ bool testPartialZmmKeepHighStoreIsDemandRewritten() {
   storeRegister(builder, zmm0, builder.CreateOr(keep, low), "ZMM0");
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   unsigned zmmLoads = 0;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
@@ -10416,7 +10416,7 @@ bool testPartialZmmNakedKeepHighStoreIsDemandRewritten() {
   storeRegister(builder, zmm0, keep, "ZMM0");
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   unsigned zmmLoads = 0;
   unsigned zmmStores = 0;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
@@ -10479,7 +10479,7 @@ bool testPartialZmmDisjointLaneChainIsDemandRewritten() {
   builder.CreateStore(used, slot);
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
   unsigned zmmLoads = 0;
   for (llvm::Instruction &inst : llvm::instructions(function)) {
     if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
@@ -10534,7 +10534,7 @@ bool testPartialDemandKeepsMemoryPointerRegisterAddress() {
   storeRegister(builder, rdx, builder.CreateOr(keep, memoryValue), "RDX");
   builder.CreateRetVoid();
 
-  auto summary = notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module);
 
   llvm::IntToPtrInst *memoryPointer = nullptr;
   for (llvm::Function &rewrittenFunction : module) {
@@ -11080,7 +11080,7 @@ bool testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata() {
   storeRegister(builder, rdi, value, "RDI");
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   bool hadMetadata = functionHasAnyRegisterSummaryMetadata(*function);
   auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
 
@@ -12472,7 +12472,7 @@ bool testStackAdjustmentPushDoesNotCreateEntryParam() {
   builder.CreateRetVoid();
 
   (void)notdec::bin2llvm::runNativeStackFrameRewrite(module);
-  (void)notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("stack_adjustment_push");
   bool hasRcxParam = false;
   if (rewritten != nullptr) {
@@ -12740,7 +12740,7 @@ bool testMixedCallBoundaryAttributesUnknownToCallee() {
   builder.CreateStore(after, sink);
   builder.CreateRetVoid();
 
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *rewritten = module.getFunction("mixed_rdi_caller");
   std::map<std::string, uint64_t> counts =
       notdec::bin2llvm::countRemainingUnknownValues(module);
@@ -13513,7 +13513,7 @@ bool testVarArgPrologueBecomesVaStart() {
   if (!expect(rewritten != nullptr, "vararg function missing after SSA")) {
     return false;
   }
-  notdec::bin2llvm::runNativeRegisterSummarySSA(module);
+  notdec::bin2llvm::runNativeRegisterElimination(module);
   llvm::Function *finalFunction = module.getFunction("native_vararg_wrapper");
   return expect(finalFunction != nullptr, "vararg function lost after SSA") &&
          expect(finalFunction->isVarArg(),

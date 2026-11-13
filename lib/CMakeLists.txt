@@ -1,34 +1,34 @@
 add_library(notdec-bin2llvm-core STATIC
-  NativeAbi.cpp
-  NotDecIntrinsics.cpp
-  NativeRelocationMetadata.cpp
-  NativeFunctionPointerPromotion.cpp
-  NativeExternalPrototype.cpp
-  NativeRegisterPartialRead.cpp
-  NativeX87Intrinsic.cpp
-  NativeRegisterPartialWrite.cpp
-  NativeRegisterValueRange.cpp
-  Pcode.cpp
-  PcodeToLLVM.cpp
-  passes/summary/RegisterModel.cpp
-  passes/summary/NativeStackAddress.cpp
-  passes/summary/NativeStackFrame.cpp
-  passes/summary/NativeVarArgRewrite.cpp
-  passes/summary/NativeStackCanaryCleanup.cpp
-  passes/summary/NativeRegisterSummary.cpp
-  passes/summary/NativeRegisterPreSummaryPeephole.cpp
-  passes/summary/NativeRegisterPostRewritePeephole.cpp
-  passes/summary/NativeRegisterSummarySSA.cpp
-  passes/summary/RegisterEliminationModel.cpp
-  passes/summary/RegisterSignatureSlots.cpp
-  passes/summary/RegisterExternalShapes.cpp
-  passes/summary/RegisterSignatureRewrite.cpp
-  passes/summary/FunctionBuilderCore.cpp
-  passes/summary/FunctionBuilderRanges.cpp
-  passes/summary/FunctionBuilderSsa.cpp
-  passes/summary/FunctionBuilderSignature.cpp
-  passes/summary/NativeRegisterFinalCleanup.cpp
-  RegisterStorage.cpp
+  abi/NativeAbi.cpp
+  abi/NativeExternalPrototype.cpp
+  core/NotDecIntrinsics.cpp
+  core/Pcode.cpp
+  core/PcodeToLLVM.cpp
+  core/RegisterStorage.cpp
+  elf/NativeRelocationMetadata.cpp
+  intrinsics/NativeRegisterPartialRead.cpp
+  intrinsics/NativeRegisterPartialWrite.cpp
+  intrinsics/NativeRegisterValueRange.cpp
+  intrinsics/NativeX87Intrinsic.cpp
+  passes/function-pointer/NativeFunctionPointerPromotion.cpp
+  passes/register/FunctionBuilderCore.cpp
+  passes/register/FunctionBuilderRanges.cpp
+  passes/register/FunctionBuilderSignature.cpp
+  passes/register/FunctionBuilderSsa.cpp
+  passes/register/NativeRegisterElimination.cpp
+  passes/register/NativeRegisterFinalCleanup.cpp
+  passes/register/NativeRegisterPostRewritePeephole.cpp
+  passes/register/NativeRegisterPreSummaryPeephole.cpp
+  passes/register/NativeRegisterSummary.cpp
+  passes/register/RegisterEliminationModel.cpp
+  passes/register/RegisterExternalShapes.cpp
+  passes/register/RegisterModel.cpp
+  passes/register/RegisterSignatureRewrite.cpp
+  passes/register/RegisterSignatureSlots.cpp
+  passes/stack/NativeStackAddress.cpp
+  passes/stack/NativeStackCanaryCleanup.cpp
+  passes/stack/NativeStackFrame.cpp
+  passes/vararg/NativeVarArgRewrite.cpp
 )
 
 target_include_directories(notdec-bin2llvm-core
@@ -45,7 +45,7 @@ target_link_libraries(notdec-bin2llvm-core
 
 if (NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
   add_library(notdec-bin2llvm-sleigh STATIC
-    SleighLift.cpp
+    core/SleighLift.cpp
   )
 
   target_include_directories(notdec-bin2llvm-sleigh
@@ -64,8 +64,8 @@ endif ()
 
 if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
   add_library(notdec-bin2llvm-native STATIC
-    LiefElfLoadImage.cpp
-    NativeAnalysis.cpp
+    discovery/NativeAnalysis.cpp
+    elf/LiefElfLoadImage.cpp
   )
 
   target_include_directories(notdec-bin2llvm-native

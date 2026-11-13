@@ -1,6 +1,6 @@
 #pragma once
 
-#include "notdec-bin2llvm/Pcode.h"
+#include "notdec-bin2llvm/core/Pcode.h"
 
 #include <cstdint>
 #include <filesystem>

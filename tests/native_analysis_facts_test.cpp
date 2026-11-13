@@ -1,4 +1,4 @@
-#include "notdec-bin2llvm/NativeAnalysis.h"
+#include "notdec-bin2llvm/discovery/NativeAnalysis.h"
 
 #include <LIEF/ELF/Binary.hpp>
 #include <LIEF/ELF/Parser.hpp>

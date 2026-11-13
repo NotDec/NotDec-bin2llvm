@@ -1,6 +1,6 @@
 #include "SleighBytes.h"
-#include "notdec-bin2llvm/LiefElfLoadImage.h"
-#include "notdec-bin2llvm/SleighLift.h"
+#include "notdec-bin2llvm/elf/LiefElfLoadImage.h"
+#include "notdec-bin2llvm/core/SleighLift.h"
 
 #include <LIEF/ELF/Binary.hpp>
 #include <LIEF/ELF/Parser.hpp>
