@@ -85,8 +85,19 @@
 | `passes/register/RegisterSummaryRewrite.cpp` | ~430 |
 | `passes/register/RegisterSummarySignature.cpp` | ~400 |
 
-验证：ctest 16/16；x86_64 IR 逐字节相同；i386 指令/metadata 相同，
-`%ST1.clobberNNN` 后缀不同（见下）。
+验证：ctest 16/16；x86_64 IR 逐字节相同；i386 指令与 metadata 内容相同，
+但 `%ST1.clobberNNN` 的数字后缀不同（旧基线 724，当前 727）。
+
+### i386 后缀数字的结论
+
+- 现在输出与构建布局无关：重新链接（改变二进制布局）后逐字节相同；
+  带不带 `--register-ssa-warning-out` / `--summary-json-out` 也相同。
+- 但旧基线里的 `724` 是旧代码按 `std::map<Function*>` / `GlobalVariable*` 的
+  指针顺序创建临时占位时留下的"创建历史计数"，指针顺序本身不可复现；
+  即使把顺序改成 module/创建顺序，历史计数也不会回到 724。
+- 最终 IR 中存活的 `ST1.clobber` 数量两边都是 4；去掉数字后逐字节相同。
+  因此"与旧基线逐字节相同"这个目标不可达；可达且更有意义的目标是
+  "输出确定 + 内容与旧基线相同"，两者都已满足。
 
 ### 确定性修复
 
