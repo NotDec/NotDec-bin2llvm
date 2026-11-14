@@ -452,7 +452,12 @@ bool FunctionBuilder::transferRangeInstruction(llvm::Instruction &inst,
     }
 
     bool countedUnknownCall = false;
-    for (const auto &[global, unit] : Units) {
+    // Register order decides the order of the post-call placeholders created
+    // below (and therefore every generated value name); keep it name-stable
+    // instead of relying on std::map<GlobalVariable*> pointer order.
+    for (const RegisterUnit *unitPtr : unitsInCreationOrder(*Function.getParent(), Units)) {
+      llvm::GlobalVariable *global = unitPtr->Global;
+      const RegisterUnit &unit = *unitPtr;
       CallRegisterEffect effect = callEffect(*call, unit);
       if (effect == CallRegisterEffect::Preserve) {
         continue;

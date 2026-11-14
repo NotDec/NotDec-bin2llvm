@@ -93,6 +93,19 @@ std::vector<const RegisterUnit *> unitsInNameOrder(const RegisterUnitMap &units)
   return ordered;
 }
 
+std::vector<const RegisterUnit *>
+unitsInCreationOrder(const llvm::Module &module, const RegisterUnitMap &units) {
+  std::vector<const RegisterUnit *> ordered;
+  ordered.reserve(units.size());
+  for (const llvm::GlobalVariable &global : module.globals()) {
+    auto it = units.find(const_cast<llvm::GlobalVariable *>(&global));
+    if (it != units.end()) {
+      ordered.push_back(&it->second);
+    }
+  }
+  return ordered;
+}
+
 std::string storageUnitName(const NativeAbiStorage &storage,
                             const RegisterUnitMap &units) {
   // ABI records may mention partial names such as XMM0_Qa while lifting keeps

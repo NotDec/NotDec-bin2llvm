@@ -201,7 +201,7 @@ void FunctionBuilder::planRegisterRanges() {
     // Iterate registers in name order, not std::map<GlobalVariable*> order:
     // PlannedRanges is a vector, and the order in which its segments are later
     // materialized determines every generated value name.
-    for (const RegisterUnit *unitPtr : unitsInNameOrder(Units)) {
+    for (const RegisterUnit *unitPtr : unitsInCreationOrder(*Function.getParent(), Units)) {
       llvm::GlobalVariable *global = unitPtr->Global;
       auto boundariesIt = RangeBoundaries.find(global);
       if (boundariesIt == RangeBoundaries.end()) {

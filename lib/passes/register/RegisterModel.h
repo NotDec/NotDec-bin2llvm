@@ -15,6 +15,7 @@ class GlobalVariable;
 class Instruction;
 class LoadInst;
 class Module;
+class Module;
 class StoreInst;
 } // namespace llvm
 
@@ -42,6 +43,12 @@ RegisterUnitMap collectRegisterUnits(llvm::Module &module);
 // global pointer, so iterating it directly makes emitted metadata depend on
 // heap layout; anything that writes IR or JSON must use this instead.
 std::vector<const RegisterUnit *> unitsInNameOrder(const RegisterUnitMap &units);
+
+// Module global creation order.  The lifter creates register globals in a fixed
+// order, and the original pointer-keyed maps happened to iterate in that order;
+// IR-generation code uses this order so value names stay reproducible.
+std::vector<const RegisterUnit *>
+unitsInCreationOrder(const llvm::Module &module, const RegisterUnitMap &units);
 
 std::string unitName(const llvm::GlobalVariable &global);
 uint64_t unitOffset(const llvm::GlobalVariable &global);
