@@ -198,7 +198,16 @@ void FunctionBuilder::planRegisterRanges() {
     addSummaryDemandRangeBoundaries();
     addCallParamRangeBoundaries();
 
-    for (const auto &[global, boundaries] : RangeBoundaries) {
+    // Iterate registers in name order, not std::map<GlobalVariable*> order:
+    // PlannedRanges is a vector, and the order in which its segments are later
+    // materialized determines every generated value name.
+    for (const RegisterUnit *unitPtr : unitsInNameOrder(Units)) {
+      llvm::GlobalVariable *global = unitPtr->Global;
+      auto boundariesIt = RangeBoundaries.find(global);
+      if (boundariesIt == RangeBoundaries.end()) {
+        continue;
+      }
+      const std::set<uint64_t> &boundaries = boundariesIt->second;
       if (boundaries.size() < 2) {
         continue;
       }

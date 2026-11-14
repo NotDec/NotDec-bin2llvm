@@ -939,7 +939,19 @@ void rewriteSignatureShapes(
   std::map<llvm::Function *, llvm::Function *> replacements;
   std::map<llvm::Function *, const SignatureShape *> rewrittenFunctionShapes;
   std::vector<std::pair<llvm::Function *, SignatureShape>> replacementShapes;
-  for (auto &[function, shape] : state.Shapes) {
+  // state.Shapes is keyed by Function*, so iterating it directly makes the
+  // rewrite order (and therefore every IR value name it creates) depend on
+  // heap layout.  Rewrite in module order instead: that order comes from
+  // lifting and is stable across builds.
+  std::vector<llvm::Function *> orderedFunctions;
+  orderedFunctions.reserve(state.Shapes.size());
+  for (llvm::Function &function : module) {
+    if (state.Shapes.count(&function) != 0) {
+      orderedFunctions.push_back(&function);
+    }
+  }
+  for (llvm::Function *function : orderedFunctions) {
+    SignatureShape &shape = state.Shapes.find(function)->second;
     llvm::FunctionType *newType =
         functionTypeForShape(module.getContext(), shape);
     if (function->getFunctionType() == newType) {

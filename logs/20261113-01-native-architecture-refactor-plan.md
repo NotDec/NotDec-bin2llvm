@@ -53,6 +53,19 @@
 - fortune x86_64 IR：`/tmp/refactor-baseline/x86_64.ll`（3.20–3.24s）。
 - fortune i386 IR：`/tmp/refactor-baseline/i386.ll`。
 
+## 后续（2026-11-14 第二轮）
+
+### 确定性修复
+
+- `rewriteSignatureShapes` 改为按 module function 顺序处理 `state.Shapes`
+  （原来按 `Function*` 的 map 顺序）。
+- `planRegisterRanges` 改为按 `unitsInNameOrder()` 遍历 `RangeBoundaries`
+  （原来按 `GlobalVariable*` 的 map 顺序，决定 `PlannedRanges` 向量顺序，
+  进而决定生成值的名字编号）。
+- 结果：fortune x86_64 / i386 的 IR 与重构前基线**逐字节相同**，且与
+  `--register-ssa-warning-out` / `--summary-json-out` 是否出现无关；
+  重新链接（改变二进制布局）后仍然一致。
+
 ## 完成情况（2026-11-14）
 
 - P0–P6 全部完成，共 8 个提交。
