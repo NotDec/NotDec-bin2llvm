@@ -5,6 +5,11 @@ add_library(notdec-bin2llvm-core STATIC
   core/NotDecIntrinsics.cpp
   core/Pcode.cpp
   core/PcodeToLLVM.cpp
+  core/PcodeToLLVMSupport.cpp
+  core/PcodeLowererCore.cpp
+  core/PcodeLowererX87.cpp
+  core/PcodeLowererCfg.cpp
+  core/PcodeLowererOps.cpp
   core/RegisterStorage.cpp
   elf/NativeRelocationMetadata.cpp
   intrinsics/NativeRegisterPartialRead.cpp
@@ -21,6 +26,12 @@ add_library(notdec-bin2llvm-core STATIC
   passes/register/NativeRegisterPostRewritePeephole.cpp
   passes/register/NativeRegisterPreSummaryPeephole.cpp
   passes/register/NativeRegisterSummary.cpp
+  passes/register/RegisterSummarySupport.cpp
+  passes/register/RegisterSummaryCore.cpp
+  passes/register/RegisterSummaryFlow.cpp
+  passes/register/RegisterSummaryDemand.cpp
+  passes/register/RegisterSummaryRewrite.cpp
+  passes/register/RegisterSummarySignature.cpp
   passes/register/RegisterEliminationModel.cpp
   passes/register/RegisterExternalShapes.cpp
   passes/register/RegisterModel.cpp

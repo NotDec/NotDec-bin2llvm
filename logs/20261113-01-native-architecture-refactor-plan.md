@@ -55,6 +55,39 @@
 
 ## 后续（2026-11-14 第二轮）
 
+### 拆分 PcodeToLLVM（4553 行）
+
+`class PcodeLowerer` 144 个方法改为 out-of-line：
+
+| 文件 | 行数 |
+|---|---|
+| `core/PcodeToLLVM.cpp` | 91（appendPcodeFunction / buildPcodeModule） |
+| `core/PcodeToLLVMInternal.h` | 590 |
+| `core/PcodeToLLVMSupport.cpp` | 266 |
+| `core/PcodeLowererCore.cpp` | 687 |
+| `core/PcodeLowererX87.cpp` | 1222 |
+| `core/PcodeLowererCfg.cpp` | 884 |
+| `core/PcodeLowererOps.cpp` | 1197 |
+
+### 拆分 NativeRegisterSummary（3160 行）
+
+`class Analyzer` 58 个方法改为 out-of-line；summary 的 `AbiFacts` 改名
+`SummaryAbiFacts` 避免与消除 pass 的同名类型冲突：
+
+| 文件 | 行数 |
+|---|---|
+| `passes/register/NativeRegisterSummary.cpp` | 34（入口） |
+| `passes/register/RegisterSummaryInternal.h` | ~510 |
+| `passes/register/RegisterSummarySupport.cpp` | ~300 |
+| `passes/register/RegisterSummaryCore.cpp` | ~400 |
+| `passes/register/RegisterSummaryFlow.cpp` | ~400 |
+| `passes/register/RegisterSummaryDemand.cpp` | ~380 |
+| `passes/register/RegisterSummaryRewrite.cpp` | ~430 |
+| `passes/register/RegisterSummarySignature.cpp` | ~400 |
+
+验证：ctest 16/16；x86_64 IR 逐字节相同；i386 指令/metadata 相同，
+`%ST1.clobberNNN` 后缀不同（见下）。
+
 ### 确定性修复
 
 - `rewriteSignatureShapes` 改为按 module function 顺序处理 `state.Shapes`
