@@ -505,3 +505,37 @@ low-64 直接塞给 `sdiv/srem` 的操作数；`or disjoint` 再按 lane 拆分�
    `return_binding_uses_clobber_value`（间接调用返回槽），217 个是
    `range_return_rewrite_missing_value`（外部 callee 的返回槽），与间接调用收敛
    是同一件事。
+
+## 13. 第 5 轮：控制流条件不再允许 poison
+
+### 13.1 动机
+
+上一轮刻画的 3 个 `br i1 poison` 会让**整个函数**成为 UB（LLVM 可以把 poison
+细化成任意值），比“值未知”严重得多。它们的根因（phi/covered-range 把死值回流到
+条件）还需要逐例分析，但“条件未知”本身可以先用不透明调用表示，符合 AGENTS 的
+“unknown 用 `notdec.unknown.*`”准则。
+
+### 13.2 改动
+
+`NativeRegisterFinalCleanup` 新增 `replacePoisonControlFlowConditions(module)`：
+
+- 扫 `br`（条件分支）和 `switch`；条件是 `PoisonValue` 时，在指令前插入
+  `call i1 @notdec.unknown.i1()`，挂
+  `!notdec.unknown.source`（`reason=poison_control_flow_condition`,
+  `register=condition`, `kind=branch`），替换条件。
+- 统计进 `PoisonControlFlowConditionsReplaced`；pipeline 的 final-cleanup stage
+  在计数非 0 时打印
+  `Native final cleanup: poison control-flow conditions replaced=N`。
+- **值层面的 poison 不动**，仍作为 demand 分析缺口的信号；只保证控制流不再
+  直接依赖 poison。
+- 新增单测 `testFinalCleanupReplacesPoisonBranchCondition`。
+
+### 13.3 验证（hexx64.so 全量，7257 函数、0 skip）
+
+- 最终 IR：`br i1 poison` 3 → **0**；出现 3 条
+  `!notdec.unknown.source`（reason=poison_control_flow_condition，分别对应
+  FUN_19e440 / FUN_20c910 / FUN_2ca720）。
+- `llvm-as` + `opt -passes=verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
+- 已知边界：如果 poison 条件在 final cleanup **之前**就被 InstCombine/SimplifyCFG
+  折掉（小函数里很常见），这个兜底看不到它；hexx64 这 3 条都是活到最后的。
+  更根本的修法仍是逐例补 phi/covered-range 的 demand 规则。

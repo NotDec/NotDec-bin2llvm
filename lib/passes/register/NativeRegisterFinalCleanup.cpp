@@ -4,6 +4,10 @@
 #include "notdec-bin2llvm/intrinsics/NativeRegisterPartialWrite.h"
 #include "notdec-bin2llvm/intrinsics/NativeRegisterValueRange.h"
 
+#include "core/NotDecIntrinsics.h"
+
+#include "RegisterEliminationInternal.h"
+
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -198,6 +202,46 @@ uint64_t lowerValueRangeHelpers(llvm::Module &module) {
     ++lowered;
   }
   return lowered;
+}
+
+// br/switch 的条件是 poison 时，整个函数都是 UB（poison 可被细化成任意值）。
+// 这里把条件换成不透明的 notdec.unknown.i1() 并保留来源，让"条件未知"变成
+// 良定义的保守行为；值本身的 poison 不动，仍作为 demand 分析缺口的信号。
+uint64_t replacePoisonControlFlowConditions(llvm::Module &module) {
+  uint64_t replaced = 0;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      llvm::Value *condition = nullptr;
+      if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(&inst)) {
+        if (!branch->isConditional()) {
+          continue;
+        }
+        condition = branch->getCondition();
+      } else if (auto *switchInst = llvm::dyn_cast<llvm::SwitchInst>(&inst)) {
+        condition = switchInst->getCondition();
+      } else {
+        continue;
+      }
+      if (!llvm::isa<llvm::PoisonValue>(condition)) {
+        continue;
+      }
+      llvm::IRBuilder<> builder(&inst);
+      llvm::Value *unknown =
+          unknownValueAt(builder, condition->getType(), "poison.condition");
+      attachUnknownValueMetadata(unknown, "poison_control_flow_condition",
+                                 function.getName(), "", "condition", "branch");
+      if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(&inst)) {
+        branch->setCondition(unknown);
+      } else {
+        llvm::cast<llvm::SwitchInst>(&inst)->setCondition(unknown);
+      }
+      ++replaced;
+    }
+  }
+  return replaced;
 }
 
 uint64_t lowerVarArgUnknownHelpers(llvm::Module &module) {
@@ -566,6 +610,8 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   }
   summary.ValueRangeHelpersLowered += lowerValueRangeHelpers(module);
   summary.VarArgUnknownHelpersLowered += lowerVarArgUnknownHelpers(module);
+  summary.PoisonControlFlowConditionsReplaced +=
+      replacePoisonControlFlowConditions(module);
   runLocalDeadCodeCleanup(module);
   summary.DeadUnknownValuesRemoved += eraseDeadUnknownValueCalls(module);
   summary.DeadRegisterReadsRemoved += eraseDeadRegisterReads(module);
@@ -612,6 +658,8 @@ void printNativeRegisterFinalCleanupSummary(
      << " value_range_helpers_lowered=" << summary.ValueRangeHelpersLowered
      << " vararg_unknown_helpers_lowered="
      << summary.VarArgUnknownHelpersLowered
+     << " poison_control_flow_conditions_replaced="
+     << summary.PoisonControlFlowConditionsReplaced
      << " function_metadata_cleared=" << summary.FunctionMetadataCleared
      << " instruction_metadata_cleared=" << summary.InstructionMetadataCleared
      << " remaining_register_accesses=" << summary.RemainingRegisterAccesses

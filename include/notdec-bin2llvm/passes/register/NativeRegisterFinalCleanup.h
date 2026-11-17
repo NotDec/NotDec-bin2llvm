@@ -29,6 +29,9 @@ struct NativeRegisterFinalCleanupSummary {
   uint64_t HelperDeclarationsRemoved = 0;
   uint64_t ValueRangeHelpersLowered = 0;
   uint64_t VarArgUnknownHelpersLowered = 0;
+  // 控制流条件（br/switch）是 poison 时改成 notdec.unknown.i1(): poison 条件
+  // 会让整个函数成为 UB，而这里只是"条件未知"，用不透明调用表示。
+  uint64_t PoisonControlFlowConditionsReplaced = 0;
   uint64_t FunctionMetadataCleared = 0;
   uint64_t InstructionMetadataCleared = 0;
   uint64_t RemainingRegisterAccesses = 0;

@@ -325,7 +325,13 @@ bool runFinalCleanupStage(const NativeStageConfig &Stage,
     Options.RunGlobalDCE = false;
     break;
   }
-  runNativeRegisterFinalCleanup(Context.Module, Options);
+  NativeRegisterFinalCleanupSummary CleanupSummary =
+      runNativeRegisterFinalCleanup(Context.Module, Options);
+  if (CleanupSummary.PoisonControlFlowConditionsReplaced != 0) {
+    llvm::errs() << "Native final cleanup: poison control-flow conditions "
+                    "replaced="
+                 << CleanupSummary.PoisonControlFlowConditionsReplaced << "\n";
+  }
   return true;
 }
 

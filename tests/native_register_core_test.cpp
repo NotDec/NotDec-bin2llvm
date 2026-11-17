@@ -5522,6 +5522,54 @@ bool testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata() {
          verifyOk(module, "module failed verifier after final cleanup test");
 }
 
+bool testFinalCleanupReplacesPoisonBranchCondition() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-poison-condition", context);
+  attachTestAbi(module);
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "poison_condition", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock *taken = llvm::BasicBlock::Create(context, "taken", function);
+  llvm::BasicBlock *other = llvm::BasicBlock::Create(context, "other", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateCondBr(llvm::PoisonValue::get(llvm::Type::getInt1Ty(context)),
+                       taken, other);
+  builder.SetInsertPoint(taken);
+  builder.CreateRetVoid();
+  builder.SetInsertPoint(other);
+  builder.CreateRetVoid();
+
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+  auto *branch =
+      llvm::dyn_cast<llvm::BranchInst>(&function->getEntryBlock().back());
+  llvm::Value *condition =
+      branch != nullptr && branch->isConditional() ? branch->getCondition()
+                                                   : nullptr;
+  auto *unknown = llvm::dyn_cast_or_null<llvm::CallInst>(condition);
+  bool hasSource = false;
+  if (unknown != nullptr) {
+    if (llvm::Function *callee = unknown->getCalledFunction()) {
+      hasSource = callee->getName().starts_with("notdec.unknown.");
+    }
+    hasSource = hasSource &&
+                unknown->getMetadata("notdec.unknown.source") != nullptr;
+  }
+  if (!hasSource) {
+    module.print(llvm::errs(), nullptr);
+  }
+
+  return expect(cleanup.PoisonControlFlowConditionsReplaced >= 1,
+                "poison branch condition was not counted") &&
+         expect(unknown != nullptr,
+                "poison branch condition was not replaced with a call") &&
+         expect(hasSource,
+                "poison branch condition has no attributed unknown helper") &&
+         verifyOk(module, "module failed verifier after poison condition test");
+}
+
 bool testFinalCleanupKeepsMetadataWhenRegisterAccessRemains() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-residue", context);
@@ -6472,6 +6520,7 @@ int main() {
   ok &= testPartialDemandKeepsMemoryPointerRegisterAddress();
   ok &= testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata();
   ok &= testFinalCleanupKeepsMetadataWhenRegisterAccessRemains();
+  ok &= testFinalCleanupReplacesPoisonBranchCondition();
   ok &= testFinalCleanupCountsPartialWriteResidue();
   ok &= testFinalCleanupCountsPartialReadResidue();
   ok &= testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering();
