@@ -389,6 +389,13 @@ public:
   llvm::BasicBlock *blockForNativeTarget(uint64_t address,
                                          std::string &errorMessage);
 
+  // SLEIGH 把 CMOV 一类指令的内部跳转目标写成“指令结束地址”。如果该地址
+  // 后面到块尾的字节不再产生任何 p-code（典型是 nopl 填充），discovery 注册
+  // 不出内部块，lowering 会误报 missing native block。这里把这类目标归一到
+  // 当前 native block 唯一的块尾后继，语义就是“继续执行下一条指令”。
+  std::optional<uint64_t> resolveOrphanBranchTarget(size_t opIndex,
+                                                    uint64_t target) const;
+
   bool isInternalPcodeTarget(size_t blockIndex, llvm::BasicBlock *targetBlock);
 
   bool nativeDirectBranchTarget(size_t blockIndex, uint64_t target,
@@ -550,6 +557,8 @@ private:
   std::unordered_map<std::string, uint64_t> SourceRamByVarnode;
   std::vector<size_t> BlockStarts;
   std::vector<size_t> BlockEnds;
+  // 当前正在 lower 的 native block 地址，只用于把 CFG 失败定位到来源块。
+  std::optional<uint64_t> CurrentNativeBlockAddress;
   std::unordered_map<size_t, uint64_t> NativeBlockAddressForStart;
   std::unordered_map<size_t, uint64_t> NativeParentBlockAddressForStart;
   std::unordered_map<size_t, uint64_t> NativeBlockEndForStart;

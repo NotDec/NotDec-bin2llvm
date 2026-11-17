@@ -48,6 +48,7 @@ bool PcodeLowerer::lower(const PcodeProgram &program, std::string &errorMessage)
       size_t start = BlockStarts[blockIndex];
       size_t end = BlockEnds[blockIndex];
       Builder.SetInsertPoint(BlockForStart[start]);
+      CurrentNativeBlockAddress = blockAddressForIndex(blockIndex);
       X87Depth.reset();
       if (PreciseX87Depth) {
         auto depthIt = X87BlockEntryDepth.find(start);

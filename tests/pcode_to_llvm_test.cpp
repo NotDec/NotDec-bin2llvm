@@ -1311,6 +1311,61 @@ bool testNativeInternalConditionalKeepsSkippedPcode() {
                 "module failed verifier after internal conditional lowering");
 }
 
+// CMOV 这类指令的内部跳转目标可能落在不产生 p-code 的填充上（例如块尾的
+// nopl），目标地址既没有 p-code op 也没有内部块。它语义上等价于继续执行该
+// native block 的唯一后继，不能因此把整个函数判成 CFG 不一致。
+bool testNativeInternalConditionalTargetOnPaddingUsesBlockSuccessor() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  program.Ops.push_back(cbranchOp(0x1000, 0x1001));
+  program.Ops.push_back(copyFromUnknownUniqueOp(0x1000));
+  program.Ops.push_back(returnOp(0x1002));
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "native_internal_conditional_padding";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1002);
+  config.BlockRanges.emplace(0x1002, 0x1003);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{0x1002});
+  config.BlockSuccessors.emplace(0x1002, std::vector<uint64_t>{});
+
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config,
+                                         errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr,
+              "internal conditional padding function is missing")) {
+    return false;
+  }
+
+  bool entryBranchesToBlockEnd = false;
+  bool hasInternalBlock = false;
+  for (llvm::BasicBlock &block : *function) {
+    if (block.getName() == "bb_1000") {
+      auto *branch = llvm::dyn_cast<llvm::BranchInst>(block.getTerminator());
+      if (branch != nullptr && branch->isConditional()) {
+        for (unsigned index = 0; index < branch->getNumSuccessors(); ++index) {
+          entryBranchesToBlockEnd |=
+              branch->getSuccessor(index)->getName() == "bb_1002";
+        }
+      }
+    }
+    hasInternalBlock |= block.getName().starts_with("bb_1000") &&
+                        block.getName() != "bb_1000";
+  }
+
+  return expect(entryBranchesToBlockEnd,
+                "padding target did not fold to the native block successor") &&
+         expect(hasInternalBlock,
+                "padding target dropped the instruction-internal false edge") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after padding target lowering");
+}
+
 bool testNativeInternalConditionalJoinUsesPhiForPartialUniqueDef() {
   llvm::LLVMContext context;
   notdec::bin2llvm::PcodeProgram program;
@@ -3509,6 +3564,7 @@ int main() {
   ok &= testNativeRelativeConditionalRequiresNativeTargetBlock();
   ok &= testNativeConditionalOutsideTrueTargetAllowsFalseOnlySuccessor();
   ok &= testNativeInternalConditionalKeepsSkippedPcode();
+  ok &= testNativeInternalConditionalTargetOnPaddingUsesBlockSuccessor();
   ok &= testNativeInternalConditionalJoinUsesPhiForPartialUniqueDef();
   ok &= testNativeInternalConditionalRequiresTrueSuccessorFact();
   ok &= testNativeConditionalSuccessorsRejectMultipleFalseTargets();

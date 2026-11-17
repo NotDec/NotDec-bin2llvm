@@ -530,9 +530,52 @@ llvm::BasicBlock *PcodeLowerer::blockForNativeTarget(uint64_t address,
     std::ostringstream os;
     os << "native branch target 0x" << std::hex << address
        << " is missing a native block";
+    if (CurrentNativeBlockAddress) {
+      os << " (from block 0x" << *CurrentNativeBlockAddress << ")";
+    }
     errorMessage = os.str();
     return nullptr;
   }
+
+std::optional<uint64_t>
+PcodeLowerer::resolveOrphanBranchTarget(size_t opIndex,
+                                        uint64_t target) const {
+    if (!usesNativeCfg() || CurrentProgramOps == nullptr ||
+        opIndex >= CurrentProgramOps->size()) {
+      return std::nullopt;
+    }
+    std::optional<std::pair<uint64_t, uint64_t>> range =
+        nativeRangeForAddress((*CurrentProgramOps)[opIndex].Address);
+    if (!range) {
+      return std::nullopt;
+    }
+    const uint64_t blockAddress = range->first;
+    const uint64_t blockEnd = range->second;
+    // 只处理落在同一个 native block 内部的指令级目标；跨块目标沿用原有逻辑。
+    if (target <= blockAddress || target >= blockEnd) {
+      return std::nullopt;
+    }
+    if (BlockForAddress.count(target) != 0) {
+      return std::nullopt;
+    }
+    // 目标地址之后到块尾之间只要还有 p-code，就不能当成“落在纯填充上”。
+    for (const PcodeOpView &op : *CurrentProgramOps) {
+      if (op.Address >= target && op.Address < blockEnd) {
+        return std::nullopt;
+      }
+    }
+    // 只有块尾就是唯一后继时，“继续执行”的落点才没有歧义。
+    auto successorsIt = Config.BlockSuccessors.find(blockAddress);
+    if (successorsIt == Config.BlockSuccessors.end() ||
+        successorsIt->second.size() != 1) {
+      return std::nullopt;
+    }
+    const uint64_t successor = successorsIt->second.front();
+    if (successor != blockEnd || BlockForAddress.count(successor) == 0) {
+      return std::nullopt;
+    }
+    return successor;
+}
 
 bool PcodeLowerer::isInternalPcodeTarget(size_t blockIndex, llvm::BasicBlock *targetBlock) {
     if (targetBlock == nullptr || !usesNativeCfg()) {
@@ -561,7 +604,8 @@ bool PcodeLowerer::nativeDirectBranchTarget(size_t blockIndex, uint64_t target,
         targetBlockIt->second != targetBlock) {
       std::ostringstream os;
       os << "native branch target 0x" << std::hex << target
-         << " is missing a native block";
+         << " is missing a native block (from block 0x"
+         << blockAddressForIndex(blockIndex) << ")";
       errorMessage = os.str();
       return false;
     }
@@ -693,6 +737,9 @@ bool PcodeLowerer::lowerTerminator(size_t blockIndex, size_t opIndex, const Pcod
       }
       auto target = directTarget(op, 0);
       if (target) {
+        if (auto resolved = resolveOrphanBranchTarget(opIndex, *target)) {
+          target = *resolved;
+        }
         auto blockIt = BlockForAddress.find(*target);
         if (blockIt == BlockForAddress.end()) {
           auto externalIt = Config.ExternalCallTargets.find(*target);
@@ -749,6 +796,9 @@ bool PcodeLowerer::lowerTerminator(size_t blockIndex, size_t opIndex, const Pcod
       llvm::BasicBlock *trueBlock = nullptr;
       std::optional<uint64_t> trueAddress;
       if (target) {
+        if (auto resolved = resolveOrphanBranchTarget(opIndex, *target)) {
+          target = *resolved;
+        }
         trueAddress = *target;
         if (usesNativeCfg()) {
           if (auto blockIt = BlockForAddress.find(*target);
