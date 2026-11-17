@@ -550,6 +550,75 @@ bool testUnknownUserOpGetsNamedPlaceholder() {
                 "module failed verifier after named userop test");
 }
 
+// ud2/ud1 在 Sleigh 里是 CALLOTHER("invalidInstructionException") + BRANCHIND：
+// BRANCHIND 把 userop 的返回值当作跳转目标。真实语义必然是 trap，不能 lower
+// 成“先调用占位函数、再间接 tail call 它的返回值”。
+bool testInvalidInstructionUserOpLowersToTrap() {
+  llvm::LLVMContext context;
+  notdec::bin2llvm::PcodeProgram program;
+  addX64Registers(program);
+  program.UserOpNames.resize(216);
+  program.UserOpNames[77] = "invalidInstructionException";
+
+  notdec::bin2llvm::PcodeOpView callOther;
+  callOther.Address = 0x1000;
+  callOther.InstructionSize = 2;
+  callOther.Opcode = notdec::bin2llvm::PcodeOpcode::CallOther;
+  callOther.OpcodeName = "CALLOTHER";
+  callOther.Output = uniqueVarnode(0x6c580, 8);
+  callOther.Inputs.push_back(constVarnode(77, 4));
+  program.Ops.push_back(callOther);
+
+  notdec::bin2llvm::PcodeOpView branchInd;
+  branchInd.Address = 0x1000;
+  branchInd.InstructionSize = 2;
+  branchInd.Opcode = notdec::bin2llvm::PcodeOpcode::BranchInd;
+  branchInd.OpcodeName = "BRANCHIND";
+  branchInd.Inputs.push_back(uniqueVarnode(0x6c580, 8));
+  program.Ops.push_back(branchInd);
+
+  notdec::bin2llvm::PcodeLoweringConfig config;
+  config.EntryFunctionName = "invalid_instruction_trap";
+  config.EntryAddress = 0x1000;
+  config.BlockRanges.emplace(0x1000, 0x1002);
+  config.BlockSuccessors.emplace(0x1000, std::vector<uint64_t>{});
+  std::string errorMessage;
+  std::unique_ptr<llvm::Module> module =
+      notdec::bin2llvm::buildPcodeModule(context, program, config, errorMessage);
+  if (!expect(module != nullptr, errorMessage)) {
+    return false;
+  }
+  llvm::Function *function = module->getFunction(config.EntryFunctionName);
+  if (!expect(function != nullptr,
+              "invalid instruction trap function is missing")) {
+    return false;
+  }
+
+  bool hasTrapCall = false;
+  bool hasUnreachable = false;
+  bool hasIndirectCall = false;
+  for (llvm::BasicBlock &block : *function) {
+    for (llvm::Instruction &inst : block) {
+      hasUnreachable |= llvm::isa<llvm::UnreachableInst>(&inst);
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      hasIndirectCall |= callee == nullptr;
+      hasTrapCall |= callee != nullptr && callee->getName() == "llvm.trap";
+    }
+  }
+  return expect(hasTrapCall,
+                "invalid instruction did not lower to llvm.trap") &&
+         expect(hasUnreachable,
+                "invalid instruction did not terminate with unreachable") &&
+         expect(!hasIndirectCall,
+                "invalid instruction still lowered as an indirect call") &&
+         expect(!llvm::verifyModule(*module, &llvm::errs()),
+                "module failed verifier after invalid instruction lowering");
+}
+
 // 没有 userop 名字表时（手工构造的 program / 旧输入）退回编号命名，保证仍然是
 // "一个 userop 一个占位函数"。
 bool testUnknownUserOpWithoutNamesUsesIndex() {
@@ -3603,6 +3672,7 @@ int main() {
   ok &= testWideOnlyRegisterReadStaysWholeRegister();
   ok &= testStaticMemoryWriteIsLiftedAsStore();
   ok &= testUnknownUserOpGetsNamedPlaceholder();
+  ok &= testInvalidInstructionUserOpLowersToTrap();
   ok &= testUnknownUserOpWithoutNamesUsesIndex();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

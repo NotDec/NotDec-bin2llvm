@@ -100,6 +100,13 @@ bool PcodeLowerer::lower(const PcodeProgram &program, std::string &errorMessage)
         if (!lowerOp(op, errorMessage)) {
           return false;
         }
+        // 个别 op 会直接终止控制流（例如 ud2 的 invalidInstructionException
+        // 归一到 llvm.trap + unreachable）。后续 p-code 已经不可达，不能继续
+        // 往同一个块里插指令。
+        if (Builder.GetInsertBlock()->getTerminator() != nullptr) {
+          ended = true;
+          break;
+        }
       }
 
       if (!ended) {

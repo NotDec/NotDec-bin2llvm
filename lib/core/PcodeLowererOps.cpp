@@ -1000,6 +1000,17 @@ void PcodeLowerer::warnUnsupportedUserOp(uint64_t index, const std::string &name
   }
 
 bool PcodeLowerer::lowerCallOther(const PcodeOpView &op, std::string &errorMessage) {
+    // ud2/ud1 在 Sleigh 里编译成 CALLOTHER("invalidInstructionException")
+    // + BRANCHIND：BRANCHIND 把 userop 的返回值当成后续跳转目标。真实语义是
+    // 必然 trap（不返回），不能 lower 成“调用占位函数、再间接 tail call 它”。
+    if (isUserOp(op, "invalidInstructionException", 77)) {
+      llvm::Function *trap = llvm::Intrinsic::getOrInsertDeclaration(
+          &Module, llvm::Intrinsic::trap);
+      Builder.CreateCall(trap);
+      Builder.CreateUnreachable();
+      return true;
+    }
+
     // rdtsc 有现成的 LLVM intrinsic 对应，直接映射。
     if (op.Output && requireInputCount(op, 1, errorMessage) &&
         isUserOp(op, "rdtsc", 77)) {

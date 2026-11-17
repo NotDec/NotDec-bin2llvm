@@ -222,3 +222,56 @@ rebase 到 main 的新 commit `e858f43`（稳定 GTIRB 导入顺序并清理死 
   `llvm-as` + `opt -passes=verify` 通过。
 - 修复后统计：`unknowns=691`、`clobber_placeholders=11019`、
   `local_register_reads=2680`、`boundary_register_reads=204`。
+
+## 8. P5 修复：`ud2` 按 trap 语义 lower
+
+### 8.1 现象与根因
+
+Sleigh 的 x86 `ud2`（以及 `ud1`）不是一条普通指令，而是：
+
+```
+unique = CALLOTHER("invalidInstructionException")   ; userop 77
+BRANCHIND (unique)                                  ; 把 userop 返回值当跳转目标
+```
+
+旧 lowering 先把 CALLOTHER 落成返回 i64 的占位函数，再走 BRANCHIND 的间接
+路径，于是每个 `ud2` 都变成：
+
+```llvm
+%u = call i64 @notdec.register.userop.invalidInstructionException.i64()
+%p = inttoptr i64 %u to ptr
+tail call void %p()
+; 继续返回
+```
+
+更关键的是：hexx64.so 的 `.text` 开头 16 字节是一组**共享 trap stub**
+（0x25a40..0x25a4e），反调试代码会 `if (under_debugger) jne <trap>` 跳过去。
+discovery 把这些 stub 块挂到引用它们的函数上，导致 971 个函数的 IR 里都出现
+这条“假间接调用 + 继续执行”的路径（旧的 979 个 userop 调用点）。
+
+### 8.2 修复
+
+- `lib/core/PcodeLowererOps.cpp`：`lowerCallOther` 一开头识别
+  `invalidInstructionException`（名字匹配，index 77 兜底），直接发
+  `call void @llvm.trap()` + `unreachable`，不再走占位 userop。
+- `lib/core/PcodeLowererCore.cpp`：op lowering 之后若当前块已经有 terminator，
+  立即结束当前块，跳过同一机器块里不可达的后续 P-Code（例如 BRANCHIND）。
+- 新增单测 `testInvalidInstructionUserOpLowersToTrap`：构造
+  CALLOTHER + BRANCHIND，断言产物里是 `llvm.trap` + `unreachable`、没有间接
+  调用、模块通过 verifier。
+
+### 8.3 验证（hexx64.so 全量）
+
+| 指标 | 修复前（native3） | 修复后（native4） |
+|------|------------------|------------------|
+| `invalidInstructionException` 调用点 | 979 | 0 |
+| `llvm.trap` / `unreachable` | 0 / 0 | 1185 / 1207 |
+| `tail call` | 3146 | 2174 |
+| `clobber_placeholders` | 11019 | 8880 |
+| `unknowns` | 691 | 688 |
+| `local_register_reads` | 2680 | 2645 |
+| `boundary_register_reads` | 204 | 198 |
+
+- `_start` 从“userop + 间接尾调用 + 返回未知寄存器”变成干净的
+  `call void @llvm.trap(); unreachable`。
+- 函数数保持 7257，0 条 skip；`llvm-as` + `opt -passes=verify` 通过。
