@@ -794,6 +794,25 @@ std::map<llvm::Value *, llvm::APInt> FunctionBuilder::computePartialDemands() {
 void FunctionBuilder::rewritePartialWrites() {
     UndemandedWalkClean.clear();
     std::map<llvm::Value *, llvm::APInt> demands = computePartialDemands();
+    // rewritePartialReads() 已经跑过：这里还剩的 partial_read 都是解析不掉的读。
+    // 这些读的 demand 在 SSA 上接不到写侧（partial_write 还没落成 insert/store），
+    // 此时若按"零 demand"把写侧 operand 换成 poison，第二遍才能解析到的值就被
+    // 提前毒化了（hexx64 FUN_1456d0 的 sdiv 链：store zext(partial_read) 被下毒，
+    // 第二遍把读替换成 extract poison，分支条件折成 poison）。
+    // 对这些寄存器先跳过下毒，等读侧解析完/下一遍再处理；最坏保留裸读，不产生 UB。
+    std::set<llvm::GlobalVariable *> unresolvedReadGlobals;
+    for (llvm::Instruction &inst : llvm::instructions(Function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      if (std::optional<NativeRegisterPartialReadInfo> read =
+              parseNativeRegisterPartialRead(*call)) {
+        if (read->Global != nullptr) {
+          unresolvedReadGlobals.insert(read->Global);
+        }
+      }
+    }
     std::vector<llvm::StoreInst *> stores;
     std::vector<llvm::CallBase *> partialWrites;
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
@@ -816,6 +835,11 @@ void FunctionBuilder::rewritePartialWrites() {
         continue;
       }
       ++Summary.PartialDemandCandidates;
+      if (access.Unit->Global != nullptr &&
+          unresolvedReadGlobals.count(access.Unit->Global) != 0) {
+        ++Summary.PartialDemandRejected;
+        continue;
+      }
       if (!PostSignatureCleanup &&
           (isRecordedCallArgStore(store) ||
            isRecordedCallArgValue(store->getValueOperand()))) {
@@ -840,6 +864,11 @@ void FunctionBuilder::rewritePartialWrites() {
         continue;
       }
       ++Summary.PartialDemandCandidates;
+      if (partial->Global != nullptr &&
+          unresolvedReadGlobals.count(partial->Global) != 0) {
+        ++Summary.PartialDemandRejected;
+        continue;
+      }
       llvm::SmallPtrSet<llvm::Value *, 16> visiting;
       if (rewriteUndemandedRegisterStoreOperands(partial->Value, demands,
                                                  visiting)) {

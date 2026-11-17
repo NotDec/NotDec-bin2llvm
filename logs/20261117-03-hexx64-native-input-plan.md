@@ -350,3 +350,66 @@ demand 分析的 bug 报告，应该逐个反推根因，而不是把 poison 一
    `testKnownVarArgUnknownPhiTailUsesPoison`，并在 log 里记录取舍。
 3. 每修一类都重跑 fortune x86_64/i386 和 hexx64 全量，对比 poison 计数与
    `unknowns` 不能互相掩盖。
+
+## 10. P4 修复：未解析的 partial_read 不再让写侧提前下毒
+
+### 10.1 根因
+
+`FunctionBuilder::run()` 的第一遍里，`rewritePartialReads()` 先跑、`rewritePartialWrites()`
+后跑，但有些读在第一遍解析不掉：它们读的位是由 `notdec.partial_write` 写的，而这个
+call 要到 `rewritePartialWrites()` 里才落成 `insert`/`store`。于是 demand 链断在
+这个还没替换的读上：
+
+```llvm
+%unique_de00_41509 = load i32, ptr ...          ; 栈上值
+call void @notdec.partial_write.i64.i32(ptr @RAX, i32 %unique_de00_41509, i64 0)
+%EAX1510 = call i32 @notdec.partial_read.i64.i32(ptr @RAX, i64 0)  ; 第一遍解析不掉
+%709 = zext i32 %EAX1510 to i64
+store i64 %709, ptr @RAX                        ; demand=0 → 被换成 poison
+...
+%unique_45880_8 = sdiv ...                      ; 真正的观察者在后面
+icmp ult → br                                   ; 第二遍解析读以后整条链被折掉
+```
+
+`rewritePartialWrites()` 里从 `store` 的 value 往回走，发现 `%709` 零 demand，就按
+"undemanded store operand" 的设计换成 poison；第二遍（`PostSignatureCleanup`）
+把读替换成 `extract(insert(poison, ...))`，InstCombine 再把比较折成
+`br i1 poison`，sdiv 链整个被 DCE 掉。hexx64 的 `FUN_1456d0` 就是这样。
+
+### 10.2 修复
+
+`FunctionBuilder::rewritePartialWrites()` 开头先扫一遍函数里还剩的
+`notdec.partial_read`，收集它们对应的寄存器 global；写侧要下毒时，如果目标
+寄存器还在这个集合里就跳过（把决定推迟到读解析完的下一遍；如果一直解析不掉，
+就保留原值/裸读，而不是 poison）。
+
+定位手段：在 `rewriteUndemandedRegisterStoreOperands` 的替换点临时加
+`NOTDEC_TRACE_POISON=<函数名>` 的 stderr 打印（打出被下毒的指令和 operand），
+全量跑一遍就能看到调用链；验证完已删除。
+
+### 10.3 验证
+
+hexx64.so 全量（7257 函数、0 skip、`llvm-as` + `opt -passes=verify` 通过）：
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| poison 总数 | 4462 | 3461 |
+| 分支条件 poison | 28 | 10 |
+| phi 入边 poison | 346 | 89 |
+| return poison | 7 | 5 |
+| 调用实参 poison | 4026 | 3339 |
+| `unknowns` | 688 | 688 |
+| `notdec.partial_read` | 1471 | 1470 |
+| `local_register_reads` | 2645 | 2641 |
+| `clobber_placeholders` | 8880 | 8902 |
+
+- `FUN_1456d0` 的 `bb_145ed3` 恢复成完整的
+  `call get_tinfo_property → shl/ashr（除数）→ sext（被除数）→ sdiv → 比较`，
+  `br i1 poison` 消失。
+- `ctest` 19/19（含 fortune x86_64/i386）。
+
+### 10.4 剩余 poison
+
+- 3167 个来自 final cleanup 的 `vararg_unknown → poison`（见 9.4，待定表示）。
+- 剩下的 RSP 地址链 poison（`%RSP.entry → add -8 → …`）是"栈地址只写不读"的死值，
+  属于 zero-demand 的正常结果；要确认它们不会经 phi/调用再回流到观察者。
