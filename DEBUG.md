@@ -34,6 +34,37 @@ native discovery 默认读取 DDISASM 生成的 GTIRB facts，并补充 ELF、�
   -passes=verify /tmp/memcached.native.bc -o /tmp/memcached.native.opt.bc
 ```
 
+## 2.1 pipeline 配置（--config）
+
+默认 pipeline 是内置的；要改 pass 顺序/参数、或对单个函数替换 IR 时用 JSON 配置：
+
+```bash
+# 导出当前默认配置（可直接当模板改）
+build/bin/notdec-native-llvm --print-config > /tmp/pipeline.json
+
+build/bin/notdec-native-llvm /path/to/bin --all-confirmed \
+  --config /tmp/pipeline.json -o /tmp/out.ll
+
+# 查 stage 列表和每个 stage 的默认参数
+build/bin/notdec-native-llvm --list-stages
+```
+
+`ir-override` stage 用外部 `.ll`/`.bc` 整函数替换目标函数体：
+
+```json
+{"stage": "ir-override", "options": {
+  "file": "overrides/foo.ll", "select": [{"name": "foo"}]}}
+```
+
+- 相对路径相对配置文件所在目录解析（不相对 CWD）。
+- 被替换的函数挂 `!notdec.override`，带 `--config` 的产物挂 `!notdec.config`（注：新增的命名
+  元数据会让后续 metadata 编号整体后移，diff 时先忽略 `!notdec.*` 编号）。
+- `--dump-stages <dir>` 保存每个 stage 前后的 IR；`--manifest-out <path>` 输出配置与外部文件的
+  sha256 清单。
+- 旧的逐 pass 开关（`--no-instcombine-pass`、`--no-register-ssa-pass`、
+  `--no-summary-register-residue-removal`、`--no-vararg-recovery`、`--abi-for-all-functions`、
+  `--external-prototypes`）已删除，统一走 `--config`。
+
 ## 3. 当前已经跑过的样本
 
 - `memcached limit20`

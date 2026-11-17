@@ -19,6 +19,7 @@ BUILD_DIR="$4"
 
 OUT_DIR="${NOTDEC_NATIVE_FORTUNE_X86_64_OUT_DIR:-$BUILD_DIR/native-fortune-x86_64-regression}"
 PROTO_JSON="$SOURCE_DIR/tests/fixtures/native/fortune-x86_64.external-prototypes.json"
+PIPELINE_JSON="$SOURCE_DIR/tests/fixtures/native/fortune-x86_64.pipeline.json"
 FETCH_FIXTURE="$SOURCE_DIR/scripts/fetch-native-fixture.py"
 RESIDUE_AUDIT="$SOURCE_DIR/scripts/native-register-residue-audit.py"
 
@@ -63,6 +64,7 @@ require_executable "$LLVM_BIN/opt"
 require_executable "$FETCH_FIXTURE"
 require_executable "$RESIDUE_AUDIT"
 require_file "$PROTO_JSON"
+require_file "$PIPELINE_JSON"
 mkdir -p "$OUT_DIR"
 
 set +e
@@ -87,7 +89,7 @@ STDERR_TXT="$OUT_DIR/run.stderr"
   -o "$OUT_LL" \
   --all-confirmed \
   --skip-runtime \
-  --external-prototypes "$PROTO_JSON" \
+  --config "$PIPELINE_JSON" \
   --summary-json-out "$SUMMARY_JSON" \
   --register-ssa-warning-out "$WARNING_TSV" \
   --register-ssa-summary \

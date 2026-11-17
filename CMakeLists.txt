@@ -164,6 +164,36 @@ if (BUILD_TESTING)
       "${NOTDEC_BIN2LLVM_GHIDRA_SOURCE_DIR}/Ghidra/Processors/x86/data/languages/x86-64-gcc.cspec"
   )
 
+  add_executable(native_pipeline_config_test
+    tests/native_pipeline_config_test.cpp
+  )
+
+  target_link_libraries(native_pipeline_config_test
+    PRIVATE
+      notdec-bin2llvm-core
+  )
+
+  add_test(
+    NAME notdec.native_pipeline_config
+    COMMAND
+      native_pipeline_config_test
+  )
+
+  add_executable(native_ir_override_test
+    tests/native_ir_override_test.cpp
+  )
+
+  target_link_libraries(native_ir_override_test
+    PRIVATE
+      notdec-bin2llvm-core
+  )
+
+  add_test(
+    NAME notdec.native_ir_override
+    COMMAND
+      native_ir_override_test
+  )
+
   add_executable(native_register_summary_test
     tests/native_register_summary_test.cpp
   )

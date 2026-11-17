@@ -14,6 +14,7 @@ fi
 
 NATIVE_LLVM="$1"
 FIXTURE_LL="$2"
+CONFIG_JSON="$(cd "$(dirname "$FIXTURE_LL")" && pwd)/cli-no-instcombine.json"
 BUILD_DIR="$3"
 LLVM_BIN="$4"
 
@@ -80,6 +81,7 @@ require_executable "$NATIVE_LLVM"
 require_executable "$LLVM_BIN/llvm-as"
 require_executable "$LLVM_BIN/opt"
 require_file "$FIXTURE_LL"
+require_file "$CONFIG_JSON"
 mkdir -p "$BUILD_DIR"
 
 run_default_summary_rewrite_check() {
@@ -90,7 +92,7 @@ run_default_summary_rewrite_check() {
   local verify_bc="$5"
 
   "$NATIVE_LLVM" "$input_ir" \
-    --no-instcombine-pass \
+    --config "$CONFIG_JSON" \
     -o "$out_ll" \
     2> "$stderr_txt"
 

@@ -20,6 +20,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
@@ -66,21 +67,20 @@ struct CliOptions {
   std::string OutputPath;
   std::string SummaryJsonPath;
   std::string RegisterSSAWarningPath;
-  std::string ExternalPrototypeJsonPath;
+  // 改变 module 的配置全部走 --config；CLI 只负责输入、输出、诊断。
+  std::string ConfigPath;
+  bool HasPrintConfig = false;
+  std::string PrintConfigPath;
+  bool ListStages = false;
+  std::string DumpStagesDir;
+  std::string ManifestPath;
   notdec::bin2llvm::NativeDecodeMode DecodeMode =
       notdec::bin2llvm::NativeDecodeMode::Gtirb;
   notdec::bin2llvm::NativeSleighDecodeOptions DecodeOptions;
   notdec::bin2llvm::NativeGtirbDecodeOptions GtirbOptions;
   notdec::bin2llvm::PcodeMemoryModel MemoryModel =
       notdec::bin2llvm::PcodeMemoryModel::IntToPtr;
-  bool DisableRegisterSSAPass = false;
-  bool DisableSummaryRegisterResidueRemoval = false;
-  bool DisableVarArgRecovery = false;
-  // 要求所有函数都遵守外部 ABI（参数/返回都用 ABI 寄存器）。默认只对导出/地址被取的
-  // 函数强制，本地链接且地址没被取的函数允许本 pass 自定义约定。
-  bool AbiForAllFunctions = false;
   bool PrintRegisterSSASummary = false;
-  bool DisableInstCombinePass = false;
   bool SkipRuntimeFunctions = false;
 };
 
@@ -104,23 +104,25 @@ nativeFunctionLinkage(const notdec::bin2llvm::NativeProgramState &state,
 
 void printUsage(const char *argv0) {
   std::cerr << "usage: " << argv0
-            << " <elf-file> [sla-file] "
+            << " <elf-file|module.ll> [sla-file] "
                "(-a <address> -l <length> | -f <entry> | -n <name> | "
                "--all-confirmed) "
                "-o <output.ll> [--summary-json-out <path>] "
                "[--register-ssa-warning-out <path>] "
-               "[--external-prototypes <path>] "
-               "[--no-instcombine-pass] "
-               "[--no-register-ssa-pass] "
-               "[--summary-register-ssa-pass] "
-               "[--no-summary-register-residue-removal] "
-               "[--no-vararg-recovery] [--abi-for-all-functions] "
+               "[--config <pipeline.json>] "
+               "[--dump-stages <dir>] "
+               "[--manifest-out <path>] "
                "[--register-ssa-summary] "
                "[--skip-runtime] "
                "[--native-decode-mode gtirb|internal] [--gtirb <path>] "
                "[--decode-seed-limit <count>] "
                "[--memory-model inttoptr|global-array] [-p root-sla-dir] "
-               "[-s pspec-file]\n";
+               "[-s pspec-file]\n"
+               "\n"
+               "standalone modes:\n"
+               "  --list-stages              print the stage registry as JSON\n"
+               "  --print-config [<path>]    print the effective pipeline "
+               "config as JSON\n";
 }
 
 bool parseUint64(const std::string &text, uint64_t &value) {
@@ -155,46 +157,26 @@ bool isIRInputPath(const std::string &path) {
 }
 
 std::optional<CliOptions> parseArgs(int argc, char **argv) {
-  if (argc < 4) {
+  if (argc < 2) {
     return std::nullopt;
   }
 
   CliOptions options;
-  options.ElfPath = argv[1];
-  bool hasAddress = false;
-  bool hasLength = false;
-  int argIndex = 2;
-  if (argIndex < argc && std::string(argv[argIndex]).rfind("-", 0) != 0) {
+  int argIndex = 1;
+  if (std::string(argv[argIndex]).rfind("-", 0) != 0) {
+    options.ElfPath = argv[argIndex++];
+  }
+  if (!options.ElfPath.empty() && argIndex < argc &&
+      std::string(argv[argIndex]).rfind("-", 0) != 0) {
     options.SpecOptions.SlaFileName = argv[argIndex++];
   }
 
+  bool hasAddress = false;
+  bool hasLength = false;
   for (; argIndex < argc; ++argIndex) {
     std::string flag = argv[argIndex];
     if (flag == "--all-confirmed") {
       options.AllConfirmed = true;
-      continue;
-    }
-    if (flag == "--no-register-ssa-pass") {
-      options.DisableRegisterSSAPass = true;
-      continue;
-    }
-    if (flag == "--summary-register-ssa-pass") {
-      continue;
-    }
-    if (flag == "--no-summary-register-residue-removal") {
-      options.DisableSummaryRegisterResidueRemoval = true;
-      continue;
-    }
-    if (flag == "--abi-for-all-functions") {
-      options.AbiForAllFunctions = true;
-      continue;
-    }
-    if (flag == "--no-vararg-recovery") {
-      options.DisableVarArgRecovery = true;
-      continue;
-    }
-    if (flag == "--no-instcombine-pass") {
-      options.DisableInstCombinePass = true;
       continue;
     }
     if (flag == "--register-ssa-summary") {
@@ -203,6 +185,17 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
     }
     if (flag == "--skip-runtime") {
       options.SkipRuntimeFunctions = true;
+      continue;
+    }
+    if (flag == "--list-stages") {
+      options.ListStages = true;
+      continue;
+    }
+    if (flag == "--print-config") {
+      options.HasPrintConfig = true;
+      if (argIndex + 1 < argc && argv[argIndex + 1][0] != '-') {
+        options.PrintConfigPath = argv[++argIndex];
+      }
       continue;
     }
     if (argIndex + 1 >= argc) {
@@ -238,8 +231,12 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.SummaryJsonPath = std::move(value);
     } else if (flag == "--register-ssa-warning-out") {
       options.RegisterSSAWarningPath = std::move(value);
-    } else if (flag == "--external-prototypes") {
-      options.ExternalPrototypeJsonPath = std::move(value);
+    } else if (flag == "--config") {
+      options.ConfigPath = std::move(value);
+    } else if (flag == "--dump-stages") {
+      options.DumpStagesDir = std::move(value);
+    } else if (flag == "--manifest-out") {
+      options.ManifestPath = std::move(value);
     } else if (flag == "--native-decode-mode") {
       if (value == "gtirb") {
         options.DecodeMode = notdec::bin2llvm::NativeDecodeMode::Gtirb;
@@ -273,6 +270,14 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       std::cerr << "unknown flag: " << flag << '\n';
       return std::nullopt;
     }
+  }
+
+  if (options.ListStages || options.HasPrintConfig) {
+    return options;
+  }
+  if (options.ElfPath.empty()) {
+    std::cerr << "missing input file\n";
+    return std::nullopt;
   }
 
   unsigned selectionCount = 0;
@@ -1036,17 +1041,54 @@ std::unique_ptr<llvm::Module> readIRModule(const std::string &inputPath,
 }
 
 
-notdec::bin2llvm::NativePipelineOptions
-pipelineOptions(const CliOptions &options) {
-  notdec::bin2llvm::NativePipelineOptions pipeline;
-  pipeline.DisableRegisterElimination = options.DisableRegisterSSAPass;
-  pipeline.DisableResidueRemoval = options.DisableSummaryRegisterResidueRemoval;
-  pipeline.DisableInstCombine = options.DisableInstCombinePass;
-  pipeline.DisableVarArgRecovery = options.DisableVarArgRecovery;
-  pipeline.AbiForAllFunctions = options.AbiForAllFunctions;
-  pipeline.PrintRegisterSummary = options.PrintRegisterSSASummary;
-  pipeline.ExternalPrototypeJsonPath = options.ExternalPrototypeJsonPath;
-  return pipeline;
+void printStageRegistry(llvm::raw_ostream &OS) {
+  using namespace notdec::bin2llvm;
+  llvm::json::OStream J(OS, /*IndentSize=*/2);
+  J.array([&] {
+    for (const NativeStageDescriptor &Descriptor : nativeStageDescriptors()) {
+      NativeStageConfig Stage;
+      Stage.Kind = Descriptor.Kind;
+      Stage.Name = Descriptor.Name.str();
+      J.object([&] {
+        J.attribute("stage", Descriptor.Name);
+        J.attribute("repeatable", Descriptor.Repeatable);
+        J.attribute("filterable", Descriptor.Filterable);
+        llvm::json::Object Options = nativeStageOptionsToJson(Stage);
+        J.attribute("default_options",
+                    llvm::json::Value(std::move(Options)));
+      });
+    }
+  });
+  OS << "\n";
+}
+
+bool writeTextFile(const std::string &Path, llvm::StringRef Text);
+
+bool writeManifestIfRequested(
+    const CliOptions &Options,
+    const notdec::bin2llvm::NativeConfig &Config) {
+  if (Options.ManifestPath.empty()) {
+    return true;
+  }
+  std::string Text;
+  llvm::raw_string_ostream Stream(Text);
+  llvm::json::OStream Json(Stream, /*IndentSize=*/2);
+  Json.value(
+      llvm::json::Value(notdec::bin2llvm::nativeConfigManifest(Config)));
+  Stream.flush();
+  Text += "\n";
+  return writeTextFile(Options.ManifestPath, Text);
+}
+
+bool writeTextFile(const std::string &Path, llvm::StringRef Text) {
+  std::error_code EC;
+  llvm::raw_fd_ostream Output(Path, EC);
+  if (EC) {
+    std::cerr << "failed to write " << Path << ": " << EC.message() << '\n';
+    return false;
+  }
+  Output << Text;
+  return true;
 }
 
 } // namespace
@@ -1057,6 +1099,53 @@ int main(int argc, char **argv) {
     if (!options) {
       printUsage(argv[0]);
       return 1;
+    }
+
+    if (options->ListStages) {
+      printStageRegistry(llvm::outs());
+      return 0;
+    }
+
+    notdec::bin2llvm::NativePipelineInput inputKind =
+        isIRInputPath(options->ElfPath)
+            ? notdec::bin2llvm::NativePipelineInput::IR
+            : notdec::bin2llvm::NativePipelineInput::Binary;
+    if (options->HasPrintConfig) {
+      notdec::bin2llvm::NativeConfig config =
+          notdec::bin2llvm::defaultNativeConfig(inputKind);
+      if (!options->ConfigPath.empty()) {
+        std::string error;
+        auto loaded = notdec::bin2llvm::loadNativeConfig(
+            options->ConfigPath, inputKind, error);
+        if (!loaded) {
+          std::cerr << "failed to load config: " << error << '\n';
+          return 1;
+        }
+        config = std::move(*loaded);
+      }
+      std::string text;
+      llvm::raw_string_ostream stream(text);
+      notdec::bin2llvm::printNativeConfig(config, stream);
+      stream.flush();
+      if (options->PrintConfigPath.empty()) {
+        llvm::outs() << text;
+      } else if (!writeTextFile(options->PrintConfigPath, text)) {
+        return 1;
+      }
+      return 0;
+    }
+
+    notdec::bin2llvm::NativeConfig config =
+        notdec::bin2llvm::defaultNativeConfig(inputKind);
+    if (!options->ConfigPath.empty()) {
+      std::string error;
+      auto loaded = notdec::bin2llvm::loadNativeConfig(
+          options->ConfigPath, inputKind, error);
+      if (!loaded) {
+        std::cerr << "failed to load config: " << error << '\n';
+        return 1;
+      }
+      config = std::move(*loaded);
     }
 
     if (isIRInputPath(options->ElfPath)) {
@@ -1071,43 +1160,25 @@ int main(int argc, char **argv) {
       if (!ensureDefaultAbiMetadata(*module, options->SpecOptions)) {
         return 1;
       }
-      if (!notdec::bin2llvm::runNativeInstCombineStage(*module,
-                                                       pipelineOptions(*options))) {
+      notdec::bin2llvm::NativePipelineContext pipeline{*module, config};
+      pipeline.OutputPath = options->OutputPath;
+      pipeline.DumpStagesDir = options->DumpStagesDir;
+      pipeline.PrintSummary = options->PrintRegisterSSASummary;
+      std::string pipelineError;
+      if (!notdec::bin2llvm::runNativePipeline(pipeline, pipelineError)) {
+        std::cerr << "pipeline failed: " << pipelineError << '\n';
         return 1;
       }
-      auto elimination = notdec::bin2llvm::runNativeRegisterEliminationStage(
-          *module, pipelineOptions(*options));
-      if (!elimination.Ok) {
+      if (!writeManifestIfRequested(*options, config)) {
         return 1;
       }
       if (!options->RegisterSSAWarningPath.empty() &&
-          !writeRegisterSSAWarnings(elimination.Summary,
+          !writeRegisterSSAWarnings(pipeline.EliminationSummary,
                                     options->RegisterSSAWarningPath)) {
         return 1;
       }
-      if (!runNativeInstCombineStage(*module, pipelineOptions(*options),
-                                       /*runEarlyCSEFirst=*/true)) {
-        return 1;
-      }
-      if (!runNativePostRewritePeepholeStage(*module, pipelineOptions(*options))) {
-        return 1;
-      }
-      if (!notdec::bin2llvm::runNativeFinalCleanupStage(*module)) {
-        return 1;
-      }
-      // final cleanup 把 notdec.reg.* 辅助调用降成显式 insert/extract 链，
-      // 这里再收一次尾，别让重复链进入最终 IR。
-      if (!runNativeInstCombineStage(*module, pipelineOptions(*options),
-                                       /*runEarlyCSEFirst=*/true)) {
-        return 1;
-      }
-      // 这次 InstCombine 可能删掉某个 unknown 占位的最后一个使用者；unknown
-      // 调用本身不会被当死代码删（call 有副作用语义），补一次清理。
-      notdec::bin2llvm::eraseDeadUnknownValueCalls(*module);
-      // 同一次化简也可能才删掉死块里的 userop 占位调用，声明的清理跟着补一次。
-      notdec::bin2llvm::eraseUnusedRegisterHelperDeclarations(*module);
       if (options->PrintRegisterSSASummary) {
-        reportRemainingUnknownValues(*module, options->AbiForAllFunctions);
+        reportRemainingUnknownValues(*module, pipeline.AbiForAllFunctions);
       }
       return writeModule(*module, options->OutputPath);
     }
@@ -1265,56 +1336,42 @@ int main(int argc, char **argv) {
       std::cerr << "module verification failed\n";
       return 1;
     }
-    if (!runNativeInstCombineStage(*module, pipelineOptions(*options))) {
+    std::vector<notdec::bin2llvm::NativeFunctionIdentity> functionIdentities;
+    if (selectedState) {
+      NativeCallTargets plannedTargets = planNativeCallTargets(
+          *selectedState, options->SkipRuntimeFunctions);
+      for (const auto &[entry, function] : selectedState->functions()) {
+        auto targetIt = plannedTargets.Direct.find(entry);
+        if (targetIt == plannedTargets.Direct.end()) {
+          continue;
+        }
+        functionIdentities.push_back(
+            {targetIt->second, function.Name, entry});
+      }
+    }
+
+    notdec::bin2llvm::NativePipelineContext pipeline{*module, config};
+    pipeline.State = selectedState.get();
+    pipeline.FunctionIdentities = std::move(functionIdentities);
+    pipeline.PreservedFunctions = std::move(preservedFunctions);
+    pipeline.OutputPath = options->OutputPath;
+    pipeline.DumpStagesDir = options->DumpStagesDir;
+    pipeline.PrintSummary = options->PrintRegisterSSASummary;
+    std::string pipelineError;
+    if (!notdec::bin2llvm::runNativePipeline(pipeline, pipelineError)) {
+      std::cerr << "pipeline failed: " << pipelineError << '\n';
       return 1;
     }
-    auto elimination = notdec::bin2llvm::runNativeRegisterEliminationStage(
-        *module, pipelineOptions(*options));
-    if (!elimination.Ok) {
+    if (!writeManifestIfRequested(*options, config)) {
       return 1;
     }
     if (!options->RegisterSSAWarningPath.empty() &&
-        !writeRegisterSSAWarnings(elimination.Summary,
+        !writeRegisterSSAWarnings(pipeline.EliminationSummary,
                                   options->RegisterSSAWarningPath)) {
       return 1;
     }
-    if (!runNativeInstCombineStage(*module, pipelineOptions(*options),
-                                     /*runEarlyCSEFirst=*/true)) {
-      return 1;
-    }
-    notdec::bin2llvm::NativeFunctionPointerPromotionSummary
-        promotionSummary =
-            notdec::bin2llvm::runNativeFunctionPointerPromotion(*module);
     if (options->PrintRegisterSSASummary) {
-      llvm::errs() << "Native function pointer promotion: seen="
-                   << promotionSummary.IndirectCallsSeen
-                   << " promoted=" << promotionSummary.IndirectCallsPromoted
-                   << " slots="
-                   << promotionSummary.SlotsWithKnownSingleTarget
-                   << " unknown_writes="
-                   << promotionSummary.SlotsWithUnknownWrites
-                   << " escaped="
-                   << promotionSummary.SlotsWithEscapedAddress
-                   << " multiple_targets="
-                   << promotionSummary.SlotsWithMultipleTargets << '\n';
-    }
-    if (!runNativePostRewritePeepholeStage(*module, pipelineOptions(*options))) {
-      return 1;
-    }
-    if (!notdec::bin2llvm::runNativeFinalCleanupStage(*module, preservedFunctions)) {
-      return 1;
-    }
-    // final cleanup 把 notdec.reg.* 辅助调用降成显式 insert/extract 链，
-    // 这里再收一次尾，别让重复链进入最终 IR。
-    if (!runNativeInstCombineStage(*module, pipelineOptions(*options),
-                                     /*runEarlyCSEFirst=*/true)) {
-      return 1;
-    }
-    // 同上：最后一次 InstCombine 之后补一次死 unknown 清理。
-    notdec::bin2llvm::eraseDeadUnknownValueCalls(*module);
-    notdec::bin2llvm::eraseUnusedRegisterHelperDeclarations(*module);
-    if (options->PrintRegisterSSASummary) {
-      reportRemainingUnknownValues(*module, options->AbiForAllFunctions);
+      reportRemainingUnknownValues(*module, pipeline.AbiForAllFunctions);
     }
 
     return writeModule(*module, options->OutputPath);

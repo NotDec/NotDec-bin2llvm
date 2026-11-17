@@ -2,6 +2,7 @@
 set -euo pipefail
 
 BUILD_DIR="${NOTDEC_BIN2LLVM_BUILD_DIR:-/tmp/notdec-bin2llvm-build}"
+SOURCE_DIR="${NOTDEC_BIN2LLVM_SOURCE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 BENCH2_ROOT="${BENCH2_ROOT:-/sn640/NotDec-Exp/Bench2/rootfs}"
 MANIFEST="${BENCH2_MANIFEST:-/sn640/NotDec-Exp/Bench2/manifest/benchmark-targets.tsv}"
 OUT_DIR="${OUT_DIR:-/tmp/notdec-bin2llvm-bench2-scale-audit}"
@@ -140,8 +141,8 @@ for target in "${TARGETS[@]}"; do
     started_at="$(date +%s)"
     set +e
     timeout "$TIMEOUT_SECONDS"s "$NATIVE_LLVM" "$binary" --all-confirmed \
-      --decode-seed-limit "$limit" --no-instcombine-pass \
-      --no-register-ssa-pass -o "$ll" \
+      --decode-seed-limit "$limit" --config "$SOURCE_DIR/scripts/config/raw-lift.json" \
+      -o "$ll" \
       >"$stdout" 2>"$stderr"
     rc="$?"
     set -e

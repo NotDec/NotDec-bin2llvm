@@ -25,7 +25,7 @@
 
 - 代码在 `include/notdec-bin2llvm/passes/register/`、`lib/passes/register/`
 - `NativeRegisterSummary` 与 `NativeRegisterElimination` 负责寄存器 SSA、寄存器消除和 native 函数签名重写。
-- `notdec-native-llvm` 默认且唯一使用该路；`--summary-register-ssa-pass` 仅保留为兼容别名。
+- `notdec-native-llvm` 默认且唯一使用该路；Pass 顺序与参数统一通过 `--config <pipeline.json>` 控制（`--print-config` 导出默认配置、`--list-stages` 查 stage/参数），不再提供逐 pass 的 CLI 开关。
 - 新的寄存器消除、call/internal signature rewrite 都基于 summary 结果，不依赖 Ghidra `notdec.prototype.*` metadata。相关 plan/记录在 `logs/20260616-01-native-prototype-recovery-stage2/`。
 
 **寄存器值的表示准则（硬性，2026-09-28 定）**

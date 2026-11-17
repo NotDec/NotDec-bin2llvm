@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "pipeline": [
+    {"stage": "instcombine", "options": {"early_cse": false}},
+    {
+      "stage": "register-elimination",
+      "options": {
+        "external_prototypes": "fortune-x86_64.external-prototypes.json"
+      }
+    },
+    {"stage": "instcombine", "options": {"early_cse": true}},
+    {"stage": "function-pointer-promotion"},
+    {"stage": "post-rewrite-peephole"},
+    {"stage": "final-cleanup"},
+    {"stage": "instcombine", "options": {"early_cse": true}},
+    {"stage": "erase-dead-helpers"}
+  ]
+}

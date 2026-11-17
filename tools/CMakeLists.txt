@@ -108,6 +108,15 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
     )
 
     add_test(
+      NAME notdec.native_llvm.config_override_smoke
+      COMMAND
+        ${PROJECT_SOURCE_DIR}/scripts/native-llvm-config-override-smoke.sh
+        $<TARGET_FILE:notdec-native-llvm>
+        ${NOTDEC_LLVM_INSTALL_DIR}/bin
+        ${PROJECT_BINARY_DIR}
+    )
+
+    add_test(
       NAME notdec.native_llvm.realworld_fortune_x86_64
       COMMAND
         ${PROJECT_SOURCE_DIR}/scripts/native-fortune-x86_64-regression.sh

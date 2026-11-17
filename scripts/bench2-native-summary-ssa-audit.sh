@@ -2,6 +2,8 @@
 set -euo pipefail
 
 BUILD_DIR="${NOTDEC_BIN2LLVM_BUILD_DIR:-/tmp/notdec-bin2llvm-build}"
+SOURCE_DIR="${NOTDEC_BIN2LLVM_SOURCE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+NO_RESIDUE_CONFIG="$SOURCE_DIR/scripts/config/summary-no-residue.json"
 BENCH2_ROOT="${BENCH2_ROOT:-/sn640/NotDec-Exp/Bench2/rootfs}"
 MANIFEST="${BENCH2_MANIFEST:-/sn640/NotDec-Exp/Bench2/manifest/benchmark-targets.tsv}"
 OUT_DIR="${OUT_DIR:-/tmp/notdec-bin2llvm-bench2-summary-ssa-audit}"
@@ -120,7 +122,7 @@ mode_args() {
   local mode="$1"
   case "$mode" in
   summary-no-residue)
-    printf '%s\n' "--no-summary-register-residue-removal"
+    printf '%s\n' "--config" "$NO_RESIDUE_CONFIG"
     printf '%s\n' "--register-ssa-summary"
     ;;
   summary-residue)

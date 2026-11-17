@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "pipeline": [
+    {
+      "stage": "register-elimination",
+      "options": {"post_rewrite_instcombine": false}
+    },
+    {"stage": "post-rewrite-peephole"},
+    {"stage": "final-cleanup"},
+    {"stage": "erase-dead-helpers"}
+  ]
+}
