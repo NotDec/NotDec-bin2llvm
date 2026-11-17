@@ -5,6 +5,7 @@
 #include "notdec-bin2llvm/intrinsics/NativeRegisterValueRange.h"
 
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -19,6 +20,7 @@
 #include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/DCE.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 #include "llvm/IR/Metadata.h"
 
@@ -261,6 +263,73 @@ uint64_t eraseDeadRegisterReads(llvm::Module &module) {
   return removed;
 }
 
+bool isDeadRemovableValueHelperName(llvm::StringRef name) {
+  // 这些 helper 是纯值占位/值重组：没有副作用，也没人读时可以直接删。
+  // 注意不要包含 notdec.register.userop.*（未建模指令可能对应 trap/异常）。
+  return name.starts_with("notdec.register.summary_") ||
+         name.starts_with("notdec.unknown.") ||
+         name.starts_with("notdec.reg.extract.") ||
+         name.starts_with("notdec.reg.insert.") ||
+         name.starts_with("notdec.partial_read.") ||
+         isVarArgUnknownHelperName(name);
+}
+
+// 删除没人用的 notdec 值 helper，并递归清掉因此变死的操作数链。
+// 普通 call 有副作用语义，DCE/ADCE 不会删这些占位；但占位只在"值被读到"
+// 时才有意义，残留的死占位会让 clobber/unknown 审计计数随创建顺序漂移。
+uint64_t eraseDeadNotDecValueHelperCallsImpl(llvm::Module &module) {
+  std::vector<llvm::CallBase *> worklist;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr || !call->use_empty()) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee != nullptr &&
+          isDeadRemovableValueHelperName(callee->getName())) {
+        worklist.push_back(call);
+      }
+    }
+  }
+
+  uint64_t removed = 0;
+  while (!worklist.empty()) {
+    llvm::CallBase *call = worklist.back();
+    worklist.pop_back();
+    if (call->getParent() == nullptr || !call->use_empty()) {
+      continue;
+    }
+    llvm::SmallVector<llvm::Value *, 4> operands;
+    for (llvm::Use &operand : call->operands()) {
+      if (llvm::isa<llvm::Instruction>(operand.get())) {
+        operands.push_back(operand.get());
+      }
+    }
+    call->eraseFromParent();
+    ++removed;
+    for (llvm::Value *operand : operands) {
+      auto *operandCall = llvm::dyn_cast<llvm::CallBase>(operand);
+      llvm::RecursivelyDeleteTriviallyDeadInstructions(operand);
+      // RecursivelyDeleteTriviallyDeadInstructions does not remove calls (they
+      // are not trivially dead without attributes), so enqueue a helper call
+      // that just lost its last user.
+      if (operandCall != nullptr && operandCall->getParent() != nullptr &&
+          operandCall->use_empty()) {
+        llvm::Function *callee = operandCall->getCalledFunction();
+        if (callee != nullptr &&
+            isDeadRemovableValueHelperName(callee->getName())) {
+          worklist.push_back(operandCall);
+        }
+      }
+    }
+  }
+  return removed;
+}
+
 uint64_t eraseUnusedRegisterGlobals(llvm::Module &module) {
   std::vector<llvm::GlobalVariable *> deadGlobals;
   for (llvm::GlobalVariable &global : module.globals()) {
@@ -407,6 +476,10 @@ uint64_t eraseUnusedRegisterHelperDeclarations(llvm::Module &module) {
 // 本身不会被当死代码删掉（普通 call 有副作用语义）。最终 IR 之前要再扫一次，
 // 因为 tool 在 final cleanup 之后还会跑一次 InstCombine，它可能删掉最后一个
 // 使用者。
+uint64_t eraseDeadNotDecValueHelperCalls(llvm::Module &module) {
+  return eraseDeadNotDecValueHelperCallsImpl(module);
+}
+
 uint64_t eraseDeadUnknownValueCalls(llvm::Module &module) {
   std::vector<llvm::CallBase *> deadCalls;
   for (llvm::Function &function : module) {
@@ -497,6 +570,7 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   summary.DeadUnknownValuesRemoved += eraseDeadUnknownValueCalls(module);
   summary.DeadRegisterReadsRemoved += eraseDeadRegisterReads(module);
   runLocalDeadCodeCleanup(module);
+  eraseDeadNotDecValueHelperCallsImpl(module);
   summary.RegisterGlobalsRemoved += eraseUnusedRegisterGlobals(module);
   summary.HelperDeclarationsRemoved +=
       eraseUnusedRegisterHelperDeclarationsImpl(module);

@@ -701,7 +701,7 @@ void addIndirectCallsiteShapes(
     const AbiFacts &abi);
 
 void addDemandedExternalReturns(
-    SignatureRewriteState &state,
+    llvm::Module &module, SignatureRewriteState &state,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     const AbiFacts &abi, const NativeExternalPrototypeMap &prototypes);
 

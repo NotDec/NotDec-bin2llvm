@@ -680,16 +680,22 @@ void FunctionBuilder::rewriteLoads() {
   }
 
 void FunctionBuilder::removeDeadPartialReads() {
-    llvm::SmallPtrSet<llvm::CallBase *, 16> candidates;
-    for (llvm::WeakVH &handle : ReplacedPartialReads) {
-      if (auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(handle)) {
-        candidates.insert(call);
+    // 候选按记录顺序（IR 扫描顺序）遍历，而不是 SmallPtrSet 的指针顺序：
+    // 删除一条读会让它的操作数变死，不同删除顺序会留下不同的死链，最终只
+    // 表现为 `...clobberNNN` 编号和 IR 字节漂移。
+    llvm::SmallPtrSet<llvm::CallBase *, 16> seen;
+    std::vector<llvm::CallBase *> candidates;
+    auto appendCandidate = [&](llvm::WeakVH &handle) {
+      auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(handle);
+      if (call != nullptr && seen.insert(call).second) {
+        candidates.push_back(call);
       }
+    };
+    for (llvm::WeakVH &handle : ReplacedPartialReads) {
+      appendCandidate(handle);
     }
     for (llvm::WeakVH &handle : PartialReads) {
-      if (auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(handle)) {
-        candidates.insert(call);
-      }
+      appendCandidate(handle);
     }
     for (llvm::CallBase *call : candidates) {
       if (call->getParent() == nullptr || !call->use_empty()) {

@@ -1002,17 +1002,30 @@ void addIndirectCallsiteShapes(
 }
 
 void addDemandedExternalReturns(
-    SignatureRewriteState &state,
+    llvm::Module &module, SignatureRewriteState &state,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     const AbiFacts &abi, const NativeExternalPrototypeMap &prototypes) {
-  std::set<llvm::CallBase *> calls;
+  // 收集有返回占位的调用点。不能直接遍历 ReturnHelpers/RangeReturnHelpers
+  // （std::map<CallBase*>，顺序随堆布局），也不能遍历 std::set<CallBase*>：
+  // 同一个外部 callee 的返回槽是按调用点顺序追加的，顺序一变返回结构体字段
+  // 和后续取值的编号就会漂移。按 module/指令顺序收集，保证同一 IR 上稳定。
+  std::set<llvm::CallBase *> wantedCalls;
   for (const auto &[call, helpers] : state.ReturnHelpers) {
     (void)helpers;
-    calls.insert(call);
+    wantedCalls.insert(call);
   }
   for (const auto &[call, helpers] : state.RangeReturnHelpers) {
     (void)helpers;
-    calls.insert(call);
+    wantedCalls.insert(call);
+  }
+  std::vector<llvm::CallBase *> calls;
+  for (llvm::Function &function : module) {
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call != nullptr && wantedCalls.count(call) != 0) {
+        calls.push_back(call);
+      }
+    }
   }
 
   for (llvm::CallBase *call : calls) {

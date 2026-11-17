@@ -165,6 +165,16 @@ private:
       return;
     }
 
+    // FunctionEntries is std::map<UUID, ...>: its iteration order is the
+    // random UUID order ddisasm assigns, not address order.  Collect first and
+    // sort by entry address before adding seeds/functions, otherwise the
+    // discovery worklist (and any first-seed-wins range decision) changes from
+    // run to run even for the same binary.
+    struct CollectedFunction {
+      NativeFunction Function;
+      size_t RawBlockCount = 0;
+    };
+    std::vector<CollectedFunction> collected;
     for (const auto &[functionUuid, entryUuids] : *functionEntries) {
       if (entryUuids.empty()) {
         continue;
@@ -220,9 +230,6 @@ private:
            isNativeRuntimeAddress(state, entryAddress))) {
         continue;
       }
-      state.addFunctionSeed(entryAddress, rangeEnd - rangeStart, name,
-                            "gtirb-ddisasm",
-                            NativeFunctionConfidence::High);
       NativeFunction function;
       function.Entry = entryAddress;
       function.RangeStart = rangeStart;
@@ -230,9 +237,36 @@ private:
       function.Name = std::move(name);
       function.Blocks = std::move(blocks);
       function.Source = "gtirb-ddisasm";
+      collected.push_back(
+          CollectedFunction{std::move(function), blocksIterator->second.size()});
+    }
+
+    std::sort(collected.begin(), collected.end(),
+              [](const CollectedFunction &lhs, const CollectedFunction &rhs) {
+                if (lhs.Function.Entry != rhs.Function.Entry) {
+                  return lhs.Function.Entry < rhs.Function.Entry;
+                }
+                if (lhs.Function.RangeStart != rhs.Function.RangeStart) {
+                  return lhs.Function.RangeStart < rhs.Function.RangeStart;
+                }
+                if (lhs.Function.RangeEnd != rhs.Function.RangeEnd) {
+                  return lhs.Function.RangeEnd < rhs.Function.RangeEnd;
+                }
+                if (lhs.Function.Name != rhs.Function.Name) {
+                  return lhs.Function.Name < rhs.Function.Name;
+                }
+                return lhs.Function.Blocks.size() < rhs.Function.Blocks.size();
+              });
+
+    for (CollectedFunction &item : collected) {
+      NativeFunction &function = item.Function;
+      state.addFunctionSeed(function.Entry,
+                            function.RangeEnd - function.RangeStart,
+                            function.Name, "gtirb-ddisasm",
+                            NativeFunctionConfidence::High);
       if (state.addFunction(std::move(function))) {
         ++functionCount;
-        blockCount += blocksIterator->second.size();
+        blockCount += item.RawBlockCount;
       }
     }
   }
@@ -243,9 +277,16 @@ private:
     const gtirb::CFG &cfg = module.getIR()->getCFG();
     std::map<uint64_t, const gtirb::CodeBlock *> codeBlocksByAddress;
     for (const gtirb::CodeBlock &block : module.code_blocks()) {
-      if (block.getAddress()) {
-        codeBlocksByAddress.emplace(static_cast<uint64_t>(*block.getAddress()),
-                                    &block);
+      if (!block.getAddress()) {
+        continue;
+      }
+      uint64_t address = static_cast<uint64_t>(*block.getAddress());
+      auto [iterator, inserted] = codeBlocksByAddress.emplace(address, &block);
+      if (!inserted && block.getSize() > iterator->second->getSize()) {
+        // Duplicate code blocks at one address exist for overlapping thunks.
+        // module.code_blocks() order is GTIRB/UUID order; pick the larger block
+        // explicitly so the CFG import does not depend on it.
+        iterator->second = &block;
       }
     }
 
@@ -305,6 +346,9 @@ private:
           }
         }
         if (attachSuccessors) {
+          std::sort(successors.begin(), successors.end());
+          successors.erase(std::unique(successors.begin(), successors.end()),
+                           successors.end());
           state.addBasicBlockSuccessors(function.Entry, source, successors);
         }
       };

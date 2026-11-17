@@ -1230,6 +1230,27 @@ void rewriteSignatureShapes(
     auto rangeHelpersIt = state.RangeReturnHelpers.find(oldCall);
     if (rangeHelpersIt != state.RangeReturnHelpers.end() &&
         !shape->Returns.empty()) {
+      // RangeReturnHelpers are appended in the order the SSA walk first reads
+      // the post-call registers.  That order is stable only if every walk is
+      // stable; make it explicit so the extract/trunc sequence (and therefore
+      // the IR text) does not depend on which use was visited first.
+      std::stable_sort(
+          rangeHelpersIt->second.begin(), rangeHelpersIt->second.end(),
+          [](const RangeReturnHelper &lhs, const RangeReturnHelper &rhs) {
+            const std::string lhsName =
+                lhs.Range.Global == nullptr ? std::string()
+                                            : lhs.Range.Global->getName().str();
+            const std::string rhsName =
+                rhs.Range.Global == nullptr ? std::string()
+                                            : rhs.Range.Global->getName().str();
+            if (lhsName != rhsName) {
+              return lhsName < rhsName;
+            }
+            if (lhs.Range.BitOffset != rhs.Range.BitOffset) {
+              return lhs.Range.BitOffset < rhs.Range.BitOffset;
+            }
+            return lhs.Range.BitWidth < rhs.Range.BitWidth;
+          });
       llvm::IRBuilder<> builder(newCall->getNextNode());
       for (RangeReturnHelper &rangeHelper : rangeHelpersIt->second) {
         llvm::CallInst *helper = rangeHelper.Helper;

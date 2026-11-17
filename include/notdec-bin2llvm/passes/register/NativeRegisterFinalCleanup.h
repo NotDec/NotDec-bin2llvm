@@ -44,6 +44,12 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
 // 删掉。
 uint64_t eraseDeadUnknownValueCalls(llvm::Module &module);
 
+// 清掉没人用的 notdec 值 helper 调用（unknown / summary_clobber /
+// partial_read / reg.extract / reg.insert / vararg_unknown），并递归删除因此
+// 变死的操作数链。tool 在最后一次 InstCombine 之后补一次，避免死占位留在
+// 产物里、让审计计数随创建顺序漂移。
+uint64_t eraseDeadNotDecValueHelperCalls(llvm::Module &module);
+
 // 清掉没人用的 helper 声明（notdec.register.summary_* / userop 占位 /
 // unknown / value-range / partial read-write）。tool 的最后一次
 // InstCombine+SimplifyCFG 之后补一次：那次化简可能才删掉死块里的最后调用。

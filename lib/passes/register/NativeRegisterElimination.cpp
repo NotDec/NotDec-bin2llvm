@@ -207,7 +207,8 @@ runNativeRegisterElimination(llvm::Module &module,
   if (options.EnableRewrite) {
     refineIndirectCallsiteParamShapes(signatureState);
     refineInternalStackParamShapes(signatureState);
-    addDemandedExternalReturns(signatureState, units, abi, externalPrototypes);
+    addDemandedExternalReturns(module, signatureState, units, abi,
+                               externalPrototypes);
     markSignatureCallArgStores(signatureState, summary);
     rewriteSignatureShapes(module, signatureState, units, abi, summary);
     // Stage 2：签名/SSA 都稳定之后，把"自己取变参"的手写菱形折成 va_arg。

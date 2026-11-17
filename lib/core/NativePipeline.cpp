@@ -335,7 +335,7 @@ bool runEraseDeadHelpersStage(const NativeStageConfig &Stage,
   (void)Stage;
   (void)Path;
   (void)Error;
-  eraseDeadUnknownValueCalls(Context.Module);
+  eraseDeadNotDecValueHelperCalls(Context.Module);
   eraseUnusedRegisterHelperDeclarations(Context.Module);
   return true;
 }
