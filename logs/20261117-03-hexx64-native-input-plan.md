@@ -467,3 +467,41 @@ low-64 直接塞给 `sdiv/srem` 的操作数；`or disjoint` 再按 lane 拆分�
   `br i1 poison` 消失。
 - `llvm-as` + `opt -passes=verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
 - 剩下 3 个 `br i1 poison` 在其它函数，留作下一批 demand 缺口。
+
+## 12. 第 4 轮：剩余 3 个 poison 分支的刻画 + vararg 表示试验（回退）
+
+### 12.1 剩余 3 个 `br i1 poison`
+
+| 函数 | 位置 | 特征 |
+|------|------|------|
+| FUN_19e440 | bb_19e490 | 条件是间接调用返回值上的 `test al,al`；该块 R12/R15 的 range-summary phi 入边是 poison，trace 里全是 RSP 地址链 |
+| FUN_20c910 | bb_20ca38 | 带间接调用的循环头；该块所有 range-summary phi 入边都是 poison；`%78 = sub %72,%77`（数组索引地址链）被下毒 |
+| FUN_2ca720 | bb_2cadbc | 循环头 phi `%storemerge6347` 的入边被下毒，条件随后折成 poison |
+
+共同点：poison 从“只写不读的地址/循环携带值”经 phi / covered-range 回流到分支条件。
+要修需要按 phi 的 demand 传播逐例分析，可能还有 1–2 条独立的 demand 规则缺口，
+本轮没有收口。
+
+### 12.2 `vararg_unknown` 表示试验（已回退）
+
+按 AGENTS 的“unknown 统一用 `notdec.unknown.*`”准则，试过把
+`lowerVarArgUnknownHelpers` 的 `poison` 换成 `notdec.unknown.<type>` 并复制
+`!notdec.unknown.source`：
+
+- 改完后 `native_register_vararg_test` 通过；
+- 但 `notdec.native_llvm.realworld_fortune_x86_64` 失败：
+  `unexpected text ...: notdec.unknown`。门槛在
+  `scripts/native-fortune-x86_64-regression.sh:106`
+  （`require_not_contains "notdec.unknown"`）。
+- 结论：现状是**故意**让 vararg 恢复不出来的槽走 poison 而不是 unknown——fortune
+  这类小二进制要求“零 unknown”。要改表示必须先把这个质量门槛一起改掉（例如先把
+  fortune 的变参槽全部恢复出来），不能只替换表示。
+- 已回退，IR 与门槛保持原状。
+
+### 12.3 下一步候选
+
+1. 按 phi 的 demand 传播逐例修这 3 个 poison 分支；
+2. 或者转向收益面更大的 688 个 unknown：其中 451 个是
+   `return_binding_uses_clobber_value`（间接调用返回槽），217 个是
+   `range_return_rewrite_missing_value`（外部 callee 的返回槽），与间接调用收敛
+   是同一件事。
