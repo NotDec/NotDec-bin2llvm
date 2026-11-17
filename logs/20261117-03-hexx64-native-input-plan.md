@@ -413,3 +413,57 @@ hexx64.so 全量（7257 函数、0 skip、`llvm-as` + `opt -passes=verify` 通�
 - 3167 个来自 final cleanup 的 `vararg_unknown → poison`（见 9.4，待定表示）。
 - 剩下的 RSP 地址链 poison（`%RSP.entry → add -8 → …`）是"栈地址只写不读"的死值，
   属于 zero-demand 的正常结果；要确认它们不会经 phi/调用再回流到观察者。
+
+## 11. P4 修复二：div/rem 的 demand 传播
+
+### 11.1 根因（FUN_1bad80）
+
+128 位 `idiv` 在 p-code 里是 `sdiv/srem i128`，被除数由 RDX:RAX 拼成：
+
+```llvm
+%high = shl i128 (zext RDX), 64
+%low  = zext RAX
+%dividend = or disjoint %high, %low
+%quot = sdiv i128 %dividend, %RBP
+%rem  = srem i128 %dividend, %RBP
+%q64 = trunc %quot to i64   → store @RAX   ; 死值
+%r64 = trunc %rem  to i64   → store @RDX
+icmp eq %r64, 0 → @ZF → br
+```
+
+`trunc` 把 demand 裁到低 64 位，`computePartialDemands` 的 default 传播把这份
+low-64 直接塞给 `sdiv/srem` 的操作数；`or disjoint` 再按 lane 拆分，高半段
+（`shl`）拿到 0 demand，被 `rewriteUndemandedRegisterStoreOperands` 换成
+`shl i128 poison, 64`。这份被除数是商和余数共享的，余数链上的
+`icmp → @ZF → br` 随即折成 `br i1 poison`（hexx64 里 7 个函数同类）。
+
+除法/取余没有逐位映射：商/余数的低位同样依赖被除数全部位，demand 必须全量。
+这和 20260915-08 修动态移位量是同一类问题。
+
+### 11.2 修复
+
+- `computePartialDemands` 增加 `SDiv/UDiv/SRem/URem`：两个操作数 enqueue 全量
+  mask。
+- 第 10 节的“跳过未解析读”守卫从**扫描 IR 里剩下的 `partial_read`** 改成在
+  `rewritePartialReads()/rewriteLoads()` 里**精确记录没解析掉的读**
+  （`UnresolvedReadGlobals`）。扫描版会把 `rewriteLoads()` 新建的 entry read
+  也算进去，保护面过大（native6 的 poison 3461 主要是它压下去的），会掩盖
+  poison 这个 bug 信号；精确版只在真的解析失败时暂缓下毒。
+- 新单测 `testPartialDemandKeepsDivRemOperand`：128 位 `sdiv/srem` 共享被除数、
+  商写死值、余数走分支；旧规则下出现 `shl i128 poison, 64`，修复后高半段保留
+  （已确认该单测在去掉修复时会失败）。
+
+### 11.3 验证（hexx64.so 全量，7257 函数、0 skip）
+
+| 指标 | 第 10 节后（扫描守卫） | 本节（精确守卫 + div 修复） |
+|------|----------------------|---------------------------|
+| poison 总数 | 3461（守卫掩盖） | 4347（如实暴露） |
+| `br i1 poison` | 10 | **3** |
+| phi 入边 poison | 89 | 279 |
+| return poison | 5 | 7 |
+| `unknowns` | 688 | 688 |
+
+- `FUN_1456d0` 的 `sdiv` 链、`FUN_1bad80` 的 128 位 `srem` 链都保留下来，
+  `br i1 poison` 消失。
+- `llvm-as` + `opt -passes=verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
+- 剩下 3 个 `br i1 poison` 在其它函数，留作下一批 demand 缺口。

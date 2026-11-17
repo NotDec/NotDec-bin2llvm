@@ -734,6 +734,19 @@ std::map<llvm::Value *, llvm::APInt> FunctionBuilder::computePartialDemands() {
         }
         break;
       }
+      case llvm::Instruction::SDiv:
+      case llvm::Instruction::UDiv:
+      case llvm::Instruction::SRem:
+      case llvm::Instruction::URem: {
+        // 除法/取余没有逐位映射：结果任意一位都可能依赖操作数全部位（`sdiv
+        // 71/8` 的低位同样受被除数高位影响，余数也是）。default 的"按结果
+        // demand 裁操作数"会把高半段裁成零 demand，partial demand 随即把
+        // 共享的被除数高位换成 poison，毒化整条链（hexx64 FUN_1bad80 的
+        // 128 位 idiv：被除数 or disjoint 的高、低半段分别来自 RDX/RAX）。
+        enqueue(inst->getOperand(0), fullMaskFor(inst->getOperand(0)));
+        enqueue(inst->getOperand(1), fullMaskFor(inst->getOperand(1)));
+        break;
+      }
       case llvm::Instruction::Shl:
       case llvm::Instruction::LShr:
       case llvm::Instruction::AShr: {
@@ -794,25 +807,11 @@ std::map<llvm::Value *, llvm::APInt> FunctionBuilder::computePartialDemands() {
 void FunctionBuilder::rewritePartialWrites() {
     UndemandedWalkClean.clear();
     std::map<llvm::Value *, llvm::APInt> demands = computePartialDemands();
-    // rewritePartialReads() 已经跑过：这里还剩的 partial_read 都是解析不掉的读。
-    // 这些读的 demand 在 SSA 上接不到写侧（partial_write 还没落成 insert/store），
-    // 此时若按"零 demand"把写侧 operand 换成 poison，第二遍才能解析到的值就被
-    // 提前毒化了（hexx64 FUN_1456d0 的 sdiv 链：store zext(partial_read) 被下毒，
-    // 第二遍把读替换成 extract poison，分支条件折成 poison）。
-    // 对这些寄存器先跳过下毒，等读侧解析完/下一遍再处理；最坏保留裸读，不产生 UB。
-    std::set<llvm::GlobalVariable *> unresolvedReadGlobals;
-    for (llvm::Instruction &inst : llvm::instructions(Function)) {
-      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
-      if (call == nullptr) {
-        continue;
-      }
-      if (std::optional<NativeRegisterPartialReadInfo> read =
-              parseNativeRegisterPartialRead(*call)) {
-        if (read->Global != nullptr) {
-          unresolvedReadGlobals.insert(read->Global);
-        }
-      }
-    }
+    // rewritePartialReads()/rewriteLoads() 已经跑过；它们这遍没能替换掉的读都在
+    // UnresolvedReadGlobals 里。这些读的 demand 在 SSA 上接不到写侧，此时若按
+    // "零 demand"把写侧 operand 换成 poison，第二遍才能解析到的值就被提前毒化
+    // 了（hexx64 FUN_1456d0 的 sdiv 链 / FUN_1bad80 的 ZF 链）。对这些寄存器
+    // 先跳过下毒，等读解析完的下一遍再处理；最坏保留原值/裸读，不产生 UB。
     std::vector<llvm::StoreInst *> stores;
     std::vector<llvm::CallBase *> partialWrites;
     for (llvm::Instruction &inst : llvm::instructions(Function)) {
@@ -836,7 +835,7 @@ void FunctionBuilder::rewritePartialWrites() {
       }
       ++Summary.PartialDemandCandidates;
       if (access.Unit->Global != nullptr &&
-          unresolvedReadGlobals.count(access.Unit->Global) != 0) {
+          UnresolvedReadGlobals.count(access.Unit->Global) != 0) {
         ++Summary.PartialDemandRejected;
         continue;
       }
@@ -865,7 +864,7 @@ void FunctionBuilder::rewritePartialWrites() {
       }
       ++Summary.PartialDemandCandidates;
       if (partial->Global != nullptr &&
-          unresolvedReadGlobals.count(partial->Global) != 0) {
+          UnresolvedReadGlobals.count(partial->Global) != 0) {
         ++Summary.PartialDemandRejected;
         continue;
       }

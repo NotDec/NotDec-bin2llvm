@@ -609,6 +609,7 @@ void FunctionBuilder::eraseInstructionFromParent(llvm::Instruction &inst) {
   }
 
 void FunctionBuilder::rewritePartialReads() {
+    UnresolvedReadGlobals.clear();
     llvm::DominatorTree domTree(Function);
     for (llvm::WeakVH &handle : PartialReads) {
       auto *call = llvm::dyn_cast_or_null<llvm::CallBase>(handle);
@@ -633,6 +634,8 @@ void FunctionBuilder::rewritePartialReads() {
           unitIt->second.Name + ".partial_range", domTree,
           /*allowUnknownSegments=*/true);
       if (value == nullptr || value->getType() != call->getType()) {
+        // 读没解析掉：demand 链会断在这里，写侧这一遍不能按零 demand 下毒。
+        UnresolvedReadGlobals.insert(partial->Global);
         continue;
       }
       recordReplacement(call, value);
@@ -668,6 +671,9 @@ void FunctionBuilder::rewriteLoads() {
       value = resolve(value);
       if (value == nullptr || value == load ||
           value->getType() != load->getType()) {
+        if (access.Unit->Global != nullptr) {
+          UnresolvedReadGlobals.insert(access.Unit->Global);
+        }
         continue;
       }
       recordReplacement(load, value);

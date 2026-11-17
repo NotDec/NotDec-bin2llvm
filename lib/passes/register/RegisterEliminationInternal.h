@@ -907,6 +907,9 @@ private:
   SignatureRewriteState &SignatureState;
   std::vector<llvm::LoadInst *> Loads;
   std::vector<llvm::WeakVH> PartialReads;
+  // 本遍 rewritePartialReads()/rewriteLoads() 没能替换掉的寄存器读（demand 链会
+  // 断在这些读上）。rewritePartialWrites() 用它对写侧暂缓下毒。
+  std::set<llvm::GlobalVariable *> UnresolvedReadGlobals;
   std::vector<llvm::WeakVH> ReplacedLoads;
   std::vector<llvm::WeakVH> ReplacedPartialReads;
   std::vector<llvm::WeakVH> FoldedZeroXors;

@@ -5154,6 +5154,103 @@ bool testPartialDemandKeepsSameWidthMulOperand() {
                   "module failed verifier after same-width mul demand test");
 }
 
+bool testPartialDemandKeepsDivRemOperand() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-demand-div-rem", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX"});
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rdx = createRegisterGlobal(module, "RDX");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+  auto *sink = new llvm::GlobalVariable(
+      module, llvm::Type::getInt64Ty(context), false,
+      llvm::GlobalValue::ExternalLinkage, nullptr, "sink");
+
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  llvm::Type *i128 = llvm::Type::getInt128Ty(context);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "div_rem_helper", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::BasicBlock *taken = llvm::BasicBlock::Create(context, "taken", callee);
+  llvm::BasicBlock *fallthrough =
+      llvm::BasicBlock::Create(context, "fallthrough", callee);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *value = loadRegister(builder, rsi, "RSI", "value");
+  // 128 位被除数：高半段来自 RSI，低半段是常数（模拟 idiv 的 RDX:RAX）。
+  llvm::Value *high = builder.CreateZExt(value, i128, "high");
+  llvm::Value *highShift =
+      builder.CreateShl(high, llvm::ConstantInt::get(i128, 64), "high_shift");
+  llvm::Value *low = builder.CreateZExt(
+      llvm::ConstantInt::get(i64, 7), i128, "low");
+  llvm::Value *dividend = builder.CreateOr(highShift, low, "dividend");
+  llvm::Value *divisor = builder.CreateZExt(
+      llvm::ConstantInt::get(i64, 3), i128, "divisor");
+  llvm::Value *quotient = builder.CreateSDiv(dividend, divisor, "quotient");
+  llvm::Value *remainder = builder.CreateSRem(dividend, divisor, "remainder");
+  llvm::Value *quotient64 = builder.CreateTrunc(quotient, i64, "quotient64");
+  llvm::Value *remainder64 = builder.CreateTrunc(remainder, i64, "remainder64");
+  // 商写 RDX 之后不再被读：这条 register store 的 operand 本来没有 demand；
+  // 但除法/取余共享同一份被除数，取余链是活的，被除数高位不能被裁。
+  storeRegister(builder, rdx, quotient64, "RDX");
+  storeRegister(builder, rax, remainder64, "RAX");
+  llvm::Value *flag =
+      builder.CreateICmpEQ(remainder64, llvm::ConstantInt::get(i64, 0), "flag");
+  builder.CreateCondBr(flag, taken, fallthrough);
+
+  // 两条分支必须不一样，否则 SimplifyCFG 会把分支连同条件一起折掉。
+  builder.SetInsertPoint(taken);
+  builder.CreateRetVoid();
+  builder.SetInsertPoint(fallthrough);
+  builder.CreateRetVoid();
+
+  // 调用点观察 RAX 返回，取余链才有真实 demand。
+  llvm::Function *caller = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "use_div_rem", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  builder.CreateCall(type, callee);
+  builder.CreateStore(loadRegister(builder, rax, "RAX", "returned"), sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
+  options.EnablePostRewriteInstCombine = false;
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
+  // 签名重写会换掉 Function 对象，按名字重新取。
+  llvm::Function *rewritten = module.getFunction("div_rem_helper");
+  bool sawSRem = false;
+  bool poisonedDividend = false;
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(rewritten)) {
+      if (inst.getOpcode() == llvm::Instruction::SRem) {
+        sawSRem = true;
+      }
+      // 只查被除数的高半段（`shl i128`）和取余自身：商的 register store 是死值，
+      // 那条 dead 链上的 poison 是 zero-demand 的正常结果，不算失败。旧 lane
+      // 规则会把 `shl i128 poison, 64` 的高半段裁掉。
+      const bool isDividendHigh = inst.getOpcode() == llvm::Instruction::Shl &&
+                                  inst.getType()->isIntegerTy(128);
+      if (!isDividendHigh && inst.getOpcode() != llvm::Instruction::SRem &&
+          inst.getOpcode() != llvm::Instruction::SDiv) {
+        continue;
+      }
+      for (llvm::Use &operand : inst.operands()) {
+        poisonedDividend |= llvm::isa<llvm::PoisonValue>(operand.get());
+      }
+    }
+  }
+  if (!sawSRem || poisonedDividend) {
+    module.print(llvm::errs(), nullptr);
+  }
+
+  return expect(summary.PartialDemandCandidates >= 1,
+                "div/rem store was not seen as a partial demand candidate") &&
+         expect(sawSRem, "srem disappeared from the function") &&
+         expect(!poisonedDividend,
+                "shared dividend operand was replaced with poison") &&
+         verifyOk(module, "module failed verifier after div/rem demand test");
+}
+
 bool testPartialZmmKeepHighStoreIsDemandRewritten() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-zmm-demand", context);
@@ -6368,6 +6465,7 @@ int main() {
   ok &= testPartialDemandPoisonReplacementIsMarked();
   ok &= testPartialDemandKeepsDynamicShiftAmount();
   ok &= testPartialDemandKeepsSameWidthMulOperand();
+  ok &= testPartialDemandKeepsDivRemOperand();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmDisjointLaneChainIsDemandRewritten();
