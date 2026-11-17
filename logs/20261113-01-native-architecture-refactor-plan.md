@@ -88,6 +88,17 @@
 验证：ctest 16/16；x86_64 IR 逐字节相同；i386 指令与 metadata 内容相同，
 但 `%ST1.clobberNNN` 的数字后缀不同（旧基线 724，当前 727）。
 
+### NativeAnalysisSupport 再拆（2026-11-17）
+
+- 1523 行按职责一分为二：
+  - `NativeAnalysisSupport.cpp`（405 行）：地址、ELF/reloc、eh_frame 统计、
+    dynamic entry 等通用 helper；
+  - `NativeX86Patterns.cpp`（1124 行）：x86 反汇编文本匹配（LEA base、
+    寄存器名降宽、外部函数指针、PIC jump table）。
+- 不再继续拆 x86 文件：1124 行是同一类"读 mnemonic 文本"的逻辑，再拆只会
+  把共享的寄存器名/操作数解析切碎。
+- 验证：ctest 16/16；x86_64 IR 逐字节相同；i386 去数字后相同。
+
 ### i386 后缀数字的结论
 
 - 现在输出与构建布局无关：重新链接（改变二进制布局）后逐字节相同；

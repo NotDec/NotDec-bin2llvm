@@ -558,7 +558,8 @@ external/NotDec-bin2llvm/
     discovery/NativeSleighSeeds.cpp SLEIGH seed 指令解码
     discovery/NativeX86Facts.cpp    x86 pc-thunk / jump table / flow normalizer
     discovery/NativeReport.cpp      discovery report
-    discovery/NativeAnalysisSupport.cpp  discovery 公共 helper
+    discovery/NativeAnalysisSupport.cpp  discovery 公共 helper（地址/ELF/reloc/eh_frame/dynamic）
+    discovery/NativeX86Patterns.cpp     x86 反汇编文本匹配（LEA base / 寄存器名 / 外部函数指针 / PIC dispatch）
     NativeExternalPrototype.cpp     默认外部原型和 JSON 加载
     SleighLift.cpp                  SLEIGH instruction / p-code 收集
     PcodeToLLVM.cpp                 p-code 到 LLVM IR lowering

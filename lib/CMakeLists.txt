@@ -78,6 +78,7 @@ if (NOTDEC_BIN2LLVM_ENABLE_LIEF AND NOTDEC_BIN2LLVM_ENABLE_SLEIGH)
   add_library(notdec-bin2llvm-native STATIC
     discovery/NativeAnalysis.cpp
     discovery/NativeAnalysisSupport.cpp
+    discovery/NativeX86Patterns.cpp
     discovery/NativeElfFacts.cpp
     discovery/NativeEhFrame.cpp
     discovery/NativeGtirbFacts.cpp
