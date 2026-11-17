@@ -275,3 +275,78 @@ discovery 把这些 stub 块挂到引用它们的函数上，导致 971 个函�
 - `_start` 从“userop + 间接尾调用 + 返回未知寄存器”变成干净的
   `call void @llvm.trap(); unreachable`。
 - 函数数保持 7257，0 条 skip；`llvm-as` + `opt -passes=verify` 通过。
+
+## 9. 下一步问题：IR 里的 poison 泄漏（P4）
+
+### 9.1 现象
+
+`hexx64.native4.ll` 里实际值为 `poison` 的操作数共 4462 处（排除
+`nocreateundeforpoison` 属性文本）：
+
+| 位置 | 数量 |
+|------|------|
+| 调用实参 | 4026（2921 个调用点） |
+| phi 入边 | 346 |
+| 分支条件 | 28 |
+| 返回值 | 7 |
+| 其它（extract/insert 等） | 55 |
+
+这违反 `AGENTS.md` 的硬性规则（“不要用 poison/undef/freeze(poison) 表示
+寄存器值未知”），而且 `br i1 poison`、`ret i32 poison` 会直接把 lifted IR 变成
+UB。仓库里既有的设计是**故意**用 poison 暴露“partial demand 漏掉的 observer”
+（见 `logs/20260917-03-callee-saved-and-df-plan.md`、
+`logs/20260915-08-native-dynamic-shift-demand-plan.md`），所以这些站点是
+demand 分析的 bug 报告，应该逐个反推根因，而不是把 poison 一把换成 unknown。
+
+### 9.2 按 stage 归因
+
+用 `--dump-stages` 全模块跑一遍（`/tmp/hexx64/stages_full/`，16 个 stage）：
+
+| stage | poison 数 |
+|-------|-----------|
+| 000-instcombine-before（lowering 产物） | 0 |
+| 000-instcombine-after | 0 |
+| 001-register-elimination-before | 0 |
+| 001-register-elimination-after | 1816 |
+| 005-final-cleanup-before | 1757 |
+| 005-final-cleanup-after | 4924 |
+| 006-instcombine-after（最终） | 4462 |
+
+结论：
+
+1. lowering 本身不产生 poison（此前的怀疑排除）。
+2. register elimination 引入 1816：来自
+   `FunctionBuilderCore::rewriteUndemandedRegisterStoreOperands`
+   （`!notdec.register.summary_ssa.zero_demand_operand` 机制）和
+   summary 覆盖范围读（`readAccessRangeIfDominating`）。
+3. final cleanup 又加 3167：`lowerVarArgUnknownHelpers` 把
+   `notdec.register.vararg_unknown.*`（3226 个 helper 调用，自带
+   `!notdec.unknown.source`）整批换成 poison。这是既有设计（单测
+   `testKnownVarArgUnknownPhiTailUsesPoison` 明确断言 poison），改它需要连同
+   设计意图一起定（见下）。
+
+### 9.3 已收集的具体案例
+
+- `FUN_1456d0` bb_145ed3：asm 是
+  `call get_tinfo_property; mov %rax,%rsi; ...; cltd; idiv %esi; cltq;
+  cmp %rax,%rcx; jb ...`，但 register elimination 后只剩
+  `%RAX.partial_range.covered = extract.i64.i32(i64 poison, 0)`，后续被
+  InstCombine 折成 `br i1 poison`。pre-pass IR 的完整链见
+  `/tmp/hexx64/f1456d0_pre.ll:2886-2935`（sdiv/srem、or disjoint、partial_read
+  RAX 都在）。
+- `FUN_48ff0`：`memmove(dst, poison, n)`——实参来自被下毒的寄存器值。
+- `FUN_248840`：`ret i32 poison`，且函数里 `sbbq` 之后的 flag 链与
+  `under_debugger` 检查都被折掉。
+
+### 9.4 下一步
+
+1. 先把 `FUN_1456d0` 的 sdiv 链追到底：确认是 `or disjoint` 的 lane demand、
+   `zext/trunc` 还是 partial_read covered-range 的哪一步把 RAX 的 demand 归零。
+   修法参照 20260915-08（shift 操作数保持全量 demand）的模式，只动那一条传播
+   规则。
+2. 评估 `vararg_unknown → poison`：它与 AGENTS 的“unknown 用 notdec.unknown”
+   规则冲突，且占了 3167/4462。若确认改成 `notdec.unknown.<type>` 不改变现有
+   benchmarks 的已知行为，就改表示 + 更新
+   `testKnownVarArgUnknownPhiTailUsesPoison`，并在 log 里记录取舍。
+3. 每修一类都重跑 fortune x86_64/i386 和 hexx64 全量，对比 poison 计数与
+   `unknowns` 不能互相掩盖。
