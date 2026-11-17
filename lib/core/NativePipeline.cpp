@@ -327,10 +327,15 @@ bool runFinalCleanupStage(const NativeStageConfig &Stage,
   }
   NativeRegisterFinalCleanupSummary CleanupSummary =
       runNativeRegisterFinalCleanup(Context.Module, Options);
-  if (CleanupSummary.PoisonControlFlowConditionsReplaced != 0) {
-    llvm::errs() << "Native final cleanup: poison control-flow conditions "
-                    "replaced="
-                 << CleanupSummary.PoisonControlFlowConditionsReplaced << "\n";
+  if (CleanupSummary.PoisonControlFlowConditionsReplaced != 0 ||
+      CleanupSummary.PoisonReturnValuesReplaced != 0) {
+    llvm::errs() << "Native final cleanup: poison terminators replaced="
+                 << CleanupSummary.PoisonControlFlowConditionsReplaced +
+                        CleanupSummary.PoisonReturnValuesReplaced
+                 << " (conditions="
+                 << CleanupSummary.PoisonControlFlowConditionsReplaced
+                 << ", returns=" << CleanupSummary.PoisonReturnValuesReplaced
+                 << ")\n";
   }
   return true;
 }
@@ -343,6 +348,18 @@ bool runEraseDeadHelpersStage(const NativeStageConfig &Stage,
   (void)Error;
   eraseDeadNotDecValueHelperCalls(Context.Module);
   eraseUnusedRegisterHelperDeclarations(Context.Module);
+  // 最后一次 InstCombine 可能才把某个 phi/select 折成 poison；这里补做一次
+  // 终结指令的兜底，保证产物里没有 poison 条件/返回值。
+  NativePoisonTerminatorSummary poisonTerminators =
+      replacePoisonTerminatorValues(Context.Module);
+  if (poisonTerminators.ConditionsReplaced != 0 ||
+      poisonTerminators.ReturnsReplaced != 0) {
+    llvm::errs() << "Native erase dead helpers: poison terminators replaced="
+                 << poisonTerminators.ConditionsReplaced +
+                        poisonTerminators.ReturnsReplaced
+                 << " (conditions=" << poisonTerminators.ConditionsReplaced
+                 << ", returns=" << poisonTerminators.ReturnsReplaced << ")\n";
+  }
   return true;
 }
 

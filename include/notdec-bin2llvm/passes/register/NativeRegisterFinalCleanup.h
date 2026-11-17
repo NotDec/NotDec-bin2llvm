@@ -29,9 +29,10 @@ struct NativeRegisterFinalCleanupSummary {
   uint64_t HelperDeclarationsRemoved = 0;
   uint64_t ValueRangeHelpersLowered = 0;
   uint64_t VarArgUnknownHelpersLowered = 0;
-  // 控制流条件（br/switch）是 poison 时改成 notdec.unknown.i1(): poison 条件
-  // 会让整个函数成为 UB，而这里只是"条件未知"，用不透明调用表示。
+  // 终结指令上的 poison 改成带归因的 notdec.unknown：br/switch 条件是 poison
+  // 会让整个函数 UB，ret 的返回值是 poison 会让调用点 UB。
   uint64_t PoisonControlFlowConditionsReplaced = 0;
+  uint64_t PoisonReturnValuesReplaced = 0;
   uint64_t FunctionMetadataCleared = 0;
   uint64_t InstructionMetadataCleared = 0;
   uint64_t RemainingRegisterAccesses = 0;
@@ -40,6 +41,18 @@ struct NativeRegisterFinalCleanupSummary {
 NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
     llvm::Module &module,
     const NativeRegisterFinalCleanupOptions &options = {});
+
+// 把终结指令上的 poison 换成带归因的 notdec.unknown：br/switch 条件是 poison
+// 会让整个函数 UB，ret 的返回值是 poison 会让调用点 UB。runNativeRegisterFinalCleanup
+// 内部会调一次；tool 在最后一次 InstCombine 之后还要再调一次——那次化简可能才把
+// 某个 phi/select 折成 poison。
+struct NativePoisonTerminatorSummary {
+  uint64_t ConditionsReplaced = 0;
+  uint64_t ReturnsReplaced = 0;
+};
+
+NativePoisonTerminatorSummary
+replacePoisonTerminatorValues(llvm::Module &module);
 
 // 清掉没人用的 notdec.unknown.* 占位调用。runNativeRegisterFinalCleanup 内部会
 // 调一次；tool 在最后一次 InstCombine 之后还要再调一次——那次 InstCombine 可能

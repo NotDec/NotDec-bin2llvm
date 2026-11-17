@@ -539,3 +539,38 @@ low-64 直接塞给 `sdiv/srem` 的操作数；`or disjoint` 再按 lane 拆分�
 - 已知边界：如果 poison 条件在 final cleanup **之前**就被 InstCombine/SimplifyCFG
   折掉（小函数里很常见），这个兜底看不到它；hexx64 这 3 条都是活到最后的。
   更根本的修法仍是逐例补 phi/covered-range 的 demand 规则。
+
+## 14. 第 6 轮：终结指令兜底扩展到 `ret`，并在最后一次 InstCombine 之后再兜一次
+
+### 14.1 `ret` 返回值同样是 UB 源
+
+hexx64 里除了 3 个 poison 条件，还有 7 个 `ret ... poison`：调用点拿到 poison
+返回值同样是 UB。把第 13 节的兜底扩展到 `ret`（`reason=poison_terminator_value`,
+`kind=return`，计数 `PoisonReturnValuesReplaced`）。
+
+顺带修了一个 `ret void` 时 `getReturnValue()` 为空、`isa<PoisonValue>(nullptr)`
+的崩溃。
+
+### 14.2 时机：跑两次
+
+- **final cleanup（第一次）**：尽早换掉终结指令上的 poison，避免后续
+  InstCombine 继续基于 poison 折叠、删代码；
+- **erase-dead-helpers（最后一次 InstCombine 之后）**：stage-006 的 InstCombine
+  还会把 phi/select 折成 poison——hexx64 里正好有 2 个 `ret poison` 是那时才
+  出现的。兜底函数已导出（`replacePoisonTerminatorValues`），这个 stage 里再调
+  一次，两个 stage 都会打印
+  `poison terminators replaced=N (conditions=…, returns=…)`。
+- 新增单测 `testFinalCleanupReplacesPoisonReturnValue`。
+
+### 14.3 验证（hexx64.so 全量）
+
+```
+Native final cleanup: poison terminators replaced=9 (conditions=4, returns=5)
+Native erase dead helpers: poison terminators replaced=2 (conditions=0, returns=2)
+```
+
+- 最终 IR：`br i1 poison` = 0，literal `ret ... poison` = 0；7 条 return 替换都带
+  `reason=poison_terminator_value` 归因。
+- `llvm-as` + `opt -passes=verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
+- conditions=4 而 metadata 只有 3 个节点：LLVM 会 unique 字段完全相同的 MDNode
+  （同一函数、同一 kind 的重复替换共用一个节点）。

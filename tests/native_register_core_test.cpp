@@ -5522,6 +5522,47 @@ bool testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata() {
          verifyOk(module, "module failed verifier after final cleanup test");
 }
 
+bool testFinalCleanupReplacesPoisonReturnValue() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-final-cleanup-poison-return", context);
+  attachTestAbi(module);
+
+  auto *type = llvm::FunctionType::get(
+      llvm::Type::getInt32Ty(context), {}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "poison_return", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  builder.CreateRet(llvm::PoisonValue::get(llvm::Type::getInt32Ty(context)));
+
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&function->getEntryBlock().back());
+  auto *unknown = ret == nullptr
+                      ? nullptr
+                      : llvm::dyn_cast_or_null<llvm::CallInst>(
+                            ret->getReturnValue());
+  bool hasSource = false;
+  if (unknown != nullptr) {
+    if (llvm::Function *callee = unknown->getCalledFunction()) {
+      hasSource = callee->getName() == "notdec.unknown.i32";
+    }
+    hasSource = hasSource &&
+                unknown->getMetadata("notdec.unknown.source") != nullptr;
+  }
+  if (!hasSource) {
+    module.print(llvm::errs(), nullptr);
+  }
+
+  return expect(cleanup.PoisonReturnValuesReplaced >= 1,
+                "poison return value was not counted") &&
+         expect(unknown != nullptr,
+                "poison return value was not replaced with a call") &&
+         expect(hasSource,
+                "poison return value has no attributed unknown helper") &&
+         verifyOk(module, "module failed verifier after poison return test");
+}
+
 bool testFinalCleanupReplacesPoisonBranchCondition() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-final-cleanup-poison-condition", context);
@@ -6521,6 +6562,7 @@ int main() {
   ok &= testFinalCleanupDropsDeadRegisterGlobalsAndSummaryMetadata();
   ok &= testFinalCleanupKeepsMetadataWhenRegisterAccessRemains();
   ok &= testFinalCleanupReplacesPoisonBranchCondition();
+  ok &= testFinalCleanupReplacesPoisonReturnValue();
   ok &= testFinalCleanupCountsPartialWriteResidue();
   ok &= testFinalCleanupCountsPartialReadResidue();
   ok &= testFinalCleanupDropsDeadPartialReadsAfterValueRangeLowering();

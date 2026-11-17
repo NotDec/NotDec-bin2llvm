@@ -204,46 +204,6 @@ uint64_t lowerValueRangeHelpers(llvm::Module &module) {
   return lowered;
 }
 
-// br/switch 的条件是 poison 时，整个函数都是 UB（poison 可被细化成任意值）。
-// 这里把条件换成不透明的 notdec.unknown.i1() 并保留来源，让"条件未知"变成
-// 良定义的保守行为；值本身的 poison 不动，仍作为 demand 分析缺口的信号。
-uint64_t replacePoisonControlFlowConditions(llvm::Module &module) {
-  uint64_t replaced = 0;
-  for (llvm::Function &function : module) {
-    if (function.isDeclaration()) {
-      continue;
-    }
-    for (llvm::Instruction &inst : llvm::instructions(function)) {
-      llvm::Value *condition = nullptr;
-      if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(&inst)) {
-        if (!branch->isConditional()) {
-          continue;
-        }
-        condition = branch->getCondition();
-      } else if (auto *switchInst = llvm::dyn_cast<llvm::SwitchInst>(&inst)) {
-        condition = switchInst->getCondition();
-      } else {
-        continue;
-      }
-      if (!llvm::isa<llvm::PoisonValue>(condition)) {
-        continue;
-      }
-      llvm::IRBuilder<> builder(&inst);
-      llvm::Value *unknown =
-          unknownValueAt(builder, condition->getType(), "poison.condition");
-      attachUnknownValueMetadata(unknown, "poison_control_flow_condition",
-                                 function.getName(), "", "condition", "branch");
-      if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(&inst)) {
-        branch->setCondition(unknown);
-      } else {
-        llvm::cast<llvm::SwitchInst>(&inst)->setCondition(unknown);
-      }
-      ++replaced;
-    }
-  }
-  return replaced;
-}
-
 uint64_t lowerVarArgUnknownHelpers(llvm::Module &module) {
   std::vector<llvm::CallBase *> calls;
   for (llvm::Function &function : module) {
@@ -509,6 +469,61 @@ void runLocalDeadCodeCleanup(llvm::Module &module) {
 
 } // namespace
 
+// 终结指令上的 poison 一律换成带归因的 notdec.unknown：
+// - br/switch 条件是 poison：整个函数 UB；
+// - ret 的值是 poison：调用点拿到的返回值 UB。
+// 这两处都只是"值未知"，用不透明调用表示；值层面的其它 poison 保持不动，
+// 仍作为 demand 分析缺口的信号。
+//
+NativePoisonTerminatorSummary
+replacePoisonTerminatorValues(llvm::Module &module) {
+  NativePoisonTerminatorSummary summary;
+  uint64_t &replacedConditions = summary.ConditionsReplaced;
+  uint64_t &replacedReturns = summary.ReturnsReplaced;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      llvm::Value *poison = nullptr;
+      if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(&inst)) {
+        if (!branch->isConditional()) {
+          continue;
+        }
+        poison = branch->getCondition();
+      } else if (auto *switchInst = llvm::dyn_cast<llvm::SwitchInst>(&inst)) {
+        poison = switchInst->getCondition();
+      } else if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&inst)) {
+        poison = ret->getReturnValue();
+      } else {
+        continue;
+      }
+      if (poison == nullptr || !llvm::isa<llvm::PoisonValue>(poison)) {
+        continue;
+      }
+      llvm::IRBuilder<> builder(&inst);
+      llvm::Value *unknown =
+          unknownValueAt(builder, poison->getType(), "poison.value");
+      bool isReturn = llvm::isa<llvm::ReturnInst>(&inst);
+      attachUnknownValueMetadata(unknown, "poison_terminator_value",
+                                 function.getName(), "", "value",
+                                 isReturn ? "return" : "branch");
+      if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(&inst)) {
+        branch->setCondition(unknown);
+        ++replacedConditions;
+      } else if (auto *switchInst = llvm::dyn_cast<llvm::SwitchInst>(&inst)) {
+        switchInst->setCondition(unknown);
+        ++replacedConditions;
+      } else {
+        llvm::cast<llvm::ReturnInst>(&inst)->setOperand(0, unknown);
+        ++replacedReturns;
+      }
+    }
+  }
+  return summary;
+}
+
+
 // 同 eraseDeadUnknownValueCalls：tool 的最后一次 InstCombine+SimplifyCFG 可能
 // 才把死块里的调用删掉，于是 helper 声明在那之后才变成没人用。导出同一个清理，
 // 让 tool 在最后再补一次。
@@ -610,8 +625,11 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   }
   summary.ValueRangeHelpersLowered += lowerValueRangeHelpers(module);
   summary.VarArgUnknownHelpersLowered += lowerVarArgUnknownHelpers(module);
+  NativePoisonTerminatorSummary poisonTerminators =
+      replacePoisonTerminatorValues(module);
   summary.PoisonControlFlowConditionsReplaced +=
-      replacePoisonControlFlowConditions(module);
+      poisonTerminators.ConditionsReplaced;
+  summary.PoisonReturnValuesReplaced += poisonTerminators.ReturnsReplaced;
   runLocalDeadCodeCleanup(module);
   summary.DeadUnknownValuesRemoved += eraseDeadUnknownValueCalls(module);
   summary.DeadRegisterReadsRemoved += eraseDeadRegisterReads(module);
@@ -660,6 +678,8 @@ void printNativeRegisterFinalCleanupSummary(
      << summary.VarArgUnknownHelpersLowered
      << " poison_control_flow_conditions_replaced="
      << summary.PoisonControlFlowConditionsReplaced
+     << " poison_return_values_replaced="
+     << summary.PoisonReturnValuesReplaced
      << " function_metadata_cleared=" << summary.FunctionMetadataCleared
      << " instruction_metadata_cleared=" << summary.InstructionMetadataCleared
      << " remaining_register_accesses=" << summary.RemainingRegisterAccesses
