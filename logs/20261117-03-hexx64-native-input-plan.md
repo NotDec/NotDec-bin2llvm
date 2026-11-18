@@ -1067,3 +1067,42 @@ poison struct 的单索引 `insertvalue`，先把其余每个字段补成带归�
   上 `%unknown.field`（调用点读字段 1 不再是 poison）；`notdec.unknown` 调用数
   1219 → 1223；文本 poison 仍是 8（6 个是链基座、2 个是外部变参槽），但**会被读
   的 poison 字段已经清零**；`llvm-as`/`opt verify` 通过，`ctest` 19/19。
+
+## 28. 第 20 轮：没有返回值用途的间接调用补回实参
+
+### 28.1 现象
+
+FUN_2e83c0（`llvm.va_start` + `callui` 调用的 IDA 运行时辅助）汇编里给调用准备了
+四个实参：
+
+```
+movl $24,%edi
+movl $4,%esi
+movq %rdi,%rdx
+movq %rsp,%rcx
+callq *(%r8)
+```
+
+IR 里却是 `call void %0()` —— 四个实参全丢，寄存器准备代码随后被 DCE 删掉，
+调用会用调用者残留的寄存器值执行。
+
+### 28.2 根因
+
+`addIndirectCallsiteShapes` 只为出现在 `ReturnHelpers` / `RangeReturnHelpers` 里的
+间接调用建 shape；只丢弃返回值（或 void）的间接调用两者都不在，于是入参证据
+（`state.IndirectCallInputs`，由 `inferIndirectCallInputs` 从调用点槽证据算出）
+永远不会被用上，`collectSignatureCallArgs` 也不会收集实参，调用点保持无参。
+探针结果（`NOTDEC_TRACE_INDIRECT_INPUTS`）显示该调用点 `int=2`：RDI/RSI 是
+LocalDefinition、RDX/R8/R9 是 ForwardedEntry，前缀规则按设计停在 2。
+
+### 28.3 修复
+
+`addIndirectCallsiteShapes` 先遍历 `IndirectCallInputs`，为所有有入参证据的间接
+调用建 shape（只放形参），后面两个返回值循环再补返回值。
+
+### 28.4 验证
+
+- 单函数 `-f 0x2e83c0`：`call void %0()` → `call void %0(i64 24, i64 4)`
+  （第三、四个槽在 ForwardedEntry 之后，按既有前缀规则保守截断）。
+- hexx64.so 全量（native40）：带实参的间接调用 **1943 → 1985**（+42 个调用点恢复
+  实参）；poison 仍 8、unknown 仍 1223；`llvm-as`/`opt verify` 通过，`ctest` 19/19。

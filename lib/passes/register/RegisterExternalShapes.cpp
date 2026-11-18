@@ -824,10 +824,6 @@ void inferIndirectCallInputs(
         renumberedSlotsByKind(callsite, true);
     unsigned integerCount = localDefinitionPrefix(integerSlots);
     unsigned floatCount = localDefinitionPrefix(floatSlots);
-    if (integerCount == 0 && floatCount == 0) {
-      continue;
-    }
-
     std::vector<NativeRegisterCallInputSlot> inputs;
     unsigned integerSeen = 0;
     unsigned floatSeen = 0;
@@ -954,6 +950,23 @@ void addIndirectCallsiteShapes(
       }
     }
   };
+
+  // 只丢弃返回值/void 的间接调用不会出现在 ReturnHelpers / RangeReturnHelpers
+  // 里，但它们的入参证据同样有效（hexx64 FUN_2e83c0 里 `callui(24,4,arg,&ap)`
+  // 就是这样丢掉了全部实参）。先为所有有入参证据的间接调用建 shape，后面两个
+  // 循环再补返回值。
+  for (const auto &[call, inputs] : state.IndirectCallInputs) {
+    if (call == nullptr || call->getParent() == nullptr ||
+        call->getCalledFunction() != nullptr) {
+      continue;
+    }
+    llvm::CallBase *mutableCall = const_cast<llvm::CallBase *>(call);
+    if (state.IndirectCallShapes.count(mutableCall) != 0) {
+      continue;
+    }
+    SignatureShape &shape = state.IndirectCallShapes[mutableCall];
+    addIndirectInputParams(mutableCall, shape);
+  }
 
   for (const auto &[call, helpers] : state.ReturnHelpers) {
     if (call == nullptr || call->getParent() == nullptr ||
