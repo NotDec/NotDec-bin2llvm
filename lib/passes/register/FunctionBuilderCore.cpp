@@ -321,6 +321,25 @@ bool isPhiIncomingValue(const llvm::Value *value) {
 }
 } // namespace
 
+namespace {
+// 值是否被 notdec.reg.extract/insert 这类位段胶水 helper 当作源使用。这类链上
+// 的 poison 会被 InstCombine 折成 poison 常量，再顺着 extract 流到 select/phi/
+// ret（hexx64 里 151 个函数、749 个 extract）。所以胶水源上的操作数保留原值。
+bool isRangeHelperSource(const llvm::Value *value) {
+  for (const llvm::User *user : value->users()) {
+    auto *call = llvm::dyn_cast<llvm::CallBase>(user);
+    if (call == nullptr) {
+      continue;
+    }
+    if (parseNativeRegisterValueExtract(*call) ||
+        parseNativeRegisterValueInsert(*call)) {
+      return true;
+    }
+  }
+  return false;
+}
+} // namespace
+
 bool FunctionBuilder::rewriteUndemandedRegisterStoreOperands(
       llvm::Value *value, const std::map<llvm::Value *, llvm::APInt> &demands,
       llvm::SmallPtrSetImpl<llvm::Value *> &visiting) {
@@ -369,6 +388,11 @@ bool FunctionBuilder::rewriteUndemandedRegisterStoreOperands(
       // store（hexx64 里 94 个 phi、146 条入边）。保留原值，最坏退化成裸
       // 寄存器读。
       if (isPhiIncomingValue(operand)) {
+        continue;
+      }
+      // 当前指令的值还要作为位段 helper 的源时也不能下毒：helper 链会把
+      // poison 折成常量并流到观察点（见 isRangeHelperSource 注释）。
+      if (isRangeHelperSource(inst)) {
         continue;
       }
       llvm::Value *poison =

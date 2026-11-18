@@ -997,3 +997,39 @@ post-rewrite peephole 把 `extract(poison)` 折成 poison，poison 再顺着 sel
 
 已确认：把 `replacePoisonRangeExtracts(module)` 注释掉时该测试失败（poison 源的
 extract 残留），恢复后通过。`ctest` 19/19。
+
+## 26. 第 18 轮：位段胶水链的操作数不再按零 demand 下毒
+
+### 26.1 溯源结论
+
+给四个候选创建入口都加了 env-gated 探针（`NOTDEC_TRACE_POISON_EXTRACT=1`）并全量跑：
+`extractBitsFromInteger`、`extractBitsFromIntegerValue`、`createValueRangeExtract`、
+`recordReplacement`（target=poison）——**全部 0 命中**。结合 dump 里 0 个 poison
+store，机制是：
+
+1. partial-demand walk 把某个"位段重建计算"（binop 链）的**操作数**换成 poison；
+2. InstCombine 随后把整个 binop 折成 literal poison 常量并 RAUW，于是
+   `notdec.reg.extract.i64.i32(i64 poison, 0)` 出现（创建时源还是真实值）。
+
+所以不能只在创建点拦，要在 walk 侧拦住"会喂给位段 helper 的计算"。
+
+### 26.2 修复
+
+`rewriteUndemandedRegisterStoreOperands` 新增守卫：当前指令的值还被
+`notdec.reg.extract.*` / `notdec.reg.insert.*` 这类位段胶水 helper 当源使用时，
+不下毒它的操作数（`isRangeHelperSource`）。
+
+### 26.3 验证（hexx64.so 全量，native38）
+
+| 指标 | 修前（native34） | 修后（native38） |
+|------|------------------|------------------|
+| poison 总数 | 27 | **8** |
+| 调用实参 poison | 21 | 2 |
+| `unknowns`（notdec.unknown 调用数） | 1810 | **1219** |
+| `poison_range_extract_source` 使用数 | 149 | 44 |
+| 产物大小 | 84.0 MB | 87.8 MB（保留的未删计算） |
+
+`llvm-as` + `opt verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
+
+剩下的 8 个 poison：2 个外部/间接调用变参槽 + 6 个 select/insert 类死值。
+unknown 降了 591（位段 poison 链断掉后，大量级联 unknown 消失）。
