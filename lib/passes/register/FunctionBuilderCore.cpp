@@ -346,6 +346,13 @@ bool FunctionBuilder::rewriteUndemandedRegisterStoreOperands(
       // integer operand with poison keeps a missed observer visible instead of
       // silently manufacturing a valid-looking zero; normal DCE can still
       // remove stale register loads when the demand result is correct.
+      // select 的 condition 决定选哪个值，可能是地址/控制流的一部分；按零
+      // demand 把它换成 poison 会让整条地址链变成 UB（hexx64 FUN_153800：
+      // condition 的 icmp 被毒化，load 地址成 poison，整个函数体被 InstCombine
+      // 折成 unreachable 删掉）。condition 子树保留原样，最坏退化成裸读。
+      if (llvm::isa<llvm::SelectInst>(inst) && currentOperandIndex == 0) {
+        continue;
+      }
       llvm::Value *poison =
           undemandedStoreOperandPoison(operand->getType());
       if (poison == nullptr) {
@@ -663,6 +670,12 @@ std::map<llvm::Value *, llvm::APInt> FunctionBuilder::computePartialDemands() {
         }
         break;
       case llvm::Instruction::Select:
+        // condition 决定选哪个分支：结果一旦被使用，condition 就必须完整，否则
+        // 按 demand 走的时候 condition 是零 demand，会被 partial demand 当成死值
+        // 换成 poison。hexx64 FUN_153800：select 的 condition 参与内存地址计算，
+        // 被毒化后 load 变成 UB，InstCombine/SimplifyCFG 把整个函数体（128 个块）
+        // 折成 unreachable 删掉。
+        enqueue(inst->getOperand(0), fullMaskFor(inst->getOperand(0)));
         enqueue(inst->getOperand(1), inputDemand);
         enqueue(inst->getOperand(2), inputDemand);
         break;

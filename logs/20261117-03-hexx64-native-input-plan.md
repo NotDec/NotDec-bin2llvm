@@ -574,3 +574,65 @@ Native erase dead helpers: poison terminators replaced=2 (conditions=0, returns=
 - `llvm-as` + `opt -passes=verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
 - conditions=4 而 metadata 只有 3 个节点：LLVM 会 unique 字段完全相同的 MDNode
   （同一函数、同一 kind 的重复替换共用一个节点）。
+
+## 15. 第 7 轮：select 的 condition 被下毒导致整个函数体被删
+
+### 15.1 现象
+
+按 asm 指令数 / IR 语句数排序，`FUN_153800`（482 条 asm）在 final IR 里只剩 38 行、
+3 个块；discovery 里它有 132 个块。stage 000 有 132 块，register-elimination 之后
+只剩 4 块，并多出一条 `llvm.assume(i1 (ret == 0))`——整个函数体（128 个块）被
+InstCombine/SimplifyCFG 当死代码删掉了。
+
+### 15.2 根因（两个叠加）
+
+1. `computePartialDemands` 的 `Select` 分支只给两个候选值（operand 1/2）传 demand，
+   **没有给 condition（operand 0）传**。select 一旦被 demand（例如它的结果被当作
+   load/store 的地址），condition 在 demand 表里仍是零，走到它时被当成死值。
+2. `rewriteUndemandedRegisterStoreOperands` 按“零 demand → poison”处理 operand，
+   于是 select 的 condition 被换成 `poison`；condition 又是内存地址的一部分，
+   `load ptr (inttoptr (select i1 poison, ...))` 变成 UB，InstCombine/SimplifyCFG
+   把该块折成 `unreachable`，再把指向它的分支折成 `llvm.assume` + 单边跳转，
+   级联删掉整个函数体。
+
+用 `NOTDEC_DUMP_PREINST` 在 register elimination 内部的每次 InstCombine 前 dump
+可复现：修 demand 前 `preinst_0` 已有 `select i1 poison`；补上 demand 后
+`preinst_0` 干净，但第二遍清理（iteration 1）的 walk 又把新 select 的 condition
+毒化（`preinst_1` 出现 `select i1 poison`）。所以两处都需要修。
+
+### 15.3 修复
+
+- `computePartialDemands` 的 `Select` 分支补上
+  `enqueue(operand(0), fullMaskFor(...))`：condition 决定选哪个值，结果被使用就
+  必须完整。
+- `rewriteUndemandedRegisterStoreOperands` 里，`select` 的 condition 子树**保留
+  原样、不按零 demand 下毒**：最坏退化成裸寄存器读，符合“载体 > 裸读 > unknown”。
+- 新增单测 `testPartialDemandKeepsSelectCondition`（去掉任一修复都会失败：
+  “partial demand replaced the select condition with poison”）。
+
+### 15.4 验证
+
+- `FUN_153800` 单函数：register-elimination 后 132 → **98 块**（修前 4 块）、
+  `llvm.assume` 0 条（修前 2 条）；最终 IR 96 块 / 1386 行（修前 38 行），
+  `llvm-as` + `opt -passes=verify` 通过。
+- `ctest` 19/19（含 fortune x86_64/i386）。
+
+### 15.5 全量 hexx64 结果（native17 vs native16）
+
+| 指标 | 修前 | 修后 |
+|------|------|------|
+| poison 总数 | 4347 | **4215** |
+| phi 入边 poison | 279 | **158** |
+| `br i1 poison` / literal `ret poison` | 0 / 0 | 0 / 0 |
+| final-cleanup 终结指令替换 | 9（条件 4、返回 5） | **0**（不再需要兜底） |
+| 产物大小 | 87.3 MB | 87.7 MB（多保住 0.4 MB 代码） |
+| 极端坍缩函数（final < 20% × stage000 块数） | 145 | **139** |
+
+- `FUN_153800`、`FUN_15d620` 已从坍缩名单里消失；`llvm-as` + `opt -passes=verify`
+  通过，`ctest` 19/19。
+- 还剩 139 个极端坍缩函数，其中 21 个在 lowering（stage 000）就已经坍缩——例如
+  `FUN_210d80`：discovery 68 块，lowering 只剩 8 块，函数体在 0x3898b 附近被一条
+  反调试 `jne .L_389b5` 带偏，主体块全部不可达后被删。这类属于 lowering/CFG
+  的问题（不是寄存器消除），留作下一批。
+- 调试钩子：`NOTDEC_DUMP_PREINST=<dir>` 会在 register elimination 内部每次
+  InstCombine 前 dump 当前 module，定位"哪一遍 InstCombine 删的代码"很方便。

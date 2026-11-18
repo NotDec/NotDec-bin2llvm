@@ -5067,6 +5067,64 @@ bool testPartialDemandKeepsDynamicShiftAmount() {
                   "module failed verifier after dynamic shift demand test");
 }
 
+bool testPartialDemandKeepsSelectCondition() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-partial-demand-select-condition", context);
+  attachTestAbiWithInputs(module, {"RDI", "RSI", "RDX", "RCX"});
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *rsi = createRegisterGlobal(module, "RSI");
+
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "select_condition_helper",
+      module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", callee);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *value = loadRegister(builder, rsi, "RSI", "value");
+  llvm::Value *condition =
+      builder.CreateICmpEQ(value, llvm::ConstantInt::get(i64, 0), "cond");
+  // select 的 condition 必须先被 demand 到，否则 partial demand 会把 condition
+  // 换成 poison（hexx64 FUN_153800 的地址选择 select 就这样毒化了整条地址链）。
+  llvm::Value *selected =
+      builder.CreateSelect(condition, llvm::ConstantInt::get(i64, 16),
+                           llvm::ConstantInt::get(i64, 32), "selected");
+  storeRegister(builder, rax, selected, "RAX");
+  builder.CreateRetVoid();
+
+  // 调用点观察 RAX 返回，select 才有真实 demand。
+  llvm::Function *caller = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "use_select_condition", module);
+  llvm::BasicBlock *callerEntry =
+      llvm::BasicBlock::Create(context, "entry", caller);
+  builder.SetInsertPoint(callerEntry);
+  llvm::Value *sink = builder.CreateAlloca(i64);
+  builder.CreateCall(type, callee);
+  builder.CreateStore(loadRegister(builder, rax, "RAX", "returned"), sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
+  options.EnablePostRewriteInstCombine = false;
+  notdec::bin2llvm::runNativeRegisterElimination(module, options);
+  llvm::Function *rewritten = module.getFunction("select_condition_helper");
+  llvm::SelectInst *select = nullptr;
+  if (rewritten != nullptr) {
+    for (llvm::Instruction &inst : llvm::instructions(*rewritten)) {
+      if (auto *candidate = llvm::dyn_cast<llvm::SelectInst>(&inst)) {
+        select = candidate;
+        break;
+      }
+    }
+  }
+  if (select == nullptr) {
+    module.print(llvm::errs(), nullptr);
+  }
+  return expect(select != nullptr, "select was removed") &&
+         expect(!llvm::isa<llvm::PoisonValue>(select->getCondition()),
+                "partial demand replaced the select condition with poison") &&
+         verifyOk(module, "module failed verifier after select condition test");
+}
+
 bool testPartialDemandKeepsSameWidthMulOperand() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-demand-same-width-mul", context);
@@ -6554,6 +6612,7 @@ int main() {
   ok &= testPartialDemandPoisonReplacementIsMarked();
   ok &= testPartialDemandKeepsDynamicShiftAmount();
   ok &= testPartialDemandKeepsSameWidthMulOperand();
+  ok &= testPartialDemandKeepsSelectCondition();
   ok &= testPartialDemandKeepsDivRemOperand();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();

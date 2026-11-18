@@ -1,5 +1,7 @@
 #include "RegisterEliminationInternal.h"
 
+#include <cstdlib>
+
 namespace notdec::bin2llvm {
 
 NativeRegisterCallInputSlot callInputSlot(const NativeSignatureSlot &slot) {
@@ -1430,6 +1432,16 @@ bool runPostRewriteInstCombine(llvm::Module &module) {
   builder.crossRegisterProxies(loopAnalysis, functionAnalysis, cgsccAnalysis,
                                moduleAnalysis);
 
+  if (const char *dumpDir = std::getenv("NOTDEC_DUMP_PREINST")) {
+    static unsigned dumpCounter = 0;
+    std::string path = std::string(dumpDir) + "/preinst_" +
+                       std::to_string(dumpCounter++) + ".ll";
+    std::error_code ec;
+    llvm::raw_fd_ostream out(path, ec);
+    if (!ec) {
+      module.print(out, nullptr);
+    }
+  }
   llvm::FunctionPassManager functionPasses;
   functionPasses.addPass(llvm::InstCombinePass());
   functionPasses.addPass(llvm::SimplifyCFGPass());
