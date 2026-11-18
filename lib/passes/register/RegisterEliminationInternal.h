@@ -1000,6 +1000,12 @@ private:
       llvm::SmallPtrSetImpl<llvm::Value *> &visiting);
 
   std::map<llvm::Value *, llvm::APInt> computePartialDemands();
+  // 本函数里"喂给调用实参"的值的依赖闭包：这些指令的操作数不能按零 demand
+  // 下毒（调用实参是最高优先级载体，链上任何一段变成 poison 都会让整个实参
+  // 退化成 unknown；hexx64 里 memmove/memset 的长度参数就是这样丢的）。
+  void collectCallArgDependencies();
+  llvm::DenseSet<llvm::Value *> CallArgDependencyValues;
+  bool CallArgDependenciesCollected = false;
 
   void rewritePartialWrites();
 

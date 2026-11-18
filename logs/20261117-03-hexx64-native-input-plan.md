@@ -1106,3 +1106,53 @@ LocalDefinition、RDX/R8/R9 是 ForwardedEntry，前缀规则按设计停在 2�
   （第三、四个槽在 ForwardedEntry 之后，按既有前缀规则保守截断）。
 - hexx64.so 全量（native40）：带实参的间接调用 **1943 → 1985**（+42 个调用点恢复
   实参）；poison 仍 8、unknown 仍 1223；`llvm-as`/`opt verify` 通过，`ctest` 19/19。
+
+## 29. 第 21 轮：调用实参的依赖闭包不再按零 demand 下毒
+
+### 29.1 现象
+
+`call_arg_uses_poison_value`（148 个元数据点，179 处使用）几乎全是
+`memmove`/`memset` 的**长度参数 RDX**：例如 FUN_4a090 里
+
+```
+%53 = call i64 @memmove(i64 %dst, i64 %src, i64 %RDX.arg_unknown)
+%RDX.arg_unknown = call i64 @notdec.unknown.i64(), !notdec.unknown.source !...
+```
+
+汇编里长度是完整算出来的（`sub/sar/imul/leaq/shl` 链），IR 只剩 unknown。
+
+### 29.2 根因
+
+walk 跑在签名重写**之前**：此时外部调用的实参还没出现在 `call` 指令上（`call`
+是无参的），所以实参寄存器的写入链没有任何 observer、零 demand。`rewriteLoads`
+先把 `load @RAX` 之类的读换成共享的 SSA 值，之后 walk 看到某个 store 是死的，
+就把它的操作数下毒——而那个操作数链和实参链是**同一个值**，于是实参链
+`valueDependsOnPoison` 成立，调用点只能落成 unknown。
+
+### 29.3 修复
+
+`renderPartialWrites` 开头新增 `collectCallArgDependencies()`：用
+`isRecordedCallArgValue` 在函数里找出所有"调用实参记录值"，沿操作数做传递闭包，
+得到"喂给调用实参"的指令集合；walk 里遇到集合内的指令时不下毒它的操作数
+（和 `isRangeHelperSource` 同一思路，实参是最高优先级载体）。
+
+### 29.4 验证
+
+单函数 `-f 0x4a090`：`%53 = call i64 @memmove(..., i64 %52)`（长度链恢复），
+第二个 memmove 的长度也是真实值。
+
+hexx64.so 全量（native42）：
+
+| 指标 | 修前（native40） | 修后（native42） |
+|------|------------------|------------------|
+| `notdec.unknown` 调用数 | 1223 | **728**（−495） |
+| poison | 8 | 6 |
+| `call_arg_uses_poison_value` | 148 | **0** |
+| `vararg_arg_uses_poison_value` | 111 | **0** |
+| `poison_range_extract_source` | 44 | **0** |
+| 产物大小 | 87.8 MB | 88.1 MB |
+
+`llvm-as` + `opt verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
+剩下的 unknown 主要是 `return_binding_uses_clobber_value`（314）和
+`range_return_rewrite_missing_value`（157）——都是"外部调用没原型/返回槽位宽
+不足"的固有缺口。

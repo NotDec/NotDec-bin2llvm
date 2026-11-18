@@ -395,6 +395,12 @@ bool FunctionBuilder::rewriteUndemandedRegisterStoreOperands(
       if (isRangeHelperSource(inst)) {
         continue;
       }
+      // 当前指令位于"喂给调用实参"的依赖闭包里时不能下毒：实参是最高优先级
+      // 的载体，链上任何一段变成 poison 都会让整个实参退化成 unknown
+      // （hexx64 里 memmove/memset 的长度参数，见 collectCallArgDependencies）。
+      if (CallArgDependencyValues.count(inst) != 0) {
+        continue;
+      }
       llvm::Value *poison =
           undemandedStoreOperandPoison(operand->getType());
       if (poison == nullptr) {
@@ -859,8 +865,38 @@ std::map<llvm::Value *, llvm::APInt> FunctionBuilder::computePartialDemands() {
     return demands;
   }
 
+void FunctionBuilder::collectCallArgDependencies() {
+    if (CallArgDependenciesCollected) {
+      return;
+    }
+    CallArgDependenciesCollected = true;
+    std::vector<llvm::Value *> worklist;
+    for (llvm::Instruction &inst : llvm::instructions(Function)) {
+      // isRecordedCallArgValue 只做指针比较（resolve 不解引用），跨迭代残留的
+      // 记录值即使已经被删也不会踩空。
+      if (isRecordedCallArgValue(&inst)) {
+        worklist.push_back(&inst);
+      }
+    }
+    while (!worklist.empty()) {
+      llvm::Value *value = worklist.back();
+      worklist.pop_back();
+      auto *inst = llvm::dyn_cast_or_null<llvm::Instruction>(value);
+      if (inst == nullptr || inst->getFunction() != &Function ||
+          !CallArgDependencyValues.insert(inst).second) {
+        continue;
+      }
+      for (llvm::Value *operand : inst->operands()) {
+        if (operand != nullptr) {
+          worklist.push_back(resolve(operand));
+        }
+      }
+    }
+  }
+
 void FunctionBuilder::rewritePartialWrites() {
     UndemandedWalkClean.clear();
+    collectCallArgDependencies();
     std::map<llvm::Value *, llvm::APInt> demands = computePartialDemands();
     // rewritePartialReads()/rewriteLoads() 已经跑过；它们这遍没能替换掉的读都在
     // UnresolvedReadGlobals 里。这些读的 demand 在 SSA 上接不到写侧，此时若按
