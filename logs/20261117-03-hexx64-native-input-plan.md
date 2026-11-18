@@ -968,3 +968,32 @@ post-rewrite peephole 把 `extract(poison)` 折成 poison，poison 再顺着 sel
 27 个，全部是**外部/间接调用的变参槽**（`pack_dq` / `copy_tinfo_t` /
 `clear_tinfo_t` / `qsnprintf` 等导入）加 1 个 `insertvalue`。前者是
 `vararg_unknown` 降级路径的既定设计（fortune 零-unknown 门槛依赖它）。
+
+## 25. 第 17 轮：poison 位段源的溯源（未果）与回归测试
+
+### 25.1 溯源尝试
+
+目标：找出 749 个 `notdec.reg.extract(poison)` 的创建者，从源头消除而不只是表示层
+兜底。在三个入口加了 env-gated 探针 `NOTDEC_TRACE_POISON_EXTRACT=1`：
+
+- `extractBitsFromInteger`（位段提取调用创建点）：0 次命中；
+- `recordReplacement`（值替换点，检查 target 是 poison）：0 次命中；
+- 配合 `NOTDEC_DUMP_AFTER_REG` 的 dump：0 个 `store ... poison`。
+
+结论：poison 不是从这两个"值传入/替换"入口进来的。剩下的候选是
+`extractBitsFromIntegerValue`（`currentSegment`/`materializeCoveredAccess` 用的另一
+个创建点）或签名重写的 `createValueRangeExtract`，也可能是 partial-range 重建时
+"没有旧值"用的 poison 基座；本轮没有钉死。探针已全部移除。
+
+### 25.2 交付：回归测试
+
+`testPoisonRangeExtractBecomesAttributedUnknown`：构造
+`%seg = call i32 @notdec.reg.extract.i64.i32(i64 poison, i64 0)` 的函数，跑完
+`runNativeRegisterElimination` 后断言：
+
+- 模块里不再有"源是 poison"的 `notdec.reg.extract.*` 调用；
+- 存在 `reason=poison_range_extract_source` 的带归因 `notdec.unknown`；
+- 模块通过 verifier。
+
+已确认：把 `replacePoisonRangeExtracts(module)` 注释掉时该测试失败（poison 源的
+extract 残留），恢复后通过。`ctest` 19/19。

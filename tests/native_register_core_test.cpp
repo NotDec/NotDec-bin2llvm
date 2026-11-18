@@ -5067,6 +5067,77 @@ bool testPartialDemandKeepsDynamicShiftAmount() {
                   "module failed verifier after dynamic shift demand test");
 }
 
+bool testPoisonRangeExtractBecomesAttributedUnknown() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-poison-range-extract", context);
+  attachTestAbi(module);
+
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+  auto *extractType = llvm::FunctionType::get(i32, {i64, i64}, false);
+  llvm::FunctionCallee extract =
+      module.getOrInsertFunction("notdec.reg.extract.i64.i32", extractType);
+  auto *type = llvm::FunctionType::get(i32, {}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "poison_extract_helper",
+      module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  // 位段读取的源是 poison：寄存器消除结束时必须换成带归因的 unknown，
+  // 否则 post-rewrite peephole 会把它折成 poison 并流进 ret/br。
+  llvm::Value *segment = builder.CreateCall(
+      extract, {llvm::PoisonValue::get(i64), llvm::ConstantInt::get(i64, 0)},
+      "range_segment");
+  llvm::Value *result = builder.CreateAdd(
+      segment, llvm::ConstantInt::get(i32, 1), "result");
+  builder.CreateRet(result);
+
+  notdec::bin2llvm::runNativeRegisterElimination(module);
+
+  bool foundPoisonExtract = false;
+  bool foundAttributedUnknown = false;
+  for (llvm::Function &fn : module) {
+    for (llvm::Instruction &inst : llvm::instructions(fn)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee == nullptr) {
+        continue;
+      }
+      if (callee->getName().starts_with("notdec.reg.extract.")) {
+        for (llvm::Value *argument : call->args()) {
+          if (llvm::isa<llvm::PoisonValue>(argument)) {
+            foundPoisonExtract = true;
+          }
+        }
+      }
+      if (llvm::MDNode *source =
+              call->getMetadata("notdec.unknown.source")) {
+        for (const llvm::MDOperand &operand : source->operands()) {
+          auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+          if (text != nullptr &&
+              text->getString() == "reason=poison_range_extract_source") {
+            foundAttributedUnknown = true;
+          }
+        }
+      }
+    }
+  }
+  if (foundPoisonExtract || !foundAttributedUnknown) {
+    module.print(llvm::errs(), nullptr);
+  }
+  return expect(!foundPoisonExtract,
+                "poison-sourced range extract remained after register "
+                "elimination") &&
+         expect(foundAttributedUnknown,
+                "poison-sourced range extract was not replaced with an "
+                "attributed unknown") &&
+         verifyOk(module,
+                  "module failed verifier after poison range extract test");
+}
+
 bool testPartialDemandKeepsSelectCondition() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-partial-demand-select-condition", context);
@@ -6613,6 +6684,7 @@ int main() {
   ok &= testPartialDemandKeepsDynamicShiftAmount();
   ok &= testPartialDemandKeepsSameWidthMulOperand();
   ok &= testPartialDemandKeepsSelectCondition();
+  ok &= testPoisonRangeExtractBecomesAttributedUnknown();
   ok &= testPartialDemandKeepsDivRemOperand();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();
