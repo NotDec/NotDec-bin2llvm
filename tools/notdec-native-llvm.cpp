@@ -772,6 +772,25 @@ bool shouldLowerNativeFunction(
          !notdec::bin2llvm::isNativeRuntimeFunction(state, function);
 }
 
+// PLT 桩是链接器生成的跳板（.plt/.plt.got/.plt.sec 里 16 字节一条），不是
+// 用户代码。lifted IR 里真实调用点已经通过 ExternalCallTargets 解析成对导入
+// 符号的调用，留下桩函数只会带出 "tail call void %ptr(); ret unknown" 这类
+// 噪声（hexx64 里 1070 个桩、145 条 return_clobber unknown）。这些桩函数在
+// 产物里也没有调用者，直接跳过；带 --skip-runtime 时它们本来就会被跳过。
+bool isPltStubAddress(const notdec::bin2llvm::NativeProgramState &state,
+                      uint64_t address) {
+  static constexpr const char *PltSections[] = {".plt", ".plt.got", ".plt.sec"};
+  for (const char *name : PltSections) {
+    std::optional<notdec::bin2llvm::NativeSectionInfo> section =
+        sectionByName(state, name);
+    if (section && address >= section->Address &&
+        address < section->Address + section->Size) {
+      return true;
+    }
+  }
+  return false;
+}
+
 NativeCallTargets planNativeCallTargets(
     const notdec::bin2llvm::NativeProgramState &state,
     bool skipRuntimeFunctions) {
@@ -931,6 +950,7 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
 
   unsigned appended = 0;
   unsigned skippedRuntime = 0;
+  unsigned skippedPltStubs = 0;
   // One parsed SLEIGH spec for every function.  Reparsing the .sla per
   // function used to dominate the confirmed-module build (about a third of a
   // wrk run); the discovery decoder already reuses one engine the same way.
@@ -938,6 +958,10 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
                                                           std::cerr);
   for (const auto &[entry, function] : state.functions()) {
     (void)entry;
+    if (isPltStubAddress(state, function.Entry)) {
+      ++skippedPltStubs;
+      continue;
+    }
     if (!shouldLowerNativeFunction(state, function, skipRuntimeFunctions)) {
       if (function.RangeEnd > function.Entry && skipRuntimeFunctions) {
         ++skippedRuntime;
@@ -999,6 +1023,10 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
 
   if (skippedRuntime != 0) {
     std::cerr << "skipped runtime native functions: " << skippedRuntime
+              << '\n';
+  }
+  if (skippedPltStubs != 0) {
+    std::cerr << "skipped PLT stub native functions: " << skippedPltStubs
               << '\n';
   }
 

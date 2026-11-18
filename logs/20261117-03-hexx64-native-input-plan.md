@@ -715,3 +715,40 @@ InstCombine/SimplifyCFG 当死代码删掉了。
   调用实参 poison 减少 2793（1878 个是 known-zero 假零，其余是级联：值不再经过
   poison，链上后续槽也不再被毒化）。`llvm-as` + `opt verify` 通过，7257 函数、
   0 skip。
+
+## 18. 第 10 轮：PLT 桩不再当普通函数 lifting
+
+### 18.1 观察
+
+hexx64 的 7257 个函数里有 **1070 个落在 `.plt` / `.plt.got` / `.plt.sec`**（16 字节
+一条的链接器跳板；PLT0 被其余 554 条桩 tail call）。这些桩被当成普通函数 lift：
+
+```llvm
+%ptr = inttoptr (load GOT-slot)
+tail call void %ptr()
+ret i64 <unknown>          ; return_binding_uses_clobber_value
+```
+
+带出 145 条 `return_binding_uses_clobber_value` unknown。但真实调用点在降低时已经
+通过 `ExternalCallTargets` 解析成对导入符号的直接调用，全量 IR 里**没有任何非 .plt
+函数调用 .plt 里的函数**（脚本核对过），这些桩在产物里是死代码。
+
+### 18.2 改动
+
+`tools/notdec-native-llvm.cpp` 新增 `isPltStubAddress()`：降低时跳过
+`.plt`/`.plt.got`/`.plt.sec` 里的函数，并打印
+`skipped PLT stub native functions: N`。`--skip-runtime` 行为不变（这些函数本来就被
+它跳过；fortune 两个用例都用 `--skip-runtime`，产物不变）。
+
+### 18.3 验证（hexx64.so 全量）
+
+| 指标 | 修前 | 修后 |
+|------|------|------|
+| 函数数 | 7257 | **6187**（−1070 桩） |
+| `unknowns` | 702 | **559** |
+| `return_binding_uses_clobber_value` | 459 | **314** |
+| poison 总数 | 1418 | 1399 |
+| 调用实参 poison | 1230 | 1204 |
+| 产物大小 | 87.71 MB | 87.38 MB |
+
+`llvm-as` + `opt verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
