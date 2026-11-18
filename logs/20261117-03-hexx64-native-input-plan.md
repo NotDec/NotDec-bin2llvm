@@ -925,3 +925,46 @@ materialize/currentSegment 的 poison 源）。下一步要么给全量 dump 加
 追踪（在寄存器消除内部的最终产物上打标），要么把 `notdec.reg.extract(poison)`
 在 peephole 之前统一换成带归因 unknown（表示层兜底，和 final cleanup 的三处
 兜底同一思路）。
+
+## 24. 第 16 轮：poison 位段源的兜底替换（phi poison 主源找到）
+
+### 24.1 定位
+
+新增调试钩子 `NOTDEC_DUMP_AFTER_REG=<path>`（在 register-elimination stage 结束后
+dump 整个 module），全量跑一次得到寄存器消除后的真实状态（139 MB）：
+
+- **literal-poison phi 入边：0 个**；
+- `notdec.reg.extract.i64.*(i64 poison, off)`：**749 个**，分布在 151 个函数里；
+- 典型形态：`%range_segment336 = call i32 @notdec.reg.extract.i64.i32(i64 poison, i64 0)`
+  再被 select 使用。
+
+结论：extract 创建时源还是真实值，是后续迭代的 partial-demand walk 把源下毒；
+post-rewrite peephole 把 `extract(poison)` 折成 poison，poison 再顺着 select/phi
+流到 ret/br/store。所以第 23 节在 `currentSegment`/`materializeCoveredAccess` 加的
+"poison 不作源"守卫没用（创建时源还不是 poison）。
+
+### 24.2 修复
+
+`runNativeRegisterElimination` 末尾（peephole 之前）新增
+`replacePoisonRangeExtracts()`：把所有源是 literal poison 的
+`notdec.reg.extract.*` 调用替换成带归因的 `notdec.unknown`
+（reason=`poison_range_extract_source`），表示层兜底。
+
+### 24.3 验证（hexx64.so 全量，native34）
+
+| 指标 | 修前（native31） | 修后（native34） |
+|------|------------------|------------------|
+| poison 总数 | 43 | **27** |
+| `poison_phi_incoming` 使用数 | 450 | **0** |
+| 调用实参 poison | 33 | 21 |
+| 其它 poison | 10 | 6 |
+| `unknowns` | 1668 | 1810（+142，带归因） |
+| 产物大小 | 84 MB | 84 MB |
+
+`llvm-as` + `opt verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
+
+### 24.4 剩余 poison
+
+27 个，全部是**外部/间接调用的变参槽**（`pack_dq` / `copy_tinfo_t` /
+`clear_tinfo_t` / `qsnprintf` 等导入）加 1 个 `insertvalue`。前者是
+`vararg_unknown` 降级路径的既定设计（fortune 零-unknown 门槛依赖它）。

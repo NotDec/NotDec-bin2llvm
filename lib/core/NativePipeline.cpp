@@ -1,5 +1,7 @@
 #include "notdec-bin2llvm/core/NativePipeline.h"
 
+#include <cstdlib>
+
 #include "notdec-bin2llvm/core/NativeIROverride.h"
 #include "notdec-bin2llvm/passes/function-pointer/NativeFunctionPointerPromotion.h"
 #include "notdec-bin2llvm/passes/register/NativeRegisterFinalCleanup.h"
@@ -221,6 +223,13 @@ bool runRegisterEliminationStage(const NativeStageConfig &Stage,
                                   Config.IgnoredRegisters.end());
   Context.EliminationSummary =
       runNativeRegisterElimination(Context.Module, Options);
+  if (const char *dumpPath = std::getenv("NOTDEC_DUMP_AFTER_REG")) {
+    std::error_code EC;
+    llvm::raw_fd_ostream Out(dumpPath, EC);
+    if (!EC) {
+      Context.Module.print(Out, nullptr);
+    }
+  }
   Context.AbiForAllFunctions = Options.AbiForAllFunctions;
   return true;
 }

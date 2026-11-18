@@ -67,6 +67,47 @@ auditNativeRegisterValueSources(llvm::Module &module,
   return auditRegisterValueSourcesImpl(module, abiForAllFunctions);
 }
 
+namespace {
+// 把源是 literal poison 的 notdec.reg.extract.* 调用换成带归因的
+// notdec.unknown（reason=poison_range_extract_source），避免 poison 顺着位段
+// 链流进 select/phi/ret。
+uint64_t replacePoisonRangeExtracts(llvm::Module &module) {
+  uint64_t replaced = 0;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    std::vector<llvm::CallInst *> poisonExtracts;
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      std::optional<NativeRegisterValueExtractInfo> extract =
+          parseNativeRegisterValueExtract(*call);
+      if (!extract || !llvm::isa<llvm::PoisonValue>(extract->FullValue)) {
+        continue;
+      }
+      poisonExtracts.push_back(call);
+    }
+    for (llvm::CallInst *call : poisonExtracts) {
+      if (call->getParent() == nullptr) {
+        continue;
+      }
+      llvm::IRBuilder<> builder(call);
+      llvm::Value *unknown = unknownValueAt(builder, call->getType(),
+                                            "range_extract_unknown");
+      attachUnknownValueMetadata(unknown, "poison_range_extract_source",
+                                 function.getName(), "", "", "range_extract");
+      call->replaceAllUsesWith(unknown);
+      call->eraseFromParent();
+      ++replaced;
+    }
+  }
+  return replaced;
+}
+} // namespace
+
 NativeRegisterEliminationSummary
 runNativeRegisterElimination(llvm::Module &module,
                             const NativeRegisterEliminationOptions &options) {
@@ -290,6 +331,10 @@ runNativeRegisterElimination(llvm::Module &module,
     eraseDeadSummaryCallValueHelpers(module);
     eraseUnusedSummaryHelperDeclarations(module);
   }
+  // 位段读取的源如果被下毒，`notdec.reg.extract.iFULL.iW(poison, off)` 会在
+  // post-rewrite peephole 里被折成 poison，再顺着 select/phi 流到 ret/br/store。
+  // 这里统一换成带归因的 unknown：表示层兜底，代价是这些位段变成未知值。
+  replacePoisonRangeExtracts(module);
   summary.FunctionsSeen = summary.Functions.size();
   summary.Warnings = collectRemainingCallValueWarnings(module);
   summary.Warnings.insert(summary.Warnings.end(),
