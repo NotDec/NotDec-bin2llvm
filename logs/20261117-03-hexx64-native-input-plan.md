@@ -671,3 +671,47 @@ InstCombine/SimplifyCFG 当死代码删掉了。
 - 顺带纠正一个度量口径：**块数坍缩不等于丢代码**。例如 `FUN_8a140` 39 块 → 1 块，
   但它是直线代码 + 36 条无条跳（调用边界拆分），语句全在（156 行），合并是
   正确行为。判断丢代码要看 asm 指令数 / IR 语句数，而不是块数。
+
+## 17. 第 9 轮：变参槽不要毒化"数据流里真实的 0"
+
+### 17.1 现象与证据
+
+全量 IR 里约 4000 个调用实参是 `poison`，其中 3227 个来自
+`notdec.register.vararg_unknown.*`（final cleanup 降级成 poison）。在
+`005-final-cleanup-before` 的 dump 里按归因统计：**1878 / 3227 是
+`vararg_arg_unproven_zero`**，即"IR 能证明这个值就是 0"却被换成了占位。
+
+`shouldPoisonUnprovenVarArg` 的旧规则：`computeKnownBits(value).isZero()` 就换
+`vararg_unknown`。但：
+
+- `valueMayDependOnUnknownPlaceholder` 已经把 poison / undef / freeze / 已知占位
+  调用排除在外；
+- 剩下的 known-zero 是真实数据流（`xorl %edi,%edi`、`movl $0,...`、真实算术）
+  证明出来的 0，传 0 是忠实翻译；
+- 换成 `vararg_unknown → poison` 既让调用点成为 UB，又丢失
+  `!notdec.unknown.source` 归因（poison 带不了 metadata）。
+
+### 17.2 修复
+
+`shouldPoisonUnprovenVarArg` 只保留"依赖 unknown 占位"这一条：真实值（包括真实
+的 0）原样传进变参槽。`testKnownVarArgUnknownPhiTailUsesPoison` 仍通过（它的值
+依赖 `freeze(poison)`，属于占位）。
+
+### 17.3 验证
+
+- `ctest` 19/19（含 fortune x86_64/i386；fortune 的 `notdec.unknown` 门槛不受
+  影响）。
+- hexx64 全量（native19 vs native18）：
+
+| 指标 | 修前 | 修后 |
+|------|------|------|
+| poison 总数 | 4215 | **1418** |
+| 调用实参 poison | 4023 | **1230** |
+| phi 入边 poison | 158 | 158 |
+| `br i1 poison` / literal `ret poison` | 0 / 0 | 0 / 0 |
+| `unknowns` | 691 | 702（+11） |
+| 产物大小 | 87.73 MB | 87.71 MB |
+
+  调用实参 poison 减少 2793（1878 个是 known-zero 假零，其余是级联：值不再经过
+  poison，链上后续槽也不再被毒化）。`llvm-as` + `opt verify` 通过，7257 函数、
+  0 skip。

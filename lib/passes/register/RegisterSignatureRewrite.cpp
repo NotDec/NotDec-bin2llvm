@@ -784,18 +784,14 @@ bool shouldPoisonUnprovenVarArg(const CallArgStoreBinding &binding,
                                 const llvm::DataLayout &layout,
                                 const llvm::Instruction *context) {
   (void)binding;
-  if (valueMayDependOnUnknownPlaceholder(value)) {
-    return true;
-  }
-  if (llvm::isa_and_nonnull<llvm::ConstantInt>(value)) {
-    return false;
-  }
-  if (value == nullptr || !value->getType()->isIntegerTy()) {
-    return false;
-  }
-  llvm::KnownBits known =
-      llvm::computeKnownBits(value, layout, nullptr, context);
-  return known.isZero();
+  (void)layout;
+  (void)context;
+  // 只要值不依赖 poison / undef / freeze / unknown 占位，它就是数据流里
+  // 真实的值；即使恰好是 0（`xorl %edi,%edi`、`movl $0,...` 这类真实初始化）
+  // 也应当原样传进变参槽。旧规则"known-zero 就换占位"会把这类真实零也变成
+  // vararg_unknown→poison：既丢了 !notdec.unknown.source 归因，又让调用点
+  // 成为 UB（hexx64 全量 3227 个变参占位里有 1878 个是这种假零）。
+  return valueMayDependOnUnknownPlaceholder(value);
 }
 
 bool collectInsertedExtractPieces(
