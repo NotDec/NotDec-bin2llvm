@@ -1210,3 +1210,47 @@ case 值和目标块全部对得上。单元测试 `testNativeIndirectBranchLowe
 ### 30.4 结论
 
 跳转表、栈帧、尺寸三类审计均通过；本轮无代码改动。
+
+## 31. 第 23 轮：收尾核查与最终状态
+
+### 31.1 两个候选改动（都回退）
+
+1. **内部变参 callee 跳过 vararg_unknown**（保留真实值）：实测 0 效果
+   （728 → 728、poison 6 → 6）。剩下的 73 个 `poison_call_argument` 都发生在
+   重写时还是**间接调用**的调用点（callee 后来才被函数指针提升解析成内部变参
+   函数），走的是"外部/间接"路径（那条路径的 poison 是 fortune 零-unknown 门槛
+   的既定表示）。已回退。
+2. **纯 clobber 返回槽保留 clobber 载体**（预期 −314 unknown）：
+   `notdec.register_elimination.core` / `.stack` 两个单测立刻失败
+   （"internal return exposed external clobber helper"）——设计上内部函数返回槽
+   不允许把外部 clobber helper 暴露给调用者；fortune 门槛也禁止
+   `notdec.register.summary_clobber` 出现在产物里。已回退。
+
+### 31.2 新增核查
+
+- **常量地址访问**：3952 处 `inttoptr (i64 K to ptr)` 全部落在
+  `notdec.memory_map` 的两段区间内（代码 0x0..0x3EE990、数据
+  0x5EF468..0x601F68），无越界/错地址。
+- **`return_binding_uses_clobber_value` 的需求来源**：以 FUN_110760 为例，
+  R9/R10 返回槽不是凭空来的——FUN_d6110、FUN_2921b0 等调用点确实
+  `extractvalue` 了 R9/R10 槽位；函数体在这些路径上最后一次调用（qfree 等）
+  不产生 R9/R10，所以"返回 clobber 的值"是真实数据流，unknown 是忠实表示。
+- 另有 2 个 `call_effect_mixed`（FUN_326470 的 RDI 读）：callee 的 summary
+  同时把 RDI 记成 read_entry 和 modifies，调用后只能按 clobber 处理，忠实。
+
+### 31.3 最终状态（native44，本轮 reverted 构建）
+
+| 指标 | 第 9 轮基线 | 现在 |
+|------|-------------|------|
+| poison | 4347 | **6** |
+| `notdec.unknown` 调用数 | 1723 | **728** |
+| 函数数 | 6187 | 6187 |
+| `llvm-as`/`opt verify` | ok | ok |
+| `ctest` | 19/19 | 19/19 |
+
+剩余 unknown 的分布：`return_binding_uses_clobber_value` 314、
+`range_return_rewrite_missing_value` 157、`poison_call_argument` 73（间接变参
+调用点的既定设计）、`call_arg_rewrite_missing_binding` 5、
+`poison_aggregate_field` 4、`call_effect_mixed` 2。全部是"外部调用无原型 /
+返回槽位宽不足 / 间接变参未证"的固有缺口或有意为之的设计取舍，不再有可安全
+消除的类别。
