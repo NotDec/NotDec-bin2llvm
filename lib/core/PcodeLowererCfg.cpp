@@ -347,10 +347,21 @@ bool PcodeLowerer::nativeFallthroughBlock(size_t blockIndex, llvm::BasicBlock *&
                               std::string &errorMessage) {
     result = nullptr;
     if (isInternalPcodeBlock(blockIndex)) {
-      result = nextBlock(blockIndex);
-      return true;
+      // 指令内拆出来的 p-code 块（CMOV 等）：下一个 op 还在同一个 native 块里
+      // 就继续走它；否则必须按所属 native 块的后继事实走。不能再无条件取
+      // nextBlock：BlockStarts 顺序里下一个块可能属于别的 native 块
+      // （hexx64 FUN_210d80 的内部块就被接到了 0x3898b 的冷块上，函数主体
+      // 全部不可达，最后只剩下 8 个块）。
+      size_t internalEnd = BlockEnds[blockIndex];
+      if (internalEnd != 0) {
+        if (llvm::BasicBlock *continuation =
+                internalPcodeContinuation(blockIndex, internalEnd - 1)) {
+          result = continuation;
+          return true;
+        }
+      }
     }
-    uint64_t blockAddress = blockAddressForIndex(blockIndex);
+    uint64_t blockAddress = parentBlockAddressForIndex(blockIndex);
     auto successorIt = Config.BlockSuccessors.find(blockAddress);
     if (successorIt == Config.BlockSuccessors.end()) {
       if (usesNativeCfg()) {

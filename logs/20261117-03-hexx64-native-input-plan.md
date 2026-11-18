@@ -636,3 +636,38 @@ InstCombine/SimplifyCFG 当死代码删掉了。
   的问题（不是寄存器消除），留作下一批。
 - 调试钩子：`NOTDEC_DUMP_PREINST=<dir>` 会在 register elimination 内部每次
   InstCombine 前 dump 当前 module，定位"哪一遍 InstCombine 删的代码"很方便。
+
+## 16. 第 8 轮：内部 p-code 块的 fallthrough 被接到别的 native 块
+
+### 16.1 现象
+
+`FUN_210d80`：discovery 68 个块，lowering（stage 000）只有 8 个块，最终 IR 只剩
+一条 `_Unwind_Resume` 路径。反调试判断 `cmpb $0,(under_debugger); jne .L_389b5`
+之后的整段主体全部不可达。
+
+### 16.2 根因
+
+`nativeFallthroughBlock` 对内部 p-code 块（CMOV 等指令内控制流拆出来的块）无条件
+取 `nextBlock(blockIndex)`，即 `BlockStarts` 顺序里的下一个块。当这个内部块正好是
+所属 native 块的最后一个 p-code 块时，下一个块可能属于完全不同的 native 块——
+`FUN_210d80` 的 CMOV 内部块被接到了 `0x3898b` 的冷块上，主体块全部不可达，被
+`EliminateUnreachableBlocks` 删掉。
+
+### 16.3 修复
+
+- 内部块先用 `internalPcodeContinuation(blockIndex, BlockEnds[blockIndex]-1)`：
+  下一个 op 还在同一个 native 块里就继续走它；
+- 否则用 `parentBlockAddressForIndex()` 查所属 native 块的 CFG 后继事实（和普通
+  native 块一致），不再盲取 `nextBlock`。
+
+### 16.4 验证
+
+- `FUN_210d80` 单函数：stage 000 **8 → 51 块**，stage 001 **1 → 20 块**；
+  最终 IR 155 行，包含 `FUN_29c650` / `FUN_1deb80` / `FUN_2e4e70`（50592/50593/
+  50594 三个反调试分支）和 `clear_tinfo_t` 的真实主体，0 条 `llvm.assume`，
+  `llvm-as` + `opt verify` 通过。
+- hexx64.so 全量：7257 函数、0 skip；按 asm/IR 语句比筛出的“疑似丢代码”函数
+  （asm≥40 且 IR<50%）**37 → 33**；verify 通过；`ctest` 19/19（含 fortune）。
+- 顺带纠正一个度量口径：**块数坍缩不等于丢代码**。例如 `FUN_8a140` 39 块 → 1 块，
+  但它是直线代码 + 36 条无条跳（调用边界拆分），语句全在（156 行），合并是
+  正确行为。判断丢代码要看 asm 指令数 / IR 语句数，而不是块数。
