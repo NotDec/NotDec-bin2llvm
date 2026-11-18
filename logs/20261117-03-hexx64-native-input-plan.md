@@ -887,3 +887,41 @@ unknown 归因分布：`poison_phi_incoming` 462、`return_binding_uses_clobber_
 314、`range_return_rewrite_missing_value` 162、`call_arg_uses_poison_value` 151、
 `vararg_arg_uses_poison_value` 117、`poison_call_argument` 116 等。
 `llvm-as` + `opt verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
+
+## 23. 第 15 轮：phi 入边值的下毒守卫与 poison 源的排查
+
+### 23.1 排查
+
+第 22 节之后 final IR 里 `poison` 只剩 46 个（33 个外部/间接调用实参 + 10 个
+零散），但 final cleanup 仍需替换 450 处 `poison_phi_incoming`，说明寄存器消除阶段
+还在产生 phi 入边 poison。逐阶段看 FUN_141fa0 的旧 dump：
+
+- stage 000/001-after：`bb_142058` 里出现
+  `%range_segment817 = call i8 @notdec.reg.extract.i64.i8(i64 poison, i64 0)`；
+- stage 004 post-rewrite-peephole 之后，peephole 把 `extract(poison)` 降成
+  `trunc(poison)`，phi 入边变成 literal `poison`；
+- 也就是说 poison 的源头是寄存器消除阶段某次迭代里被下毒的 def，之后被
+  `currentSegment` 当成了位段源。
+
+单函数模式（`-f 0x141fa0`）复现不出这个 phi poison（模块上下文里的 callee shape
+不同），所以只能靠全量 dump 定位；在 `materializeCoveredAccess`/`currentSegment`
+加的"poison 不作为位段源"守卫实测对全量指标 0 效果（450 处不变），已回退。
+
+### 23.2 保留的改动
+
+`rewriteUndemandedRegisterStoreOperands` 增加守卫：要下毒的操作数如果**还被某个
+PHINode 当作入边使用**，就保留原值（`isPhiIncomingValue`）。理由：phi 会把值带到
+ret/br/store 等观察点，而入边的 demand 往往要在后续遍才确定。
+
+### 23.3 验证
+
+hexx64.so 全量：poison 46 → **43**，`poison_phi_incoming` 的使用数 462 → **450**；
+unknown 总数 1668 不变；`llvm-as` + `opt verify` 通过；`ctest` 19/19。
+
+### 23.4 结论
+
+phi 入边 poison 的主源还没钉死（不是 walk 直接毒化 phi 操作数，也不是
+materialize/currentSegment 的 poison 源）。下一步要么给全量 dump 加"poison 来源"
+追踪（在寄存器消除内部的最终产物上打标），要么把 `notdec.reg.extract(poison)`
+在 peephole 之前统一换成带归因 unknown（表示层兜底，和 final cleanup 的三处
+兜底同一思路）。

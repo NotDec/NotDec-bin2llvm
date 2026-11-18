@@ -309,6 +309,18 @@ void FunctionBuilder::eraseTriviallyDeadNonPhiTree(llvm::Instruction *root) {
     }
   }
 
+namespace {
+// 值是否被某个 PHINode 当作入边使用。
+bool isPhiIncomingValue(const llvm::Value *value) {
+  for (const llvm::User *user : value->users()) {
+    if (llvm::isa<llvm::PHINode>(user)) {
+      return true;
+    }
+  }
+  return false;
+}
+} // namespace
+
 bool FunctionBuilder::rewriteUndemandedRegisterStoreOperands(
       llvm::Value *value, const std::map<llvm::Value *, llvm::APInt> &demands,
       llvm::SmallPtrSetImpl<llvm::Value *> &visiting) {
@@ -351,6 +363,12 @@ bool FunctionBuilder::rewriteUndemandedRegisterStoreOperands(
       // condition 的 icmp 被毒化，load 地址成 poison，整个函数体被 InstCombine
       // 折成 unreachable 删掉）。condition 子树保留原样，最坏退化成裸读。
       if (llvm::isa<llvm::SelectInst>(inst) && currentOperandIndex == 0) {
+        continue;
+      }
+      // 值还要作为 phi 的入边使用时不能下毒：phi 会把 poison 带到 ret/br/
+      // store（hexx64 里 94 个 phi、146 条入边）。保留原值，最坏退化成裸
+      // 寄存器读。
+      if (isPhiIncomingValue(operand)) {
         continue;
       }
       llvm::Value *poison =
