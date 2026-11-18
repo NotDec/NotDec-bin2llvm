@@ -774,6 +774,48 @@ bool valueMayDependOnUnknownPlaceholder(
   return false;
 }
 
+// 值本身或它的计算链里是否含 poison/undef（含 freeze(poison)、phi 的 poison
+// 入边、select 的 poison 分支）。这类值不能当实参传给 callee：调用点会变成
+// UB，而 poison 又带不了 !notdec.unknown.source 归因。
+bool valueDependsOnPoison(llvm::Value *value,
+                          llvm::SmallPtrSetImpl<llvm::Value *> &seen) {
+  if (value == nullptr) {
+    return false;
+  }
+  if (llvm::isa<llvm::PoisonValue>(value) ||
+      llvm::isa<llvm::UndefValue>(value)) {
+    return true;
+  }
+  if (llvm::isa<llvm::Constant>(value)) {
+    return false;
+  }
+  if (!seen.insert(value).second) {
+    return false;
+  }
+  if (auto *freeze = llvm::dyn_cast<llvm::FreezeInst>(value)) {
+    return valueDependsOnPoison(freeze->getOperand(0), seen);
+  }
+  if (llvm::isa<llvm::PHINode>(value) || llvm::isa<llvm::SelectInst>(value) ||
+      llvm::isa<llvm::CastInst>(value) ||
+      llvm::isa<llvm::BinaryOperator>(value) ||
+      llvm::isa<llvm::UnaryOperator>(value) ||
+      llvm::isa<llvm::ExtractValueInst>(value) ||
+      llvm::isa<llvm::InsertValueInst>(value)) {
+    for (llvm::Value *operand :
+         llvm::cast<llvm::User>(value)->operand_values()) {
+      if (valueDependsOnPoison(operand, seen)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool valueDependsOnPoison(llvm::Value *value) {
+  llvm::SmallPtrSet<llvm::Value *, 16> seen;
+  return valueDependsOnPoison(value, seen);
+}
+
 bool valueMayDependOnUnknownPlaceholder(llvm::Value *value) {
   llvm::SmallPtrSet<llvm::Value *, 16> seen;
   return valueMayDependOnUnknownPlaceholder(value, seen);
@@ -1093,13 +1135,39 @@ void rewriteSignatureShapes(
           }
         }
       }
-      if (value == nullptr && oldCall->getFunction() != nullptr) {
+      auto entryArgumentForSlot = [&]() -> llvm::Value * {
         // §15 ②：这个槽就是调用者自己的入参寄存器时，直接传调用者的形参。
         llvm::Function *newCaller = oldCall->getFunction();
+        if (newCaller == nullptr) {
+          return nullptr;
+        }
         auto callerShapeIt = rewrittenFunctionShapes.find(newCaller);
-        if (callerShapeIt != rewrittenFunctionShapes.end()) {
-          value = callerEntryArgumentForSlot(*newCaller, *callerShapeIt->second,
-                                             slot, oldCallBuilder);
+        if (callerShapeIt == rewrittenFunctionShapes.end()) {
+          return nullptr;
+        }
+        return callerEntryArgumentForSlot(*newCaller, *callerShapeIt->second,
+                                          slot, oldCallBuilder);
+      };
+      if (value == nullptr) {
+        value = entryArgumentForSlot();
+      }
+      bool poisonedArgument = false;
+      // 依赖 poison/undef 的值不能当实参传给 callee：调用点会变成 UB，而
+      // poison 又带不了 !notdec.unknown.source 归因。先回落调用者入口形参
+      // （thunk/递归调用转发自己形参的场景），回落不到再换成带归因的 unknown。
+      if (value != nullptr && valueDependsOnPoison(value)) {
+        if (llvm::Value *entryArgument = entryArgumentForSlot()) {
+          value = entryArgument;
+        } else {
+          value = nullptr;
+          poisonedArgument = true;
+        }
+      }
+      // 类型对不上时也先试调用者入口形参：thunk 转发自己形参时，range SSA
+      // 给出的常是窄类型值，而形参本身就是要传的值（hexx64 FUN_5d030）。
+      if (value != nullptr && value->getType() != slotType(slot)) {
+        if (llvm::Value *entryArgument = entryArgumentForSlot()) {
+          value = entryArgument;
         }
       }
       if (value != nullptr) {
@@ -1108,7 +1176,8 @@ void rewriteSignatureShapes(
       }
       llvm::StringRef reason;
       if (value == nullptr) {
-        reason = "call_arg_rewrite_missing_binding";
+        reason = poisonedArgument ? "call_arg_uses_poison_value"
+                                  : "call_arg_rewrite_missing_binding";
       } else if (value->getType() != slotType(slot)) {
         reason = "call_arg_rewrite_type_mismatch";
       } else if (valueMayDependOnUnknownPlaceholder(value)) {

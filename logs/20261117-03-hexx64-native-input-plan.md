@@ -752,3 +752,40 @@ ret i64 <unknown>          ; return_binding_uses_clobber_value
 | 产物大小 | 87.71 MB | 87.38 MB |
 
 `llvm-as` + `opt verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。
+
+## 19. 第 11 轮：调用实参不能是 poison / poison 依赖链
+
+### 19.1 现象
+
+全量 IR 里 **588 个对内部函数（有函数体）的调用带 poison 实参**，例如
+`call @FUN_dfd90(i64 poison)`：实参应该是循环计数器，却变成 poison。poison 实参
+让调用点成为 UB，而且 poison 带不了 `!notdec.unknown.source` 归因。
+
+### 19.2 修复
+
+`rewriteSignatureShapes` 的固定参数槽在拿到绑定值之后加两道检查：
+
+- **poison/undef 依赖链**：新增 `valueDependsOnPoison()`，递归检查
+  poison / undef / `freeze(poison)` / phi 的 poison 入边 / select 的 poison 分支 /
+  算术 cast 链。命中的话先回落调用者自己的入口形参（thunk 转发、递归调用转发
+  自己形参的场景），回落不到就换成带归因的 `notdec.unknown`（reason=
+  `call_arg_uses_poison_value`），绝不让 poison 进实参。
+- **类型不符**时也先试调用者入口形参：range SSA 给出的常是窄类型值，而形参
+  本身就是要传的值（hexx64 FUN_5d030 的 `call_arg_rewrite_type_mismatch`）。
+
+### 19.3 验证（hexx64.so 全量）
+
+| 指标 | 修前 | 修后 |
+|------|------|------|
+| poison 总数 | 1399 | **643** |
+| 调用实参 poison | 1204 | **470** |
+| 内部调用带 poison 实参 | 588 | **170** |
+| phi 入边 poison | 164 | 146 |
+| `unknowns` | 558 | 740（+182，poison→带归因 unknown） |
+| 产物大小 | 87.38 MB | 87.41 MB |
+
+`llvm-as` + `opt verify` 通过；`ctest` 19/19（含 fortune x86_64/i386，fortune 的
+`notdec.unknown` 门槛不受影响）。
+
+剩下的 170 个内部调用 poison 实参不是签名重写时带进去的：它们在重写**之后**由
+同一遍的 partial-demand walk 毒化了实参的 def 链（下一轮再追）。
