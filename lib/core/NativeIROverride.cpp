@@ -356,6 +356,13 @@ bool applyNativeIROverride(llvm::Module &Module,
       Map[Symbol.first] = Symbol.second;
     }
     Map[Entry] = Target;
+    // CloneFunctionInto 不会自己把源函数的形参映射到目标函数的形参：它要按 VMap
+    // 把源函数体里的实参引用换成目标形参。缺了这些映射，带形参的函数克隆会在
+    // CloneFunctionAttributesInto 里解引用空句柄而段错误（无参函数不受影响，
+    // 所以单测里的无参用例一直是通过的）。
+    for (unsigned i = 0; i < Entry->arg_size(); ++i) {
+      Map[Entry->getArg(i)] = Target->getArg(i);
+    }
 
     Target->dropAllReferences();
     while (!Target->empty()) {

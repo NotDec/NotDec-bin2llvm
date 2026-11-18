@@ -375,3 +375,86 @@ struct NativeStageDescriptor {
   memcached 的运行时间 11.33s -> 11.51s，属于同一量级。
 - 配置路径：`--print-config` / `--list-stages` / `--dump-stages` / `--manifest-out` 手动跑通；
   override 产物可被 LLVM 22 `llvm-as` + `opt -passes=verify` 验证。
+
+## 9. 在 hexx64.so 上实测 override / 原型接口（2026-11-18）
+
+### 9.1 IR override 的两个 bug（都已修）
+
+在 hexx64 上跑 `ir-override` stage 时发现：
+
+1. **带形参的函数克隆直接段错误**。`CloneFunctionInto` 不会自己把源函数的形参映射到
+   目标形参，`VMap` 缺这些映射时会在 `CloneFunctionAttributesInto` 里解引用空句柄。
+   单测里的函数全是无参的，所以一直没暴露。
+   修复：clone 前显式 `Map[Entry->getArg(i)] = Target->getArg(i)`。
+   回归测试：`testReplaceWithArguments`（带 1/2 个形参的 replace；已验证去掉修复时
+   测试二进制直接 SIGSEGV）。
+2. **override 文件里的外部全局变量写法**：`@V = external global i64` 必须按全局变量
+   声明；写成 `declare i64 @V` 会在解析期报错（这条是使用姿势，不是 bug）。
+
+修复后 hexx64 全量跑通（`native46.ll`）：`FUN_2e83c0` 换成手写 body，
+`!notdec.override` 元数据正确，`llvm-as`/`opt verify` 通过。
+
+实测用例：`FUN_2e83c0` 里 `callui@GOTPCREL` 的间接调用在汇编里准备了 4 个实参
+（edi=24, esi=4, rdx=入口 RDI, rcx=rsp=va_list），但寄存器 SSA 的"局部定义前缀"
+规则只认到 RDI/RSI，提升后的调用只剩 2 个实参。手写 override 补回 4 个：
+`call void %fn(i64 24, i64 4, i64 %RDI.arg, ptr %va)`。
+
+### 9.2 external_prototypes JSON 实验（qfree 声明为 void）
+
+配置：`{"qfree": {"fixed_args": 1, "return": "void"}}`（hexx64 的构建产物
+`native45.ll`）。结果：
+
+| 指标 | 默认（native44） | qfree=void（native45） |
+|------|------------------|------------------------|
+| qfree 调用点改成 `void` | 0 / 8797 | 8797 / 8797 |
+| `range_return_rewrite_missing_value` | 157 | 115 |
+| `return_binding_uses_clobber_value` | 314 | 547 |
+| unknown 总数 | 728 | 895 |
+| 产物大小 | 88.1 MB | 87.9 MB |
+
+解释：qfree 在 IDA SDK 里是 `void qfree(void*)`，之前的 `{double,i64}` 返回形状是
+"调用点读后置寄存器"反推出来的**假返回值**。声明成 void 后假返回值消失，
+`range_return` 那类 unknown 少了 42 个，但原来被假返回值"遮住"的 clobber 返回槽
+暴露出来，`return_binding_uses_clobber_value` 增加 233。也就是说：**用户提供的
+真语义可能让 unknown 变多**——它把不忠实但看似有值的模型换成了忠实的模型。
+
+### 9.3 最后两类 unknown 的构成与可补齐性
+
+**A. `return_binding_uses_clobber_value`（314 处 / 192 个函数）**
+
+- 寄存器分布：R9 96、RAX 82、R8 37、R10 33、R11 30、RSI 13、RCX 11、RDX 9。
+- 机制：函数签名被内部约定扩展成"任意 value-carrying GPR 都能当返回槽"，返回槽的
+  值在图上是**纯 clobber**：最后一次内部调用（qfree 等）之后的寄存器值。
+  典型：`FUN_29a670` = `jmp qfree@PLT`，它的 R8/R9/R10/R11/RCX/RDX/RSI/RDI 返回槽
+  就是 qfree 的 scratch。
+- 忠实性已核对：`FUN_110760` 的 R9/R10 返回槽确实被 `FUN_d6110`、`FUN_2921b0` 等
+  调用点 `extractvalue` 使用，`FUN_d6110` 还把它继续当自己的返回值传出；调用点
+  汇编在这条路径上确实没有先写 R9。
+- 二进制里没有可补齐的"正确值"：caller-saved 寄存器在调用后的内容 ABI 未定义，
+  真值取决于 callee 实现（qfree 的 scratch 具体是多少并不在二进制里表达）。
+  原型 JSON 也表达不了：`max_return_registers` 只覆盖 ABI 输出寄存器（SysV 的
+  XMM0/XMM1/RAX），没有"某个非 ABI 寄存器在调用后是什么"的字段。
+
+**B. `range_return_rewrite_missing_value`（157 个元数据点 / 212 处使用 / 112 函数）**
+
+- 寄存器：ZMM0 211、RAX 1。callee 前几名：qfree 66、getinf 15、get_tinfo_property 11、
+  getinf_flag 9、clear_tinfo_t 9、qvector_reserve 7、_ZdlPv 6、log2ceil 6、
+  lexcompare_tinfo 6、cleanup_argloc 6。
+- 机制：函数返回槽是 128 位 ZMM0（调用者真的读了 16 字节），但值来源的调用只返回
+  64 位（double）。高 64 位落成 `notdec.unknown`。
+- 同样不可补齐：double 返回后 XMM0 高 64 位 ABI 未定义；原型 schema 的返回类型只有
+  i32/i64/ptr/float/double/longdouble（longdouble 走 ST0），没有 128 位/向量返回，
+  也没有"高位固定为 0"这种表达。
+
+### 9.4 结论：这两类要不要靠用户信息补？
+
+- **原型 JSON 补不了**这两类（缺的是"调用后某个寄存器的具体值"，schema 没有这个维度）。
+- **整函数 IR override 可以表达**（用户手写 body，想要什么语义都行），代价是要写整个
+  函数体；对 192/112 个函数不现实，只适合少量关键函数（例如本例的 `FUN_2e83c0`）。
+- 这两类的根因不是"缺信息"，而是"二进制本身读的就是未定义值"：提升器如实建模成
+  unknown/carrier 是正确的。要让它们"变好看"，只能改表示层（把 unknown 换成
+  clobber 载体——但现有单测与 fortune 门槛明确禁止），或接受。
+- 如果以后要扩展 JSON 接口，最小有价值的增量是**按调用点/按 callee 的 effect 覆盖**
+  （例如 `{"callee": "X", "preserves": ["R9"], "returns": {"RAX": "opaque"}}`），
+  以及**返回槽显式取值**（`{"function": "F", "return_slot": {"R9": "zero"}}`）。
+  这两种都需要新的 schema 字段和对应 pass 支持，属于后续工作，不在本轮范围。

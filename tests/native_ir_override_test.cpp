@@ -116,6 +116,49 @@ bool testReplaceByName(const std::string &Dir) {
   return Ok;
 }
 
+bool testReplaceWithArguments(const std::string &Dir) {
+  bool Ok = true;
+  std::string OverridePath = Dir + "/replace-args.ll";
+  writeFile(OverridePath,
+            "define i64 @add(i64 %a, i64 %b) {\n"
+            "entry:\n"
+            "  %s = add i64 %a, %b\n"
+            "  ret i64 %s\n"
+            "}\n");
+
+  llvm::LLVMContext Context;
+  llvm::Module Module("override-args-test", Context);
+  llvm::Type *I64 = llvm::Type::getInt64Ty(Context);
+  auto *Type = llvm::FunctionType::get(I64, {I64, I64}, false);
+  llvm::Function *Add = llvm::Function::Create(
+      Type, llvm::GlobalValue::ExternalLinkage, "add", Module);
+  llvm::BasicBlock *Entry = llvm::BasicBlock::Create(Context, "entry", Add);
+  llvm::IRBuilder<> Builder(Entry);
+  Builder.CreateRet(llvm::ConstantInt::get(I64, 0));
+
+  std::string Error;
+  std::vector<NativeFunctionIdentity> Identities;
+  bool Applied = applyNativeIROverride(Module, makeOptions(OverridePath),
+                                       Identities, Error);
+  if (!expect(Applied, "replace with arguments applies: " + Error)) {
+    return false;
+  }
+  // 修复前：带形参的函数克隆会在 CloneFunctionAttributesInto 里段错误（VMap
+  // 缺形参映射）。这里确认克隆出来的函数体真的用了目标形参。
+  bool SawAdd = false;
+  for (llvm::Instruction &Inst : llvm::instructions(*Add)) {
+    if (auto *Bin = llvm::dyn_cast<llvm::BinaryOperator>(&Inst)) {
+      SawAdd = Bin->getOpcode() == llvm::Instruction::Add;
+    }
+  }
+  Ok &= expect(SawAdd, "override body with arguments is cloned");
+  Ok &= expect(Add->getMetadata("notdec.override") != nullptr,
+               "override metadata is attached (arguments case)");
+  Ok &= expect(llvm::verifyModule(Module, &llvm::errs()) == false,
+               "module verifies after replace with arguments");
+  return Ok;
+}
+
 bool testSelectAndEntry(const std::string &Dir) {
   bool Ok = true;
   std::string OverridePath = Dir + "/select.ll";
@@ -328,6 +371,7 @@ int main() {
   bool Ok = true;
   std::string Dir = makeTempDir();
   Ok &= testReplaceByName(Dir);
+  Ok &= testReplaceWithArguments(Dir);
   Ok &= testSelectAndEntry(Dir);
   Ok &= testHelperImport(Dir);
   Ok &= testMissingSymbolPolicy(Dir);
