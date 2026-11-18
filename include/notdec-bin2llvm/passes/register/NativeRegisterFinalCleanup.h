@@ -33,6 +33,7 @@ struct NativeRegisterFinalCleanupSummary {
   // 会让整个函数 UB，ret 的返回值是 poison 会让调用点 UB。
   uint64_t PoisonControlFlowConditionsReplaced = 0;
   uint64_t PoisonReturnValuesReplaced = 0;
+  uint64_t PoisonCallArgumentsReplaced = 0;
   uint64_t FunctionMetadataCleared = 0;
   uint64_t InstructionMetadataCleared = 0;
   uint64_t RemainingRegisterAccesses = 0;
@@ -53,6 +54,10 @@ struct NativePoisonTerminatorSummary {
 
 NativePoisonTerminatorSummary
 replacePoisonTerminatorValues(llvm::Module &module);
+
+// 把"有函数体的 callee"调用里的 poison 实参换成带归因的 notdec.unknown。
+// 外部/间接 callee 的变参槽 poison 不动（fortune 零-unknown 门槛依赖它）。
+uint64_t replacePoisonCallArguments(llvm::Module &module);
 
 // 清掉没人用的 notdec.unknown.* 占位调用。runNativeRegisterFinalCleanup 内部会
 // 调一次；tool 在最后一次 InstCombine 之后还要再调一次——那次 InstCombine 可能

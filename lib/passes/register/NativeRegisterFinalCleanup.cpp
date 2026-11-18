@@ -469,6 +469,46 @@ void runLocalDeadCodeCleanup(llvm::Module &module) {
 
 } // namespace
 
+// 有函数体的 callee 是我们自己 lift 出来的函数：它的形参/实参是真实观察者，
+// poison 实参会让调用点变成 UB。把这类实参换成带归因的 notdec.unknown。
+// 外部/间接 callee 不动：它们的变参槽 poison 是 fortune x86_64 零-unknown
+// 门槛的既定表示（vararg_unknown 降级路径），不能一起改。
+uint64_t replacePoisonCallArguments(llvm::Module &module) {
+  uint64_t replaced = 0;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr || call->arg_size() == 0) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee == nullptr || callee->isDeclaration()) {
+        continue;
+      }
+      llvm::IRBuilder<> builder(call);
+      for (unsigned index = 0; index < call->arg_size(); ++index) {
+        llvm::Value *argument = call->getArgOperand(index);
+        if (argument == nullptr ||
+            !llvm::isa<llvm::PoisonValue>(argument)) {
+          continue;
+        }
+        llvm::Value *unknown =
+            unknownValueAt(builder, argument->getType(), "unknown.arg");
+        attachUnknownValueMetadata(unknown, "poison_call_argument",
+                                   function.getName(), callee->getName(), "",
+                                   "call_arg");
+        call->setArgOperand(index, unknown);
+        ++replaced;
+      }
+    }
+  }
+  return replaced;
+}
+
+
 // 终结指令上的 poison 一律换成带归因的 notdec.unknown：
 // - br/switch 条件是 poison：整个函数 UB；
 // - ret 的值是 poison：调用点拿到的返回值 UB。
@@ -625,6 +665,7 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   }
   summary.ValueRangeHelpersLowered += lowerValueRangeHelpers(module);
   summary.VarArgUnknownHelpersLowered += lowerVarArgUnknownHelpers(module);
+  summary.PoisonCallArgumentsReplaced += replacePoisonCallArguments(module);
   NativePoisonTerminatorSummary poisonTerminators =
       replacePoisonTerminatorValues(module);
   summary.PoisonControlFlowConditionsReplaced +=
@@ -680,6 +721,8 @@ void printNativeRegisterFinalCleanupSummary(
      << summary.PoisonControlFlowConditionsReplaced
      << " poison_return_values_replaced="
      << summary.PoisonReturnValuesReplaced
+     << " poison_call_arguments_replaced="
+     << summary.PoisonCallArgumentsReplaced
      << " function_metadata_cleared=" << summary.FunctionMetadataCleared
      << " instruction_metadata_cleared=" << summary.InstructionMetadataCleared
      << " remaining_register_accesses=" << summary.RemainingRegisterAccesses

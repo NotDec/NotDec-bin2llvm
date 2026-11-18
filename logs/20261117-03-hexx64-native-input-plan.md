@@ -820,3 +820,38 @@ ret i64 <unknown>          ; return_binding_uses_clobber_value
 
 剩余 168 个内部调用 poison 实参在签名重写时**还不是** poison：它们是重写之后由
 同一遍的 partial-demand walk 毒化实参的 def 链产生的（下一轮在 walk 侧封住）。
+
+## 21. 第 13 轮：内部 callee 的 poison 实参在 final cleanup 兜底
+
+### 21.1 现象
+
+第 20 节之后仍有 **168 个对内部函数的调用带 poison 实参**，而且它们不是签名重写
+时带进去的：poison 是重写之后由寄存器 SSA 的胶水链在后续 InstCombine 里折出来的
+（`call @FUN_48b90(i64 %RDI.arg, i64 %12, i64 poison)`）。在 walk 侧加"调用实参
+观察者"守卫实测 **0 效果**（native26 数字完全不变，用后即回退）；从胶水链的源头
+逐个堵不现实。
+
+### 21.2 修复
+
+`NativeRegisterFinalCleanup` 新增 `replacePoisonCallArguments()`：对**所有 callee
+有函数体**的调用，把 literal poison 实参换成带归因的 `notdec.unknown`
+（reason=`poison_call_argument`）。final cleanup 与 erase-dead-helpers 两个阶段各
+跑一次（后者兜住最后一次 InstCombine 折出来的）。外部/间接 callee 不动：它们的
+变参槽 poison 是 fortune x86_64 零-unknown 门槛的既定表示。
+
+### 21.3 验证（hexx64.so 全量，native28）
+
+| 指标 | 修前（native26） | 修后（native28） |
+|------|------------------|------------------|
+| 内部调用 poison 实参 | 168 | **0** |
+| poison 总数（按 token 计） | 458 | **208** |
+| 调用实参 poison | 287 | **37**（外部/间接调用） |
+| phi 入边 poison | 146 | 146 |
+| `unknowns` | 921 | 1171（新增的是带归因占位） |
+| 函数数 / verify / ctest | 6187 / 通过 / 19/19 | 同左 |
+
+### 21.4 度量口径教训
+
+新建的占位 SSA 值名字里不能带 `poison` 这个词：`%poison.arg` 会让
+`grep -c poison` 的统计反向暴涨（一开始差点误判成回归）。现在统一叫
+`%unknown.arg`，统计时按 token `\bpoison\b` 匹配。
