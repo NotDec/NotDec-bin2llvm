@@ -469,6 +469,48 @@ void runLocalDeadCodeCleanup(llvm::Module &module) {
 
 } // namespace
 
+// phi 的 poison 入边会把 poison 带到 ret/br/store 等观察点（phi 本身不会被
+// InstCombine 折掉），在最终 IR 里换成带归因的 notdec.unknown：未定义变成
+// "某个未知值"，调用点/返回点不再是 UB。占位插在该入边对应的前驱块终止符前。
+uint64_t replacePoisonPhiIncomings(llvm::Module &module) {
+  uint64_t replaced = 0;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &inst : block) {
+        auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
+        if (phi == nullptr) {
+          continue;
+        }
+        for (unsigned index = 0; index < phi->getNumIncomingValues(); ++index) {
+          llvm::Value *incoming = phi->getIncomingValue(index);
+          if (incoming == nullptr ||
+              !llvm::isa<llvm::PoisonValue>(incoming)) {
+            continue;
+          }
+          llvm::BasicBlock *predecessor = phi->getIncomingBlock(index);
+          llvm::Instruction *insertBefore = predecessor->getTerminator();
+          if (insertBefore == nullptr) {
+            continue;
+          }
+          llvm::IRBuilder<> builder(insertBefore);
+          llvm::Value *unknown =
+              unknownValueAt(builder, incoming->getType(), "unknown.phi");
+          attachUnknownValueMetadata(unknown, "poison_phi_incoming",
+                                     function.getName(), "", phi->getName(),
+                                     "phi");
+          phi->setIncomingValue(index, unknown);
+          ++replaced;
+        }
+      }
+    }
+  }
+  return replaced;
+}
+
+
 // 有函数体的 callee 是我们自己 lift 出来的函数：它的形参/实参是真实观察者，
 // poison 实参会让调用点变成 UB。把这类实参换成带归因的 notdec.unknown。
 // 外部/间接 callee 不动：它们的变参槽 poison 是 fortune x86_64 零-unknown
@@ -666,6 +708,7 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   summary.ValueRangeHelpersLowered += lowerValueRangeHelpers(module);
   summary.VarArgUnknownHelpersLowered += lowerVarArgUnknownHelpers(module);
   summary.PoisonCallArgumentsReplaced += replacePoisonCallArguments(module);
+  summary.PoisonPhiIncomingsReplaced += replacePoisonPhiIncomings(module);
   NativePoisonTerminatorSummary poisonTerminators =
       replacePoisonTerminatorValues(module);
   summary.PoisonControlFlowConditionsReplaced +=
@@ -723,6 +766,8 @@ void printNativeRegisterFinalCleanupSummary(
      << summary.PoisonReturnValuesReplaced
      << " poison_call_arguments_replaced="
      << summary.PoisonCallArgumentsReplaced
+     << " poison_phi_incomings_replaced="
+     << summary.PoisonPhiIncomingsReplaced
      << " function_metadata_cleared=" << summary.FunctionMetadataCleared
      << " instruction_metadata_cleared=" << summary.InstructionMetadataCleared
      << " remaining_register_accesses=" << summary.RemainingRegisterAccesses

@@ -855,3 +855,35 @@ ret i64 <unknown>          ; return_binding_uses_clobber_value
 新建的占位 SSA 值名字里不能带 `poison` 这个词：`%poison.arg` 会让
 `grep -c poison` 的统计反向暴涨（一开始差点误判成回归）。现在统一叫
 `%unknown.arg`，统计时按 token `\bpoison\b` 匹配。
+
+## 22. 第 14 轮：phi 的 poison 入边换成带归因 unknown
+
+### 22.1 现象
+
+第 21 节之后还剩 **146 个 phi 入边是 poison**（分布在 94 个 phi 上）。phi 不会被
+InstCombine 折掉，poison 会顺着值流到观察点：统计里 2 个 phi 直接喂 `br`、3 个
+直接喂 `ret`（`ret i64 %R9.range_summary_ssa`，其中一条入边 poison），其余喂
+icmp/store。观察点上的 poison 就是 UB。
+
+### 22.2 修复
+
+`NativeRegisterFinalCleanup` 新增 `replacePoisonPhiIncomings()`：把所有 literal
+poison 的 phi 入边换成带归因的 `notdec.unknown`（reason=`poison_phi_incoming`），
+占位指令插在**对应前驱块的终止符前**（保证支配该入边；不能插在 phi 所在块里）。
+final cleanup 与 erase-dead-helpers 两个阶段各跑一次。
+
+### 22.3 验证（hexx64.so 全量，native29）
+
+| 指标 | 修前（native28） | 修后（native29） |
+|------|------------------|------------------|
+| poison 总数 | 208 | **46** |
+| phi 入边 poison | 146 | **0** |
+| 调用实参 poison | 37 | 35（外部/间接） |
+| 其它 poison | 25 | 11 |
+| `unknowns` | 1171 | 1723（全部带 `!notdec.unknown.source`） |
+| 产物大小 | 87.5 MB | 84.0 MB |
+
+unknown 归因分布：`poison_phi_incoming` 462、`return_binding_uses_clobber_value`
+314、`range_return_rewrite_missing_value` 162、`call_arg_uses_poison_value` 151、
+`vararg_arg_uses_poison_value` 117、`poison_call_argument` 116 等。
+`llvm-as` + `opt verify` 通过；`ctest` 19/19（含 fortune x86_64/i386）。

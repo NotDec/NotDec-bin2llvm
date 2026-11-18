@@ -351,6 +351,7 @@ bool runEraseDeadHelpersStage(const NativeStageConfig &Stage,
   // 最后一次 InstCombine 可能才把某个 phi/select 折成 poison；这里补做一次
   // 终结指令的兜底，保证产物里没有 poison 条件/返回值。
   replacePoisonCallArguments(Context.Module);
+  replacePoisonPhiIncomings(Context.Module);
   NativePoisonTerminatorSummary poisonTerminators =
       replacePoisonTerminatorValues(Context.Module);
   if (poisonTerminators.ConditionsReplaced != 0 ||
