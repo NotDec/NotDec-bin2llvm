@@ -2566,6 +2566,44 @@ bool testExternalPrototypeJsonAcceptsLongDouble() {
                 "long double JSON return was not parsed");
 }
 
+bool testExternalPrototypeJsonAcceptsVector128() {
+  llvm::SmallString<128> jsonPath;
+  int jsonFd = -1;
+  std::error_code error = llvm::sys::fs::createTemporaryFile(
+      "notdec-external-vector128-prototype", "json", jsonFd, jsonPath);
+  if (error) {
+    std::cerr << "failed to create vector128 prototype JSON: "
+              << error.message() << '\n';
+    return false;
+  }
+  {
+    llvm::raw_fd_ostream json(jsonFd, true);
+    json << R"({"json_get128":{"fixed_args":1,"return":"xmm128"}})";
+  }
+
+  std::string errorMessage;
+  std::optional<notdec::bin2llvm::NativeExternalPrototypeMap> prototypes =
+      notdec::bin2llvm::loadNativeExternalPrototypesJson(jsonPath,
+                                                         errorMessage);
+  (void)llvm::sys::fs::remove(jsonPath);
+  if (!prototypes) {
+    std::cerr << "failed to parse vector128 prototype JSON: " << errorMessage
+              << '\n';
+    return false;
+  }
+
+  const notdec::bin2llvm::NativeExternalPrototype *prototype =
+      notdec::bin2llvm::lookupNativeExternalPrototype(*prototypes,
+                                                      "json_get128");
+  using ValueType = notdec::bin2llvm::NativeExternalPrototype::ValueType;
+  return expect(prototype != nullptr,
+                "vector128 JSON prototype was not loaded") &&
+         expect(prototype->FixedArgs == 1,
+                "vector128 JSON prototype lost fixed_args") &&
+         expect(prototype->TypedReturn == ValueType::Vector128,
+                "vector128 JSON return was not parsed");
+}
+
 bool testUnknownExternalArityStopsAtClobberArg() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-unknown-external-clobber-arity", context);
@@ -6708,6 +6746,7 @@ int main() {
   ok &= testConsumedRegisterBeforeLaterArgumentKeepsArity();
   ok &= testExternalPrototypeJsonOverridesInferredArity();
   ok &= testExternalPrototypeJsonAcceptsLongDouble();
+  ok &= testExternalPrototypeJsonAcceptsVector128();
   ok &= testUnknownExternalArityStopsAtClobberArg();
   ok &= testUnknownExternalArityStopsAtPhiClobberArg();
   ok &= testUnknownExternalArityCountsExplicitBinaryArg();

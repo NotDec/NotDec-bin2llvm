@@ -114,6 +114,13 @@ bool applyFunctionClaims(NativePipelineContext &Context, std::string &Error) {
         Context.PinnedFunctions.insert(Name);
         Context.PreservedFunctions.insert(Name);
       }
+      if (Claim.AbiConvention == NativeFunctionConfig::Abi::External) {
+        Context.ForcedExternalAbiFunctions.insert(Name);
+        Context.ForcedInternalAbiFunctions.erase(Name);
+      } else if (Claim.AbiConvention == NativeFunctionConfig::Abi::Internal) {
+        Context.ForcedInternalAbiFunctions.insert(Name);
+        Context.ForcedExternalAbiFunctions.erase(Name);
+      }
     }
   }
   return true;
@@ -216,6 +223,8 @@ bool runRegisterEliminationStage(const NativeStageConfig &Stage,
   Options.EnablePostRewriteInstCombine = Config.PostRewriteInstCombine;
   Options.EnableVarArgRecovery = Config.VarArgRecovery;
   Options.AbiForAllFunctions = Config.AbiForAllFunctions;
+  Options.ForcedExternalAbiFunctions = Context.ForcedExternalAbiFunctions;
+  Options.ForcedInternalAbiFunctions = Context.ForcedInternalAbiFunctions;
   Options.AttachMetadata = Config.AttachMetadata;
   Options.PrintSummary = Context.PrintSummary;
   Options.ExternalPrototypeJsonPath = Config.ResolvedExternalPrototypes;

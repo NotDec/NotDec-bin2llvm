@@ -38,13 +38,16 @@ llvm::Type *llvmTypeForKnownValue(llvm::Module &module,
     return llvm::Type::getDoubleTy(context);
   case NativeExternalPrototype::ValueType::LongDouble:
     return llvm::Type::getX86_FP80Ty(context);
+  case NativeExternalPrototype::ValueType::Vector128:
+    return llvm::IntegerType::get(context, 128);
   }
   return llvm::Type::getInt64Ty(context);
 }
 
 bool isFloatKnownValue(NativeExternalPrototype::ValueType type) {
   return type == NativeExternalPrototype::ValueType::Float ||
-         type == NativeExternalPrototype::ValueType::Double;
+         type == NativeExternalPrototype::ValueType::Double ||
+         type == NativeExternalPrototype::ValueType::Vector128;
 }
 
 NativeSignatureSlot integerSignatureSlot(const RegisterUnit &unit) {
@@ -768,13 +771,27 @@ SignatureShape shapeForKnownExternal(
     unsigned integerIndex = 0;
     unsigned floatIndex = 0;
     unsigned stackIndex = 0;
-    for (NativeExternalPrototype::ValueType type : known->TypedParams) {
-      std::optional<NativeSignatureSlot> slot = typedParamSlot(
-          type, integerIndex, floatIndex, stackIndex, units, abi, *module);
-      if (!slot) {
-        return shape;
+    if (!known->TypedParams.empty()) {
+      for (NativeExternalPrototype::ValueType type : known->TypedParams) {
+        std::optional<NativeSignatureSlot> slot = typedParamSlot(
+            type, integerIndex, floatIndex, stackIndex, units, abi, *module);
+        if (!slot) {
+          return shape;
+        }
+        shape.Params.push_back(*slot);
       }
-      shape.Params.push_back(*slot);
+    } else {
+      // 只写了类型化 return、没写 params 的原型：fixed_args 仍然是形参个数。
+      // 之前这里直接跳过，导致 `{"fixed_args": 1, "return": "i64"}` 的调用点
+      // 被改写成零实参（悄悄丢参数）。
+      for (unsigned index = 0; index < known->FixedArgs; ++index) {
+        std::optional<NativeSignatureSlot> slot =
+            untypedIntegerParamSlot(index, units, abi, *module);
+        if (!slot) {
+          return shape;
+        }
+        shape.Params.push_back(*slot);
+      }
     }
     if (known->TypedReturn) {
       std::optional<NativeSignatureSlot> slot =

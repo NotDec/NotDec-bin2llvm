@@ -458,3 +458,99 @@ struct NativeStageDescriptor {
   （例如 `{"callee": "X", "preserves": ["R9"], "returns": {"RAX": "opaque"}}`），
   以及**返回槽显式取值**（`{"function": "F", "return_slot": {"R9": "zero"}}`）。
   这两种都需要新的 schema 字段和对应 pass 支持，属于后续工作，不在本轮范围。
+
+## 10. 128 位返回与"调用约定范围"（class A/B 的补法，2026-11-18）
+
+用户的问题：最后两类 unknown 能不能靠 override 补齐？"当前真的没有定义 128 位的返回吗？"
+本节是实测回答。
+
+### 10.1 之前确实没有 128 位返回
+
+`NativeExternalPrototype::ValueType` 原来只有 `i32/i64/ptr/float/double/long_double`；
+`llvmTypeForKnownValue` 没有 128 位类型，`long_double` 走 ST0（x87），不是 XMM。
+所以"某个外部 callee 真的返回完整 128 位（XMM0）"没法声明。
+
+本轮新增：
+
+- `ValueType::Vector128`（JSON 里 `xmm128`/`i128`/`f128`/`vector128`/`__m128`），
+  LLVM 类型用 `i128`，按 float 槽走 XMM0；
+- 修了一个顺带发现的 bug：只写类型化 `return`、没写 `params` 时，`fixed_args`
+  被忽略，调用点会被改写成零实参（悄悄丢参数）。现在会按 `fixed_args` 补无类型
+  整数形参；
+- 修了 `castSlotValueToRegister`：浮点/向量槽原来只接受浮点值，`i128` 的向量槽
+  会被判成"缺失"→ `range_return_rewrite_missing_value`。现在整数位模式也能铺进槽位。
+
+### 10.2 实测：qfree 声明为 xmm128
+
+`{"qfree": {"fixed_args": 1, "return": "xmm128"}}`（构建产物 `native50.ll`）：
+
+| 指标 | 默认（native44） | qfree=xmm128（native50） |
+|------|------------------|--------------------------|
+| qfree 调用点 | `call {double,i64} (...)` | `call i128 @qfree(i64)` |
+| `range_return_rewrite_missing_value` | 157 | **115**（qfree 的 42 处解决） |
+| `return_binding_uses_clobber_value` | 314 | 547（+233） |
+| unknown 总数 | 728 | 895 |
+
+结论：128 位返回**可以声明并且现在真的能绑上**（FUN_29a670 的 ZMM0 用上了调用的
+i128 返回值），但是**单值类型化返回会把原来 `{double,i64}` 里的 RAX 返回槽挤掉**，
+RAX 变成 clobber → clobber-return unknown 增加。也就是说：光有"128 位返回类型"
+不够，真实场景是**一个 callee 同时在多个寄存器里返回值**。
+
+### 10.3 实测：调用约定范围
+
+已有的全局开关 `abi_for_all_functions: true`（所有函数只按外部 ABI 传参/返回）：
+
+| 指标 | 默认（native44） | abi_for_all（native47） |
+|------|------------------|-------------------------|
+| poison | 6 | **2** |
+| unknown 总数 | 728 | **712** |
+| `return_binding_uses_clobber_value` | 314 | **91** |
+| `range_return_rewrite_missing_value` | 157 | 157 |
+| `call_effect_mixed` | 2 | 59 |
+| 产物大小 | 88.1 MB | **83.2 MB** |
+
+这正是用户说的"设置一个默认的调用约定的应用范围"：函数不再假设 R8/R9/R10/R11 等
+都能当返回通道，class A 从 314 降到 91。代价是调用点读这些寄存器时改成
+`call_effect_mixed`（59 处），总量仍是下降的。
+
+本轮还把范围做到**按函数**：配置 `functions[].abi`（`"external"`/`"internal"`），
+经 `NativePipelineContext` 传进 register-elimination，`abiConventionFor` 优先看
+强制集合。验证：小模块里 `@f` 挂了 `!notdec.abi = !{!"conventions=external"}`、
+`@g` 挂 `conventions=internal`。hexx64 上的 scoped 实验还没跑（全量一轮 11 分钟）。
+
+### 10.4 下一步（真正把 class A/B 钉死的 schema）
+
+两类 unknown 缺的都是"这个 callee 到底在哪些寄存器、多少位里返回值"，所以需要
+**多寄存器返回声明**，而不是单值类型：
+
+```json
+{
+  "qfree": {
+    "params": ["i64"],
+    "returns": [
+      {"register": "RAX",  "width": 64},
+      {"register": "XMM0", "width": 128}
+    ]
+  }
+}
+```
+
+以及按函数钉死输入/输出（用户提的"直接设置每个函数的输入和输出寄存器"）：
+
+```json
+{
+  "functions": [
+    {"select": {"name": "FUN_x"},
+     "signature": {
+       "params":  [{"register": "RDI", "width": 64}],
+       "returns": [{"register": "RAX", "width": 64},
+                   {"register": "XMM0", "width": 128}]
+     }}
+  ]
+}
+```
+
+实现落点：`shapeForKnownExternal`（按 returns 列表直接建 `shape.Returns`，宽度来自
+`iN`）＋ `buildInitialSignatureShapes` 里对 pin 的函数覆盖 shape。`extractReturnRange`
+和 `castSlotValueToRegister` 已经支持"整数位模式 + 任意宽度槽位"，这轮的两个 bug
+修复就是为它铺的路。本次没有实现多寄存器列表，留作下一步。

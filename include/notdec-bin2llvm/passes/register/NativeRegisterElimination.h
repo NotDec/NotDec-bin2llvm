@@ -28,6 +28,11 @@ struct NativeRegisterEliminationOptions {
   // 约定（例如把 caller-saved 的 RCX/R8 也当返回通道）。某些编译配置下所有函数都遵守
   // ABI，这时打开该开关，产物形状与打开前一致。
   bool AbiForAllFunctions = false;
+  // 按函数名强制调用约定（用户 JSON `functions[].abi`）：external = 参数/返回只
+  // 用外部 ABI 寄存器（不再假设所有寄存器都能当返回通道）；internal = 允许自定义
+  // 约定。集合里的名字优先于 AbiForAllFunctions。
+  std::set<std::string> ForcedExternalAbiFunctions;
+  std::set<std::string> ForcedInternalAbiFunctions;
   bool PrintSummary = false;
   std::string ExternalPrototypeJsonPath;
   std::set<std::string> IgnoredRegisters;

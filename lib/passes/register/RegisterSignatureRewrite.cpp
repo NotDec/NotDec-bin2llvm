@@ -348,7 +348,7 @@ llvm::Value *castSlotValueToRegister(llvm::IRBuilder<> &builder,
     return nullptr;
   }
 
-  if (!value->getType()->isFloatingPointTy() || !registerType->isIntegerTy()) {
+  if (!registerType->isIntegerTy()) {
     return nullptr;
   }
   unsigned registerBits = registerType->getIntegerBitWidth();
@@ -356,10 +356,23 @@ llvm::Value *castSlotValueToRegister(llvm::IRBuilder<> &builder,
       slot.OffsetBits + slot.SizeBits > registerBits) {
     return nullptr;
   }
+  // 浮点/向量返回槽的值可能是 float/double（bitcast 成位模式），也可能是整数
+  // （`return: "xmm128"` 这种 128 位向量槽用 i128 表示）。两种都按位宽铺到
+  // 寄存器槽位里。
   llvm::Type *intType =
       llvm::IntegerType::get(builder.getContext(), slot.SizeBits);
-  llvm::Value *bits =
-      builder.CreateBitCast(value, intType, slot.Unit->Name + ".ret_bits");
+  llvm::Value *bits = nullptr;
+  if (value->getType() == intType) {
+    bits = value;
+  } else if (value->getType()->isFloatingPointTy()) {
+    bits = builder.CreateBitCast(value, intType, slot.Unit->Name + ".ret_bits");
+  } else if (value->getType()->isIntegerTy() &&
+             value->getType()->getIntegerBitWidth() < slot.SizeBits) {
+    bits = builder.CreateZExt(value, intType,
+                              slot.Unit->Name + ".ret_zext_bits");
+  } else {
+    return nullptr;
+  }
   llvm::Value *zero = llvm::ConstantInt::get(registerType, 0);
   return createValueRangeInsert(builder, zero, bits, slot.SizeBits,
                                 slot.OffsetBits,

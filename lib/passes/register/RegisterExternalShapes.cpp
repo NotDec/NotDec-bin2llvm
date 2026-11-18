@@ -1317,7 +1317,8 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     const std::map<llvm::Function *, FunctionSummaryFacts> &summaryFacts,
     const AbiFacts &abi, const NativeExternalPrototypeMap &prototypes,
-    bool abiForAllFunctions) {
+    bool abiForAllFunctions, const std::set<std::string> *forcedExternal,
+    const std::set<std::string> *forcedInternal) {
   std::map<llvm::Function *, SignatureShape> shapes;
   for (llvm::Function &function : module) {
     // 内置 intrinsic（notdec.register.* 命名空间 + 历史前缀）不参与签名重写，
@@ -1339,7 +1340,8 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
             ? shapeForKnownExternal(function, units, abi, prototypes)
             : shapeForInternalFunction(
                   function, units, summaryFacts, abi,
-                  abiConventionFor(function, abiForAllFunctions));
+                  abiConventionFor(function, abiForAllFunctions,
+                                   forcedExternal, forcedInternal));
     if (!shape.Params.empty() || !shape.Returns.empty() || shape.VarArg) {
       shapes.emplace(&function, std::move(shape));
     }

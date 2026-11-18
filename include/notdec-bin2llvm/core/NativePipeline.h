@@ -27,6 +27,10 @@ struct NativePipelineContext {
   std::set<std::string> PreservedFunctions;
   // 由 Config.Functions 里 pin 解析出的函数名，后续 stage 跳过它们。
   std::set<std::string> PinnedFunctions;
+  // 由 Config.Functions 里 abi 声明解析出的函数名：强制 external/internal
+  // 调用约定（register-elimination 用）。
+  std::set<std::string> ForcedExternalAbiFunctions;
+  std::set<std::string> ForcedInternalAbiFunctions;
   // 非空时在每个 stage 前后写 <NN>-<name>-{before,after}.ll。
   std::string DumpStagesDir;
   // 校验失败时写 <OutputPath>.<NN>-<name>.bad.ll（OutputPath 非空时）。

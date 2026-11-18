@@ -407,13 +407,17 @@ uint64_t eraseDeadSummaryCallValueHelpers(llvm::Module &module);
 
 bool registerValueSourceIsControlled(const llvm::Function &function);
 
-AbiConvention abiConventionFor(const llvm::Function &function,
-                               bool abiForAllFunctions);
+AbiConvention abiConventionFor(
+    const llvm::Function &function, bool abiForAllFunctions,
+    const std::set<std::string> *forcedExternal = nullptr,
+    const std::set<std::string> *forcedInternal = nullptr);
 
 bool pointerIsRegisterGlobal(const llvm::Value *value);
 
-NativeRegisterValueSourceAudit
-auditRegisterValueSourcesImpl(llvm::Module &module, bool abiForAllFunctions);
+NativeRegisterValueSourceAudit auditRegisterValueSourcesImpl(
+    llvm::Module &module, bool abiForAllFunctions,
+    const std::set<std::string> *forcedExternal = nullptr,
+    const std::set<std::string> *forcedInternal = nullptr);
 
 llvm::MDNode *registerAccessNode(llvm::LLVMContext &context,
                                  const RegisterUnit &unit);
@@ -730,7 +734,9 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
     const std::map<llvm::Function *, FunctionSummaryFacts> &summaryFacts,
     const AbiFacts &abi, const NativeExternalPrototypeMap &prototypes,
-    bool abiForAllFunctions);
+    bool abiForAllFunctions,
+    const std::set<std::string> *forcedExternal = nullptr,
+    const std::set<std::string> *forcedInternal = nullptr);
 
 bool isStackSignatureSlot(const NativeSignatureSlot &slot);
 

@@ -206,7 +206,8 @@ runNativeRegisterElimination(llvm::Module &module,
   if (options.EnableRewrite) {
     signatureState.Shapes = buildInitialSignatureShapes(
         module, units, facts, abi, externalPrototypes,
-        options.AbiForAllFunctions);
+        options.AbiForAllFunctions, &options.ForcedExternalAbiFunctions,
+        &options.ForcedInternalAbiFunctions);
     propagateTailCallStackParams(module, signatureState);
     // 每个函数的调用约定标记（Arch2.md 第 13 节）：external = 参数/返回都按外部 ABI；
     // internal = 接口可改，可以用自定义约定。审计和后续 pass 只读这个标记，不再重算。
@@ -216,7 +217,9 @@ runNativeRegisterElimination(llvm::Module &module,
           continue;
         }
         AbiConvention convention =
-            abiConventionFor(function, options.AbiForAllFunctions);
+            abiConventionFor(function, options.AbiForAllFunctions,
+                             &options.ForcedExternalAbiFunctions,
+                             &options.ForcedInternalAbiFunctions);
         llvm::Metadata *fields[] = {llvm::MDString::get(
             module.getContext(),
             convention == AbiConvention::External ? "conventions=external"

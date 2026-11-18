@@ -657,7 +657,8 @@ std::optional<NativeConfig> parseNativeConfig(StringRef Text,
         Error = Path + ": expected object";
         return std::nullopt;
       }
-      if (!checkKeys(*Item, {"select", "pin", "attributes"}, Path, Error)) {
+      if (!checkKeys(*Item, {"select", "pin", "attributes", "abi"}, Path,
+                     Error)) {
         return std::nullopt;
       }
       NativeFunctionConfig Function;
@@ -678,8 +679,24 @@ std::optional<NativeConfig> parseNativeConfig(StringRef Text,
           return std::nullopt;
         }
       }
-      if (!Function.Pin && Function.Attributes.empty()) {
-        Error = Path + ": needs at least one of pin/attributes";
+      if (const Value *Abi = Item->get("abi")) {
+        std::optional<StringRef> Text = Abi->getAsString();
+        if (!Text) {
+          Error = Path + ".abi: expected string";
+          return std::nullopt;
+        }
+        if (*Text == "external") {
+          Function.AbiConvention = NativeFunctionConfig::Abi::External;
+        } else if (*Text == "internal") {
+          Function.AbiConvention = NativeFunctionConfig::Abi::Internal;
+        } else {
+          Error = Path + ".abi: expected \"external\" or \"internal\"";
+          return std::nullopt;
+        }
+      }
+      if (!Function.Pin && Function.Attributes.empty() &&
+          Function.AbiConvention == NativeFunctionConfig::Abi::Unset) {
+        Error = Path + ": needs at least one of pin/attributes/abi";
         return std::nullopt;
       }
       Config.Functions.push_back(std::move(Function));
@@ -839,6 +856,13 @@ void printNativeConfig(const NativeConfig &Config, llvm::raw_ostream &OS) {
             J.attribute("select", Value(std::move(Select)));
             if (Function.Pin) {
               J.attribute("pin", true);
+            }
+            if (Function.AbiConvention != NativeFunctionConfig::Abi::Unset) {
+              J.attribute("abi",
+                          Function.AbiConvention ==
+                                  NativeFunctionConfig::Abi::External
+                              ? "external"
+                              : "internal");
             }
             const NativeFunctionAttributes &Attributes = Function.Attributes;
             if (!Attributes.empty()) {

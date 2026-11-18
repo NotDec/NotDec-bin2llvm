@@ -41,6 +41,11 @@ bool parseValueType(llvm::StringRef text, ValueType &type) {
     type = ValueType::LongDouble;
     return true;
   }
+  if (text == "xmm128" || text == "i128" || text == "f128" ||
+      text == "vector128" || text == "__m128") {
+    type = ValueType::Vector128;
+    return true;
+  }
   return false;
 }
 

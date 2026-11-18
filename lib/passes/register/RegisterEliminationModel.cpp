@@ -292,9 +292,19 @@ bool registerValueSourceIsControlled(const llvm::Function &function) {
 }
 
 AbiConvention abiConventionFor(const llvm::Function &function,
-                               bool abiForAllFunctions) {
+                               bool abiForAllFunctions,
+                               const std::set<std::string> *forcedExternal,
+                               const std::set<std::string> *forcedInternal) {
   if (function.isDeclaration()) {
     return AbiConvention::External;
+  }
+  if (forcedExternal != nullptr &&
+      forcedExternal->count(function.getName().str()) != 0) {
+    return AbiConvention::External;
+  }
+  if (forcedInternal != nullptr &&
+      forcedInternal->count(function.getName().str()) != 0) {
+    return AbiConvention::Internal;
   }
   if (abiForAllFunctions) {
     return AbiConvention::External;
@@ -310,7 +320,9 @@ bool pointerIsRegisterGlobal(const llvm::Value *value) {
 }
 
 NativeRegisterValueSourceAudit
-auditRegisterValueSourcesImpl(llvm::Module &module, bool abiForAllFunctions) {
+auditRegisterValueSourcesImpl(llvm::Module &module, bool abiForAllFunctions,
+                              const std::set<std::string> *forcedExternal,
+                              const std::set<std::string> *forcedInternal) {
   NativeRegisterValueSourceAudit audit;
   for (llvm::Function &function : module) {
     if (function.isDeclaration()) {
@@ -318,8 +330,9 @@ auditRegisterValueSourcesImpl(llvm::Module &module, bool abiForAllFunctions) {
     }
     // 和签名构建用同一个判定：只有“接口可改”的函数的残留寄存器读才算 local，
     // 遵守 ABI 的函数（导出/地址被取，或开关强制）算边界读。
-    const bool controlled = abiConventionFor(function, abiForAllFunctions) ==
-                            AbiConvention::Internal;
+    const bool controlled =
+        abiConventionFor(function, abiForAllFunctions, forcedExternal,
+                         forcedInternal) == AbiConvention::Internal;
     for (llvm::BasicBlock &block : function) {
       for (llvm::Instruction &instruction : block) {
         if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction)) {

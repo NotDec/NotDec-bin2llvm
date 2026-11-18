@@ -25,6 +25,10 @@ struct NativeExternalPrototype {
     // x86 ELF SysV long double: 80-bit x87 payload, passed through the stack
     // and returned in ST0.  Other long double ABIs are intentionally excluded.
     LongDouble,
+    // 128-bit 值走 SSE/XMM 通道（SysV 下 `__m128`、`struct {double,double}` 这类
+    // 返回；LLVM 侧用 i128 表示）。用于声明"这个 callee 真的返回完整 128 位"，
+    // 让寄存器 SSA 不再把高 64 位落成 unknown。
+    Vector128,
   };
 
   unsigned FixedArgs = 0;

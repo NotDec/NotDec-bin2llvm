@@ -63,6 +63,10 @@ struct NativeFunctionConfig {
   NativeFunctionSelector Select;
   bool Pin = false;
   NativeFunctionAttributes Attributes;
+  // 可选：强制这批函数的调用约定。external = 参数/返回只用外部 ABI 寄存器
+  // （不再假设 R8/R9/R10/R11 等也能当返回通道）；internal = 允许自定义约定。
+  enum class Abi { Unset, External, Internal };
+  Abi AbiConvention = Abi::Unset;
 };
 
 // --- 各 stage 的 options ----------------------------------------------------
