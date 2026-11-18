@@ -789,3 +789,34 @@ ret i64 <unknown>          ; return_binding_uses_clobber_value
 
 剩下的 170 个内部调用 poison 实参不是签名重写时带进去的：它们在重写**之后**由
 同一遍的 partial-demand walk 毒化了实参的 def 链（下一轮再追）。
+
+## 20. 第 12 轮：变参槽同样不允许 poison
+
+### 20.1 现象
+
+第 19 节修掉了固定参数槽的 poison 实参，剩下的 170 个内部调用 poison 实参大多
+落在**变参槽**上（`call i128 (i64, ...) @FUN_4f650(..., i64 poison)`）：这些槽走
+`shouldPoisonUnprovenVarArg` → `vararg_unknown` → final cleanup 降级成 poison。
+
+### 20.2 修复
+
+变参槽在进入 `shouldPoisonUnprovenVarArg` 之前先做 poison 依赖检查：
+`valueDependsOnPoison(value)` 命中就直接换成带归因的 `notdec.unknown`
+（reason=`vararg_arg_uses_poison_value`），并且**优先于** `vararg_unknown` 路径
+（否则又会被降级回 poison）。依赖 `notdec.unknown` 占位（非 poison）的槽仍走原
+来的 `vararg_unknown` 路径——那条路径是 fortune x86_64 零-unknown 门槛的一部分，
+不能一起改。
+
+### 20.3 验证（hexx64.so 全量）
+
+| 指标 | 修前 | 修后 |
+|------|------|------|
+| poison 总数 | 643 | **462** |
+| 调用实参 poison | 470 | **289** |
+| 内部调用带 poison 实参 | 170 | 168 |
+| `unknowns` | 740 | 921（+181，poison→带归因 unknown） |
+
+`llvm-as` + `opt verify` 通过；`ctest` 19/19。
+
+剩余 168 个内部调用 poison 实参在签名重写时**还不是** poison：它们是重写之后由
+同一遍的 partial-demand walk 毒化实参的 def 链产生的（下一轮在 walk 侧封住）。

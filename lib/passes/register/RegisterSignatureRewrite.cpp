@@ -1216,9 +1216,28 @@ void rewriteSignatureShapes(
               "vararg_arg_uses_clobber_value"));
         }
         bool unknownValue = valueMayDependOnUnknownPlaceholder(value);
-        if (isLikelyX86_64SysVAbi(abi) &&
-            shouldPoisonUnprovenVarArg(binding, value, module.getDataLayout(),
-                                       oldCall)) {
+        // poison/undef 不能进变参槽：调用点会变成 UB，poison 也带不了
+        // !notdec.unknown.source 归因。换成带归因的 unknown，并且优先于下面的
+        // vararg_unknown 路径（否则又会被降级回 poison）。
+        if (valueDependsOnPoison(value)) {
+          state.Warnings.push_back(finalCallRegisterWarning(
+              binding.Unit == nullptr ? "" : binding.Unit->Name, "call_arg",
+              "vararg_arg_uses_poison_value"));
+          llvm::Value *poisonReplacement = unknownValueAt(
+              oldCallBuilder, value->getType(),
+              (binding.Unit == nullptr ? llvm::Twine("vararg")
+                                       : llvm::Twine(binding.Unit->Name)) +
+                  ".arg_unknown");
+          attachUnknownValueMetadata(
+              poisonReplacement, "vararg_arg_uses_poison_value",
+              oldCall->getFunction()->getName(), rewrittenCalleeName,
+              binding.Unit == nullptr ? "" : binding.Unit->Name, "call_arg");
+          value = poisonReplacement;
+          unknownValue = true;
+        } else if (isLikelyX86_64SysVAbi(abi) &&
+                   shouldPoisonUnprovenVarArg(binding, value,
+                                              module.getDataLayout(),
+                                              oldCall)) {
           llvm::StringRef reason = unknownValue
                                        ? "vararg_arg_uses_unknown_value"
                                        : "vararg_arg_unproven_zero";
