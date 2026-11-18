@@ -5067,6 +5067,75 @@ bool testPartialDemandKeepsDynamicShiftAmount() {
                   "module failed verifier after dynamic shift demand test");
 }
 
+bool testPoisonAggregateBaseGetsFilledFields() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-poison-aggregate-base", context);
+  attachTestAbi(module);
+
+  llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+  llvm::StructType *pair = llvm::StructType::get(context, {i64, i64});
+  auto *type = llvm::FunctionType::get(pair, {i64}, false);
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::ExternalLinkage, "poison_aggregate_helper",
+      module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *base = llvm::PoisonValue::get(pair);
+  llvm::Value *built = builder.CreateInsertValue(base, function->getArg(0), 0);
+  builder.CreateRet(built);
+
+  auto cleanup = notdec::bin2llvm::runNativeRegisterFinalCleanup(module);
+
+  bool foundAttributedField = false;
+  std::set<unsigned> writtenIndices;
+  llvm::Value *returned = nullptr;
+  for (llvm::Instruction &inst : llvm::instructions(*function)) {
+    if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&inst)) {
+      returned = ret->getReturnValue();
+    }
+    auto *call = llvm::dyn_cast<llvm::CallInst>(&inst);
+    if (call == nullptr) {
+      continue;
+    }
+    if (llvm::MDNode *source = call->getMetadata("notdec.unknown.source")) {
+      for (const llvm::MDOperand &operand : source->operands()) {
+        auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+        if (text != nullptr &&
+            text->getString() == "reason=poison_aggregate_field") {
+          foundAttributedField = true;
+        }
+      }
+    }
+  }
+  // 返回的聚合必须是完整写满的 insertvalue 链（基座可以是 poison，但每个字段
+  // 都已被覆盖）。
+  for (llvm::Value *value = returned; value != nullptr;) {
+    auto *insert = llvm::dyn_cast<llvm::InsertValueInst>(value);
+    if (insert == nullptr || insert->getNumIndices() != 1) {
+      break;
+    }
+    writtenIndices.insert(insert->getIndices()[0]);
+    value = insert->getAggregateOperand();
+    if (llvm::isa<llvm::PoisonValue>(value)) {
+      break;
+    }
+  }
+  bool allFieldsWritten = writtenIndices.count(0) != 0 &&
+                          writtenIndices.count(1) != 0;
+  if (!foundAttributedField || !allFieldsWritten) {
+    module.print(llvm::errs(), nullptr);
+  }
+  return expect(cleanup.PoisonAggregateBasesReplaced >= 1,
+                "poison aggregate base was not counted") &&
+         expect(foundAttributedField,
+                "unset aggregate field was not filled with an attributed "
+                "unknown") &&
+         expect(allFieldsWritten,
+                "returned aggregate still has an unwritten (poison) field") &&
+         verifyOk(module,
+                  "module failed verifier after poison aggregate base test");
+}
+
 bool testPoisonRangeExtractBecomesAttributedUnknown() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-poison-range-extract", context);
@@ -6685,6 +6754,7 @@ int main() {
   ok &= testPartialDemandKeepsSameWidthMulOperand();
   ok &= testPartialDemandKeepsSelectCondition();
   ok &= testPoisonRangeExtractBecomesAttributedUnknown();
+  ok &= testPoisonAggregateBaseGetsFilledFields();
   ok &= testPartialDemandKeepsDivRemOperand();
   ok &= testPartialZmmKeepHighStoreIsDemandRewritten();
   ok &= testPartialZmmNakedKeepHighStoreIsDemandRewritten();

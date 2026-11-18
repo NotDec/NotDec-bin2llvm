@@ -469,6 +469,54 @@ void runLocalDeadCodeCleanup(llvm::Module &module) {
 
 } // namespace
 
+// `insertvalue <struct> poison, %v, i` 用来构造"只填部分字段"的结构体：未填
+// 字段就是未知值。最终 IR 里不能留 poison（poison 会让使用者成为 UB，也带不了
+// 归因），所以给其余每个字段补一个带归因的 notdec.unknown，再把原 insertvalue
+// 的基座接到补齐后的聚合上。只处理单层索引的 struct（多字段结构体的常见构造）。
+uint64_t replacePoisonAggregateBases(llvm::Module &module) {
+  uint64_t replaced = 0;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    std::vector<llvm::InsertValueInst *> candidates;
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      auto *insert = llvm::dyn_cast<llvm::InsertValueInst>(&inst);
+      if (insert == nullptr || insert->getNumIndices() != 1) {
+        continue;
+      }
+      auto *poison =
+          llvm::dyn_cast<llvm::PoisonValue>(insert->getAggregateOperand());
+      if (poison == nullptr ||
+          llvm::dyn_cast<llvm::StructType>(poison->getType()) == nullptr) {
+        continue;
+      }
+      candidates.push_back(insert);
+    }
+    for (llvm::InsertValueInst *insert : candidates) {
+      auto *structType =
+          llvm::cast<llvm::StructType>(insert->getAggregateOperand()->getType());
+      unsigned setIndex = insert->getIndices()[0];
+      llvm::IRBuilder<> builder(insert);
+      llvm::Value *current = llvm::PoisonValue::get(structType);
+      for (unsigned index = 0; index < structType->getNumElements(); ++index) {
+        if (index == setIndex) {
+          continue;
+        }
+        llvm::Value *field = unknownValueAt(
+            builder, structType->getElementType(index), "unknown.field");
+        attachUnknownValueMetadata(field, "poison_aggregate_field",
+                                   function.getName(), "", "", "insertvalue");
+        current = builder.CreateInsertValue(current, field, index);
+      }
+      insert->setOperand(0, current);
+      ++replaced;
+    }
+  }
+  return replaced;
+}
+
+
 // phi 的 poison 入边会把 poison 带到 ret/br/store 等观察点（phi 本身不会被
 // InstCombine 折掉），在最终 IR 里换成带归因的 notdec.unknown：未定义变成
 // "某个未知值"，调用点/返回点不再是 UB。占位插在该入边对应的前驱块终止符前。
@@ -709,6 +757,7 @@ NativeRegisterFinalCleanupSummary runNativeRegisterFinalCleanup(
   summary.VarArgUnknownHelpersLowered += lowerVarArgUnknownHelpers(module);
   summary.PoisonCallArgumentsReplaced += replacePoisonCallArguments(module);
   summary.PoisonPhiIncomingsReplaced += replacePoisonPhiIncomings(module);
+  summary.PoisonAggregateBasesReplaced += replacePoisonAggregateBases(module);
   NativePoisonTerminatorSummary poisonTerminators =
       replacePoisonTerminatorValues(module);
   summary.PoisonControlFlowConditionsReplaced +=
@@ -768,6 +817,8 @@ void printNativeRegisterFinalCleanupSummary(
      << summary.PoisonCallArgumentsReplaced
      << " poison_phi_incomings_replaced="
      << summary.PoisonPhiIncomingsReplaced
+     << " poison_aggregate_bases_replaced="
+     << summary.PoisonAggregateBasesReplaced
      << " function_metadata_cleared=" << summary.FunctionMetadataCleared
      << " instruction_metadata_cleared=" << summary.InstructionMetadataCleared
      << " remaining_register_accesses=" << summary.RemainingRegisterAccesses

@@ -35,6 +35,7 @@ struct NativeRegisterFinalCleanupSummary {
   uint64_t PoisonReturnValuesReplaced = 0;
   uint64_t PoisonCallArgumentsReplaced = 0;
   uint64_t PoisonPhiIncomingsReplaced = 0;
+  uint64_t PoisonAggregateBasesReplaced = 0;
   uint64_t FunctionMetadataCleared = 0;
   uint64_t InstructionMetadataCleared = 0;
   uint64_t RemainingRegisterAccesses = 0;
@@ -63,6 +64,10 @@ uint64_t replacePoisonCallArguments(llvm::Module &module);
 // 把 phi 的 literal poison 入边换成带归因的 notdec.unknown（占位插在对应前驱
 // 块的终止符前），避免 poison 顺着 phi 流到 ret/br/store。
 uint64_t replacePoisonPhiIncomings(llvm::Module &module);
+
+// 把"insertvalue 的基座是 poison struct"这种部分构造，补齐成每个字段都有值的
+// 聚合（未设置的字段用带归因的 notdec.unknown），避免 poison 漏给使用者。
+uint64_t replacePoisonAggregateBases(llvm::Module &module);
 
 // 清掉没人用的 notdec.unknown.* 占位调用。runNativeRegisterFinalCleanup 内部会
 // 调一次；tool 在最后一次 InstCombine 之后还要再调一次——那次 InstCombine 可能

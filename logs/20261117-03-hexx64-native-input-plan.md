@@ -1033,3 +1033,37 @@ store，机制是：
 
 剩下的 8 个 poison：2 个外部/间接调用变参槽 + 6 个 select/insert 类死值。
 unknown 降了 591（位段 poison 链断掉后，大量级联 unknown 消失）。
+
+## 27. 第 19 轮：部分构造聚合的 poison 字段补齐
+
+### 27.1 现象
+
+剩余 8 个 poison 里 6 个是 `insertvalue`：
+
+```
+%2 = insertvalue { i64, i64 } poison, i64 %RAX.ret_slot47, 0
+```
+
+`{i64,i64}` 的第二个字段**没有被写**，而调用点确实读了它
+（`%RDX.ret_slot244 = extractvalue { i64, i64 } %276, 1`，FUN_148d10 的调用者），
+所以调用者拿到的是 poison —— 观察点上的 UB。另外两处
+`insertvalue { i32, i64 } { i32 1, i64 poison }, ... , 1` 的字段 1 随后被覆盖，
+是良性的（常量基座里的 poison 被完全覆盖）。
+
+### 27.2 修复
+
+`NativeRegisterFinalCleanup` 新增 `replacePoisonAggregateBases()`：对基座是
+poison struct 的单索引 `insertvalue`，先把其余每个字段补成带归因的
+`notdec.unknown`（reason=`poison_aggregate_field`），再把原 insertvalue 接到补齐
+后的聚合上。这样**返回的聚合每个字段都有值**（链基座仍是 poison，但会被逐字段
+覆盖，这是 LLVM 构造结构体的固有写法）。
+
+### 27.3 验证
+
+- 单测 `testPoisonAggregateBaseGetsFilledFields`：断言返回的 `{i64,i64}` 链覆盖
+  索引 0/1、存在 `poison_aggregate_field` 归因、verifier 通过；已验证把调用注释掉
+  时该测试失败。
+- hexx64.so 全量（native39）：FUN_148d10 / FUN_1d8690 / FUN_1eb800 的返回聚合补
+  上 `%unknown.field`（调用点读字段 1 不再是 poison）；`notdec.unknown` 调用数
+  1219 → 1223；文本 poison 仍是 8（6 个是链基座、2 个是外部变参槽），但**会被读
+  的 poison 字段已经清零**；`llvm-as`/`opt verify` 通过，`ctest` 19/19。

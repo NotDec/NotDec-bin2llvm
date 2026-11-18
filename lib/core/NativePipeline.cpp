@@ -361,6 +361,7 @@ bool runEraseDeadHelpersStage(const NativeStageConfig &Stage,
   // 终结指令的兜底，保证产物里没有 poison 条件/返回值。
   replacePoisonCallArguments(Context.Module);
   replacePoisonPhiIncomings(Context.Module);
+  replacePoisonAggregateBases(Context.Module);
   NativePoisonTerminatorSummary poisonTerminators =
       replacePoisonTerminatorValues(Context.Module);
   if (poisonTerminators.ConditionsReplaced != 0 ||
