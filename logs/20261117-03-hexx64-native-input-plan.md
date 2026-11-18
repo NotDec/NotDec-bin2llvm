@@ -1156,3 +1156,57 @@ hexx64.so 全量（native42）：
 剩下的 unknown 主要是 `return_binding_uses_clobber_value`（314）和
 `range_return_rewrite_missing_value`（157）——都是"外部调用没原型/返回槽位宽
 不足"的固有缺口。
+
+## 30. 第 22 轮：语义审计（跳转表 / 栈帧 / 尺寸异常）——未发现新 bug
+
+本轮没有再改代码，把三处"看起来可疑"的地方逐一对上汇编验证，结论都是实现正确。
+
+### 30.1 跳转表 switch 降级
+
+以 FUN_1eb840 为例，汇编：
+
+```
+movl 8(%rdi),%eax
+subl $70,%eax
+cmpl $14,%eax
+ja .L_1ebcb0
+leaq (.L_34f8b0)(%rip),%rdx
+movslq (%rdx,%rax,4),%rax
+addq %rdx,%rax
+jmpq *%rax
+```
+
+IR：边界检查 `br i1 %1, label %bb_1ebcb0, label %bb_1eb85d`；表地址
+`%narrow = add (index*4), 3471536`（3471536 = 0x34F8B0，正是表基址）；
+`switch i32 %entry, label %native_indirect_default [i32 -1458240, label %bb_1eb870, ...]`。
+逐项核对：-1458240 = 0x1eb870 - 0x34F8B0、-1458156 = 0x1eb8c4 - 0x34F8B0 ——
+case 值和目标块全部对得上。单元测试 `testNativeIndirectBranchLowersMultipleSuccessorsAsSwitch`
+已覆盖该行为。
+
+### 30.2 栈帧尺寸
+
+对 3774 个"汇编里有 `subq $N,%rsp`、IR 里有 `alloca [M x i8]`"的函数比较，
+一开始有 3459 个 M ≠ N，差值恰好是 8×push 数：
+
+- FUN_1f12a0：push r15/r14/r13/r12/rbp/rbx（48）+ `subq $8` = 56 = IR alloca；
+- FUN_1eb840：48 + `subq $40` = 88 = IR alloca；
+- FUN_2e83c0：无 push、`subq $216` = 216 = IR alloca（va_list 在 rsp+0、
+  canary 在 rsp+24、GP 保存区 rsp+40..72、XMM 保存区 rsp+80..192，与
+  `llvm.va_start(%alloca)` 的指向一致）。
+
+即 alloca 覆盖"被调用者保存寄存器 + 局部区"整帧，偏移相对最终 rsp，正确。
+
+### 30.3 asm/IR 尺寸异常
+
+- FUN_282830：IR 931 条 / 汇编 23 条（40x）。原因是它是
+  `jmp FUN_281da0` thunk，ddisasm 的 `functionBlocks` 把被尾跳函数
+  （FUN_281da0，0x281da0..0x282830）的块算成"从该函数可达"，一并归到
+  FUN_282830（范围 0x281da0..0x282880、147 块）。合并后的 IR 只有 FUN_282830
+  一个函数、无对 `@FUN_281da0` 的未定义引用，尾跳语义等价，不算错误。
+- FUN_3d4cb 等低比值项是 1 字节函数（`nop`）或 thunk；统计脚本把后续无关指令
+  算进了 asm 条数，属统计口径问题。
+- FUN_489e0 是 `deregister_tm_clones`，正确。
+
+### 30.4 结论
+
+跳转表、栈帧、尺寸三类审计均通过；本轮无代码改动。
