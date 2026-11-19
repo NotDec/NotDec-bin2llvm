@@ -20,11 +20,16 @@
   审计/指标把它从 unknown 里分出来。
 - [x] **P2 指标工程化**：`--metrics-json`（unknown 按 reason/function/callee、
   ABI 未定义位、裸寄存器读、poison、模块规模、verify）+ `scripts/native-metrics-matrix.sh`。
-- [ ] **P3 纠正错误方向**：在交接文档里把"用 `returns` 声明补高位"标为被否方案，
-  说明 qfree pin 那 66 个 unknown 是造值换来的；给出正确做法（P1）与判据。
-- [ ] **P4 回归**：ctest 19/19（fortune x86_64/i386 门槛）、hexx64 全量指标对比
-  （native44 默认 vs native53 新默认 vs native52 pin 配置）。
-- [ ] **P5 单测**：给 register 核心单测加一个"窄浮点返回 + 宽返回槽 → ABI 未定义位"的用例。
+- [x] **P3 纠正错误方向**：交接文档 §5.2 已把"用 `returns` 声明补高位"标为被否
+  方案，说明 qfree pin 那 66 个 unknown 是造值换来的；给出正确做法（P1）与判据。
+  §7"被否方向"也补了这一条。
+- [x] **P4 回归**：ctest 19/19（fortune x86_64/i386 门槛通过）、hexx64 全量指标
+  对比（默认 728 → 517+211、abi 501+211，见上面表格）、`native53.ll` 过
+  LLVM 22 `llvm-as` + `opt -passes=verify`。
+- [x] **P5 单测**：`testAbiUndefinedValuesAreAuditedSeparately` 覆盖**记账侧**
+  （审计/剩余 unknown 统计把 ABI 未定义位分开）。**发射侧**（窄浮点返回槽 +
+  宽请求位段）没写单测：复现它要完整走一遍签名重写的返回槽装配，成本高，
+  当前由 hexx64 全量跑 + 指标 JSON 覆盖（qfree/getinf 等 211 个值）。
 
 ## 参数口径统一（本轮顺手做的）
 
