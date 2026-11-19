@@ -5,10 +5,14 @@ namespace notdec::bin2llvm {
 namespace {
 // 临时诊断（NOTDEC_TRACE_ZMM0_DEMAND=1）：打印 ZMM0 需求的"种子读"和
 // "沿调用边传给 callee 的退出需求"，用来回答"这个 128 位需求到底从哪来"。
-bool traceZmm0Demand() {
-  static const bool enabled =
-      ::getenv("NOTDEC_TRACE_ZMM0_DEMAND") != nullptr;
-  return enabled;
+const char *tracedDemandRegister() {
+  static const char *name = ::getenv("NOTDEC_TRACE_DEMAND");
+  return name;
+}
+
+bool traceDemandFor(const std::string &registerName) {
+  const char *traced = tracedDemandRegister();
+  return traced != nullptr && registerName == traced;
 }
 } // namespace
 
@@ -31,15 +35,26 @@ RegisterDemand
               mask = mask.zext(mask.getBitWidth() + partial->BitOffset)
                          .shl(partial->BitOffset);
             }
+            // DF 在 ABI 边界上按约定就是 0（isAbiBoundaryZeroRegister），
+            // 值侧已经由入口/调用点直接给常量，需求侧不该再向 callee 要：
+            // 否则每个读 DF 的 cmp*/sca*/movs* 循环都会给"上一个调用"记一笔
+            // 退出需求，再沿返回槽透传放大（hexx64 上 1450 个函数）。
+            if (auto unitIt = Units.find(partial->Global);
+                unitIt != Units.end() &&
+                isAbiBoundaryZeroRegister(unitIt->second.Name)) {
+              continue;
+            }
             addDemand(live, partial->Global, mask);
-            if (traceZmm0Demand()) {
+            if (tracedDemandRegister() != nullptr) {
               auto unitIt = Units.find(partial->Global);
-              if (unitIt != Units.end() && unitIt->second.Name == "ZMM0") {
-                llvm::errs() << "ZMM0READ fn=" << block.getParent()->getName()
-                             << " bb=" << block.getName() << " off="
-                             << partial->BitOffset << " width="
-                             << partial->ReadWidth << " mask="
-                             << maskToHex(mask) << "\n";
+              if (unitIt != Units.end() &&
+                  traceDemandFor(unitIt->second.Name)) {
+                llvm::errs() << "DEMANDREAD reg=" << unitIt->second.Name
+                             << " fn=" << block.getParent()->getName()
+                             << " bb=" << block.getName()
+                             << " off=" << partial->BitOffset
+                             << " width=" << partial->ReadWidth
+                             << " mask=" << maskToHex(mask) << "\n";
               }
             }
           }
@@ -80,7 +95,8 @@ RegisterDemand
       }
       if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
         RegisterAccess access = registerLoad(*load, Units);
-        if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
+        if (access.Unit != nullptr && !isIgnored(*access.Unit, Options) &&
+            !isAbiBoundaryZeroRegister(access.Unit->Name)) {
           addDemand(live, access.Unit->Global, valueDemand(load, valueDemands));
         }
       }
@@ -112,8 +128,8 @@ void Analyzer::applyBackwardCallDemand(
         if (maskNonZero(nonEntryBits)) {
           addDemand(additions[callee], global, nonEntryBits);
           DemandEdges[unit.Name][call.getFunction()].insert(callee);
-          if (traceZmm0Demand() && unit.Name == "ZMM0") {
-            llvm::errs() << "ZMM0EXIT caller="
+          if (traceDemandFor(unit.Name)) {
+            llvm::errs() << "DEMANDEXIT reg=" << unit.Name << " caller="
                          << call.getParent()->getParent()->getName()
                          << " callee=" << callee->getName()
                          << " bits=" << maskToHex(nonEntryBits)
@@ -142,6 +158,11 @@ void Analyzer::applyBackwardCallDemand(
           continue;
         }
         Cell calleeCell = cellIn(effect, global);
+        // DF 同理：值由 ABI 边界给 0，callee 读入口 DF 不需要调用点准备值，
+        // 否则"读 DF 的函数"会把需求逆向传给所有调用者（hexx64 上 1384 个函数）。
+        if (isAbiBoundaryZeroRegister(unit.Name)) {
+          continue;
+        }
         llvm::APInt entryNeeds = calleeCell.ReadEntry;
         // 浮点返回寄存器（XMM/ZMM/ST0）不做入口侧闭合（和
         // shapeForInternalFunction 的取舍一致）：调用点还答不出整条向量。

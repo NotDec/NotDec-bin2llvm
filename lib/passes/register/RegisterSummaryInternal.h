@@ -321,6 +321,10 @@ bool isKeepHighPartialLoadUse(llvm::LoadInst &load,
 bool isIgnored(const RegisterUnit &unit,
                const NativeRegisterSummaryOptions &options);
 
+// DF 在 ABI 边界（函数入口、调用之后）按约定必须是 0；值侧由入口/调用点直接
+// 给常量，需求侧也据此跳过（见 RegisterEliminationModel.cpp 的实现注释）。
+bool isAbiBoundaryZeroRegister(llvm::StringRef name);
+
 class Analyzer {
 public:
   Analyzer(llvm::Module &module, NativeRegisterSummaryOptions options);

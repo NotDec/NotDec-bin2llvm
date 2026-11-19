@@ -344,3 +344,33 @@ Arch2.md 新增 11.1 节记录设计，§10 全貌和 §12 边界同步更新。
 DF 1450 节点 / 1402 纯透传（106 源头）、R9 1305/881（121）、R8 551/317（17）、
 R10 487/436（4）、R11 478/452（4）。可观察性报告里 RDI 144、RAX 181、RSI 38 个
 cuttable callsites 也还在。
+
+## 第二条链：DF（1450 节点 / 4430 边 → 0）
+DF 是方向标志：值侧早就按 ABI 处理成"边界处恒为 0"（`isAbiBoundaryZeroRegister`
+注释里写了：函数入口按 ABI 是 0，调用后也是 0，`cmpsb` 展开循环的方向不能被
+clobber 占位污染），但**需求侧没跟上**，于是每个读 DF 的 `cmp*/sca*/movs*` 循环都
+给"上一个调用"记一笔退出需求，再沿返回槽透传放大。
+
+两处补齐（`RegisterSummarySignature.cpp`）：
+1. `liveBeforeBlock` 的 `partial_read` / `load` 分支：DF 不加需求（值由边界规则给 0）；
+2. `applyBackwardCallDemand` 的 `entryNeeds` 循环：DF 跳过（callee 读入口 DF 不需要
+   调用点准备值）。
+
+效果：需求图里 `DF nodes=1450 edges=4430 sources=106` **整行消失**。指标不变
+（515 / abi_undef 0）——DF 不是 value-carrying 寄存器，从来没有返回槽或形参，
+所以这条链此前只是纯记账噪音和定点开销；修它主要是让需求图恢复可信。
+
+## 诊断工具升级
+`NOTDEC_TRACE_ZMM0_DEMAND` 改成 `NOTDEC_TRACE_DEMAND=<寄存器名>`，可以给任意寄存器
+打种子读（`DEMANDREAD`）和需求边（`DEMANDEXIT`）。DF 的定位就是靠它：先看到
+`DEMANDEXIT` 有 19 万条、`DEMANDREAD` 一条都没有，才意识到种子在 `load` 分支和
+callee 的 `ReadEntry` 上，而不是 `partial_read`。
+
+## 下一条链：R10 / R11（487 / 478 节点，各 4 个源头）
+- 源头函数：`FUN_1d52d0`、`FUN_334770`、`FUN_340d90`（R10 另有 `FUN_2244e0`，
+  R11 另有 `FUN_12bb90`）；
+- 这两个寄存器是 value-carrying，链条对应 `return_binding_uses_clobber_value` 里
+  R10=33、R11=30 个 unknown，**修掉是有指标收益的**；
+- 已确认它们确实是普通寄存器写/读（`FUN_334770` 的 asm 里就有对 R10/R11 的写），
+  不是 idiom；源头是"某条路径上读了一个本函数没写过的 R10/R11"，下一步用
+  `NOTDEC_TRACE_DEMAND=R11` 的 `DEMANDREAD` 定位到具体 block 再对照 asm。
