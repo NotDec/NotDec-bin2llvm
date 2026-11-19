@@ -22,6 +22,10 @@ NativeRegisterSummary Analyzer::run() {
       collectExternalCallsiteEvidence();
     }
     if (Options.RunTopDownDemand) {
+      // 可观察性分析：先算出"入口值有没有人真正观察"，再跑 demand。
+      // 目前只打印（阶段 1），还没有用它裁剪 ReadEntry。
+      computeUsedInputs();
+      reportUnobservableInputs();
       runTopDownDemand();
       reportDemandOrigins();
     }

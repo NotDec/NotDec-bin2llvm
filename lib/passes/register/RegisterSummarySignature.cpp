@@ -376,6 +376,253 @@ bool functionTouchesRegister(llvm::Function &function,
 
 } // namespace
 
+namespace {
+
+// 从"可观察 sink"反向收集所有被需要的 SSA 值。
+// 和 computeValueDemands 的区别：这里去掉两个会放大需求的 seed——
+//   * partial_write 的值（写回寄存器不等于被观察，只有寄存器后续被可观察读才算）
+//   * icmp 的操作数（比较结果可能只喂给死掉的 flag store）
+// 保留的 sink 都是"函数外可见"的：ret、br/switch 条件、store 到非寄存器内存。
+// 内部 callee 的实参由 usedInputs 定点决定；外部调用没有显式实参（参数在寄存器
+// 里），用 callsExternal 标记，由 computeUsedInputs 把 ABI 输入寄存器整体算 used。
+std::set<llvm::Value *>
+observableValuesInFunction(llvm::Function &function,
+                           const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+                           bool &callsExternal) {
+  std::set<llvm::Value *> needed;
+  std::vector<llvm::Value *> worklist;
+  auto mark = [&](llvm::Value *value) {
+    if (value == nullptr || llvm::isa<llvm::Constant>(value)) {
+      return;
+    }
+    if (needed.insert(value).second) {
+      worklist.push_back(value);
+    }
+  };
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &inst : block) {
+      if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&inst)) {
+        mark(ret->getReturnValue());
+        continue;
+      }
+      if (auto *branch = llvm::dyn_cast<llvm::BranchInst>(&inst)) {
+        if (branch->isConditional()) {
+          mark(branch->getCondition());
+        }
+        continue;
+      }
+      if (auto *sw = llvm::dyn_cast<llvm::SwitchInst>(&inst)) {
+        mark(sw->getCondition());
+        continue;
+      }
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        if (registerStore(*store, units).Unit == nullptr) {
+          mark(store->getValueOperand());
+        }
+        continue;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr || isNotDecRegisterHelperCall(*call)) {
+        continue;
+      }
+      llvm::Function *callee = call->getCalledFunction();
+      if (callee == nullptr || callee->isDeclaration()) {
+        callsExternal = true;
+      }
+    }
+  }
+  while (!worklist.empty()) {
+    llvm::Value *value = worklist.back();
+    worklist.pop_back();
+    auto *inst = llvm::dyn_cast<llvm::Instruction>(value);
+    if (inst == nullptr) {
+      continue;
+    }
+    for (llvm::Value *operand : inst->operand_values()) {
+      mark(operand);
+    }
+  }
+  return needed;
+}
+
+std::vector<llvm::Value *>
+registerReadsInFunction(llvm::Function &function,
+                        llvm::GlobalVariable *global) {
+  std::vector<llvm::Value *> reads;
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &inst : block) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (load->getPointerOperand()->stripPointerCasts() == global) {
+          reads.push_back(load);
+        }
+        continue;
+      }
+      auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+      if (call == nullptr) {
+        continue;
+      }
+      if (std::optional<NativeRegisterPartialReadInfo> read =
+              parseNativeRegisterPartialRead(*call);
+          read && read->Global == global) {
+        reads.push_back(call);
+      }
+    }
+  }
+  return reads;
+}
+
+} // namespace
+
+void Analyzer::computeUsedInputs() {
+  std::map<llvm::Function *, std::set<llvm::GlobalVariable *>> localUsed;
+  std::map<llvm::Function *, bool> callsExternal;
+  std::map<llvm::Function *, std::set<llvm::Function *>> internalCallees;
+  const std::set<llvm::Function *> defined(Functions.begin(), Functions.end());
+
+  for (llvm::Function *function : Functions) {
+    bool external = false;
+    std::set<llvm::Value *> needed =
+        observableValuesInFunction(*function, Units, external);
+    callsExternal[function] = external;
+    for (const auto &[global, unit] : Units) {
+      if (isIgnored(unit, Options)) {
+        continue;
+      }
+      for (llvm::Value *read : registerReadsInFunction(*function, global)) {
+        if (needed.find(read) != needed.end()) {
+          localUsed[function].insert(global);
+          break;
+        }
+      }
+    }
+    for (llvm::BasicBlock &block : *function) {
+      for (llvm::Instruction &inst : block) {
+        auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+        if (call == nullptr || isNotDecRegisterHelperCall(*call)) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee != nullptr && !callee->isDeclaration() &&
+            defined.count(callee) != 0) {
+          internalCallees[function].insert(callee);
+        }
+      }
+    }
+  }
+
+  std::deque<llvm::Function *> worklist;
+  std::set<llvm::Function *> inQueue;
+  auto enqueue = [&](llvm::Function *function) {
+    if (function != nullptr && inQueue.insert(function).second) {
+      worklist.push_back(function);
+    }
+  };
+  for (llvm::Function *function : Functions) {
+    // 接口不可改（地址被取，可能被我们看不到的代码调用）：整条保守算 used。
+    const bool interfaceFixed = function->hasAddressTaken();
+    for (const auto &[global, unit] : Units) {
+      if (isIgnored(unit, Options)) {
+        continue;
+      }
+      const bool abiInputAndCallsOut =
+          callsExternal[function] != 0 && Abi.Inputs.count(unit.Name) != 0;
+      if (localUsed[function].count(global) != 0 || interfaceFixed ||
+          abiInputAndCallsOut) {
+        UsedInputs[function].insert(unit.Name);
+      }
+    }
+    enqueue(function);
+  }
+
+  while (!worklist.empty()) {
+    llvm::Function *function = worklist.front();
+    worklist.pop_front();
+    inQueue.erase(function);
+    bool changed = false;
+    for (llvm::Function *callee : internalCallees[function]) {
+      const auto calleeIt = UsedInputs.find(callee);
+      if (calleeIt == UsedInputs.end()) {
+        continue;
+      }
+      for (const std::string &name : calleeIt->second) {
+        if (UsedInputs[function].insert(name).second) {
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      const auto callersIt = Callers.find(function);
+      if (callersIt != Callers.end()) {
+        for (llvm::Function *caller : callersIt->second) {
+          enqueue(caller);
+        }
+      }
+    }
+  }
+}
+
+void Analyzer::reportUnobservableInputs() {
+  for (const auto &[global, unit] : Units) {
+    if (isIgnored(unit, Options)) {
+      continue;
+    }
+    std::vector<std::string> unobservable;
+    for (llvm::Function *function : Functions) {
+      const auto factIt = Effects.find(function);
+      if (factIt == Effects.end()) {
+        continue;
+      }
+      const Cell cell = cellIn(factIt->second, global);
+      if (!maskNonZero(cell.ReadEntry)) {
+        continue;
+      }
+      const auto usedIt = UsedInputs.find(function);
+      if (usedIt != UsedInputs.end() &&
+          usedIt->second.count(unit.Name) != 0) {
+        continue;
+      }
+      unobservable.push_back(function->getName().str());
+    }
+    // 调用点：callee 读入口、但读到的值没人观察 ⇒ 调用点不需要为它准备值。
+    uint64_t cuttableCallSites = 0;
+    for (const auto &[caller, callees] : Calls) {
+      (void)caller;
+      for (llvm::Function *callee : callees) {
+        const auto factIt = Effects.find(callee);
+        if (factIt == Effects.end()) {
+          continue;
+        }
+        if (!maskNonZero(cellIn(factIt->second, global).ReadEntry)) {
+          continue;
+        }
+        const auto usedIt = UsedInputs.find(callee);
+        if (usedIt != UsedInputs.end() &&
+            usedIt->second.count(unit.Name) != 0) {
+          continue;
+        }
+        ++cuttableCallSites;
+      }
+    }
+    if (unobservable.empty() && cuttableCallSites == 0) {
+      continue;
+    }
+    llvm::errs() << "Native register observable inputs: " << unit.Name
+                 << " read_entry_functions=" << unobservable.size()
+                 << " cuttable_callsites=" << cuttableCallSites;
+    if (!unobservable.empty()) {
+      llvm::errs() << " examples:";
+      const size_t limit = std::min<size_t>(unobservable.size(), 6);
+      for (size_t index = 0; index < limit; ++index) {
+        llvm::errs() << ' ' << unobservable[index];
+      }
+      if (unobservable.size() > limit) {
+        llvm::errs() << " ...(+" << unobservable.size() - limit << ')';
+      }
+    }
+    llvm::errs() << '\n';
+  }
+}
+
 void Analyzer::reportDemandOrigins() {
   for (const auto &[registerName, edges] : DemandEdges) {
     if (edges.empty()) {

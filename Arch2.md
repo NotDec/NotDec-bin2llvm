@@ -440,8 +440,12 @@ ELF 机器码
       调用点统一"调用后状态"占位 + 被读证据
   -> 外部参数推断 inferExternalCallShapes             （第 6 代）
       arity / 整型浮点 / vararg 按调用点
-  -> 第二遍 NativeRegisterSummary                     （第 2/6 代）
-      带最终签名重跑完整分析（effect + demand + metadata）
+  -> 第二遍 NativeRegisterSummary                     （第 2/6/9 代）
+      带最终签名重跑完整分析：
+        a. 自底向上 effect（ReadEntry/MayEntry/MayNonEntry）
+        b. usedInputs 可观察性定点（第 9 代，进行中；当前只诊断）
+        c. 自顶向下 demand 定点 + 需求图诊断
+        d. metadata（按位需求/效果）
   -> 构建初始签名形状                                  （第 2 代）
   -> 逐函数 SummarySSA                                （第 1/3/5/8 代）
       按位区间建 SSA + PHI
@@ -454,6 +458,12 @@ ELF 机器码
       删无用全局 / helper；统计残留
   -> .ll / .bc
 ```
+
+> 第二遍内部现在还会打印两张诊断表（不动 IR）：
+> `Native register observable inputs:`（每个寄存器有多少函数"读过入口值但没人观察"、
+> 有多少调用点的实参需求可以剪）和 `Native register demand:`（需求图的源头/纯透传/
+> 汇点）。前者是第 9 代的输入，后者用来判断一条 unknown/clobber 链是"处处漏水"还是
+> "一个源头拖一串"。
 
 配套的验证手段：
 
@@ -480,10 +490,59 @@ ELF 机器码
 打破，"整寄存器粒度够用"被部分读写打破，"SSA 自己能猜边界"被参数/返回需求打破，"分析单个函数就够"被
 调用图/外部函数打破，"第一遍就能区分返回和 clobber"被浮点返回和鸡生蛋打破。
 
+## 11.1 第 9 代（2026-11-19，进行中）：可观察性裁剪
+
+**动机**：hexx64 上有一个"1 个死读撑起 385 个假返回槽"的案例。需求图诊断
+（`Analyzer::reportDemandOrigins`）显示 ZMM0 的需求图有 385 个函数、1183 条边，
+**只有 1 个源头**；那个源头 `FUN_2b12e0` 只是把一个调用的 i128 返回值传给
+`FUN_29a940` 的一个**从未被使用的形参**，而这个形参又来自 `FUN_29a940` pre-RE 体
+里的一批死读（结果只喂给没人用的计算）。链条是：
+
+```text
+死读 → ReadEntry[ZMM0]=true → 签名加 i128 形参 → 调用点被迫提供值
+     → 调用者 live 带 ZMM0 → 上一个调用的 callee 拿到 ExitDemand
+     → 它的返回槽又要求下一个 callee …… → 385 个函数
+```
+
+**问题本质**：`ReadEntry` 的语义是"入口值被读过"（定义线索），但**被读过 ≠ 被观察**。
+而"可观察"不能只在函数内判定——传给调用在函数内看就是可观察的，只有跨函数才知道
+那个形参有没有人用。所以这是一个**第三个定点**，位置在 effect 和 demand 之间：
+
+```text
+Analyzer::run()
+  runBottomUp()            自底向上 effect
+  computeUsedInputs()      可观察性定点（第 9 代）
+  runTopDownDemand()       自顶向下 demand（只吃过滤后的 ReadEntry）
+```
+
+**规则**（保守方向：拿不准就算 used）：
+
+- `usedInputs[F][U]`：F 的入口值 U 是否可能被可观察地使用；
+- 可观察 sink：`ret` 操作数、`br`/`switch` 条件、store 到非寄存器内存；
+- 外部调用：pre-RE IR 里外部调用没有显式实参（参数在寄存器里），所以"函数里有外部
+  调用"⇒ ABI 输入寄存器整体算 used；
+- 内部 callee：只有 `usedInputs[G][U]` 成立时，调用点传给 G 的 U 才算 used
+  （worklist 定点，只增，和 demand 定点同一套结构）；
+- 接口不可改（`Function::hasAddressTaken()`）⇒ 整条算 used；
+- 和 `computeValueDemands` 的区别：去掉两个会放大需求的 seed
+  （`partial_write` 的值、`icmp` 的操作数）。
+
+**当前状态**：
+
+- 阶段 1（已完成，只诊断）：`computeUsedInputs()` + `reportUnobservableInputs()`
+  打印每个寄存器的 `read_entry_functions`（读过入口、但没人观察的函数数）和
+  `cuttable_callsites`（callee 读了没人用的入口 ⇒ 调用点不必准备值的调用点数）。
+- 阶段 2（未做）：用 `usedInputs` 过滤 `ReadEntry`，同时削减
+  `applyBackwardCallDemand` 里的 `entryNeeds`。预期 hexx64 的 211 个 ABI 未定义位
+  整体消失（那批槽本来就是这条链的尾巴），DF/R9/R8 几条同类大链也会缩。
+- 阶段 3（可选）：残留的死形参/死返回槽再按 DAE 式裁剪。
+
 ## 12. 已知边界与押后项
 
 - 未知外部返回推断仍是保守启发式：调用后同时读 `XMM0` 和 `ST0` 的 long double 函数会误选 `XMM0`。
   更准的做法是"后向数据流：调用后被读的寄存器值是否到达本函数 ret"，改动面大，押后。
+  （第 9 代的可观察性分析是同一个方向，但它判的是"入口读有没有人观察"，
+  返回侧那半还没有做；见 11.1。）
 - 外部 libm 的 long double 原型（`sqrtl`/`round`）、`complex long double` 返回、多 long double
   结构体返回押后。
 - 栈参数绑定（调用前压栈的参数恢复成 call 参数）从 2026-07-25 起持续推进，尚未完全收口。

@@ -453,6 +453,24 @@ public:
 
   void runTopDownDemand();
 
+  // 可观察性分析（第 9 代的第一步，只用于诊断/裁剪需求种子）：
+  // 对每个函数 × 寄存器，判断"入口值 U 是否可能被可观察地使用"。
+  //
+  //   usedInputs[F][U] = 函数内从可观察 sink 反向可达的 U 读
+  //                    ∪ 传给内部 callee G 且 usedInputs[G][U] 成立的实参
+  //
+  // 可观察 sink：ret 操作数、br/switch 条件、store 到非寄存器内存、
+  // 调用"没有函数体"的 callee 的实参（外部代码看不到，一律算 used）。
+  // 保守规则：拿不准就算 used；地址被取/接口不可改的函数全算 used。
+  //
+  // 用途：`ReadEntry` 里没有被可观察使用的位不应该成为参数，也不应该向
+  // callee 要值——hexx64 的 ZMM0 128 位返回槽就是被一个死读经入口需求放大出来的
+  // （见 logs/20261119-02-abi-undefined-bits-plan.md）。
+  void computeUsedInputs();
+  // 诊断输出：按寄存器汇总"ReadEntry 存在但不可观察"的函数数，以及可剪掉的
+  // 调用点实参需求数。不动 IR，用于评估裁剪收益。
+  void reportUnobservableInputs();
+
   // 定点结束后打印"需求从哪来"：按寄存器统计需求图规模、源头（无入边的函数）、
   // 纯透传节点（对寄存器没有任何本地访问），并提示"先处理源头，不要顺着透传链
   // 一个个修"。hexx64 的 ZMM0 128 位返回槽就是 385 个函数挂在唯一一个源头上。
@@ -497,6 +515,11 @@ private:
   std::vector<llvm::Function *> Functions;
   std::map<llvm::Function *, std::set<llvm::Function *>> Calls;
   std::map<llvm::Function *, std::set<llvm::Function *>> Callers;
+  // 可观察性分析结果：函数 × 寄存器的入口值是否可能被可观察地使用。
+  // 注意与 Effects 里的 ReadEntry 区分：ReadEntry 是"入口值被读过"（定义线索），
+  // 这里是"读到的值最终有没有人观察"（使用线索）。
+  std::map<llvm::Function *, std::set<std::string>> UsedInputs;
+
   // 需求来源诊断：按寄存器记录"caller 在调用点把该寄存器的需求传给 callee"的边。
   // 定点结束后用它找需求的源头（没有入边的函数）和纯透传节点（既不读也不写该
   // 寄存器、只是把需求传下去的函数）。见 reportDemandOrigins。

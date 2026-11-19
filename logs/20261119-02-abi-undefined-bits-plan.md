@@ -253,3 +253,54 @@
 3. 槽宽按需求位宽：**其实已经是这样** —— `integerSlotForSingleDemandRange` 用
    `returnMask` 建槽；只有 mask 不连续时才退化成整个单元宽。本例 mask 是满 128 位，
    所以换宽度不解决问题；真正要换的是 mask 的来源（即 1/2）。
+
+## 可观察性分析（阶段 1）与源头的真正性质（2026-11-19 晚）
+
+按讨论实现阶段 1：`Analyzer::computeUsedInputs()` + `reportUnobservableInputs()`，
+在第二遍 summary 的 effect 与 demand 之间跑一个"入口值有没有被可观察地使用"的定点
+（保守规则：ret/br/store 到内存/外部调用 ABI 输入/内部 callee 递归/地址被取）。
+Arch2.md 新增 11.1 节记录设计，§10 全貌和 §12 边界同步更新。
+
+**结果推翻了"死读"假设**：
+
+- 报告里 **ZMM0 根本没出现**（`read_entry_functions=0 cuttable_callsites=0`）——
+  因为 `FUN_29a940` 的 16 字节 XMM0 读**确实被 store 到内存**（`movups` 到
+  `RDI+0x28/0x38/0x9c/0xac`），是可观察使用。所以阶段 2 按"可观察性"过滤
+  `ReadEntry` **不会**消掉 ZMM0 这条链。
+- 继续看 asm 找到真正的原因：
+
+  ```asm
+  29a94a: 66 0f 76 c0    pcmpeqd %xmm0,%xmm0      ; XMM0 = 全 1（常见 idiom）
+  ...
+  29a9f1: 0f 11 47 28     movups %xmm0,0x28(%rdi)
+  29a9f5: 0f 11 47 38     movups %xmm0,0x38(%rdi)
+  29a9f9: 0f 11 87 9c ..  movups %xmm0,0x9c(%rdi)
+  29aa00: 0f 11 87 ac ..  movups %xmm0,0xac(%rdi)
+  ```
+
+  p-code 把它降成这样（pre-RE IR）：
+
+  ```llvm
+  %XMM0_Da  = call i32 @notdec.partial_read.i512.i32(ptr @ZMM0, i64 0)   ; 同一个读
+  %XMM0_Da1 = call i32 @notdec.partial_read.i512.i32(ptr @ZMM0, i64 0)   ; 又读一次
+  %0 = icmp eq i32 %XMM0_Da, %XMM0_Da1
+  %neg = sext i1 %0 to i32
+  call void @notdec.partial_write.i512.i32(ptr @ZMM0, i32 %neg, i64 0)
+  ```
+
+  两条 `partial_read` 是同一个寄存器同一个位置，但 summary 的 SSA 不认为它们相等
+  （是两个独立的调用），于是 `icmp eq` 的操作数被当成"入口值读"→ `ReadEntry[ZMM0]`
+  → 形参 → 385 个函数的返回槽。而**重写后 `icmp eq %a, %a` 被 InstCombine 折成
+  true**，值变成 `-1`（最终 IR 里就是 `store i128 -1`），形参因此没人用。
+
+  换句话说：值本身最后是对的，**错的是 summary 把"自比较 idiom"当成了入口依赖**。
+
+**结论 / 下一步**：真正的修法是**在 p-code 降级阶段把同一个 p-code 指令内的重复
+寄存器读 CSE 掉**（同 `(global, offset, width)` 的 `partial_read` 复用同一个调用，
+遇到写失效）。这样 `icmp eq %v, %v` 直接折成 true，`partial_write` 变成常量，
+`ReadEntry` 不再有 ZMM0，整条 385 函数的链自然消失。这比"死读 DCE"更小更准，
+而且是通用收益（IR 也会变小）。
+
+阶段 1 的价值就在这：**在动需求种子之前就否掉了错的假设**。报告里其余寄存器
+（RSI 38、RDI 144、RAX 181 个 cuttable callsites；DF 33）是另一类真实的可剪需求，
+等 idiom 修完再单独评估。
