@@ -9,6 +9,19 @@
 
 namespace notdec::bin2llvm {
 
+// 用户声明的寄存器槽位：寄存器名 + 位宽。宽度为 0 时按寄存器名推断
+// （XMM=128、YMM=256、ZMM=512，其它按寄存器 global 的整宽）。
+struct NativeRegisterSlotSpec {
+  std::string Register;
+  unsigned Width = 0;
+};
+
+// 用户按函数钉死的输入/输出寄存器（配置 `functions[].signature`）。
+struct NativeSignaturePin {
+  std::vector<NativeRegisterSlotSpec> Params;
+  std::vector<NativeRegisterSlotSpec> Returns;
+};
+
 // External library prototypes used by native register SSA.  These are not
 // recovered program prototypes; they are trusted declarations for known imported
 // functions such as libc calls.  The storage-independent type is lowered through
@@ -40,6 +53,9 @@ struct NativeExternalPrototype {
   // Optional upper bound for bounded varargs such as open(path, flags[, mode]).
   // Zero means unbounded.
   unsigned MaxArgs = 0;
+  // 显式声明这个 callee 在哪些寄存器、多少位里返回值。非空时优先于
+  // TypedReturn / MaxReturnRegisters（一个 callee 可以同时在多个寄存器里返回）。
+  std::vector<NativeRegisterSlotSpec> ReturnSlots;
 };
 
 using NativeExternalPrototypeMap =

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "notdec-bin2llvm/abi/NativeExternalPrototype.h"
+
 #include <cstdint>
 #include <map>
 #include <set>
@@ -33,6 +35,8 @@ struct NativeRegisterEliminationOptions {
   // 约定。集合里的名字优先于 AbiForAllFunctions。
   std::set<std::string> ForcedExternalAbiFunctions;
   std::set<std::string> ForcedInternalAbiFunctions;
+  // 按函数名钉死的输入/输出寄存器（用户 JSON `functions[].signature`）。
+  std::map<std::string, NativeSignaturePin> PinnedSignatures;
   bool PrintSummary = false;
   std::string ExternalPrototypeJsonPath;
   std::set<std::string> IgnoredRegisters;

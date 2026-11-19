@@ -207,7 +207,7 @@ runNativeRegisterElimination(llvm::Module &module,
     signatureState.Shapes = buildInitialSignatureShapes(
         module, units, facts, abi, externalPrototypes,
         options.AbiForAllFunctions, &options.ForcedExternalAbiFunctions,
-        &options.ForcedInternalAbiFunctions);
+        &options.ForcedInternalAbiFunctions, &options.PinnedSignatures);
     propagateTailCallStackParams(module, signatureState);
     // 每个函数的调用约定标记（Arch2.md 第 13 节）：external = 参数/返回都按外部 ABI；
     // internal = 接口可改，可以用自定义约定。审计和后续 pass 只读这个标记，不再重算。

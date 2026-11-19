@@ -1,5 +1,7 @@
 #pragma once
 
+#include "notdec-bin2llvm/abi/NativeExternalPrototype.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
@@ -67,6 +69,8 @@ struct NativeFunctionConfig {
   // （不再假设 R8/R9/R10/R11 等也能当返回通道）；internal = 允许自定义约定。
   enum class Abi { Unset, External, Internal };
   Abi AbiConvention = Abi::Unset;
+  // 可选：直接钉死输入/输出寄存器，跳过寄存器 SSA 的形状推断。
+  std::optional<NativeSignaturePin> Signature;
 };
 
 // --- 各 stage 的 options ----------------------------------------------------

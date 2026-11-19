@@ -31,6 +31,8 @@ struct NativePipelineContext {
   // 调用约定（register-elimination 用）。
   std::set<std::string> ForcedExternalAbiFunctions;
   std::set<std::string> ForcedInternalAbiFunctions;
+  // 由 Config.Functions 里 signature 声明解析出的按函数钉死的输入/输出寄存器。
+  std::map<std::string, NativeSignaturePin> PinnedSignatures;
   // 非空时在每个 stage 前后写 <NN>-<name>-{before,after}.ll。
   std::string DumpStagesDir;
   // 校验失败时写 <OutputPath>.<NN>-<name>.bad.ll（OutputPath 非空时）。

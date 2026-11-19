@@ -1318,7 +1318,8 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
     const std::map<llvm::Function *, FunctionSummaryFacts> &summaryFacts,
     const AbiFacts &abi, const NativeExternalPrototypeMap &prototypes,
     bool abiForAllFunctions, const std::set<std::string> *forcedExternal,
-    const std::set<std::string> *forcedInternal) {
+    const std::set<std::string> *forcedInternal,
+    const std::map<std::string, NativeSignaturePin> *pinnedSignatures) {
   std::map<llvm::Function *, SignatureShape> shapes;
   for (llvm::Function &function : module) {
     // 内置 intrinsic（notdec.register.* 命名空间 + 历史前缀）不参与签名重写，
@@ -1342,6 +1343,28 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
                   function, units, summaryFacts, abi,
                   abiConventionFor(function, abiForAllFunctions,
                                    forcedExternal, forcedInternal));
+    if (pinnedSignatures != nullptr) {
+      auto pinnedIt = pinnedSignatures->find(function.getName().str());
+      if (pinnedIt != pinnedSignatures->end()) {
+        // 用户钉死的签名：参数/返回槽完全按声明来，不再看 summary 推断。
+        SignatureShape pinnedShape;
+        pinnedShape.VarArg = shape.VarArg;
+        pinnedShape.MaxArgs = shape.MaxArgs;
+        for (const NativeRegisterSlotSpec &spec : pinnedIt->second.Params) {
+          if (std::optional<NativeSignatureSlot> slot =
+                  explicitRegisterSlot(spec, units, module)) {
+            pinnedShape.Params.push_back(*slot);
+          }
+        }
+        for (const NativeRegisterSlotSpec &spec : pinnedIt->second.Returns) {
+          if (std::optional<NativeSignatureSlot> slot =
+                  explicitRegisterSlot(spec, units, module)) {
+            pinnedShape.Returns.push_back(*slot);
+          }
+        }
+        shape = std::move(pinnedShape);
+      }
+    }
     if (!shape.Params.empty() || !shape.Returns.empty() || shape.VarArg) {
       shapes.emplace(&function, std::move(shape));
     }

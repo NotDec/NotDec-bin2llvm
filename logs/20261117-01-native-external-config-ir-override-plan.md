@@ -554,3 +554,91 @@ RAX 变成 clobber → clobber-return unknown 增加。也就是说：光有"128
 `iN`）＋ `buildInitialSignatureShapes` 里对 pin 的函数覆盖 shape。`extractReturnRange`
 和 `castSlotValueToRegister` 已经支持"整数位模式 + 任意宽度槽位"，这轮的两个 bug
 修复就是为它铺的路。本次没有实现多寄存器列表，留作下一步。
+
+## 11. 多寄存器返回 + 按函数签名钉死（已实现）
+
+按 §10.4 的方案落地。
+
+### 11.1 新 schema
+
+**外部 callee 的多寄存器返回**（`external_prototypes` JSON）：
+
+```json
+{
+  "qfree": {
+    "params": ["i64"],
+    "returns": [
+      {"register": "RAX",  "width": 64},
+      {"register": "XMM0", "width": 128}
+    ]
+  }
+}
+```
+
+- `returns` 与 `return`/`noreturn`/`max_return_registers` 互斥（同时写会报错）；
+- 元素可写成字符串 `"RAX"`（宽度按寄存器推断：XMM=128、YMM=256、ZMM=512、
+  其它按寄存器 global 整宽）或 `{"register","width"}`；
+- 寄存器名会做归一化（`XMM0`/`YMM0` → 模块里实际存在的 `ZMM0`）。
+
+**按函数钉死输入/输出寄存器**（pipeline 配置）：
+
+```json
+{
+  "functions": [
+    {"select": {"name": "FUN_x"},
+     "signature": {
+       "params":  [{"register": "RDI", "width": 64}],
+       "returns": [{"register": "RAX", "width": 64},
+                   {"register": "XMM0", "width": 128}]
+     }}
+  ]
+}
+```
+
+钉死的函数不再走 summary 形状推断，调用点也按这个形状改写。寄存器名必须在模块里
+有对应的寄存器 global，否则 pipeline 直接报错
+（`functions[0].signature: register 'NOPE' is not a lifted register global`）。
+`--print-config` 会原样回显。
+
+### 11.2 实现
+
+- `explicitRegisterSlot()`：寄存器名 → `RegisterUnit`（含 XMM/YMM→ZMM 归一化）、
+  宽度 → `iN` 槽（FloatRegister/IntegerRegister 按寄存器类）；
+- `shapeForKnownExternal` 优先用 `ReturnSlots` 建返回槽（再拼形参）；
+- `buildInitialSignatureShapes` 对 `functions[].signature` 命中的函数覆盖
+  Params/Returns；
+- `castSlotValueToRegister`（§10 修过）支持整数位模式，i128 能铺进 ZMM0 的
+  128 位子范围；
+- 校验在 `applyFunctionClaims` 做（module 已存在，能查寄存器 global）。
+
+### 11.3 单测
+
+- `testExternalPrototypeJsonMultiRegisterReturns`：声明 `returns=[RAX:64,
+  XMM0:128]` 后调用点类型是 `{ i64, i128 }`，两个返回槽都被调用者消费；
+- `testPinnedSignatureOverridesInference`：`params=[RDI:32]`、`returns=[RAX:32]`
+  钉死后函数签名变成 `i32 @f(i32)`（覆盖推断出的 64 位形状）；
+- `testExternalPrototypeJsonAcceptsVector128`（§10）；
+- 配置端到端：`pin_target` 被钉成 `i32 @pin_target(i32)`，`--print-config` 回显，
+  非法寄存器报错。
+
+### 11.4 hexx64 实测
+
+| 配置 | unknown | poison | IR 大小 |
+|------|---------|--------|---------|
+| 默认（native44） | 728 | 6 | 88.1 MB |
+| `abi_for_all_functions`（native47） | 712 | 2 | 83.2 MB |
+| qfree 钉 `RAX+XMM0`（native51） | 662 | 6 | 88.2 MB |
+| 两者组合（native52） | **646** | 2 | 83.2 MB |
+
+qfree 钉死后（native51）：
+
+- 调用点变成 `call { i64, i128 } @qfree(i64 ...)`；
+- `FUN_29a670` 直接 `extractvalue` 出 `%ZMM0.ret_slot16` / `%RAX.ret_slot`，
+  range-return unknown 157 → 115（qfree 的 42 处解决）；
+- 其余寄存器（RCX/RDX/RSI/RDI/R8/R9/R10/R11）仍是 unknown：用户没有声明它们，
+  提升器按"未声明 = 可能不是返回值"处理。
+
+组合配置把两类主要缺口一起压下来：class A 314 → 91（调用约定范围），
+class B 157 → 115（多寄存器返回声明）。剩余部分要继续给 getinf /
+get_tinfo_property / clear_tinfo_t 等 callee 补声明——每个 callee 的寄存器组合
+需要用户从二进制/头文件里确认。

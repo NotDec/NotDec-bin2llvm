@@ -2604,6 +2604,162 @@ bool testExternalPrototypeJsonAcceptsVector128() {
                 "vector128 JSON return was not parsed");
 }
 
+bool testExternalPrototypeJsonMultiRegisterReturns() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-external-multi-return", context);
+  // ABI：输入 RDI，返回 RAX + XMM0（XMM0 用 128 位寄存器 global 表示）。
+  {
+    notdec::bin2llvm::NativeAbiSpec abi;
+    abi.PrototypeName = "__multi_return_test";
+    abi.StackPointerRegister = "RSP";
+    abi.StackPointerSpace = "register";
+    notdec::bin2llvm::NativeAbiParamEntry input;
+    input.MinSize = 1;
+    input.MaxSize = 8;
+    input.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+    input.Storage.Name = "RDI";
+    abi.Inputs.push_back(input);
+    auto addOutput = [&](llvm::StringRef name, uint32_t maxSize) {
+      notdec::bin2llvm::NativeAbiParamEntry output;
+      output.MinSize = 1;
+      output.MaxSize = maxSize;
+      output.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+      output.Storage.Name = name.str();
+      abi.Outputs.push_back(output);
+      notdec::bin2llvm::NativeAbiEffect killed;
+      killed.Kind = notdec::bin2llvm::NativeAbiEffectKind::KilledByCall;
+      killed.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+      killed.Storage.Name = name.str();
+      abi.Effects.push_back(killed);
+    };
+    addOutput("RAX", 8);
+    addOutput("XMM0", 16);
+    for (llvm::StringRef name : {"RBX", "RBP"}) {
+      notdec::bin2llvm::NativeAbiEffect unaffected;
+      unaffected.Kind = notdec::bin2llvm::NativeAbiEffectKind::Unaffected;
+      unaffected.Storage.Kind = notdec::bin2llvm::NativeAbiStorageKind::Register;
+      unaffected.Storage.Name = name.str();
+      abi.Effects.push_back(unaffected);
+    }
+    notdec::bin2llvm::attachNativeAbiMetadata(module, abi);
+  }
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  llvm::GlobalVariable *xmm0 = createRegisterGlobal(
+      module, "XMM0", llvm::IntegerType::get(context, 128), 0, 16);
+  auto *sinkType = llvm::IntegerType::get(context, 128);
+  auto *sink = new llvm::GlobalVariable(
+      module, sinkType, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "multi_ret_sink");
+
+  auto *calleeType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *callee =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "json_multi_ret", module);
+  llvm::Function *caller =
+      llvm::Function::Create(calleeType, llvm::GlobalValue::ExternalLinkage,
+                             "json_multi_ret_caller", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", caller);
+  llvm::IRBuilder<> builder(entry);
+  storeRegister(builder, rdi, llvm::ConstantInt::get(rdi->getValueType(), 1),
+                "RDI");
+  builder.CreateCall(calleeType, callee);
+  llvm::Value *low = loadRegister(builder, rax, "RAX", "low");
+  llvm::Value *high = loadRegister(builder, xmm0, "XMM0", "high");
+  llvm::Value *combined = builder.CreateOr(
+      builder.CreateZExt(low, sinkType, "low.wide"), high, "combined");
+  builder.CreateStore(combined, sink);
+  builder.CreateRetVoid();
+
+  llvm::SmallString<128> jsonPath;
+  int jsonFd = -1;
+  std::error_code error = llvm::sys::fs::createTemporaryFile(
+      "notdec-external-multi-return", "json", jsonFd, jsonPath);
+  if (error) {
+    std::cerr << "failed to create multi-return prototype JSON: "
+              << error.message() << '\n';
+    return false;
+  }
+  {
+    llvm::raw_fd_ostream json(jsonFd, true);
+    json << R"({"json_multi_ret":{"params":["i64"],"returns":[)"
+            R"({"register":"RAX","width":64},{"register":"XMM0","width":128}]}})";
+  }
+
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
+  options.ExternalPrototypeJsonPath = jsonPath.str().str();
+  auto summary = notdec::bin2llvm::runNativeRegisterElimination(module, options);
+  (void)llvm::sys::fs::remove(jsonPath);
+
+  llvm::Function *rewritten = module.getFunction("json_multi_ret");
+  bool callHasTwoReturns = false;
+  llvm::Function *rewrittenCaller =
+      module.getFunction("json_multi_ret_caller");
+  if (rewrittenCaller == nullptr) {
+    return false;
+  }
+  for (llvm::Instruction &inst : llvm::instructions(*rewrittenCaller)) {
+    if (auto *call = llvm::dyn_cast<llvm::CallInst>(&inst)) {
+      if (call->getCalledFunction() == rewritten) {
+        auto *structType = llvm::dyn_cast<llvm::StructType>(call->getType());
+        callHasTwoReturns = structType != nullptr &&
+                            structType->getNumElements() == 2 &&
+                            structType->getElementType(0)->isIntegerTy(64) &&
+                            structType->getElementType(1)->isIntegerTy(128);
+      }
+    }
+  }
+  (void)summary;
+  if (!callHasTwoReturns) {
+    module.print(llvm::errs(), nullptr);
+  }
+  return expect(rewritten != nullptr, "multi-return callee missing") &&
+         expect(rewritten->arg_size() == 1,
+                "multi-return prototype lost its parameter") &&
+         expect(callHasTwoReturns,
+                "multi-return prototype did not produce a 2-value return") &&
+         verifyOk(module, "module failed verifier after multi-return test");
+}
+
+bool testPinnedSignatureOverridesInference() {
+  llvm::LLVMContext context;
+  llvm::Module module("pinned-signature", context);
+  attachTestAbiWithInputs(module, {"RDI"});
+
+  llvm::GlobalVariable *rdi = createRegisterGlobal(module, "RDI");
+  llvm::GlobalVariable *rax = createRegisterGlobal(module, "RAX");
+  auto *voidType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      voidType, llvm::GlobalValue::InternalLinkage, "pinned_target", module);
+  llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Value *value = loadRegister(builder, rdi, "RDI", "in");
+  storeRegister(builder, rax, value, "RAX");
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterEliminationOptions options;
+  notdec::bin2llvm::NativeSignaturePin pin;
+  pin.Params.push_back(notdec::bin2llvm::NativeRegisterSlotSpec{"RDI", 32});
+  pin.Returns.push_back(notdec::bin2llvm::NativeRegisterSlotSpec{"RAX", 32});
+  options.PinnedSignatures.emplace("pinned_target", pin);
+  (void)notdec::bin2llvm::runNativeRegisterElimination(module, options);
+
+  llvm::Function *rewritten = module.getFunction("pinned_target");
+  if (rewritten == nullptr || !rewritten->getReturnType()->isIntegerTy(32) ||
+      rewritten->arg_size() != 1 ||
+      !rewritten->getArg(0)->getType()->isIntegerTy(32)) {
+    module.print(llvm::errs(), nullptr);
+  }
+  return expect(rewritten != nullptr, "pinned function missing") &&
+         expect(rewritten->getReturnType()->isIntegerTy(32),
+                "pinned return width was not applied") &&
+         expect(rewritten->arg_size() == 1 &&
+                    rewritten->getArg(0)->getType()->isIntegerTy(32),
+                "pinned parameter width was not applied") &&
+         verifyOk(module, "module failed verifier after pinned signature test");
+}
+
 bool testUnknownExternalArityStopsAtClobberArg() {
   llvm::LLVMContext context;
   llvm::Module module("summary-ssa-unknown-external-clobber-arity", context);
@@ -6747,6 +6903,8 @@ int main() {
   ok &= testExternalPrototypeJsonOverridesInferredArity();
   ok &= testExternalPrototypeJsonAcceptsLongDouble();
   ok &= testExternalPrototypeJsonAcceptsVector128();
+  ok &= testExternalPrototypeJsonMultiRegisterReturns();
+  ok &= testPinnedSignatureOverridesInference();
   ok &= testUnknownExternalArityStopsAtClobberArg();
   ok &= testUnknownExternalArityStopsAtPhiClobberArg();
   ok &= testUnknownExternalArityCountsExplicitBinaryArg();

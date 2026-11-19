@@ -49,6 +49,19 @@ bool parseValueType(llvm::StringRef text, ValueType &type) {
   return false;
 }
 
+bool readString(const llvm::json::Object &object, llvm::StringRef key,
+                std::string &value, std::string &errorMessage) {
+  if (std::optional<llvm::StringRef> text = object.getString(key)) {
+    value = text->str();
+    return true;
+  }
+  if (object.get(key) != nullptr) {
+    errorMessage = (key + " must be string").str();
+    return false;
+  }
+  return true;
+}
+
 bool readUnsigned(const llvm::json::Object &object, llvm::StringRef key,
                   unsigned &value, std::string &errorMessage) {
   if (std::optional<int64_t> number = object.getInteger(key)) {
@@ -97,6 +110,46 @@ bool readTypeArray(const llvm::json::Object &object, llvm::StringRef key,
   return true;
 }
 
+bool readRegisterSlotArray(const llvm::json::Object &object,
+                           llvm::StringRef key,
+                           std::vector<NativeRegisterSlotSpec> &specs,
+                           std::string &errorMessage) {
+  const llvm::json::Array *array = object.getArray(key);
+  if (array == nullptr) {
+    if (object.get(key) != nullptr) {
+      errorMessage = (key + " must be an array").str();
+      return false;
+    }
+    return true;
+  }
+  for (const llvm::json::Value &entry : *array) {
+    NativeRegisterSlotSpec spec;
+    if (std::optional<llvm::StringRef> text = entry.getAsString()) {
+      spec.Register = text->str();
+    } else if (const llvm::json::Object *slot = entry.getAsObject()) {
+      if (!readString(*slot, "register", spec.Register, errorMessage)) {
+        return false;
+      }
+      if (spec.Register.empty()) {
+        errorMessage = (key + " entries need a non-empty register").str();
+        return false;
+      }
+      if (!readUnsigned(*slot, "width", spec.Width, errorMessage)) {
+        return false;
+      }
+    } else {
+      errorMessage = (key + " entries must be strings or objects").str();
+      return false;
+    }
+    if (spec.Register.empty()) {
+      errorMessage = (key + " entries need a non-empty register").str();
+      return false;
+    }
+    specs.push_back(std::move(spec));
+  }
+  return true;
+}
+
 std::optional<Prototype> parsePrototype(const llvm::json::Object &object,
                                         std::string &errorMessage) {
   Prototype prototype;
@@ -106,7 +159,16 @@ std::optional<Prototype> parsePrototype(const llvm::json::Object &object,
       !readUnsigned(object, "max_return_registers",
                     prototype.MaxReturnRegisters, errorMessage) ||
       !readUnsigned(object, "max_args", prototype.MaxArgs, errorMessage) ||
-      !readTypeArray(object, "params", prototype.TypedParams, errorMessage)) {
+      !readTypeArray(object, "params", prototype.TypedParams, errorMessage) ||
+      !readRegisterSlotArray(object, "returns", prototype.ReturnSlots,
+                             errorMessage)) {
+    return std::nullopt;
+  }
+  if (!prototype.ReturnSlots.empty() &&
+      (prototype.TypedReturn.has_value() || prototype.NoReturn ||
+       object.get("max_return_registers") != nullptr)) {
+    errorMessage = "returns cannot be combined with return/noreturn/"
+                   "max_return_registers";
     return std::nullopt;
   }
 

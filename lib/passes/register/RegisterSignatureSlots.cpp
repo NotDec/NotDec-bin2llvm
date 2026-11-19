@@ -21,6 +21,81 @@ unitByName(const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
   return nullptr;
 }
 
+bool isVectorRegisterName(llvm::StringRef name) {
+  return name.starts_with("XMM") || name.starts_with("YMM") ||
+         name.starts_with("ZMM");
+}
+
+const RegisterUnit *resolveRegisterUnitByName(
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    llvm::StringRef name) {
+  if (const RegisterUnit *unit = unitByName(units, name)) {
+    return unit;
+  }
+  // lifting 只保留最宽的寄存器 global（ZMM0），ABI 里的 XMM0/YMM0 要映射过去。
+  for (llvm::StringRef prefix : {llvm::StringRef("XMM"), llvm::StringRef("YMM")}) {
+    if (!name.starts_with(prefix)) {
+      continue;
+    }
+    llvm::StringRef rest = name.drop_front(prefix.size());
+    size_t digits = 0;
+    while (digits < rest.size() && rest[digits] >= '0' && rest[digits] <= '9') {
+      ++digits;
+    }
+    if (digits == 0) {
+      continue;
+    }
+    std::string candidate = ("ZMM" + rest.take_front(digits)).str();
+    if (const RegisterUnit *unit = unitByName(units, candidate)) {
+      return unit;
+    }
+  }
+  return nullptr;
+}
+
+unsigned defaultSlotWidth(llvm::StringRef name, const RegisterUnit &unit) {
+  if (name.starts_with("XMM")) {
+    return 128;
+  }
+  if (name.starts_with("YMM")) {
+    return 256;
+  }
+  if (name.starts_with("ZMM")) {
+    return 512;
+  }
+  return static_cast<unsigned>(unit.Size * 8);
+}
+
+// 用户显式声明的返回槽（`returns: [{"register": ..., "width": ...}]`）。
+std::optional<NativeSignatureSlot> explicitRegisterSlot(
+    const NativeRegisterSlotSpec &spec,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    llvm::Module &module) {
+  const RegisterUnit *unit = resolveRegisterUnitByName(units, spec.Register);
+  if (unit == nullptr) {
+    return std::nullopt;
+  }
+  unsigned unitBits = static_cast<unsigned>(unit->Size * 8);
+  unsigned width = spec.Width != 0 ? spec.Width : defaultSlotWidth(spec.Register, *unit);
+  if (width == 0 || width > unitBits) {
+    width = unitBits;
+  }
+  if (width == 0) {
+    return std::nullopt;
+  }
+  NativeSignatureSlot slot;
+  slot.Kind = isVectorRegisterName(spec.Register) ||
+                      isVectorRegisterName(unit->Name)
+                  ? NativeSignatureSlotKind::FloatRegister
+                  : NativeSignatureSlotKind::IntegerRegister;
+  slot.Unit = unit;
+  slot.AbiName = spec.Register;
+  slot.OffsetBits = 0;
+  slot.SizeBits = width;
+  slot.LlvmType = llvm::IntegerType::get(module.getContext(), width);
+  return slot;
+}
+
 llvm::Type *llvmTypeForKnownValue(llvm::Module &module,
                                   NativeExternalPrototype::ValueType type) {
   llvm::LLVMContext &context = module.getContext();
@@ -761,6 +836,49 @@ SignatureShape shapeForKnownExternal(
   const KnownExternalPrototype *known =
       knownExternalPrototype(prototypes, function.getName());
   if (known == nullptr) {
+    return shape;
+  }
+  if (!known->ReturnSlots.empty()) {
+    // 显式多寄存器返回：一个 callee 可以同时在 RAX/XMM0 等多个寄存器里返回，
+    // 每个槽自己带宽度（i128 之类可以直接铺到 ZMM0 的 128 位子范围）。
+    llvm::Module *module = function.getParent();
+    if (module == nullptr) {
+      return SignatureShape{};
+    }
+    unsigned integerIndex = 0;
+    unsigned floatIndex = 0;
+    unsigned stackIndex = 0;
+    if (!known->TypedParams.empty()) {
+      for (NativeExternalPrototype::ValueType type : known->TypedParams) {
+        std::optional<NativeSignatureSlot> slot = typedParamSlot(
+            type, integerIndex, floatIndex, stackIndex, units, abi, *module);
+        if (!slot) {
+          return SignatureShape{};
+        }
+        shape.Params.push_back(*slot);
+      }
+    } else {
+      for (unsigned index = 0; index < known->FixedArgs; ++index) {
+        std::optional<NativeSignatureSlot> slot =
+            untypedIntegerParamSlot(index, units, abi, *module);
+        if (!slot) {
+          return SignatureShape{};
+        }
+        shape.Params.push_back(*slot);
+      }
+    }
+    for (const NativeRegisterSlotSpec &spec : known->ReturnSlots) {
+      std::optional<NativeSignatureSlot> slot =
+          explicitRegisterSlot(spec, units, *module);
+      if (!slot) {
+        // 寄存器名在本模块里不存在：退化成"未知外部"，不要用一个残缺的形状
+        // 把调用点改坏。诊断信息见 unresolved_external_return_register。
+        return SignatureShape{};
+      }
+      shape.Returns.push_back(*slot);
+    }
+    shape.VarArg = known->VarArg;
+    shape.MaxArgs = known->MaxArgs;
     return shape;
   }
   if (!known->TypedParams.empty() || known->TypedReturn) {

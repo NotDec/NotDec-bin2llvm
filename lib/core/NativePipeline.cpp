@@ -92,6 +92,55 @@ void applyFunctionAttributes(llvm::Function &Function,
   }
 }
 
+bool moduleHasRegister(const llvm::Module &Module, llvm::StringRef Name) {
+  if (Module.getNamedGlobal(Name) != nullptr) {
+    return true;
+  }
+  // lifting 只保留最宽的寄存器 global（XMM0 -> ZMM0）。
+  for (llvm::StringRef Prefix : {llvm::StringRef("XMM"),
+                                 llvm::StringRef("YMM")}) {
+    if (!Name.starts_with(Prefix)) {
+      continue;
+    }
+    llvm::StringRef Rest = Name.drop_front(Prefix.size());
+    size_t Digits = 0;
+    while (Digits < Rest.size() && Rest[Digits] >= '0' &&
+           Rest[Digits] <= '9') {
+      ++Digits;
+    }
+    if (Digits == 0) {
+      continue;
+    }
+    std::string Candidate = ("ZMM" + Rest.take_front(Digits)).str();
+    if (Module.getNamedGlobal(Candidate) != nullptr) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool validateSignaturePin(const llvm::Module &Module,
+                          const NativeSignaturePin &Pin,
+                          llvm::StringRef Path, std::string &Error) {
+  for (llvm::StringRef Key : {"params", "returns"}) {
+    const std::vector<NativeRegisterSlotSpec> &Specs =
+        Key == "params" ? Pin.Params : Pin.Returns;
+    for (const NativeRegisterSlotSpec &Spec : Specs) {
+      if (!moduleHasRegister(Module, Spec.Register)) {
+        Error = (Path + ": register '" + Spec.Register +
+                 "' is not a lifted register global").str();
+        return false;
+      }
+      if (Spec.Width != 0 && Spec.Width % 8 != 0) {
+        Error = (Path + ": register '" + Spec.Register +
+                 "' width must be a multiple of 8 bits").str();
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 bool applyFunctionClaims(NativePipelineContext &Context, std::string &Error) {
   for (size_t I = 0; I < Context.Config.Functions.size(); ++I) {
     const NativeFunctionConfig &Claim = Context.Config.Functions[I];
@@ -113,6 +162,14 @@ bool applyFunctionClaims(NativePipelineContext &Context, std::string &Error) {
       if (Claim.Pin) {
         Context.PinnedFunctions.insert(Name);
         Context.PreservedFunctions.insert(Name);
+      }
+      if (Claim.Signature.has_value()) {
+        if (!validateSignaturePin(
+                Context.Module, *Claim.Signature,
+                "functions[" + std::to_string(I) + "].signature", Error)) {
+          return false;
+        }
+        Context.PinnedSignatures[Name] = *Claim.Signature;
       }
       if (Claim.AbiConvention == NativeFunctionConfig::Abi::External) {
         Context.ForcedExternalAbiFunctions.insert(Name);
@@ -225,6 +282,7 @@ bool runRegisterEliminationStage(const NativeStageConfig &Stage,
   Options.AbiForAllFunctions = Config.AbiForAllFunctions;
   Options.ForcedExternalAbiFunctions = Context.ForcedExternalAbiFunctions;
   Options.ForcedInternalAbiFunctions = Context.ForcedInternalAbiFunctions;
+  Options.PinnedSignatures = Context.PinnedSignatures;
   Options.AttachMetadata = Config.AttachMetadata;
   Options.PrintSummary = Context.PrintSummary;
   Options.ExternalPrototypeJsonPath = Config.ResolvedExternalPrototypes;

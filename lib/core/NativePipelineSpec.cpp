@@ -210,6 +210,53 @@ bool readSelectors(const Object &Obj, StringRef Key,
 
 // --- 属性 ------------------------------------------------------------------
 
+// `params`/`returns` 的数组元素：字符串 "RAX" 或对象 {"register":"RAX",
+// "width":64}。宽度缺省时后面按寄存器名/整宽推断。
+bool parseRegisterSlotArray(const Object &Bag, StringRef Key,
+                            std::vector<NativeRegisterSlotSpec> &Out,
+                            StringRef Path, std::string &Error) {
+  const Array *Items = Bag.getArray(Key);
+  if (Items == nullptr) {
+    if (Bag.get(Key) != nullptr) {
+      Error = (Path + ": expected array").str();
+      return false;
+    }
+    return true;
+  }
+  for (size_t I = 0; I < Items->size(); ++I) {
+    std::string ItemPath = (Path + "[" + std::to_string(I) + "]").str();
+    NativeRegisterSlotSpec Spec;
+    const Value &Item = (*Items)[I];
+    if (std::optional<StringRef> Text = Item.getAsString()) {
+      Spec.Register = Text->str();
+    } else if (const Object *Slot = Item.getAsObject()) {
+      if (!checkKeys(*Slot, {"register", "width"}, ItemPath, Error)) {
+        return false;
+      }
+      if (!readString(*Slot, "register", Spec.Register, ItemPath, Error)) {
+        return false;
+      }
+      if (const Value *Width = Slot->get("width")) {
+        std::optional<int64_t> Number = Width->getAsInteger();
+        if (!Number || *Number <= 0) {
+          Error = ItemPath + ".width: expected positive integer";
+          return false;
+        }
+        Spec.Width = static_cast<unsigned>(*Number);
+      }
+    } else {
+      Error = ItemPath + ": expected string or object";
+      return false;
+    }
+    if (Spec.Register.empty()) {
+      Error = ItemPath + ": needs a non-empty register name";
+      return false;
+    }
+    Out.push_back(std::move(Spec));
+  }
+  return true;
+}
+
 bool parseAttributes(const Value &V, StringRef Path,
                      NativeFunctionAttributes &Out, std::string &Error) {
   const Object *Obj = V.getAsObject();
@@ -657,8 +704,8 @@ std::optional<NativeConfig> parseNativeConfig(StringRef Text,
         Error = Path + ": expected object";
         return std::nullopt;
       }
-      if (!checkKeys(*Item, {"select", "pin", "attributes", "abi"}, Path,
-                     Error)) {
+      if (!checkKeys(*Item, {"select", "pin", "attributes", "abi",
+                             "signature"}, Path, Error)) {
         return std::nullopt;
       }
       NativeFunctionConfig Function;
@@ -694,9 +741,30 @@ std::optional<NativeConfig> parseNativeConfig(StringRef Text,
           return std::nullopt;
         }
       }
+      if (const Value *Signature = Item->get("signature")) {
+        const Object *SignatureObject = Signature->getAsObject();
+        if (SignatureObject == nullptr) {
+          Error = Path + ".signature: expected object";
+          return std::nullopt;
+        }
+        if (!checkKeys(*SignatureObject, {"params", "returns"},
+                       Path + ".signature", Error)) {
+          return std::nullopt;
+        }
+        NativeSignaturePin Pin;
+        if (!parseRegisterSlotArray(*SignatureObject, "params", Pin.Params,
+                                    Path + ".signature.params", Error) ||
+            !parseRegisterSlotArray(*SignatureObject, "returns", Pin.Returns,
+                                    Path + ".signature.returns", Error)) {
+          return std::nullopt;
+        }
+        Function.Signature = std::move(Pin);
+      }
       if (!Function.Pin && Function.Attributes.empty() &&
-          Function.AbiConvention == NativeFunctionConfig::Abi::Unset) {
-        Error = Path + ": needs at least one of pin/attributes/abi";
+          Function.AbiConvention == NativeFunctionConfig::Abi::Unset &&
+          !Function.Signature.has_value()) {
+        Error = Path +
+                ": needs at least one of pin/attributes/abi/signature";
         return std::nullopt;
       }
       Config.Functions.push_back(std::move(Function));
@@ -856,6 +924,34 @@ void printNativeConfig(const NativeConfig &Config, llvm::raw_ostream &OS) {
             J.attribute("select", Value(std::move(Select)));
             if (Function.Pin) {
               J.attribute("pin", true);
+            }
+            if (Function.Signature.has_value()) {
+              auto slotJson = [](const NativeRegisterSlotSpec &Spec) {
+                Object Slot;
+                Slot["register"] = Spec.Register;
+                if (Spec.Width != 0) {
+                  Slot["width"] = static_cast<int64_t>(Spec.Width);
+                }
+                return Slot;
+              };
+              Object Signature;
+              Array Params;
+              for (const NativeRegisterSlotSpec &Spec :
+                   Function.Signature->Params) {
+                Params.push_back(slotJson(Spec));
+              }
+              Array Returns;
+              for (const NativeRegisterSlotSpec &Spec :
+                   Function.Signature->Returns) {
+                Returns.push_back(slotJson(Spec));
+              }
+              if (!Params.empty()) {
+                Signature["params"] = std::move(Params);
+              }
+              if (!Returns.empty()) {
+                Signature["returns"] = std::move(Returns);
+              }
+              J.attribute("signature", Value(std::move(Signature)));
             }
             if (Function.AbiConvention != NativeFunctionConfig::Abi::Unset) {
               J.attribute("abi",

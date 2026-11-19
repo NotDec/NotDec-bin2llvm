@@ -729,6 +729,13 @@ void refineInternalStackParamShapes(SignatureRewriteState &state);
 void markSignatureCallArgStores(SignatureRewriteState &state,
                                 NativeRegisterEliminationSummary &summary);
 
+// 用户显式声明的寄存器槽（`returns: [{"register":...,"width":...}]` 派生的
+// NativeSignatureSlot）。寄存器不存在时返回 nullopt。
+std::optional<NativeSignatureSlot> explicitRegisterSlot(
+    const NativeRegisterSlotSpec &spec,
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    llvm::Module &module);
+
 std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
     llvm::Module &module,
     const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
@@ -736,7 +743,9 @@ std::map<llvm::Function *, SignatureShape> buildInitialSignatureShapes(
     const AbiFacts &abi, const NativeExternalPrototypeMap &prototypes,
     bool abiForAllFunctions,
     const std::set<std::string> *forcedExternal = nullptr,
-    const std::set<std::string> *forcedInternal = nullptr);
+    const std::set<std::string> *forcedInternal = nullptr,
+    const std::map<std::string, NativeSignaturePin> *pinnedSignatures =
+        nullptr);
 
 bool isStackSignatureSlot(const NativeSignatureSlot &slot);
 
