@@ -91,6 +91,31 @@ scripts/native-metrics-matrix.sh build/bin/notdec-native-llvm /path/to/bin \
   就没有约定值，不算缺口，不要用声明更宽的返回槽去"消掉"它；
 - `poison_operand_instructions` —— 只应出现在 ABI 保证的死值上（如 x87 空槽）。
 
+## 2.3 需求来源诊断（透传链）
+
+register-elimination 在需求定点结束后会打印一张需求图摘要（每行一个寄存器）：
+
+```
+Native register demand: ZMM0 nodes=385 edges=1183 sources=1 sinks=49 pass_through=367
+  warning: 367/385 functions carry a ZMM0 demand without any local access to that register;
+  the demand is pass-through, not a real value need. Fix the source(s) first ...
+  sources: FUN_2b12e0
+  pass_through_examples: ...
+```
+
+- `sources`：需求图里没有入边的函数——它们自己的需求来自本地读/ABI 种子，**是要修的地方**；
+- `pass_through`：对该寄存器没有任何本地访问、只是把需求传下去的函数——改它们没有意义；
+- 这条链路之前出现过（hexx64 的 ZMM0 128 位返回槽：385 个函数挂在 1 个死读上），
+  所以看到"某寄存器一堆 unknown/clobber"时先看这张表，别顺着链一个个修。
+
+要拿到每条边的细节（谁会话、哪个 block 的读是种子），用临时诊断：
+
+```bash
+NOTDEC_TRACE_ZMM0_DEMAND=1 build/bin/notdec-native-llvm ... 2> trace.err
+# ZMM0READ fn=... bb=... off=... width=... mask=...
+# ZMM0EXIT caller=... callee=... bits=... live=...
+```
+
 ## 3. 当前已经跑过的样本
 
 - `memcached limit20`

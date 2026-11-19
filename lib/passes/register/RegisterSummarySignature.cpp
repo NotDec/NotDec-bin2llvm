@@ -2,6 +2,16 @@
 
 namespace notdec::bin2llvm {
 
+namespace {
+// 临时诊断（NOTDEC_TRACE_ZMM0_DEMAND=1）：打印 ZMM0 需求的"种子读"和
+// "沿调用边传给 callee 的退出需求"，用来回答"这个 128 位需求到底从哪来"。
+bool traceZmm0Demand() {
+  static const bool enabled =
+      ::getenv("NOTDEC_TRACE_ZMM0_DEMAND") != nullptr;
+  return enabled;
+}
+} // namespace
+
 RegisterDemand
   Analyzer::liveBeforeBlock(llvm::BasicBlock &block, RegisterDemand live,
                   std::map<llvm::Function *, RegisterDemand> &additions,
@@ -22,6 +32,16 @@ RegisterDemand
                          .shl(partial->BitOffset);
             }
             addDemand(live, partial->Global, mask);
+            if (traceZmm0Demand()) {
+              auto unitIt = Units.find(partial->Global);
+              if (unitIt != Units.end() && unitIt->second.Name == "ZMM0") {
+                llvm::errs() << "ZMM0READ fn=" << block.getParent()->getName()
+                             << " bb=" << block.getName() << " off="
+                             << partial->BitOffset << " width="
+                             << partial->ReadWidth << " mask="
+                             << maskToHex(mask) << "\n";
+              }
+            }
           }
           continue;
         }
@@ -91,6 +111,14 @@ void Analyzer::applyBackwardCallDemand(
         llvm::APInt nonEntryBits = calleeCell.MayNonEntry & mask;
         if (maskNonZero(nonEntryBits)) {
           addDemand(additions[callee], global, nonEntryBits);
+          DemandEdges[unit.Name][call.getFunction()].insert(callee);
+          if (traceZmm0Demand() && unit.Name == "ZMM0") {
+            llvm::errs() << "ZMM0EXIT caller="
+                         << call.getParent()->getParent()->getName()
+                         << " callee=" << callee->getName()
+                         << " bits=" << maskToHex(nonEntryBits)
+                         << " live=" << maskToHex(mask) << "\n";
+          }
         }
         llvm::APInt killedBits = ~calleeCell.MayEntry & mask;
         if (maskNonZero(killedBits)) {
@@ -313,6 +341,114 @@ void Analyzer::attachMetadata() {
       }
     }
   }
+
+
+namespace {
+
+bool functionTouchesRegister(llvm::Function &function,
+                             llvm::GlobalVariable *global) {
+  for (llvm::BasicBlock &block : function) {
+    for (llvm::Instruction &inst : block) {
+      if (auto *load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+        if (load->getPointerOperand()->stripPointerCasts() == global) {
+          return true;
+        }
+      } else if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+        if (store->getPointerOperand()->stripPointerCasts() == global) {
+          return true;
+        }
+      } else if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
+        if (std::optional<NativeRegisterPartialReadInfo> read =
+                parseNativeRegisterPartialRead(*call);
+            read && read->Global == global) {
+          return true;
+        }
+        if (std::optional<NativeRegisterPartialWriteInfo> write =
+                parseNativeRegisterPartialWrite(*call);
+            write && write->Global == global) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+} // namespace
+
+void Analyzer::reportDemandOrigins() {
+  for (const auto &[registerName, edges] : DemandEdges) {
+    if (edges.empty()) {
+      continue;
+    }
+    auto unitIt = UnitsByName.find(registerName);
+    if (unitIt == UnitsByName.end()) {
+      continue;
+    }
+    llvm::GlobalVariable *global = unitIt->second;
+
+    std::set<llvm::Function *> nodes;
+    std::map<llvm::Function *, unsigned> inDegree;
+    uint64_t edgeCount = 0;
+    for (const auto &[caller, callees] : edges) {
+      nodes.insert(caller);
+      for (llvm::Function *callee : callees) {
+        nodes.insert(callee);
+        ++inDegree[callee];
+        ++edgeCount;
+      }
+    }
+
+    std::vector<std::string> sources;
+    std::vector<std::string> passThrough;
+    std::vector<std::string> sinks;
+    for (llvm::Function *function : nodes) {
+      const bool hasIncoming = inDegree[function] != 0;
+      const auto outIt = edges.find(function);
+      const bool hasOutgoing = outIt != edges.end() && !outIt->second.empty();
+      if (!hasIncoming) {
+        sources.push_back(function->getName().str());
+      }
+      if (!hasOutgoing) {
+        sinks.push_back(function->getName().str());
+      }
+      if (!functionTouchesRegister(*function, global)) {
+        passThrough.push_back(function->getName().str());
+      }
+    }
+
+    llvm::errs() << "Native register demand: " << registerName
+                 << " nodes=" << nodes.size() << " edges=" << edgeCount
+                 << " sources=" << sources.size()
+                 << " sinks=" << sinks.size()
+                 << " pass_through=" << passThrough.size() << '\n';
+    if (!passThrough.empty()) {
+      llvm::errs()
+          << "  warning: " << passThrough.size() << '/' << nodes.size()
+          << " functions carry a " << registerName
+          << " demand without any local access to that register; the demand is"
+             " pass-through, not a real value need. Fix the source(s) first"
+             " instead of chasing the chain.\n";
+      auto printList = [&](llvm::StringRef label,
+                           const std::vector<std::string> &values) {
+        if (values.empty()) {
+          return;
+        }
+        llvm::errs() << "  " << label << ":";
+        const size_t limit = std::min<size_t>(values.size(), 8);
+        for (size_t index = 0; index < limit; ++index) {
+          llvm::errs() << ' ' << values[index];
+        }
+        if (values.size() > limit) {
+          llvm::errs() << " ...(+" << values.size() - limit << ')';
+        }
+        llvm::errs() << '\n';
+      };
+      printList("sources", sources);
+      printList("pass_through_examples", passThrough);
+    }
+  }
+}
 
 NativeRegisterSummary Analyzer::buildPublicSummary() const {
     NativeRegisterSummary summary;

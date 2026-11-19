@@ -23,6 +23,7 @@ NativeRegisterSummary Analyzer::run() {
     }
     if (Options.RunTopDownDemand) {
       runTopDownDemand();
+      reportDemandOrigins();
     }
     if (Options.AttachMetadata) {
       attachMetadata();

@@ -453,6 +453,11 @@ public:
 
   void runTopDownDemand();
 
+  // 定点结束后打印"需求从哪来"：按寄存器统计需求图规模、源头（无入边的函数）、
+  // 纯透传节点（对寄存器没有任何本地访问），并提示"先处理源头，不要顺着透传链
+  // 一个个修"。hexx64 的 ZMM0 128 位返回槽就是 385 个函数挂在唯一一个源头上。
+  void reportDemandOrigins();
+
   void seedAbiReturns(FunctionDemand &demand) const;
 
   llvm::APInt
@@ -492,6 +497,13 @@ private:
   std::vector<llvm::Function *> Functions;
   std::map<llvm::Function *, std::set<llvm::Function *>> Calls;
   std::map<llvm::Function *, std::set<llvm::Function *>> Callers;
+  // 需求来源诊断：按寄存器记录"caller 在调用点把该寄存器的需求传给 callee"的边。
+  // 定点结束后用它找需求的源头（没有入边的函数）和纯透传节点（既不读也不写该
+  // 寄存器、只是把需求传下去的函数）。见 reportDemandOrigins。
+  std::map<std::string,
+           std::map<llvm::Function *, std::set<llvm::Function *>>>
+      DemandEdges;
+
   std::map<llvm::Function *, FunctionEffect> Effects;
   std::map<llvm::Function *, FunctionDemand> Demands;
   std::set<llvm::Value *> CrossBlockValues;
