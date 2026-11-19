@@ -374,3 +374,59 @@ callee 的 `ReadEntry` 上，而不是 `partial_read`。
 - 已确认它们确实是普通寄存器写/读（`FUN_334770` 的 asm 里就有对 R10/R11 的写），
   不是 idiom；源头是"某条路径上读了一个本函数没写过的 R10/R11"，下一步用
   `NOTDEC_TRACE_DEMAND=R11` 的 `DEMANDREAD` 定位到具体 block 再对照 asm。
+
+## R10/R11 链的根因（2026-11-19 晚，已定位到具体指令）
+
+排查路径：`NOTDEC_TRACE_DEMAND=R11` → 4 个源头 → 逐个看它们的 R11 访问 → 最终落在
+**3 个函数**（`FUN_dd270`、`FUN_1d01c0`，以及经由调用合并继承的 `FUN_1d0fd0`），
+summary 里它们的 `read_entry_mask[R11]` 都是 **0xFFFFFF00**。
+
+看 `FUN_1d01c0` 的 pre-RE IR（块 `bb_1d0521`）：
+
+```llvm
+%unique_e900_1 = zext i1 %463 to i8
+call void @notdec.partial_write.i64.i8(ptr @R11, i8 %unique_e900_1, i64 0)  ; 只写低 8 位
+...
+%R11D = call i32 @notdec.partial_read.i64.i32(ptr @R11, i64 0)             ; 读 32 位
+%464  = and i32 %R8D, %R11D
+```
+
+对照 asm（0x1d0531–0x1d0547）：
+
+```asm
+1d0531: 41 0f 95 c0   setne  %r8b        ; 标志位 → 寄存器低字节
+1d0538: 41 0f 96 c3   setbe  %r11b
+1d053c: 45 21 d8      and    %r11d,%r8d  ; 32 位 and：高 24 位是垃圾，但编译器不在乎
+1d0547: 45 84 c0      test   %r8b,%r8b   ; 后面只用低 8 位
+```
+
+**链条**：`setcc` 只写寄存器低字节 → 后面的 32 位 `and` 读整寄存器 → 高 24 位没有
+本地定义 → 需求 `0xFFFFFF00` 一路传到函数入口 → `ReadEntry[R11]` → 形参/返回槽 →
+沿调用链放大成 478/487 个节点。
+
+**放大器在 `computeValueDemands`（RegisterSummarySupport.cpp:342-378）**：
+
+```cpp
+if (std::optional<NativeRegisterPartialWriteInfo> partial = parseNativeRegisterPartialWrite(*call)) {
+  enqueue(partial->Value, fullMaskForValue(partial->Value));   // ← 任何写进寄存器的值都按满宽 seed
+  continue;
+}
+```
+
+于是 `and` 的 32 位结果被满宽 seed → 两个操作数都要 32 位 → `%R11D` 要 32 位 →
+本地那次 8 位写只擦掉 8 位，剩 `0xFFFFFF00` 记到入口。**这正是"高 24 位其实是垃圾"
+的位被当成真需求的原因**；再加 `valueDemand` 对"不在 map 里的值"默认返回全 1
+（RegisterSummaryRewrite.cpp:387-389），把这条放大固化了。
+
+**修法（下一步）**：把 `usedInputs` 那套"可观察性"用到**值**上，而不是只用在入口：
+
+1. 寄存器写的 seed 改成"只 seed 该寄存器后续被观察到的位"（用后向寄存器
+   liveness 算，而不是 `fullMask`）；
+2. `valueDemand` 的默认值从"全 1"改成"0"（前提是 transfer 覆盖完整，`default:`
+   已经把所有操作数按 demand 传下去，所以"不在 map 里"确实等于"到不了可观察使用"）；
+3. 更针对性的快修：`setcc` 写低字节后，未写的高位在**下一次整寄存器写之前**都是
+   don't-care（x86 的 `setcc` 语义就是不定义高位），可以给这些位标成 ABI 未定义
+   而不是向入口要值——这和第 9 代的 `!notdec.abi_undefined` 是同一类。
+
+预期：R11=30、R10=33、R8=36、R9=96 这 ~195 个 unknown 里的大部分会消失
+（它们都是同一个放大器的产物）。
