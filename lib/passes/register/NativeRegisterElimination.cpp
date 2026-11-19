@@ -199,6 +199,7 @@ runNativeRegisterElimination(llvm::Module &module,
 
   NativeRegisterSummaryOptions baseSummaryOptions;
   baseSummaryOptions.AttachMetadata = false;
+  baseSummaryOptions.PrintSummary = options.PrintSummary;
   baseSummaryOptions.IgnoredRegisters = effectiveOptions.IgnoredRegisters;
   baseSummaryOptions.ExternalCallShapes =
       buildExternalCallShapes(module, units, abi, externalPrototypes);

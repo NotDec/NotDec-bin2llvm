@@ -23,11 +23,16 @@ NativeRegisterSummary Analyzer::run() {
     }
     if (Options.RunTopDownDemand) {
       // 可观察性分析：先算出"入口值有没有人真正观察"，再跑 demand。
-      // 目前只打印（阶段 1），还没有用它裁剪 ReadEntry。
+      // 目前只打印（阶段 1），还没有用它裁剪 ReadEntry；诊断输出跟
+      // Options.PrintSummary（--register-ssa-summary）走，普通运行保持安静。
       computeUsedInputs();
-      reportUnobservableInputs();
+      if (Options.PrintSummary) {
+        reportUnobservableInputs();
+      }
       runTopDownDemand();
-      reportDemandOrigins();
+      if (Options.PrintSummary) {
+        reportDemandOrigins();
+      }
     }
     if (Options.AttachMetadata) {
       attachMetadata();
