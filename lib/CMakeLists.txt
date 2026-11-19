@@ -28,6 +28,7 @@ add_library(notdec-bin2llvm-core STATIC
   passes/register/NativeRegisterPostRewritePeephole.cpp
   passes/register/NativeRegisterPreSummaryPeephole.cpp
   passes/register/NativeRegisterSummary.cpp
+  passes/register/NativeRegisterValueDce.cpp
   passes/register/RegisterSummarySupport.cpp
   passes/register/RegisterSummaryCore.cpp
   passes/register/RegisterSummaryFlow.cpp

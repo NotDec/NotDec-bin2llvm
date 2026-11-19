@@ -100,6 +100,7 @@ struct NativeRegisterEliminationConfig {
   bool ResidueRemoval = true;
   bool PostRewriteInstCombine = true;
   bool VarArgRecovery = true;
+  bool ValueDce = false;
   bool AbiForAllFunctions = false;
   bool AttachMetadata = true;
   // 原始路径 + 解析后的绝对路径（可能是同一个）。

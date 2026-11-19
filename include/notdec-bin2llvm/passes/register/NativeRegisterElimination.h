@@ -25,6 +25,13 @@ struct NativeRegisterEliminationOptions {
   bool AttachMetadata = true;
   // 识别编译器生成的变参序言并恢复成 llvm.va_start + 变参签名（默认开）。
   bool EnableVarArgRecovery = true;
+  // 寄存器感知 DCE（默认关）：需求定点后把"写了没人读"的寄存器写的值换成 0，
+  // 删掉死掉的计算链，再重跑一遍 summary。
+  // 关掉的原因：需求的死写判定只对"签名要不要这几位"负责，还没证明对"删除值"
+  // 是 sound 的（hexx64/fortune 上已经抓到 noreturn 调用的实参被误判成死写，
+  // 修掉之后仍有 callee-saved 返回槽上的差异）。要打开需要先把需求分析做成
+  // 严格的上界，见 logs/20261120-01-native-demand-dce-plan.md。
+  bool EnableValueDce = false;
   // 是否要求所有函数都遵守外部 ABI（参数和返回都用 ABI 寄存器）。
   // 默认 false：本地链接、地址没被取的函数属于"接口可改"，参数和返回都可以用自定义
   // 约定（例如把 caller-saved 的 RCX/R8 也当返回通道）。某些编译配置下所有函数都遵守

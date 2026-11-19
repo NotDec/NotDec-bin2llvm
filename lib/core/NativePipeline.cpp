@@ -279,6 +279,7 @@ bool runRegisterEliminationStage(const NativeStageConfig &Stage,
   Options.EnableResidueRemoval = Config.ResidueRemoval;
   Options.EnablePostRewriteInstCombine = Config.PostRewriteInstCombine;
   Options.EnableVarArgRecovery = Config.VarArgRecovery;
+  Options.EnableValueDce = Config.ValueDce;
   Options.AbiForAllFunctions = Config.AbiForAllFunctions;
   Options.ForcedExternalAbiFunctions = Context.ForcedExternalAbiFunctions;
   Options.ForcedInternalAbiFunctions = Context.ForcedInternalAbiFunctions;

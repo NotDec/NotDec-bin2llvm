@@ -19,7 +19,8 @@ bool traceDemandFor(const std::string &registerName) {
 RegisterDemand
   Analyzer::liveBeforeBlock(llvm::BasicBlock &block, RegisterDemand live,
                   std::map<llvm::Function *, RegisterDemand> &additions,
-                  const std::map<llvm::Value *, llvm::APInt> &valueDemands) {
+                  const std::map<llvm::Value *, llvm::APInt> &valueDemands,
+                  std::map<llvm::Instruction *, llvm::APInt> *observedWrites) {
     for (llvm::Instruction &inst : llvm::reverse(block)) {
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&inst)) {
         if (std::optional<NativeRegisterPartialReadInfo> partial =
@@ -63,8 +64,21 @@ RegisterDemand
         if (std::optional<NativeRegisterPartialWriteInfo> partial =
                 parseNativeRegisterPartialWrite(*call)) {
           auto unitIt = Units.find(partial->Global);
-          if (unitIt != Units.end() &&
-              isX64Low32GprWrite(*partial, unitIt->second)) {
+          const bool low32 =
+              unitIt != Units.end() &&
+              isX64Low32GprWrite(*partial, unitIt->second);
+          llvm::APInt writeMask =
+              low32 ? registerRangeMask(partial->Global, 0, 32)
+                    : registerRangeMask(partial->Global, partial->BitOffset,
+                                        partial->WriteWidth);
+          // 反馈给值层：这次写之后该寄存器还有哪些位会被读（写覆盖的位里
+          // 只有这些位需要写入值；低位段写的高位在 x86-64 上被清零，不算）。
+          if (observedWrites != nullptr) {
+            (*observedWrites)[&inst] =
+                demandFor(live, partial->Global) & writeMask;
+          }
+          if (low32) {
+            // 32 位写把高 32 位清零，整个寄存器都有确定值了。
             eraseDemand(live, partial->Global);
           } else {
             // partial write 定义写入位：擦除这些位的 live demand（写覆盖旧
@@ -73,8 +87,6 @@ RegisterDemand
             // 调用点之后的传参写（如 lua_pushnumber 的 double 参数写 ZMM0）
             // 会把 ZMM0 需求误传给更早的 callee，给不返回 double 的函数
             // 误加 ZMM0 返回槽。
-            llvm::APInt writeMask = registerRangeMask(
-                partial->Global, partial->BitOffset, partial->WriteWidth);
             eraseDemand(live, partial->Global, writeMask);
           }
           continue;
@@ -88,8 +100,20 @@ RegisterDemand
       }
       if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
         RegisterAccess access = registerStore(*store, Units);
-        if (access.Unit != nullptr && !isIgnored(*access.Unit, Options)) {
-          eraseDemand(live, access.Unit->Global);
+        if (access.Unit != nullptr) {
+          // 整寄存器写：写完之后该寄存器还被读的位就是这次写要提供的值。
+          // ignored 寄存器不产生需求（读侧也跳过），记 0 即可，避免值层
+          // 因为"没有反馈"退回满宽 seed。
+          if (observedWrites != nullptr) {
+            llvm::APInt observed = demandFor(live, access.Unit->Global);
+            if (observed.getBitWidth() == 0) {
+              observed = llvm::APInt(registerBitWidth(*access.Unit), 0);
+            }
+            (*observedWrites)[&inst] = std::move(observed);
+          }
+          if (!isIgnored(*access.Unit, Options)) {
+            eraseDemand(live, access.Unit->Global);
+          }
         }
         continue;
       }
@@ -97,7 +121,8 @@ RegisterDemand
         RegisterAccess access = registerLoad(*load, Units);
         if (access.Unit != nullptr && !isIgnored(*access.Unit, Options) &&
             !isAbiBoundaryZeroRegister(access.Unit->Name)) {
-          addDemand(live, access.Unit->Global, valueDemand(load, valueDemands));
+          addDemand(live, access.Unit->Global,
+                      valueDemand(load, valueDemands));
         }
       }
     }
@@ -112,33 +137,38 @@ void Analyzer::applyBackwardCallDemand(
         Effects.count(callee) != 0) {
       const FunctionEffect &effect = Effects[callee];
       if (effect.NoReturn) {
+        // 调用点之后没有"之后"：清掉返回后的 live 需求。但**不能**直接 return：
+        // 调用点本身还是要读 callee 的入口位（实参寄存器），那段需求必须继续
+        // 往下走。否则调用前的实参准备被当成死写，寄存器感知 DCE 会把值换成 0
+        // （hexx64/fortune 上 FUN_4db0 对 noreturn FUN_27a0 的 RDI 实参就是这么
+        // 被错的死写判定命中的）。
         live.clear();
-        return;
-      }
-      for (const auto &[global, unit] : Units) {
-        llvm::APInt mask = demandFor(live, global);
-        if (isIgnored(unit, Options) || mask.getBitWidth() == 0 ||
-            mask.isZero()) {
-          continue;
-        }
-        Cell calleeCell = cellIn(effect, global);
-        // 只把 callee 实际改写（MayNonEntry）的位加进 callee 的退出需求；
-        // 调用后仍可能是入口值（MayEntry）的位，live 需求保留。
-        llvm::APInt nonEntryBits = calleeCell.MayNonEntry & mask;
-        if (maskNonZero(nonEntryBits)) {
-          addDemand(additions[callee], global, nonEntryBits);
-          DemandEdges[unit.Name][call.getFunction()].insert(callee);
-          if (traceDemandFor(unit.Name)) {
-            llvm::errs() << "DEMANDEXIT reg=" << unit.Name << " caller="
-                         << call.getParent()->getParent()->getName()
-                         << " callee=" << callee->getName()
-                         << " bits=" << maskToHex(nonEntryBits)
-                         << " live=" << maskToHex(mask) << "\n";
+      } else {
+        for (const auto &[global, unit] : Units) {
+          llvm::APInt mask = demandFor(live, global);
+          if (isIgnored(unit, Options) || mask.getBitWidth() == 0 ||
+              mask.isZero()) {
+            continue;
           }
-        }
-        llvm::APInt killedBits = ~calleeCell.MayEntry & mask;
-        if (maskNonZero(killedBits)) {
-          eraseDemand(live, global, killedBits);
+          Cell calleeCell = cellIn(effect, global);
+          // 只把 callee 实际改写（MayNonEntry）的位加进 callee 的退出需求；
+          // 调用后仍可能是入口值（MayEntry）的位，live 需求保留。
+          llvm::APInt nonEntryBits = calleeCell.MayNonEntry & mask;
+          if (maskNonZero(nonEntryBits)) {
+            addDemand(additions[callee], global, nonEntryBits);
+            DemandEdges[unit.Name][call.getFunction()].insert(callee);
+            if (traceDemandFor(unit.Name)) {
+              llvm::errs() << "DEMANDEXIT reg=" << unit.Name << " caller="
+                           << call.getParent()->getParent()->getName()
+                           << " callee=" << callee->getName()
+                           << " bits=" << maskToHex(nonEntryBits)
+                           << " live=" << maskToHex(mask) << "\n";
+            }
+          }
+          llvm::APInt killedBits = ~calleeCell.MayEntry & mask;
+          if (maskNonZero(killedBits)) {
+            eraseDemand(live, global, killedBits);
+          }
         }
       }
       // callee 在入口需要的位，调用点必须已经有值——但只要求"签名确实会带进来的位"，
@@ -642,6 +672,62 @@ void Analyzer::reportUnobservableInputs() {
     }
     llvm::errs() << '\n';
   }
+}
+
+std::vector<llvm::Instruction *> Analyzer::collectDeadRegisterWrites() const {
+  const bool dump = ::getenv("NOTDEC_DUMP_DEAD_WRITES") != nullptr;
+  std::vector<llvm::Instruction *> dead;
+  for (llvm::Function *function : Functions) {
+    auto it = DeadRegisterWritesByFunction.find(function);
+    if (it == DeadRegisterWritesByFunction.end()) {
+      continue;
+    }
+    dead.insert(dead.end(), it->second.begin(), it->second.end());
+  }
+  if (dump) {
+    for (llvm::Instruction *inst : dead) {
+      llvm::errs() << "DEADWRITE fn=" << inst->getFunction()->getName()
+                   << " bb=" << inst->getParent()->getName() << " : ";
+      inst->print(llvm::errs());
+      llvm::errs() << '\n';
+    }
+  }
+  return dead;
+}
+
+void Analyzer::reportWriteObservations() {
+  uint64_t deadWrites = 0;
+  uint64_t liveWrites = 0;
+  for (const auto &[function, stats] : WriteObservationStats) {
+    (void)function;
+    deadWrites += stats.first;
+    liveWrites += stats.second;
+  }
+  if (deadWrites == 0 && liveWrites == 0) {
+    return;
+  }
+  llvm::errs() << "Native register write observations: dead=" << deadWrites
+               << " live=" << liveWrites;
+  std::map<std::string, uint64_t> byRegister;
+  for (const auto &[function, counts] : DeadWritesByRegister) {
+    (void)function;
+    for (const auto &[name, count] : counts) {
+      byRegister[name] += count;
+    }
+  }
+  std::vector<std::pair<std::string, uint64_t>> top(byRegister.begin(),
+                                                    byRegister.end());
+  std::sort(top.begin(), top.end(), [](const auto &lhs, const auto &rhs) {
+    if (lhs.second != rhs.second) {
+      return lhs.second > rhs.second;
+    }
+    return lhs.first < rhs.first;
+  });
+  const size_t limit = std::min<size_t>(top.size(), 8);
+  for (size_t i = 0; i < limit; ++i) {
+    llvm::errs() << ' ' << top[i].first << ':' << top[i].second;
+  }
+  llvm::errs() << '\n';
 }
 
 void Analyzer::reportDemandOrigins() {

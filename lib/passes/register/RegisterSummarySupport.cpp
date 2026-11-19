@@ -310,11 +310,37 @@ llvm::APInt trimmedMask(const llvm::APInt &mask, unsigned width) {
   return mask.zextOrTrunc(width);
 }
 
+namespace {
+// 寄存器坐标掩码（寄存器位 0 起）-> 写入值坐标（结果位 0 起）。
+// partial_write 的 BitOffset 是写入位段在寄存器里的起点；值本身从 bit 0 起。
+llvm::APInt observedValueMask(const llvm::APInt &registerMask,
+                              uint64_t offsetBits, unsigned valueWidth) {
+  if (valueWidth == 0) {
+    return llvm::APInt();
+  }
+  if (offsetBits >= registerMask.getBitWidth()) {
+    return llvm::APInt(valueWidth, 0);
+  }
+  return trimmedMask(registerMask.lshr(offsetBits), valueWidth);
+}
+} // namespace
+
 std::map<llvm::Value *, llvm::APInt> computeValueDemands(
     llvm::Function &function,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units) {
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const std::map<llvm::Instruction *, llvm::APInt> *observedWrites) {
   std::map<llvm::Value *, llvm::APInt> demands;
   std::vector<llvm::Value *> worklist;
+
+  // 上一轮寄存器走查的反馈：这个寄存器写之后还有哪些位会被读。
+  // nullptr = 第一轮（或该写没被记录），按满宽保守处理。
+  auto observedWrite = [&](llvm::Instruction &inst) -> const llvm::APInt * {
+    if (observedWrites == nullptr) {
+      return nullptr;
+    }
+    auto it = observedWrites->find(&inst);
+    return it == observedWrites->end() ? nullptr : &it->second;
+  };
 
   auto enqueue = [&](llvm::Value *value, llvm::APInt demand) {
     unsigned width = valueBitWidth(value);
@@ -360,7 +386,15 @@ std::map<llvm::Value *, llvm::APInt> computeValueDemands(
       }
       if (std::optional<NativeRegisterPartialWriteInfo> partial =
               parseNativeRegisterPartialWrite(*call)) {
-        enqueue(partial->Value, fullMaskForValue(partial->Value));
+        // 写进寄存器的值：只有该寄存器后续真被读的位才需要它。第一轮没有
+        // 反馈（observedWrite == nullptr）时按满宽 seed，作为定点迭代的上界。
+        if (const llvm::APInt *observed = observedWrite(inst)) {
+          enqueue(partial->Value,
+                  observedValueMask(*observed, partial->BitOffset,
+                                    valueBitWidth(partial->Value)));
+        } else {
+          enqueue(partial->Value, fullMaskForValue(partial->Value));
+        }
         continue;
       }
       for (llvm::Use &arg : call->args()) {
@@ -370,8 +404,17 @@ std::map<llvm::Value *, llvm::APInt> computeValueDemands(
     }
     if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
       RegisterAccess access = registerStore(*store, units);
+      llvm::Value *stored = store->getValueOperand();
       if (access.Unit == nullptr) {
-        seed(store->getValueOperand());
+        seed(stored);
+        continue;
+      }
+      // 整寄存器写同理：寄存器层告诉我们写完之后哪些位还会被读（写之前
+      // 被覆盖的旧需求不算）。第一轮按满宽。
+      if (const llvm::APInt *observed = observedWrite(inst)) {
+        enqueue(stored, trimmedMask(*observed, valueBitWidth(stored)));
+      } else {
+        seed(stored);
       }
       continue;
     }
@@ -383,11 +426,6 @@ std::map<llvm::Value *, llvm::APInt> computeValueDemands(
     }
     if (auto *sw = llvm::dyn_cast<llvm::SwitchInst>(&inst)) {
       seed(sw->getCondition());
-      continue;
-    }
-    if (auto *icmp = llvm::dyn_cast<llvm::ICmpInst>(&inst)) {
-      seed(icmp->getOperand(0));
-      seed(icmp->getOperand(1));
       continue;
     }
   }
@@ -429,8 +467,18 @@ std::map<llvm::Value *, llvm::APInt> computeValueDemands(
       }
       break;
     case llvm::Instruction::Select:
+      // 条件本身也是被观察的值：漏掉它，select 条件上的比较链就收不到需求。
+      enqueue(inst->getOperand(0), llvm::APInt::getAllOnes(1));
       enqueue(inst->getOperand(1), demand);
       enqueue(inst->getOperand(2), demand);
+      break;
+    case llvm::Instruction::ICmp:
+    case llvm::Instruction::FCmp:
+      // 比较结果被需要（1 位）就意味着两个操作数的所有位都被需要；结果没有
+      // 需求时不能 seed——否则死标志位的计算链会把寄存器读重新拉成全宽
+      // （FUN_1d01c0 的 R11 高 24 位就是这么来的）。
+      enqueue(inst->getOperand(0), fullMaskForValue(inst->getOperand(0)));
+      enqueue(inst->getOperand(1), fullMaskForValue(inst->getOperand(1)));
       break;
     case llvm::Instruction::And:
       if (auto *lhs = llvm::dyn_cast<llvm::ConstantInt>(inst->getOperand(0))) {

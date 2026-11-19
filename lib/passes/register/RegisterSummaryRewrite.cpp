@@ -392,35 +392,166 @@ llvm::APInt
 
 std::map<llvm::Function *, RegisterDemand>
   Analyzer::analyzeCallerDemand(llvm::Function &function) {
-    std::map<llvm::Value *, llvm::APInt> valueDemands =
-        computeValueDemands(function, Units);
+    // 两层定点（Arch2 §10.1）：值层的初始需求决定寄存器读的位宽，寄存器层的
+    // 后向走查又反过来决定"某个寄存器写有哪些位真的会被读"。第一轮从满宽
+    // 开始（与旧行为一致），之后把观察位反馈给值层再走一遍，直到两层都稳定。
+    // 每轮都是上界（写观察位 = 该写之后仍被读的位，值层只会越收越窄），
+    // 单调下降保证停在最大不动点，不会比真实需求少。
     std::map<llvm::BasicBlock *, RegisterDemand> in;
     std::map<llvm::BasicBlock *, RegisterDemand> out;
     std::map<llvm::Function *, RegisterDemand> additions;
+    std::map<llvm::Instruction *, llvm::APInt> observedWrites;
+    std::map<llvm::Value *, llvm::APInt> valueDemands;
 
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      for (llvm::BasicBlock &block : llvm::reverse(function)) {
-        RegisterDemand liveOut;
-        for (llvm::BasicBlock *succ : llvm::successors(&block)) {
-          mergeDemand(liveOut, in[succ]);
+    // 一般 2 轮就稳定（第二轮收窄，第三轮确认）；上限只防退化输入。
+    constexpr unsigned MaxRounds = 8;
+    for (unsigned round = 0;; ++round) {
+      valueDemands =
+          computeValueDemands(function, Units,
+                              round == 0 ? nullptr : &observedWrites);
+      // 诊断（NOTDEC_TRACE_DEMAND=<寄存器名>）：按轮打印读的位需求和写的观察位，
+      // 用来判断两层定点是否还在收窄、卡在哪一轮。
+      llvm::GlobalVariable *tracedGlobal = nullptr;
+      if (const char *traced = ::getenv("NOTDEC_TRACE_DEMAND")) {
+        auto unitIt = UnitsByName.find(traced);
+        if (unitIt != UnitsByName.end()) {
+          tracedGlobal = unitIt->second;
         }
-        if (llvm::isa<llvm::ReturnInst>(block.getTerminator())) {
-          mergeDemand(liveOut, Demands[&function].ExitDemand);
+      }
+      if (tracedGlobal != nullptr) {
+        llvm::errs() << "DEMANDROUND fn=" << function.getName()
+                     << " round=" << round << "\n";
+        for (llvm::BasicBlock &block : function) {
+          for (llvm::Instruction &inst : block) {
+            auto *call = llvm::dyn_cast<llvm::CallBase>(&inst);
+            if (call == nullptr) {
+              continue;
+            }
+            std::optional<NativeRegisterPartialReadInfo> read =
+                parseNativeRegisterPartialRead(*call);
+            if (read && read->Global == tracedGlobal) {
+              llvm::errs() << "  READ bb=" << block.getName()
+                           << " off=" << read->BitOffset
+                           << " width=" << read->ReadWidth << " demand="
+                           << maskToHex(valueDemand(call, valueDemands)) << "\n";
+            }
+          }
         }
-        RegisterDemand live =
-            liveBeforeBlock(block, liveOut, additions, valueDemands);
-        if (out[&block] != liveOut) {
-          out[&block] = std::move(liveOut);
-          changed = true;
+      }
+      in.clear();
+      out.clear();
+      additions.clear();
+
+      std::map<llvm::Instruction *, llvm::APInt> nextObservations;
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        // 只在"这一遍没有改动任何块"时采用它的观察结果：那一遍的 live 就是
+        // 稳定解，否则观察位可能是中途状态的欠近似。
+        nextObservations.clear();
+        for (llvm::BasicBlock &block : llvm::reverse(function)) {
+          RegisterDemand liveOut;
+          for (llvm::BasicBlock *succ : llvm::successors(&block)) {
+            mergeDemand(liveOut, in[succ]);
+          }
+          if (llvm::isa<llvm::ReturnInst>(block.getTerminator())) {
+            mergeDemand(liveOut, Demands[&function].ExitDemand);
+          }
+          RegisterDemand live =
+              liveBeforeBlock(block, liveOut, additions, valueDemands,
+                              &nextObservations);
+          if (out[&block] != liveOut) {
+            out[&block] = std::move(liveOut);
+            changed = true;
+          }
+          if (in[&block] != live) {
+            in[&block] = std::move(live);
+            changed = true;
+          }
         }
-        if (in[&block] != live) {
-          in[&block] = std::move(live);
-          changed = true;
+      }
+
+      if (tracedGlobal != nullptr && round != 0) {
+        for (llvm::BasicBlock &block : function) {
+          llvm::APInt inMask = demandFor(in[&block], tracedGlobal);
+          llvm::APInt outMask = demandFor(out[&block], tracedGlobal);
+          if (maskNonZero(inMask) || maskNonZero(outMask)) {
+            llvm::errs() << "  LIVEMASK bb=" << block.getName()
+                         << " in=" << maskToHex(inMask)
+                         << " out=" << maskToHex(outMask) << "\n";
+          }
+        }
+      }
+      if (nextObservations == observedWrites) {
+        break;
+      }
+      if (tracedGlobal != nullptr) {
+        for (const auto &[inst, mask] : nextObservations) {
+          llvm::GlobalVariable *global = nullptr;
+          if (auto *call = llvm::dyn_cast<llvm::CallBase>(inst)) {
+            if (std::optional<NativeRegisterPartialWriteInfo> write =
+                    parseNativeRegisterPartialWrite(*call)) {
+              global = write->Global;
+            }
+          } else if (auto *store = llvm::dyn_cast<llvm::StoreInst>(inst)) {
+            global = llvm::dyn_cast<llvm::GlobalVariable>(
+                store->getPointerOperand()->stripPointerCasts());
+          }
+          if (global == tracedGlobal) {
+            llvm::errs() << "  WRITE bb=" << inst->getParent()->getName()
+                         << " observed=" << maskToHex(mask) << "\n";
+          }
+        }
+        llvm::errs() << "  ENTRY round=" << round << " demand="
+                     << maskToHex(demandFor(in[&function.getEntryBlock()],
+                                            tracedGlobal))
+                     << "\n";
+      }
+      observedWrites = std::move(nextObservations);
+      if (round + 1 >= MaxRounds) {
+        // 上限兜底：最后一轮用的是上一轮的观察位，结论仍是上界。
+        break;
+      }
+    }
+    // 寄存器写观察统计（诊断）：最后一轮的观察位为 0 = 写了没人读。
+    // 按函数指令顺序收集，保证 DCE 的输入顺序确定。
+    uint64_t deadWrites = 0;
+    uint64_t liveWrites = 0;
+    std::vector<llvm::Instruction *> deadInstructions;
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &candidate : block) {
+        auto it = observedWrites.find(&candidate);
+        if (it == observedWrites.end()) {
+          continue;
+        }
+        llvm::GlobalVariable *global = nullptr;
+        if (auto *call = llvm::dyn_cast<llvm::CallBase>(&candidate)) {
+          if (std::optional<NativeRegisterPartialWriteInfo> write =
+                  parseNativeRegisterPartialWrite(*call)) {
+            global = write->Global;
+          }
+        } else if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&candidate)) {
+          global = llvm::dyn_cast<llvm::GlobalVariable>(
+              store->getPointerOperand()->stripPointerCasts());
+        }
+        if (global == nullptr) {
+          continue;
+        }
+        auto unitIt = Units.find(global);
+        if (unitIt == Units.end() || isIgnored(unitIt->second, Options)) {
+          continue;
+        }
+        const bool dead = it->second.getBitWidth() == 0 || it->second.isZero();
+        ++(dead ? deadWrites : liveWrites);
+        if (dead) {
+          ++DeadWritesByRegister[&function][unitIt->second.Name];
+          deadInstructions.push_back(&candidate);
         }
       }
     }
+    WriteObservationStats[&function] = {deadWrites, liveWrites};
+    DeadRegisterWritesByFunction[&function] = std::move(deadInstructions);
+
     Demands[&function].EntryDemand = in[&function.getEntryBlock()];
     return additions;
   }

@@ -1,5 +1,7 @@
 #include "RegisterTestHarness.h"
 
+#include "notdec-bin2llvm/passes/register/NativeRegisterValueDce.h"
+
 namespace {
 
 bool testDuplicatePredecessorEdgesKeepPhiComplete() {
@@ -6937,8 +6939,65 @@ bool testAbiUndefinedValuesAreAuditedSeparately() {
 
 } // namespace
 
+
+// 寄存器感知 DCE 的机制测试：死写的值换成 0、写本身保留、值链被删；
+// 输入列表之外的写不动。
+bool testRegisterValueDceClearsDeadWriteAndPrunesChain() {
+  llvm::LLVMContext context;
+  llvm::Module module("register-value-dce", context);
+  llvm::GlobalVariable *r8 = createRegisterGlobal(module, "R8");
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function =
+      llvm::Function::Create(type, llvm::GlobalValue::ExternalLinkage,
+                             "value_dce_dead", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  llvm::Function *partialRead =
+      notdec::bin2llvm::getOrInsertNativeRegisterPartialRead(
+          module, r8->getType(), llvm::Type::getInt32Ty(context), 64, 32);
+  llvm::CallInst *read = builder.CreateCall(
+      partialRead, {r8, builder.getInt64(0)}, "R8.read");
+  llvm::Value *extended =
+      builder.CreateZExt(read, llvm::Type::getInt64Ty(context), "R8.zext");
+  llvm::StoreInst *store = storeRegister(builder, r8, extended, "R8");
+  llvm::ReturnInst *ret = builder.CreateRetVoid();
+
+  auto summary = notdec::bin2llvm::pruneDeadRegisterValues(module, {store});
+  bool ok = expect(summary.DeadWrites == 1, "value dce did not see dead write");
+  ok &= expect(summary.ValuesCleared == 1,
+               "value dce did not clear the dead write value");
+  ok &= expect(summary.InstructionsRemoved == 2,
+               "value dce did not prune the dead read chain");
+  ok &= expect(summary.RegisterReadsRemoved == 1,
+               "value dce did not count the pruned register read");
+  ok &= expect(store->getParent() == entry,
+               "value dce must keep the dead write itself");
+  auto *zero = llvm::dyn_cast<llvm::ConstantInt>(store->getValueOperand());
+  ok &= expect(zero != nullptr && zero->isZero(),
+               "value dce did not replace the dead write value with 0");
+  ok &= expect(countPartialReadCalls(*function, r8, 0, 32) == 0,
+               "value dce left the dead partial read in place");
+
+  // 不在死写列表里的写保持原样（只按传入的观察结果动）。
+  builder.SetInsertPoint(ret);
+  llvm::CallInst *liveRead = builder.CreateCall(
+      partialRead, {r8, builder.getInt64(0)}, "R8.live_read");
+  storeRegister(builder, r8, liveRead, "R8");
+  auto empty = notdec::bin2llvm::pruneDeadRegisterValues(module, {});
+  ok &= expect(empty.ValuesCleared == 0 && empty.InstructionsRemoved == 0,
+               "value dce changed the module with an empty dead list");
+  ok &= expect(countPartialReadCalls(*function, r8, 0, 32) == 1,
+               "value dce removed a read that was not in the dead list");
+  ok &= expect(verifyOk(module, "value dce module failed verifier"),
+               "value dce broke the verifier");
+  return ok;
+}
+
 int main() {
   bool ok = true;
+  ok &= testRegisterValueDceClearsDeadWriteAndPrunesChain();
   ok &= testDuplicatePredecessorEdgesKeepPhiComplete();
   ok &= testPartialReadLoopPassthroughUsesDominatorTree();
   ok &= testX87Fp80StoreStillFeedsRange();

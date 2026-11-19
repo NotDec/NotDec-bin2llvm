@@ -251,9 +251,15 @@ llvm::APInt lowBitsMask(unsigned width, unsigned bits);
 
 llvm::APInt trimmedMask(const llvm::APInt &mask, unsigned width);
 
+// 值层需求：从函数内"可观察使用"反向传播位掩码，回答"这次读需要多少位"。
+//
+// observedWrites 是寄存器层反馈（见 liveBeforeBlock 的注释）：寄存器写指令 →
+// 该写之后该寄存器还会被读的位（寄存器坐标，可能为 0）。为空表示第一轮，所有
+// 寄存器写按满宽 seed；非空时按观察位收窄。两层交替迭代到不动点才对齐。
 std::map<llvm::Value *, llvm::APInt> computeValueDemands(
     llvm::Function &function,
-    const std::map<llvm::GlobalVariable *, RegisterUnit> &units);
+    const std::map<llvm::GlobalVariable *, RegisterUnit> &units,
+    const std::map<llvm::Instruction *, llvm::APInt> *observedWrites = nullptr);
 
 std::optional<std::pair<std::string, llvm::APInt>>
 storageUnitMask(const NativeAbiStorage &storage, uint64_t sizeBytes,
@@ -475,6 +481,18 @@ public:
   // 调用点实参需求数。不动 IR，用于评估裁剪收益。
   void reportUnobservableInputs();
 
+  // 诊断输出：寄存器写的观察位统计。observed=0 的写就是"写了没人读"，
+  // 是寄存器感知 DCE 的删除对象；先只统计，用来评估收益和风险。
+  void reportWriteObservations();
+  std::map<llvm::Function *, std::pair<uint64_t, uint64_t>>
+      WriteObservationStats;
+  // 每个函数最后一轮定点的"观察位为 0"的寄存器写（按函数指令顺序）。
+  std::map<llvm::Function *, std::vector<llvm::Instruction *>>
+      DeadRegisterWritesByFunction;
+  std::vector<llvm::Instruction *> collectDeadRegisterWrites() const;
+  std::map<llvm::Function *, std::map<std::string, uint64_t>>
+      DeadWritesByRegister;
+
   // 定点结束后打印"需求从哪来"：按寄存器统计需求图规模、源头（无入边的函数）、
   // 纯透传节点（对寄存器没有任何本地访问），并提示"先处理源头，不要顺着透传链
   // 一个个修"。hexx64 的 ZMM0 128 位返回槽就是 385 个函数挂在唯一一个源头上。
@@ -482,6 +500,8 @@ public:
 
   void seedAbiReturns(FunctionDemand &demand) const;
 
+  // 读结果的值需求。值层没分析到的值按满宽处理（三道保险之一，见
+  // computeValueDemands 的注释）。
   llvm::APInt
   valueDemand(llvm::Value *value,
               const std::map<llvm::Value *, llvm::APInt> &valueDemands) const;
@@ -489,10 +509,15 @@ public:
   std::map<llvm::Function *, RegisterDemand>
   analyzeCallerDemand(llvm::Function &function);
 
+  // 块级寄存器后向走查。observedWrites 非空时额外记录每个寄存器写指令在
+  // "该写之后"仍被读的位（寄存器坐标）：写覆盖的位里只有这些位需要写入值，
+  // 这就是反馈给值层初始需求的按位活跃信息。store 记录整寄存器、partial_write
+  // 记录写入位段，未写位不算该写提供的值。
   RegisterDemand
   liveBeforeBlock(llvm::BasicBlock &block, RegisterDemand live,
                   std::map<llvm::Function *, RegisterDemand> &additions,
-                  const std::map<llvm::Value *, llvm::APInt> &valueDemands);
+                  const std::map<llvm::Value *, llvm::APInt> &valueDemands,
+                  std::map<llvm::Instruction *, llvm::APInt> *observedWrites);
 
   void applyBackwardCallDemand(
       llvm::CallBase &call, RegisterDemand &live,

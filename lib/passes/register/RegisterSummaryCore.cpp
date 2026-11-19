@@ -1,5 +1,7 @@
 #include "RegisterSummaryInternal.h"
 
+#include "notdec-bin2llvm/passes/register/NativeRegisterValueDce.h"
+
 namespace notdec::bin2llvm {
 
 Analyzer::Analyzer(llvm::Module &module, NativeRegisterSummaryOptions options)
@@ -26,12 +28,26 @@ NativeRegisterSummary Analyzer::run() {
       // 目前只打印（阶段 1），还没有用它裁剪 ReadEntry；诊断输出跟
       // Options.PrintSummary（--register-ssa-summary）走，普通运行保持安静。
       computeUsedInputs();
-      if (Options.PrintSummary) {
+      if (Options.PrintSummary && !Options.PruneDeadRegisterValues) {
         reportUnobservableInputs();
       }
       runTopDownDemand();
-      if (Options.PrintSummary) {
+      if (Options.PrintSummary && !Options.PruneDeadRegisterValues) {
+        reportWriteObservations();
         reportDemandOrigins();
+      }
+      if (Options.PruneDeadRegisterValues) {
+        // 寄存器感知 DCE：观察位为 0 的写没人读，把写入值换成 0 并删掉因此
+        // 没人用的计算链。IR 变了，Effects/ReadEntry 都依赖这些读，所以重新
+        // 跑一遍完整分析（递归一次，PruneDeadRegisterValues=false）。
+        NativeRegisterValueDceSummary dce =
+            pruneDeadRegisterValues(Module, collectDeadRegisterWrites());
+        if (Options.PrintSummary) {
+          printNativeRegisterValueDceSummary(dce, llvm::errs());
+        }
+        NativeRegisterSummaryOptions next = Options;
+        next.PruneDeadRegisterValues = false;
+        return Analyzer(Module, next).run();
       }
     }
     if (Options.AttachMetadata) {

@@ -130,6 +130,9 @@ struct NativeRegisterSummaryOptions {
   // Callsite evidence only needs the stable bottom-up states.  The preliminary
   // external-call pass can skip return-demand propagation.
   bool RunTopDownDemand = true;
+  // 需求定点之后做寄存器感知 DCE：观察位为 0 的寄存器写，值换成 0 并删掉
+  // 因此没人用的计算链，然后重新跑一遍分析（Effects/ReadEntry 依赖这些读）。
+  bool PruneDeadRegisterValues = false;
   bool CollectExternalCallsiteEvidence = false;
   std::vector<NativeRegisterCallInputSlot> ExternalEvidenceSlots;
 };

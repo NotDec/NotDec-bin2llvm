@@ -368,7 +368,7 @@ bool parseRegisterEliminationOptions(const Object &Options, StringRef Path,
                                      std::string &Error) {
   if (!checkKeys(Options,
                  {"rewrite", "residue_removal", "post_rewrite_instcombine",
-                  "vararg_recovery", "abi_for_all_functions",
+                  "vararg_recovery", "value_dce", "abi_for_all_functions",
                   "attach_metadata", "external_prototypes",
                   "ignored_registers"},
                  Path, Error)) {
@@ -382,6 +382,7 @@ bool parseRegisterEliminationOptions(const Object &Options, StringRef Path,
                 Elimination.PostRewriteInstCombine, Path, Error) ||
       !readBool(Options, "vararg_recovery", Elimination.VarArgRecovery, Path,
                 Error) ||
+      !readBool(Options, "value_dce", Elimination.ValueDce, Path, Error) ||
       !readBool(Options, "abi_for_all_functions",
                 Elimination.AbiForAllFunctions, Path, Error) ||
       !readBool(Options, "attach_metadata", Elimination.AttachMetadata, Path,
@@ -846,6 +847,7 @@ Object nativeStageOptionsToJson(const NativeStageConfig &Stage) {
     Options["post_rewrite_instcombine"] =
         Elimination.PostRewriteInstCombine;
     Options["vararg_recovery"] = Elimination.VarArgRecovery;
+    Options["value_dce"] = Elimination.ValueDce;
     Options["abi_for_all_functions"] = Elimination.AbiForAllFunctions;
     Options["attach_metadata"] = Elimination.AttachMetadata;
     Options["external_prototypes"] = Elimination.ExternalPrototypes;

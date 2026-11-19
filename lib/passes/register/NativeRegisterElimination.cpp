@@ -223,6 +223,7 @@ runNativeRegisterElimination(llvm::Module &module,
   NativeRegisterSummaryOptions finalSummaryOptions = baseSummaryOptions;
   finalSummaryOptions.AttachMetadata = options.AttachMetadata;
   finalSummaryOptions.RunTopDownDemand = true;
+  finalSummaryOptions.PruneDeadRegisterValues = options.EnableValueDce;
   finalSummaryOptions.ExternalCallShapes =
       buildExternalCallShapes(module, units, abi, externalPrototypes);
   finalSummaryOptions.ExternalCallsiteShapes = externalCallsiteShapes;
