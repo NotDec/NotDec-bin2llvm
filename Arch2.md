@@ -348,6 +348,13 @@ i386 的 `repz cmpsb`（字符串比较）循环方向由 `DF` 标志决定。AB
 修复：在代码层建模"调用后 `DF` 定为常量 0"（`isPostCallZeroRegister`）。其他标志（`CF`/`PF`/`AF`/
 `ZF`/`SF`/`OF`）是 caller-saved、没有"必须为 0"的约定，不能一样处理。
 
+需求侧同理（2026-11-19 补）：值侧给了常量 0，需求侧也必须跳过，否则每个读 `DF` 的
+`cmp*/sca*/movs*` 循环都会给"上一个调用"记一笔退出需求。具体两处：
+`liveBeforeBlock` 的 `load`/`partial_read` 遇到 `DF` 不加需求；
+`applyBackwardCallDemand` 的 `entryNeeds` 跳过 `DF`。修之前 hexx64 的 `DF` 需求图是
+1450 个函数 / 4430 条边，修完整行消失（`DF` 不是 value-carrying 寄存器，本来就没有
+返回槽，所以指标不变，纯粹是记账噪音）。
+
 ### 8.2 x87：从整条折叠到 ST0/ST1 窗口建模
 
 x87 指令的语义是 8 个浮点寄存器组成一个"栈"（`ST0`..`ST7`），push 会把寄存器整体往下挪，和普通
@@ -475,6 +482,31 @@ ELF 机器码
 - `--register-ssa-warning-out`：残留 helper、未知外部签名、未消除访问的量化清单；
 - fortune（i386/x86_64）、wrk、vsftpd、memcached、libuv 等真实目标回归。
 
+### 10.1 需求模型的两层（2026-11-19 补充）
+
+"需求"（demand）在代码里是两层，精度不一样，混起来看容易误判：
+
+- **寄存器级（按位，精确）**：`Analyzer::liveBeforeBlock` 对每个基本块做后向走查，
+  用"每寄存器一份位掩码"表示"这个点往后还会被读的位"。`partial_read` 按读结果的需求
+  位移位后加位，写按写入位段擦位，调用点走 `applyBackwardCallDemand`。写 8 位就只擦
+  8 位，剩下的位继续往前要。
+- **值级（整值/粗）**：`computeValueDemands` 给每个 SSA 值算"哪些位被需要"，从种子
+  （`ret`、调用实参、`store` 到内存、分支条件、`icmp` 操作数、`partial_write` 的写入值）
+  出发逆着操作数传播。
+
+两层之间靠一个**保守桥**连接：写进寄存器的值，在值级被 `fullMaskForValue` 满宽 seed
+（`RegisterSummarySupport.cpp` 的 `partial_write` 分支），因为"写寄存器 → 后来从寄存器
+读"要经过 `@REG` 全局变量，SSA 链在那里断了，值级看不到后续读了哪些位。
+
+这个桥是几个大需求链的放大器：`setcc %r11b` 只写低字节、后面 `and %r11d,%r8d` 读整
+寄存器时，寄存器级只擦 8 位、值级却已经把 32 位全要了，于是 `0xFFFFFF00` 一路记到函数
+入口（hexx64 上 R10/R11 各 478/487 个函数的链，见 logs/20261119-02）。同层还有两个
+放大器：`icmp` 操作数无条件按满宽 seed；`valueDemand` 对"不在 map 里"的值默认返回全 1
+（`RegisterSummaryRewrite.cpp:387`）。
+
+改的方向：把寄存器级的按位 liveness 反馈给值级种子（不再满宽）；种子完整之后，
+`valueDemand` 的默认值才能从全 1 改成 0。
+
 ## 11. 主线总结
 
 | 代 | 时间 | 和前一代比，流程上多了/改了/删了什么 | 为什么改 | 改完又暴露的问题 |
@@ -540,9 +572,11 @@ Analyzer::run()
 - 阶段 1（已完成，只诊断）：`computeUsedInputs()` + `reportUnobservableInputs()`
   打印每个寄存器的 `read_entry_functions`（读过入口、但没人观察的函数数）和
   `cuttable_callsites`（callee 读了没人用的入口 ⇒ 调用点不必准备值的调用点数）。
-- 阶段 2（未做）：用 `usedInputs` 过滤 `ReadEntry`，同时削减
-  `applyBackwardCallDemand` 里的 `entryNeeds`。预期 hexx64 的 211 个 ABI 未定义位
-  整体消失（那批槽本来就是这条链的尾巴），DF/R9/R8 几条同类大链也会缩。
+- 阶段 2（未做，目标已修正）：原先预期"过滤 `ReadEntry` 能让 hexx64 的 211 个 ABI
+  未定义位消失"——**这个预期是错的**。那批位实际是 p-code 重复读（`pcmpeqd` 自比较）
+  造成的，已由读 CSE 修掉（211 → 0）；DF 那条链也已按 ABI 边界规则单独修掉（见 8.1）。
+  可观察性过滤真正能剪的是另一批：报告里 RDI 144、RAX 181、RSI 38 个
+  `cuttable_callsites`（各自的 `read_entry_functions` 见报告）。
 - 阶段 3（可选）：残留的死形参/死返回槽再按 DAE 式裁剪。
 
 ## 12. 已知边界与押后项
