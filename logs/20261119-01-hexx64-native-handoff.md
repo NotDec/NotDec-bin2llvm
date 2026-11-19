@@ -154,6 +154,12 @@ override 文件里定义同名同签名的函数体即可；产物挂 `!notdec.o
   qfree 66、getinf 15、get_tinfo_property 11、getinf_flag 9、clear_tinfo_t 9、
   qvector_reserve 7、_ZdlPv 6、log2ceil 6、lexcompare_tinfo 6、cleanup_argloc 6。
 - 二进制里 double 返回后 XMM0 高 64 位是 ABI 未定义，不能凭空补。
+- **2026-11-19 晚更正**：查了汇编——这个 .so 没有任何导出函数，`FUN_29a670`
+  就是 `jmp qfree@plt`，而它的调用者调完之后根本没读 XMM0；1038 次 i128 取值里
+  1037 次是纯透传、唯一一次本地使用传进的形参也没被用；374 个带 ZMM0 需求槽的
+  函数里 352 个 pre-RE 体里连 ZMM0 都没出现。所以这批值是**人造值流**（槽按整个
+  128 位单元建 + 需求沿返回槽透传且成环），不是"二进制真读了 ABI 未定义位"。
+  标记本身没错，但要根治得改需求分析/槽宽。详见 20261119-02 的"更正"一节。
 - **2026-11-19 更新（方向已纠正）**：这批不再是 unknown，而是单独的
   **ABI 未定义位**类别：值仍然是 `notdec.unknown.<ty>()`，但挂
   `!notdec.abi_undefined` 标记 + `reason=abi_undefined_bits`，审计和指标把它
