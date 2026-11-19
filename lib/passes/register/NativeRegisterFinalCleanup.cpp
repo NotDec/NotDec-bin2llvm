@@ -714,6 +714,13 @@ countRemainingUnknownValues(llvm::Module &module) {
       if (callee == nullptr || !isOpaqueUnknownHelperName(callee->getName())) {
         continue;
       }
+      // ABI 未定义位（!notdec.abi_undefined）不是建模缺口：它们记录的是"二进制
+      // 里这几位本来就没有约定值"，和"我们不知道值"分开统计（见
+      // logs/20261119-02-abi-undefined-bits-plan.md）。审计里由
+      // NativeRegisterValueSourceAudit::AbiUndefinedValues 单独计数。
+      if (call->getMetadata("notdec.abi_undefined") != nullptr) {
+        continue;
+      }
       std::string reason = "unknown";
       std::string calleeName;
       std::string registerName;

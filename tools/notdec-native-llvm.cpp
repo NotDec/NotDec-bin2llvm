@@ -67,6 +67,8 @@ struct CliOptions {
   std::string OutputPath;
   std::string SummaryJsonPath;
   std::string RegisterSSAWarningPath;
+  // 机器可读的指标输出（unknown/ABI 未定义位/裸读/poison/规模/verify）。
+  std::string MetricsJsonPath;
   // 改变 module 的配置全部走 --config；CLI 只负责输入、输出、诊断。
   std::string ConfigPath;
   bool HasPrintConfig = false;
@@ -111,7 +113,7 @@ void printUsage(const char *argv0) {
                "[--register-ssa-warning-out <path>] "
                "[--config <pipeline.json>] "
                "[--dump-stages <dir>] "
-               "[--manifest-out <path>] "
+               "[--manifest-out <path>] [--metrics-json <path>] "
                "[--register-ssa-summary] "
                "[--skip-runtime] "
                "[--native-decode-mode gtirb|internal] [--gtirb <path>] "
@@ -237,6 +239,8 @@ std::optional<CliOptions> parseArgs(int argc, char **argv) {
       options.DumpStagesDir = std::move(value);
     } else if (flag == "--manifest-out") {
       options.ManifestPath = std::move(value);
+    } else if (flag == "--metrics-json") {
+      options.MetricsJsonPath = std::move(value);
     } else if (flag == "--native-decode-mode") {
       if (value == "gtirb") {
         options.DecodeMode = notdec::bin2llvm::NativeDecodeMode::Gtirb;
@@ -608,6 +612,7 @@ void reportRemainingUnknownValues(llvm::Module &module,
             << " boundary_register_reads=" << audit.BoundaryRegisterReads
             << " partial_write_helpers=" << audit.PartialWriteHelpers
             << " clobber_placeholders=" << audit.ClobberPlaceholders
+            << " abi_undefined_values=" << audit.AbiUndefinedValues
             << " unknowns=" << auditUnknowns;
   for (const auto &[reason, count] : audit.UnknownValuesByReason) {
     std::cerr << " " << reason << "=" << count;
@@ -1037,8 +1042,212 @@ std::unique_ptr<llvm::Module> buildConfirmedModule(
   return module;
 }
 
-int writeModule(const llvm::Module &module, const std::string &outputPath) {
-  std::error_code errorCode;
+// --- 指标输出 --------------------------------------------------------------
+//
+// 把"这一轮到底还剩多少洞"变成机器可读的一段数据：按 reason/function/callee
+// 的 unknown 计数、ABI 未定义位（!notdec.abi_undefined，不算建模缺口）、裸
+// 寄存器读、poison、模块规模和 verify 结果。配合 scripts/native-metrics-run.sh
+// 做配置矩阵对比，避免每轮实验都用临时 grep 统计（口径会漂，主次会看错）。
+std::optional<std::string> metadataField(const llvm::MDNode *node,
+                                         llvm::StringRef key) {
+  if (node == nullptr) {
+    return std::nullopt;
+  }
+  std::string prefix = (key + "=").str();
+  for (const llvm::MDOperand &operand : node->operands()) {
+    auto *text = llvm::dyn_cast_or_null<llvm::MDString>(operand.get());
+    if (text == nullptr) {
+      continue;
+    }
+    llvm::StringRef value = text->getString();
+    if (value.starts_with(prefix)) {
+      return value.drop_front(prefix.size()).str();
+    }
+  }
+  return std::nullopt;
+}
+
+void writeJsonCountMap(std::ostream &output,
+                       const std::map<std::string, uint64_t> &counts,
+                       const std::string &indent) {
+  if (counts.empty()) {
+    output << "{}";
+    return;
+  }
+  output << "{\n";
+  bool first = true;
+  for (const auto &[key, count] : counts) {
+    output << (first ? "" : ",\n");
+    output << indent << "  \"" << jsonEscape(key) << "\": " << count;
+    first = false;
+  }
+  output << "\n" << indent << "}";
+}
+
+struct MetricsJsonCounts {
+  uint64_t UnknownCalls = 0;
+  uint64_t AbiUndefinedCalls = 0;
+  uint64_t RegisterVarargUnknownCalls = 0;
+  uint64_t PoisonOperandInstructions = 0;
+  std::set<const llvm::MDNode *> UnknownSources;
+  // 同一个 !notdec.unknown.source 节点常被多个 unknown 调用引用，所以按
+  // reason 统计时同时给 calls 和 sources 两个口径（交接文档里的表用的是 sources）。
+  std::map<const llvm::MDNode *, std::string> SourceReason;
+  std::map<std::string, uint64_t> UnknownByReason;
+  std::map<std::string, uint64_t> UnknownByFunction;
+  std::map<std::string, uint64_t> UnknownByCallee;
+  std::map<std::string, uint64_t> AbiUndefinedByCallee;
+};
+
+MetricsJsonCounts collectMetricsJsonCounts(llvm::Module &module) {
+  MetricsJsonCounts counts;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        for (const llvm::Use &operand : instruction.operands()) {
+          if (llvm::isa<llvm::PoisonValue>(operand.get())) {
+            ++counts.PoisonOperandInstructions;
+            break;
+          }
+        }
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        llvm::Function *callee = call->getCalledFunction();
+        if (callee == nullptr) {
+          continue;
+        }
+        llvm::StringRef name = callee->getName();
+        if (name.starts_with("notdec.register.vararg_unknown.")) {
+          ++counts.RegisterVarargUnknownCalls;
+          continue;
+        }
+        if (!name.starts_with("notdec.unknown.")) {
+          continue;
+        }
+        const llvm::MDNode *source = call->getMetadata("notdec.unknown.source");
+        if (call->getMetadata("notdec.abi_undefined") != nullptr) {
+          ++counts.AbiUndefinedCalls;
+          ++counts.AbiUndefinedByCallee[metadataField(source, "callee")
+                                           .value_or("")];
+          continue;
+        }
+        std::string reason =
+            metadataField(source, "reason").value_or("no_reason");
+        if (source != nullptr) {
+          counts.UnknownSources.insert(source);
+          counts.SourceReason.emplace(source, reason);
+        }
+        ++counts.UnknownCalls;
+        ++counts.UnknownByReason[reason];
+        ++counts.UnknownByFunction[function.getName().str()];
+        ++counts.UnknownByCallee[metadataField(source, "callee").value_or("")];
+      }
+    }
+  }
+  return counts;
+}
+
+bool writeMetricsJson(llvm::Module &module, const std::string &path,
+                      const std::string &inputPath,
+                      const notdec::bin2llvm::NativeConfig &config,
+                      bool abiForAllFunctions) {
+  std::ofstream output(path);
+  if (!output) {
+    std::cerr << "failed to open metrics json: " << path << '\n';
+    return false;
+  }
+
+  MetricsJsonCounts counts = collectMetricsJsonCounts(module);
+  notdec::bin2llvm::NativeRegisterValueSourceAudit audit =
+      notdec::bin2llvm::auditNativeRegisterValueSources(module,
+                                                        abiForAllFunctions);
+
+  uint64_t definitions = 0;
+  uint64_t declarations = 0;
+  uint64_t blocks = 0;
+  uint64_t instructions = 0;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      ++declarations;
+      continue;
+    }
+    ++definitions;
+    blocks += function.size();
+    instructions += function.getInstructionCount();
+  }
+
+  std::string verifyMessage;
+  llvm::raw_string_ostream verifyStream(verifyMessage);
+  bool verified = !llvm::verifyModule(module, &verifyStream);
+
+  output << "{\n";
+  output << "  \"schema_version\": 1,\n";
+  output << "  \"input\": \"" << jsonEscape(inputPath) << "\",\n";
+  output << "  \"config\": \"" << jsonEscape(config.SourcePath) << "\",\n";
+  output << "  \"abi_for_all_functions\": "
+         << (abiForAllFunctions ? "true" : "false") << ",\n";
+  output << "  \"stages\": [";
+  bool firstStage = true;
+  for (const notdec::bin2llvm::NativeStageConfig &stage : config.Pipeline) {
+    output << (firstStage ? "" : ", ") << "\"" << jsonEscape(stage.Name)
+           << "\"";
+    firstStage = false;
+  }
+  output << "],\n";
+  output << "  \"module\": {\n";
+  output << "    \"definitions\": " << definitions << ",\n";
+  output << "    \"declarations\": " << declarations << ",\n";
+  output << "    \"globals\": " << module.global_size() << ",\n";
+  output << "    \"blocks\": " << blocks << ",\n";
+  output << "    \"instructions\": " << instructions << "\n";
+  output << "  },\n";
+  std::map<std::string, uint64_t> sourcesByReason;
+  for (const auto &[node, reason] : counts.SourceReason) {
+    (void)node;
+    ++sourcesByReason[reason];
+  }
+
+  output << "  \"unknown\": {\n";
+  output << "    \"calls\": " << counts.UnknownCalls << ",\n";
+  output << "    \"sources\": " << counts.UnknownSources.size() << ",\n";
+  output << "    \"register_vararg_calls\": "
+         << counts.RegisterVarargUnknownCalls << ",\n";
+  output << "    \"by_reason\": ";
+  writeJsonCountMap(output, counts.UnknownByReason, "    ");
+  output << ",\n    \"sources_by_reason\": ";
+  writeJsonCountMap(output, sourcesByReason, "    ");
+  output << ",\n    \"by_function\": ";
+  writeJsonCountMap(output, counts.UnknownByFunction, "    ");
+  output << ",\n    \"by_callee\": ";
+  writeJsonCountMap(output, counts.UnknownByCallee, "    ");
+  output << "\n  },\n";
+  output << "  \"abi_undefined\": {\n";
+  output << "    \"calls\": " << counts.AbiUndefinedCalls << ",\n";
+  output << "    \"by_callee\": ";
+  writeJsonCountMap(output, counts.AbiUndefinedByCallee, "    ");
+  output << "\n  },\n";
+  output << "  \"poison_operand_instructions\": "
+         << counts.PoisonOperandInstructions << ",\n";
+  output << "  \"register_reads\": {\n";
+  output << "    \"local\": " << audit.LocalRegisterReads << ",\n";
+  output << "    \"boundary\": " << audit.BoundaryRegisterReads << ",\n";
+  output << "    \"partial_write_helpers\": " << audit.PartialWriteHelpers
+         << ",\n";
+  output << "    \"clobber_placeholders\": " << audit.ClobberPlaceholders
+         << "\n";
+  output << "  },\n";
+  output << "  \"verify\": {\"ok\": " << (verified ? "true" : "false")
+         << ", \"error\": \"" << jsonEscape(verifyMessage) << "\"}\n";
+  output << "}\n";
+  return true;
+}
+
+int writeModule(const llvm::Module &module, const std::string &outputPath) {  std::error_code errorCode;
   llvm::raw_fd_ostream output(outputPath, errorCode);
   if (errorCode) {
     std::cerr << "failed to open output file: " << outputPath << ": "
@@ -1207,6 +1416,12 @@ int main(int argc, char **argv) {
       }
       if (options->PrintRegisterSSASummary) {
         reportRemainingUnknownValues(*module, pipeline.AbiForAllFunctions);
+      }
+      if (!options->MetricsJsonPath.empty() &&
+          !writeMetricsJson(*module, options->MetricsJsonPath,
+                            options->ElfPath, config,
+                            pipeline.AbiForAllFunctions)) {
+        return 1;
       }
       return writeModule(*module, options->OutputPath);
     }
@@ -1400,6 +1615,12 @@ int main(int argc, char **argv) {
     }
     if (options->PrintRegisterSSASummary) {
       reportRemainingUnknownValues(*module, pipeline.AbiForAllFunctions);
+    }
+    if (!options->MetricsJsonPath.empty() &&
+        !writeMetricsJson(*module, options->MetricsJsonPath,
+                          options->ElfPath, config,
+                          pipeline.AbiForAllFunctions)) {
+      return 1;
     }
 
     return writeModule(*module, options->OutputPath);

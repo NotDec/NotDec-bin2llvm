@@ -74,6 +74,44 @@ llvm::Value *unknownValueBefore(llvm::Instruction &insertBefore,
   return unknownValueAt(builder, type, name);
 }
 
+void attachAbiUndefinedValueMetadata(llvm::Value *value,
+                                     llvm::StringRef functionName,
+                                     llvm::StringRef calleeName,
+                                     llvm::StringRef registerName,
+                                     unsigned slotBits, unsigned unitBits,
+                                     llvm::StringRef abiKind) {
+  auto *inst = llvm::dyn_cast_or_null<llvm::Instruction>(value);
+  if (inst == nullptr) {
+    return;
+  }
+  llvm::LLVMContext &context = inst->getContext();
+  std::string detail = "slot_bits=" + std::to_string(slotBits) +
+                       ",unit_bits=" + std::to_string(unitBits) +
+                       ",abi=" + abiKind.str();
+  std::vector<llvm::Metadata *> source{
+      llvm::MDString::get(context, "reason=abi_undefined_bits"),
+      llvm::MDString::get(context, "function=" + functionName.str()),
+      llvm::MDString::get(context, "callee=" + calleeName.str()),
+      llvm::MDString::get(context, "register=" + registerName.str()),
+      llvm::MDString::get(context, "kind=abi_undefined"),
+      llvm::MDString::get(context, "detail=" + detail),
+  };
+  inst->setMetadata("notdec.unknown.source",
+                    llvm::MDNode::get(context, source));
+  // 单独的标记元数据：指标和审计先用它分流（不看 reason 字符串），也方便在
+  // 产物里 grep "!notdec.abi_undefined" 直接盘点这批值。
+  std::vector<llvm::Metadata *> marker{
+      llvm::MDString::get(context, "register=" + registerName.str()),
+      llvm::MDString::get(context, "callee=" + calleeName.str()),
+      llvm::MDString::get(context, detail),
+  };
+  inst->setMetadata("notdec.abi_undefined", llvm::MDNode::get(context, marker));
+}
+
+bool isAbiUndefinedValue(const llvm::Instruction &inst) {
+  return inst.getMetadata("notdec.abi_undefined") != nullptr;
+}
+
 llvm::Function *getOrInsertVarArgUnknownHelper(llvm::Module &module,
                                                llvm::Type *type) {
   std::string name = "notdec.register.vararg_unknown." + llvmTypeName(type);
@@ -366,6 +404,15 @@ auditRegisterValueSourcesImpl(llvm::Module &module, bool abiForAllFunctions,
         } else if (name.starts_with("notdec.register.summary_clobber.")) {
           ++audit.ClobberPlaceholders;
         } else if (isNotDecOpaqueUnknownName(name)) {
+          if (isAbiUndefinedValue(*call)) {
+            ++audit.AbiUndefinedValues;
+            ++audit.AbiUndefinedByCallee[mdField(
+                                              call->getMetadata(
+                                                  "notdec.unknown.source"),
+                                              "callee")
+                                              .value_or("")];
+            continue;
+          }
           std::string reason =
               mdField(call->getMetadata("notdec.unknown.source"), "reason")
                   .value_or("no_reason");

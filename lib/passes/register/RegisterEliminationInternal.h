@@ -366,6 +366,21 @@ void attachUnknownValueMetadata(llvm::Value *value, llvm::StringRef reason,
                                 llvm::StringRef kind = "",
                                 llvm::StringRef detail = "");
 
+// ABI 未定义位的专用标注。这些位在二进制里"有值但没有任何约定"（例如 double
+// 返回之后 XMM0 的高 64 位），和"我们不知道值"是两件事：
+//   - 值本身仍然用 notdec.unknown.<ty> 承载（保持确定性，不用 poison/undef，
+//     理由见 NotDecIntrinsics.cpp 的注释和 logs/20260927-02 计划）；
+//   - 但额外挂 !notdec.abi_undefined 标记，并把 reason 记成 abi_undefined_bits，
+//     指标/审计据此把它从 unknown 里分出来，不参与"建模缺口"的统计。
+// 使用前提：调用点确实能从 ABI 上证明这些位不属于任何返回值（例如已知 callee
+// 的返回槽只有 64 位浮点，而请求的位段整个落在槽之上）。
+void attachAbiUndefinedValueMetadata(llvm::Value *value,
+                                     llvm::StringRef functionName,
+                                     llvm::StringRef calleeName,
+                                     llvm::StringRef registerName,
+                                     unsigned slotBits, unsigned unitBits,
+                                     llvm::StringRef abiKind);
+
 llvm::Value *unknownValueBefore(llvm::Instruction &insertBefore,
                                 llvm::Type *type, llvm::Twine name);
 

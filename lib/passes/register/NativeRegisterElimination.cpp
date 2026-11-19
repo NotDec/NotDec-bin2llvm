@@ -108,6 +108,40 @@ uint64_t replacePoisonRangeExtracts(llvm::Module &module) {
 }
 } // namespace
 
+namespace {
+// ABI 未定义位是在"签名重写之后的清理遍"里补出来的，而 summary.Functions 里
+// 的按函数副本在重写前就固定了，清理遍用的又是一个临时 summary。这里按最终
+// IR 重新数一遍，避免 abi_undefined_returns 永远显示 0。
+void refreshAbiUndefinedReturnCounters(
+    llvm::Module &module, NativeRegisterEliminationSummary &summary) {
+  std::map<std::string, uint64_t> byName;
+  for (llvm::Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    uint64_t count = 0;
+    for (llvm::Instruction &inst : llvm::instructions(function)) {
+      if (inst.getMetadata("notdec.abi_undefined") != nullptr) {
+        ++count;
+      }
+    }
+    if (count != 0) {
+      byName[function.getName().str()] = count;
+    }
+  }
+  uint64_t total = 0;
+  for (NativeRegisterEliminationFunctionSummary &fn : summary.Functions) {
+    auto it = byName.find(fn.FunctionName);
+    fn.AbiUndefinedReturnValues = it == byName.end() ? 0 : it->second;
+    if (it != byName.end()) {
+      byName.erase(it);
+    }
+    total += fn.AbiUndefinedReturnValues;
+  }
+  summary.AbiUndefinedReturnValues = total;
+}
+} // namespace
+
 NativeRegisterEliminationSummary
 runNativeRegisterElimination(llvm::Module &module,
                             const NativeRegisterEliminationOptions &options) {
@@ -338,6 +372,7 @@ runNativeRegisterElimination(llvm::Module &module,
   // post-rewrite peephole 里被折成 poison，再顺着 select/phi 流到 ret/br/store。
   // 这里统一换成带归因的 unknown：表示层兜底，代价是这些位段变成未知值。
   replacePoisonRangeExtracts(module);
+  refreshAbiUndefinedReturnCounters(module, summary);
   summary.FunctionsSeen = summary.Functions.size();
   summary.Warnings = collectRemainingCallValueWarnings(module);
   summary.Warnings.insert(summary.Warnings.end(),
@@ -362,6 +397,7 @@ void printNativeRegisterEliminationSummary(
      << " entry_range_rejected_reads=" << summary.EntryRangeRejectedReads
      << " call_returns=" << summary.CallReturnValues
      << " call_clobbers=" << summary.CallClobberValues
+     << " abi_undefined_returns=" << summary.AbiUndefinedReturnValues
      << " call_arg_stores_marked=" << summary.CallArgStoresMarked
      << " calls_rewritten=" << summary.CallsRewritten
      << " functions_rewritten=" << summary.FunctionsRewritten
@@ -421,6 +457,7 @@ void printNativeRegisterEliminationSummary(
        << " entry_range_rejected_reads=" << function.EntryRangeRejectedReads
        << " call_returns=" << function.CallReturnValues
        << " call_clobbers=" << function.CallClobberValues
+       << " abi_undefined_returns=" << function.AbiUndefinedReturnValues
        << " call_arg_stores_marked=" << function.CallArgStoresMarked
        << " calls_rewritten=" << function.CallsRewritten
        << " functions_rewritten=" << function.FunctionsRewritten

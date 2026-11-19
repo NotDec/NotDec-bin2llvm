@@ -90,6 +90,8 @@ uint64_t eraseUnusedRegisterHelperDeclarations(llvm::Module &module);
 // reason/callee/register 归因（key 形如 "call_effect_mixed:FUN_17e10:R9"）。
 // 只在 tool 的最后一次 InstCombine + eraseDeadUnknownValueCalls 之后调用，
 // 用来回答"剩下的 unknown 到底是什么"，而不是只报一个总数。
+// 带 !notdec.abi_undefined 的值不参与统计（它们是 ABI 未定义位，不是建模缺口），
+// 单独由 NativeRegisterValueSourceAudit::AbiUndefinedValues 计数。
 std::map<std::string, uint64_t>
 countRemainingUnknownValues(llvm::Module &module);
 

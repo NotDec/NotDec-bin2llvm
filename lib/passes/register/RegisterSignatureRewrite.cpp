@@ -15,6 +15,7 @@ void addFunctionSummary(NativeRegisterEliminationSummary &total,
   total.EntryRangeRejectedReads += fn.EntryRangeRejectedReads;
   total.CallReturnValues += fn.CallReturnValues;
   total.CallClobberValues += fn.CallClobberValues;
+  total.AbiUndefinedReturnValues += fn.AbiUndefinedReturnValues;
   total.CallArgStoresMarked += fn.CallArgStoresMarked;
   total.CallsRewritten += fn.CallsRewritten;
   total.FunctionsRewritten += fn.FunctionsRewritten;

@@ -55,6 +55,9 @@ struct NativeRegisterEliminationFunctionSummary {
   uint64_t EntryRangeRejectedReads = 0;
   uint64_t CallReturnValues = 0;
   uint64_t CallClobberValues = 0;
+  // 调用点补的"ABI 未定义位"值（!notdec.abi_undefined）。和 unknown 分开计，
+  // 它们不是建模缺口，而是二进制里本来就没有约定的位。
+  uint64_t AbiUndefinedReturnValues = 0;
   uint64_t CallArgStoresMarked = 0;
   uint64_t CallsRewritten = 0;
   uint64_t FunctionsRewritten = 0;
@@ -104,6 +107,9 @@ struct NativeRegisterEliminationSummary {
   uint64_t EntryRangeRejectedReads = 0;
   uint64_t CallReturnValues = 0;
   uint64_t CallClobberValues = 0;
+  // 调用点补的"ABI 未定义位"值（!notdec.abi_undefined）。和 unknown 分开计，
+  // 它们不是建模缺口，而是二进制里本来就没有约定的位。
+  uint64_t AbiUndefinedReturnValues = 0;
   uint64_t CallArgStoresMarked = 0;
   uint64_t CallsRewritten = 0;
   uint64_t FunctionsRewritten = 0;
@@ -146,6 +152,11 @@ struct NativeRegisterValueSourceAudit {
   uint64_t BoundaryRegisterReads = 0;
   uint64_t PartialWriteHelpers = 0;
   uint64_t ClobberPlaceholders = 0;
+  // ABI 未定义位（!notdec.abi_undefined）单独计数：它们不是"建模缺口"，而是
+  // 二进制里本来就没有约定值的位（例如 double 返回后 XMM0 的高半）。
+  // UnknownValuesByReason 只统计真正的未知，方便按 I2 不变量收敛。
+  uint64_t AbiUndefinedValues = 0;
+  std::map<std::string, uint64_t> AbiUndefinedByCallee;
   std::map<std::string, uint64_t> UnknownValuesByReason;
 };
 

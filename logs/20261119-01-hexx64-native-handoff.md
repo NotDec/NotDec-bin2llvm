@@ -43,21 +43,32 @@ cd /tmp/hexx64
 
 | 配置 | poison | `notdec.unknown` 调用数 | IR 大小 |
 |------|--------|--------------------------|---------|
-| 默认（native44） | 6 | 728 | 88.1 MB |
+| 默认（native44，旧口径） | 6 | 728 | 88.1 MB |
+| **默认（native53，新口径）** | 4 | **517**（另有 211 个 ABI 未定义位） | 88.1 MB |
 | `abi_for_all_functions: true`（native47） | 2 | 712 | 83.2 MB |
-| qfree 钉 `RAX:64 + XMM0:128`（native51） | 6 | 662 | 88.2 MB |
-| 两者组合（native52） | 2 | **646** | 83.2 MB |
+| `abi_for_all_functions: true`（新口径，`/tmp/hexx64/metrics/abi.json`） | 2 | **501**（另有 211 个 ABI 未定义位） | 83.2 MB |
+| qfree 钉 `RAX:64 + XMM0:128`（native51） | 6 | 662（旧口径；其中一批是造值） | 88.2 MB |
+| 两者组合（native52） | 2 | **646**（旧口径，已否） | 83.2 MB |
+
+> 2026-11-19 起口径变了：`notdec.unknown` 里"ABI 未定义位"（`!notdec.abi_undefined`）
+> 单独计数，不再算建模缺口。新旧对比只在新口径内部做；poison 用
+> `--metrics-json` 的 `poison_operand_instructions`。
 
 默认配置下 unknown 的归因分布：
 
-| reason | 数量 |
-|--------|------|
-| `return_binding_uses_clobber_value` | 314 |
-| `range_return_rewrite_missing_value` | 157 |
-| `poison_call_argument` | 73 |
-| `call_arg_rewrite_missing_binding` | 5 |
-| `poison_aggregate_field` | 4 |
-| `call_effect_mixed` | 2 |
+| reason | 源节点（旧口径） | 调用点（新口径） |
+|--------|------|------|
+| `return_binding_uses_clobber_value` | 314 | 314 |
+| `range_return_rewrite_missing_value` | 157 | 1（其余 211 个已归 ABI 未定义位） |
+| `poison_call_argument` | 73 | 176 |
+| `call_arg_rewrite_missing_binding` | 5 | 19 |
+| `poison_aggregate_field` | 4 | 4 |
+| `call_effect_mixed` | 2 | 2 |
+| `poison_range_extract_source` | — | 1 |
+
+> 一个 `!notdec.unknown.source` 节点常被多个 `notdec.unknown` 调用引用，所以
+> "源节点"和"调用点"是两个口径（旧表用的是前者）。新口径见
+> `--metrics-json` 的 `unknown.by_reason` / `unknown.sources_by_reason`。
 
 产物都在 `/tmp/hexx64/native*.ll`；配置和 override 文件在 `/tmp/hexx64/exp/`。
 
@@ -142,8 +153,15 @@ override 文件里定义同名同签名的函数体即可；产物挂 `!notdec.o
 - 全是 ZMM0 128 位槽，值来源只给 64 位（double 返回）。callee 前几名：
   qfree 66、getinf 15、get_tinfo_property 11、getinf_flag 9、clear_tinfo_t 9、
   qvector_reserve 7、_ZdlPv 6、log2ceil 6、lexcompare_tinfo 6、cleanup_argloc 6。
-- 二进制里 double 返回后 XMM0 高 64 位是 ABI 未定义，不能凭空补；正确做法是给
-  这些 callee 声明真实的多寄存器返回（qfree 已示范：157 → 115）。
+- 二进制里 double 返回后 XMM0 高 64 位是 ABI 未定义，不能凭空补。
+- **2026-11-19 更新（方向已纠正）**：这批不再是 unknown，而是单独的
+  **ABI 未定义位**类别：值仍然是 `notdec.unknown.<ty>()`，但挂
+  `!notdec.abi_undefined` 标记 + `reason=abi_undefined_bits`，审计和指标把它
+  从"建模缺口"里分出来。触发条件：已知/声明的 callee 返回槽是 64 位标量浮点
+  （float/double），而调用点请求的位段整个落在槽之上。
+- **被否方案**：用 `functions[].signature.returns` 给 callee 声明 `XMM0:128`
+  （native51/52 的 qfree pin）。它把 42 个 unknown 换成"已定义的高 64 位"，
+  指标好看但语义是造值；现在有了 ABI 未定义表示，这类声明既不需要也不应该写。
 
 ### 5.3 `poison_call_argument`（73 → abi_for_all 后 90）
 
@@ -158,18 +176,22 @@ override 文件里定义同名同签名的函数体即可；产物挂 `!notdec.o
 
 ## 6. 接下来该做什么（建议优先级）
 
-1. **P0：给剩余 class B callee 补 `returns` 声明**（收益最直接、不动代码）。
-   需要真实签名：从 IDA SDK 头文件/文档确认每个函数在哪些寄存器返回值；先用
-   asm 观察调用点之后读了哪些寄存器，再对照 callee 的 `ret` 路径。每加一个 callee
-   重跑全量，记录 unknown / poison / IR 大小（native52 = 646 是当前最好）。
+1. ~~**P0：给剩余 class B callee 补 `returns` 声明**~~ —— **已否**（见 5.2）。
+   声明更宽的返回槽等于给 ABI 未定义的位造值；正确做法是 ABI 未定义位表示，
+   已在 `logs/20261119-02-abi-undefined-bits-plan.md` 落地。
+   仍然成立的窄版本：只有当 asm 证据表明 callee **真的**在多个寄存器返回值
+   （而不是"我们想要一个值"）时，才用 `returns` 声明；写之前先用
+   `--metrics-json` 看 `abi_undefined.by_callee` 里还有多少，别用 unknown 数
+   当唯一目标。
 2. **P1：class A 的分函数约定范围**。`functions[].abi: "external"` 已经可用；
    对 class A 高发函数（`FUN_29a670`、`FUN_29a660`、`FUN_2a9cf0`、`FUN_2e4e70`、
    `FUN_195a70`…）逐个钉，或调研 `call_effect_mixed` 的 59 处（可能是可修的
    effect 分类问题，而不是用户信息缺失）。
-3. **P2：工程化"提升-观察-调 override"循环**：给工具加一个 `--metrics-json`
-   输出（按 reason 的 unknown 计数、poison、IR 大小、verify 结果），方便批量对比
-   不同 config；顺手给 `external_prototypes` 里解析不到的寄存器名加 warning
-   （现在会静默退化成"未知外部"）。
+3. ~~**P2：工程化"提升-观察-调 override"循环**~~ —— **已完成**（2026-11-19）：
+   `--metrics-json` 输出 unknown（按 reason/function/callee）、ABI 未定义位、
+   poison、裸寄存器读、模块规模、verify；`scripts/native-metrics-matrix.sh`
+   一条命令跑配置矩阵并打印对比表。`external_prototypes` 里解析不到的寄存器名
+   仍然静默退化，warn 还没加。
 4. **P3：小类**：`call_arg_rewrite_missing_binding`（栈参数绑定）、
    `poison_aggregate_field`（常量聚合基座）、`call_effect_mixed`。
 5. **P4：文档**：把"用户 override 工作流"（如何写 prototypes / functions[].signature

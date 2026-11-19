@@ -1107,6 +1107,61 @@ bool FunctionBuilder::isEntryInputValue(llvm::Value *value) {
     return false;
   }
 
+namespace {
+
+// "调用点请求的这几位，ABI 根本没有定义过"的判定结果。
+struct AbiUndefinedReturnInfo {
+  unsigned SlotBits = 0;
+  unsigned UnitBits = 0;
+  llvm::StringRef AbiKind;
+};
+
+// 只有"没有函数体的 callee"才有 ABI 未定义的位：内部 callee 的返回槽是我们按
+// 需求自己建的，缺位属于建模缺口，必须继续算 unknown（见 logs/20261119-02）。
+//
+// SysV x86-64 的浮点返回只有低 32/64 位有意义（float/double）；高半在二进制里
+// 是调用前残留的位，没有任何约定。当前只在"请求位段整个落在窄浮点返回槽之上"
+// 时下这个结论，部分重叠的位段保守地继续报 unknown。
+std::optional<AbiUndefinedReturnInfo>
+abiUndefinedReturnRange(const SignatureShape &shape, const llvm::CallBase &call,
+                        const RegisterRangeKey &range) {
+    llvm::Function *callee = call.getCalledFunction();
+    if (callee == nullptr || !callee->isDeclaration()) {
+      return std::nullopt;
+    }
+    for (const NativeSignatureSlot &slot : shape.Returns) {
+      if (slot.Unit == nullptr || slot.Unit->Global != range.Global) {
+        continue;
+      }
+      if (slot.Kind != NativeSignatureSlotKind::FloatRegister) {
+        continue;
+      }
+      llvm::Type *slotType = slot.LlvmType;
+      if (slotType == nullptr ||
+          (!slotType->isFloatTy() && !slotType->isDoubleTy())) {
+        continue;
+      }
+      if (slot.OffsetBits != 0 || slot.SizeBits == 0) {
+        continue;
+      }
+      unsigned unitBits = 0;
+      if (auto *unitType =
+              llvm::dyn_cast<llvm::IntegerType>(slot.Unit->Global->getValueType())) {
+        unitBits = unitType->getBitWidth();
+      }
+      if (unitBits == 0 || slot.SizeBits >= unitBits) {
+        continue;
+      }
+      if (range.BitOffset < slot.SizeBits) {
+        continue;
+      }
+      return AbiUndefinedReturnInfo{slot.SizeBits, unitBits, "float_return"};
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
 llvm::Value *FunctionBuilder::callRangeValue(llvm::CallBase &call,
                               const RegisterRangeKey &range) {
     const RegisterUnit *unit = unitForRange(range);
@@ -1147,6 +1202,21 @@ llvm::Value *FunctionBuilder::callRangeValue(llvm::CallBase &call,
         llvm::Value *value = extractReturnRange(builder, *shape, call, range);
         if (value != nullptr && value->getType() == rangeType(range)) {
           CallRangeValues.emplace(key, value);
+          return value;
+        }
+        // 落在"ABI 只定义了更窄浮点返回"之上的位：这些位在二进制里没有约定值，
+        // 不能用 unknown 记账（那会把 ABI 事实算成建模缺口），也不能声明成更宽的
+        // 返回槽去造一个值（旧做法，见 logs/20261119-02）。改用 ABI 未定义标注。
+        if (std::optional<AbiUndefinedReturnInfo> abi =
+                abiUndefinedReturnRange(*shape, call, range)) {
+          llvm::Value *value =
+              unknownValueAt(builder, rangeType(range),
+                             unit->Name + ".abi_undefined");
+          attachAbiUndefinedValueMetadata(
+              value, Function.getName(), calleeNameForWarning(call),
+              unit->Name, abi->SlotBits, abi->UnitBits, abi->AbiKind);
+          CallRangeValues.emplace(key, value);
+          ++Summary.AbiUndefinedReturnValues;
           return value;
         }
       }

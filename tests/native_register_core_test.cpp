@@ -6857,6 +6857,84 @@ bool testMixedCallBoundaryAttributesUnknownToCallee() {
                   "module failed verifier after unknown attribution test");
 }
 
+
+// ABI 未定义位的记账口径：带 !notdec.abi_undefined 的值不能算进"建模缺口"，
+// 否则修 ABI 事实会被当成修 bug，指标会朝错的方向优化。
+bool testAbiUndefinedValuesAreAuditedSeparately() {
+  llvm::LLVMContext context;
+  llvm::Module module("summary-ssa-abi-undefined-audit", context);
+  llvm::Type *i64Type = llvm::Type::getInt64Ty(context);
+  auto *sink = new llvm::GlobalVariable(
+      module, i64Type, false, llvm::GlobalValue::ExternalLinkage, nullptr,
+      "sink");
+  llvm::FunctionCallee unknown = module.getOrInsertFunction(
+      "notdec.unknown.i64", llvm::FunctionType::get(i64Type, {}, false));
+
+  auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(context), {});
+  llvm::Function *function = llvm::Function::Create(
+      type, llvm::GlobalValue::InternalLinkage, "audited_unknowns", module);
+  llvm::BasicBlock *entry =
+      llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry);
+  auto *gap = builder.CreateCall(unknown, {}, "gap");
+  gap->setMetadata(
+      "notdec.unknown.source",
+      llvm::MDNode::get(context,
+                        {llvm::MDString::get(
+                             context, "reason=callee_summary_missing"),
+                         llvm::MDString::get(context, "function=audited_unknowns"),
+                         llvm::MDString::get(context, "callee=some_callee")}));
+  auto *abiUndefined = builder.CreateCall(unknown, {}, "abi.undefined");
+  abiUndefined->setMetadata(
+      "notdec.unknown.source",
+      llvm::MDNode::get(context,
+                        {llvm::MDString::get(context,
+                                             "reason=abi_undefined_bits"),
+                         llvm::MDString::get(context,
+                                             "function=audited_unknowns"),
+                         llvm::MDString::get(context, "callee=double_callee"),
+                         llvm::MDString::get(context, "register=ZMM0"),
+                         llvm::MDString::get(context, "kind=abi_undefined")}));
+  abiUndefined->setMetadata(
+      "notdec.abi_undefined",
+      llvm::MDNode::get(context,
+                        {llvm::MDString::get(context, "register=ZMM0"),
+                         llvm::MDString::get(context, "callee=double_callee")}));
+  builder.CreateStore(gap, sink);
+  builder.CreateStore(abiUndefined, sink);
+  builder.CreateRetVoid();
+
+  notdec::bin2llvm::NativeRegisterValueSourceAudit audit =
+      notdec::bin2llvm::auditNativeRegisterValueSources(module);
+  std::map<std::string, uint64_t> remaining =
+      notdec::bin2llvm::countRemainingUnknownValues(module);
+
+  uint64_t countedUnknowns = 0;
+  for (const auto &[reason, count] : audit.UnknownValuesByReason) {
+    (void)reason;
+    countedUnknowns += count;
+  }
+  uint64_t countedRemaining = 0;
+  for (const auto &[key, count] : remaining) {
+    (void)key;
+    countedRemaining += count;
+  }
+
+  return expect(audit.AbiUndefinedValues == 1,
+                "audit did not isolate the abi undefined value") &&
+         expect(audit.AbiUndefinedByCallee.count("double_callee") == 1,
+                "audit lost the abi undefined callee attribution") &&
+         expect(countedUnknowns == 1,
+                "audit counted the abi undefined value as a model unknown") &&
+         expect(audit.UnknownValuesByReason.count("callee_summary_missing") == 1,
+                "audit lost the real unknown reason") &&
+         expect(remaining.count("callee_summary_missing:some_callee") == 1,
+                "remaining unknown tally lost the real unknown") &&
+         expect(countedRemaining == 1,
+                "remaining unknown tally still counts abi undefined values") &&
+         verifyOk(module, "module failed verifier after abi undefined audit test");
+}
+
 } // namespace
 
 int main() {
@@ -6893,6 +6971,7 @@ int main() {
   ok &= testKnownExternalUsesSingleIntegerReturn();
   ok &= testUnknownExternalTreatsRdxAsClobberNotReturn();
   ok &= testUnknownExternalFloatReturnPicksSingleXmmSlot();
+  ok &= testAbiUndefinedValuesAreAuditedSeparately();
   ok &= testUnknownExternalClobberArgBecomesUnknown();
   ok &= testInternalReturnDoesNotExposeExternalClobber();
   ok &= testClobberReturnPhiPreservesMixedPath();

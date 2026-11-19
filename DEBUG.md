@@ -65,6 +65,32 @@ build/bin/notdec-native-llvm --list-stages
   `--no-summary-register-residue-removal`、`--no-vararg-recovery`、`--abi-for-all-functions`、
   `--external-prototypes`）已删除，统一走 `--config`。
 
+## 2.2 指标对比（--metrics-json + 矩阵脚本）
+
+每轮实验都该用同一套口径记录"还剩多少洞"，不要临时 grep 产物（口径会漂）：
+
+```bash
+# 单个配置：把指标写到 JSON（unknown 按 reason/function/callee、ABI 未定义位、
+# poison、裸寄存器读、模块规模、verify 结果）
+build/bin/notdec-native-llvm /path/to/bin --all-confirmed --register-ssa-summary \
+  --config /tmp/pipeline.json -o /tmp/out.ll --metrics-json /tmp/out.metrics.json
+
+# 多个配置一条命令跑完并打印对比表（MATRIX 每行 <label>\t<config|->
+cat > /tmp/matrix.tsv <<'EOF2'
+default	-
+abi	/tmp/pipeline-abi.json
+EOF2
+scripts/native-metrics-matrix.sh build/bin/notdec-native-llvm /path/to/bin \
+  /tmp/matrix.tsv /tmp/metrics -- --gtirb /path/to/bin.gtirb
+```
+
+指标口径（三种洞要分开看，别混成一个数）：
+
+- `unknown.calls` —— 建模缺口/信息缺失，是要收敛的目标；
+- `abi_undefined.calls` —— ABI 未定义位（`!notdec.abi_undefined`），二进制里本来
+  就没有约定值，不算缺口，不要用声明更宽的返回槽去"消掉"它；
+- `poison_operand_instructions` —— 只应出现在 ABI 保证的死值上（如 x87 空槽）。
+
 ## 3. 当前已经跑过的样本
 
 - `memcached limit20`
