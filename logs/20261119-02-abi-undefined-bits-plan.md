@@ -119,3 +119,51 @@
 - 所以默认保持 `abi_for_all_functions: false`，需要压 unknown 时再按配置开。
   真正该动的是 `call_effect_mixed`（abi 下 2 → 59）：那是"外部 callee 的
   caller-saved 寄存器既可能是入口值又可能被改写"的建模缺口，下一轮 S3 处理。
+
+## S3：`call_effect_mixed` / `poison_call_argument` triage
+
+两个桶都查了机制和证据，**结论都不是独立 bug**：一个是调用约定范围的必然代价，
+一个是"缺载体"而不是"值错"，后者需要新特性（不是修 bug）。因此本轮不改代码。
+
+### S3.1 `call_effect_mixed`（默认 2 / abi_for_all 59）
+
+- 默认配置的 2 个都在 `FUN_326470 → FUN_2d6a40`：RDI 的上下两个 32 位各一个。
+  机制（`callEffect`）：callee 的 RDI 事实是 `MayEntry && MayNonEntry`——某些路径
+  保持入口值、某些路径改写；调用点在 RDI 之后要值，但 callee 遵守 ABI 时只有
+  RAX/XMM0 能给返回槽，RDI 拿不到载体 → `call_effect_mixed`。
+- 这 2 个值确实被用着（喂给 `%RDI.range_summary_ssa` 的 phi），不是死值。
+- abi_for_all 下 2 → 59 的原因：更多函数被强制成"遵守 ABI"，同样的模式被放大，
+  不是新 bug。**想消掉只有一条路**：让"非导出"的函数即使标成 external 也允许
+  透传返回槽（`ReturnEntryMask`）。没有做——它和 S4 的结论冲突（外部约定的意义
+  就是"签名不可改"），而且会重新引入 §5.1 那批造值风险。
+
+### S3.2 `poison_call_argument`（73 个源 / 176 个调用点）
+
+- 位置直方图（0 基 args 下标，统计 176 个未知实参）：
+  `{1:1, 2:2, 3:7, 4:55, 5:69, 6:42}`——集中在第 4/5/6 个实参，也就是
+  **变参尾部**（RCX/R8/R9/栈），不是固定参数。
+- asm 证据（`FUN_16afc0` → `FUN_cc790`，调用点在 `0x16b491`）：
+
+  ```
+  16b485: lea    0x1e2b61(%rip),%rsi   # 0x34dfed  ← IR 里的 i64 3465197
+  16b48c: mov    %rbx,%rdi
+  16b48f: xor    %eax,%eax             ← 变参的 AL 计数标记
+  16b491: call   cc790
+  ```
+
+  调用点只写了 RDI/RSI/EAX，RDX/RCX/R8/R9 全是残留值。而 IR 这边给
+  `@FUN_cc790(i64, i64, i8, ...)` 传了 7 个实参，第 5/6 个是未知。
+- 机制：这些寄存器的值 = **本函数的入口值**（函数内从没写过），但函数签名里
+  没有它们的载体（`FUN_16afc0(i64 RDI, i64 RSI, i32 RDX)`），于是调用点答不出
+  来 → poison → unknown。所以是"缺载体"，不是"值算错"。
+- **正确的修法（下一步的特性，不是 bug fix）**：把调用实参槽也当成入口需求
+  （现在只有显式 `partial_read`/`load` 才算读），给这些位加入口形参，让透传
+  沿调用链上升，最终在导出边界落成 ABI 未定义位（就是本轮新加的类别）。
+  代价：1–2 天，要改需求分析（`liveBeforeBlock`/`applyBackwardCallDemand`）
+  和签名构建；签名会变宽（每个透传寄存器一个形参）。
+- 顺带确认的两件事：
+  - 73 个源节点对 176 个调用点，是因为 poison 占位按"函数 × 类型"复用
+    （`replacePoisonCallArguments` 缓存），一个源节点会被多个调用点共用。
+  - 36/37 个变参函数带一个**没用的** `i8 %RAX.arg` 形参（SysV 的 AL 变参计数
+    被当成固定参数），每个变参调用点因此多传一个实参。但它只导致 2 个未知
+    （位置 2），当前不值得为它改签名；记在这里当清理项。

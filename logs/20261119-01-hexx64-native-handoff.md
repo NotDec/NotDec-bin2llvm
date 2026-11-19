@@ -163,16 +163,23 @@ override 文件里定义同名同签名的函数体即可；产物挂 `!notdec.o
   （native51/52 的 qfree pin）。它把 42 个 unknown 换成"已定义的高 64 位"，
   指标好看但语义是造值；现在有了 ABI 未定义表示，这类声明既不需要也不应该写。
 
-### 5.3 `poison_call_argument`（73 → abi_for_all 后 90）
+### 5.3 `poison_call_argument`（73 个源 / 176 个调用点）
 
-- 都发生在重写时还是间接调用的调用点（callee 后来才被函数指针提升解析成内部
-  变参函数），走"外部/间接"路径，poison 是 fortune 零-unknown 门槛的既定表示；
-  cleanup 时再把内部 callee 的 poison 换成 unknown。要更好只能在重写时保留候选值。
+- 都在变参尾部（位置直方图 `{1:1, 2:2, 3:7, 4:55, 5:69, 6:42}`，第 4/5/6 个实参
+  占 166 个）。asm 证据见 `logs/20261119-02-abi-undefined-bits-plan.md` S3.2：
+  调用点只写了 RDI/RSI/EAX（后者是变参 AL 计数），RCX/R8/R9 是残留值。
+- **机制已确认：缺载体，不是值错**。这些位在函数内从没被写过，值就是函数自己的
+  入口值，但签名里没有对应形参。正规修法是把调用实参槽也当入口需求、加形参让
+  透传沿调用链上升，最终在导出边界落成 ABI 未定义位（需要改需求分析，1–2 天）。
+  简单截断尾部实参不行：callee 真的会 `va_arg` 读它们。
+- 旧描述（"间接调用点 + fortune 门槛的既定表示"）不准确：abi_for_all 之后这些
+  调用点仍是直接调用，问题在实参槽没有载体。
 
 ### 5.4 小类
 
-`call_arg_rewrite_missing_binding` 5（栈参数绑定缺失）、
-`poison_aggregate_field` 4、`call_effect_mixed` 2/59（abi_for_all 后）。
+`call_arg_rewrite_missing_binding` 5 源 / 19 调用点（栈参数绑定缺失）、
+`poison_aggregate_field` 4、`call_effect_mixed` 2/59（abi_for_all 后，见 5.3 上方
+的说明：不是 bug，是外部约定下 caller-saved 寄存器没有返回通道）。
 
 ## 6. 接下来该做什么（建议优先级）
 
@@ -183,17 +190,21 @@ override 文件里定义同名同签名的函数体即可；产物挂 `!notdec.o
    （而不是"我们想要一个值"）时，才用 `returns` 声明；写之前先用
    `--metrics-json` 看 `abi_undefined.by_callee` 里还有多少，别用 unknown 数
    当唯一目标。
-2. **P1：class A 的分函数约定范围**。`functions[].abi: "external"` 已经可用；
-   对 class A 高发函数（`FUN_29a670`、`FUN_29a660`、`FUN_2a9cf0`、`FUN_2e4e70`、
-   `FUN_195a70`…）逐个钉，或调研 `call_effect_mixed` 的 59 处（可能是可修的
-   effect 分类问题，而不是用户信息缺失）。
+2. **P1：给调用实参槽补载体（当前最大的一块）**。`poison_call_argument`
+   166/176 在变参尾部，机制已确认是"函数把自己的入口寄存器透传给调用但签名没有
+   载体"（S3.2）。做法：需求分析把调用实参槽也当入口需求，逐级加形参，导出边界
+   落成 ABI 未定义位。它会同时吃掉部分 `call_arg_rewrite_missing_binding`（19）。
+   **先做这个，再谈继续压 unknown**；`call_effect_mixed`（2/59）已确认不是 bug，
+   别在它上面花时间（要消掉只能放开"非导出函数也允许透传返回槽"，和 S4 冲突）。
 3. ~~**P2：工程化"提升-观察-调 override"循环**~~ —— **已完成**（2026-11-19）：
    `--metrics-json` 输出 unknown（按 reason/function/callee）、ABI 未定义位、
    poison、裸寄存器读、模块规模、verify；`scripts/native-metrics-matrix.sh`
    一条命令跑配置矩阵并打印对比表。`external_prototypes` 里解析不到的寄存器名
    仍然静默退化，warn 还没加。
-4. **P3：小类**：`call_arg_rewrite_missing_binding`（栈参数绑定）、
-   `poison_aggregate_field`（常量聚合基座）、`call_effect_mixed`。
+4. **P3：小类**：`call_arg_rewrite_missing_binding`（栈参数绑定，19 个调用点，
+   大概率被 P1 的载体一起解决）、`poison_aggregate_field`（常量聚合基座，4）、
+   变参函数那个没用的 `i8 %RAX.arg` 形参（36/37 个函数，只影响 2 个未知，
+   纯清理项）。
 5. **P4：文档**：把"用户 override 工作流"（如何写 prototypes / functions[].signature
    / ir-override，怎么迭代、怎么验证）整理进 `docs/`，现在只在 logs 里。
 6. 每轮结束照旧：`ctest` 必须 19/19；产物用 LLVM 22 的 `llvm-as` + `opt -passes=verify`
@@ -206,6 +217,10 @@ override 文件里定义同名同签名的函数体即可；产物挂 `!notdec.o
 - 全局把 vararg 的 poison 换成 `notdec.unknown`：fortune 零-unknown 门槛。
 - 给外部 noreturn 函数做截断：指标回退（unknowns、clobber 都涨）。
 - 任何"看起来能省 unknown"的改动，先跑 fortune ctest 再跑全量。
+- 用 `functions[].signature.returns` 给 callee 造更宽的返回槽（native51/52 的
+  qfree pin）：指标好看但值是编的，2026-11-19 起用 `!notdec.abi_undefined` 代替。
+- 把变参调用点的 poison 尾部实参直接截断：callee 真的会 `va_arg` 读它们，
+  截断会把"未知值"换成"读越界"，更糟。
 
 ## 8. 关键文件
 
