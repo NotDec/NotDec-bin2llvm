@@ -554,6 +554,14 @@ private:
   std::unordered_map<std::string, llvm::Value *> Values;
   std::map<std::pair<std::string, llvm::BasicBlock *>, llvm::Value *>
       NonDominatingReadValues;
+  // 同一段 p-code 里同一寄存器位段只发射一次读。SLEIGH 的比较类指令经常把同一个
+  // varnode 读两次（`pcmpeqd %xmm0,%xmm0`、`cmp %eax,%eax` 这类自比较 idiom），
+  // 两次 partial_read 会让寄存器 summary 把"自比较"当成入口依赖（hexx64 的 385 个
+  // ZMM0 返回槽就是这么来的，见 logs/20261119-02）。寄存器写、调用、换块时失效。
+  // 只缓存寄存器读；ram 的 load 不缓存（可能被未知 store 别名）。
+  std::map<std::string, llvm::Value *> RegisterReadCache;
+  llvm::BasicBlock *RegisterReadCacheBlock = nullptr;
+
   std::unordered_map<std::string, uint64_t> SourceRamByVarnode;
   std::vector<size_t> BlockStarts;
   std::vector<size_t> BlockEnds;

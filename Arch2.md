@@ -430,6 +430,9 @@ ELF 机器码
   -> Sleigh p-code -> PcodeToLLVM                    （第 0 代）
       部分读写展开成 partial_read / partial_write    （第 5 代）
       x87 按助记符折叠 / 窗口展开                    （第 7 代）
+      同一段 p-code 内重复寄存器读 CSE               （第 9 代）
+        （写/调用/换块失效；否则 `pcmpeqd %x,%x` 这类自比较会被 summary
+          当成入口依赖，见 11.1）
   -> 加载外部原型（内置表 + JSON 覆盖）               （第 6 代）
   -> noreturn 截断（exit、__stack_chk_fail）          （第 4 代）
   -> NativeStackFrameRewrite（RSP/RBP -> alloca）     （第 4 代）
@@ -529,6 +532,11 @@ Analyzer::run()
 
 **当前状态**：
 
+- **源头已修（2026-11-19）**：不是死读，而是 `pcmpeqd %xmm0,%xmm0` 被降成两条相同的
+  `partial_read` + `icmp eq`。在 p-code 降级阶段加了同一段 p-code 内的寄存器读 CSE
+  （写/调用/换块失效），`icmp eq %v,%v` 折成 true → 常量写 → `ReadEntry` 消失。
+  hexx64 全量：`abi_undefined` 211 → **0**，unknown 517 → 515，指令数 −1.3%，
+  IR 88.1 → 86.3 MB，`ZMM0 nodes=385 sources=1` 那一行从需求图诊断里消失。
 - 阶段 1（已完成，只诊断）：`computeUsedInputs()` + `reportUnobservableInputs()`
   打印每个寄存器的 `read_entry_functions`（读过入口、但没人观察的函数数）和
   `cuttable_callsites`（callee 读了没人用的入口 ⇒ 调用点不必准备值的调用点数）。

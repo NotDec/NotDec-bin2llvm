@@ -81,12 +81,24 @@ llvm::Value *PcodeLowerer::read(const VarnodeView &varnode) {
     }
 
     if (varnode.IsRegister && Registers != nullptr) {
+      // 换块就清空：缓存只在"同一块内、中间没有写/调用"时成立。
+      llvm::BasicBlock *insertBlock = Builder.GetInsertBlock();
+      if (insertBlock != RegisterReadCacheBlock) {
+        RegisterReadCache.clear();
+        RegisterReadCacheBlock = insertBlock;
+      }
+      std::string key = varnodeKey(varnode);
+      if (auto cached = RegisterReadCache.find(key);
+          cached != RegisterReadCache.end()) {
+        return cached->second;
+      }
       RegisterAccess access{varnode.Space, varnode.Offset, varnode.Size,
                             varnode.RegisterName};
       if (llvm::Value *value = Registers->read(Builder, access)) {
         if (access.Size > 1) {
           RegisterReads.push_back({value, access});
         }
+        RegisterReadCache.emplace(std::move(key), value);
         return value;
       }
     }
@@ -138,6 +150,9 @@ void PcodeLowerer::write(const VarnodeView &varnode, llvm::Value *value) {
                             varnode.RegisterName};
       if (Registers->hasRegister(access)) {
         Registers->write(Builder, access, resized, CurrentOpIsFloatWrite);
+        // 任一寄存器写都可能与缓存里的读重叠（写 EAX 也要让 RAX/AX/AL 失效），
+        // 一条机器指令的 p-code 只有几十个 op，整清空最简单也最安全。
+        RegisterReadCache.clear();
         return;
       }
     }
@@ -1054,10 +1069,16 @@ bool PcodeLowerer::lowerOp(const PcodeOpView &op, std::string &errorMessage) {
     case PcodeOpcode::Store:
       return lowerStore(op, errorMessage);
     case PcodeOpcode::Call:
-      return lowerCall(op, errorMessage);
     case PcodeOpcode::CallInd:
-      return lowerCallInd(op, errorMessage);
     case PcodeOpcode::CallOther:
+      // 调用会隐式改写 caller-saved 寄存器，寄存器读缓存必须失效。
+      RegisterReadCache.clear();
+      if (op.Opcode == PcodeOpcode::Call) {
+        return lowerCall(op, errorMessage);
+      }
+      if (op.Opcode == PcodeOpcode::CallInd) {
+        return lowerCallInd(op, errorMessage);
+      }
       return lowerCallOther(op, errorMessage);
     case PcodeOpcode::Branch:
     case PcodeOpcode::BranchInd:

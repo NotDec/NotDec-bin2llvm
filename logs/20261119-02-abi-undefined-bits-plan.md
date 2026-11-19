@@ -304,3 +304,43 @@ Arch2.md 新增 11.1 节记录设计，§10 全貌和 §12 边界同步更新。
 阶段 1 的价值就在这：**在动需求种子之前就否掉了错的假设**。报告里其余寄存器
 （RSI 38、RDI 144、RAX 181 个 cuttable callsites；DF 33）是另一类真实的可剪需求，
 等 idiom 修完再单独评估。
+
+## 修复：p-code 降级阶段 CSE 同一段 p-code 内的重复寄存器读（2026-11-19 晚）
+
+**根因**（承接上一节）：`PcodeLowerer` 对非寄存器 varnode 有 `Values` 缓存，但寄存器
+读完全绕过它（`Registers->read()` 每次都发射新的 `load`/`partial_read`），而
+`write()` 在寄存器分支直接 `return`、也不失效。于是 `pcmpeqd %xmm0,%xmm0` 的
+`icmp eq <同一个读>, <同一个读>` 变成两个独立调用的比较，summary 把操作数当入口读。
+
+**改动**（`lib/core/PcodeToLLVMInternal.h` + `lib/core/PcodeLowererOps.cpp`）：
+
+- 新增 `RegisterReadCache`（key 同 `varnodeKey`，只缓存寄存器读，不缓存 ram load）；
+- `read()`：换块清空 → 查缓存 → 命中直接复用 → 未命中读一次并写入缓存；
+- `write()`：寄存器写之后清空（写 EAX 也让 RAX/AX/AL 失效，一条机器指令的 p-code
+  只有几十个 op，整清空最简单）；
+- `Call`/`CallInd`/`CallOther`：调用会隐式 clobber，先清空。
+
+**验证**：
+
+- 单函数 `-f 0x29a940`：签名从 `(i64 %RDI.arg, i128 %ZMM0.arg)` 变回
+  `(i64 %RDI.arg)`，函数体里 4 个 `store i128 -1`（值是对的，之前也是 -1，
+  但那时靠 InstCombine 折 `icmp eq %a,%a`），**全文 ZMM0 出现 0 次**。
+- 全量（6187 函数，`--metrics-json`）：
+
+| 指标 | 修复前 native55 | 修复后 native56 |
+|---|---|---|
+| `unknown.calls` | 517 | **515** |
+| `abi_undefined.calls` | **211** | **0** |
+| `return_binding_uses_clobber_value` | 314 | 312 |
+| 指令数 | 1,145,990 | 1,131,049（−1.3%） |
+| IR 大小 | 88.1 MB | 86.3 MB |
+| verify | ok | ok |
+
+- 需求图诊断里 `ZMM0 nodes=385 sources=1` 那一行**消失**：源头修掉之后 384 个
+  下游返回槽一起没了（和预期一致）。
+- `ctest` 19/19（含 fortune x86_64/i386）。
+
+**还没动的同类链**（各自有独立源头，属于阶段 2 / 后续 idiom 的范畴）：
+DF 1450 节点 / 1402 纯透传（106 源头）、R9 1305/881（121）、R8 551/317（17）、
+R10 487/436（4）、R11 478/452（4）。可观察性报告里 RDI 144、RAX 181、RSI 38 个
+cuttable callsites 也还在。
