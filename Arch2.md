@@ -1,661 +1,223 @@
+# Summary 静态分析的思路
 
-# Summary静态分析的思路
+## 两遍自底向上分析
 
-### 两遍自底向上分析
+首先在 CallGraph SCC 上自底向上分析，收集每个寄存器按位的三类事实（与调用者无关）：
 
-首先（在CallGraph SCC上）自底向上分析，分析和调用无关的部分
-1. ReadEntry：入口值在被覆盖前被读过（参数候选）。如果读取了来自入口的值，则说明很可能存在一个参数。反之即使有参数，如果完全在函数内没有用过，那么也相当于不存在这个参数。
-  - 特殊情况：参数在原位置传递给了其他函数，没有任何指令操作。
-2. MayNonEntry：可能被本函数（或内部调用）改过。对于调用者来说，如果可能被改过，就得当做这个寄存器被用过了，不再保留原来的值（callee saved register单独识别和处理）
-3. MayEntry：出口处可能仍是入口值。如果这个值是false，则表示某个寄存器在调用后，一定不是原来的值了。
+1. **ReadEntry**：入口值在被覆盖前被读过（参数候选）。入口值被读过说明很可能存在参数；反之即使原本有参数，函数内完全不用，也等价于无此参数。
+   - 特殊情况：参数在原位置直接透传给其他函数，中间没有任何显式读写。
+2. **MayNonEntry**：出口处可能已被本函数（或内部调用）改写过。对调用者而言，被改写过的位不能再假定保留原值（callee-saved 寄存器通过保存槽识别单独处理）。
+3. **MayEntry**：出口处可能仍是入口值。若为 false，说明该位在调用后一定不再是原值。
 
-外部导入函数，改动的寄存器以及保存的寄存器情况严格遵守**调用约定**。
+外部导入函数严格按**调用约定（ABI）**建模被改动与被保留的寄存器：
 
-- （对于有函数体的）参数和返回值：按照使用线索，而不是定义线索。参数根据自底向上分析可以得到。返回值则需要对每个函数收集所有caller，看调用点后使用了什么被函数修改过的值。
-- 外部导入函数的参数和返回值：返回值可以一样类似根据使用推断，但是参数则需要特殊处理：根据定义点分析潜在的参数。见后面《未知外部参数、vararg的处理》一节。还有顶层导出函数的返回值。
+- **内部函数（有函数体）**：参数和返回值都按"使用线索"判定。参数来自自底向上 `ReadEntry`；返回值需汇总所有 caller，看调用点之后用到了哪些被该函数改写过的位。
+- **外部导入函数**：返回值同样可按调用点后续使用推断；参数则没有函数体，需按调用点的"定义线索"推断（见下节）。
 
-在自底向上分析后，进行外部函数签名分析，vararg的处理，分析函数的参数和返回值。然后重新进行自底向上分析。
+第一遍自底向上分析时，未知外部函数按 clobber 处理（不假设其输入），这会漏掉"入口值直接透传给外部函数"的场景（例如 `int f(int x) { g(x); }` 中 `g` 的参数尚未确定时，`f` 无法推出对 `x` 的读取）。因此流程拆成两遍：第一遍收集调用点证据并推断外部函数参数与 vararg 尾参，第二遍带入最终外部签名重跑完整分析。内部调用在第一遍就能直接代入 callee 的 `ReadEntry`，因此不受影响。
 
-然后是重新跑自底向上分析：因为，第一遍分析对外部函数都假设是clobber，没有假设外部函数的use，因此会缺失这一小部分。比如：`int f(int x) { g(x); }` 调用了外部函数g，且参数在寄存器内无操作原样传递，第一遍推理后根据其他的使用点将g设置为一个参数后，f才能推理出参数。
-  - 注：对内部函数，因为遇到call时，可以直接代入call的ReadEntry，因此是准确的。
+## 未知外部参数与 vararg 处理
 
-## 未知外部参数、vararg的处理、顶层导出函数的返回值
+对每个"未知外部 / 已知 vararg 外部"调用点，基于第一遍稳定后的正向数据流状态，对每个候选寄存器/栈槽按来源分类：
 
-对每个"未知外部 / 已知 vararg 外部"的调用点，分析使用点的定义情况：
-- 正向分析，得到每个call，位置的状态
+- **Entry**：入口值透传（不算参数证据）
+- **Local**：本函数显式写过（参数证据）
+- **FloatLocal**：`Local` 中最后一次写为浮点指令的子集（区分 `movsd` 真浮点参数与 `movq` 等整数打包，避免误判假浮点参数）
+- **CallClobber**：前一次调用弄脏的（不算）
+- **Mixed**：多条路径合并后来源不唯一
 
-对于每个寄存器，包含以下属性：
-- Entry：入口值透传（不算参数证据）
-- Local：本函数显式写过（参数证据）
-- FloatLocal：Local 中"最后一次写是浮点指令"的子集（区分 movsd 真浮点参数和 movq 整数打包，避免 lua_createtable 那种 7 个假 double）
-- CallClobber：前一次调用弄脏的（不算）
-- Mixed：路径合并分不清
+## 需求传播（双向不动点）
 
-### 自顶向下分析
+汇总所有 caller 对 callee 的使用需求，反推每个函数的返回值和调用点活跃位：
 
-1. 最顶层一般是导出函数，严格按照ABI来。
-1. 已知所有caller的使用，分析函数caller对callee的期望
+- **根函数（顶层导出 / 无内部 caller）**：按 ABI 主输出寄存器（如 `RAX`）注入初始 `ExitDemand`。
+- **ExitDemand（返回值判定的关键）**：函数退出时调用者还会使用的寄存器位。多个 caller 的需求取并集（部分调用点可能忽略返回值）。`shapeForInternalFunction` 要求 `MayNonEntry && ExitDemand`，返回槽按 `ExitDemandMask & MayNonEntryMask` 收窄。
+- **函数内计算**：采用"寄存器级按位反向 liveness + SSA 值级位需求"两层不动点，把寄存器写的实际观察位反馈给值层，收窄宽读带来的虚假位需求。
+- **跨函数传播**：需求在调用边界上是双向的（caller → callee 传 `ExitDemand`；callee → caller 传入口与返回透传需求），因此以单调 worklist 不动点迭代至收敛。
+- **EntryDemand**：函数入口处活跃（live-in）的寄存器位。因可能包含部分写（读改写）的保留位，内部函数形参实际以 `ReadEntryMask`（以及返回槽透传位 `ReturnEntryMask`）为准，不直接使用 `EntryDemand`。
 
-- ExitDemand：（用来分析函数返回值的关键）函数退出时调用者用到的被修改过的寄存器。用于返回值判定。shapeForInternalFunction :1600-1601，要求 MayNonEntry （一定被存入了值） && ExitDemand （调用者都用了）。不同的caller之间的ExitDemand要并起来，因为可能有的调用点不需要用返回值。函数内部通过计算反向 liveness确定。
-- EntryDemand：（暂时用处没那么大）函数入口处，存有有效值的寄存器范围。用于外部函数参数推断。设置了 ReadEntry（入口值确实被读过）才可能成为参数？
+---
 
-# 寄存器消除的架构变迁（bin2llvm）
+# 寄存器消除的架构演进（bin2llvm）
 
-## 0. 背景：寄存器在反编译结果里长什么样
+## 0. 背景与术语
 
-反编译流程：机器码 → Ghidra 的 p-code（指令语义的中间语言）→ LLVM IR → 输出 `.ll` 文件。
+反编译流程：机器码 → Ghidra Sleigh p-code → LLVM IR → `.ll` / `.bc`。
 
-在最早期，寄存器被直接表示成 **LLVM 全局变量**：`@RAX`、`@RSP` 这样的程序级变量。指令读写寄存器，
-翻译成 IR 就是 load/store（读/写内存）这个全局变量。
+最早期，寄存器被直接表示为 **LLVM 全局变量**（`@RAX`、`@RSP` 等），指令读写寄存器即对全局变量的 `load`/`store`。这种表示有两个明显缺陷：
 
-这样做的缺点很明显：
+- 函数间通过全局内存隐式通信，看不出参数和返回值；
+- IR 充满全局 `load`/`store`，阻碍后续优化与分析。
 
-- 每个函数通过全局内存和其他函数间接地通信，看不出参数和返回值；
-- 代码里充满 load/store，阻碍后续优化
-
-所以要做"寄存器消除"：把寄存器读写变成普通变量、函数参数、返回值，让 IR 重新像一个正常程序。
+**寄存器消除**的目标是把寄存器读写还原为普通 SSA 值、函数参数和返回值，让 IR 恢复正常程序形态。
 
 术语：
 
-- 寄存器：CPU 内部的高速存储位置（`RAX`、`RSP`、`XMM0`、`ST0` 等）。
-- 全局变量：整个程序共享的变量。
-- SSA：一种"每个变量只赋值一次"的表示，让每个值都有唯一来源，方便分析。
-- PHI：SSA 里表示"几个分支的值在合流处汇合"的特殊节点。
-- pass：LLVM 里的一个处理步骤。
-- 静态分析：不运行程序，只看代码结构推断信息。
-- 调用约定（ABI）：规定参数放哪些寄存器、返回值放哪些寄存器、哪些寄存器被调用后必须保持不变的规则。
-- 调用点：程序中调用某个函数的那条指令。
-- clobber：寄存器被一次调用"弄脏"（值被改写）。
-- callee-saved：ABI 规定被调用方必须保持原值的寄存器；函数开头保存、结尾恢复。
-- 部分读写：只读写寄存器的一部分（如只写 `EAX`，`RAX` 的高位不变）。
-- 帧指针/栈指针：`RSP` 指向当前栈顶，`RBP` 常用来定位局部变量；它们管的是内存栈，不是普通值。
-- intrinsic：一种内建函数，编译器/分析器特殊处理它。
-- 标志寄存器：记录运算结果的零散位（`ZF`、`CF`、`DF` 等）。
-- x87：老式 x86 浮点单元，8 个浮点寄存器（`ST0`..`ST7`）组成一个"栈"。
+- **寄存器**：CPU 内部高速存储（`RAX`、`RSP`、`XMM0`、`ST0` 等）。
+- **SSA / PHI**：每个变量只赋值一次的表示形式；多分支汇合处用 `PHI` 合并不同路径的值。
+- **调用约定（ABI）**：规定参数/返回值寄存器、caller-saved（调用可能改写）与 callee-saved（被调用方必须保存/恢复）的规则。
+- **clobber**：一次调用改写（弄脏）了某个寄存器。
+- **部分读写**：只读写寄存器的一部分位段（如写 `EAX`、读 `AL` 或写 `XMM` 低 lane）。
+- **栈指针 / 帧指针**：`RSP` 指向当前栈顶，`RBP` 常用于定位栈帧局部变量。
+- **intrinsic**：编译器/分析器特殊识别的内建函数调用。
+- **标志寄存器 / x87**：标志位记录运算状态（`ZF`/`CF`/`DF` 等）；x87 是由 `ST0`..`ST7` 组成的旧式浮点寄存器栈。
 
-## 1. 第 0 代（2026-05 前）：起点——寄存器全是全局变量
+## 1. 第 0 代：起点——寄存器全是全局变量
 
 ```text
-机器码
-  -> Sleigh p-code          （Ghidra 的指令语义中间语言）
-  -> PcodeToLLVM            （转成 LLVM IR）
-      寄存器 = 全局变量：@RAX、@RSP、@XMM0 ...
-      读写寄存器 = load / store 这个全局变量
-  -> LLVM IR：到处都是寄存器 load/store，没有参数、没有返回值
+机器码 -> Sleigh p-code -> PcodeToLLVM
+    寄存器 = 全局变量（@RAX、@RSP、@XMM0 ...）
+    读写寄存器 = load / store 全局变量
 ```
 
-提升层（`RegisterStorage`）做了一件事：把重叠的寄存器（`RAX`/`EAX`/`AX`/`AL`）合并到同一个全局
-变量，用位切片处理子寄存器读写。但它只解决"怎么表示到LLVM IR"。
+提升层（`RegisterStorage`）将重叠寄存器（`RAX`/`EAX`/`AX`/`AL`）合并到同一个全局变量，用位切片处理子寄存器读写，解决了"如何表示到 LLVM IR"。
 
-**问题**：每个函数看起来都像在通过全局内存和其他函数"偷偷通信"，函数边界被藏在一堆内存操作
-里，后续任何分析都用不了。
+**问题**：函数边界隐藏在全局内存操作里，没有参数和返回值，后续分析无从下手。
 
-## 2. 第 1 代（2026-05-29）：第一个寄存器 SSA pass NativeRegisterSSA
+## 2. 第 1 代：`NativeRegisterSSA`（整寄存器按需 SSA）
 
-基于SSA 构建算法去“初步”消除对全局寄存器变量的load和store，变成显式的值。
+引入按需 SSA 构建（参考 *Simple and Efficient SSA Construction*），初步将全局寄存器的 `load`/`store` 转为显式 SSA 值与 `PHI`：
 
 ```text
 机器码 -> p-code -> PcodeToLLVM
-  -> NativeRegisterSSA                    <- 新增
-      读寄存器：向前找最近的写
-        找到了  -> 用 SSA 值替换 load
-        找不到  -> 说明是外部传进来的值（候选参数）
-      多个前驱汇合 -> 插 PHI
-  -> LLVM IR：整寄存器读写变成 SSA 值
+  -> NativeRegisterSSA
+      读寄存器：沿 CFG 向前查找最近定义（找不到则视为入口候选值）
+      多前驱汇合：插入 PHI
 ```
-
-**为什么改（关键问题）**：寄存器全是 load/store，看不出"这个值从哪里来"，没法给后面的原型恢复用。
-SSA 恰好能表达"每个值都有唯一来源"，于是引入按需构建 SSA 的 pass（参考《Simple and Efficient SSA
-Construction》）：用到寄存器时再往前查，不用预先算复杂的前置分析。目标是大部分寄存器不再反复 load/store，而是变成 SSA 值、参数、返回值和必要的 PHI。
-
-**效果**：整寄存器粒度的读写被替换成 SSA 值。
 
 **暴露的问题**：
 
-1. 只处理"整个寄存器"的读写。部分读写（`EAX`、`XMM` 的 lane）进不了 SSA，消不掉。
-2. call 对寄存器的影响没有数据流表达，实现里经常用 `undef`/空值糊结构。"调用后 `RAX` 是什么"
-   没人说得清，后续分析也没法用。
-3. `RSP`/`RBP` 是栈指针，不能当普通寄存器消。
-4. "哪些寄存器是参数、哪些是返回值"这个信息，SSA 本身给不出来，需要另一套分析。
+1. 仅支持整寄存器粒度，部分读写（`EAX`、`XMM` lane 等）无法进入 SSA；
+2. 函数调用对寄存器的影响缺乏数据流建模；
+3. `RSP`/`RBP` 与 callee-saved 保存恢复不能当作普通数据寄存器消除；
+4. SSA 本身无法推断哪些寄存器是真实参数或返回值。
 
-## 3. 第 2 代（2026-06-16~18）：引入寄存器静态分析 NativeRegisterSummary
+## 3. 第 2 代：`NativeRegisterSummary`（静态分析确定函数边界）
 
-先静态分析出边界，再建 SSA：
-
-```text
-机器码 -> p-code -> PcodeToLLVM
-  -> NativeRegisterSummary                 <- 新增：静态分析
-      自底向上：每个寄存器记三类事实
-        "可能仍是入口值" / "可能被函数改过" / "入口值被读过"
-      递归函数：按调用图 SCC（互相调用的循环组）反复迭代到稳定
-      自顶向下：从顶层 ABI 开始，传"调用者真会用的返回寄存器"（demand）
-  -> NativeRegisterElimination              <- 新增：基于 summary 的新 SSA
-  -> LLVM IR
-```
-
-**为什么改（关键问题）**：函数签名（参数/返回）推断需要三个信息，SSA 给不出：
-
-- 入口哪些寄存器被真实读过 → 参数候选；
-- 出口哪些寄存器被改过且调用者真的用了 → 返回候选；
-- call 会弄脏哪些寄存器 → clobber。
-
-于是引入**寄存器静态分析**：不运行程序，沿函数控制流算每个寄存器"可能是什么值、被谁读过"。
-
-- **自底向上**：从被调用者向调用者汇总。每个寄存器记"可能仍是入口值 / 可能被函数内部改过 / 入口值
-  在被覆盖前被读过"三类事实；递归、互相调用的函数按调用图 SCC 反复迭代到不再变化。
-- **自顶向下（demand）**：从遵守 ABI 的顶层开始，把"调用者真正会用的返回寄存器"传下去，过滤掉
-  "改了但没人用"的寄存器——函数尾部往往改了一堆寄存器，但真正的返回值只有调用者用到的那些。
-- 内部调用直接用 callee 的 summary；外部调用、间接调用先按 ABI 兜底。
-
-**改完又暴露的新问题**：SSA 构建和函数签名重写强耦合。分开两个 pass 时，签名重写完，旧寄存器 store
-又"活"过来了，还要额外清理，两套逻辑很难保持一致。
-
-## 4. 第 3 代（2026-06-19）：函数签名重写并入 SummarySSA
-
-和前一代相比，流程上**删掉了独立的签名重写 pass，把它折进 SummarySSA**：
+将顺序反过来：**先做模块级静态分析算出函数边界，再建 SSA**（静态分析细节见文首）：
 
 ```text
 机器码 -> p-code -> PcodeToLLVM
+  -> 前置栈帧/变参/canary 处理
   -> NativeRegisterSummary
-  -> NativeRegisterElimination              <- 扩展：SSA + 签名重写 + 清理
-      SSA 构建
-      addDemandedExternalReturns
-        （"调用后被读的 ABI 输出寄存器" -> 补返回槽）
-      重写函数类型（内部函数 + 外部声明）
-      调用前寄存器 store -> 变成 LLVM call 参数
-      返回寄存器 -> 变成 LLVM 返回值
-      清理暴露出来的死 store
-  -> LLVM IR
-```
-
-**为什么改（关键问题）**：参数/返回信息算出来后，要改写函数类型和调用点——把"先 store 寄存器，再
-call"变成"直接传参数"，把返回寄存器变成 LLVM 返回值。这件事和 SSA 构建强耦合，分开做两边都对不齐：
-重写完旧寄存器 store 又活过来，还得额外清理。
-
-**方案**：删掉独立的 `NativeExternalCallSignatureRewrite`，把签名重写按顺序折进
-`NativeRegisterElimination`：先建 SSA，再按 SSA 结果重写函数类型、call 参数、返回值，最后清理死
-store。同时引入 `addDemandedExternalReturns`：给"调用后被读的 ABI 输出寄存器"补返回槽。
-
-注意：从这一天起，返回推理就是放在 SSA 构建**之后**跑的——因为"调用后哪个寄存器被读了"这个证据是
-在 SSA 构建过程中产生的。这个决定后来埋了雷，见第 8 代。
-
-**改完又暴露的新问题**：`RSP`/`RBP` 和 callee-saved 保存恢复。函数开头 `push rbx`、结尾 `pop rbx`
-这类机械动作被当成"读了入口寄存器"，导致函数被推断出大量假参数（`main` 甚至带上了 RBX/R12-R15
-参数）。
-
-## 5. 第 4 代（2026-06-19 起）：栈帧恢复——RSP/RBP 不能当普通寄存器消
-
-和前一代相比，流程上**在整条链最前面加了两个 pass，并扩展了静态分析**：
-
-```text
-机器码 -> p-code -> PcodeToLLVM
-  -> NativeStackFrameRewrite               <- 新增
-      RSP 栈流量 -> alloca / 栈对象
-      RBP 只在证明来自 RSP 时才替换
-  -> NativeStackCanaryCleanup              <- 新增：删栈保护检查
-  -> NativeRegisterSummary                 <- 扩展
-      跟踪"入口 RSP + 常量偏移"，识别连续 push/pop 的保存槽
-      callee-saved 保存/恢复不再算"读了入口寄存器"
+      自底向上 SCC 不动点（ReadEntry / MayEntry / MayNonEntry）
+      跨函数需求传播（ExitDemand）
   -> NativeRegisterElimination
-  -> LLVM IR
 ```
 
-**为什么改（关键问题）**：
+**配套前置处理（栈帧与 callee-saved）**：
 
-- `RSP` 是栈指针：函数开头分配栈、结尾释放、call 压返回地址、栈参数传递都走它。把它当普通寄存器消，
-  栈语义全乱。
-- `RBP` 有时是帧指针（用来定位局部变量），有时只是普通 callee-saved 寄存器，不能一刀切。
-- callee-saved 的保存/恢复序列（`push rbx` 开头、`pop rbx` 结尾）是"机械动作"，不该算作函数真实
-  读写了这些寄存器。
+- `RSP` 承载栈分配、返回地址与栈参数，`RBP` 既可能是帧指针也可能是普通 callee-saved 寄存器，不能一刀切按普通寄存器消除。前置 pass `NativeStackFrameRewrite` 将可证明为本地栈帧的 `RSP` 访问转为 LLVM `alloca`（`RBP` 仅在证明来自 `RSP` 时替换）；`NativeStackCanaryCleanup` 清理 `__stack_chk_fail` 栈保护检查；`NativeVarArgRewrite` 将变参序言的寄存器保存区改写为 `llvm.va_start`。
+- `NativeRegisterSummary` 在数据流中跟踪"入口 `RSP` + 常量偏移"的固定栈槽，识别 callee-saved 的 `push`/`pop` 保存恢复及栈对齐槽，防止机械保存动作被误判为读取入口参数。
 
-**方案**：`NativeStackFrameRewrite` 把能证明为本地栈帧的 `RSP` 流量转成 LLVM 的 alloca（栈上分配）/
-栈对象；`RBP` 只在"当前值已证明来自 `RSP`"时才替换。静态分析里跟踪"入口 `RSP` + 常量偏移"，识别
-连续 push/pop 形成的保存槽，callee-saved 保存/恢复不再污染"读了入口寄存器"的事实，函数不再多出假
-参数。之后又陆续加了 canary 清理（删 `__stack_chk_fail` 检查）和栈参数绑定（把调用前压栈的参数也绑
-成 call 参数）。
+**暴露的问题**：SSA 构建与函数签名重写强耦合，拆成独立 pass 会导致状态失配并重新暴露大量死 `store`。
 
-**改完又暴露的新问题**：部分读写仍然消不掉（第 5 代解决）；外部函数没有原型，签名靠猜（第 6 代）。
+## 4. 第 3 代：签名重写并入 `NativeRegisterElimination`
 
-## 6. 第 5 代（2026-07 上中旬）：按"位区间"的 range SSA
-
-和前一代相比，流程上**改动发生在三个位置**：
+去掉独立的签名重写 pass，将 SSA 构建、签名重写、返回绑定与死代码清理统一编排在 `NativeRegisterElimination` 内，并确立**返回信息唯一由签名决定**的原则：
 
 ```text
-机器码 -> p-code -> PcodeToLLVM            <- 扩展
-      部分读写先展开成 partial_read / partial_write intrinsic
-  -> NativeStackFrameRewrite / CanaryCleanup
-  -> NativeRegisterSummary                 <- 扩展：effect / demand 按 bit 区间算
-  -> NativeRegisterElimination              <- 重写：SSA 变量 = 寄存器的某段 bit 区间
-      RAX[0:32]、RAX[32:32]、ZMM0[0:64] 各自有独立 SSA 值和 PHI
-  -> NativeRegisterFinalCleanup            <- 新增：删无用全局 / helper
-  -> LLVM IR
-```
-
-**为什么改（关键问题）**：x86 指令大量只写寄存器的一部分——写 `EAX` 保留 `RAX` 高位、写 `XMM` 低
-lane 保留高位、读写 8/16 位。整寄存器粒度的 SSA 面对部分读写时：
-
-- 只读 `EAX` 却把整个 `RAX` 拖进来，生成 64 位 PHI；
-- SIMD 低 lane 拖进整个 `ZMM0`，PHI 类型可能变成 512 位；
-- 部分写没法进同一套"当前定义"表，之后的部分读要反向扫描补洞；
-- 参数、返回、clobber、入口输入也容易按整寄存器扩散，什么都消不干净。
-
-**方案**：
-
-- 提升层先把部分读写展开成 `notdec.partial_read` / `notdec.partial_write` intrinsic（先读完整值，
-  再切片/拼装）；
-- SSA 的"变量"从"整个寄存器"改成"寄存器的某一段 bit 区间"（range）：`RAX[0:32]`、`RAX[32:32]`、
-  `ZMM0[0:64]` 各自有独立的 SSA 值和 PHI，完整寄存器读写变成若干区间的拼接/拆分；
-- 活跃性（哪些值还用得上）、demand（哪些 bit 被需要）也都按 bit 区间做；
-- 末尾加 `NativeRegisterFinalCleanup`，统一删无用全局和 helper。
-
-**配套修正**：
-
-- InstCombine（LLVM 通用化简 pass）可能把寄存器 load 变成"PHI 指向的 load"，静态分析认不出这是寄存器
-  访问，需要先规整回"load 的 PHI"（`canonicalizeRegisterPointerPhiLoads`）；
-- 未知值用可清理的 opaque helper 表示，而不是 `freeze`/`undef`，方便后面统一清理。
-
-**改完又暴露的新问题**：外部函数参数/返回还是靠猜，而且猜测证据和 clobber 混在一起会漏参（第 6 代
-后半）。
-
-## 7. 第 6 代（2026-07-03~21）：外部函数签名推断 + 两遍 summary
-
-和前一代相比，流程上**把一遍 summary 拆成两遍，中间夹一个参数推断**：
-
-```text
-机器码 -> p-code -> PcodeToLLVM
-  -> NativeStackFrameRewrite / CanaryCleanup
-  -> 第一遍 NativeRegisterSummary          <- 变化：只做 effect + 收集调用点证据，不跑 demand
-  -> 外部参数推断 inferExternalCallShapes  <- 新增
-      按"调用前被显式写入的连续 ABI 参数前缀"数 arity
-      区分整型 / 浮点（XMM）参数序列
-      vararg 按调用点推断尾参
-  -> 第二遍 NativeRegisterSummary          <- 变化：带最终签名重跑完整分析
-      （自底向上 + 自顶向下 demand + 最终 metadata）
+NativeRegisterSummary
   -> NativeRegisterElimination
-  -> LLVM IR
+      1. 逐函数构建 SSA：调用点统一生成"调用后状态"占位，并收集
+         "调用后 ABI 输出寄存器被实际读取"的证据（不在此阶段硬区分 return/clobber）
+      2. 确定函数与调用点签名（shape.Returns 唯一决定返回槽）
+      3. 重写函数类型、call 实参/返回值（ret 此时先建占位）
+      4. post-rewrite cleanup 循环：
+           首轮按最终值链收集返回绑定并填入 ret
+           多轮 InstCombine + 删死 store，末尾再清残余栈帧/canary
 ```
 
-**为什么改（关键问题）**：外部函数（libc 等）在 IR 里只有一句 `declare`，参数、返回都不知道。没有
-签名就没法重写调用点，调用后哪些寄存器是返回值也无法分析。
+关键设计：
 
-**方案演进**：
+- **解耦占位与返回判定**：构建 SSA 时不再提前猜测某个调用后寄存器是返回值还是 clobber，消除鸡生蛋问题；是否为返回槽唯一由签名 `shape.Returns` 决定（内部函数来自静态分析，已知外部函数来自原型，未知外部函数按保守规则推断）。
+- **混合 clobber 路径不静默截断**：收集返回绑定时，若返回值的 PHI/计算链同时包含真实来源与 clobber/unknown 来源，保留整条值链与分支并记录 warning；仅当整条链全为 clobber/unknown 时才折叠为单个显式 `notdec.unknown`。
 
-1. **参数证据收紧**。第一版（07-03）把"被调用弄脏的寄存器"也算进参数/返回证据，严重过数：`RDX`
-   经常只是被弄脏，却被当成第二返回值，参数前缀也会被 clobber 值污染。改成只数"调用前被本函数
-   显式写入的连续 ABI 参数前缀"（LocalDefinition），clobber 不算。
-2. **量化手段**。加 `--register-ssa-warning-out`，把残留的 helper、未知外部签名、未消除寄存器访问
-   落盘成 warning 表，批量定位剩余问题。
-3. **两遍 summary（07-10）**。参数是"调用前"信息，第一遍就能收集齐，不依赖返回需求。于是改成：
-   第一遍只做自底向上 effect + 收集每个调用点的证据（不跑 top-down demand）；中间做外部参数推断
-   （arity、整型/浮点、vararg 按调用点推断尾参）；第二遍带最终签名重跑完整分析。
-4. **调用点证据分类（07-21）**。区分三类：`Entry`（函数入口带来的值）、`Local`（本函数显式写的）、
-   `CallClobber`（call 隐式弄脏的）。之前把"来自 call 的显式写入"和"call 隐式弄脏"混成一类，导致
-   `malloc` 的返回值存进 `RSI` 时 `RSI` 被当成 clobber、参数推断漏参。改完后 `Local` 就是 `Local`，
-   路径合并分不清时保持 `Mixed`。
+**暴露的问题**：整寄存器粒度仍消不掉部分读写；外部函数缺少原型，签名无法准确推断。
 
-**改完又暴露的新问题**：返回信息仍来自第一遍在调用点的 return/clobber 区分——这是个鸡生蛋问题，
-外部浮点返回（`XMM0`/`ST0`）也接不住（见第 8 代）。
+## 5. 第 4 代：按位区间的 range SSA
 
-## 8. 第 7 代（2026-08-04~05）：特殊寄存器——DF 标志与 x87
+x86 指令大量只读写寄存器的一部分（写 `EAX` 清零 `RAX` 高 32 位、写 `AL`/`AH` 保留高位、写 `XMM` 低 lane 保留高位）。整寄存器 SSA 会拖入过宽的 PHI（甚至 512 位 `ZMM`），也无法跟踪部分覆盖。
 
-和前一代相比，流程上**改动集中在两端**：
+方案将粒度从"整寄存器"细化为"寄存器的 bit 区间（range）"：
+
+- **提升层**：部分读写统一展开为 `notdec.partial_read` / `notdec.partial_write` intrinsic；
+- **分析与 SSA**：`NativeRegisterSummary` 的 effect/demand 和 `NativeRegisterElimination` 的 SSA 变量均按 bit 区间维护，`RAX[0:32]`、`RAX[32:32]`、`ZMM0[0:64]` 各自拥有独立的 SSA 值与 PHI，整寄存器访问化为区间的拆分与拼装；
+- **前置规整与终态清理**：前置 `canonicalizeRegisterPointerPhiLoads` 将 InstCombine 生成的"PHI 指针的 load"规整回"load 的 PHI"；末尾由 `NativeRegisterFinalCleanup` 统一清理无用寄存器全局与 helper。
+
+## 6. 第 5 代：外部函数签名推断、两遍 summary 与特殊寄存器
+
+外部库函数在 IR 中只有 `declare`，既无函数体也无原型。为此将 summary 拆为两遍，中间插入外部签名推断：
 
 ```text
-机器码 -> p-code -> PcodeToLLVM            <- 扩展
-      x87 指令按助记符折叠 / 窗口展开（ST0、ST1 建全局，ST2..ST7 留在库内）
-  -> NativeStackFrameRewrite / CanaryCleanup
-  -> 第一遍 summary                         <- 扩展：ST0/ST1 也参与 effect 分析
-  -> 外部参数推断                           <- 扩展：XMM 参数证据区分"真浮点写"和"整数打包"
-  -> 第二遍 summary
-  -> NativeRegisterElimination               <- 扩展
-      调用点 DF 定值为常量 0
-      ST0 -> 返回槽 x86_fp80，跟 RAX/XMM0 同一套路径
-  -> LLVM IR
+第一遍 NativeRegisterSummary（仅自底向上 effect + 收集未知外部/vararg 调用点证据）
+  -> inferExternalCallShapes（外部参数与 vararg 尾参推断）
+  -> 第二遍 NativeRegisterSummary（带入外部签名，跑完整 effect + 双向需求 + metadata）
 ```
 
-### 8.1 DF 标志：ABI 规定"调用后必须是 0"
+- **外部参数推断**：依据调用点前的 `Local`/`FloatLocal`/`Entry`/`CallClobber`/`Mixed` 证据，只统计调用前被本函数显式写入（`Local`）的连续 ABI 参数前缀，排除 `CallClobber` 与已消费的临时值；浮点槽要求 `FloatLocal`（`float_write` 标记），避免把 `movq` 等整数打包误判为浮点参数；vararg 外部函数按各调用点独立推断尾参。
+- **未知外部返回槽（保守规则）**：整型返回（`RAX`，排除 `RDX`）与浮点返回（`XMM0` 优先，有 x87 证据时选 `ST0`）互斥；旧 call 若已有非 void 返回类型则作为最高优先级证据，否则退回"调用后状态占位被实际读取（非死值）"的证据。
+- **特殊寄存器处理**：
+  - **DF 标志**：ABI 规定函数入口与调用返回后 `DF` 恒为 0。值侧在边界直接定为常量 0，需求侧跳过 `DF` 不记录需求（`isAbiBoundaryZeroRegister`），避免 `repz cmpsb`/`movs*` 等循环在调用图上扩散无意义的需求链。
+  - **x87（`ST0`/`ST1` 窗口）**：p-code 提升层将 `ST0`/`ST1` 建模为 80 位寄存器全局并直接展开窗口内运算，深层栈 `ST2`..`ST7` 留在库内（仅保留 push/pop/peek/poke 四个衔接 intrinsic）。由此 `ST0`（SysV `long double` 返回）直接复用与 `RAX`/`XMM0` 相同的静态分析、需求传播与签名路径。
 
-i386 的 `repz cmpsb`（字符串比较）循环方向由 `DF` 标志决定。ABI 规定 `DF` 在函数入口、返回、外部调用
-返回后都必须为 0，但本地用的 cspec（ABI 描述文件）的"不受影响寄存器"列表里没有 `DF`，通用 clobber
-逻辑把它当未知值，循环方向就变未知了。
-
-修复：在代码层建模"调用后 `DF` 定为常量 0"（`isPostCallZeroRegister`）。其他标志（`CF`/`PF`/`AF`/
-`ZF`/`SF`/`OF`）是 caller-saved、没有"必须为 0"的约定，不能一样处理。
-
-需求侧同理（2026-11-19 补）：值侧给了常量 0，需求侧也必须跳过，否则每个读 `DF` 的
-`cmp*/sca*/movs*` 循环都会给"上一个调用"记一笔退出需求。具体两处：
-`liveBeforeBlock` 的 `load`/`partial_read` 遇到 `DF` 不加需求；
-`applyBackwardCallDemand` 的 `entryNeeds` 跳过 `DF`。修之前 hexx64 的 `DF` 需求图是
-1450 个函数 / 4430 条边，修完整行消失（`DF` 不是 value-carrying 寄存器，本来就没有
-返回槽，所以指标不变，纯粹是记账噪音）。
-
-### 8.2 x87：从整条折叠到 ST0/ST1 窗口建模
-
-x87 指令的语义是 8 个浮点寄存器组成一个"栈"（`ST0`..`ST7`），push 会把寄存器整体往下挪，和普通
-寄存器完全不同，直接进 SSA/静态分析很别扭。这里经历了两步：
-
-1. **先整条折叠成 intrinsic 库调用**：按汇编助记符把每条 x87 指令变成 `notdec.x87.*` 库函数调用，
-   `ST0`..`ST7` 不建全局，状态藏在库内部。
-2. **再收敛成 ST0/ST1 窗口**：发现整条折叠有两个问题——SysV long double 返回（结果留在 `ST0`）只能
-   靠"ret 前最后一条指令是 x87"这种启发式猜，不走静态分析，误报/漏报多；`fcomi` 这类指令把比较结果写
-   进标志寄存器，不得不引入 `FPUStatusWord` 全局做读改写，和非 x87 的标志语义对不上。收敛方案：
-   - `ST0`/`ST1` 建成真正的 LLVM 寄存器全局（80 位），窗口内的操作直接展开成 LLVM 指令；
-   - `ST2`..`ST7` 留在库内部，只留 4 个衔接 intrinsic：push / pop / peek / poke；
-   - 这样 `ST0` 也走完整的寄存器静态分析：函数尾 `store @ST0` → 出口需求 → 返回槽 `x86_fp80`，
-     调用点拿返回值、传参，跟 `RAX`/`XMM0` 走同一套路径。
-
-**配套修正**：
-
-- XMM 参数证据里区分"真浮点写"（`float_write` 标记）和"整数打包"（`movq` 等），避免 vararg 浮点参数
-  计数误判（`lua_createtable` 传 7 个 double 的场景曾因为 `XMM0` 里装的是整数而误判）；
-- 部分写只擦掉实际写到的 bit 的 demand，不再整寄存器一起擦。
-
-**改完又暴露的新问题**：返回信息归属问题到了必须解决的时候（第 8 代）。
-
-## 9. 第 8 代（2026-08-05，当前）：返回信息唯一来源是签名
-
-和前一代相比，流程上**第一遍不再区分 return/clobber，返回槽由签名决定，返回绑定收集移到重写之后**：
-
-```text
-机器码 -> p-code -> PcodeToLLVM
-  -> NativeStackFrameRewrite / CanaryCleanup
-  -> 第一遍 summary                          <- 变化
-      统一生成"调用后状态"占位（不再区分 return / clobber）
-      + "调用后 ABI 输出寄存器被读"的证据
-  -> 外部参数推断
-  -> 第二遍 summary
-  -> NativeRegisterElimination                <- 变化
-      构建 SSA；重写函数和 call 签名
-      重写时 ret 先建 unknown（返回槽由签名决定，不再由第一遍占位决定）
-  -> post-rewrite cleanup                    <- 新增/移动
-      按最终链值收集返回绑定，填 ret
-      删死 store；再清一轮栈帧 / canary
-  -> final cleanup
-  -> LLVM IR
-```
-
-**为什么改（关键问题）**：三个具体 bug，背后是同一个架构问题——第一遍 SSA 构建在调用点区分
-return/clobber，而"是不是返回寄存器"本该由签名决定。
-
-1. 外部 `sqrtl`（`long double sqrtl(long double)`）原型推断失败：SysV 下 long double 参数走栈，
-   arity 推断只数寄存器前缀 → 得出 0 参数；而且外部浮点返回没有 `RAX` 那种"整型 ABI 输出默认返回"
-   的待遇，`XMM0`/`ST0` 的浮点返回全部接不住。
-2. `stats_stdev` 返回链断掉：返回绑定遇到"依赖 clobber 占位的分支"时，把整个绑定判死成 unknown，
-   连 PHI 里其他确定分支的值一起丢掉。
-3. 鸡生蛋：第一遍不知道"是不是返回寄存器"，就没法产生返回占位；没有返回占位，就无法驱动签名补返回槽。
-
-**方案**：
-
-- 第一遍 SSA 构建不再区分 return/clobber：统一生成"调用后状态"占位 + "调用后 ABI 输出寄存器被读"
-  的证据；
-- "是不是返回寄存器"唯一由签名（`shape.Returns`）决定：内部函数/已知外部来自可信原型或静态分析事实，
-  未知外部来自保守推断；
-- 未知外部返回槽保守规则：浮点返回（`XMM0` 优先，有 x87 证据才 `ST0`）和整型返回（`RAX`，`RDX`
-  排除）互斥，只取一类；旧 call 的非 void 返回类型是最高优先级证据，void call 才退回"占位被实际读取"
-  的证据（死值不算）；
-- 返回绑定收集移到重写后的清理遍：重写时 `ret` 先建 unknown，清理遍按最终链值填；确定分支保留真实值，
-  纯未知/clobber 分支折叠成显式 unknown，不再整体判死。
-- 如果返回值的 PHI/计算链同时含有真实来源和 `summary_clobber`/unknown 来源，保留整条值链和分支，
-  并记录 `return_binding_preserved_mixed_clobber` warning；只有整条链都由 clobber/unknown 组成时，
-  才折叠成一个 opaque unknown。这样暴露的是具体不可信路径，而不是用删除分支掩盖问题。
-
-**效果**：`sqrtl`/`round` 的浮点返回恢复，`stats_stdev` 恢复 `x86_fp80` 返回，wrk 的 warning 净减
-104 条，`i64 @sqrtl()` 这类错误返回类型消失。
-
-## 10. 当前全貌（2026-08-06）
-
-把上面各代拼起来，就是当前主 pass 的完整流程。每步标注它来自第几代：
+## 7. 当前完整流程
 
 ```text
 ELF 机器码
-  -> Sleigh p-code -> PcodeToLLVM                    （第 0 代）
-      部分读写展开成 partial_read / partial_write    （第 5 代）
-      x87 按助记符折叠 / 窗口展开                    （第 7 代）
-      同一段 p-code 内重复寄存器读 CSE               （第 9 代）
-        （写/调用/换块失效；否则 `pcmpeqd %x,%x` 这类自比较会被 summary
-          当成入口依赖，见 11.1）
-  -> 加载外部原型（内置表 + JSON 覆盖）               （第 6 代）
-  -> noreturn 截断（exit、__stack_chk_fail）          （第 4 代）
-  -> NativeStackFrameRewrite（RSP/RBP -> alloca）     （第 4 代）
-  -> NativeStackCanaryCleanup（删栈保护检查）          （第 4 代）
-  -> canonicalizeRegisterPointerPhiLoads              （第 5 代）
-  -> 第一遍 NativeRegisterSummary                     （第 2/6/8 代）
-      自底向上 effect + 调用点证据，不跑 demand
-      调用点统一"调用后状态"占位 + 被读证据
-  -> 外部参数推断 inferExternalCallShapes             （第 6 代）
-      arity / 整型浮点 / vararg 按调用点
-  -> 第二遍 NativeRegisterSummary                     （第 2/6/9 代）
-      带最终签名重跑完整分析：
-        a. 自底向上 effect（ReadEntry/MayEntry/MayNonEntry）
-        b. usedInputs 可观察性定点（第 9 代，进行中；当前只诊断）
-        c. 自顶向下 demand 定点 + 需求图诊断
-        d. metadata（按位需求/效果）
-  -> 构建初始签名形状                                  （第 2 代）
-  -> 逐函数 SummarySSA                                （第 1/3/5/8 代）
-      按位区间建 SSA + PHI
-      调用点占位 + 证据收集
-      重写函数和 call 签名（ret 先建 unknown）
-  -> 补外部返回值（按签名，保守规则）                  （第 3/8 代）
-  -> post-rewrite cleanup loop                        （第 3/4/8 代）
-      收集返回绑定填 ret；删死 store；再清栈帧/canary
-  -> NativeRegisterFinalCleanup                       （第 5 代）
-      删无用全局 / helper；统计残留
+  -> Sleigh p-code -> PcodeToLLVM
+      部分读写展开为 partial_read / partial_write
+      x87 ST0/ST1 窗口展开
+      同块内重复寄存器读 CSE（写/调用/换块失效）
+  -> 加载外部原型（内置表 + JSON 覆盖）& 截断已知 noreturn 调用
+  -> 前置规整：
+      NativeStackFrameRewrite（RSP/RBP -> alloca）
+      NativeStackCanaryCleanup（删栈保护检查）
+      canonicalizeRegisterPointerPhiLoads / PreSummaryPeephole / x87 窗口规整
+      NativeVarArgRewrite（变参序言 -> llvm.va_start）
+  -> 第一遍 NativeRegisterSummary
+      自底向上 effect + 收集未知外部/vararg 调用点证据（不跑 demand）
+  -> inferExternalCallShapes（外部参数 / vararg 尾参推断）
+  -> 第二遍 NativeRegisterSummary
+      自底向上 effect -> 双向需求不动点（含函数内寄存器/值两层定点）
+      -> 可选寄存器感知 DCE -> 写入 metadata
+  -> 构建初始签名形状（含间接调用输入推断与尾调用栈参数传播）
+  -> 逐函数构建 range SSA（调用点统一占位 + 收集被读证据）
+  -> 签名细化与重写
+      间接调用/内部栈参数细化、补外部返回值、重写函数与 call 签名、折叠手写 va_arg
+  -> post-rewrite cleanup 循环
+      首轮按最终值链收集返回绑定填 ret；多轮 InstCombine + 删死 store；再清残余栈帧/canary
+  -> NativeRegisterFinalCleanup（删无用全局/helper，统计残留）
   -> .ll / .bc
 ```
 
-> 第二遍内部现在还会打印两张诊断表（不动 IR）：
-> `Native register observable inputs:`（每个寄存器有多少函数"读过入口值但没人观察"、
-> 有多少调用点的实参需求可以剪）和 `Native register demand:`（需求图的源头/纯透传/
-> 汇点）。前者是第 9 代的输入，后者用来判断一条 unknown/clobber 链是"处处漏水"还是
-> "一个源头拖一串"。
+配套验证手段：
 
-配套的验证手段：
+- `llvm-as` + `opt -passes=verify`：校验 IR 合法性；
+- `native-register-residue-audit.py`：统计残留的寄存器 `load`/`store`；
+- `--register-ssa-warning-out`：量化输出残留 helper、未知外部签名与未消除访问；
+- fortune（i386/x86_64）、wrk、vsftpd、memcached、libuv 等真实二进制回归验证。
 
-- `llvm-as` + `opt -passes=verify`：IR 至少合法；
-- `native-register-residue-audit.py`：统计还剩多少寄存器 load/store；
-- `--register-ssa-warning-out`：残留 helper、未知外部签名、未消除访问的量化清单；
-- fortune（i386/x86_64）、wrk、vsftpd、memcached、libuv 等真实目标回归。
+## 8. 寄存器值的表示准则
 
-### 10.1 需求模型的两层（2026-11-19 补充）
+寄存器消除中，裸寄存器读（`load @REG` / `notdec.partial_read`）与 `notdec.unknown.*` 都应尽量减少；在尚未完全消除时，遵循三条硬性准则：
 
-"需求"（demand）在代码里是两层，精度不一样，混起来看容易误判：
+1. **值来源优先级：载体 > 裸读 > `notdec.unknown`**
+   - **载体**（入口形参 / 返回槽 / 调用点实参）是正常数据流；
+   - **裸读**保留了"哪个寄存器、哪几位、在何处读取"，后续阶段仍可将其提升为载体；
+   - **`notdec.unknown.*`** 彻底丢失来源身份，只能依赖 `!notdec.unknown.source` 人工排查。
+   - 因此未知的寄存器值宁可先退化为裸读，也不要过早落成 unknown；终态目标是两者都不出现（裸读仅允许留在接口不可改边界和不透明调用出口）。
 
-- **寄存器级（按位，精确）**：`Analyzer::liveBeforeBlock` 对每个基本块做后向走查，
-  用"每寄存器一份位掩码"表示"这个点往后还会被读的位"。`partial_read` 按读结果的需求
-  位移位后加位，写按写入位段擦位，调用点走 `applyBackwardCallDemand`。写 8 位就只擦
-  8 位，剩下的位继续往前要。
-- **值级（整值/粗）**：`computeValueDemands` 给每个 SSA 值算"哪些位被需要"，从种子
-  （`ret`、调用实参、`store` 到内存、分支条件、`icmp` 操作数、`partial_write` 的写入值）
-  出发逆着操作数传播。
+2. **禁用 `poison` / `undef` / `freeze(poison)` 表示未知**
+   - LLVM 允许将 `poison` 细化为任意具体值（如 `freeze(poison)` 会被 InstCombine 折叠为 0），会静默篡改语义并丢失归因。凡表示"寄存器值未知"一律使用 `notdec.unknown.*` + `!notdec.unknown.source`。
 
-两层之间靠一个**保守桥**连接：写进寄存器的值，在值级被 `fullMaskForValue` 满宽 seed
-（`RegisterSummarySupport.cpp` 的 `partial_write` 分支），因为"写寄存器 → 后来从寄存器
-读"要经过 `@REG` 全局变量，SSA 链在那里断了，值级看不到后续读了哪些位。
+3. **边界两侧的位必须闭合（双向需求）**
+   - **返回侧收窄**：返回槽只覆盖 `ExitDemand ∩ MayNonEntry`；callee 从未改写过的位直接由调用者调用前值保留，不塞入返回槽。
+   - **入口侧闭合**：返回槽中"某些路径上仍为入口值"的位（`ReturnEntryMask = ExitDemand ∩ MayEntry ∩ MayNonEntry`）必须并入入口形参（`paramMask = ReadEntryMask | ReturnEntryMask`），否则函数体在未写路径上只能裸读寄存器（适用于接口可改的内部通用寄存器；浮点返回与变参函数暂不扩展）。
+   - **调用点侧闭合**：若只扩入口形参而不要求调用点提供对应位，会把函数内裸读转嫁成调用点 unknown。因此在 `applyBackwardCallDemand` 中同步将 callee 入口需要的位（`ReadEntry | (ReturnEntryMask ∩ live)`）加回调用点的 live 需求；跨函数需求传播也随之成为**双向单调 worklist 不动点**（caller → callee 传 `ExitDemand`，callee → caller 传入口/透传需求），保证载体在调用边界两侧闭合。
 
-这个桥是几个大需求链的放大器：`setcc %r11b` 只写低字节、后面 `and %r11d,%r8d` 读整
-寄存器时，寄存器级只擦 8 位、值级却已经把 32 位全要了，于是 `0xFFFFFF00` 一路记到函数
-入口（hexx64 上 R10/R11 各 478/487 个函数的链，见 logs/20261119-02）。同层还有两个
-放大器：`icmp` 操作数无条件按满宽 seed；`valueDemand` 对"不在 map 里"的值默认返回全 1
-（`RegisterSummaryRewrite.cpp:387`）。
+## 9. 已知边界与押后项
 
-改的方向：把寄存器级的按位 liveness 反馈给值级种子（不再满宽）；种子完整之后，
-`valueDemand` 的默认值才能从全 1 改成 0。
-
-## 11. 主线总结
-
-| 代 | 时间 | 和前一代比，流程上多了/改了/删了什么 | 为什么改 | 改完又暴露的问题 |
-| --- | --- | --- | --- | --- |
-| 0 | 2026-05 前 | 起点：寄存器 = 全局变量 | — | 看不出参数/返回 |
-| 1 | 05-29 | 多一个按需 SSA pass（整寄存器粒度） | 寄存器读写没有数据流 | 部分读写消不掉；call 影响没表达；RSP/RBP 特殊 |
-| 2 | 06-16~18 | 先静态分析出边界，再建 SSA；换 summary 链为主链 | 参数/返回只能静态分析得到 | 签名重写和 SSA 强耦合 |
-| 3 | 06-19 | 删独立签名重写 pass，折进 SummarySSA | 签名重写与 SSA 分不开 | callee-saved 保存恢复被误当参数 |
-| 4 | 06-19 起 | 链首加栈帧重写 + canary 清理；summary 识别保存槽 | RSP/RBP/保存恢复不能当普通寄存器 | 部分读写仍消不掉；外部签名靠猜 |
-| 5 | 07-03~18 | 部分读写先展开；SSA 变量改成 bit 区间；末尾加 final cleanup | 部分读写进不了整寄存器 SSA | 外部签名猜测证据和 clobber 混在一起 |
-| 6 | 07-03~21 | 一遍 summary 拆两遍，中间夹参数推断；证据分三类 | 外部函数没有签名 | 返回信息是鸡生蛋；浮点返回接不住 |
-| 7 | 08-04~05 | p-code 层处理 x87；调用点 DF 定 0；ST0/ST1 走完整静态分析 | DF/x87 等特殊寄存器语义 | 返回信息归属问题 |
-| 8 | 08-05 | 第一遍不区分 return/clobber；返回槽由签名决定；返回绑定移到重写后 | 返回/clobber 不该在第一遍区分 | 混合 clobber 路径必须保留并告警；纯 unknown 才折叠 |
-
-一句话主线：**每次架构变更，都是旧架构的一个简化假设被真实二进制打破。** "寄存器是全局变量"被 SSA
-打破，"整寄存器粒度够用"被部分读写打破，"SSA 自己能猜边界"被参数/返回需求打破，"分析单个函数就够"被
-调用图/外部函数打破，"第一遍就能区分返回和 clobber"被浮点返回和鸡生蛋打破。
-
-## 11.1 第 9 代（2026-11-19，进行中）：可观察性裁剪
-
-**动机**：hexx64 上有一个"1 个死读撑起 385 个假返回槽"的案例。需求图诊断
-（`Analyzer::reportDemandOrigins`）显示 ZMM0 的需求图有 385 个函数、1183 条边，
-**只有 1 个源头**；那个源头 `FUN_2b12e0` 只是把一个调用的 i128 返回值传给
-`FUN_29a940` 的一个**从未被使用的形参**，而这个形参又来自 `FUN_29a940` pre-RE 体
-里的一批死读（结果只喂给没人用的计算）。链条是：
-
-```text
-死读 → ReadEntry[ZMM0]=true → 签名加 i128 形参 → 调用点被迫提供值
-     → 调用者 live 带 ZMM0 → 上一个调用的 callee 拿到 ExitDemand
-     → 它的返回槽又要求下一个 callee …… → 385 个函数
-```
-
-**问题本质**：`ReadEntry` 的语义是"入口值被读过"（定义线索），但**被读过 ≠ 被观察**。
-而"可观察"不能只在函数内判定——传给调用在函数内看就是可观察的，只有跨函数才知道
-那个形参有没有人用。所以这是一个**第三个定点**，位置在 effect 和 demand 之间：
-
-```text
-Analyzer::run()
-  runBottomUp()            自底向上 effect
-  computeUsedInputs()      可观察性定点（第 9 代）
-  runTopDownDemand()       自顶向下 demand（只吃过滤后的 ReadEntry）
-```
-
-**规则**（保守方向：拿不准就算 used）：
-
-- `usedInputs[F][U]`：F 的入口值 U 是否可能被可观察地使用；
-- 可观察 sink：`ret` 操作数、`br`/`switch` 条件、store 到非寄存器内存；
-- 外部调用：pre-RE IR 里外部调用没有显式实参（参数在寄存器里），所以"函数里有外部
-  调用"⇒ ABI 输入寄存器整体算 used；
-- 内部 callee：只有 `usedInputs[G][U]` 成立时，调用点传给 G 的 U 才算 used
-  （worklist 定点，只增，和 demand 定点同一套结构）；
-- 接口不可改（`Function::hasAddressTaken()`）⇒ 整条算 used；
-- 和 `computeValueDemands` 的区别：去掉两个会放大需求的 seed
-  （`partial_write` 的值、`icmp` 的操作数）。
-
-**当前状态**：
-
-- **源头已修（2026-11-19）**：不是死读，而是 `pcmpeqd %xmm0,%xmm0` 被降成两条相同的
-  `partial_read` + `icmp eq`。在 p-code 降级阶段加了同一段 p-code 内的寄存器读 CSE
-  （写/调用/换块失效），`icmp eq %v,%v` 折成 true → 常量写 → `ReadEntry` 消失。
-  hexx64 全量：`abi_undefined` 211 → **0**，unknown 517 → 515，指令数 −1.3%，
-  IR 88.1 → 86.3 MB，`ZMM0 nodes=385 sources=1` 那一行从需求图诊断里消失。
-- 阶段 1（已完成，只诊断）：`computeUsedInputs()` + `reportUnobservableInputs()`
-  打印每个寄存器的 `read_entry_functions`（读过入口、但没人观察的函数数）和
-  `cuttable_callsites`（callee 读了没人用的入口 ⇒ 调用点不必准备值的调用点数）。
-- 阶段 2（未做，目标已修正）：原先预期"过滤 `ReadEntry` 能让 hexx64 的 211 个 ABI
-  未定义位消失"——**这个预期是错的**。那批位实际是 p-code 重复读（`pcmpeqd` 自比较）
-  造成的，已由读 CSE 修掉（211 → 0）；DF 那条链也已按 ABI 边界规则单独修掉（见 8.1）。
-  可观察性过滤真正能剪的是另一批：报告里 RDI 144、RAX 181、RSI 38 个
-  `cuttable_callsites`（各自的 `read_entry_functions` 见报告）。
-- 阶段 3（可选）：残留的死形参/死返回槽再按 DAE 式裁剪。
-
-## 12. 已知边界与押后项
-
-- 未知外部返回推断仍是保守启发式：调用后同时读 `XMM0` 和 `ST0` 的 long double 函数会误选 `XMM0`。
-  更准的做法是"后向数据流：调用后被读的寄存器值是否到达本函数 ret"，改动面大，押后。
-  （第 9 代的可观察性分析是同一个方向，但它判的是"入口读有没有人观察"，
-  返回侧那半还没有做；见 11.1。）
-- 外部 libm 的 long double 原型（`sqrtl`/`round`）、`complex long double` 返回、多 long double
-  结构体返回押后。
-- 栈参数绑定（调用前压栈的参数恢复成 call 参数）从 2026-07-25 起持续推进，尚未完全收口。
-
-## 13. 寄存器值的表示准则（2026-09-28）
-
-第 8 代把"返回信息唯一来源是签名"定下来之后，剩下的问题从"值从哪来"变成了"值丢了的时候怎么表示"。
-这一步只有三条准则，但它决定了后面还能不能把值修回来。
-
-**1. 优先级：载体 > 裸读 > unknown。**
-
-- **载体** = 入口形参 / 返回槽 / 调用点实参，值的真正来源；
-- **裸读** = `load @REG` / `notdec.partial_read.*(@REG, off)`：保留了"哪个寄存器、哪几位、
-  在哪个位置"；后面的阶段还能靠它把值提成形参/实参（第 12 节"栈参数绑定"就是这类工作）；
-- `notdec.unknown.*` 只说明"这里缺一个值"，寄存器和位的身份全丢了，只能靠人重新分析
-  （所以它要带 `!notdec.unknown.source` 归因）。
-
-所以同一个"未知的寄存器值"，宁可先落成裸读，也不要直接落成 unknown。**终态是两者都不出现**：
-裸读只允许出现在接口不可改的边界函数（导出函数、地址被取的函数）和不透明 callee 的出口。
-
-**2. 不用 poison 表示未知。**
-
-LLVM 允许把 poison 细化成任意具体值（`freeze(poison)` 会被 InstCombine 折成 0），占位会静默
-变成具体值，同时丢掉 `!notdec.unknown.source` 的归因。要表示"值未知"就用 `notdec.unknown.*`
-+ `!notdec.unknown.source`（`unknownValueAt` 的注释里已经写了这条）。目前仍在用 poison 的几处
-（x87 空槽入口读、`vararg_unknown` 占位的降级、zero-demand 操作数）是旧决定的残留，逐个评估后换。
-
-**3. 边界两侧的位必须闭合。**
-
-现在两侧的判据是分着的：
-
-| 侧 | 判据 | 位置 |
-| --- | --- | --- |
-| 入口形参 | `ReadEntry` + `ReadEntryMask`（"入口值在被覆盖前被读过"的位） | `shapeForInternalFunction` 的 `addParamForUnit` |
-| 返回槽 | `MayNonEntry && ExitDemand` + `ExitDemandMask` | 同函数的返回槽循环 |
-
-缝隙是 `ExitDemandMask & MayNonEntryMask & MayEntryMask`——"返回槽里可能还是入口值的位"。
-构造出口寄存器值需要这些位的入口值，而入口没有形参承载它们，按位 SSA 就只能去裸读寄存器 global。
-补法是把这段 mask 并进入口 `paramMask`（见 `logs/20260927-02` §9.1 的 1c patch）。
-
-**例子：lighttpd `fdevent_fdnode_event_set`（0x38e10）**
-
-汇编上 EDX 是第 3 个源码参数 `int events`：两条提前返回的路径上 RDX 完全没被动过，间接调用
-`ev->event_set` 之后 RDX 被 clobber（caller-saved）。于是 summary 里：
-
-```text
-RDX: read_entry_mask=0xFFFFFFFF          （低 32 位真被读过：mov r12d,edx / cmp edx,[rsi+0x14]）
-     may_entry_mask=0xFFFFFFFFFFFFFFFF    （出口时高半可能还是入口值）
-     may_non_entry_mask=0xFFFFFFFFFFFFFFFF
-     exit_demand_mask=0xFFFFFFFFFFFFFFFF  （调用者把返回的 RDX 当 8 字节切片继续用）
-```
-
-当前产物是**混合态**——既不是"只当参数"，也不是"当返回值就同时把入口整个当参数"：
-
-```llvm
-define internal i64 @fdevent_fdnode_event_set(i64 %RDI.arg, i64 %RSI.arg, i32 %RDX.arg) {
-  %RDX.range_entry68 = call i32 @notdec.partial_read.i64.i32(ptr @RDX, i64 32)  ; ← 高半裸读
-  ...
-  ; 低半 = %RDX.arg / clobber / 重试路径返回值
-  ; 高半 = 上面这条裸读 / clobber / 重试路径返回值
-  ; 两半 zext 后拼成 i64 返回
-}
-```
-
-闭合之后（入口 `paramMask` 并上 `returnEntryMask`）应该长这样，裸读消失、也没有 unknown：
-
-```llvm
-define internal i64 @fdevent_fdnode_event_set(i64 %RDI.arg, i64 %RSI.arg, i64 %RDX.arg) {
-  ; 高半就是形参的高半；返回槽仍是 i64
-}
-```
-
-这就是"先让逻辑只在这三种情况之间切换、完全消掉裸读，再调策略"：闭合做完之后，"RDX 要不要当
-返回值 / 要不要整条当形参"才是纯粹的策略选择，而不是由两个判据的缝隙决定。
-
-**2026-09-28 实测（详见 `logs/20260927-02` §17）**：
-
-- 已经落地：返回槽收窄到 `ExitDemand ∩ MayNonEntry`；`calleeNeverWritesRange` 逐 range 保留
-  调用者前值；caller 侧三档（range 值表 → 调用者形参 → 入口裸读）；`return_entry_mask` 标记。
-  结果是 unknown 不净增（tmux 25→22、wolfssl 556→535），`call_arg_rewrite_missing_binding`
-  合计 57→33，local 裸读基本不变。
-- **入口形参侧的消费（`paramMask |= ReturnEntryMask`）单独打开是回归**：lighttpd unknown
-  26→83、wolfssl 556→650，虽然裸读同时下降（lighttpd local 120→78）。原因是调用点侧的值同样
-  被更早的 Mixed 调用丢掉了——新增的载体把需求推到调用点，调用点答不出来。
-- **补上 demand 的入口需求之后就成立了**：`applyBackwardCallDemand` 里给内部 callee 补上
-  "callee 入口需要的位要在调用点活着"（镜像签名判据：`ReadEntry | (MayEntry ∩ MayNonEntry ∩
-  callee.ExitDemand ∩ live)`），再打开入口形参闭合，unknown 直方图逐键不变
-  （lighttpd 26、tmux 22、wolfssl 535），裸读还少了几条（lighttpd 120→117、wolfssl 648→646）。
-  `fdevent_fdnode_event_set` 现在是 `i64 %RDX.arg` + i64 返回、没有 `partial_read`，调用点传
-  的是真值。见 `logs/20260927-02` §18。
-- **demand 分析本身改成了双向 worklist**（§19）：需求有两个方向（caller → callee 的 ExitDemand、
-  callee → caller 的透传需求），所以 `runTopDownDemand` 不再是"自顶向下扫描"，而是普通的单调
-  worklist 定点：caller 的 `additions` 变化入队 callee，callee 的 ExitDemand 变化入队它的所有
-  caller。所有量只置位、有限格，一定收敛（递归也一样）。实测与版本号循环持平或略好。
-  直接用 callee 的 `EntryDemand` 当调用点需求是回归（lighttpd 26→35、tmux 22→76），因为它是
-  入口 live-in，含 partial write 写保留位等垃圾位。
-- 另一处修正：返回槽本来还有 `MayNonEntry` 布尔闸门，"从不写但被需要"的位不会建出返回槽；
-  收窄真正生效的是"部分写过"的寄存器（例如 wolfSSL 里只写过低字节的 RAX）。
-
-
+- 未知外部返回推断仍依赖保守启发式：调用后同时读 `XMM0` 和 `ST0` 的 `long double` 外部函数可能误选 `XMM0`（更精确的返回侧后向数据流分析押后）。
+- 外部 libm `long double` 原型（`sqrtl`/`round`）、`complex long double` 返回及多 `long double` 结构体返回押后。
+- 栈参数绑定（将调用前压栈参数还原为 call 实参）仍在持续收口。
